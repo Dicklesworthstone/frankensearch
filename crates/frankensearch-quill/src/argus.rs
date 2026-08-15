@@ -3796,6 +3796,64 @@ fn classify_seek_result(target: u32, result: Option<u32>) -> Result<SeekDangerRe
 /// future WAND and block-max implementations.
 pub struct ReferenceScorer<'a> {
     node: ScorerNode<'a>,
+    subtree_nodes: usize,
+}
+
+fn take_scorer_node(mut scorer: ReferenceScorer<'_>) -> ScorerNode<'_> {
+    std::mem::replace(&mut scorer.node, ScorerNode::Empty)
+}
+
+impl Drop for ReferenceScorer<'_> {
+    fn drop(&mut self) {
+        let root = std::mem::replace(&mut self.node, ScorerNode::Empty);
+        if matches!(root, ScorerNode::Empty) {
+            return;
+        }
+        let mut pending = Vec::new();
+        if pending.try_reserve_exact(self.subtree_nodes).is_err() {
+            // Recursive destruction is not an admissible OOM fallback for an
+            // adversarial scorer shape. Leaking during process-wide allocation
+            // failure is preferable to overflowing the native stack.
+            std::mem::forget(root);
+            return;
+        }
+        pending.push(root);
+        while let Some(node) = pending.pop() {
+            match node {
+                ScorerNode::Intersection(scorer) => {
+                    for child in scorer.scorers {
+                        pending.push(take_scorer_node(child));
+                    }
+                }
+                ScorerNode::Union(scorer) => {
+                    for child in scorer.active {
+                        pending.push(take_scorer_node(child));
+                    }
+                }
+                ScorerNode::UnscoredUnion(scorer) => {
+                    for child in scorer.active {
+                        pending.push(take_scorer_node(child));
+                    }
+                }
+                ScorerNode::RequiredOptional(scorer) => {
+                    pending.push(take_scorer_node(*scorer.required));
+                    pending.push(take_scorer_node(*scorer.optional));
+                }
+                ScorerNode::Exclude(scorer) => {
+                    pending.push(take_scorer_node(*scorer.include));
+                    for child in scorer.excluded {
+                        pending.push(take_scorer_node(child));
+                    }
+                }
+                ScorerNode::Empty
+                | ScorerNode::All(_)
+                | ScorerNode::Term(_)
+                | ScorerNode::Phrase(_)
+                | ScorerNode::NumericRange(_)
+                | ScorerNode::ConstantScore(_) => {}
+            }
+        }
+    }
 }
 
 impl<'a> ReferenceScorer<'a> {
@@ -3804,6 +3862,7 @@ impl<'a> ReferenceScorer<'a> {
     pub const fn empty() -> Self {
         Self {
             node: ScorerNode::Empty,
+            subtree_nodes: 1,
         }
     }
 
@@ -3849,6 +3908,7 @@ impl<'a> ReferenceScorer<'a> {
         } else {
             Ok(Self {
                 node: ScorerNode::All(all),
+                subtree_nodes: 1,
             })
         }
     }
@@ -3861,6 +3921,7 @@ impl<'a> ReferenceScorer<'a> {
         } else {
             Self {
                 node: ScorerNode::Term(term),
+                subtree_nodes: 1,
             }
         }
     }
@@ -3873,6 +3934,7 @@ impl<'a> ReferenceScorer<'a> {
         } else {
             Self {
                 node: ScorerNode::Phrase(phrase),
+                subtree_nodes: 1,
             }
         }
     }
@@ -3939,6 +4001,7 @@ impl<'a> ReferenceScorer<'a> {
                 segment_num_docs,
                 boost,
             )),
+            subtree_nodes: 1,
         })
     }
 
@@ -3983,6 +4046,7 @@ impl<'a> ReferenceScorer<'a> {
                 covers_every_document,
                 boost,
             )),
+            subtree_nodes: 1,
         })
     }
 
@@ -4035,6 +4099,7 @@ impl<'a> ReferenceScorer<'a> {
                 segment_num_docs,
                 score,
             }),
+            subtree_nodes: 1,
         })
     }
 
@@ -4410,10 +4475,15 @@ impl<'a> ReferenceScorer<'a> {
                         #[cfg(feature = "pruning-conformance")]
                         None,
                     )?;
+                    let subtree_nodes = required
+                        .subtree_nodes
+                        .saturating_add(optional.subtree_nodes)
+                        .saturating_add(1);
                     Self {
                         node: ScorerNode::RequiredOptional(RequiredOptionalScorer::new(
                             required, optional,
                         )?),
+                        subtree_nodes,
                     }
                 }
             }
@@ -4429,8 +4499,11 @@ impl<'a> ReferenceScorer<'a> {
                         #[cfg(feature = "pruning-conformance")]
                         None,
                     )?;
+                    let mut with_all = reserve_scorers("optional All clauses", 2)?;
+                    with_all.push(ordinary_should);
+                    with_all.push(all);
                     scorer_union(
-                        vec![ordinary_should, all],
+                        with_all,
                         false,
                         #[cfg(feature = "pruning-conformance")]
                         None,
@@ -4448,8 +4521,14 @@ impl<'a> ReferenceScorer<'a> {
         if excluded.is_empty() {
             return Ok(include);
         }
+        let subtree_nodes = excluded
+            .iter()
+            .fold(include.subtree_nodes.saturating_add(1), |count, scorer| {
+                count.saturating_add(scorer.subtree_nodes)
+            });
         Ok(Self {
             node: ScorerNode::Exclude(ExcludeScorer::new(include, excluded)?),
+            subtree_nodes,
         })
     }
 
@@ -4798,12 +4877,16 @@ fn scorer_intersection(
             "required scorer count changed during lowering",
         )),
         _ => {
+            let subtree_nodes = scorers.iter().fold(1_usize, |count, scorer| {
+                count.saturating_add(scorer.subtree_nodes)
+            });
             let intersection = IntersectionScorer::new(scorers)?;
             if intersection.doc().is_none() {
                 Ok(ReferenceScorer::empty())
             } else {
                 Ok(ReferenceScorer {
                     node: ScorerNode::Intersection(intersection),
+                    subtree_nodes,
                 })
             }
         }
@@ -4825,14 +4908,20 @@ fn scorer_union<'a>(
         1 => scorers.pop().ok_or(ArgusError::CursorInvariant(
             "optional scorer count changed during lowering",
         )),
-        _ => Ok(ReferenceScorer {
-            node: ScorerNode::Union(BufferedUnionScorer::new(
-                scorers,
-                topdocs_root,
-                #[cfg(feature = "pruning-conformance")]
-                conformance_checkpoint,
-            )?),
-        }),
+        _ => {
+            let subtree_nodes = scorers.iter().fold(1_usize, |count, scorer| {
+                count.saturating_add(scorer.subtree_nodes)
+            });
+            Ok(ReferenceScorer {
+                node: ScorerNode::Union(BufferedUnionScorer::new(
+                    scorers,
+                    topdocs_root,
+                    #[cfg(feature = "pruning-conformance")]
+                    conformance_checkpoint,
+                )?),
+                subtree_nodes,
+            })
+        }
     }
 }
 
@@ -4844,9 +4933,15 @@ fn scorer_union_unscored(
         1 => scorers.pop().ok_or(ArgusError::CursorInvariant(
             "unscored optional scorer count changed during lowering",
         )),
-        _ => Ok(ReferenceScorer {
-            node: ScorerNode::UnscoredUnion(UnscoredUnionScorer::new(scorers)?),
-        }),
+        _ => {
+            let subtree_nodes = scorers.iter().fold(1_usize, |count, scorer| {
+                count.saturating_add(scorer.subtree_nodes)
+            });
+            Ok(ReferenceScorer {
+                node: ScorerNode::UnscoredUnion(UnscoredUnionScorer::new(scorers)?),
+                subtree_nodes,
+            })
+        }
     }
 }
 

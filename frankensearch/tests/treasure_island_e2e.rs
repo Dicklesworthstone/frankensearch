@@ -416,9 +416,15 @@ fn semantic_queries_do_not_leak_the_answer_vocabulary() {
 #[cfg(feature = "quill")]
 mod lexical {
     #[cfg(feature = "lexical-tantivy")]
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::{LEXICAL_QUERIES, Passage, chapters_of, corpus};
+    #[cfg(feature = "lexical-tantivy")]
+    use frankensearch::lexical_tantivy::tantivy_crate::query::BoostQuery;
+    #[cfg(feature = "lexical-tantivy")]
+    use frankensearch::lexical_tantivy::{
+        IndexRecordOption, Query, TantivyDocument, Term, TermQuery, TopDocs, Value,
+    };
     use frankensearch::{IndexableDocument, LexicalRead, LexicalWrite, QuillConfig, QuillIndex};
     #[cfg(feature = "lexical-tantivy")]
     use frankensearch::{ScoredResult, TantivyIndex};
@@ -639,6 +645,118 @@ mod lexical {
             .into_iter()
             .map(|result: ScoredResult| (result.doc_id.to_string(), result.score.to_bits()))
             .collect()
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    fn tantivy_depth_72_oracle_observation(
+        index: &TantivyIndex,
+        pairs: usize,
+        limit: usize,
+    ) -> RankedObservation {
+        const AND_BOOST: f32 = 1.03125;
+        const OR_BOOST: f32 = 1.0625;
+        const TITLE_BOOST: f32 = 2.0;
+
+        assert!(pairs > 0, "the depth oracle requires at least one pair");
+        let index_handle = index.index_handle();
+        let schema = index_handle.schema();
+        let content = schema.get_field("content").expect("content field");
+        let title = schema.get_field("title").expect("title field");
+        let id = schema.get_field("id").expect("id field");
+        let term_query = |field, text: &str| {
+            TermQuery::new(
+                Term::from_field_text(field, text),
+                IndexRecordOption::WithFreqs,
+            )
+        };
+        let reader = index_handle.reader().expect("open Tantivy oracle reader");
+        reader.reload().expect("reload Tantivy oracle reader");
+        let searcher = reader.searcher();
+        let score_term = |query: &dyn Query| -> BTreeMap<String, f32> {
+            searcher
+                .search(query, &TopDocs::with_limit(limit).order_by_score())
+                .expect("execute Tantivy term oracle")
+                .into_iter()
+                .map(|(score, address)| {
+                    let document: TantivyDocument =
+                        searcher.doc(address).expect("load Tantivy oracle hit");
+                    let document_id = document
+                        .get_first(id)
+                        .and_then(|value| value.as_str())
+                        .expect("Tantivy oracle hit id")
+                        .to_owned();
+                    (document_id, score)
+                })
+                .collect()
+        };
+
+        // A deeply nested Tantivy Boolean scorer repeatedly seeks through the
+        // same intersection chain and is itself impractical at this depth.
+        // Tantivy distributes every enclosing BoostQuery into its leaf
+        // scorers before Boolean addition. Score each leaf with Tantivy's
+        // native boosted TermQuery, then replay only the query tree's exact
+        // left-associated f32 additions. The tractable-depth crosscheck below
+        // pins this scalar oracle to the real public Tantivy parser before it
+        // is used at depth 72.
+        let leaf_boost = |pair: usize, include_and_boost: bool| {
+            let mut boost = 1.0_f32;
+            for _ in ((pair + 1)..pairs).rev() {
+                boost *= OR_BOOST;
+                boost *= AND_BOOST;
+            }
+            boost *= OR_BOOST;
+            if include_and_boost {
+                boost *= AND_BOOST;
+            }
+            boost
+        };
+        let boosted_term_scores = |field, text: &str, boost: f32| {
+            score_term(&BoostQuery::new(Box::new(term_query(field, text)), boost))
+        };
+
+        let mut scores = boosted_term_scores(content, "depthneedle", leaf_boost(0, true));
+        for pair in 0..pairs {
+            let required =
+                boosted_term_scores(content, &format!("required{pair}"), leaf_boost(pair, true));
+            scores.retain(|document_id, score| {
+                let Some(required_score) = required.get(document_id) else {
+                    return false;
+                };
+                *score += *required_score;
+                true
+            });
+
+            let optional = boosted_term_scores(
+                title,
+                &format!("optional{pair}"),
+                leaf_boost(pair, false) * TITLE_BOOST,
+            );
+            for (document_id, score) in &mut scores {
+                *score += optional.get(document_id).copied().unwrap_or(0.0);
+            }
+        }
+
+        let mut ranked = scores.into_iter().collect::<Vec<_>>();
+        ranked.sort_by(|(left_id, left_score), (right_id, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|(document_id, score)| (document_id, score.to_bits()))
+            .collect()
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    fn alternating_boolean_depth_query(pairs: usize) -> String {
+        let mut query = "content:depthneedle".to_owned();
+        for pair in 0..pairs {
+            query = format!("content:({query} AND required{pair})^1.03125");
+            query = format!("title:({query} OR optional{pair})^1.0625");
+        }
+        query
     }
 
     /// The public and identifier-only paths must return the same score groups
@@ -1116,6 +1234,83 @@ mod lexical {
             assert_eq!(
                 quill_hits, tantivy_hits,
                 "nested Boolean structure must not make redundant field scopes consume the depth budget"
+            );
+        });
+    }
+
+    /// Seventy-two non-redundant groups alternate field scope, Boolean shape,
+    /// and boost. The required-only document must traverse the deepest branch;
+    /// dropping the historical depth-64 subtree changes both membership and
+    /// the exact score accumulation order.
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_depth_72_alternating_boolean_arena_matches_tantivy_oracle() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            const PAIRS: usize = 36;
+            const EXPECTED_GROUPS: usize = 72;
+
+            let query = alternating_boolean_depth_query(PAIRS);
+            assert_eq!(PAIRS * 2, EXPECTED_GROUPS);
+            assert!(query.chars().count() <= frankensearch::quill::MAX_QUERY_LENGTH);
+
+            let mut all_content = "depthneedle".to_owned();
+            let mut all_title = String::new();
+            let mut required_content = "depthneedle".to_owned();
+            let mut missing_outer_required = "depthneedle".to_owned();
+            let mut wrong_field = "depthneedle".to_owned();
+            for pair in 0..PAIRS {
+                let required = format!(" required{pair}");
+                all_content.push_str(&required);
+                required_content.push_str(&required);
+                wrong_field.push_str(&required);
+                if pair + 1 < PAIRS {
+                    missing_outer_required.push_str(&required);
+                }
+                all_title.push_str(&format!(" optional{pair}"));
+            }
+            let documents = Vec::from([
+                IndexableDocument::new("all-clauses", all_content).with_title(all_title),
+                IndexableDocument::new("required-only", required_content).with_title("neutral"),
+                IndexableDocument::new("missing-outer-required", missing_outer_required)
+                    .with_title("neutral"),
+                IndexableDocument::new("wrong-field", "neutral").with_title(wrong_field),
+            ]);
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &documents).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &documents).await;
+
+            const ORACLE_CROSSCHECK_PAIRS: usize = 4;
+            let oracle_crosscheck_query = alternating_boolean_depth_query(ORACLE_CROSSCHECK_PAIRS);
+            assert_eq!(
+                tantivy_depth_72_oracle_observation(&tantivy, ORACLE_CROSSCHECK_PAIRS, 10),
+                public_observation(&tantivy, &cx, &oracle_crosscheck_query, 10).await,
+                "the direct Tantivy tree must be score-bit identical to its query parser at a tractable depth"
+            );
+
+            // Tantivy's query-string parser recursively expands this exact
+            // depth-stress input and does not complete in a practical test
+            // bound. The crosschecked scalar oracle isolates Quill's public
+            // parser/arena while retaining Tantivy's native term scoring and
+            // exact Boolean score accumulation.
+            let tantivy_hits = tantivy_depth_72_oracle_observation(&tantivy, PAIRS, 10);
+            assert_eq!(
+                tantivy_hits
+                    .iter()
+                    .map(|(document_id, _)| document_id.as_str())
+                    .collect::<Vec<_>>(),
+                Vec::from(["all-clauses", "required-only"]),
+                "the pinned oracle must require all content clauses and preserve field scope"
+            );
+            assert!(
+                f32::from_bits(tantivy_hits[0].1) > f32::from_bits(tantivy_hits[1].1),
+                "optional title clauses must give all-clauses a strict score lead"
+            );
+
+            let quill_hits = public_observation(&quill, &cx, &query, 10).await;
+            assert_eq!(
+                quill_hits, tantivy_hits,
+                "depth-72 public Quill parse/canonicalize/lower/search must match the crosschecked Tantivy oracle in order and exact score bits"
             );
         });
     }

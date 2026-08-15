@@ -16,10 +16,11 @@ use crate::scribe::{FrankensearchTokenizer, analyze_admitted, is_cass_cjk};
 /// Maximum number of Unicode scalar values admitted to either native parser.
 pub const MAX_QUERY_LENGTH: usize = 10_000;
 
-/// Maximum recursive group depth accepted by the lenient parser.
+/// Historical parser nesting threshold retained as a public API constant.
 ///
-/// The input-length limit already bounds work; this separate cap prevents a
-/// hostile parenthesis run from turning into unbounded native-stack growth.
+/// The arena parser no longer rejects queries at this depth. The admitted
+/// query-length bound limits total work, while explicit parser and lowering
+/// stacks keep nesting independent of the native call stack.
 pub const MAX_QUERY_DEPTH: usize = 64;
 
 const CONTENT_FIELD_NAME: &str = "content";
@@ -97,7 +98,7 @@ pub enum BooleanOperator {
     Or,
 }
 
-/// One owned child in a Boolean query.
+/// One owned child used while constructing a Boolean query arena.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BooleanClause {
     /// Match occurrence.
@@ -114,16 +115,44 @@ impl BooleanClause {
     }
 }
 
-/// Engine-neutral lexical query tree.
+/// Stable index into one [`Query`] arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QueryNodeId(usize);
+
+impl QueryNodeId {
+    const ROOT: Self = Self(usize::MAX);
+    const ALL: Self = Self(usize::MAX - 1);
+    const EMPTY: Self = Self(usize::MAX - 2);
+
+    const fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// One Boolean edge in stable construction order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryClause {
+    /// Match occurrence.
+    pub occur: Occur,
+    /// Child node in the owning query arena.
+    pub query: QueryNodeId,
+}
+
+/// One node in an engine-neutral lexical query arena.
 ///
 /// Text and phrase leaves may target several fields when analysis produced the
 /// same token sequence for each field. This preserves the default parser's
 /// ordered `[content, title]` expansion without smuggling backend handles into
 /// the durable query boundary.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Query {
+pub enum QueryNode {
     /// Match nothing.
     Empty,
+    /// A bounded arena allocation failed before the requested shape existed.
+    AllocationFailure {
+        /// Number of arena entries the failed construction attempted to reserve.
+        requested: usize,
+    },
     /// Match every live document.
     All,
     /// One analyzed term over one or more fields.
@@ -147,7 +176,7 @@ pub enum Query {
     /// Boolean combination.
     Boolean {
         /// Stable construction-order children.
-        clauses: Vec<BooleanClause>,
+        clauses: Vec<QueryClause>,
         /// Explicit source operator, when one was present.
         operator: Option<BooleanOperator>,
     },
@@ -177,17 +206,292 @@ pub enum Query {
     /// Explicit score multiplier.
     Boost {
         /// Wrapped query.
-        query: Box<Self>,
+        query: QueryNodeId,
         /// Finite, non-negative multiplier.
         factor: f32,
     },
 }
 
+/// Owned postorder query arena with an inline root.
+///
+/// Every descendant child id is smaller than its parent id; the inline root is
+/// addressed by a sentinel id. Recursive Boolean and boost ownership therefore
+/// becomes bounded heap storage, and cloning or dropping an adversarially
+/// nested query never consumes the native call stack. Keeping the root inline
+/// also makes leaf, match-all, and match-none construction allocation-free.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Query {
+    nodes: Vec<QueryNode>,
+    root: QueryNode,
+}
+
 impl Query {
+    const fn node_id(index: usize) -> QueryNodeId {
+        QueryNodeId(index)
+    }
+
+    fn new(node: QueryNode) -> Self {
+        Self {
+            nodes: Vec::new(),
+            root: node,
+        }
+    }
+
+    /// Match nothing.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(QueryNode::Empty)
+    }
+
+    fn arena_allocation_failure(requested: usize) -> Self {
+        Self::new(QueryNode::AllocationFailure { requested })
+    }
+
+    /// Match every live document.
+    #[must_use]
+    pub fn all() -> Self {
+        Self::new(QueryNode::All)
+    }
+
+    fn leaf(node: QueryNode) -> Self {
+        debug_assert!(!matches!(
+            node,
+            QueryNode::Boolean { .. } | QueryNode::Boost { .. }
+        ));
+        Self::new(node)
+    }
+
+    /// Construct a term leaf.
+    #[must_use]
+    pub fn term(fields: Vec<QueryField>, text: String) -> Self {
+        Self::leaf(QueryNode::Term { fields, text })
+    }
+
+    /// Construct a phrase leaf.
+    #[must_use]
+    pub fn phrase(
+        fields: Vec<QueryField>,
+        terms: Vec<PositionedTerm>,
+        slop: u32,
+        prefix: bool,
+    ) -> Self {
+        Self::leaf(QueryNode::Phrase {
+            fields,
+            terms,
+            slop,
+            prefix,
+        })
+    }
+
+    /// Construct a typed range leaf.
+    #[must_use]
+    pub fn range(field_id: u16, lower: Bound<QueryValue>, upper: Bound<QueryValue>) -> Self {
+        Self::leaf(QueryNode::Range {
+            field_id,
+            lower,
+            upper,
+        })
+    }
+
+    /// Construct a typed set leaf.
+    #[must_use]
+    pub fn set(field_id: u16, values: Vec<QueryValue>) -> Self {
+        Self::leaf(QueryNode::Set { field_id, values })
+    }
+
+    /// Construct a glob leaf.
+    #[must_use]
+    pub fn glob(field_ids: Vec<u16>, pattern: String) -> Self {
+        Self::leaf(QueryNode::Glob { field_ids, pattern })
+    }
+
+    /// Construct a Boolean arena while retaining every clause occurrence.
+    #[must_use]
+    pub fn boolean(clauses: Vec<BooleanClause>, operator: Option<BooleanOperator>) -> Self {
+        if let Some(requested) = clauses
+            .iter()
+            .find_map(|clause| clause.query.allocation_failure())
+        {
+            return Self::arena_allocation_failure(requested);
+        }
+        let mut query = Self {
+            nodes: Vec::new(),
+            root: QueryNode::Empty,
+        };
+        let descendants = clauses.iter().fold(0_usize, |count, clause| {
+            count.saturating_add(clause.query.nodes.len().saturating_add(1))
+        });
+        if query.nodes.try_reserve_exact(descendants).is_err() {
+            return Self::arena_allocation_failure(descendants);
+        }
+        let mut flat = Vec::new();
+        if flat.try_reserve_exact(clauses.len()).is_err() {
+            return Self::arena_allocation_failure(clauses.len());
+        }
+        for clause in clauses {
+            let child = query.append(clause.query);
+            flat.push(QueryClause {
+                occur: clause.occur,
+                query: child,
+            });
+        }
+        query.root = QueryNode::Boolean {
+            clauses: flat,
+            operator,
+        };
+        query
+    }
+
+    /// Construct a boosted query without recursive ownership.
+    #[must_use]
+    pub fn boost(query: Self, factor: f32) -> Self {
+        if let Some(requested) = query.allocation_failure() {
+            return Self::arena_allocation_failure(requested);
+        }
+        let mut arena = Self {
+            nodes: Vec::new(),
+            root: QueryNode::Empty,
+        };
+        if arena
+            .nodes
+            .try_reserve_exact(query.nodes.len().saturating_add(1))
+            .is_err()
+        {
+            return Self::arena_allocation_failure(query.nodes.len().saturating_add(1));
+        }
+        let child = arena.append(query);
+        arena.root = QueryNode::Boost {
+            query: child,
+            factor,
+        };
+        arena
+    }
+
+    fn push(&mut self, node: QueryNode) -> QueryNodeId {
+        let id = Self::node_id(self.nodes.len());
+        debug_assert!(self.nodes.len() < self.nodes.capacity());
+        self.nodes.push(node);
+        id
+    }
+
+    fn append(&mut self, other: Self) -> QueryNodeId {
+        if other.nodes.is_empty() {
+            match &other.root {
+                QueryNode::All => return QueryNodeId::ALL,
+                QueryNode::Empty => return QueryNodeId::EMPTY,
+                _ => {}
+            }
+        }
+        let base = self.nodes.len();
+        let child_root = base.saturating_add(other.nodes.len());
+        let remap = |id: QueryNodeId| {
+            if id == QueryNodeId::ROOT {
+                QueryNodeId(child_root)
+            } else {
+                QueryNodeId(base.saturating_add(id.index()))
+            }
+        };
+        for node in other.nodes {
+            self.push(remap_query_node(node, remap));
+        }
+        self.push(remap_query_node(other.root, remap))
+    }
+
+    /// Root node.
+    #[must_use]
+    pub fn root(&self) -> &QueryNode {
+        &self.root
+    }
+
+    /// Root node id.
+    #[must_use]
+    pub const fn root_id(&self) -> QueryNodeId {
+        QueryNodeId::ROOT
+    }
+
+    /// Node by id.
+    #[must_use]
+    pub fn node(&self, id: QueryNodeId) -> &QueryNode {
+        if id == QueryNodeId::ROOT {
+            &self.root
+        } else if id == QueryNodeId::ALL {
+            &QueryNode::All
+        } else if id == QueryNodeId::EMPTY {
+            &QueryNode::Empty
+        } else {
+            &self.nodes[id.index()]
+        }
+    }
+
+    /// Number of logical nodes, including allocation-free `All` and `Empty`
+    /// children represented by sentinel edges.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.nodes.iter().chain(std::iter::once(&self.root)).fold(
+            self.nodes.len().saturating_add(1),
+            |count, node| {
+                let sentinels = match node {
+                    QueryNode::Boolean { clauses, .. } => clauses
+                        .iter()
+                        .filter(|clause| {
+                            clause.query == QueryNodeId::ALL || clause.query == QueryNodeId::EMPTY
+                        })
+                        .count(),
+                    QueryNode::Boost { query, .. }
+                        if *query == QueryNodeId::ALL || *query == QueryNodeId::EMPTY =>
+                    {
+                        1
+                    }
+                    _ => 0,
+                };
+                count.saturating_add(sentinels)
+            },
+        )
+    }
+
+    fn node_mut(&mut self, id: QueryNodeId) -> &mut QueryNode {
+        if id == QueryNodeId::ROOT {
+            &mut self.root
+        } else {
+            &mut self.nodes[id.index()]
+        }
+    }
+
     /// Whether this tree is the match-none sentinel.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        matches!(self, Self::Empty)
+    pub fn is_empty(&self) -> bool {
+        matches!(self.root(), QueryNode::Empty)
+    }
+
+    /// Failed arena reservation carried without masquerading as match-none.
+    #[must_use]
+    pub fn allocation_failure(&self) -> Option<usize> {
+        match &self.root {
+            QueryNode::AllocationFailure { requested } => Some(*requested),
+            _ => None,
+        }
+    }
+}
+
+fn remap_query_node(
+    node: QueryNode,
+    remap: impl Fn(QueryNodeId) -> QueryNodeId + Copy,
+) -> QueryNode {
+    match node {
+        QueryNode::Boolean {
+            mut clauses,
+            operator,
+        } => {
+            for clause in &mut clauses {
+                clause.query = remap(clause.query);
+            }
+            QueryNode::Boolean { clauses, operator }
+        }
+        QueryNode::Boost { query, factor } => QueryNode::Boost {
+            query: remap(query),
+            factor,
+        },
+        leaf => leaf,
     }
 }
 
@@ -265,17 +569,31 @@ fn push_bound_key(out: &mut Vec<u8>, bound: &Bound<QueryValue>) {
     }
 }
 
+fn canonical_child_key(keys: &[Vec<u8>], id: QueryNodeId) -> &[u8] {
+    if id == QueryNodeId::ALL {
+        &[1]
+    } else if id == QueryNodeId::EMPTY {
+        &[0]
+    } else {
+        &keys[id.index()]
+    }
+}
+
 /// Total deterministic structural key for one query subtree. Two subtrees
 /// share a key iff they are structurally identical (field ids, boost bits,
 /// terms, positions, bounds, values, patterns, and child order-sensitive
 /// structure), so the key is safe both for deterministic ordering and for
 /// exact-duplicate detection.
-fn canonical_sort_key(query: &Query) -> Vec<u8> {
+fn canonical_sort_key_for_node(node: &QueryNode, keys: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
-    match query {
-        Query::Empty => out.push(0),
-        Query::All => out.push(1),
-        Query::Term { fields, text } => {
+    match node {
+        QueryNode::Empty => out.push(0),
+        QueryNode::All => out.push(1),
+        QueryNode::AllocationFailure { requested } => {
+            out.push(9);
+            out.extend_from_slice(&requested.to_be_bytes());
+        }
+        QueryNode::Term { fields, text } => {
             out.push(2);
             out.extend_from_slice(&fields.len().to_be_bytes());
             for field in fields {
@@ -283,7 +601,7 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
             }
             push_framed_bytes(&mut out, text.as_bytes());
         }
-        Query::Phrase {
+        QueryNode::Phrase {
             fields,
             terms,
             slop,
@@ -302,7 +620,7 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
             out.extend_from_slice(&slop.to_be_bytes());
             out.push(u8::from(*prefix));
         }
-        Query::Boolean { clauses, operator } => {
+        QueryNode::Boolean { clauses, operator } => {
             out.push(4);
             out.push(match operator {
                 None => 0,
@@ -312,11 +630,10 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
             out.extend_from_slice(&clauses.len().to_be_bytes());
             for clause in clauses {
                 out.push(occur_rank(clause.occur));
-                let child = canonical_sort_key(&clause.query);
-                push_framed_bytes(&mut out, &child);
+                push_framed_bytes(&mut out, canonical_child_key(keys, clause.query));
             }
         }
-        Query::Range {
+        QueryNode::Range {
             field_id,
             lower,
             upper,
@@ -326,7 +643,7 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
             push_bound_key(&mut out, lower);
             push_bound_key(&mut out, upper);
         }
-        Query::Set { field_id, values } => {
+        QueryNode::Set { field_id, values } => {
             out.push(6);
             out.extend_from_slice(&field_id.to_be_bytes());
             out.extend_from_slice(&values.len().to_be_bytes());
@@ -334,7 +651,7 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
                 push_query_value_key(&mut out, value);
             }
         }
-        Query::Glob { field_ids, pattern } => {
+        QueryNode::Glob { field_ids, pattern } => {
             out.push(7);
             out.extend_from_slice(&field_ids.len().to_be_bytes());
             for field_id in field_ids {
@@ -342,20 +659,34 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
             }
             push_framed_bytes(&mut out, pattern.as_bytes());
         }
-        Query::Boost { query, factor } => {
+        QueryNode::Boost {
+            query: child,
+            factor,
+        } => {
             out.push(8);
             out.extend_from_slice(&factor.to_bits().to_be_bytes());
-            let child = canonical_sort_key(query);
-            push_framed_bytes(&mut out, &child);
+            push_framed_bytes(&mut out, canonical_child_key(keys, *child));
         }
     }
     out
 }
 
+#[cfg(test)]
+fn canonical_sort_key(query: &Query) -> Vec<u8> {
+    let mut keys = Vec::<Vec<u8>>::new();
+    if keys.try_reserve_exact(query.nodes.len()).is_err() {
+        return Vec::new();
+    }
+    for node in &query.nodes {
+        keys.push(canonical_sort_key_for_node(node, &keys));
+    }
+    canonical_sort_key_for_node(query.root(), &keys)
+}
+
 /// Canonicalize a parsed query tree for deterministic planning and
 /// score-neutral deduplication (bd-quill-duel-ast-dedup-7hsu).
 ///
-/// The pass is recursive (bottom-up) and applies three score-neutral rules:
+/// The pass is iterative (bottom-up) and applies three score-neutral rules:
 ///
 /// 1. **Deterministic occurrence groups**: Boolean children are stably grouped
 ///    as `Must`, `Should`, `MustNot`. Construction order within each group is
@@ -378,58 +709,93 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
 #[must_use]
 pub fn canonicalize_query(query: &mut Query) -> QueryCanonicalizationReport {
     let mut report = QueryCanonicalizationReport::default();
-    canonicalize_query_inner(query, &mut report);
-    report
-}
-
-fn canonicalize_query_inner(query: &mut Query, report: &mut QueryCanonicalizationReport) {
-    match query {
-        Query::Boolean { clauses, .. } => {
-            for clause in clauses.iter_mut() {
-                canonicalize_query_inner(&mut clause.query, report);
+    let mut keys = Vec::<Vec<u8>>::new();
+    if keys.try_reserve_exact(query.nodes.len()).is_err() {
+        return report;
+    }
+    for index in 0..query.nodes.len() {
+        if let QueryNode::Boolean { clauses, .. } = &mut query.nodes[index] {
+            let mut seen_must_not = Vec::<Vec<u8>>::new();
+            if seen_must_not.try_reserve_exact(clauses.len()).is_err() {
+                return report;
             }
-            // MustNot dedup: exclusion is idempotent.
-            let mut seen_must_not = Vec::new();
             clauses.retain(|clause| {
                 if clause.occur != Occur::MustNot {
                     return true;
                 }
-                let key = canonical_sort_key(&clause.query);
-                if seen_must_not.contains(&key) {
+                let key = canonical_child_key(&keys, clause.query);
+                if seen_must_not
+                    .iter()
+                    .any(|candidate| candidate.as_slice() == key)
+                {
                     report.must_not_duplicates_removed += 1;
                     return false;
                 }
-                seen_must_not.push(key);
+                seen_must_not.push(key.to_vec());
                 true
             });
-            // Group occurrences stably. Argus constructs separate required
-            // and optional aggregates in this order, but the relative order of
-            // score-bearing clauses inside either aggregate is observable via
-            // non-associative f32 addition and must not be canonicalized away.
             let before = clauses
                 .iter()
                 .map(|clause| clause.occur)
                 .collect::<Vec<_>>();
             clauses.sort_by_key(|clause| occur_rank(clause.occur));
-            let after = clauses
-                .iter()
-                .map(|clause| clause.occur)
-                .collect::<Vec<_>>();
-            if before != after {
+            if before
+                != clauses
+                    .iter()
+                    .map(|clause| clause.occur)
+                    .collect::<Vec<_>>()
+            {
                 report.boolean_levels_sorted += 1;
             }
-        }
-        Query::Term { .. } | Query::Phrase { .. } => {}
-        Query::Glob { field_ids, .. } => {
+        } else if let QueryNode::Glob { field_ids, .. } = &mut query.nodes[index] {
             let original = field_ids.clone();
             field_ids.sort_unstable();
             if *field_ids != original {
                 report.glob_fields_canonicalized += 1;
             }
         }
-        Query::Boost { query, .. } => canonicalize_query_inner(query, report),
-        Query::Empty | Query::All | Query::Range { .. } | Query::Set { .. } => {}
+        keys.push(canonical_sort_key_for_node(&query.nodes[index], &keys));
     }
+    if let QueryNode::Boolean { clauses, .. } = &mut query.root {
+        let mut seen_must_not = Vec::<Vec<u8>>::new();
+        if seen_must_not.try_reserve_exact(clauses.len()).is_ok() {
+            clauses.retain(|clause| {
+                if clause.occur != Occur::MustNot {
+                    return true;
+                }
+                let key = canonical_child_key(&keys, clause.query);
+                if seen_must_not
+                    .iter()
+                    .any(|candidate| candidate.as_slice() == key)
+                {
+                    report.must_not_duplicates_removed += 1;
+                    return false;
+                }
+                seen_must_not.push(key.to_vec());
+                true
+            });
+        }
+        let before = clauses
+            .iter()
+            .map(|clause| clause.occur)
+            .collect::<Vec<_>>();
+        clauses.sort_by_key(|clause| occur_rank(clause.occur));
+        if before
+            != clauses
+                .iter()
+                .map(|clause| clause.occur)
+                .collect::<Vec<_>>()
+        {
+            report.boolean_levels_sorted += 1;
+        }
+    } else if let QueryNode::Glob { field_ids, .. } = &mut query.root {
+        let original = field_ids.clone();
+        field_ids.sort_unstable();
+        if *field_ids != original {
+            report.glob_fields_canonicalized += 1;
+        }
+    }
+    report
 }
 
 /// Stable user-facing classification preserved from the incumbent adapter.
@@ -496,6 +862,8 @@ pub enum QueryDiagnosticKind {
     AllNegativeRepair,
     /// The nesting cap was reached.
     DepthLimit,
+    /// A bounded parser or arena allocation could not be reserved.
+    AllocationFailure,
     /// An analyzed term exceeded [`MAX_TERM_BYTES`], so the branch that
     /// required it was lowered to match-nothing.
     ///
@@ -665,6 +1033,12 @@ impl fmt::Display for IndexCapability {
 /// A query names an operator the index cannot serve on that field.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum QueryCapabilityError {
+    /// The query arena could not reserve its bounded node storage.
+    #[error("query arena could not reserve {requested} entries")]
+    ArenaAllocation {
+        /// Requested arena entry count.
+        requested: usize,
+    },
     /// A position-dependent operator named a field indexed without positions.
     #[error(
         "operator {operator} requires {capability} on field {field} of schema {schema}, \
@@ -700,52 +1074,60 @@ pub fn validate_index_capabilities(
     query: &Query,
     schema: SchemaDescriptor,
 ) -> Result<(), QueryCapabilityError> {
-    match query {
-        // Position-independent: nothing to check.
-        Query::Empty
-        | Query::All
-        | Query::Term { .. }
-        | Query::Range { .. }
-        | Query::Set { .. }
-        | Query::Glob { .. } => Ok(()),
-        Query::Phrase { fields, terms, .. } => {
-            if terms.len() < 2 {
-                return Ok(());
+    let mut pending = Vec::new();
+    if pending.try_reserve_exact(query.node_count()).is_err() {
+        return Err(QueryCapabilityError::ArenaAllocation {
+            requested: query.node_count(),
+        });
+    }
+    pending.push(query.root_id());
+    while let Some(node_id) = pending.pop() {
+        match query.node(node_id) {
+            QueryNode::AllocationFailure { requested } => {
+                return Err(QueryCapabilityError::ArenaAllocation {
+                    requested: *requested,
+                });
             }
-            for field in fields {
-                let descriptor = schema
-                    .fields
-                    .iter()
-                    .find(|candidate| candidate.id == field.field_id);
-                let positioned = matches!(
-                    descriptor.map(|descriptor| descriptor.kind),
-                    Some(FieldKind::Text {
-                        positions: true,
-                        ..
-                    })
-                );
-                if !positioned {
-                    return Err(QueryCapabilityError::PositionsRequired {
-                        schema: schema.name,
-                        field: descriptor.map_or_else(
-                            || format!("#{}", field.field_id),
-                            |descriptor| descriptor.name.to_owned(),
-                        ),
-                        operator: QueryExplanation::Phrase,
-                        capability: IndexCapability::Positions,
-                    });
+            QueryNode::Phrase { fields, terms, .. } if terms.len() >= 2 => {
+                for field in fields {
+                    let descriptor = schema
+                        .fields
+                        .iter()
+                        .find(|candidate| candidate.id == field.field_id);
+                    let positioned = matches!(
+                        descriptor.map(|descriptor| descriptor.kind),
+                        Some(FieldKind::Text {
+                            positions: true,
+                            ..
+                        })
+                    );
+                    if !positioned {
+                        return Err(QueryCapabilityError::PositionsRequired {
+                            schema: schema.name,
+                            field: descriptor.map_or_else(
+                                || format!("#{}", field.field_id),
+                                |descriptor| descriptor.name.to_owned(),
+                            ),
+                            operator: QueryExplanation::Phrase,
+                            capability: IndexCapability::Positions,
+                        });
+                    }
                 }
             }
-            Ok(())
-        }
-        Query::Boolean { clauses, .. } => {
-            for clause in clauses {
-                validate_index_capabilities(&clause.query, schema)?;
+            QueryNode::Boolean { clauses, .. } => {
+                pending.extend(clauses.iter().rev().map(|clause| clause.query));
             }
-            Ok(())
+            QueryNode::Boost { query: child, .. } => pending.push(*child),
+            QueryNode::Empty
+            | QueryNode::All
+            | QueryNode::Term { .. }
+            | QueryNode::Phrase { .. }
+            | QueryNode::Range { .. }
+            | QueryNode::Set { .. }
+            | QueryNode::Glob { .. } => {}
         }
-        Query::Boost { query, .. } => validate_index_capabilities(query, schema),
     }
+    Ok(())
 }
 
 /// Shipping lenient parser for the default `[content, title^2]` expansion.
@@ -815,19 +1197,48 @@ impl DefaultQueryParser {
             diagnostics,
             lowered_atoms: Vec::new(),
             field_scopes: Vec::new(),
+            allocation_failure: None,
         };
+        grammar.lower_primary_tokens();
+        grammar.collapse_groups();
         grammar.recover_leading_binary_operators();
-        let mut parsed = grammar.parse_expression(0);
+        let mut parsed = grammar.parse_expression();
         grammar.recover_trailing_tokens();
-        if let Some(node) = parsed.as_mut() {
-            rewrite_parser_syntax(node);
-            trim_parser_dropped(&mut node.query, &node.dedup_key);
-            flatten_should_of_should(&mut node.query);
+        if let Some(requested) = parsed
+            .as_ref()
+            .and_then(|node| node.dedup_key.allocation_failure())
+        {
+            grammar.allocation_failure("query syntax arena", requested);
         }
-        repair_root_all_negative(&mut parsed, &mut grammar);
+        if grammar.allocation_failure.is_none() {
+            if let Some(node) = parsed.as_mut() {
+                rewrite_parser_syntax(node);
+                trim_parser_dropped(&mut node.query, &node.dedup_key);
+                flatten_should_of_should(&mut node.query);
+            }
+            repair_root_all_negative(&mut parsed, &mut grammar);
+        }
 
+        let query = grammar.allocation_failure.map_or_else(
+            || parsed.map_or_else(Query::empty, |node| node.query),
+            Query::arena_allocation_failure,
+        );
+        if let Some(requested) = query.allocation_failure() {
+            if !grammar
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::AllocationFailure)
+            {
+                grammar.push_diagnostic(QueryDiagnostic {
+                    kind: QueryDiagnosticKind::AllocationFailure,
+                    message: format!("query arena could not reserve {requested} entries"),
+                    byte_offset: None,
+                    fragment: None,
+                });
+            }
+        }
         ParsedQuery {
-            query: parsed.map_or(Query::Empty, |node| node.query),
+            query,
             explanation,
             diagnostics: grammar.diagnostics,
             was_truncated,
@@ -959,8 +1370,19 @@ struct SetToken {
     byte_offset: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyntaxNodeId(usize);
+
+impl SyntaxNodeId {
+    const ROOT: Self = Self(usize::MAX);
+
+    const fn index(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SyntaxKey {
+enum SyntaxNode {
     Atom {
         field: Option<String>,
         raw: String,
@@ -983,16 +1405,174 @@ enum SyntaxKey {
         field: Option<String>,
         pattern: String,
     },
-    LoweredAway(Box<Self>),
-    Boolean(Vec<(Option<Occur>, Self)>),
+    LoweredAway(SyntaxNodeId),
+    Boolean(Vec<(Option<Occur>, SyntaxNodeId)>),
     Boost {
-        query: Box<Self>,
+        query: SyntaxNodeId,
         factor_bits: u64,
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntaxKey {
+    nodes: Vec<SyntaxNode>,
+    root: SyntaxNode,
+    allocation_failure: Option<usize>,
+}
+
+impl SyntaxKey {
+    fn leaf(root: SyntaxNode) -> Self {
+        Self {
+            nodes: Vec::new(),
+            root,
+            allocation_failure: None,
+        }
+    }
+
+    fn empty_boolean() -> Self {
+        Self::leaf(SyntaxNode::Boolean(Vec::new()))
+    }
+
+    const fn root_id() -> SyntaxNodeId {
+        SyntaxNodeId::ROOT
+    }
+
+    fn node(&self, id: SyntaxNodeId) -> &SyntaxNode {
+        if id == SyntaxNodeId::ROOT {
+            &self.root
+        } else {
+            &self.nodes[id.index()]
+        }
+    }
+
+    fn node_mut(&mut self, id: SyntaxNodeId) -> &mut SyntaxNode {
+        if id == SyntaxNodeId::ROOT {
+            &mut self.root
+        } else {
+            &mut self.nodes[id.index()]
+        }
+    }
+
+    fn push(&mut self, node: SyntaxNode) -> SyntaxNodeId {
+        debug_assert!(self.nodes.len() < self.nodes.capacity());
+        let id = SyntaxNodeId(self.nodes.len());
+        self.nodes.push(node);
+        id
+    }
+
+    const fn allocation_failure(&self) -> Option<usize> {
+        self.allocation_failure
+    }
+
+    fn append(&mut self, other: Self) -> SyntaxNodeId {
+        let base = self.nodes.len();
+        let child_root = base.saturating_add(other.nodes.len());
+        let remap = |id: SyntaxNodeId| {
+            if id == SyntaxNodeId::ROOT {
+                SyntaxNodeId(child_root)
+            } else {
+                SyntaxNodeId(base.saturating_add(id.index()))
+            }
+        };
+        for node in other.nodes {
+            self.push(remap_syntax_node(node, remap));
+        }
+        self.push(remap_syntax_node(other.root, remap))
+    }
+
+    fn boolean(keys: Vec<(Option<Occur>, Self)>) -> Self {
+        let mut syntax = Self::empty_boolean();
+        if let Some(requested) = keys.iter().find_map(|(_, key)| key.allocation_failure()) {
+            syntax.allocation_failure = Some(requested);
+            return syntax;
+        }
+        let descendants = keys.iter().fold(0_usize, |count, (_, key)| {
+            count.saturating_add(key.nodes.len().saturating_add(1))
+        });
+        if syntax.nodes.try_reserve_exact(descendants).is_err() {
+            syntax.allocation_failure = Some(descendants);
+            return syntax;
+        }
+        let mut children = Vec::new();
+        if children.try_reserve_exact(keys.len()).is_err() {
+            syntax.allocation_failure = Some(keys.len());
+            return syntax;
+        }
+        for (occur, key) in keys {
+            let child = syntax.append(key);
+            children.push((occur, child));
+        }
+        syntax.root = SyntaxNode::Boolean(children);
+        syntax
+    }
+
+    fn boost(query: Self, factor_bits: u64) -> Self {
+        if query.allocation_failure().is_some() {
+            return query;
+        }
+        let mut syntax = Self::empty_boolean();
+        if syntax
+            .nodes
+            .try_reserve_exact(query.nodes.len().saturating_add(1))
+            .is_err()
+        {
+            syntax.allocation_failure = Some(query.nodes.len().saturating_add(1));
+            return syntax;
+        }
+        let child = syntax.append(query);
+        syntax.root = SyntaxNode::Boost {
+            query: child,
+            factor_bits,
+        };
+        syntax
+    }
+
+    fn mark_lowered_away(&mut self) {
+        let mut current = Self::root_id();
+        while let SyntaxNode::Boost { query, .. } = self.node(current) {
+            current = *query;
+        }
+        if self.nodes.try_reserve_exact(1).is_err() {
+            self.allocation_failure = Some(1);
+            return;
+        }
+        if current == SyntaxNodeId::ROOT {
+            let child = std::mem::replace(&mut self.root, SyntaxNode::Boolean(Vec::new()));
+            let child = self.push(child);
+            self.root = SyntaxNode::LoweredAway(child);
+        } else {
+            let child = std::mem::replace(
+                &mut self.nodes[current.index()],
+                SyntaxNode::Boolean(Vec::new()),
+            );
+            let child = self.push(child);
+            self.nodes[current.index()] = SyntaxNode::LoweredAway(child);
+        }
+    }
+}
+
+fn remap_syntax_node(
+    node: SyntaxNode,
+    remap: impl Fn(SyntaxNodeId) -> SyntaxNodeId + Copy,
+) -> SyntaxNode {
+    match node {
+        SyntaxNode::LoweredAway(query) => SyntaxNode::LoweredAway(remap(query)),
+        SyntaxNode::Boolean(mut keys) => {
+            for (_, child) in &mut keys {
+                *child = remap(*child);
+            }
+            SyntaxNode::Boolean(keys)
+        }
+        SyntaxNode::Boost { query, factor_bits } => SyntaxNode::Boost {
+            query: remap(query),
+            factor_bits,
+        },
+        leaf => leaf,
+    }
+}
+
 fn take_syntax_key(slot: &mut SyntaxKey) -> SyntaxKey {
-    std::mem::replace(slot, SyntaxKey::Boolean(Vec::new()))
+    std::mem::replace(slot, SyntaxKey::empty_boolean())
 }
 
 fn boost_syntax_key(query: SyntaxKey, raw: Option<&str>) -> SyntaxKey {
@@ -1008,78 +1588,90 @@ fn boost_syntax_key(query: SyntaxKey, raw: Option<&str>) -> SyntaxKey {
     if (factor - 1.0).abs() <= f64::EPSILON {
         query
     } else {
-        SyntaxKey::Boost {
-            query: Box::new(query),
-            factor_bits: factor.to_bits(),
-        }
+        SyntaxKey::boost(query, factor.to_bits())
     }
 }
 
 #[allow(clippy::cast_possible_truncation)]
 fn empty_query_for_syntax(syntax: &SyntaxKey) -> Query {
-    if let SyntaxKey::LoweredAway(inner) = syntax {
-        return empty_query_for_syntax(inner);
+    if let Some(requested) = syntax.allocation_failure() {
+        return Query::arena_allocation_failure(requested);
     }
-    let SyntaxKey::Boost { query, factor_bits } = syntax else {
-        return Query::Empty;
-    };
-    let inner = empty_query_for_syntax(query);
-    // Tantivy parses boost syntax as f64, then lowers it to the f32 scoring
-    // domain. Preserve that intentional narrowing, including overflow to
-    // infinity, for differential parity.
-    let factor = f64::from_bits(*factor_bits) as f32;
-    if factor.to_bits() == 1.0_f32.to_bits() {
-        inner
-    } else {
-        Query::Boost {
-            query: Box::new(inner),
-            factor,
+    let mut factors = Vec::new();
+    if factors
+        .try_reserve_exact(syntax.nodes.len().saturating_add(1))
+        .is_err()
+    {
+        return Query::arena_allocation_failure(syntax.nodes.len().saturating_add(1));
+    }
+    let mut current = SyntaxKey::root_id();
+    loop {
+        match syntax.node(current) {
+            SyntaxNode::LoweredAway(child) => current = *child,
+            SyntaxNode::Boost { query, factor_bits } => {
+                factors.push(*factor_bits);
+                current = *query;
+            }
+            SyntaxNode::Atom { .. }
+            | SyntaxNode::Range { .. }
+            | SyntaxNode::Set { .. }
+            | SyntaxNode::Regex { .. }
+            | SyntaxNode::Boolean(_) => break,
         }
     }
+    let mut query = Query::empty();
+    for factor_bits in factors.into_iter().rev() {
+        // Tantivy parses boost syntax as f64, then lowers it to the f32 scoring
+        // domain. Preserve that intentional narrowing, including overflow to
+        // infinity, for differential parity.
+        let factor = f64::from_bits(factor_bits) as f32;
+        // Bit-exact, not approximate: `1.0_f32` has exactly one encoding, so
+        // this is the same predicate as `factor != 1.0` for every input,
+        // including NaN and the signed zeroes, without inviting an epsilon.
+        if factor.to_bits() != 1.0_f32.to_bits() {
+            query = Query::boost(query, factor);
+        }
+    }
+    query
 }
 
-fn mark_syntax_lowered_away(syntax: SyntaxKey) -> SyntaxKey {
-    match syntax {
-        SyntaxKey::Boost { query, factor_bits } => SyntaxKey::Boost {
-            query: Box::new(mark_syntax_lowered_away(*query)),
-            factor_bits,
-        },
-        syntax => SyntaxKey::LoweredAway(Box::new(syntax)),
-    }
+fn mark_syntax_lowered_away(mut syntax: SyntaxKey) -> SyntaxKey {
+    syntax.mark_lowered_away();
+    syntax
 }
 
 fn range_dedup_key(token: &RangeToken) -> SyntaxKey {
     boost_syntax_key(
-        SyntaxKey::Range {
+        SyntaxKey::leaf(SyntaxNode::Range {
             field: token.field.clone(),
             lower: token.lower.clone(),
             upper: token.upper.clone(),
             lower_inclusive: token.lower != "*" && token.lower_inclusive,
             upper_inclusive: token.upper != "*" && token.upper_inclusive,
-        },
+        }),
         token.boost.as_deref(),
     )
 }
 
 fn set_dedup_key(token: &SetToken) -> SyntaxKey {
     boost_syntax_key(
-        SyntaxKey::Set {
+        SyntaxKey::leaf(SyntaxNode::Set {
             field: token.field.clone(),
             values: token.values.clone(),
-        },
+        }),
         token.boost.as_deref(),
     )
 }
 
 fn atom_dedup_key(atom: &AtomToken) -> SyntaxKey {
     boost_syntax_key(
-        SyntaxKey::Atom {
+        SyntaxKey::leaf(SyntaxNode::Atom {
             field: atom.field.clone(),
             raw: atom.raw.clone(),
             delimiter: atom.delimiter,
             slop: atom.slop,
             prefix: atom.prefix,
-        },
+        }),
         atom.boost.as_deref(),
     )
 }
@@ -1113,7 +1705,7 @@ fn parse_boost_factor(raw: &str) -> Option<f32> {
         .filter(|factor| factor.is_finite() && *factor >= 0.0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum LexToken {
     Atom(AtomToken),
     Range(RangeToken),
@@ -1130,6 +1722,10 @@ enum LexToken {
     Not(usize),
     Plus(usize),
     Minus(usize),
+    Lowered {
+        node: ParsedNode,
+        byte_offset: usize,
+    },
     LeftParen {
         byte_offset: usize,
         field: Option<String>,
@@ -1141,7 +1737,7 @@ enum LexToken {
 }
 
 /// Normalize depth-inert wrappers around the whole token stream before
-/// recursive descent.
+/// precedence parsing.
 ///
 /// Balanced unfielded, unboosted wrappers are removed. A pure chain of
 /// identical unboosted field scopes keeps one innermost wrapper so it still
@@ -1296,6 +1892,7 @@ impl LexToken {
             | Self::Not(offset)
             | Self::Plus(offset)
             | Self::Minus(offset) => *offset,
+            Self::Lowered { byte_offset, .. } => *byte_offset,
             Self::LeftParen { byte_offset, .. } | Self::RightParen { byte_offset, .. } => {
                 *byte_offset
             }
@@ -1313,6 +1910,7 @@ impl LexToken {
                 | Self::Not(_)
                 | Self::Plus(_)
                 | Self::Minus(_)
+                | Self::Lowered { .. }
                 | Self::LeftParen { .. }
         )
     }
@@ -2294,7 +2892,7 @@ fn trim_typed_literal(raw: &str) -> &str {
     raw
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 struct ParsedNode {
     query: Query,
     occur: Option<Occur>,
@@ -2309,9 +2907,201 @@ struct Grammar {
     diagnostics: Vec<QueryDiagnostic>,
     lowered_atoms: Vec<(String, Option<Query>)>,
     field_scopes: Vec<String>,
+    allocation_failure: Option<usize>,
 }
 
 impl Grammar {
+    fn allocation_node(&mut self, resource: &'static str, count: usize) -> ParsedNode {
+        self.allocation_failure(resource, count);
+        ParsedNode {
+            query: Query::arena_allocation_failure(count),
+            occur: None,
+            from_not: false,
+            dedup_key: SyntaxKey::empty_boolean(),
+        }
+    }
+
+    fn allocation_failure(&mut self, resource: &'static str, count: usize) {
+        if self.allocation_failure.is_none() {
+            self.allocation_failure = Some(count);
+        }
+        self.drop_with_diagnostic(
+            QueryDiagnosticKind::AllocationFailure,
+            &format!("could not reserve {count} entries for {resource}"),
+            self.peek().map_or(0, LexToken::byte_offset),
+            None,
+        );
+    }
+
+    fn lower_primary_tokens(&mut self) {
+        let token_count = self.tokens.len();
+        let group_count = self
+            .tokens
+            .iter()
+            .filter(|token| matches!(token, LexToken::LeftParen { .. }))
+            .count();
+        let mut scoped_groups = Vec::new();
+        if scoped_groups.try_reserve_exact(group_count).is_err()
+            || self.field_scopes.try_reserve_exact(group_count).is_err()
+            || self.lowered_atoms.try_reserve_exact(token_count).is_err()
+        {
+            self.allocation_failure("query parser scratch", token_count.max(group_count));
+            self.tokens.clear();
+            return;
+        }
+
+        self.cursor = 0;
+        while let Some(token) = self.peek().cloned() {
+            match token {
+                LexToken::LeftParen { field, .. } => {
+                    let scoped = field.is_some();
+                    if let Some(field) = field {
+                        self.field_scopes.push(field);
+                    }
+                    scoped_groups.push(scoped);
+                    self.cursor += 1;
+                }
+                LexToken::RightParen { .. } => {
+                    if scoped_groups.pop() == Some(true) {
+                        let _ = self.field_scopes.pop();
+                    }
+                    self.cursor += 1;
+                }
+                LexToken::Atom(_)
+                | LexToken::Range(_)
+                | LexToken::Set(_)
+                | LexToken::UnsupportedRegex { .. }
+                | LexToken::Dropped(_) => {
+                    let token_index = self.cursor;
+                    let byte_offset = token.byte_offset();
+                    let lowered = self.parse_primary();
+                    self.tokens[token_index] =
+                        lowered.map_or(LexToken::Dropped(byte_offset), |node| LexToken::Lowered {
+                            node,
+                            byte_offset,
+                        });
+                }
+                LexToken::And(_)
+                | LexToken::Or(_)
+                | LexToken::Not(_)
+                | LexToken::Plus(_)
+                | LexToken::Minus(_)
+                | LexToken::Lowered { .. } => self.cursor += 1,
+            }
+        }
+        self.cursor = 0;
+        self.field_scopes.clear();
+    }
+
+    fn push_group_token(&mut self, tokens: &mut Vec<LexToken>, token: LexToken) -> bool {
+        if tokens.len() == tokens.capacity() && tokens.try_reserve(1).is_err() {
+            self.allocation_failure("query group tokens", tokens.len().saturating_add(1));
+            return false;
+        }
+        tokens.push(token);
+        true
+    }
+
+    fn parse_flat_tokens(&mut self, tokens: Vec<LexToken>) -> Option<ParsedNode> {
+        let saved_tokens = std::mem::replace(&mut self.tokens, tokens);
+        let saved_cursor = std::mem::replace(&mut self.cursor, 0);
+        self.recover_leading_binary_operators();
+        let parsed = self.parse_expression();
+        self.recover_trailing_tokens();
+        self.tokens = saved_tokens;
+        self.cursor = saved_cursor;
+        parsed
+    }
+
+    fn collapsed_group_token(
+        &mut self,
+        tokens: Vec<LexToken>,
+        byte_offset: usize,
+        boost: Option<&str>,
+        close_offset: usize,
+    ) -> LexToken {
+        let Some(mut node) = self.parse_flat_tokens(tokens) else {
+            return LexToken::Dropped(byte_offset);
+        };
+        node.query = self.apply_raw_boost(node.query, boost, close_offset, None);
+        node.dedup_key = boost_syntax_key(node.dedup_key, boost);
+        LexToken::Lowered { node, byte_offset }
+    }
+
+    fn collapse_groups(&mut self) {
+        struct GroupFrame {
+            tokens: Vec<LexToken>,
+            byte_offset: usize,
+        }
+
+        let input = std::mem::take(&mut self.tokens);
+        let group_count = input
+            .iter()
+            .filter(|token| matches!(token, LexToken::LeftParen { .. }))
+            .count();
+        let mut frames = Vec::new();
+        if frames.try_reserve_exact(group_count).is_err() {
+            self.allocation_failure("query group frames", group_count);
+            return;
+        }
+        let mut current = Vec::new();
+        for token in input {
+            match token {
+                LexToken::LeftParen { byte_offset, .. } => {
+                    frames.push(GroupFrame {
+                        tokens: current,
+                        byte_offset,
+                    });
+                    current = Vec::new();
+                }
+                LexToken::RightParen { byte_offset, boost } => {
+                    let Some(frame) = frames.pop() else {
+                        if !self.push_group_token(
+                            &mut current,
+                            LexToken::RightParen { byte_offset, boost },
+                        ) {
+                            self.tokens.clear();
+                            return;
+                        }
+                        continue;
+                    };
+                    let token = self.collapsed_group_token(
+                        current,
+                        frame.byte_offset,
+                        boost.as_deref(),
+                        byte_offset,
+                    );
+                    current = frame.tokens;
+                    if !self.push_group_token(&mut current, token) {
+                        self.tokens.clear();
+                        return;
+                    }
+                }
+                token => {
+                    if !self.push_group_token(&mut current, token) {
+                        self.tokens.clear();
+                        return;
+                    }
+                }
+            }
+        }
+        while let Some(frame) = frames.pop() {
+            self.syntax_diagnostic_at(
+                "syntax recovery: missing closing parenthesis",
+                frame.byte_offset,
+            );
+            let token =
+                self.collapsed_group_token(current, frame.byte_offset, None, frame.byte_offset);
+            current = frame.tokens;
+            if !self.push_group_token(&mut current, token) {
+                self.tokens.clear();
+                return;
+            }
+        }
+        self.tokens = current;
+        self.cursor = 0;
+    }
+
     fn recover_leading_binary_operators(&mut self) {
         while matches!(self.peek(), Some(LexToken::And(_) | LexToken::Or(_))) {
             let offset = self.peek().map_or(0, LexToken::byte_offset);
@@ -2336,24 +3126,30 @@ impl Grammar {
         true
     }
 
-    fn parse_expression(&mut self, depth: usize) -> Option<ParsedNode> {
-        self.parse_or(depth)
+    fn parse_expression(&mut self) -> Option<ParsedNode> {
+        self.parse_or()
     }
 
-    fn parse_or(&mut self, depth: usize) -> Option<ParsedNode> {
+    fn parse_or(&mut self) -> Option<ParsedNode> {
         let mut top_nodes = Vec::new();
         let mut top_operands = 0_usize;
         let mut run_nodes = Vec::new();
         let mut run_operands = 0_usize;
         let mut run_explicit = false;
         let mut joined_from_explicit_or = false;
+        let node_bound = self.tokens.len();
+        if top_nodes.try_reserve_exact(node_bound).is_err()
+            || run_nodes.try_reserve_exact(node_bound).is_err()
+        {
+            return Some(self.allocation_node("Boolean parser nodes", node_bound));
+        }
 
         loop {
             if !self.peek().is_some_and(LexToken::can_start_operand) {
                 break;
             }
             run_operands += 1;
-            let mut node = self.parse_and(depth);
+            let mut node = self.parse_and();
             let joined_to_explicit_or = matches!(self.peek(), Some(LexToken::Or(_)));
             if let Some(node) = node.as_mut()
                 && node.occur == Some(Occur::MustNot)
@@ -2386,6 +3182,9 @@ impl Grammar {
                     &mut run_operands,
                     &mut run_explicit,
                 );
+                if run_nodes.try_reserve_exact(node_bound).is_err() {
+                    return Some(self.allocation_node("Boolean parser run", node_bound));
+                }
             }
         }
 
@@ -2441,8 +3240,12 @@ impl Grammar {
         }
     }
 
-    fn parse_and(&mut self, depth: usize) -> Option<ParsedNode> {
+    fn parse_and(&mut self) -> Option<ParsedNode> {
         let mut nodes = Vec::new();
+        let node_bound = self.tokens.len();
+        if nodes.try_reserve_exact(node_bound).is_err() {
+            return Some(self.allocation_node("conjunction parser nodes", node_bound));
+        }
         let mut syntactic_operands = 1;
         // bd-quill-shipping-conformance-parse-split-w7bsu: a `NOT` operand of
         // an explicit `AND` keeps the `MustNot` occurrence `parse_unary` gave
@@ -2451,7 +3254,7 @@ impl Grammar {
         // re-wrapped it as a POSITIVE clause holding only a `MustNot` — a
         // clause with no positive term, which matches nothing and emptied the
         // whole conjunction. See the repair note on `parse_and` below.
-        if let Some(node) = self.parse_unary(depth) {
+        if let Some(node) = self.parse_unary() {
             nodes.push(node);
         }
         let mut explicit_and = false;
@@ -2466,7 +3269,7 @@ impl Grammar {
             }
             explicit_and = true;
             syntactic_operands += 1;
-            if let Some(node) = self.parse_unary(depth) {
+            if let Some(node) = self.parse_unary() {
                 nodes.push(node);
             }
         }
@@ -2477,7 +3280,7 @@ impl Grammar {
         }
     }
 
-    fn parse_unary(&mut self, depth: usize) -> Option<ParsedNode> {
+    fn parse_unary(&mut self) -> Option<ParsedNode> {
         let mut occur = None;
         let mut unary_offset = None;
         let mut not_count = 0_usize;
@@ -2502,7 +3305,7 @@ impl Grammar {
             }
         }
 
-        let Some(mut node) = self.parse_primary(depth) else {
+        let Some(mut node) = self.parse_primary() else {
             if let Some(offset) = unary_offset {
                 self.drop_with_diagnostic(
                     QueryDiagnosticKind::DroppedFragment,
@@ -2515,10 +3318,10 @@ impl Grammar {
         };
         for _ in 1..not_count {
             let dedup_key = take_syntax_key(&mut node.dedup_key);
-            node.query = Query::Boolean {
-                clauses: vec![BooleanClause::new(Occur::MustNot, node.query)],
-                operator: None,
-            };
+            node.query = Query::boolean(
+                Vec::from([BooleanClause::new(Occur::MustNot, node.query)]),
+                None,
+            );
             node.dedup_key = negative_boolean_dedup_key(dedup_key);
         }
         if not_count != 0 {
@@ -2538,10 +3341,14 @@ impl Grammar {
         Some(node)
     }
 
-    fn parse_primary(&mut self, depth: usize) -> Option<ParsedNode> {
+    fn parse_primary(&mut self) -> Option<ParsedNode> {
         let token = self.tokens.get(self.cursor)?.clone();
         let token_offset = token.byte_offset();
         match token {
+            LexToken::Lowered { node, .. } => {
+                self.cursor += 1;
+                Some(node)
+            }
             LexToken::Atom(mut atom) => {
                 self.cursor += 1;
                 if atom.field.is_none() {
@@ -2630,7 +3437,7 @@ impl Grammar {
                     field = self.field_scopes.last().cloned();
                 }
                 let dedup_key = mark_syntax_lowered_away(boost_syntax_key(
-                    SyntaxKey::Regex { field, pattern },
+                    SyntaxKey::leaf(SyntaxNode::Regex { field, pattern }),
                     boost.as_deref(),
                 ));
                 Some(ParsedNode {
@@ -2644,49 +3451,13 @@ impl Grammar {
                 self.cursor += 1;
                 None
             }
-            LexToken::LeftParen { byte_offset, field } => {
+            LexToken::LeftParen { byte_offset, .. } => {
                 self.cursor += 1;
-                if depth >= MAX_QUERY_DEPTH {
-                    self.skip_group();
-                    self.drop_with_diagnostic(
-                        QueryDiagnosticKind::DepthLimit,
-                        "query group nesting limit reached; fragment dropped",
-                        byte_offset,
-                        None,
-                    );
-                    return None;
-                }
-                let scoped = field.is_some();
-                if let Some(field_name) = field {
-                    self.field_scopes.push(field_name);
-                }
-                self.recover_leading_binary_operators();
-                let parsed = self.parse_expression(depth + 1);
-                if scoped {
-                    let _ = self.field_scopes.pop();
-                }
-                let group_boost = if let Some(LexToken::RightParen {
-                    byte_offset: close_offset,
-                    boost,
-                }) = self.peek().cloned()
-                {
-                    self.cursor += 1;
-                    Some((boost, close_offset))
-                } else {
-                    self.syntax_diagnostic_at(
-                        "syntax recovery: missing closing parenthesis",
-                        byte_offset,
-                    );
-                    None
-                };
-                parsed.map(|mut node| {
-                    if let Some((boost, close_offset)) = group_boost {
-                        node.query =
-                            self.apply_raw_boost(node.query, boost.as_deref(), close_offset, None);
-                        node.dedup_key = boost_syntax_key(node.dedup_key, boost.as_deref());
-                    }
-                    node
-                })
+                self.syntax_diagnostic_at(
+                    "syntax recovery: unresolved opening parenthesis dropped",
+                    byte_offset,
+                );
+                None
             }
             LexToken::RightParen { .. } | LexToken::And(_) | LexToken::Or(_) => None,
             LexToken::Not(_) | LexToken::Plus(_) | LexToken::Minus(_) => {
@@ -2702,7 +3473,7 @@ impl Grammar {
     fn lower_atom(&mut self, atom: &AtomToken) -> Option<Query> {
         if !atom.delimiter.is_quoted() && atom.raw == "*" {
             let Some(field_name) = atom.field.as_deref() else {
-                return Some(self.apply_boost(Query::All, atom));
+                return Some(self.apply_boost(Query::all(), atom));
             };
             let Some(descriptor) = self
                 .parser
@@ -2725,11 +3496,7 @@ impl Grammar {
                 FieldKind::I64 { fast: true, .. } | FieldKind::U64 { fast: true, .. }
             ) {
                 return Some(self.apply_boost(
-                    Query::Range {
-                        field_id: descriptor.id,
-                        lower: Bound::Unbounded,
-                        upper: Bound::Unbounded,
-                    },
+                    Query::range(descriptor.id, Bound::Unbounded, Bound::Unbounded),
                     atom,
                 ));
             }
@@ -2745,7 +3512,17 @@ impl Grammar {
             return None;
         }
 
-        let fields = if let Some(field_name) = atom.field.as_deref() {
+        let mut fields = Vec::new();
+        let requested_fields = if atom.field.is_some() {
+            1
+        } else {
+            self.parser.default_fields.len()
+        };
+        if fields.try_reserve_exact(requested_fields).is_err() {
+            self.allocation_failure("query atom fields", requested_fields);
+            return Some(Query::arena_allocation_failure(requested_fields));
+        }
+        if let Some(field_name) = atom.field.as_deref() {
             let Some(descriptor) = self
                 .parser
                 .schema
@@ -2762,19 +3539,23 @@ impl Grammar {
                 );
                 return None;
             };
-            vec![QueryField::new(
+            fields.push(QueryField::new(
                 descriptor.id,
                 if descriptor.name == TITLE_FIELD_NAME {
                     TITLE_BOOST
                 } else {
                     1.0
                 },
-            )]
+            ));
         } else {
-            self.parser.default_fields.to_vec()
-        };
+            fields.extend_from_slice(&self.parser.default_fields);
+        }
 
-        let mut field_queries = Vec::with_capacity(fields.len());
+        let mut field_queries = Vec::new();
+        if field_queries.try_reserve_exact(fields.len()).is_err() {
+            self.allocation_failure("lowered field queries", fields.len());
+            return Some(Query::arena_allocation_failure(fields.len()));
+        }
         for field in fields {
             let Some(descriptor) = self.field_by_id(field.field_id) else {
                 continue;
@@ -2813,17 +3594,17 @@ impl Grammar {
             });
             return None;
         }
-        let query = Query::Range {
-            field_id: descriptor.id,
-            lower,
-            upper,
-        };
+        let query = Query::range(descriptor.id, lower, upper);
         Some(self.apply_raw_boost(query, token.boost.as_deref(), token.byte_offset, None))
     }
 
     fn lower_set(&mut self, token: &SetToken) -> Option<Query> {
         let descriptor = self.resolve_typed_field(token.field.as_deref(), token.byte_offset)?;
-        let mut values = Vec::with_capacity(token.values.len());
+        let mut values = Vec::new();
+        if values.try_reserve_exact(token.values.len()).is_err() {
+            self.allocation_failure("typed set values", token.values.len());
+            return Some(Query::arena_allocation_failure(token.values.len()));
+        }
         for raw in &token.values {
             match Self::lower_typed_value(descriptor, raw) {
                 Some(value) if !values.contains(&value) => values.push(value),
@@ -2839,10 +3620,7 @@ impl Grammar {
                 }),
             }
         }
-        let query = Query::Set {
-            field_id: descriptor.id,
-            values,
-        };
+        let query = Query::set(descriptor.id, values);
         Some(self.apply_raw_boost(query, token.boost.as_deref(), token.byte_offset, None))
     }
 
@@ -3014,7 +3792,7 @@ impl Grammar {
                         byte_offset: Some(atom.byte_offset),
                         fragment: None,
                     });
-                    return Some(Query::Empty);
+                    return Some(Query::empty());
                 }
                 match terms.len() {
                     0 => None,
@@ -3028,16 +3806,15 @@ impl Grammar {
                         });
                         None
                     }
-                    1 => terms.pop().map(|term| Query::Term {
-                        fields: vec![field],
-                        text: term.text,
-                    }),
-                    _ => Some(Query::Phrase {
-                        fields: vec![field],
+                    1 => terms
+                        .pop()
+                        .map(|term| Query::term(Vec::from([field]), term.text)),
+                    _ => Some(Query::phrase(
+                        Vec::from([field]),
                         terms,
-                        slop: atom.slop,
-                        prefix: atom.prefix,
-                    }),
+                        atom.slop,
+                        atom.prefix,
+                    )),
                 }
             }
             FieldKind::Keyword if atom.prefix => {
@@ -3051,10 +3828,9 @@ impl Grammar {
                 });
                 None
             }
-            FieldKind::Keyword => (!atom.raw.is_empty()).then(|| Query::Term {
-                fields: vec![field],
-                text: atom.raw.clone(),
-            }),
+            FieldKind::Keyword => {
+                (!atom.raw.is_empty()).then(|| Query::term(Vec::from([field]), atom.raw.clone()))
+            }
             FieldKind::Text { .. } => {
                 self.drop_with_diagnostic(
                     QueryDiagnosticKind::UnsupportedField,
@@ -3106,11 +3882,10 @@ impl Grammar {
             return query;
         };
         match parse_boost_factor(raw_boost) {
+            // Bit-exact for the same reason as the boost-chain lowering above:
+            // an identity boost is dropped, and every other factor is kept.
             Some(factor) if factor.to_bits() == 1.0_f32.to_bits() => query,
-            Some(factor) => Query::Boost {
-                query: Box::new(query),
-                factor,
-            },
+            Some(factor) => Query::boost(query, factor),
             _ => {
                 self.push_diagnostic(QueryDiagnostic {
                     kind: QueryDiagnosticKind::InvalidBoost,
@@ -3119,23 +3894,6 @@ impl Grammar {
                     fragment,
                 });
                 query
-            }
-        }
-    }
-
-    fn skip_group(&mut self) {
-        let mut depth = 1_usize;
-        while let Some(token) = self.tokens.get(self.cursor) {
-            self.cursor += 1;
-            match token {
-                LexToken::LeftParen { .. } => depth += 1,
-                LexToken::RightParen { .. } => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -3188,11 +3946,8 @@ impl Grammar {
 
 fn wrap_direct_negative_or_operand(node: &mut ParsedNode) {
     let dedup_key = take_syntax_key(&mut node.dedup_key);
-    let query = std::mem::replace(&mut node.query, Query::Empty);
-    node.query = Query::Boolean {
-        clauses: vec![BooleanClause::new(Occur::MustNot, query)],
-        operator: None,
-    };
+    let query = std::mem::replace(&mut node.query, Query::empty());
+    node.query = Query::boolean(Vec::from([BooleanClause::new(Occur::MustNot, query)]), None);
     node.occur = None;
     node.from_not = false;
     node.dedup_key = negative_boolean_dedup_key(dedup_key);
@@ -3212,7 +3967,7 @@ fn wrap_direct_negative_or_operand(node: &mut ParsedNode) {
 // cannot become a positive alternative.
 
 fn negative_boolean_dedup_key(child: SyntaxKey) -> SyntaxKey {
-    SyntaxKey::Boolean(vec![(Some(Occur::MustNot), child)])
+    SyntaxKey::boolean(Vec::from([(Some(Occur::MustNot), child)]))
 }
 
 /// Mirror the pinned grammar's lowering: an optional (`Should`) clause whose
@@ -3229,35 +3984,50 @@ fn negative_boolean_dedup_key(child: SyntaxKey) -> SyntaxKey {
 /// exactly. A non-`Should` occurrence or a mixed-occurrence child is a
 /// boundary, as is any non-boolean node (boosts included).
 fn flatten_should_of_should(query: &mut Query) {
-    let Query::Boolean { clauses, .. } = query else {
-        return;
-    };
-    for clause in clauses.iter_mut() {
-        flatten_should_of_should(&mut clause.query);
-    }
-    let mut flattened = Vec::with_capacity(clauses.len());
-    for clause in clauses.drain(..) {
-        let splice = clause.occur == Occur::Should
-            && matches!(
-                &clause.query,
-                Query::Boolean { clauses: children, .. }
-                    if children
-                        .iter()
-                        .all(|child| child.occur == Occur::Should)
-            );
-        if splice {
-            let Query::Boolean {
-                clauses: children, ..
-            } = clause.query
-            else {
-                unreachable!("splice guard matched a boolean");
-            };
-            flattened.extend(children);
+    for index in 0..=query.nodes.len() {
+        let node_id = if index == query.nodes.len() {
+            query.root_id()
         } else {
-            flattened.push(clause);
+            Query::node_id(index)
+        };
+        let QueryNode::Boolean { clauses, .. } = query.node(node_id) else {
+            continue;
+        };
+        let flattened_len = clauses.iter().fold(0_usize, |len, clause| {
+            if clause.occur == Occur::Should
+                && let QueryNode::Boolean {
+                    clauses: children, ..
+                } = query.node(clause.query)
+                && children.iter().all(|child| child.occur == Occur::Should)
+            {
+                len.saturating_add(children.len())
+            } else {
+                len.saturating_add(1)
+            }
+        });
+        if flattened_len == clauses.len() {
+            continue;
+        }
+        let mut flattened = Vec::new();
+        if flattened.try_reserve_exact(flattened_len).is_err() {
+            continue;
+        }
+        for clause in clauses {
+            if clause.occur == Occur::Should
+                && let QueryNode::Boolean {
+                    clauses: children, ..
+                } = query.node(clause.query)
+                && children.iter().all(|child| child.occur == Occur::Should)
+            {
+                flattened.extend_from_slice(children);
+            } else {
+                flattened.push(*clause);
+            }
+        }
+        if let QueryNode::Boolean { clauses, .. } = query.node_mut(node_id) {
+            *clauses = flattened;
         }
     }
-    *clauses = flattened;
 }
 
 fn combine_and(nodes: Vec<ParsedNode>, syntactic_operands: usize) -> Option<ParsedNode> {
@@ -3288,8 +4058,17 @@ fn combine_boolean(
     operator: Option<BooleanOperator>,
     syntactic_operands: usize,
 ) -> Option<ParsedNode> {
-    let mut clauses = Vec::with_capacity(nodes.len() + 1);
-    let mut keys = Vec::with_capacity(nodes.len());
+    let requested = nodes.len();
+    let mut clauses = Vec::new();
+    let mut keys = Vec::new();
+    if clauses.try_reserve_exact(requested).is_err() || keys.try_reserve_exact(requested).is_err() {
+        return Some(ParsedNode {
+            query: Query::arena_allocation_failure(requested),
+            occur: None,
+            from_not: false,
+            dedup_key: SyntaxKey::empty_boolean(),
+        });
+    }
     for node in nodes {
         let syntax_occur = node.occur.or(match operator {
             Some(BooleanOperator::And) => Some(Occur::Must),
@@ -3315,9 +4094,13 @@ fn combine_boolean(
         });
     }
 
-    let dedup_key = SyntaxKey::Boolean(keys);
+    let dedup_key = SyntaxKey::boolean(keys);
+    let query = dedup_key.allocation_failure().map_or_else(
+        || Query::boolean(clauses, operator),
+        Query::arena_allocation_failure,
+    );
     Some(ParsedNode {
-        query: Query::Boolean { clauses, operator },
+        query,
         occur: None,
         from_not: false,
         dedup_key,
@@ -3333,54 +4116,170 @@ fn combine_boolean(
 /// singleton child whose outer occurrence is implicit, transferring the
 /// child's explicit occurrence to the parent clause.
 fn rewrite_parser_syntax(node: &mut ParsedNode) {
-    rewrite_parser_syntax_inner(&mut node.query, &mut node.dedup_key);
+    let query = &mut node.query;
+    let syntax = &mut node.dedup_key;
+    let mut pending = Vec::new();
+    let task_count = query
+        .node_count()
+        .saturating_add(syntax.nodes.len().saturating_add(1));
+    if pending.try_reserve_exact(task_count).is_err() {
+        return;
+    }
+    pending.push((query.root_id(), SyntaxKey::root_id(), false));
+    while let Some((query_id, syntax_id, visited)) = pending.pop() {
+        if !visited {
+            let (QueryNode::Boolean { clauses, .. }, SyntaxNode::Boolean(keys)) =
+                (query.node(query_id), syntax.node(syntax_id))
+            else {
+                continue;
+            };
+            if clauses.len() != keys.len() {
+                debug_assert_eq!(clauses.len(), keys.len());
+                continue;
+            }
+            pending.push((query_id, syntax_id, true));
+            pending.extend(
+                clauses
+                    .iter()
+                    .zip(keys)
+                    .rev()
+                    .map(|(clause, (_, key))| (clause.query, *key, false)),
+            );
+            continue;
+        }
+
+        let (QueryNode::Boolean { clauses, .. }, SyntaxNode::Boolean(keys)) =
+            (query.node(query_id), syntax.node(syntax_id))
+        else {
+            continue;
+        };
+        let mut keep = Vec::new();
+        if keep.try_reserve_exact(keys.len()).is_err() {
+            continue;
+        }
+        for (index, (occur, child)) in keys.iter().enumerate() {
+            let duplicate = keys[..index].iter().any(|(prior_occur, prior_child)| {
+                prior_occur == occur && syntax_subtree_eq(syntax, *prior_child, *child)
+            });
+            keep.push(!duplicate);
+        }
+        let retained = keep.iter().filter(|keep| **keep).count();
+        if retained != keep.len() {
+            let mut retained_keys = Vec::new();
+            let mut retained_clauses = Vec::new();
+            if retained_keys.try_reserve_exact(retained).is_err()
+                || retained_clauses.try_reserve_exact(retained).is_err()
+            {
+                continue;
+            }
+            retained_keys.extend(
+                keys.iter()
+                    .zip(&keep)
+                    .filter(|(_, keep)| **keep)
+                    .map(|(key, _)| *key),
+            );
+            retained_clauses.extend(
+                clauses
+                    .iter()
+                    .zip(&keep)
+                    .filter(|(_, keep)| **keep)
+                    .map(|(clause, _)| *clause),
+            );
+            if let SyntaxNode::Boolean(keys) = syntax.node_mut(syntax_id) {
+                *keys = retained_keys;
+            }
+            if let QueryNode::Boolean { clauses, .. } = query.node_mut(query_id) {
+                *clauses = retained_clauses;
+            }
+        }
+
+        let (QueryNode::Boolean { clauses, .. }, SyntaxNode::Boolean(keys)) =
+            (query.node(query_id), syntax.node(syntax_id))
+        else {
+            continue;
+        };
+        let mut replacements = Vec::new();
+        if replacements.try_reserve_exact(keys.len()).is_err() {
+            continue;
+        }
+        for ((outer_occur, child_key), outer_clause) in keys.iter().zip(clauses) {
+            let replacement = if outer_occur.is_none()
+                && let SyntaxNode::Boolean(inner_keys) = syntax.node(*child_key)
+                && let QueryNode::Boolean {
+                    clauses: inner_clauses,
+                    ..
+                } = query.node(outer_clause.query)
+                && inner_keys.len() == 1
+                && inner_clauses.len() == 1
+            {
+                Some((inner_keys[0], inner_clauses[0]))
+            } else {
+                None
+            };
+            replacements.push(replacement);
+        }
+        if let SyntaxNode::Boolean(keys) = syntax.node_mut(syntax_id) {
+            for (key, replacement) in keys.iter_mut().zip(&replacements) {
+                if let Some((inner_key, _)) = replacement {
+                    *key = *inner_key;
+                }
+            }
+        }
+        if let QueryNode::Boolean { clauses, .. } = query.node_mut(query_id) {
+            for (clause, replacement) in clauses.iter_mut().zip(replacements) {
+                if let Some((_, inner_clause)) = replacement {
+                    *clause = inner_clause;
+                }
+            }
+        }
+    }
 }
 
-fn rewrite_parser_syntax_inner(query: &mut Query, syntax: &mut SyntaxKey) {
-    let SyntaxKey::Boolean(keys) = syntax else {
-        return;
-    };
-    let Query::Boolean { clauses, .. } = query else {
-        debug_assert!(false, "Boolean syntax key must pair with a Boolean query");
-        return;
-    };
-    if clauses.len() != keys.len() {
-        debug_assert_eq!(clauses.len(), keys.len());
-        return;
+fn syntax_subtree_eq(syntax: &SyntaxKey, left: SyntaxNodeId, right: SyntaxNodeId) -> bool {
+    let mut pending = Vec::new();
+    if pending
+        .try_reserve_exact(syntax.nodes.len().saturating_add(1))
+        .is_err()
+    {
+        return false;
     }
-
-    for (clause, (_, child_key)) in clauses.iter_mut().zip(keys.iter_mut()) {
-        rewrite_parser_syntax_inner(&mut clause.query, child_key);
-    }
-
-    let mut index = 0;
-    while index < keys.len() {
-        if keys[..index].contains(&keys[index]) {
-            keys.remove(index);
-            clauses.remove(index);
-        } else {
-            index += 1;
+    pending.push((left, right));
+    while let Some((left, right)) = pending.pop() {
+        match (syntax.node(left), syntax.node(right)) {
+            (SyntaxNode::LoweredAway(left), SyntaxNode::LoweredAway(right)) => {
+                pending.push((*left, *right));
+            }
+            (SyntaxNode::Boolean(left), SyntaxNode::Boolean(right)) => {
+                if left.len() != right.len()
+                    || left
+                        .iter()
+                        .zip(right)
+                        .any(|((left, _), (right, _))| left != right)
+                {
+                    return false;
+                }
+                pending.extend(
+                    left.iter()
+                        .zip(right)
+                        .rev()
+                        .map(|((_, left), (_, right))| (*left, *right)),
+                );
+            }
+            (
+                SyntaxNode::Boost {
+                    query: left,
+                    factor_bits: left_bits,
+                },
+                SyntaxNode::Boost {
+                    query: right,
+                    factor_bits: right_bits,
+                },
+            ) if left_bits == right_bits => pending.push((*left, *right)),
+            (left, right) if left == right => {}
+            _ => return false,
         }
     }
-
-    for (key, outer_clause) in keys.iter_mut().zip(clauses.iter_mut()) {
-        let (outer_occur, child_key) = key;
-        if outer_occur.is_none()
-            && let SyntaxKey::Boolean(inner_keys) = child_key
-            && let Query::Boolean {
-                clauses: inner_clauses,
-                ..
-            } = &mut outer_clause.query
-            && inner_keys.len() == 1
-            && inner_clauses.len() == 1
-        {
-            let (inner_occur, inner_key) = inner_keys.remove(0);
-            let inner_clause = inner_clauses.remove(0);
-            *outer_occur = inner_occur;
-            *child_key = inner_key;
-            *outer_clause = inner_clause;
-        }
-    }
+    true
 }
 
 /// Mirror Tantivy's post-lowering `trim_ast` for parser leaves that failed
@@ -3388,47 +4287,117 @@ fn rewrite_parser_syntax_inner(query: &mut Query, syntax: &mut SyntaxKey) {
 /// syntax explicitly tagged `LoweredAway` disappears. A boost is a
 /// boundary even when its child failed lowering.
 fn trim_parser_dropped(query: &mut Query, syntax: &SyntaxKey) -> bool {
-    if matches!(syntax, SyntaxKey::LoweredAway(_)) {
-        return true;
+    let result_len = syntax.nodes.len().saturating_add(1);
+    let mut results = Vec::new();
+    if results.try_reserve_exact(result_len).is_err() {
+        return false;
     }
-    if let SyntaxKey::Boost {
-        query: child_key, ..
-    } = syntax
+    results.resize(result_len, false);
+    let mut pending = Vec::new();
+    if pending
+        .try_reserve_exact(query.node_count().saturating_add(result_len))
+        .is_err()
     {
-        if let Query::Boost {
-            query: child_query, ..
-        } = query
-        {
-            let _ = trim_parser_dropped(child_query, child_key);
-            return false;
+        return false;
+    }
+    pending.push((query.root_id(), SyntaxKey::root_id(), false));
+    while let Some((query_id, syntax_id, visited)) = pending.pop() {
+        let result_index = if syntax_id == SyntaxNodeId::ROOT {
+            syntax.nodes.len()
+        } else {
+            syntax_id.index()
+        };
+        if !visited {
+            match syntax.node(syntax_id) {
+                SyntaxNode::LoweredAway(_) => results[result_index] = true,
+                SyntaxNode::Boost { query: child, .. } => {
+                    let query_child = match query.node(query_id) {
+                        QueryNode::Boost { query, .. } => *query,
+                        QueryNode::Empty
+                        | QueryNode::All
+                        | QueryNode::AllocationFailure { .. }
+                        | QueryNode::Term { .. }
+                        | QueryNode::Phrase { .. }
+                        | QueryNode::Boolean { .. }
+                        | QueryNode::Range { .. }
+                        | QueryNode::Set { .. }
+                        | QueryNode::Glob { .. } => query_id,
+                    };
+                    pending.push((query_id, syntax_id, true));
+                    pending.push((query_child, *child, false));
+                }
+                SyntaxNode::Boolean(keys) => {
+                    let QueryNode::Boolean { clauses, .. } = query.node(query_id) else {
+                        continue;
+                    };
+                    if clauses.len() != keys.len() {
+                        debug_assert_eq!(clauses.len(), keys.len());
+                        continue;
+                    }
+                    pending.push((query_id, syntax_id, true));
+                    pending.extend(
+                        clauses
+                            .iter()
+                            .zip(keys)
+                            .rev()
+                            .map(|(clause, (_, key))| (clause.query, *key, false)),
+                    );
+                }
+                SyntaxNode::Atom { .. }
+                | SyntaxNode::Range { .. }
+                | SyntaxNode::Set { .. }
+                | SyntaxNode::Regex { .. } => {}
+            }
+            continue;
         }
-        return trim_parser_dropped(query, child_key);
-    }
-    let SyntaxKey::Boolean(keys) = syntax else {
-        return false;
-    };
-    let Query::Boolean { clauses, .. } = query else {
-        debug_assert!(false, "Boolean syntax key must pair with a Boolean query");
-        return false;
-    };
-    if clauses.len() != keys.len() {
-        debug_assert_eq!(clauses.len(), keys.len());
-        return false;
-    }
 
-    let original = std::mem::take(clauses);
-    clauses.reserve(original.len());
-    for (mut clause, (_, child_key)) in original.into_iter().zip(keys) {
-        if !trim_parser_dropped(&mut clause.query, child_key) {
-            clauses.push(clause);
+        match syntax.node(syntax_id) {
+            SyntaxNode::Boost { query: child, .. } => {
+                results[result_index] = if matches!(query.node(query_id), QueryNode::Boost { .. }) {
+                    false
+                } else {
+                    results[child.index()]
+                };
+            }
+            SyntaxNode::Boolean(keys) => {
+                let QueryNode::Boolean { clauses, .. } = query.node(query_id) else {
+                    continue;
+                };
+                let retained = clauses
+                    .iter()
+                    .zip(keys)
+                    .filter(|(_, (_, key))| !results[key.index()])
+                    .count();
+                if retained == 0 {
+                    *query.node_mut(query_id) = QueryNode::Empty;
+                    results[result_index] = true;
+                    continue;
+                }
+                if retained != clauses.len() {
+                    let mut kept = Vec::new();
+                    if kept.try_reserve_exact(retained).is_err() {
+                        continue;
+                    }
+                    kept.extend(
+                        clauses
+                            .iter()
+                            .zip(keys)
+                            .filter(|(_, (_, key))| !results[key.index()])
+                            .map(|(clause, _)| *clause),
+                    );
+                    if let QueryNode::Boolean { clauses, .. } = query.node_mut(query_id) {
+                        *clauses = kept;
+                    }
+                }
+            }
+            SyntaxNode::LoweredAway(_)
+            | SyntaxNode::Atom { .. }
+            | SyntaxNode::Range { .. }
+            | SyntaxNode::Set { .. }
+            | SyntaxNode::Regex { .. } => {}
         }
     }
-    if clauses.is_empty() {
-        *query = Query::Empty;
-        true
-    } else {
-        false
-    }
+    results[syntax.nodes.len()]
 }
 
 fn repair_root_all_negative(node: &mut Option<ParsedNode>, grammar: &mut Grammar) {
@@ -3438,8 +4407,14 @@ fn repair_root_all_negative(node: &mut Option<ParsedNode>, grammar: &mut Grammar
     if !query_is_all_negative(&parsed.query) {
         return;
     }
-    if !add_all_to_negative_root(&mut parsed.query) {
-        return;
+    match add_all_to_negative_root(&mut parsed.query) {
+        Ok(false) => return,
+        Ok(true) => {}
+        Err(requested) => {
+            parsed.query = Query::arena_allocation_failure(requested);
+            grammar.allocation_failure("all-negative repair clauses", requested);
+            return;
+        }
     }
     grammar.push_diagnostic(QueryDiagnostic {
         kind: QueryDiagnosticKind::AllNegativeRepair,
@@ -3450,105 +4425,158 @@ fn repair_root_all_negative(node: &mut Option<ParsedNode>, grammar: &mut Grammar
 }
 
 fn query_is_all_negative(query: &Query) -> bool {
-    match query {
-        Query::Boolean { clauses, .. } => {
+    let mut results = Vec::new();
+    if results.try_reserve_exact(query.nodes.len()).is_err() {
+        return false;
+    }
+    for node in &query.nodes {
+        let all_negative = match node {
+            QueryNode::Boolean { clauses, .. } => {
+                !clauses.is_empty()
+                    && clauses.iter().all(|clause| {
+                        clause.occur == Occur::MustNot
+                            || (!matches!(clause.query, QueryNodeId::ALL | QueryNodeId::EMPTY)
+                                && results[clause.query.index()])
+                    })
+            }
+            QueryNode::Boost { query: child, .. } => {
+                !matches!(*child, QueryNodeId::ALL | QueryNodeId::EMPTY) && results[child.index()]
+            }
+            QueryNode::Empty
+            | QueryNode::All
+            | QueryNode::AllocationFailure { .. }
+            | QueryNode::Term { .. }
+            | QueryNode::Phrase { .. }
+            | QueryNode::Range { .. }
+            | QueryNode::Set { .. }
+            | QueryNode::Glob { .. } => false,
+        };
+        results.push(all_negative);
+    }
+    match query.root() {
+        QueryNode::Boolean { clauses, .. } => {
             !clauses.is_empty()
                 && clauses.iter().all(|clause| {
-                    clause.occur == Occur::MustNot || query_is_all_negative(&clause.query)
+                    clause.occur == Occur::MustNot
+                        || (!matches!(clause.query, QueryNodeId::ALL | QueryNodeId::EMPTY)
+                            && results[clause.query.index()])
                 })
         }
-        Query::Boost { query, .. } => query_is_all_negative(query),
-        Query::Empty
-        | Query::All
-        | Query::Term { .. }
-        | Query::Phrase { .. }
-        | Query::Range { .. }
-        | Query::Set { .. }
-        | Query::Glob { .. } => false,
+        QueryNode::Boost { query: child, .. } => {
+            !matches!(*child, QueryNodeId::ALL | QueryNodeId::EMPTY) && results[child.index()]
+        }
+        QueryNode::Empty
+        | QueryNode::All
+        | QueryNode::AllocationFailure { .. }
+        | QueryNode::Term { .. }
+        | QueryNode::Phrase { .. }
+        | QueryNode::Range { .. }
+        | QueryNode::Set { .. }
+        | QueryNode::Glob { .. } => false,
     }
 }
 
-fn add_all_to_negative_root(query: &mut Query) -> bool {
-    match query {
-        Query::Boolean { clauses, .. } => {
-            clauses.push(BooleanClause::new(Occur::Should, Query::All));
-            true
-        }
-        Query::Boost { query, .. } => add_all_to_negative_root(query),
-        Query::Empty
-        | Query::All
-        | Query::Term { .. }
-        | Query::Phrase { .. }
-        | Query::Range { .. }
-        | Query::Set { .. }
-        | Query::Glob { .. } => false,
+fn add_all_to_negative_root(query: &mut Query) -> Result<bool, usize> {
+    let mut current = query.root_id();
+    while let QueryNode::Boost { query: child, .. } = query.node(current) {
+        current = *child;
     }
+    let QueryNode::Boolean { clauses, .. } = query.node_mut(current) else {
+        return Ok(false);
+    };
+    if clauses.try_reserve_exact(1).is_err() {
+        return Err(clauses.len().saturating_add(1));
+    }
+    clauses.push(QueryClause {
+        occur: Occur::Should,
+        query: QueryNodeId::ALL,
+    });
+    Ok(true)
 }
 
 fn merge_field_queries(queries: Vec<Query>) -> Option<Query> {
     let first = queries.first()?.clone();
-    match first {
-        Query::Term { text, .. }
+    match first.root() {
+        QueryNode::Term { text, .. }
             if queries.iter().all(
-                |query| matches!(query, Query::Term { text: candidate, .. } if candidate == &text),
+                |query| matches!(query.root(), QueryNode::Term { text: candidate, .. } if candidate == text),
             ) =>
         {
             if queries.len() == 1 {
                 return queries.into_iter().next();
             }
-            Some(Query::Boolean {
-                clauses: queries
-                    .into_iter()
-                    .map(|query| BooleanClause::new(Occur::Should, query))
-                    .collect(),
-                operator: None,
-            })
+            let requested = queries.len();
+            let mut clauses = Vec::new();
+            if clauses.try_reserve_exact(requested).is_err() {
+                return Some(Query::arena_allocation_failure(requested));
+            }
+            for query in queries {
+                clauses.push(BooleanClause::new(Occur::Should, query));
+            }
+            Some(Query::boolean(clauses, None))
         }
-        Query::Phrase {
+        QueryNode::Phrase {
             terms,
             slop,
             prefix,
             ..
         } if queries.iter().all(|query| {
             matches!(
-                query,
-                Query::Phrase {
+                query.root(),
+                QueryNode::Phrase {
                     terms: candidate_terms,
                     slop: candidate_slop,
                     prefix: candidate_prefix,
                     ..
-                } if candidate_terms == &terms
-                    && *candidate_slop == slop
-                    && *candidate_prefix == prefix
+                } if candidate_terms == terms
+                    && candidate_slop == slop
+                    && candidate_prefix == prefix
             )
         }) =>
         {
+            let requested = queries.iter().fold(0_usize, |count, query| {
+                let QueryNode::Phrase { fields, .. } = query.root() else {
+                    return count;
+                };
+                count.saturating_add(fields.len())
+            });
             let mut fields = Vec::new();
+            if fields.try_reserve_exact(requested).is_err() {
+                return Some(Query::arena_allocation_failure(requested));
+            }
             for query in queries {
-                let Query::Phrase {
+                let QueryNode::Phrase {
                     fields: query_fields,
                     ..
-                } = query
+                } = query.root
                 else {
                     return None;
                 };
                 fields.extend(query_fields);
             }
-            Some(Query::Phrase {
-                fields,
-                terms,
-                slop,
-                prefix,
-            })
+            Some(Query::phrase(fields, terms.clone(), *slop, *prefix))
         }
-        Query::Empty if queries.iter().all(Query::is_empty) => Some(Query::Empty),
-        _ => Some(Query::Boolean {
-            clauses: queries
-                .into_iter()
-                .map(|query| BooleanClause::new(Occur::Should, query))
-                .collect(),
-            operator: None,
-        }),
+        QueryNode::Empty if queries.iter().all(Query::is_empty) => Some(Query::empty()),
+        QueryNode::Empty
+        | QueryNode::AllocationFailure { .. }
+        | QueryNode::All
+        | QueryNode::Term { .. }
+        | QueryNode::Phrase { .. }
+        | QueryNode::Boolean { .. }
+        | QueryNode::Range { .. }
+        | QueryNode::Set { .. }
+        | QueryNode::Glob { .. }
+        | QueryNode::Boost { .. } => {
+            let requested = queries.len();
+            let mut clauses = Vec::new();
+            if clauses.try_reserve_exact(requested).is_err() {
+                return Some(Query::arena_allocation_failure(requested));
+            }
+            for query in queries {
+                clauses.push(BooleanClause::new(Occur::Should, query));
+            }
+            Some(Query::boolean(clauses, None))
+        }
     }
 }
 
@@ -3744,7 +4772,7 @@ impl CassParserFields {
     }
 
     fn regex_fields(self) -> Vec<u16> {
-        vec![self.content, self.title]
+        Vec::from([self.content, self.title])
     }
 }
 
@@ -3884,7 +4912,7 @@ impl CassQueryParser {
             diagnostics,
         };
         let parsed = grammar.parse();
-        let root = parsed.map_or(Query::All, |node| {
+        let root = parsed.map_or_else(Query::all, |node| {
             if node.negative {
                 cass_complement(node.query)
             } else {
@@ -3892,6 +4920,17 @@ impl CassQueryParser {
             }
         });
         let query = self.apply_filters(root, filters);
+        if let Some(requested) = query.allocation_failure() {
+            emit_diagnostic(
+                &mut grammar.diagnostics,
+                QueryDiagnostic {
+                    kind: QueryDiagnosticKind::AllocationFailure,
+                    message: format!("query arena could not reserve {requested} entries"),
+                    byte_offset: None,
+                    fragment: None,
+                },
+            );
+        }
         ParsedQuery {
             query,
             explanation: classify_query(admitted_query),
@@ -3909,7 +4948,10 @@ impl CassQueryParser {
         {
             return root;
         }
-        let mut clauses = Vec::with_capacity(5);
+        let mut clauses = Vec::new();
+        if clauses.try_reserve_exact(5).is_err() {
+            return Query::arena_allocation_failure(5);
+        }
         clauses.push(BooleanClause::new(Occur::Must, root));
         if let Some(filter) = cass_string_filter(self.fields.agent, &filters.agents) {
             clauses.push(BooleanClause::new(Occur::Must, filter));
@@ -3920,15 +4962,15 @@ impl CassQueryParser {
         if filters.created_from.is_some() || filters.created_to.is_some() {
             clauses.push(BooleanClause::new(
                 Occur::Must,
-                Query::Range {
-                    field_id: self.fields.created_at,
-                    lower: filters.created_from.map_or(Bound::Unbounded, |value| {
+                Query::range(
+                    self.fields.created_at,
+                    filters.created_from.map_or(Bound::Unbounded, |value| {
                         Bound::Included(QueryValue::I64(value))
                     }),
-                    upper: filters.created_to.map_or(Bound::Unbounded, |value| {
+                    filters.created_to.map_or(Bound::Unbounded, |value| {
                         Bound::Included(QueryValue::I64(value))
                     }),
-                },
+                ),
             ));
         }
         let source = match &filters.source_filter {
@@ -3946,12 +4988,9 @@ impl CassQueryParser {
             ));
         }
         if clauses.len() == 1 {
-            clauses.pop().map_or(Query::All, |clause| clause.query)
+            clauses.pop().map_or_else(Query::all, |clause| clause.query)
         } else {
-            Query::Boolean {
-                clauses,
-                operator: None,
-            }
+            Query::boolean(clauses, None)
         }
     }
 
@@ -3983,24 +5022,17 @@ impl CassQueryParser {
                     return Some(cass_required_query(
                         terms
                             .into_iter()
-                            .map(|text| Query::Term {
-                                fields: self.fields.searchable(),
-                                text,
-                            })
+                            .map(|text| Query::term(self.fields.searchable(), text))
                             .collect(),
                     ));
                 }
-                Some(Query::Term {
-                    fields: self.fields.searchable(),
-                    text: term,
-                })
+                Some(Query::term(self.fields.searchable(), term))
             }
             CassWildcardPattern::Suffix(_)
             | CassWildcardPattern::Substring(_)
-            | CassWildcardPattern::Complex(_) => Some(Query::Glob {
-                field_ids: self.fields.regex_fields(),
-                pattern: raw.to_lowercase(),
-            }),
+            | CassWildcardPattern::Complex(_) => {
+                Some(Query::glob(self.fields.regex_fields(), raw.to_lowercase()))
+            }
         }
     }
 
@@ -4013,19 +5045,19 @@ impl CassQueryParser {
         if terms.len() <= 1 || terms.iter().any(|term| term.chars().any(is_cass_cjk)) {
             return self.lower_compound(&terms);
         }
-        Query::Phrase {
-            fields: vec![
+        Query::phrase(
+            Vec::from([
                 QueryField::new(self.fields.title, 1.0),
                 QueryField::new(self.fields.content, 1.0),
-            ],
-            terms: terms
+            ]),
+            terms
                 .into_iter()
                 .zip(0_u32..)
                 .map(|(text, position)| PositionedTerm::new(position, text))
                 .collect(),
-            slop: 0,
-            prefix: false,
-        }
+            0,
+            false,
+        )
     }
 }
 
@@ -4057,31 +5089,25 @@ fn cass_string_filter(field_id: u16, values: &[String]) -> Option<Query> {
         .iter()
         .map(|value| BooleanClause::new(Occur::Should, cass_exact_term(field_id, value.to_owned())))
         .collect::<Vec<_>>();
-    (!clauses.is_empty()).then_some(Query::Boolean {
-        clauses,
-        operator: None,
-    })
+    (!clauses.is_empty()).then(|| Query::boolean(clauses, None))
 }
 
 fn cass_exact_term(field_id: u16, text: String) -> Query {
-    Query::Term {
-        fields: vec![QueryField::new(field_id, 1.0)],
-        text,
-    }
+    Query::term(Vec::from([QueryField::new(field_id, 1.0)]), text)
 }
 
 fn cass_required_query(mut queries: Vec<Query>) -> Query {
     queries.retain(|query| !query.is_empty());
     match queries.len() {
-        0 => Query::Empty,
-        1 => queries.pop().unwrap_or(Query::Empty),
-        _ => Query::Boolean {
-            clauses: queries
+        0 => Query::empty(),
+        1 => queries.pop().unwrap_or_else(Query::empty),
+        _ => Query::boolean(
+            queries
                 .into_iter()
                 .map(|query| BooleanClause::new(Occur::Must, query))
                 .collect(),
-            operator: Some(BooleanOperator::And),
-        },
+            Some(BooleanOperator::And),
+        ),
     }
 }
 
@@ -4100,13 +5126,13 @@ fn cass_cjk_terms(term: &str) -> Vec<String> {
 }
 
 fn cass_complement(query: Query) -> Query {
-    Query::Boolean {
-        clauses: vec![
-            BooleanClause::new(Occur::Must, Query::All),
+    Query::boolean(
+        Vec::from([
+            BooleanClause::new(Occur::Must, Query::all()),
             BooleanClause::new(Occur::MustNot, query),
-        ],
-        operator: None,
-    }
+        ]),
+        None,
+    )
 }
 
 #[cfg(any(test, feature = "conformance-internals"))]
@@ -4418,13 +5444,13 @@ fn cass_flush_native_or_group(pending_or_group: &mut Vec<Query>, clauses: &mut V
     if pending_or_group.is_empty() {
         return;
     }
-    let query = Query::Boolean {
-        clauses: std::mem::take(pending_or_group)
+    let query = Query::boolean(
+        std::mem::take(pending_or_group)
             .into_iter()
             .map(|query| BooleanClause::new(Occur::Should, query))
             .collect(),
-        operator: Some(BooleanOperator::Or),
-    };
+        Some(BooleanOperator::Or),
+    );
     clauses.push(BooleanClause::new(Occur::Must, query));
 }
 
@@ -4474,13 +5500,13 @@ fn cass_finish_native_clauses(mut clauses: Vec<BooleanClause>) -> Option<CassNod
         return None;
     }
     if clauses.iter().all(|clause| clause.occur == Occur::MustNot) {
-        clauses.insert(0, BooleanClause::new(Occur::Must, Query::All));
+        if clauses.try_reserve_exact(1).is_err() {
+            return None;
+        }
+        clauses.insert(0, BooleanClause::new(Occur::Must, Query::all()));
     }
     Some(CassNode {
-        query: Query::Boolean {
-            clauses,
-            operator: Some(BooleanOperator::And),
-        },
+        query: Query::boolean(clauses, Some(BooleanOperator::And)),
         negative: false,
     })
 }
@@ -4577,45 +5603,71 @@ mod tests {
         DefaultQueryParser::new(DEFAULT_SCHEMA).expect("default schema supports its parser")
     }
 
-    fn is_single_field_term(query: &Query, text: &str, field: QueryField) -> bool {
+    fn is_single_field_term(
+        query: &Query,
+        node: QueryNodeId,
+        text: &str,
+        field: QueryField,
+    ) -> bool {
         matches!(
-            query,
-            Query::Term { fields, text: candidate }
+            query.node(node),
+            QueryNode::Term { fields, text: candidate }
                 if candidate == text && fields.as_slice() == [field]
         )
     }
 
     fn is_default_term(query: &Query, text: &str) -> bool {
-        let Query::Boolean {
+        let QueryNode::Boolean {
             clauses,
             operator: None,
-        } = query
+        } = query.root()
         else {
             return false;
         };
         clauses.len() == 2
             && clauses.iter().all(|clause| clause.occur == Occur::Should)
-            && is_single_field_term(&clauses[0].query, text, QueryField::new(1, 1.0))
-            && is_single_field_term(&clauses[1].query, text, QueryField::new(2, TITLE_BOOST))
+            && is_single_field_term(query, clauses[0].query, text, QueryField::new(1, 1.0))
+            && is_single_field_term(
+                query,
+                clauses[1].query,
+                text,
+                QueryField::new(2, TITLE_BOOST),
+            )
     }
 
     fn term_leaf_count(query: &Query, text: &str) -> usize {
-        match query {
-            Query::Term {
-                text: candidate, ..
-            } => usize::from(candidate == text),
-            Query::Boolean { clauses, .. } => clauses
-                .iter()
-                .map(|clause| term_leaf_count(&clause.query, text))
-                .sum(),
-            Query::Boost { query, .. } => term_leaf_count(query, text),
-            Query::Empty
-            | Query::All
-            | Query::Phrase { .. }
-            | Query::Range { .. }
-            | Query::Set { .. }
-            | Query::Glob { .. } => 0,
+        let mut pending = Vec::new();
+        assert!(pending.try_reserve_exact(query.node_count()).is_ok());
+        pending.push(query.root_id());
+        let mut count = 0;
+        while let Some(node) = pending.pop() {
+            match query.node(node) {
+                QueryNode::Term {
+                    text: candidate, ..
+                } => count += usize::from(candidate == text),
+                QueryNode::Boolean { clauses, .. } => {
+                    pending.extend(clauses.iter().rev().map(|clause| clause.query));
+                }
+                QueryNode::Boost { query: child, .. } => pending.push(*child),
+                QueryNode::Empty
+                | QueryNode::AllocationFailure { .. }
+                | QueryNode::All
+                | QueryNode::Phrase { .. }
+                | QueryNode::Range { .. }
+                | QueryNode::Set { .. }
+                | QueryNode::Glob { .. } => {}
+            }
         }
+        count
+    }
+
+    fn query_subtree_eq(query: &Query, left: QueryNodeId, right: QueryNodeId) -> bool {
+        let mut keys = Vec::new();
+        assert!(keys.try_reserve_exact(query.nodes.len()).is_ok());
+        for node in &query.nodes {
+            keys.push(canonical_sort_key_for_node(node, &keys));
+        }
+        canonical_child_key(&keys, left) == canonical_child_key(&keys, right)
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -4770,64 +5822,105 @@ mod tests {
         pattern[pattern_index..].iter().all(|ch| *ch == '*')
     }
 
+    fn evaluate_query(query: &Query, mut evaluate_leaf: impl FnMut(&QueryNode) -> bool) -> bool {
+        enum EvalTask {
+            Visit(QueryNodeId),
+            Boolean(QueryNodeId),
+        }
+
+        let node_count = query.node_count();
+        let mut pending = Vec::new();
+        let mut values = Vec::new();
+        assert!(
+            pending
+                .try_reserve_exact(node_count.saturating_mul(2))
+                .is_ok()
+        );
+        assert!(values.try_reserve_exact(node_count).is_ok());
+        pending.push(EvalTask::Visit(query.root_id()));
+        while let Some(task) = pending.pop() {
+            match task {
+                EvalTask::Visit(node) => match query.node(node) {
+                    QueryNode::Boolean { clauses, .. } => {
+                        pending.push(EvalTask::Boolean(node));
+                        pending.extend(
+                            clauses
+                                .iter()
+                                .rev()
+                                .map(|clause| EvalTask::Visit(clause.query)),
+                        );
+                    }
+                    QueryNode::Boost { query: child, .. } => {
+                        pending.push(EvalTask::Visit(*child));
+                    }
+                    leaf => values.push(evaluate_leaf(leaf)),
+                },
+                EvalTask::Boolean(node) => {
+                    let QueryNode::Boolean { clauses, .. } = query.node(node) else {
+                        return false;
+                    };
+                    let mut has_must = false;
+                    let mut should_count = 0_usize;
+                    let mut should_match = false;
+                    let mut rejected = false;
+                    for clause in clauses.iter().rev() {
+                        let Some(child_matches) = values.pop() else {
+                            return false;
+                        };
+                        match clause.occur {
+                            Occur::Must => {
+                                has_must = true;
+                                rejected |= !child_matches;
+                            }
+                            Occur::Should => {
+                                should_count += 1;
+                                should_match |= child_matches;
+                            }
+                            Occur::MustNot => rejected |= child_matches,
+                        }
+                    }
+                    values.push(!rejected && (has_must || (should_count != 0 && should_match)));
+                }
+            }
+        }
+        values.pop().unwrap_or(false)
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     fn cass_ast_matches(query: &Query, doc: CassEvalDoc) -> bool {
-        match query {
-            Query::Empty => false,
-            Query::All => true,
-            Query::Term { fields, text } => fields
+        evaluate_query(query, |node| match node {
+            QueryNode::Empty | QueryNode::AllocationFailure { .. } => false,
+            QueryNode::All => true,
+            QueryNode::Term { fields, text } => fields
                 .iter()
                 .copied()
                 .any(|field| cass_term_matches(doc, field, text)),
-            Query::Phrase { fields, terms, .. } => fields
+            QueryNode::Phrase { fields, terms, .. } => fields
                 .iter()
                 .copied()
                 .any(|field| cass_phrase_matches(doc, field, terms)),
-            Query::Boolean { clauses, .. } => {
-                let mut has_must = false;
-                let mut should_count = 0_usize;
-                let mut should_match = false;
-                for clause in clauses {
-                    let child_matches = cass_ast_matches(&clause.query, doc);
-                    match clause.occur {
-                        Occur::Must => {
-                            has_must = true;
-                            if !child_matches {
-                                return false;
-                            }
-                        }
-                        Occur::Should => {
-                            should_count += 1;
-                            should_match |= child_matches;
-                        }
-                        Occur::MustNot if child_matches => return false,
-                        Occur::MustNot => {}
-                    }
-                }
-                has_must || (should_count != 0 && should_match)
-            }
-            Query::Range {
+            QueryNode::Range {
                 field_id,
                 lower,
                 upper,
             } if CASS_SEMANTIC_SCHEMA.fields[usize::from(*field_id)].name == "created_at" => doc
                 .created_at
                 .is_some_and(|value| cass_bound_matches(value, lower, upper)),
-            Query::Range { .. } => false,
-            Query::Set { field_id, values } => {
+            QueryNode::Range { .. } => false,
+            QueryNode::Set { field_id, values } => {
                 cass_field_text(doc, *field_id).is_some_and(|actual| {
                     values
                         .iter()
                         .any(|value| value == &QueryValue::Str(actual.to_owned()))
                 })
             }
-            Query::Glob { field_ids, pattern } => field_ids.iter().copied().any(|field_id| {
+            QueryNode::Glob { field_ids, pattern } => field_ids.iter().copied().any(|field_id| {
                 cass_field_terms(doc, field_id)
                     .iter()
                     .any(|term| star_glob_matches(pattern, &term.text))
             }),
-            Query::Boost { query, .. } => cass_ast_matches(query, doc),
-        }
+            QueryNode::Boolean { .. } | QueryNode::Boost { .. } => false,
+        })
     }
 
     fn field_text(doc: EvalDoc, field_id: u16) -> Option<&'static str> {
@@ -4902,14 +5995,14 @@ mod tests {
     }
 
     fn ast_matches(query: &Query, doc: EvalDoc) -> bool {
-        match query {
-            Query::Empty => false,
-            Query::All => true,
-            Query::Term { fields, text } => fields
+        evaluate_query(query, |node| match node {
+            QueryNode::Empty | QueryNode::AllocationFailure { .. } => false,
+            QueryNode::All => true,
+            QueryNode::Term { fields, text } => fields
                 .iter()
                 .copied()
                 .any(|field| field_term_matches(doc, field, text)),
-            Query::Phrase {
+            QueryNode::Phrase {
                 fields,
                 terms,
                 prefix,
@@ -4918,46 +6011,25 @@ mod tests {
                 .iter()
                 .copied()
                 .any(|field| field_phrase_matches(doc, field, terms, *prefix)),
-            Query::Boolean { clauses, .. } => {
-                let mut has_must = false;
-                let mut should_count = 0_usize;
-                let mut should_match = false;
-                for clause in clauses {
-                    let child_matches = ast_matches(&clause.query, doc);
-                    match clause.occur {
-                        Occur::Must => {
-                            has_must = true;
-                            if !child_matches {
-                                return false;
-                            }
-                        }
-                        Occur::Should => {
-                            should_count += 1;
-                            should_match |= child_matches;
-                        }
-                        Occur::MustNot if child_matches => return false,
-                        Occur::MustNot => {}
-                    }
-                }
-                has_must || (should_count != 0 && should_match)
-            }
-            Query::Range {
+            QueryNode::Range {
                 field_id,
                 lower,
                 upper,
             } => field_text(doc, *field_id)
                 .is_some_and(|value| string_bound_matches(value, lower, upper)),
-            Query::Set { field_id, values } => field_text(doc, *field_id).is_some_and(|value| {
-                values
-                    .iter()
-                    .any(|candidate| candidate == &QueryValue::Str(value.to_owned()))
-            }),
-            Query::Glob { field_ids, pattern } => field_ids
+            QueryNode::Set { field_id, values } => {
+                field_text(doc, *field_id).is_some_and(|value| {
+                    values
+                        .iter()
+                        .any(|candidate| candidate == &QueryValue::Str(value.to_owned()))
+                })
+            }
+            QueryNode::Glob { field_ids, pattern } => field_ids
                 .iter()
                 .copied()
                 .any(|field_id| field_text(doc, field_id).is_some_and(|value| value == pattern)),
-            Query::Boost { query, .. } => ast_matches(query, doc),
-        }
+            QueryNode::Boolean { .. } | QueryNode::Boost { .. } => false,
+        })
     }
 
     fn field_name(schema: SchemaDescriptor, field_id: u16) -> &'static str {
@@ -5006,73 +6078,52 @@ mod tests {
         query: &Query,
         occur: Option<Occur>,
     ) -> Value {
-        match query {
-            Query::Empty => json!({ "type": "Empty" }),
-            Query::All => json!({ "type": "All" }),
-            Query::Term { fields, text } => {
-                let fields = fields
-                    .iter()
-                    .map(|field| {
-                        json!({
-                            "name": field_name(schema, field.field_id),
-                            "boost": field.boost,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let mut value = json!({ "type": "Term", "text": text, "fields": fields });
-                if occur == Some(Occur::MustNot) {
-                    value["score"] = json!(0.0);
+        enum JsonTask {
+            Visit(QueryNodeId, Option<Occur>),
+            BuildBoolean(QueryNodeId),
+            BuildBoost(f32),
+        }
+
+        let mut pending = Vec::new();
+        let mut values = Vec::new();
+        assert!(
+            pending
+                .try_reserve_exact(query.node_count().saturating_mul(2))
+                .is_ok()
+        );
+        assert!(values.try_reserve_exact(query.node_count()).is_ok());
+        pending.push(JsonTask::Visit(query.root_id(), occur));
+        while let Some(task) = pending.pop() {
+            let JsonTask::Visit(node_id, occur) = task else {
+                let JsonTask::BuildBoolean(node_id) = task else {
+                    let JsonTask::BuildBoost(factor) = task else {
+                        return Value::Null;
+                    };
+                    let Some(child) = values.pop() else {
+                        return Value::Null;
+                    };
+                    values.push(json!({ "type": "Boost", "factor": factor, "query": child }));
+                    continue;
+                };
+                let QueryNode::Boolean { clauses, operator } = query.node(node_id) else {
+                    return Value::Null;
+                };
+                let mut children = Vec::new();
+                assert!(children.try_reserve_exact(clauses.len()).is_ok());
+                for clause in clauses.iter().rev() {
+                    let Some(child) = values.pop() else {
+                        return Value::Null;
+                    };
+                    children.push(json!({
+                        "occur": match clause.occur {
+                            Occur::Must => "Must",
+                            Occur::Should => "Should",
+                            Occur::MustNot => "MustNot",
+                        },
+                        "query": child,
+                    }));
                 }
-                value
-            }
-            Query::Phrase {
-                fields,
-                terms,
-                slop,
-                prefix,
-            } => {
-                let fields = fields
-                    .iter()
-                    .map(|field| {
-                        json!({
-                            "name": field_name(schema, field.field_id),
-                            "boost": field.boost,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let terms = terms
-                    .iter()
-                    .map(|term| term.text.as_str())
-                    .collect::<Vec<_>>();
-                let mut value = json!({
-                    "type": if *prefix { "PhrasePrefix" } else { "Phrase" },
-                    "terms": terms,
-                    "slop": slop,
-                    "fields": fields,
-                });
-                if occur == Some(Occur::MustNot) {
-                    value["score"] = json!(0.0);
-                }
-                value
-            }
-            Query::Boolean { clauses, operator } => {
-                let children = clauses
-                    .iter()
-                    .map(|clause| {
-                        json!({
-                            "occur": match clause.occur {
-                                Occur::Must => "Must",
-                                Occur::Should => "Should",
-                                Occur::MustNot => "MustNot",
-                            },
-                            "query": fixture_json_for_schema(
-                                schema,
-                                &clause.query,
-                                Some(clause.occur),
-                            ),
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                children.reverse();
                 let mut value = json!({ "type": "Boolean", "children": children });
                 if let Some(operator) = operator {
                     value["operator"] = json!(match operator {
@@ -5080,47 +6131,116 @@ mod tests {
                         BooleanOperator::Or => "OR",
                     });
                 }
-                value
-            }
-            Query::Range {
-                field_id,
-                lower,
-                upper,
-            } => {
-                let values = [lower, upper].into_iter().filter_map(|bound| match bound {
-                    Bound::Included(value) | Bound::Excluded(value) => Some(value),
-                    Bound::Unbounded => None,
-                });
-                let mut value = json!({
-                    "type": typed_tag("Range", values),
-                    "field": field_name(schema, *field_id),
-                    "lower": bound_json(lower),
-                    "upper": bound_json(upper),
-                });
-                if schema == CASS_SEMANTIC_SCHEMA {
-                    value["matched_score"] = json!(1.0);
+                values.push(value);
+                continue;
+            };
+            let value = match query.node(node_id) {
+                QueryNode::Empty => json!({ "type": "Empty" }),
+                QueryNode::AllocationFailure { requested } => {
+                    json!({ "type": "AllocationFailure", "requested": requested })
                 }
-                value
-            }
-            Query::Set { field_id, values } => json!({
-                "type": typed_tag("Set", values),
-                "field": field_name(schema, *field_id),
-                "values": values.iter().map(value_json).collect::<Vec<_>>(),
-            }),
-            Query::Glob { field_ids, pattern } => json!({
-                "type": "Glob",
-                "pattern": pattern,
-                "fields": field_ids
-                    .iter()
-                    .map(|field_id| field_name(schema, *field_id))
-                    .collect::<Vec<_>>(),
-            }),
-            Query::Boost { query, factor } => json!({
-                "type": "Boost",
-                "factor": factor,
-                "query": fixture_json_for_schema(schema, query, occur),
-            }),
+                QueryNode::All => json!({ "type": "All" }),
+                QueryNode::Term { fields, text } => {
+                    let fields = fields
+                        .iter()
+                        .map(|field| {
+                            json!({
+                                "name": field_name(schema, field.field_id),
+                                "boost": field.boost,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let mut value = json!({ "type": "Term", "text": text, "fields": fields });
+                    if occur == Some(Occur::MustNot) {
+                        value["score"] = json!(0.0);
+                    }
+                    value
+                }
+                QueryNode::Phrase {
+                    fields,
+                    terms,
+                    slop,
+                    prefix,
+                } => {
+                    let fields = fields
+                        .iter()
+                        .map(|field| {
+                            json!({
+                                "name": field_name(schema, field.field_id),
+                                "boost": field.boost,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let terms = terms
+                        .iter()
+                        .map(|term| term.text.as_str())
+                        .collect::<Vec<_>>();
+                    let mut value = json!({
+                        "type": if *prefix { "PhrasePrefix" } else { "Phrase" },
+                        "terms": terms,
+                        "slop": slop,
+                        "fields": fields,
+                    });
+                    if occur == Some(Occur::MustNot) {
+                        value["score"] = json!(0.0);
+                    }
+                    value
+                }
+                QueryNode::Boolean { clauses, .. } => {
+                    pending.push(JsonTask::BuildBoolean(node_id));
+                    pending.extend(
+                        clauses
+                            .iter()
+                            .rev()
+                            .map(|clause| JsonTask::Visit(clause.query, Some(clause.occur))),
+                    );
+                    continue;
+                }
+                QueryNode::Range {
+                    field_id,
+                    lower,
+                    upper,
+                } => {
+                    let values = [lower, upper].into_iter().filter_map(|bound| match bound {
+                        Bound::Included(value) | Bound::Excluded(value) => Some(value),
+                        Bound::Unbounded => None,
+                    });
+                    let mut value = json!({
+                        "type": typed_tag("Range", values),
+                        "field": field_name(schema, *field_id),
+                        "lower": bound_json(lower),
+                        "upper": bound_json(upper),
+                    });
+                    if schema == CASS_SEMANTIC_SCHEMA {
+                        value["matched_score"] = json!(1.0);
+                    }
+                    value
+                }
+                QueryNode::Set { field_id, values } => json!({
+                    "type": typed_tag("Set", values),
+                    "field": field_name(schema, *field_id),
+                    "values": values.iter().map(value_json).collect::<Vec<_>>(),
+                }),
+                QueryNode::Glob { field_ids, pattern } => json!({
+                    "type": "Glob",
+                    "pattern": pattern,
+                    "fields": field_ids
+                        .iter()
+                        .map(|field_id| field_name(schema, *field_id))
+                        .collect::<Vec<_>>(),
+                }),
+                QueryNode::Boost {
+                    query: child,
+                    factor,
+                } => {
+                    pending.push(JsonTask::BuildBoost(*factor));
+                    pending.push(JsonTask::Visit(*child, occur));
+                    continue;
+                }
+            };
+            values.push(value);
         }
+        values.pop().unwrap_or(Value::Null)
     }
 
     #[test]
@@ -5443,11 +6563,11 @@ mod tests {
                 );
             if case["query_class"] == "glob" {
                 assert_eq!(&cass_wildcard_fixture(input), expected_ast, "fixture {id}");
-                match (CassWildcardPattern::parse(input), &parsed.query) {
+                match (CassWildcardPattern::parse(input), parsed.query.root()) {
                     (
                         CassWildcardPattern::Exact(expected)
                         | CassWildcardPattern::Prefix(expected),
-                        Query::Term { fields, text },
+                        QueryNode::Term { fields, text },
                     ) => {
                         assert_eq!(text, &expected, "native parser glob text for {id}");
                         assert_eq!(
@@ -5460,7 +6580,7 @@ mod tests {
                         CassWildcardPattern::Suffix(_)
                         | CassWildcardPattern::Substring(_)
                         | CassWildcardPattern::Complex(_),
-                        Query::Glob { field_ids, pattern },
+                        QueryNode::Glob { field_ids, pattern },
                     ) => {
                         assert_eq!(pattern, &input.to_lowercase(), "native glob for {id}");
                         assert_eq!(
@@ -5579,8 +6699,8 @@ mod tests {
                 && diagnostic.message.contains("10000 Unicode scalar values")
         }));
         assert!(matches!(
-            truncated.query,
-            Query::Term { ref text, .. } if text == "auth"
+            truncated.query.root(),
+            QueryNode::Term { text, .. } if text == "auth"
         ));
 
         for raw in [
@@ -5604,13 +6724,13 @@ mod tests {
 
         let recovered = parser.parse("NOT AND cache", &CassQueryFilters::default());
         assert!(matches!(
-            recovered.query,
-            Query::Term { ref text, .. } if text == "cache"
+            recovered.query.root(),
+            QueryNode::Term { text, .. } if text == "cache"
         ));
         let recovered = parser.parse("auth OR NOT AND deprecated", &CassQueryFilters::default());
         assert!(matches!(
-            recovered.query,
-            Query::Boolean {
+            recovered.query.root(),
+            QueryNode::Boolean {
                 operator: Some(BooleanOperator::And),
                 ..
             }
@@ -6134,23 +7254,23 @@ mod tests {
     fn explicit_grouping_and_phrase_suffixes_are_retained() {
         let parsed = parser().parse("(rust OR ownership) AND \"error handling\"~2");
         assert!(matches!(
-            &parsed.query,
-            Query::Boolean {
+            parsed.query.root(),
+            QueryNode::Boolean {
                 operator: Some(BooleanOperator::And),
                 ..
             }
         ));
-        let Query::Boolean {
+        let QueryNode::Boolean {
             clauses,
             operator: Some(BooleanOperator::And),
-        } = parsed.query
+        } = parsed.query.root()
         else {
             return;
         };
         assert_eq!(clauses.len(), 2);
         assert!(matches!(
-            clauses[1].query,
-            Query::Phrase {
+            parsed.query.node(clauses[1].query),
+            QueryNode::Phrase {
                 slop: 2,
                 prefix: false,
                 ..
@@ -6159,8 +7279,8 @@ mod tests {
 
         let recovered = parser().parse("\"error handling\"~2*");
         assert!(matches!(
-            recovered.query,
-            Query::Phrase {
+            recovered.query.root(),
+            QueryNode::Phrase {
                 slop: 2,
                 prefix: false,
                 ..
@@ -6175,12 +7295,12 @@ mod tests {
     #[test]
     fn analyzed_phrase_terms_retain_positions() {
         let query = parser().parse("src/main.rs").query;
-        assert!(matches!(&query, Query::Phrase { .. }));
-        let Query::Phrase { terms, .. } = query else {
+        assert!(matches!(query.root(), QueryNode::Phrase { .. }));
+        let QueryNode::Phrase { terms, .. } = query.root() else {
             return;
         };
         assert_eq!(
-            terms,
+            terms.as_slice(),
             [
                 PositionedTerm::new(0, "src"),
                 PositionedTerm::new(1, "main"),
@@ -6198,7 +7318,7 @@ mod tests {
     #[test]
     fn mixed_chain_duplicate_survives_or_run_nesting() {
         let mixed = parser().parse("alpha OR beta AND gamma alpha");
-        let Query::Boolean { clauses, .. } = &mixed.query else {
+        let QueryNode::Boolean { clauses, .. } = mixed.query.root() else {
             panic!("mixed chain must lower to a boolean: {:?}", mixed.query);
         };
         assert_eq!(
@@ -6208,29 +7328,39 @@ mod tests {
              two SURVIVING trailing alpha field leaves: {clauses:?}"
         );
         assert!(
-            is_single_field_term(&clauses[0].query, "alpha", QueryField::new(1, 1.0),)
-                && is_single_field_term(
-                    &clauses[1].query,
-                    "alpha",
-                    QueryField::new(2, TITLE_BOOST),
-                ),
+            is_single_field_term(
+                &mixed.query,
+                clauses[0].query,
+                "alpha",
+                QueryField::new(1, 1.0),
+            ) && is_single_field_term(
+                &mixed.query,
+                clauses[1].query,
+                "alpha",
+                QueryField::new(2, TITLE_BOOST),
+            ),
             "leading operand fields first: {clauses:?}"
         );
         assert!(
-            is_single_field_term(&clauses[3].query, "alpha", QueryField::new(1, 1.0),)
-                && is_single_field_term(
-                    &clauses[4].query,
-                    "alpha",
-                    QueryField::new(2, TITLE_BOOST),
-                ),
+            is_single_field_term(
+                &mixed.query,
+                clauses[3].query,
+                "alpha",
+                QueryField::new(1, 1.0),
+            ) && is_single_field_term(
+                &mixed.query,
+                clauses[4].query,
+                "alpha",
+                QueryField::new(2, TITLE_BOOST),
+            ),
             "the trailing duplicate fields survive after flattening: {clauses:?}"
         );
 
         let pure = parser().parse("alpha alpha");
-        let Query::Boolean {
+        let QueryNode::Boolean {
             clauses: pure_clauses,
             ..
-        } = &pure.query
+        } = pure.query.root()
         else {
             panic!(
                 "two-operand implicit chain lowers to a boolean: {:?}",
@@ -6248,40 +7378,37 @@ mod tests {
     #[test]
     fn field_ids_not_backend_handles_are_stored_in_leaves() {
         let parsed = parser().parse("title:Rust");
-        assert_eq!(
-            parsed.query,
-            Query::Term {
-                fields: vec![QueryField::new(2, TITLE_BOOST)],
-                text: "rust".to_owned(),
-            }
-        );
+        assert!(matches!(
+            parsed.query.root(),
+            QueryNode::Term { fields, text }
+                if fields.as_slice() == [QueryField::new(2, TITLE_BOOST)] && text == "rust"
+        ));
 
         let id = parser().parse("id:Case-Sensitive");
-        assert_eq!(
-            id.query,
-            Query::Term {
-                fields: vec![QueryField::new(0, 1.0)],
-                text: "Case-Sensitive".to_owned(),
-            }
-        );
+        assert!(matches!(
+            id.query.root(),
+            QueryNode::Term { fields, text }
+                if fields.as_slice() == [QueryField::new(0, 1.0)] && text == "Case-Sensitive"
+        ));
     }
 
     #[test]
     fn default_terms_expand_to_ordered_single_field_should_leaves() {
-        assert_eq!(
-            parser().parse("content:release").query,
-            Query::Term {
-                fields: vec![QueryField::new(1, 1.0)],
-                text: "release".to_owned(),
-            },
+        let single = parser().parse("content:release").query;
+        assert!(
+            matches!(
+                single.root(),
+                QueryNode::Term { fields, text }
+                    if fields.as_slice() == [QueryField::new(1, 1.0)] && text == "release"
+            ),
             "an explicitly single-field term must remain one leaf"
         );
 
         let parsed = parser().parse("(release OR require) OR return");
-        let Query::Boolean { clauses, operator } = parsed.query else {
+        let QueryNode::Boolean { clauses, operator } = parsed.query.root() else {
             panic!("unfielded three-term OR must lower to an ordered boolean");
         };
-        assert_eq!(operator, Some(BooleanOperator::Or));
+        assert_eq!(*operator, Some(BooleanOperator::Or));
         let expected = [
             ("release", QueryField::new(1, 1.0)),
             ("release", QueryField::new(2, TITLE_BOOST)),
@@ -6293,13 +7420,12 @@ mod tests {
         assert_eq!(clauses.len(), expected.len());
         for (clause, (text, field)) in clauses.iter().zip(expected) {
             assert_eq!(clause.occur, Occur::Should);
-            assert_eq!(
+            assert!(is_single_field_term(
+                &parsed.query,
                 clause.query,
-                Query::Term {
-                    fields: vec![field],
-                    text: text.to_owned(),
-                }
-            );
+                text,
+                field
+            ));
         }
     }
 
@@ -6337,8 +7463,8 @@ mod tests {
         // Occurrence is part of the syntax key, and duplicate exclusions merge
         // exactly as duplicate positive clauses do.
         let merged = parser().parse("-rust -rust").query;
-        let count_must_not = |query: &Query| match query {
-            Query::Boolean { clauses, .. } => clauses
+        let count_must_not = |query: &Query| match query.root() {
+            QueryNode::Boolean { clauses, .. } => clauses
                 .iter()
                 .filter(|clause| clause.occur == Occur::MustNot)
                 .count(),
@@ -6349,8 +7475,8 @@ mod tests {
         for raw in ["rust^2^3", "(rust)^2^3", "\"rust\"^2^3"] {
             let recovered = parser().parse(raw);
             assert!(matches!(
-                recovered.query,
-                Query::Boost { factor, .. } if factor.to_bits() == 2.0_f32.to_bits()
+                recovered.query.root(),
+                QueryNode::Boost { factor, .. } if factor.to_bits() == 2.0_f32.to_bits()
             ));
             assert!(recovered.diagnostics.iter().any(|diagnostic| {
                 diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
@@ -6367,8 +7493,8 @@ mod tests {
         );
         let trailing_decimal = parser().parse("rust^2.");
         assert!(matches!(
-            trailing_decimal.query,
-            Query::Boost { factor, .. } if factor.to_bits() == 2.0_f32.to_bits()
+            trailing_decimal.query.root(),
+            QueryNode::Boost { factor, .. } if factor.to_bits() == 2.0_f32.to_bits()
         ));
         assert!(trailing_decimal.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
@@ -6387,11 +7513,15 @@ mod tests {
         );
 
         let scoped = parser().parse("title:(rust) content:(rust)").query;
-        let Query::Boolean { clauses, .. } = scoped else {
+        let QueryNode::Boolean { clauses, .. } = scoped.root() else {
             return;
         };
         assert_eq!(clauses.len(), 2);
-        assert_ne!(clauses[0].query, clauses[1].query);
+        assert!(!query_subtree_eq(
+            &scoped,
+            clauses[0].query,
+            clauses[1].query
+        ));
 
         let recovered = parser().parse("unknown:(bad title:good)");
         assert!(
@@ -6410,28 +7540,39 @@ mod tests {
 
     #[test]
     fn parser_syntax_rewrite_stops_at_non_identity_boosts() {
-        let Query::Boost { query, factor } = parser().parse("(rust rust)^2").query else {
+        let boosted = parser().parse("(rust rust)^2").query;
+        let QueryNode::Boost { query, factor } = boosted.root() else {
             panic!("the group boost must survive");
         };
         assert_eq!(factor.to_bits(), 2.0_f32.to_bits());
-        let Query::Boolean { clauses, .. } = *query else {
+        let QueryNode::Boolean { clauses, .. } = boosted.node(*query) else {
             panic!("the boosted group must retain its Boolean syntax boundary");
         };
         assert_eq!(clauses.len(), 2, "rewrite_ast does not enter Boost");
-        assert_eq!(clauses[0].query, clauses[1].query);
+        assert!(query_subtree_eq(
+            &boosted,
+            clauses[0].query,
+            clauses[1].query
+        ));
 
-        let Query::Boolean { clauses, .. } = parser().parse("(rust rust)^2 rust^2").query else {
+        let siblings = parser().parse("(rust rust)^2 rust^2").query;
+        let QueryNode::Boolean { clauses, .. } = siblings.root() else {
             panic!("the distinct boosted siblings must both survive");
         };
         assert_eq!(clauses.len(), 2);
-        assert_ne!(clauses[0].query, clauses[1].query);
+        assert!(!query_subtree_eq(
+            &siblings,
+            clauses[0].query,
+            clauses[1].query
+        ));
     }
 
     #[test]
     fn parser_syntax_rewrite_flattens_singletons_and_transfers_occurrence() {
         assert!(is_default_term(&parser().parse("+a").query, "a"));
         assert!(is_default_term(&parser().parse("(+a)").query, "a"));
-        let Query::Boolean { clauses, .. } = parser().parse("(+a) a").query else {
+        let rewritten = parser().parse("(+a) a").query;
+        let QueryNode::Boolean { clauses, .. } = rewritten.root() else {
             panic!("the rewritten duplicate keeps its root Boolean");
         };
         assert_eq!(
@@ -6440,14 +7581,19 @@ mod tests {
             "singleton unary Must is erased before the surviving term expands by field"
         );
 
-        let Query::Boolean { clauses, .. } = parser().parse("(+unknown:x^2) a").query else {
+        let boosted_empty = parser().parse("(+unknown:x^2) a").query;
+        let QueryNode::Boolean { clauses, .. } = boosted_empty.root() else {
             panic!("the optional boosted-empty branch and term remain Boolean");
         };
         assert_eq!(clauses.len(), 3);
         assert!(clauses.iter().all(|clause| clause.occur == Occur::Should));
-        assert!(matches!(clauses[0].query, Query::Boost { .. }));
+        assert!(matches!(
+            boosted_empty.node(clauses[0].query),
+            QueryNode::Boost { .. }
+        ));
 
-        let Query::Boolean { clauses, .. } = parser().parse("(-a) b").query else {
+        let negative = parser().parse("(-a) b").query;
+        let QueryNode::Boolean { clauses, .. } = negative.root() else {
             panic!("negative group plus optional term must remain Boolean");
         };
         assert_eq!(clauses.len(), 3);
@@ -6455,7 +7601,8 @@ mod tests {
         assert_eq!(clauses[1].occur, Occur::Should);
         assert_eq!(clauses[2].occur, Occur::Should);
 
-        let Query::Boolean { clauses, .. } = parser().parse("(a AND a) b").query else {
+        let required = parser().parse("(a AND a) b").query;
+        let QueryNode::Boolean { clauses, .. } = required.root() else {
             panic!("required group plus optional term must remain Boolean");
         };
         assert_eq!(clauses.len(), 3);
@@ -6463,11 +7610,12 @@ mod tests {
         assert_eq!(clauses[1].occur, Occur::Should);
         assert_eq!(clauses[2].occur, Occur::Should);
 
-        let Query::Boolean { clauses, .. } = parser().parse("((a AND a) b) (+a b)").query else {
+        let equal_groups = parser().parse("((a AND a) b) (+a b)").query;
+        let QueryNode::Boolean { clauses, .. } = equal_groups.root() else {
             panic!("the rewritten root must remain Boolean");
         };
         assert_eq!(clauses.len(), 1, "recursively equal groups deduplicate");
-        let Query::Boolean { clauses: inner, .. } = &clauses[0].query else {
+        let QueryNode::Boolean { clauses: inner, .. } = equal_groups.node(clauses[0].query) else {
             panic!("the two-clause child must retain its grouping");
         };
         assert_eq!(inner.len(), 3);
@@ -6475,30 +7623,38 @@ mod tests {
         assert_eq!(inner[1].occur, Occur::Should);
         assert_eq!(inner[2].occur, Occur::Should);
 
-        let Query::Boolean { clauses, .. } = parser().parse("(a AND a) +a").query else {
+        let flattened = parser().parse("(a AND a) +a").query;
+        let QueryNode::Boolean { clauses, .. } = flattened.root() else {
             panic!("dedup-before-flatten must leave the root Boolean");
         };
         assert_eq!(clauses.len(), 2, "the rewrite does not dedup a second time");
         assert!(clauses.iter().all(|clause| clause.occur == Occur::Must));
-        assert_eq!(clauses[0].query, clauses[1].query);
+        assert!(query_subtree_eq(
+            &flattened,
+            clauses[0].query,
+            clauses[1].query
+        ));
     }
 
     #[test]
     fn parser_syntax_rewrite_retains_lowered_away_raw_identity_until_trim() {
-        let Query::Boolean { clauses, .. } = parser().parse("(a /x/) (a /y/)").query else {
+        let distinct_regex = parser().parse("(a /x/) (a /y/)").query;
+        let QueryNode::Boolean { clauses, .. } = distinct_regex.root() else {
             panic!("raw-distinct groups must both survive");
         };
         assert_eq!(clauses.len(), 4);
         // Raw-identity dedup ran on the NESTED syntax (distinct /x/ vs /y/
         // prevent it), then the post-trim singleton groups splice into the
         // parent for oracle-associated execution (bd-htcun flatten).
-        assert!(
-            clauses
-                .iter()
-                .all(|clause| { matches!(&clause.query, Query::Term { text, .. } if text == "a") })
-        );
+        assert!(clauses.iter().all(|clause| {
+            matches!(
+                distinct_regex.node(clause.query),
+                QueryNode::Term { text, .. } if text == "a"
+            )
+        }));
 
-        let Query::Boolean { clauses, .. } = parser().parse("(a /x/) (a /x/)").query else {
+        let duplicate_regex = parser().parse("(a /x/) (a /x/)").query;
+        let QueryNode::Boolean { clauses, .. } = duplicate_regex.root() else {
             panic!("the rewritten duplicate keeps its root Boolean");
         };
         assert_eq!(
@@ -6507,22 +7663,24 @@ mod tests {
             "raw-identical groups deduplicate before the two-field expansion"
         );
 
-        let Query::Boolean { clauses, .. } = parser().parse("(a unknown:x) (a unknown:y)").query
-        else {
+        let distinct_unknown = parser().parse("(a unknown:x) (a unknown:y)").query;
+        let QueryNode::Boolean { clauses, .. } = distinct_unknown.root() else {
             panic!("distinct unknown-field syntax must prevent parent dedup");
         };
         assert_eq!(clauses.len(), 4);
 
-        let Query::Boost { query, .. } = parser().parse("(a AND unknown:x)^2").query else {
+        let boosted = parser().parse("(a AND unknown:x)^2").query;
+        let QueryNode::Boost { query, .. } = boosted.root() else {
             panic!("a valid boost remains a lowering boundary");
         };
-        let Query::Boolean { clauses, .. } = *query else {
+        let QueryNode::Boolean { clauses, .. } = boosted.node(*query) else {
             panic!("the boosted conjunction remains Boolean");
         };
         assert_eq!(clauses.len(), 1, "semantic drops trim inside Boost");
         assert_eq!(clauses[0].occur, Occur::Must);
 
-        let Query::Boolean { clauses, .. } = parser().parse("a unknown:x^1.00000001").query else {
+        let f64_only = parser().parse("a unknown:x^1.00000001").query;
+        let QueryNode::Boolean { clauses, .. } = f64_only.root() else {
             panic!("the valid sibling keeps the root Boolean");
         };
         assert_eq!(
@@ -6542,7 +7700,7 @@ mod tests {
                     .iter()
                     .any(|diagnostic| { diagnostic.kind == QueryDiagnosticKind::InvalidBoost })
             );
-            let Query::Boolean { clauses, .. } = parsed.query else {
+            let QueryNode::Boolean { clauses, .. } = parsed.query.root() else {
                 panic!("the recovered duplicate keeps the rewritten root clause");
             };
             assert_eq!(
@@ -6551,9 +7709,8 @@ mod tests {
                 "the invalid boost is absent before the surviving term expands by field"
             );
 
-            let Query::Boolean { clauses, .. } =
-                parser().parse(&format!("(rust rust)^{overflowing}")).query
-            else {
+            let group = parser().parse(&format!("(rust rust)^{overflowing}")).query;
+            let QueryNode::Boolean { clauses, .. } = group.root() else {
                 panic!("the recovered group keeps its rewritten root Boolean");
             };
             assert_eq!(
@@ -6571,16 +7728,12 @@ mod tests {
         let exists = typed_parser.parse("unsigned:*");
         assert_eq!(
             exists.query,
-            Query::Range {
-                field_id: 4,
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            }
+            Query::range(4, Bound::Unbounded, Bound::Unbounded)
         );
         assert!(exists.diagnostics.is_empty());
 
         let non_fast = typed_parser.parse("signed:*");
-        assert_eq!(non_fast.query, Query::Empty);
+        assert_eq!(non_fast.query, Query::empty());
         assert!(non_fast.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == QueryDiagnosticKind::UnsupportedField
                 && diagnostic
@@ -6595,21 +7748,21 @@ mod tests {
             DefaultQueryParser::new(TYPED_SCHEMA).expect("typed test schema is valid");
         assert_eq!(
             typed_parser.parse("signed:[-5 TO 10}").query,
-            Query::Range {
-                field_id: 3,
-                lower: Bound::Included(QueryValue::I64(-5)),
-                upper: Bound::Excluded(QueryValue::I64(10)),
-            }
+            Query::range(
+                3,
+                Bound::Included(QueryValue::I64(-5)),
+                Bound::Excluded(QueryValue::I64(10)),
+            )
         );
         assert_eq!(
             typed_parser
                 .parse("unsigned: >= 18446744073709551615")
                 .query,
-            Query::Range {
-                field_id: 4,
-                lower: Bound::Included(QueryValue::U64(u64::MAX)),
-                upper: Bound::Unbounded,
-            }
+            Query::range(
+                4,
+                Bound::Included(QueryValue::U64(u64::MAX)),
+                Bound::Unbounded,
+            )
         );
 
         for raw in [
@@ -6618,7 +7771,8 @@ mod tests {
             "signed:<5 signed:[* TO 5}",
             "signed:>=5 signed:[5 TO *]",
         ] {
-            let Query::Boolean { clauses, .. } = typed_parser.parse(raw).query else {
+            let parsed = typed_parser.parse(raw);
+            let QueryNode::Boolean { clauses, .. } = parsed.query.root() else {
                 panic!("equivalent unbounded ranges must retain one root clause: {raw}");
             };
             assert_eq!(
@@ -6631,11 +7785,7 @@ mod tests {
         let partial = typed_parser.parse("unsigned:[bad TO 3]");
         assert_eq!(
             partial.query,
-            Query::Range {
-                field_id: 4,
-                lower: Bound::Unbounded,
-                upper: Bound::Included(QueryValue::U64(3)),
-            }
+            Query::range(4, Bound::Unbounded, Bound::Included(QueryValue::U64(3)),)
         );
         assert!(
             partial
@@ -6647,52 +7797,40 @@ mod tests {
         let set = typed_parser.parse("unsigned: IN [1 bad 2 1]");
         assert_eq!(
             set.query,
-            Query::Set {
-                field_id: 4,
-                values: vec![QueryValue::U64(1), QueryValue::U64(2)],
-            }
+            Query::set(4, Vec::from([QueryValue::U64(1), QueryValue::U64(2)]),)
         );
         assert_eq!(
             typed_parser.parse("unsigned: IN []").query,
-            Query::Set {
-                field_id: 4,
-                values: Vec::new(),
-            }
+            Query::set(4, Vec::new())
         );
         assert_eq!(
             parser().parse(r#"id: IN [foo,bar ""]"#).query,
-            Query::Set {
-                field_id: 0,
-                values: vec![
+            Query::set(
+                0,
+                Vec::from([
                     QueryValue::Str("foo,bar".to_owned()),
                     QueryValue::Str(String::new()),
-                ],
-            }
+                ]),
+            )
         );
         assert_eq!(
             parser().parse(r#"id: IN ["foo]bar"]"#).query,
-            Query::Set {
-                field_id: 0,
-                values: vec![QueryValue::Str("foo]bar".to_owned())],
-            }
+            Query::set(0, Vec::from([QueryValue::Str("foo]bar".to_owned())]))
         );
         assert_eq!(
             parser().parse(r#"id: IN ["foo\q"]"#).query,
-            Query::Set {
-                field_id: 0,
-                values: vec![QueryValue::Str("fooq".to_owned())],
-            }
+            Query::set(0, Vec::from([QueryValue::Str("fooq".to_owned())]))
         );
         let unterminated_set = parser().parse("id: IN [doc-a doc-b");
         assert_eq!(
             unterminated_set.query,
-            Query::Set {
-                field_id: 0,
-                values: vec![
+            Query::set(
+                0,
+                Vec::from([
                     QueryValue::Str("doc-a".to_owned()),
                     QueryValue::Str("doc-b".to_owned()),
-                ],
-            }
+                ]),
+            )
         );
         assert!(unterminated_set.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
@@ -6700,28 +7838,28 @@ mod tests {
         }));
         assert_eq!(
             parser().parse(r"id:[foo\ bar TO z]").query,
-            Query::Range {
-                field_id: 0,
-                lower: Bound::Included(QueryValue::Str("foo bar".to_owned())),
-                upper: Bound::Included(QueryValue::Str("z".to_owned())),
-            }
+            Query::range(
+                0,
+                Bound::Included(QueryValue::Str("foo bar".to_owned())),
+                Bound::Included(QueryValue::Str("z".to_owned())),
+            )
         );
         assert_eq!(
             parser().parse(r"id:[foo\\:bar TO z]").query,
-            Query::Range {
-                field_id: 0,
-                lower: Bound::Included(QueryValue::Str(r"foo\:bar".to_owned())),
-                upper: Bound::Included(QueryValue::Str("z".to_owned())),
-            }
+            Query::range(
+                0,
+                Bound::Included(QueryValue::Str(r"foo\:bar".to_owned())),
+                Bound::Included(QueryValue::Str("z".to_owned())),
+            )
         );
         let unterminated = parser().parse("id:[a TO z");
         assert_eq!(
             unterminated.query,
-            Query::Range {
-                field_id: 0,
-                lower: Bound::Included(QueryValue::Str("a".to_owned())),
-                upper: Bound::Included(QueryValue::Str("z".to_owned())),
-            }
+            Query::range(
+                0,
+                Bound::Included(QueryValue::Str("a".to_owned())),
+                Bound::Included(QueryValue::Str("z".to_owned())),
+            )
         );
         assert!(unterminated.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
@@ -6730,11 +7868,11 @@ mod tests {
         let missing_to = parser().parse("id:[a z]");
         assert_eq!(
             missing_to.query,
-            Query::Range {
-                field_id: 0,
-                lower: Bound::Included(QueryValue::Str("a".to_owned())),
-                upper: Bound::Included(QueryValue::Str("z".to_owned())),
-            }
+            Query::range(
+                0,
+                Bound::Included(QueryValue::Str("a".to_owned())),
+                Bound::Included(QueryValue::Str("z".to_owned())),
+            )
         );
         assert!(missing_to.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
@@ -6743,19 +7881,19 @@ mod tests {
         for raw in ["id:[a TO", "id:[a"] {
             assert_eq!(
                 parser().parse(raw).query,
-                Query::Range {
-                    field_id: 0,
-                    lower: Bound::Included(QueryValue::Str("a".to_owned())),
-                    upper: Bound::Unbounded,
-                },
+                Query::range(
+                    0,
+                    Bound::Included(QueryValue::Str("a".to_owned())),
+                    Bound::Unbounded,
+                ),
                 "{raw}"
             );
         }
         assert!(typed_parser.parse("stored:[a TO b]").query.is_empty());
         let positionless_phrase = typed_parser.parse("summary:\"two words\"");
         assert!(matches!(
-            positionless_phrase.query,
-            Query::Phrase { ref terms, .. } if terms.len() == 2
+            positionless_phrase.query.root(),
+            QueryNode::Phrase { terms, .. } if terms.len() == 2
         ));
         assert!(matches!(
             validate_index_capabilities(&positionless_phrase.query, TYPED_SCHEMA),
@@ -6770,18 +7908,15 @@ mod tests {
 
         assert_eq!(
             parser().parse("ord:[0 TO 1]").query,
-            Query::Range {
-                field_id: 4,
-                lower: Bound::Included(QueryValue::U64(0)),
-                upper: Bound::Included(QueryValue::U64(1)),
-            }
+            Query::range(
+                4,
+                Bound::Included(QueryValue::U64(0)),
+                Bound::Included(QueryValue::U64(1)),
+            )
         );
         assert_eq!(
             parser().parse("ord: IN [0 1]").query,
-            Query::Set {
-                field_id: 4,
-                values: vec![QueryValue::U64(0), QueryValue::U64(1)],
-            }
+            Query::set(4, Vec::from([QueryValue::U64(0), QueryValue::U64(1)]),)
         );
     }
 
@@ -6813,16 +7948,13 @@ mod tests {
         );
 
         let all_negative = parser().parse("(-alpha) OR (-beta)");
-        let Query::Boolean { clauses, .. } = all_negative.query else {
+        let QueryNode::Boolean { clauses, .. } = all_negative.query.root() else {
             return;
         };
-        assert!(matches!(
-            clauses.last(),
-            Some(BooleanClause {
-                occur: Occur::Should,
-                query: Query::All
-            })
-        ));
+        assert!(
+            matches!(clauses.last(), Some(QueryClause { occur: Occur::Should, query })
+            if matches!(all_negative.query.node(*query), QueryNode::All))
+        );
         assert!(
             all_negative
                 .diagnostics
@@ -6831,26 +7963,27 @@ mod tests {
         );
 
         let boosted = parser().parse("(-alpha)^2");
-        assert!(matches!(
-            boosted.query,
-            Query::Boost { ref query, .. }
-                if matches!(query.as_ref(), Query::Boolean { clauses, .. }
-                    if matches!(clauses.last(), Some(BooleanClause {
-                        occur: Occur::Should,
-                        query: Query::All,
-                    })))
-        ));
+        let QueryNode::Boost { query, .. } = boosted.query.root() else {
+            panic!("boost must remain outermost");
+        };
+        let QueryNode::Boolean { clauses, .. } = boosted.query.node(*query) else {
+            panic!("negative repair must remain inside the boost");
+        };
+        assert!(
+            matches!(clauses.last(), Some(QueryClause { occur: Occur::Should, query })
+            if matches!(boosted.query.node(*query), QueryNode::All))
+        );
     }
 
     #[test]
     fn quoted_escapes_single_quotes_and_phrase_prefix_errors_are_pinned() {
         assert!(matches!(
-            parser().parse("title:'error handling'").query,
-            Query::Phrase { ref terms, .. } if terms.len() == 2
+            parser().parse("title:'error handling'").query.root(),
+            QueryNode::Phrase { terms, .. } if terms.len() == 2
         ));
         assert!(matches!(
-            parser().parse(r#"title:"say \"hello\"""#).query,
-            Query::Phrase { ref terms, .. }
+            parser().parse(r#"title:"say \"hello\"""#).query.root(),
+            QueryNode::Phrase { terms, .. }
                 if terms.iter().map(|term| term.text.as_str()).eq(["say", "hello"])
         ));
         let prefix = parser().parse("\"word\"*");
@@ -6863,21 +7996,25 @@ mod tests {
         );
 
         let malformed_slop = parser().parse("\"rust ownership\"~deprecated");
+        let QueryNode::Boolean { clauses, .. } = malformed_slop.query.root() else {
+            panic!("malformed slop must retain phrase and trailing fragments");
+        };
+        assert_eq!(clauses.len(), 3);
         assert!(matches!(
-            malformed_slop.query,
-            Query::Boolean { ref clauses, .. }
-                if clauses.len() == 3
-                    && matches!(&clauses[0].query, Query::Phrase { slop: 0, .. })
-                    && is_single_field_term(
-                        &clauses[1].query,
-                        "deprecated",
-                        QueryField::new(1, 1.0),
-                    )
-                    && is_single_field_term(
-                        &clauses[2].query,
-                        "deprecated",
-                        QueryField::new(2, TITLE_BOOST),
-                    )
+            malformed_slop.query.node(clauses[0].query),
+            QueryNode::Phrase { slop: 0, .. }
+        ));
+        assert!(is_single_field_term(
+            &malformed_slop.query,
+            clauses[1].query,
+            "deprecated",
+            QueryField::new(1, 1.0),
+        ));
+        assert!(is_single_field_term(
+            &malformed_slop.query,
+            clauses[2].query,
+            "deprecated",
+            QueryField::new(2, TITLE_BOOST),
         ));
         assert!(malformed_slop.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
@@ -6887,21 +8024,25 @@ mod tests {
         }));
 
         let overflowing_slop = parser().parse("\"rust ownership\"~4294967296");
+        let QueryNode::Boolean { clauses, .. } = overflowing_slop.query.root() else {
+            panic!("overflowing slop must retain phrase and trailing fragments");
+        };
+        assert_eq!(clauses.len(), 3);
         assert!(matches!(
-            overflowing_slop.query,
-            Query::Boolean { ref clauses, .. }
-                if clauses.len() == 3
-                    && matches!(&clauses[0].query, Query::Phrase { slop: 0, .. })
-                    && is_single_field_term(
-                        &clauses[1].query,
-                        "4294967296",
-                        QueryField::new(1, 1.0),
-                    )
-                    && is_single_field_term(
-                        &clauses[2].query,
-                        "4294967296",
-                        QueryField::new(2, TITLE_BOOST),
-                    )
+            overflowing_slop.query.node(clauses[0].query),
+            QueryNode::Phrase { slop: 0, .. }
+        ));
+        assert!(is_single_field_term(
+            &overflowing_slop.query,
+            clauses[1].query,
+            "4294967296",
+            QueryField::new(1, 1.0),
+        ));
+        assert!(is_single_field_term(
+            &overflowing_slop.query,
+            clauses[2].query,
+            "4294967296",
+            QueryField::new(2, TITLE_BOOST),
         ));
     }
 
@@ -6909,24 +8050,15 @@ mod tests {
     fn unquoted_escapes_and_unsupported_regex_recover_without_retargeting() {
         assert_eq!(
             parser().parse(r"id:foo\ bar").query,
-            Query::Term {
-                fields: vec![QueryField::new(0, 1.0)],
-                text: "foo bar".to_owned(),
-            }
+            Query::term(Vec::from([QueryField::new(0, 1.0)]), "foo bar".to_owned())
         );
         assert_eq!(
             parser().parse(r"id:foo\:bar").query,
-            Query::Term {
-                fields: vec![QueryField::new(0, 1.0)],
-                text: "foo:bar".to_owned(),
-            }
+            Query::term(Vec::from([QueryField::new(0, 1.0)]), "foo:bar".to_owned())
         );
         assert_eq!(
             parser().parse(r"id:foo\q").query,
-            Query::Term {
-                fields: vec![QueryField::new(0, 1.0)],
-                text: r"foo\q".to_owned(),
-            }
+            Query::term(Vec::from([QueryField::new(0, 1.0)]), r"foo\q".to_owned())
         );
 
         let regex = parser().parse("/rust/");
@@ -6935,48 +8067,53 @@ mod tests {
             diagnostic.kind == QueryDiagnosticKind::DroppedFragment
                 && diagnostic.message.contains("regular-expression")
         }));
-        assert!(matches!(
-            parser().parse("-/rust/ rust").query,
-            Query::Boolean { ref clauses, .. }
-                if clauses.len() == 2
-                    && is_single_field_term(
-                        &clauses[0].query,
-                        "rust",
-                        QueryField::new(1, 1.0),
-                    )
-                    && is_single_field_term(
-                        &clauses[1].query,
-                        "rust",
-                        QueryField::new(2, TITLE_BOOST),
-                    )
+        let recovered = parser().parse("-/rust/ rust").query;
+        let QueryNode::Boolean { clauses, .. } = recovered.root() else {
+            panic!("surviving term must retain default-field expansion");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(is_single_field_term(
+            &recovered,
+            clauses[0].query,
+            "rust",
+            QueryField::new(1, 1.0),
+        ));
+        assert!(is_single_field_term(
+            &recovered,
+            clauses[1].query,
+            "rust",
+            QueryField::new(2, TITLE_BOOST),
         ));
     }
 
     #[test]
     fn parser_dedup_is_raw_and_preserves_distinct_normalized_fragments() {
         let distinct = parser().parse("Rust rust").query;
-        assert!(matches!(&distinct, Query::Boolean { .. }));
+        assert!(matches!(distinct.root(), QueryNode::Boolean { .. }));
         assert_eq!(term_leaf_count(&distinct, "rust"), 4);
 
         // Idempotent MustNot clauses DO merge, even nested.
         let recursive = parser().parse("a OR -b OR (-b)").query;
         assert!(matches!(
-            recursive,
-            Query::Boolean { ref clauses, .. } if clauses.len() == 3
+            recursive.root(),
+            QueryNode::Boolean { clauses, .. } if clauses.len() == 3
         ));
     }
 
     #[test]
     fn all_negative_repair_is_root_only() {
         let query = parser().parse("rust OR (-deprecated)").query;
-        assert!(matches!(&query, Query::Boolean { .. }));
-        let Query::Boolean { clauses, .. } = query else {
+        assert!(matches!(query.root(), QueryNode::Boolean { .. }));
+        let QueryNode::Boolean { clauses, .. } = query.root() else {
             return;
         };
-        assert!(matches!(&clauses[2].query, Query::Boolean { .. }));
-        let Query::Boolean {
+        assert!(matches!(
+            query.node(clauses[2].query),
+            QueryNode::Boolean { .. }
+        ));
+        let QueryNode::Boolean {
             clauses: negative, ..
-        } = &clauses[2].query
+        } = query.node(clauses[2].query)
         else {
             return;
         };
@@ -7040,9 +8177,9 @@ mod tests {
     /// from the string parser or an already-built AST.
     #[test]
     fn capability_gate_rejects_a_constructed_phrase_on_positionless_fields() {
-        let phrase = Query::Phrase {
-            fields: vec![QueryField::new(0, 1.0)],
-            terms: vec![
+        let phrase = Query::phrase(
+            Vec::from([QueryField::new(0, 1.0)]),
+            Vec::from([
                 PositionedTerm {
                     position: 0,
                     text: "alpha".to_owned(),
@@ -7051,10 +8188,10 @@ mod tests {
                     position: 1,
                     text: "beta".to_owned(),
                 },
-            ],
-            slop: 0,
-            prefix: false,
-        };
+            ]),
+            0,
+            false,
+        );
 
         let error = validate_index_capabilities(&phrase, POSITIONLESS_SCHEMA)
             .expect_err("a multi-term phrase reads positions and cannot be served");
@@ -7063,7 +8200,10 @@ mod tests {
             field,
             operator,
             capability,
-        } = error;
+        } = error
+        else {
+            panic!("constructed phrase must fail on missing positions");
+        };
         assert_eq!(schema, "query-parser-positionless-test");
         // The error names the offending FIELD, not a bare "unsupported query".
         assert_eq!(field, "content");
@@ -7071,13 +8211,7 @@ mod tests {
         assert_eq!(capability, IndexCapability::Positions);
 
         // Nesting must not launder it.
-        let nested = Query::Boolean {
-            clauses: vec![BooleanClause {
-                occur: Occur::Should,
-                query: phrase,
-            }],
-            operator: None,
-        };
+        let nested = Query::boolean(Vec::from([BooleanClause::new(Occur::Should, phrase)]), None);
         assert!(validate_index_capabilities(&nested, POSITIONLESS_SCHEMA).is_err());
     }
 
@@ -7089,7 +8223,7 @@ mod tests {
 
         assert_ne!(
             parsed.query,
-            Query::Empty,
+            Query::empty(),
             "a capability mismatch must not silently erase the parsed branch"
         );
         let error = validate_index_capabilities(&parsed.query, POSITIONLESS_SCHEMA)
@@ -7199,33 +8333,30 @@ mod tests {
 
     #[test]
     fn range_and_glob_ast_variants_use_stable_field_ids() {
-        let range = Query::Range {
-            field_id: 5,
-            lower: Bound::Included(QueryValue::I64(10)),
-            upper: Bound::Excluded(QueryValue::I64(20)),
-        };
-        let set = Query::Set {
-            field_id: 5,
-            values: vec![QueryValue::I64(10), QueryValue::I64(20)],
-        };
-        let glob = Query::Glob {
-            field_ids: vec![6, 7],
-            pattern: "cache*".to_owned(),
-        };
-        assert!(matches!(range, Query::Range { field_id: 5, .. }));
-        assert!(matches!(set, Query::Set { field_id: 5, .. }));
-        assert!(matches!(glob, Query::Glob { field_ids, .. } if field_ids == [6, 7]));
+        let range = Query::range(
+            5,
+            Bound::Included(QueryValue::I64(10)),
+            Bound::Excluded(QueryValue::I64(20)),
+        );
+        let set = Query::set(5, Vec::from([QueryValue::I64(10), QueryValue::I64(20)]));
+        let glob = Query::glob(Vec::from([6, 7]), "cache*".to_owned());
+        assert!(matches!(range.root(), QueryNode::Range { field_id: 5, .. }));
+        assert!(matches!(set.root(), QueryNode::Set { field_id: 5, .. }));
+        assert!(
+            matches!(glob.root(), QueryNode::Glob { field_ids, .. } if field_ids.as_slice() == [6, 7])
+        );
     }
 
     #[test]
-    fn recursive_depth_is_bounded() {
+    fn parser_depth_is_independent_of_the_native_stack() {
         let mut query = "needle".to_owned();
         for _ in 0..MAX_QUERY_DEPTH + 20 {
             query = format!("needle OR ({query})");
         }
         let parsed = parser().parse(&query);
+        assert!(!parsed.query.is_empty());
         assert!(
-            parsed
+            !parsed
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::DepthLimit)
@@ -7438,9 +8569,9 @@ mod tests {
 
     /// Parse through the real Grammar while bypassing the public 10,000-byte
     /// truncation, so the oversized-token admission branch is exercisable.
-    fn parse_untruncated(parser: &DefaultQueryParser, query: &str) -> ParsedQuery {
+    fn parse_untruncated(parser: &DefaultQueryParser, input: &str) -> ParsedQuery {
         let mut diagnostics = Vec::new();
-        let tokens = lex(query, &mut diagnostics);
+        let tokens = lex(input, &mut diagnostics);
         let mut grammar = Grammar {
             parser: *parser,
             tokens,
@@ -7448,19 +8579,34 @@ mod tests {
             diagnostics,
             lowered_atoms: Vec::new(),
             field_scopes: Vec::new(),
+            allocation_failure: None,
         };
+        grammar.lower_primary_tokens();
+        grammar.collapse_groups();
         grammar.recover_leading_binary_operators();
-        let mut parsed = grammar.parse_expression(0);
+        let mut parsed = grammar.parse_expression();
         grammar.recover_trailing_tokens();
-        if let Some(node) = parsed.as_mut() {
-            rewrite_parser_syntax(node);
-            trim_parser_dropped(&mut node.query, &node.dedup_key);
-            flatten_should_of_should(&mut node.query);
+        if let Some(requested) = parsed
+            .as_ref()
+            .and_then(|node| node.dedup_key.allocation_failure())
+        {
+            grammar.allocation_failure("query syntax arena", requested);
         }
-        repair_root_all_negative(&mut parsed, &mut grammar);
+        if grammar.allocation_failure.is_none() {
+            if let Some(node) = parsed.as_mut() {
+                rewrite_parser_syntax(node);
+                trim_parser_dropped(&mut node.query, &node.dedup_key);
+                flatten_should_of_should(&mut node.query);
+            }
+            repair_root_all_negative(&mut parsed, &mut grammar);
+        }
+        let arena_query = grammar.allocation_failure.map_or_else(
+            || parsed.map_or_else(Query::empty, |node| node.query),
+            Query::arena_allocation_failure,
+        );
         ParsedQuery {
-            query: parsed.map_or(Query::Empty, |node| node.query),
-            explanation: classify_query(query),
+            query: arena_query,
+            explanation: classify_query(input),
             diagnostics: grammar.diagnostics,
             was_truncated: false,
         }
@@ -7487,19 +8633,28 @@ mod tests {
                 .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::Truncated)
         );
         fn max_term_bytes(query: &Query) -> usize {
-            match query {
-                Query::Term { text, .. } => text.len(),
-                Query::Phrase { terms, .. } => {
-                    terms.iter().map(|term| term.text.len()).max().unwrap_or(0)
+            let mut maximum = 0;
+            let mut stack = Vec::from([query.root_id()]);
+            while let Some(node_id) = stack.pop() {
+                match query.node(node_id) {
+                    QueryNode::Term { text, .. } => maximum = maximum.max(text.len()),
+                    QueryNode::Phrase { terms, .. } => {
+                        maximum = maximum
+                            .max(terms.iter().map(|term| term.text.len()).max().unwrap_or(0));
+                    }
+                    QueryNode::Boolean { clauses, .. } => {
+                        stack.extend(clauses.iter().map(|clause| clause.query));
+                    }
+                    QueryNode::Boost { query, .. } => stack.push(*query),
+                    QueryNode::Empty
+                    | QueryNode::AllocationFailure { .. }
+                    | QueryNode::All
+                    | QueryNode::Range { .. }
+                    | QueryNode::Set { .. }
+                    | QueryNode::Glob { .. } => {}
                 }
-                Query::Boolean { clauses, .. } => clauses
-                    .iter()
-                    .map(|clause| max_term_bytes(&clause.query))
-                    .max()
-                    .unwrap_or(0),
-                Query::Boost { query, .. } => max_term_bytes(query),
-                _ => 0,
             }
+            maximum
         }
         assert!(
             max_term_bytes(&parsed.query) <= MAX_QUERY_LENGTH,
@@ -7594,22 +8749,20 @@ mod tests {
         // Required conjunction: the parser retains the Empty clause so the
         // scorer shorts the whole conjunction to MatchNone (argus proof).
         let conjunction = parse_untruncated(&parser, &format!("cache AND {}", oversized_atom()));
-        let Query::Boolean { clauses, .. } = &conjunction.query else {
+        let QueryNode::Boolean { clauses, .. } = conjunction.query.root() else {
             panic!(
                 "conjunction must remain a Boolean, got {:?}",
                 conjunction.query
             );
         };
         assert!(
-            clauses
-                .iter()
-                .any(|clause| clause.occur == Occur::Must && clause.query.is_empty()),
+            clauses.iter().any(|clause| clause.occur == Occur::Must
+                && matches!(conjunction.query.node(clause.query), QueryNode::Empty)),
             "conjunction must retain Must(Empty) for the oversized operand: {clauses:?}"
         );
         assert!(
-            clauses
-                .iter()
-                .any(|clause| clause.occur == Occur::Must && !clause.query.is_empty()),
+            clauses.iter().any(|clause| clause.occur == Occur::Must
+                && !matches!(conjunction.query.node(clause.query), QueryNode::Empty)),
             "conjunction must retain the matchable sibling: {clauses:?}"
         );
 
@@ -7617,16 +8770,15 @@ mod tests {
         // Should clause, which the scorer drops while the matchable sibling
         // determines results (argus proof).
         let disjunction = parse_untruncated(&parser, &format!("cache OR {}", oversized_atom()));
-        let Query::Boolean { clauses, .. } = &disjunction.query else {
+        let QueryNode::Boolean { clauses, .. } = disjunction.query.root() else {
             panic!(
                 "disjunction must remain a Boolean, got {:?}",
                 disjunction.query
             );
         };
         assert!(
-            clauses
-                .iter()
-                .any(|clause| clause.occur == Occur::Should && clause.query.is_empty()),
+            clauses.iter().any(|clause| clause.occur == Occur::Should
+                && matches!(disjunction.query.node(clause.query), QueryNode::Empty)),
             "disjunction must retain Should(Empty) for the oversized operand: {clauses:?}"
         );
 
@@ -7634,7 +8786,7 @@ mod tests {
         // token matches nothing), and the parser's all-negative repair
         // inserts the All sibling that preserves complement semantics.
         let negation = parse_untruncated(&parser, &format!("-{}", oversized_atom()));
-        let Query::Boolean { clauses, .. } = &negation.query else {
+        let QueryNode::Boolean { clauses, .. } = negation.query.root() else {
             panic!(
                 "repaired negation must be a Boolean, got {:?}",
                 negation.query
@@ -7643,13 +8795,12 @@ mod tests {
         assert!(
             clauses
                 .iter()
-                .any(|clause| matches!(clause.query, Query::All)),
+                .any(|clause| matches!(negation.query.node(clause.query), QueryNode::All)),
             "negated oversized query must gain the All sibling: {clauses:?}"
         );
         assert!(
-            clauses
-                .iter()
-                .any(|clause| clause.occur == Occur::MustNot && clause.query.is_empty()),
+            clauses.iter().any(|clause| clause.occur == Occur::MustNot
+                && matches!(negation.query.node(clause.query), QueryNode::Empty)),
             "negated oversized operand lowers to MustNot(Empty): {clauses:?}"
         );
     }
@@ -7659,45 +8810,42 @@ mod tests {
     fn term_clause(occur: Occur, field_id: u16, text: &str) -> BooleanClause {
         BooleanClause::new(
             occur,
-            Query::Term {
-                fields: vec![QueryField::new(field_id, 1.0)],
-                text: text.to_owned(),
-            },
+            Query::term(Vec::from([QueryField::new(field_id, 1.0)]), text.to_owned()),
         )
     }
 
     fn range_clause(occur: Occur, field_id: u16, low: i64, high: i64) -> BooleanClause {
         BooleanClause::new(
             occur,
-            Query::Range {
+            Query::range(
                 field_id,
-                lower: Bound::Included(QueryValue::I64(low)),
-                upper: Bound::Included(QueryValue::I64(high)),
-            },
+                Bound::Included(QueryValue::I64(low)),
+                Bound::Included(QueryValue::I64(high)),
+            ),
         )
     }
 
     #[test]
     fn canonicalize_dedups_must_not_and_preserves_distinct_exclusions() {
-        let mut query = Query::Boolean {
-            clauses: vec![
+        let mut query = Query::boolean(
+            Vec::from([
                 term_clause(Occur::MustNot, 1, "alpha"),
                 term_clause(Occur::MustNot, 1, "beta"),
                 term_clause(Occur::MustNot, 1, "alpha"),
                 term_clause(Occur::Must, 1, "gamma"),
-            ],
-            operator: None,
-        };
+            ]),
+            None,
+        );
         let report = canonicalize_query(&mut query);
         assert_eq!(report.must_not_duplicates_removed, 1);
-        let Query::Boolean { clauses, .. } = &query else {
+        let QueryNode::Boolean { clauses, .. } = query.root() else {
             panic!("stays Boolean")
         };
         let must_not_terms: Vec<_> = clauses
             .iter()
             .filter(|clause| clause.occur == Occur::MustNot)
-            .filter_map(|clause| match &clause.query {
-                Query::Term { text, .. } => Some(text.as_str()),
+            .filter_map(|clause| match query.node(clause.query) {
+                QueryNode::Term { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -7708,32 +8856,32 @@ mod tests {
     fn canonicalize_never_dedups_scoring_clauses_for_oracle_conformance() {
         // THE CAVEAT: (A OR A) scores A twice in the oracle's sum-union, so
         // scoring duplicates MUST survive canonicalization.
-        let mut should_query = Query::Boolean {
-            clauses: vec![
+        let mut should_query = Query::boolean(
+            Vec::from([
                 term_clause(Occur::Should, 1, "alpha"),
                 term_clause(Occur::Should, 1, "alpha"),
                 term_clause(Occur::Should, 1, "alpha"),
-            ],
-            operator: Some(BooleanOperator::Or),
-        };
+            ]),
+            Some(BooleanOperator::Or),
+        );
         let report = canonicalize_query(&mut should_query);
         assert_eq!(report.must_not_duplicates_removed, 0);
         assert_eq!(report.filter_duplicates_removed, 0);
-        let Query::Boolean { clauses, .. } = &should_query else {
+        let QueryNode::Boolean { clauses, .. } = should_query.root() else {
             panic!("stays Boolean")
         };
         assert_eq!(clauses.len(), 3, "every scoring duplicate is retained");
 
         // Scoring Must (Term) duplicates are retained for the same reason.
-        let mut must_query = Query::Boolean {
-            clauses: vec![
+        let mut must_query = Query::boolean(
+            Vec::from([
                 term_clause(Occur::Must, 1, "alpha"),
                 term_clause(Occur::Must, 1, "alpha"),
-            ],
-            operator: Some(BooleanOperator::And),
-        };
+            ]),
+            Some(BooleanOperator::And),
+        );
         let _ = canonicalize_query(&mut must_query);
-        let Query::Boolean { clauses, .. } = &must_query else {
+        let QueryNode::Boolean { clauses, .. } = must_query.root() else {
             panic!("stays Boolean")
         };
         assert_eq!(clauses.len(), 2, "scoring Must duplicates are retained");
@@ -7741,33 +8889,35 @@ mod tests {
 
     #[test]
     fn canonicalize_retains_all_positive_scorers() {
-        let mut query = Query::Boost {
-            query: Box::new(Query::Boolean {
-                clauses: vec![
-                    range_clause(Occur::Must, 7, 10, 99),
-                    term_clause(Occur::Must, 1, "alpha"),
-                    range_clause(Occur::Must, 7, 10, 99),
-                    BooleanClause::new(Occur::Must, Query::All),
-                    BooleanClause::new(Occur::Must, Query::All),
-                ],
-                operator: None,
-            }),
-            factor: 2.0,
-        };
+        let child = Query::boolean(
+            Vec::from([
+                range_clause(Occur::Must, 7, 10, 99),
+                term_clause(Occur::Must, 1, "alpha"),
+                range_clause(Occur::Must, 7, 10, 99),
+                BooleanClause::new(Occur::Must, Query::all()),
+                BooleanClause::new(Occur::Must, Query::all()),
+            ]),
+            None,
+        );
+        let mut query = Query::boost(child, 2.0);
         let report = canonicalize_query(&mut query);
         assert_eq!(report.filter_duplicates_removed, 0);
-        let Query::Boost { query, factor } = &query else {
+        let QueryNode::Boost {
+            query: child,
+            factor,
+        } = query.root()
+        else {
             panic!("stays boosted")
         };
         assert_eq!(factor.to_bits(), 2.0_f32.to_bits());
-        let Query::Boolean { clauses, .. } = query.as_ref() else {
+        let QueryNode::Boolean { clauses, .. } = query.node(*child) else {
             panic!("boosted child stays Boolean")
         };
         assert_eq!(clauses.len(), 5);
         assert_eq!(
             clauses
                 .iter()
-                .filter(|clause| matches!(clause.query, Query::Range { .. }))
+                .filter(|clause| matches!(query.node(clause.query), QueryNode::Range { .. }))
                 .count(),
             2,
             "duplicate constant scorers retain both score contributions",
@@ -7775,12 +8925,12 @@ mod tests {
         assert!(
             clauses
                 .iter()
-                .any(|clause| matches!(&clause.query, Query::Term { text, .. } if text == "alpha"))
+                .any(|clause| matches!(query.node(clause.query), QueryNode::Term { text, .. } if text == "alpha"))
         );
         assert_eq!(
             clauses
                 .iter()
-                .filter(|clause| matches!(clause.query, Query::All))
+                .filter(|clause| matches!(query.node(clause.query), QueryNode::All))
                 .count(),
             2,
             "ancestor boosts can make duplicate All children score independently",
@@ -7789,29 +8939,29 @@ mod tests {
 
     #[test]
     fn canonicalize_must_not_key_frames_distinct_string_bounds() {
-        let first = Query::Range {
-            field_id: 7,
-            lower: Bound::Included(QueryValue::Str("L".to_owned())),
-            upper: Bound::Included(QueryValue::Str("p\0\u{2}q".to_owned())),
-        };
-        let second = Query::Range {
-            field_id: 7,
-            lower: Bound::Included(QueryValue::Str("L\0\u{2}p".to_owned())),
-            upper: Bound::Included(QueryValue::Str("q".to_owned())),
-        };
+        let first = Query::range(
+            7,
+            Bound::Included(QueryValue::Str("L".to_owned())),
+            Bound::Included(QueryValue::Str("p\0\u{2}q".to_owned())),
+        );
+        let second = Query::range(
+            7,
+            Bound::Included(QueryValue::Str("L\0\u{2}p".to_owned())),
+            Bound::Included(QueryValue::Str("q".to_owned())),
+        );
         assert_ne!(canonical_sort_key(&first), canonical_sort_key(&second));
 
-        let mut query = Query::Boolean {
-            clauses: vec![
-                BooleanClause::new(Occur::Must, Query::All),
+        let mut query = Query::boolean(
+            Vec::from([
+                BooleanClause::new(Occur::Must, Query::all()),
                 BooleanClause::new(Occur::MustNot, first),
                 BooleanClause::new(Occur::MustNot, second),
-            ],
-            operator: None,
-        };
+            ]),
+            None,
+        );
         let report = canonicalize_query(&mut query);
         assert_eq!(report.must_not_duplicates_removed, 0);
-        let Query::Boolean { clauses, .. } = query else {
+        let QueryNode::Boolean { clauses, .. } = query.root() else {
             panic!("stays Boolean")
         };
         assert_eq!(clauses.len(), 3);
@@ -7819,38 +8969,29 @@ mod tests {
 
     #[test]
     fn canonicalize_groups_occurrences_without_reordering_scoring_clauses() {
-        let mut query = Query::Boolean {
-            clauses: vec![
+        let mut query = Query::boolean(
+            Vec::from([
                 term_clause(Occur::MustNot, 1, "zzz"),
                 term_clause(Occur::Must, 9, "beta"),
                 BooleanClause::new(
                     Occur::Should,
-                    Query::Boost {
-                        query: Box::new(term_clause(Occur::Should, 3, "alpha").query),
-                        factor: 16_777_216.0,
-                    },
+                    Query::boost(term_clause(Occur::Should, 3, "alpha").query, 16_777_216.0),
                 ),
                 term_clause(Occur::Must, 1, "alpha"),
                 BooleanClause::new(
                     Occur::Should,
-                    Query::Boost {
-                        query: Box::new(term_clause(Occur::Should, 3, "gamma").query),
-                        factor: 1.0,
-                    },
+                    Query::boost(term_clause(Occur::Should, 3, "gamma").query, 1.0),
                 ),
                 BooleanClause::new(
                     Occur::Should,
-                    Query::Boost {
-                        query: Box::new(term_clause(Occur::Should, 3, "beta").query),
-                        factor: 0.5,
-                    },
+                    Query::boost(term_clause(Occur::Should, 3, "beta").query, 0.5),
                 ),
-            ],
-            operator: None,
-        };
+            ]),
+            None,
+        );
         let report = canonicalize_query(&mut query);
         assert_eq!(report.boolean_levels_sorted, 1);
-        let Query::Boolean { clauses, .. } = &query else {
+        let QueryNode::Boolean { clauses, .. } = query.root() else {
             panic!("stays Boolean")
         };
         let occurs: Vec<_> = clauses.iter().map(|clause| clause.occur).collect();
@@ -7868,8 +9009,8 @@ mod tests {
         let should_factors = clauses
             .iter()
             .filter(|clause| clause.occur == Occur::Should)
-            .filter_map(|clause| match &clause.query {
-                Query::Boost { factor, .. } => Some(*factor),
+            .filter_map(|clause| match query.node(clause.query) {
+                QueryNode::Boost { factor, .. } => Some(*factor),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -7882,24 +9023,22 @@ mod tests {
 
     #[test]
     fn canonicalize_recurses_and_is_idempotent() {
-        let mut query = Query::Boolean {
-            clauses: vec![
-                BooleanClause::new(
-                    Occur::Must,
-                    Query::Boolean {
-                        clauses: vec![
-                            term_clause(Occur::MustNot, 2, "dup"),
-                            term_clause(Occur::MustNot, 2, "dup"),
-                            term_clause(Occur::Must, 2, "b"),
-                            term_clause(Occur::Must, 2, "a"),
-                        ],
-                        operator: None,
-                    },
-                ),
+        let nested = Query::boolean(
+            Vec::from([
+                term_clause(Occur::MustNot, 2, "dup"),
+                term_clause(Occur::MustNot, 2, "dup"),
+                term_clause(Occur::Must, 2, "b"),
+                term_clause(Occur::Must, 2, "a"),
+            ]),
+            None,
+        );
+        let mut query = Query::boolean(
+            Vec::from([
+                BooleanClause::new(Occur::Must, nested),
                 term_clause(Occur::Must, 1, "outer"),
-            ],
-            operator: None,
-        };
+            ]),
+            None,
+        );
         let first = canonicalize_query(&mut query);
         assert_eq!(first.must_not_duplicates_removed, 1);
         assert!(first.boolean_levels_sorted >= 1);
@@ -7913,29 +9052,26 @@ mod tests {
 
     #[test]
     fn canonicalize_sorts_glob_fields_and_preserves_scoring_expansions() {
-        let mut glob = Query::Glob {
-            field_ids: vec![3, 1, 3, 2, 1],
-            pattern: "alp*".to_owned(),
-        };
+        let mut glob = Query::glob(Vec::from([3, 1, 3, 2, 1]), "alp*".to_owned());
         let report = canonicalize_query(&mut glob);
         assert_eq!(report.glob_fields_canonicalized, 1);
-        let Query::Glob { field_ids, .. } = &glob else {
+        let QueryNode::Glob { field_ids, .. } = glob.root() else {
             panic!("stays Glob")
         };
         assert_eq!(field_ids, &[1, 1, 2, 3, 3]);
 
-        let mut term = Query::Term {
-            fields: vec![
+        let mut term = Query::term(
+            Vec::from([
                 QueryField::new(1, 1.0),
                 QueryField::new(2, 2.0),
                 QueryField::new(1, 1.0),
                 QueryField::new(1, 2.0), // same id, different boost: kept
-            ],
-            text: "alpha".to_owned(),
-        };
+            ]),
+            "alpha".to_owned(),
+        );
         let report = canonicalize_query(&mut term);
         assert_eq!(report.duplicate_fields_removed, 0);
-        let Query::Term { fields, .. } = &term else {
+        let QueryNode::Term { fields, .. } = term.root() else {
             panic!("stays Term")
         };
         assert_eq!(fields.len(), 4);
@@ -7949,13 +9085,13 @@ mod tests {
     fn canonicalize_leaves_parse_fixtures_exact_when_already_canonical() {
         // A query that is already canonical is byte-stable (no report, no
         // reorder), so differential-pinned parser fixtures never drift.
-        let mut query = Query::Boolean {
-            clauses: vec![
+        let mut query = Query::boolean(
+            Vec::from([
                 term_clause(Occur::Must, 1, "alpha"),
                 term_clause(Occur::Should, 3, "beta"),
-            ],
-            operator: Some(BooleanOperator::And),
-        };
+            ]),
+            Some(BooleanOperator::And),
+        );
         let original = query.clone();
         let report = canonicalize_query(&mut query);
         assert_eq!(query, original);

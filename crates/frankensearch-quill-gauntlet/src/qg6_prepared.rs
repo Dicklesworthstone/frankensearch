@@ -13,6 +13,7 @@ use std::hint::black_box;
 use std::ops::Bound;
 use std::time::{Duration, Instant};
 
+use frankensearch_quill::query::{QueryNode, QueryNodeId};
 use frankensearch_quill::{
     BooleanOperator, DEFAULT_SCHEMA, DefaultQueryParser, Occur, Query, QueryValue,
     canonicalize_query,
@@ -5235,7 +5236,13 @@ fn parsed_ast_sha256(
     let _report = canonicalize_query(&mut parsed.query);
     let mut hasher = Sha256::new();
     hasher.update(b"frankensearch/qg6/canonical-query-ast/v1\0");
-    hash_query_ast(&mut hasher, &parsed.query);
+    hash_query_ast(&mut hasher, &parsed.query).map_err(|requested| {
+        Qg6HarnessError::InvalidSpec {
+            reason: format!(
+                "QG-6 AST traversal allocation failed for query {query_id:?}: requested={requested}"
+            ),
+        }
+    })?;
     Ok((lower_hex(hasher.finalize()), parsed))
 }
 
@@ -5246,25 +5253,27 @@ fn validate_query_shape(
 ) -> Result<(), Qg6HarnessError> {
     let accepted = match class {
         PerfQueryClass::Identifier => {
-            !query_contains_explicit_boolean(query) && !query_contains_must_not(query)
+            !query_contains_explicit_boolean(query)? && !query_contains_must_not(query)?
         }
         PerfQueryClass::ShortKeyword => {
-            matches!(query, Query::Term { .. } | Query::Glob { .. })
-                || is_implicit_short_keyword_default_field_expansion(query)
+            matches!(
+                query.root(),
+                QueryNode::Term { .. } | QueryNode::Glob { .. }
+            ) || is_implicit_short_keyword_default_field_expansion(query)
         }
         PerfQueryClass::NaturalLanguage => {
-            matches!(query, Query::Boolean { operator: None, .. })
-                && !query_contains_must_not(query)
-                && !query_contains_explicit_boolean(query)
+            matches!(query.root(), QueryNode::Boolean { operator: None, .. })
+                && !query_contains_must_not(query)?
+                && !query_contains_explicit_boolean(query)?
         }
         PerfQueryClass::Phrase => {
-            query_contains_phrase(query)
-                && !query_contains_explicit_boolean(query)
-                && !query_contains_must_not(query)
+            query_contains_phrase(query)?
+                && !query_contains_explicit_boolean(query)?
+                && !query_contains_must_not(query)?
         }
         PerfQueryClass::Boolean => {
-            matches!(query, Query::Boolean { .. })
-                && (query_contains_explicit_boolean(query) || query_contains_must_not(query))
+            matches!(query.root(), QueryNode::Boolean { .. })
+                && (query_contains_explicit_boolean(query)? || query_contains_must_not(query)?)
         }
     };
     if accepted {
@@ -5280,10 +5289,10 @@ fn validate_query_shape(
 }
 
 fn is_implicit_short_keyword_default_field_expansion(query: &Query) -> bool {
-    let Query::Boolean {
+    let QueryNode::Boolean {
         clauses,
         operator: None,
-    } = query
+    } = query.root()
     else {
         return false;
     };
@@ -5318,7 +5327,7 @@ fn is_implicit_short_keyword_default_field_expansion(query: &Query) -> bool {
         if clause.occur != Occur::Should {
             return false;
         }
-        let Query::Term { fields, text } = &clause.query else {
+        let QueryNode::Term { fields, text } = query.node(clause.query) else {
             return false;
         };
         let [field] = fields.as_slice() else {
@@ -5356,131 +5365,176 @@ fn is_implicit_short_keyword_default_field_expansion(query: &Query) -> bool {
     saw_content && saw_title
 }
 
-fn query_contains_phrase(query: &Query) -> bool {
-    match query {
-        Query::Phrase { .. } => true,
-        Query::Boolean { clauses, .. } => clauses
-            .iter()
-            .any(|clause| query_contains_phrase(&clause.query)),
-        Query::Boost { query, .. } => query_contains_phrase(query),
-        Query::Empty
-        | Query::All
-        | Query::Term { .. }
-        | Query::Range { .. }
-        | Query::Set { .. }
-        | Query::Glob { .. } => false,
-    }
+fn query_contains_phrase(query: &Query) -> Result<bool, Qg6HarnessError> {
+    query_contains(query, |node| matches!(node, QueryNode::Phrase { .. }))
 }
 
-fn query_contains_must_not(query: &Query) -> bool {
-    match query {
-        Query::Boolean { clauses, .. } => clauses
-            .iter()
-            .any(|clause| clause.occur == Occur::MustNot || query_contains_must_not(&clause.query)),
-        Query::Boost { query, .. } => query_contains_must_not(query),
-        Query::Empty
-        | Query::All
-        | Query::Term { .. }
-        | Query::Phrase { .. }
-        | Query::Range { .. }
-        | Query::Set { .. }
-        | Query::Glob { .. } => false,
-    }
+fn query_contains_must_not(query: &Query) -> Result<bool, Qg6HarnessError> {
+    query_contains(query, |node| {
+        matches!(
+            node,
+            QueryNode::Boolean { clauses, .. }
+                if clauses.iter().any(|clause| clause.occur == Occur::MustNot)
+        )
+    })
 }
 
-fn query_contains_explicit_boolean(query: &Query) -> bool {
-    match query {
-        Query::Boolean { clauses, operator } => {
-            operator.is_some()
-                || clauses
-                    .iter()
-                    .any(|clause| query_contains_explicit_boolean(&clause.query))
-        }
-        Query::Boost { query, .. } => query_contains_explicit_boolean(query),
-        Query::Empty
-        | Query::All
-        | Query::Term { .. }
-        | Query::Phrase { .. }
-        | Query::Range { .. }
-        | Query::Set { .. }
-        | Query::Glob { .. } => false,
-    }
-}
-
-fn hash_query_ast(hasher: &mut Sha256, query: &Query) {
-    match query {
-        Query::Empty => hasher.update([0]),
-        Query::All => hasher.update([1]),
-        Query::Term { fields, text } => {
-            hasher.update([2]);
-            hash_query_fields(hasher, fields);
-            hash_len_prefixed(hasher, text.as_bytes());
-        }
-        Query::Phrase {
-            fields,
-            terms,
-            slop,
-            prefix,
-        } => {
-            hasher.update([3]);
-            hash_query_fields(hasher, fields);
-            hasher.update(usize_to_u64_infallible(terms.len()).to_le_bytes());
-            for term in terms {
-                hasher.update(term.position.to_le_bytes());
-                hash_len_prefixed(hasher, term.text.as_bytes());
+fn query_contains_explicit_boolean(query: &Query) -> Result<bool, Qg6HarnessError> {
+    query_contains(query, |node| {
+        matches!(
+            node,
+            QueryNode::Boolean {
+                operator: Some(_),
+                ..
             }
-            hasher.update(slop.to_le_bytes());
-            hasher.update([u8::from(*prefix)]);
+        )
+    })
+}
+
+fn query_contains(
+    query: &Query,
+    predicate: impl Fn(&QueryNode) -> bool,
+) -> Result<bool, Qg6HarnessError> {
+    let mut pending = Vec::new();
+    let requested = query.node_count();
+    pending
+        .try_reserve_exact(requested)
+        .map_err(|_| Qg6HarnessError::InvalidSpec {
+            reason: format!("QG-6 AST traversal allocation failed: requested={requested}"),
+        })?;
+    pending.push(query.root_id());
+    while let Some(node_id) = pending.pop() {
+        let node = query.node(node_id);
+        if let QueryNode::AllocationFailure { requested } = node {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!("QG-6 query arena allocation failed: requested={requested}"),
+            });
         }
-        Query::Boolean { clauses, operator } => {
-            hasher.update([4]);
-            hasher.update([match operator {
-                None => 0,
-                Some(BooleanOperator::And) => 1,
-                Some(BooleanOperator::Or) => 2,
-            }]);
-            hasher.update(usize_to_u64_infallible(clauses.len()).to_le_bytes());
-            for clause in clauses {
-                hasher.update([match clause.occur {
+        if predicate(node) {
+            return Ok(true);
+        }
+        match node {
+            QueryNode::Boolean { clauses, .. } => {
+                for clause in clauses.iter().rev() {
+                    pending.push(clause.query);
+                }
+            }
+            QueryNode::Boost { query, .. } => pending.push(*query),
+            QueryNode::Empty
+            | QueryNode::AllocationFailure { .. }
+            | QueryNode::All
+            | QueryNode::Term { .. }
+            | QueryNode::Phrase { .. }
+            | QueryNode::Range { .. }
+            | QueryNode::Set { .. }
+            | QueryNode::Glob { .. } => {}
+        }
+    }
+    Ok(false)
+}
+
+fn hash_query_ast(hasher: &mut Sha256, query: &Query) -> Result<(), usize> {
+    enum HashTask {
+        Node(QueryNodeId),
+        Occur(Occur),
+    }
+
+    let requested = query.node_count().saturating_mul(2);
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(requested)
+        .map_err(|_| requested)?;
+    pending.push(HashTask::Node(query.root_id()));
+    while let Some(task) = pending.pop() {
+        let node_id = match task {
+            HashTask::Node(node_id) => node_id,
+            HashTask::Occur(occur) => {
+                hasher.update([match occur {
                     Occur::Must => 0,
                     Occur::Should => 1,
                     Occur::MustNot => 2,
                 }]);
-                hash_query_ast(hasher, &clause.query);
+                continue;
             }
-        }
-        Query::Range {
-            field_id,
-            lower,
-            upper,
-        } => {
-            hasher.update([5]);
-            hasher.update(field_id.to_le_bytes());
-            hash_query_bound(hasher, lower);
-            hash_query_bound(hasher, upper);
-        }
-        Query::Set { field_id, values } => {
-            hasher.update([6]);
-            hasher.update(field_id.to_le_bytes());
-            hasher.update(usize_to_u64_infallible(values.len()).to_le_bytes());
-            for value in values {
-                hash_query_value(hasher, value);
+        };
+        match query.node(node_id) {
+            QueryNode::Empty => hasher.update([0]),
+            QueryNode::AllocationFailure { requested } => {
+                hasher.update([9]);
+                hasher.update(usize_to_u64_infallible(*requested).to_le_bytes());
             }
-        }
-        Query::Glob { field_ids, pattern } => {
-            hasher.update([7]);
-            hasher.update(usize_to_u64_infallible(field_ids.len()).to_le_bytes());
-            for field_id in field_ids {
+            QueryNode::All => hasher.update([1]),
+            QueryNode::Term { fields, text } => {
+                hasher.update([2]);
+                hash_query_fields(hasher, fields);
+                hash_len_prefixed(hasher, text.as_bytes());
+            }
+            QueryNode::Phrase {
+                fields,
+                terms,
+                slop,
+                prefix,
+            } => {
+                hasher.update([3]);
+                hash_query_fields(hasher, fields);
+                hasher.update(usize_to_u64_infallible(terms.len()).to_le_bytes());
+                for term in terms {
+                    hasher.update(term.position.to_le_bytes());
+                    hash_len_prefixed(hasher, term.text.as_bytes());
+                }
+                hasher.update(slop.to_le_bytes());
+                hasher.update([u8::from(*prefix)]);
+            }
+            QueryNode::Boolean { clauses, operator } => {
+                hasher.update([4]);
+                hasher.update([match operator {
+                    None => 0,
+                    Some(BooleanOperator::And) => 1,
+                    Some(BooleanOperator::Or) => 2,
+                }]);
+                hasher.update(usize_to_u64_infallible(clauses.len()).to_le_bytes());
+                for clause in clauses.iter().rev() {
+                    pending.push(HashTask::Node(clause.query));
+                    pending.push(HashTask::Occur(clause.occur));
+                }
+            }
+            QueryNode::Range {
+                field_id,
+                lower,
+                upper,
+            } => {
+                hasher.update([5]);
                 hasher.update(field_id.to_le_bytes());
+                hash_query_bound(hasher, lower);
+                hash_query_bound(hasher, upper);
             }
-            hash_len_prefixed(hasher, pattern.as_bytes());
-        }
-        Query::Boost { query, factor } => {
-            hasher.update([8]);
-            hasher.update(factor.to_bits().to_le_bytes());
-            hash_query_ast(hasher, query);
+            QueryNode::Set { field_id, values } => {
+                hasher.update([6]);
+                hasher.update(field_id.to_le_bytes());
+                hasher.update(usize_to_u64_infallible(values.len()).to_le_bytes());
+                for value in values {
+                    hash_query_value(hasher, value);
+                }
+            }
+            QueryNode::Glob { field_ids, pattern } => {
+                hasher.update([7]);
+                hasher.update(usize_to_u64_infallible(field_ids.len()).to_le_bytes());
+                for field_id in field_ids {
+                    hasher.update(field_id.to_le_bytes());
+                }
+                hash_len_prefixed(hasher, pattern.as_bytes());
+            }
+            QueryNode::Boost {
+                query: child,
+                factor,
+            } => {
+                hasher.update([8]);
+                hasher.update(factor.to_bits().to_le_bytes());
+                pending.push(HashTask::Node(*child));
+            }
         }
     }
+    Ok(())
 }
 
 fn hash_query_fields(hasher: &mut Sha256, fields: &[frankensearch_quill::QueryField]) {
@@ -5706,6 +5760,8 @@ fn usize_to_u64_infallible(value: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+
+    use frankensearch_quill::BooleanClause;
 
     use super::*;
 
@@ -6703,29 +6759,61 @@ mod tests {
             &parse("short_keyword-explicit", "term00001 OR term00002"),
         );
 
-        let mut mixed = parse("short_keyword-mixed", "term00001");
-        let Query::Boolean { clauses, .. } = &mut mixed else {
+        let mixed = parse("short_keyword-mixed", "term00001");
+        let QueryNode::Boolean { clauses, operator } = mixed.root() else {
             panic!("shipping one-token query must use implicit default-field expansion");
         };
-        clauses[1].query = Query::All;
+        let [first_clause, second_clause] = clauses.as_slice() else {
+            panic!("shipping one-token query must have two default-field branches");
+        };
+        let QueryNode::Term { fields, text } = mixed.node(first_clause.query) else {
+            panic!("first default-field branch must be a term");
+        };
+        let mixed = Query::boolean(
+            vec![
+                BooleanClause::new(
+                    first_clause.occur,
+                    Query::term(fields.clone(), text.clone()),
+                ),
+                BooleanClause::new(second_clause.occur, Query::all()),
+            ],
+            *operator,
+        );
         rejects("short_keyword-mixed", &mixed);
 
-        let mut duplicate_field = parse("short_keyword-duplicate-field", "term00001");
-        let Query::Boolean { clauses, .. } = &mut duplicate_field else {
+        let duplicate_field = parse("short_keyword-duplicate-field", "term00001");
+        let QueryNode::Boolean { clauses, operator } = duplicate_field.root() else {
             panic!("shipping one-token query must use implicit default-field expansion");
         };
-        let Query::Term {
+        let [first_clause, second_clause] = clauses.as_slice() else {
+            panic!("shipping one-token query must have two default-field branches");
+        };
+        let QueryNode::Term {
             fields: first_fields,
-            ..
-        } = &clauses[0].query
+            text: first_text,
+        } = duplicate_field.node(first_clause.query)
         else {
             panic!("first default-field branch must be a term");
         };
-        let first_fields = first_fields.clone();
-        let Query::Term { fields, .. } = &mut clauses[1].query else {
+        let QueryNode::Term {
+            text: second_text, ..
+        } = duplicate_field.node(second_clause.query)
+        else {
             panic!("second default-field branch must be a term");
         };
-        *fields = first_fields;
+        let duplicate_field = Query::boolean(
+            vec![
+                BooleanClause::new(
+                    first_clause.occur,
+                    Query::term(first_fields.clone(), first_text.clone()),
+                ),
+                BooleanClause::new(
+                    second_clause.occur,
+                    Query::term(first_fields.clone(), second_text.clone()),
+                ),
+            ],
+            *operator,
+        );
         rejects("short_keyword-duplicate-field", &duplicate_field);
     }
 

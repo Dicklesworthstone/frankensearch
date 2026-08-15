@@ -73,6 +73,8 @@ use crate::grimoire::{
     ByteSpan, MAX_TERM_BYTES, TermDictionary, TermDictionaryError, star_glob_matches,
     trailing_star_prefix, validate_bound_term, validate_query_term,
 };
+#[cfg(feature = "bench-internals")]
+use crate::keeper::BenchmarkQuillDirectorySyncState;
 #[cfg(feature = "durability")]
 use crate::keeper::UnrepairableSegmentPolicy;
 use crate::keeper::{
@@ -85,8 +87,8 @@ use crate::keeper::{
 };
 use crate::query::{
     BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError, QueryDiagnostic,
-    QueryExplanation, QueryParserConfigError, QueryValue, canonicalize_query, classify_query,
-    validate_index_capabilities,
+    QueryExplanation, QueryNode, QueryNodeId, QueryParserConfigError, QueryValue,
+    canonicalize_query, classify_query, validate_index_capabilities,
 };
 use crate::quiver::{
     BlockMaxError, DocLenCodecError, DocLenField, DocLenSection, EncodedNumericSection,
@@ -558,85 +560,116 @@ fn hash_query_cache_bound(hasher: &mut Xxh3, bound: &Bound<QueryValue>) {
 
 #[cfg(any(test, feature = "bench-internals"))]
 fn hash_exact_query(hasher: &mut Xxh3, query: &Query) {
-    match query {
-        Query::Empty => hasher.update(&[0]),
-        Query::All => hasher.update(&[1]),
-        Query::Term { fields, text } => {
-            hasher.update(&[2]);
-            hash_query_cache_len(hasher, fields.len());
-            for field in fields {
-                hasher.update(&field.field_id.to_le_bytes());
-                hasher.update(&field.boost.to_bits().to_le_bytes());
-            }
-            hash_query_cache_bytes(hasher, text.as_bytes());
-        }
-        Query::Phrase {
-            fields,
-            terms,
-            slop,
-            prefix,
-        } => {
-            hasher.update(&[3]);
-            hash_query_cache_len(hasher, fields.len());
-            for field in fields {
-                hasher.update(&field.field_id.to_le_bytes());
-                hasher.update(&field.boost.to_bits().to_le_bytes());
-            }
-            hash_query_cache_len(hasher, terms.len());
-            for term in terms {
-                hasher.update(&term.position.to_le_bytes());
-                hash_query_cache_bytes(hasher, term.text.as_bytes());
-            }
-            hasher.update(&slop.to_le_bytes());
-            hasher.update(&[u8::from(*prefix)]);
-        }
-        Query::Boolean { clauses, operator } => {
-            hasher.update(&[4]);
-            hasher.update(&[match operator {
-                None => 0,
-                Some(BooleanOperator::And) => 1,
-                Some(BooleanOperator::Or) => 2,
-            }]);
-            hash_query_cache_len(hasher, clauses.len());
-            for clause in clauses {
-                hasher.update(&[match clause.occur {
+    enum HashTask {
+        Node(QueryNodeId),
+        Occur(Occur),
+    }
+
+    let Some(task_count) = query.node_count().checked_mul(2) else {
+        hasher.update(&[u8::MAX]);
+        return;
+    };
+    let mut pending = Vec::new();
+    if pending.try_reserve_exact(task_count).is_err() {
+        hasher.update(&[u8::MAX]);
+        return;
+    }
+    pending.push(HashTask::Node(query.root_id()));
+    while let Some(task) = pending.pop() {
+        let node_id = match task {
+            HashTask::Node(node_id) => node_id,
+            HashTask::Occur(occur) => {
+                hasher.update(&[match occur {
                     Occur::Must => 0,
                     Occur::Should => 1,
                     Occur::MustNot => 2,
                 }]);
-                hash_exact_query(hasher, &clause.query);
+                continue;
             }
-        }
-        Query::Range {
-            field_id,
-            lower,
-            upper,
-        } => {
-            hasher.update(&[5]);
-            hasher.update(&field_id.to_le_bytes());
-            hash_query_cache_bound(hasher, lower);
-            hash_query_cache_bound(hasher, upper);
-        }
-        Query::Set { field_id, values } => {
-            hasher.update(&[6]);
-            hasher.update(&field_id.to_le_bytes());
-            hash_query_cache_len(hasher, values.len());
-            for value in values {
-                hash_query_cache_value(hasher, value);
+        };
+        match query.node(node_id) {
+            QueryNode::Empty => hasher.update(&[0]),
+            QueryNode::All => hasher.update(&[1]),
+            QueryNode::AllocationFailure { requested } => {
+                hasher.update(&[9]);
+                hasher.update(&requested.to_le_bytes());
             }
-        }
-        Query::Glob { field_ids, pattern } => {
-            hasher.update(&[7]);
-            hash_query_cache_len(hasher, field_ids.len());
-            for field_id in field_ids {
+            QueryNode::Term { fields, text } => {
+                hasher.update(&[2]);
+                hash_query_cache_len(hasher, fields.len());
+                for field in fields {
+                    hasher.update(&field.field_id.to_le_bytes());
+                    hasher.update(&field.boost.to_bits().to_le_bytes());
+                }
+                hash_query_cache_bytes(hasher, text.as_bytes());
+            }
+            QueryNode::Phrase {
+                fields,
+                terms,
+                slop,
+                prefix,
+            } => {
+                hasher.update(&[3]);
+                hash_query_cache_len(hasher, fields.len());
+                for field in fields {
+                    hasher.update(&field.field_id.to_le_bytes());
+                    hasher.update(&field.boost.to_bits().to_le_bytes());
+                }
+                hash_query_cache_len(hasher, terms.len());
+                for term in terms {
+                    hasher.update(&term.position.to_le_bytes());
+                    hash_query_cache_bytes(hasher, term.text.as_bytes());
+                }
+                hasher.update(&slop.to_le_bytes());
+                hasher.update(&[u8::from(*prefix)]);
+            }
+            QueryNode::Boolean { clauses, operator } => {
+                hasher.update(&[4]);
+                hasher.update(&[match operator {
+                    None => 0,
+                    Some(BooleanOperator::And) => 1,
+                    Some(BooleanOperator::Or) => 2,
+                }]);
+                hash_query_cache_len(hasher, clauses.len());
+                for clause in clauses.iter().rev() {
+                    pending.push(HashTask::Node(clause.query));
+                    pending.push(HashTask::Occur(clause.occur));
+                }
+            }
+            QueryNode::Range {
+                field_id,
+                lower,
+                upper,
+            } => {
+                hasher.update(&[5]);
                 hasher.update(&field_id.to_le_bytes());
+                hash_query_cache_bound(hasher, lower);
+                hash_query_cache_bound(hasher, upper);
             }
-            hash_query_cache_bytes(hasher, pattern.as_bytes());
-        }
-        Query::Boost { query, factor } => {
-            hasher.update(&[8]);
-            hasher.update(&factor.to_bits().to_le_bytes());
-            hash_exact_query(hasher, query);
+            QueryNode::Set { field_id, values } => {
+                hasher.update(&[6]);
+                hasher.update(&field_id.to_le_bytes());
+                hash_query_cache_len(hasher, values.len());
+                for value in values {
+                    hash_query_cache_value(hasher, value);
+                }
+            }
+            QueryNode::Glob { field_ids, pattern } => {
+                hasher.update(&[7]);
+                hash_query_cache_len(hasher, field_ids.len());
+                for field_id in field_ids {
+                    hasher.update(&field_id.to_le_bytes());
+                }
+                hash_query_cache_bytes(hasher, pattern.as_bytes());
+            }
+            QueryNode::Boost {
+                query: child,
+                factor,
+            } => {
+                hasher.update(&[8]);
+                hasher.update(&factor.to_bits().to_le_bytes());
+                pending.push(HashTask::Node(*child));
+            }
         }
     }
 }
@@ -4502,61 +4535,79 @@ impl QueryWorkShape {
         schema: SchemaDescriptor,
         glob_expansion_limit: usize,
     ) -> Result<(), QuillIndexError> {
-        match query {
-            Query::Empty | Query::All => {}
-            Query::Term { fields, .. } => {
-                let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
-                self.posting_streams = self.posting_streams.saturating_add(fields);
+        let mut pending = Vec::new();
+        if pending.try_reserve_exact(query.node_count()).is_err() {
+            return Err(ArgusError::Allocation {
+                resource: "query work-shape traversal",
+                count: query.node_count(),
             }
-            Query::Phrase {
-                fields,
-                terms,
-                prefix,
-                ..
-            } => {
-                let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
-                let terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
-                let expansions = if *prefix {
+            .into());
+        }
+        pending.push(query.root_id());
+        while let Some(node_id) = pending.pop() {
+            match query.node(node_id) {
+                QueryNode::Empty | QueryNode::All => {}
+                QueryNode::AllocationFailure { requested } => {
+                    return Err(ArgusError::Allocation {
+                        resource: "query arena",
+                        count: *requested,
+                    }
+                    .into());
+                }
+                QueryNode::Term { fields, .. } => {
+                    let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
+                    self.posting_streams = self.posting_streams.saturating_add(fields);
+                }
+                QueryNode::Phrase {
+                    fields,
+                    terms,
+                    prefix,
+                    ..
+                } => {
+                    let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
+                    let terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
+                    let expansions = if *prefix {
+                        self.dictionary_scans = self.dictionary_scans.saturating_add(fields);
+                        u64::try_from(TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS).unwrap_or(u64::MAX)
+                    } else {
+                        1
+                    };
+                    let phrase_fields = fields.saturating_mul(expansions);
+                    let streams = phrase_fields.saturating_mul(terms);
+                    self.posting_streams = self.posting_streams.saturating_add(streams);
+                    self.phrase_streams = self.phrase_streams.saturating_add(streams);
+                    self.phrase_fields = self.phrase_fields.saturating_add(phrase_fields);
+                }
+                QueryNode::Boolean { clauses, .. } => {
+                    pending.extend(clauses.iter().rev().map(|clause| clause.query));
+                }
+                QueryNode::Boost { query: child, .. } => pending.push(*child),
+                QueryNode::Range { field_id, .. } => {
+                    if matches!(
+                        query_field_kind(schema, *field_id)?,
+                        FieldKind::Keyword | FieldKind::Text { .. }
+                    ) {
+                        self.dictionary_scans = self.dictionary_scans.saturating_add(1);
+                        self.string_range_expansions =
+                            self.string_range_expansions.saturating_add(1);
+                    }
+                }
+                QueryNode::Glob { field_ids, .. } => {
+                    let fields = u64::try_from(field_ids.len()).unwrap_or(u64::MAX);
                     self.dictionary_scans = self.dictionary_scans.saturating_add(fields);
-                    u64::try_from(TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS).unwrap_or(u64::MAX)
-                } else {
-                    1
-                };
-                let phrase_fields = fields.saturating_mul(expansions);
-                let streams = phrase_fields.saturating_mul(terms);
-                self.posting_streams = self.posting_streams.saturating_add(streams);
-                self.phrase_streams = self.phrase_streams.saturating_add(streams);
-                self.phrase_fields = self.phrase_fields.saturating_add(phrase_fields);
-            }
-            Query::Boolean { clauses, .. } => {
-                for clause in clauses {
-                    self.visit(&clause.query, schema, glob_expansion_limit)?;
+                    self.posting_streams =
+                        self.posting_streams.saturating_add(fields.saturating_mul(
+                            u64::try_from(glob_expansion_limit).unwrap_or(u64::MAX),
+                        ));
                 }
-            }
-            Query::Boost { query, .. } => self.visit(query, schema, glob_expansion_limit)?,
-            Query::Range { field_id, .. } => {
-                if matches!(
-                    query_field_kind(schema, *field_id)?,
-                    FieldKind::Keyword | FieldKind::Text { .. }
-                ) {
-                    self.dictionary_scans = self.dictionary_scans.saturating_add(1);
-                    self.string_range_expansions = self.string_range_expansions.saturating_add(1);
+                QueryNode::Set { values, .. } => {
+                    let strings = values
+                        .iter()
+                        .filter(|value| matches!(value, QueryValue::Str(_)))
+                        .count();
+                    let strings = u64::try_from(strings).unwrap_or(u64::MAX);
+                    self.posting_streams = self.posting_streams.saturating_add(strings);
                 }
-            }
-            Query::Glob { field_ids, .. } => {
-                let fields = u64::try_from(field_ids.len()).unwrap_or(u64::MAX);
-                self.dictionary_scans = self.dictionary_scans.saturating_add(fields);
-                self.posting_streams = self.posting_streams.saturating_add(
-                    fields.saturating_mul(u64::try_from(glob_expansion_limit).unwrap_or(u64::MAX)),
-                );
-            }
-            Query::Set { values, .. } => {
-                let strings = values
-                    .iter()
-                    .filter(|value| matches!(value, QueryValue::Str(_)))
-                    .count();
-                let strings = u64::try_from(strings).unwrap_or(u64::MAX);
-                self.posting_streams = self.posting_streams.saturating_add(strings);
             }
         }
         Ok(())
@@ -4867,6 +4918,76 @@ pub struct QuillIndex {
     reader: QuillReader,
     writer: Arc<Mutex<QuillWriterState>>,
     directory: Option<PathBuf>,
+    #[cfg(feature = "bench-internals")]
+    benchmark_qg4_directory_sync_state: Option<Arc<BenchmarkQuillDirectorySyncState>>,
+}
+
+/// Live arm for one controlled QG-4 Quill MANIFEST directory-sync observation.
+///
+/// Construct this immediately before the timed benchmark commit and call
+/// [`Self::finish`] after timing stops. It is neither serializable nor
+/// cloneable, so a caller cannot replay it as a declarative receipt.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct BenchmarkQuillDirectorySyncArm {
+    state: Arc<BenchmarkQuillDirectorySyncState>,
+    nonce: u64,
+    finished: bool,
+    #[cfg(test)]
+    fail_after_commit: bool,
+}
+
+/// Engine-observed result of one controlled QG-4 Quill commit.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BenchmarkQuillDirectorySyncReceipt {
+    /// On-disk root whose MANIFEST directory sync emitted the observation.
+    pub root: PathBuf,
+    /// Opaque session identity minted by the benchmark observer.
+    pub session_nonce: u64,
+    /// MANIFEST generation installed by the observed directory sync.
+    pub manifest_generation: u64,
+    /// Successful MANIFEST directory-sync calls observed in the armed session.
+    pub observed_sync_count: u8,
+}
+
+#[cfg(feature = "bench-internals")]
+impl BenchmarkQuillDirectorySyncArm {
+    /// Finalize the receipt outside the timed interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuillIndexError::Config`] when the armed session cannot show
+    /// exactly one proven MANIFEST directory sync: the timed commit returned
+    /// without an observed sync, more than one sync occurred while the session
+    /// was armed, the session was replaced or cleared before finalization, the
+    /// commit was never completed through the benchmark commit API, the armed
+    /// commit failed after its observed sync, or the successful sync did not
+    /// stamp its MANIFEST generation.
+    pub fn finish(&mut self) -> Result<BenchmarkQuillDirectorySyncReceipt, QuillIndexError> {
+        self.finished = true;
+        let (root, manifest_generation) = self
+            .state
+            .finish(self.nonce)
+            .map_err(QuillIndexError::Config)?;
+        Ok(BenchmarkQuillDirectorySyncReceipt {
+            root,
+            session_nonce: self.nonce,
+            manifest_generation,
+            observed_sync_count: 1,
+        })
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl Drop for BenchmarkQuillDirectorySyncArm {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.state.disarm(self.nonce);
+        }
+    }
 }
 
 /// Read-only Quill handle for consumers that must coexist with another
@@ -5046,6 +5167,16 @@ impl IndexBackend {
     fn bind_publication_read_state(&mut self, state: PublicationReadState) {
         if let Self::Durable(writer) = self {
             writer.bind_publication_read_state(state);
+        }
+    }
+
+    #[cfg(feature = "bench-internals")]
+    fn bind_benchmark_qg4_directory_sync_state(
+        &mut self,
+        state: Arc<BenchmarkQuillDirectorySyncState>,
+    ) {
+        if let Self::Durable(writer) = self {
+            writer.bind_benchmark_qg4_directory_sync_state(state);
         }
     }
 }
@@ -10766,12 +10897,24 @@ impl QuillSearchIndex {
 
 impl QuillIndex {
     fn from_writer(writer: QuillWriterState) -> Self {
+        #[cfg(feature = "bench-internals")]
+        let mut writer = writer;
         let directory = writer.directory().map(Path::to_path_buf);
+        #[cfg(feature = "bench-internals")]
+        let benchmark_qg4_directory_sync_state = directory.as_ref().map(|root| {
+            let state = Arc::new(BenchmarkQuillDirectorySyncState::new(root.clone()));
+            writer
+                .backend
+                .bind_benchmark_qg4_directory_sync_state(Arc::clone(&state));
+            state
+        });
         let reader = writer.reader.clone();
         Self {
             reader,
             writer: Arc::new(Mutex::with_name("quill.index.writer", writer)),
             directory,
+            #[cfg(feature = "bench-internals")]
+            benchmark_qg4_directory_sync_state,
         }
     }
 
@@ -11284,6 +11427,91 @@ impl QuillIndex {
         writer.commit(cx).await?;
         drop(writer);
         self.snapshot()
+    }
+
+    /// Arm a MANIFEST directory-sync observation immediately before one QG-4 commit.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn benchmark_arm_qg4_directory_sync(
+        &self,
+    ) -> Result<BenchmarkQuillDirectorySyncArm, QuillIndexError> {
+        let state = self
+            .benchmark_qg4_directory_sync_state
+            .as_ref()
+            .ok_or_else(|| {
+                QuillIndexError::Config(SearchError::InvalidConfig {
+                    field: "quill.qg4.directory_sync".to_owned(),
+                    value: "not_on_disk_benchmark_index".to_owned(),
+                    reason: "QG-4 directory-sync observation requires an on-disk Quill index"
+                        .to_owned(),
+                })
+            })?
+            .clone();
+        let nonce = state.arm().map_err(QuillIndexError::Config)?;
+        Ok(BenchmarkQuillDirectorySyncArm {
+            state,
+            nonce,
+            finished: false,
+            #[cfg(test)]
+            fail_after_commit: false,
+        })
+    }
+
+    /// Execute the public Quill commit path while an already-armed QG-4 observer watches its
+    /// real MANIFEST directory sync.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn benchmark_commit_qg4_directory_sync(
+        &self,
+        cx: &Cx,
+        arm: &mut BenchmarkQuillDirectorySyncArm,
+    ) -> Result<(), QuillIndexError> {
+        if arm.finished {
+            return Err(QuillIndexError::Config(SearchError::InvalidConfig {
+                field: "quill.qg4.directory_sync".to_owned(),
+                value: "foreign_or_disarmed_arm".to_owned(),
+                reason: "a finalized QG-4 directory-sync arm cannot be reused".to_owned(),
+            }));
+        }
+        let state = self
+            .benchmark_qg4_directory_sync_state
+            .as_ref()
+            .ok_or_else(|| {
+                QuillIndexError::Config(SearchError::InvalidConfig {
+                    field: "quill.qg4.directory_sync".to_owned(),
+                    value: "not_on_disk_benchmark_index".to_owned(),
+                    reason: "QG-4 directory-sync observation requires an on-disk Quill index"
+                        .to_owned(),
+                })
+            })?;
+        if !Arc::ptr_eq(state, &arm.state) {
+            return Err(QuillIndexError::Config(SearchError::InvalidConfig {
+                field: "quill.qg4.directory_sync".to_owned(),
+                value: "foreign_arm".to_owned(),
+                reason: "the supplied QG-4 directory-sync arm belongs to another index".to_owned(),
+            }));
+        }
+
+        match Self::commit(self, cx).await {
+            Ok(_) => {
+                #[cfg(test)]
+                if arm.fail_after_commit {
+                    arm.state.record_commit_failure(arm.nonce);
+                    return Err(QuillIndexError::Config(SearchError::InvalidConfig {
+                        field: "quill.qg4.directory_sync".to_owned(),
+                        value: "test_failure_after_commit".to_owned(),
+                        reason: "test-only failure after the real QG-4 commit completed".to_owned(),
+                    }));
+                }
+                arm.state
+                    .record_commit_success(arm.nonce)
+                    .map_err(QuillIndexError::Config)
+            }
+            Err(error) => {
+                arm.state.record_commit_failure(arm.nonce);
+                Err(error)
+            }
+        }
     }
 
     /// Finish an explicitly configured bulk build with one final
@@ -12211,52 +12439,64 @@ impl SnippetTailWorkShape {
     }
 
     fn visit(&mut self, query: &Query, expansion_limit: usize) {
-        match query {
-            Query::Term { fields, .. }
-                if fields.iter().any(|field| field.field_id == CONTENT_FIELD) =>
-            {
-                self.add_term_count(1);
-            }
-            Query::Phrase {
-                fields,
-                terms,
-                prefix,
-                ..
-            } if fields.iter().any(|field| field.field_id == CONTENT_FIELD) => {
-                if *prefix && !terms.is_empty() {
-                    self.add_term_count(terms.len().saturating_sub(1));
-                    self.add_wildcard_glob(expansion_limit);
-                } else {
-                    self.add_term_count(terms.len());
-                }
-            }
-            Query::Boolean { clauses, .. } => {
-                for clause in clauses
-                    .iter()
-                    .filter(|clause| clause.occur != Occur::MustNot)
+        let mut pending = Vec::new();
+        if pending.try_reserve_exact(query.node_count()).is_err() {
+            self.wildcard_glob_scans = u64::MAX;
+            self.exact_glob_scans = u64::MAX;
+            self.term_count_ceiling = u64::MAX;
+            return;
+        }
+        pending.push(query.root_id());
+        while let Some(node_id) = pending.pop() {
+            match query.node(node_id) {
+                QueryNode::Term { fields, .. }
+                    if fields.iter().any(|field| field.field_id == CONTENT_FIELD) =>
                 {
-                    self.visit(&clause.query, expansion_limit);
+                    self.add_term_count(1);
                 }
+                QueryNode::Phrase {
+                    fields,
+                    terms,
+                    prefix,
+                    ..
+                } if fields.iter().any(|field| field.field_id == CONTENT_FIELD) => {
+                    if *prefix && !terms.is_empty() {
+                        self.add_term_count(terms.len().saturating_sub(1));
+                        self.add_wildcard_glob(expansion_limit);
+                    } else {
+                        self.add_term_count(terms.len());
+                    }
+                }
+                QueryNode::Boolean { clauses, .. } => {
+                    pending.extend(
+                        clauses
+                            .iter()
+                            .rev()
+                            .filter(|clause| clause.occur != Occur::MustNot)
+                            .map(|clause| clause.query),
+                    );
+                }
+                QueryNode::Set { field_id, values } if *field_id == CONTENT_FIELD => {
+                    self.add_term_count(
+                        values
+                            .iter()
+                            .filter(|value| matches!(value, QueryValue::Str(_)))
+                            .count(),
+                    );
+                }
+                QueryNode::Glob { field_ids, pattern } if field_ids.contains(&CONTENT_FIELD) => {
+                    self.add_glob(pattern.as_bytes(), expansion_limit);
+                }
+                QueryNode::Boost { query: child, .. } => pending.push(*child),
+                QueryNode::Empty
+                | QueryNode::All
+                | QueryNode::AllocationFailure { .. }
+                | QueryNode::Term { .. }
+                | QueryNode::Phrase { .. }
+                | QueryNode::Range { .. }
+                | QueryNode::Set { .. }
+                | QueryNode::Glob { .. } => {}
             }
-            Query::Set { field_id, values } if *field_id == CONTENT_FIELD => {
-                self.add_term_count(
-                    values
-                        .iter()
-                        .filter(|value| matches!(value, QueryValue::Str(_)))
-                        .count(),
-                );
-            }
-            Query::Glob { field_ids, pattern } if field_ids.contains(&CONTENT_FIELD) => {
-                self.add_glob(pattern.as_bytes(), expansion_limit);
-            }
-            Query::Boost { query, .. } => self.visit(query, expansion_limit),
-            Query::Empty
-            | Query::All
-            | Query::Term { .. }
-            | Query::Phrase { .. }
-            | Query::Range { .. }
-            | Query::Set { .. }
-            | Query::Glob { .. } => {}
         }
     }
 }
@@ -12990,154 +13230,182 @@ fn validate_query_lowering(
     inherited_boost: f32,
     schema: SchemaDescriptor,
 ) -> Result<(), QuillIndexError> {
-    match query {
-        Query::Empty | Query::All => Ok(()),
-        Query::Term { fields, text } => {
-            for field in fields {
-                validate_query_term(schema, field.field_id, text.as_bytes())?;
-                validate_cumulative_boost(inherited_boost, field.boost)?;
-            }
-            Ok(())
-        }
-        Query::Phrase {
-            fields,
-            terms,
-            slop: _,
-            prefix,
-        } => {
-            if terms.is_empty() {
-                return Err(ArgusError::InvalidPhrase {
-                    reason: "an exact phrase requires positioned terms",
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(query.node_count())
+        .map_err(|_| ArgusError::Allocation {
+            resource: "query validation traversal",
+            count: query.node_count(),
+        })?;
+    pending.push((query.root_id(), inherited_boost));
+    while let Some((node_id, inherited_boost)) = pending.pop() {
+        match query.node(node_id) {
+            QueryNode::Empty | QueryNode::All => {}
+            QueryNode::AllocationFailure { requested } => {
+                return Err(ArgusError::Allocation {
+                    resource: "query arena",
+                    count: *requested,
                 }
                 .into());
             }
-            if terms.len() > 1 {
-                // Capability errors take precedence over operator refinements:
-                // slop and phrase-prefix queries also consume positions, so a
-                // positionless schema must receive the same typed failure.
-                validate_index_capabilities(query, schema)?;
-                if terms
-                    .windows(2)
-                    .any(|pair| pair[0].position > pair[1].position)
-                {
-                    return Err(ArgusError::InvalidPhrase {
-                        reason: "phrase positions must be non-decreasing",
-                    }
-                    .into());
-                }
-                if terms.first().map(|term| term.position) == terms.last().map(|term| term.position)
-                {
-                    return Err(ArgusError::InvalidPhrase {
-                        reason: "an exact phrase must span at least two positions",
-                    }
-                    .into());
-                }
-            }
-            if *prefix && terms.len() == 1 {
-                return Err(QuillIndexError::UnsupportedQuery {
-                    detail: "phrase prefix requires at least two positioned terms".to_owned(),
-                });
-            }
-            for term in terms {
+            QueryNode::Term { fields, text } => {
                 for field in fields {
-                    validate_query_term(schema, field.field_id, term.text.as_bytes())?;
+                    validate_query_term(schema, field.field_id, text.as_bytes())?;
+                    validate_cumulative_boost(inherited_boost, field.boost)?;
                 }
             }
-            for field in fields {
-                validate_cumulative_boost(inherited_boost, field.boost)?;
-            }
-            Ok(())
-        }
-        Query::Boolean { clauses, .. } => {
-            for clause in clauses {
-                validate_query_lowering(&clause.query, inherited_boost, schema)?;
-            }
-            Ok(())
-        }
-        Query::Range {
-            field_id,
-            lower,
-            upper,
-        } => match query_field_kind(schema, *field_id)? {
-            FieldKind::Keyword | FieldKind::Text { .. } => {
-                validate_string_query_field(schema, *field_id, "range")?;
-                let (lower, upper) = string_query_bounds(*field_id, lower, upper)?;
-                validate_bound_term(schema, *field_id, &lower)?;
-                validate_bound_term(schema, *field_id, &upper).map_err(QuillIndexError::from)
-            }
-            FieldKind::I64 { indexed: true, .. }
-            | FieldKind::I64 {
-                indexed: false,
-                fast: true,
-            }
-            | FieldKind::U64 { indexed: true, .. }
-            | FieldKind::U64 {
-                indexed: false,
-                fast: true,
-            } => numeric_query_bounds(schema, *field_id, lower, upper).map(|_| ()),
-            FieldKind::I64 {
-                indexed: false,
-                fast: false,
-            }
-            | FieldKind::U64 {
-                indexed: false,
-                fast: false,
-            } => Err(QuillIndexError::UnsupportedQuery {
-                detail: format!("range names non-indexed numeric field {field_id}"),
-            }),
-            FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
-                detail: format!("range names stored-only field {field_id}"),
-            }),
-        },
-        Query::Set { field_id, values } => match query_field_kind(schema, *field_id)? {
-            FieldKind::Keyword | FieldKind::Text { .. } => {
-                for value in values {
-                    let QueryValue::Str(value) = value else {
-                        return Err(QuillIndexError::UnsupportedQuery {
-                            detail: format!(
-                                "set value type does not match string field {field_id}"
-                            ),
-                        });
-                    };
-                    validate_query_term(schema, *field_id, value.as_bytes())?;
+            QueryNode::Phrase {
+                fields,
+                terms,
+                slop: _,
+                prefix,
+            } => {
+                if terms.is_empty() {
+                    return Err(ArgusError::InvalidPhrase {
+                        reason: "an exact phrase requires positioned terms",
+                    }
+                    .into());
                 }
-                Ok(())
+                if terms.len() > 1 {
+                    // Capability errors take precedence over operator refinements:
+                    // slop and phrase-prefix queries also consume positions, so a
+                    // positionless schema must receive the same typed failure.
+                    validate_index_capabilities(query, schema)?;
+                    if terms
+                        .windows(2)
+                        .any(|pair| pair[0].position > pair[1].position)
+                    {
+                        return Err(ArgusError::InvalidPhrase {
+                            reason: "phrase positions must be non-decreasing",
+                        }
+                        .into());
+                    }
+                    if terms.first().map(|term| term.position)
+                        == terms.last().map(|term| term.position)
+                    {
+                        return Err(ArgusError::InvalidPhrase {
+                            reason: "an exact phrase must span at least two positions",
+                        }
+                        .into());
+                    }
+                }
+                if *prefix && terms.len() == 1 {
+                    return Err(QuillIndexError::UnsupportedQuery {
+                        detail: "phrase prefix requires at least two positioned terms".to_owned(),
+                    });
+                }
+                for term in terms {
+                    for field in fields {
+                        validate_query_term(schema, field.field_id, term.text.as_bytes())?;
+                    }
+                }
+                for field in fields {
+                    validate_cumulative_boost(inherited_boost, field.boost)?;
+                }
             }
-            FieldKind::I64 { indexed: true, .. }
-            | FieldKind::I64 {
-                indexed: false,
-                fast: true,
+            QueryNode::Boolean { clauses, .. } => {
+                pending.extend(
+                    clauses
+                        .iter()
+                        .rev()
+                        .map(|clause| (clause.query, inherited_boost)),
+                );
             }
-            | FieldKind::U64 { indexed: true, .. }
-            | FieldKind::U64 {
-                indexed: false,
-                fast: true,
-            } => numeric_query_values(schema, *field_id, values).map(|_| ()),
-            FieldKind::I64 {
-                indexed: false,
-                fast: false,
+            QueryNode::Range {
+                field_id,
+                lower,
+                upper,
+            } => {
+                match query_field_kind(schema, *field_id)? {
+                    FieldKind::Keyword | FieldKind::Text { .. } => {
+                        validate_string_query_field(schema, *field_id, "range")?;
+                        let (lower, upper) = string_query_bounds(*field_id, lower, upper)?;
+                        validate_bound_term(schema, *field_id, &lower)?;
+                        validate_bound_term(schema, *field_id, &upper)
+                            .map_err(QuillIndexError::from)
+                    }
+                    FieldKind::I64 { indexed: true, .. }
+                    | FieldKind::I64 {
+                        indexed: false,
+                        fast: true,
+                    }
+                    | FieldKind::U64 { indexed: true, .. }
+                    | FieldKind::U64 {
+                        indexed: false,
+                        fast: true,
+                    } => numeric_query_bounds(schema, *field_id, lower, upper).map(|_| ()),
+                    FieldKind::I64 {
+                        indexed: false,
+                        fast: false,
+                    }
+                    | FieldKind::U64 {
+                        indexed: false,
+                        fast: false,
+                    } => Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!("range names non-indexed numeric field {field_id}"),
+                    }),
+                    FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!("range names stored-only field {field_id}"),
+                    }),
+                }?;
             }
-            | FieldKind::U64 {
-                indexed: false,
-                fast: false,
-            } => Err(QuillIndexError::UnsupportedQuery {
-                detail: format!("set names non-indexed and non-fast numeric field {field_id}"),
-            }),
-            FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
-                detail: format!("set names stored-only field {field_id}"),
-            }),
-        },
-        Query::Glob { field_ids, .. } => {
-            for &field_id in field_ids {
-                validate_string_query_field(schema, field_id, "glob")?;
+            QueryNode::Set { field_id, values } => {
+                match query_field_kind(schema, *field_id)? {
+                    FieldKind::Keyword | FieldKind::Text { .. } => {
+                        for value in values {
+                            let QueryValue::Str(value) = value else {
+                                return Err(QuillIndexError::UnsupportedQuery {
+                                    detail: format!(
+                                        "set value type does not match string field {field_id}"
+                                    ),
+                                });
+                            };
+                            validate_query_term(schema, *field_id, value.as_bytes())?;
+                        }
+                        Ok(())
+                    }
+                    FieldKind::I64 { indexed: true, .. }
+                    | FieldKind::I64 {
+                        indexed: false,
+                        fast: true,
+                    }
+                    | FieldKind::U64 { indexed: true, .. }
+                    | FieldKind::U64 {
+                        indexed: false,
+                        fast: true,
+                    } => numeric_query_values(schema, *field_id, values).map(|_| ()),
+                    FieldKind::I64 {
+                        indexed: false,
+                        fast: false,
+                    }
+                    | FieldKind::U64 {
+                        indexed: false,
+                        fast: false,
+                    } => Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!(
+                            "set names non-indexed and non-fast numeric field {field_id}"
+                        ),
+                    }),
+                    FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!("set names stored-only field {field_id}"),
+                    }),
+                }?;
             }
-            Ok(())
-        }
-        Query::Boost { query, factor } => {
-            let boost = validate_cumulative_boost(inherited_boost, *factor)?;
-            validate_query_lowering(query, boost, schema)
+            QueryNode::Glob { field_ids, .. } => {
+                for &field_id in field_ids {
+                    validate_string_query_field(schema, field_id, "glob")?;
+                }
+            }
+            QueryNode::Boost {
+                query: child,
+                factor,
+            } => {
+                let boost = validate_cumulative_boost(inherited_boost, *factor)?;
+                pending.push((*child, boost));
+            }
         }
     }
+    Ok(())
 }
 
 fn validate_cumulative_boost(inherited: f32, factor: f32) -> Result<f32, QuillIndexError> {
@@ -13414,49 +13682,61 @@ struct QueryTraceShape {
 impl QueryTraceShape {
     fn from_query(query: &Query) -> Self {
         let mut shape = Self {
-            root_kind: query_trace_kind(query),
+            root_kind: query_trace_kind(query.root()),
             topology_hash: query_topology_hash(query),
             ..Self::default()
         };
-        shape.visit(query, 1);
+        shape.visit(query);
         shape
     }
 
-    fn visit(&mut self, query: &Query, depth: u64) {
-        self.nodes = self.nodes.saturating_add(1);
-        self.depth = self.depth.max(depth);
-        match query {
-            Query::Empty | Query::All => {}
-            Query::Term { .. } => self.terms = self.terms.saturating_add(1),
-            Query::Phrase { .. } => self.phrases = self.phrases.saturating_add(1),
-            Query::Boolean { clauses, .. } => {
-                self.booleans = self.booleans.saturating_add(1);
-                for clause in clauses {
-                    self.visit(&clause.query, depth.saturating_add(1));
+    fn visit(&mut self, query: &Query) {
+        let mut pending = Vec::new();
+        if pending.try_reserve_exact(query.node_count()).is_err() {
+            return;
+        }
+        pending.push((query.root_id(), 1_u64));
+        while let Some((node_id, depth)) = pending.pop() {
+            self.nodes = self.nodes.saturating_add(1);
+            self.depth = self.depth.max(depth);
+            match query.node(node_id) {
+                QueryNode::Empty | QueryNode::All => {}
+                QueryNode::AllocationFailure { .. } => {}
+                QueryNode::Term { .. } => self.terms = self.terms.saturating_add(1),
+                QueryNode::Phrase { .. } => self.phrases = self.phrases.saturating_add(1),
+                QueryNode::Boolean { clauses, .. } => {
+                    self.booleans = self.booleans.saturating_add(1);
+                    pending.extend(
+                        clauses
+                            .iter()
+                            .rev()
+                            .map(|clause| (clause.query, depth.saturating_add(1))),
+                    );
                 }
-            }
-            Query::Range { .. } | Query::Set { .. } | Query::Glob { .. } => {
-                self.predicates = self.predicates.saturating_add(1);
-            }
-            Query::Boost { query, .. } => {
-                self.boosts = self.boosts.saturating_add(1);
-                self.visit(query, depth.saturating_add(1));
+                QueryNode::Range { .. } | QueryNode::Set { .. } | QueryNode::Glob { .. } => {
+                    self.predicates = self.predicates.saturating_add(1);
+                }
+                QueryNode::Boost { query: child, .. } => {
+                    self.boosts = self.boosts.saturating_add(1);
+                    pending.push((*child, depth.saturating_add(1)));
+                }
             }
         }
     }
 }
 
-const fn query_trace_kind(query: &Query) -> &'static str {
+const fn query_trace_kind(query: &QueryNode) -> &'static str {
     match query {
-        Query::Empty => "empty",
-        Query::All => "all",
-        Query::Term { .. } => "term",
-        Query::Phrase { .. } => "phrase",
-        Query::Boolean { .. } => "boolean",
-        Query::Range { .. } => "range",
-        Query::Set { .. } => "set",
-        Query::Glob { .. } => "glob",
-        Query::Boost { .. } => "boost",
+        QueryNode::Empty => "empty",
+        QueryNode::All => "all",
+        QueryNode::AllocationFailure { .. } => "allocation_failure",
+        QueryNode::Term { .. } => "term",
+        QueryNode::Phrase { .. } => "phrase",
+        QueryNode::Boolean { .. } => "boolean",
+        QueryNode::Range { .. } => "range",
+        QueryNode::Set { .. } => "set",
+        QueryNode::Glob { .. } => "glob",
+        QueryNode::Boost { .. } => "boost",
     }
 }
 
@@ -13480,56 +13760,81 @@ fn query_topology_hash(query: &Query) -> u64 {
 }
 
 fn hash_query_topology(hasher: &mut Xxh3, query: &Query) {
-    match query {
-        Query::Empty => hasher.update(&[0]),
-        Query::All => hasher.update(&[1]),
-        Query::Term { fields, .. } => {
-            hasher.update(&[2]);
-            hash_topology_len(hasher, fields.len());
-        }
-        Query::Phrase {
-            fields,
-            terms,
-            slop,
-            prefix,
-        } => {
-            hasher.update(&[3]);
-            hash_topology_len(hasher, fields.len());
-            hash_topology_len(hasher, terms.len());
-            hasher.update(&slop.to_le_bytes());
-            hasher.update(&[u8::from(*prefix)]);
-        }
-        Query::Boolean { clauses, operator } => {
-            hasher.update(&[4]);
-            hash_topology_len(hasher, clauses.len());
-            hasher.update(&[match operator {
-                None => 0,
-                Some(BooleanOperator::And) => 1,
-                Some(BooleanOperator::Or) => 2,
-            }]);
-            for clause in clauses {
-                hasher.update(&[match clause.occur {
+    enum HashTask {
+        Node(QueryNodeId),
+        Occur(Occur),
+    }
+
+    let Some(task_count) = query.node_count().checked_mul(2) else {
+        hasher.update(&[u8::MAX]);
+        return;
+    };
+    let mut pending = Vec::new();
+    if pending.try_reserve_exact(task_count).is_err() {
+        hasher.update(&[u8::MAX]);
+        return;
+    }
+    pending.push(HashTask::Node(query.root_id()));
+    while let Some(task) = pending.pop() {
+        let node_id = match task {
+            HashTask::Node(node_id) => node_id,
+            HashTask::Occur(occur) => {
+                hasher.update(&[match occur {
                     Occur::Must => 0,
                     Occur::Should => 1,
                     Occur::MustNot => 2,
                 }]);
-                hash_query_topology(hasher, &clause.query);
+                continue;
             }
-        }
-        Query::Range { lower, upper, .. } => {
-            hasher.update(&[5, bound_topology_kind(lower), bound_topology_kind(upper)]);
-        }
-        Query::Set { values, .. } => {
-            hasher.update(&[6]);
-            hash_topology_len(hasher, values.len());
-        }
-        Query::Glob { field_ids, .. } => {
-            hasher.update(&[7]);
-            hash_topology_len(hasher, field_ids.len());
-        }
-        Query::Boost { query, .. } => {
-            hasher.update(&[8]);
-            hash_query_topology(hasher, query);
+        };
+        match query.node(node_id) {
+            QueryNode::Empty => hasher.update(&[0]),
+            QueryNode::All => hasher.update(&[1]),
+            QueryNode::AllocationFailure { .. } => hasher.update(&[9]),
+            QueryNode::Term { fields, .. } => {
+                hasher.update(&[2]);
+                hash_topology_len(hasher, fields.len());
+            }
+            QueryNode::Phrase {
+                fields,
+                terms,
+                slop,
+                prefix,
+            } => {
+                hasher.update(&[3]);
+                hash_topology_len(hasher, fields.len());
+                hash_topology_len(hasher, terms.len());
+                hasher.update(&slop.to_le_bytes());
+                hasher.update(&[u8::from(*prefix)]);
+            }
+            QueryNode::Boolean { clauses, operator } => {
+                hasher.update(&[4]);
+                hash_topology_len(hasher, clauses.len());
+                hasher.update(&[match operator {
+                    None => 0,
+                    Some(BooleanOperator::And) => 1,
+                    Some(BooleanOperator::Or) => 2,
+                }]);
+                for clause in clauses.iter().rev() {
+                    pending.push(HashTask::Node(clause.query));
+                    pending.push(HashTask::Occur(clause.occur));
+                }
+            }
+            QueryNode::Range { lower, upper, .. } => {
+                hasher.update(&[5, bound_topology_kind(lower), bound_topology_kind(upper)]);
+            }
+            QueryNode::Set { values, .. } => {
+                hasher.update(&[6]);
+                hash_topology_len(hasher, values.len());
+            }
+            QueryNode::Glob { field_ids, .. } => {
+                hasher.update(&[7]);
+                hash_topology_len(hasher, field_ids.len());
+            }
+            QueryNode::Boost { query: child, .. } => {
+                hasher.update(&[8]);
+                pending.push(HashTask::Node(*child));
+            }
         }
     }
 }
@@ -13606,39 +13911,44 @@ enum UnionChildKind {
 /// segment sections. Only pure non-negative term unions can consume `MaxScore`
 /// or BMW metadata; every other shape keeps the pre-E4.4 POSTINGS-only path.
 fn prunable_scorer_shape(query: &Query, inherited_boost: f32) -> Option<PrunableScorerShape> {
-    match query {
-        Query::Empty => Some(PrunableScorerShape::Empty),
-        Query::Term { fields, .. } => {
-            if fields.iter().any(|field| {
-                let boost = inherited_boost * field.boost;
-                !boost.is_finite() || boost.is_sign_negative()
-            }) {
+    enum ShapeTask {
+        Visit(QueryNodeId, f32),
+        ReduceUnion(usize),
+    }
+
+    let node_count = query.node_count();
+    let task_count = node_count.checked_mul(2)?;
+    let mut pending = Vec::new();
+    let mut values = Vec::new();
+    if pending.try_reserve_exact(task_count).is_err()
+        || values.try_reserve_exact(node_count).is_err()
+    {
+        return None;
+    }
+    pending.push(ShapeTask::Visit(query.root_id(), inherited_boost));
+    while let Some(task) = pending.pop() {
+        let ShapeTask::Visit(node_id, inherited_boost) = task else {
+            let ShapeTask::ReduceUnion(clause_count) = task else {
                 return None;
-            }
-            Some(match fields.len() {
-                0 => PrunableScorerShape::Empty,
-                1 => PrunableScorerShape::Term,
-                children => PrunableScorerShape::Union {
-                    children,
-                    kind: UnionChildKind::DirectTerms,
-                },
-            })
-        }
-        Query::Boolean { clauses, .. }
-            if clauses
-                .iter()
-                .all(|clause| clause.occur == crate::query::Occur::Should) =>
-        {
+            };
             let mut children = 0_usize;
             let mut singleton = PrunableScorerShape::Empty;
             let mut direct_terms = true;
             let mut term_groups = true;
-            for clause in clauses {
-                let shape = prunable_scorer_shape(&clause.query, inherited_boost)?;
+            let mut valid = true;
+            for _ in 0..clause_count {
+                let Some(shape) = values.pop().flatten() else {
+                    valid = false;
+                    continue;
+                };
                 if shape == PrunableScorerShape::Empty {
                     continue;
                 }
-                children = children.checked_add(1)?;
+                let Some(next) = children.checked_add(1) else {
+                    valid = false;
+                    continue;
+                };
+                children = next;
                 direct_terms &= shape == PrunableScorerShape::Term;
                 term_groups &= matches!(
                     shape,
@@ -13649,13 +13959,11 @@ fn prunable_scorer_shape(query: &Query, inherited_boost: f32) -> Option<Prunable
                 );
                 singleton = shape;
             }
-            Some(match children {
+            values.push(valid.then_some(match children {
                 0 => PrunableScorerShape::Empty,
                 1 => singleton,
                 _ => PrunableScorerShape::Union {
                     children,
-                    // A child is never both a term and a union, so at most one
-                    // of these holds once `children >= 1`.
                     kind: if direct_terms {
                         UnionChildKind::DirectTerms
                     } else if term_groups {
@@ -13664,20 +13972,57 @@ fn prunable_scorer_shape(query: &Query, inherited_boost: f32) -> Option<Prunable
                         UnionChildKind::Mixed
                     },
                 },
-            })
+            }));
+            continue;
+        };
+        match query.node(node_id) {
+            QueryNode::Empty => values.push(Some(PrunableScorerShape::Empty)),
+            QueryNode::Term { fields, .. } => {
+                let valid = fields.iter().all(|field| {
+                    let boost = inherited_boost * field.boost;
+                    boost.is_finite() && !boost.is_sign_negative()
+                });
+                values.push(valid.then_some(match fields.len() {
+                    0 => PrunableScorerShape::Empty,
+                    1 => PrunableScorerShape::Term,
+                    children => PrunableScorerShape::Union {
+                        children,
+                        kind: UnionChildKind::DirectTerms,
+                    },
+                }));
+            }
+            QueryNode::Boolean { clauses, .. }
+                if clauses.iter().all(|clause| clause.occur == Occur::Should) =>
+            {
+                pending.push(ShapeTask::ReduceUnion(clauses.len()));
+                pending.extend(
+                    clauses
+                        .iter()
+                        .rev()
+                        .map(|clause| ShapeTask::Visit(clause.query, inherited_boost)),
+                );
+            }
+            QueryNode::Boost {
+                query: child,
+                factor,
+            } => {
+                let boost = inherited_boost * *factor;
+                if boost.is_finite() && !boost.is_sign_negative() {
+                    pending.push(ShapeTask::Visit(*child, boost));
+                } else {
+                    values.push(None);
+                }
+            }
+            QueryNode::All
+            | QueryNode::AllocationFailure { .. }
+            | QueryNode::Phrase { .. }
+            | QueryNode::Range { .. }
+            | QueryNode::Set { .. }
+            | QueryNode::Glob { .. }
+            | QueryNode::Boolean { .. } => values.push(None),
         }
-        Query::Boost { query, factor } => {
-            let boost = inherited_boost * *factor;
-            (boost.is_finite() && !boost.is_sign_negative())
-                .then(|| prunable_scorer_shape(query, boost))?
-        }
-        Query::All
-        | Query::Phrase { .. }
-        | Query::Range { .. }
-        | Query::Set { .. }
-        | Query::Glob { .. }
-        | Query::Boolean { .. } => None,
     }
+    values.pop().flatten()
 }
 
 /// Whether the root scorer can actually consume rank-pruning metadata, and so
@@ -13761,226 +14106,291 @@ fn lower_query_with_mode<'a>(
     rank_pruning: bool,
     topdocs_root: bool,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
-    match query {
-        Query::Empty => Ok(ReferenceScorer::empty()),
-        Query::All => {
-            let (docid_lo, docid_hi) = leaf.docid_range();
-            Ok(ReferenceScorer::all_with_boost(
-                docid_lo,
-                docid_hi,
-                leaf.live_document_count()?,
-                inherited_boost,
-            )?)
-        }
-        Query::Term { fields, text } => {
-            let mut clauses = Vec::new();
-            clauses
-                .try_reserve_exact(fields.len())
-                .map_err(|_| invalid_state("could not allocate expanded term clauses"))?;
-            for field in fields {
-                clauses.push(ScorerClause::should(lower_leaf_term(
-                    leaf,
-                    snapshot,
-                    schema,
-                    field.field_id,
-                    text.as_bytes(),
-                    prepared_doc_freqs,
-                    inherited_boost * field.boost,
-                    rank_pruning,
-                    checkpoint,
-                )?));
+    enum LowerTask {
+        Visit {
+            node: QueryNodeId,
+            boost: f32,
+            topdocs_root: bool,
+        },
+        BuildBoolean {
+            node: QueryNodeId,
+            topdocs_root: bool,
+        },
+    }
+
+    let node_count = query.node_count();
+    let task_count = node_count
+        .checked_mul(2)
+        .ok_or_else(|| invalid_state("query lowering task count overflowed"))?;
+    let mut pending = Vec::new();
+    let mut values = Vec::new();
+    pending
+        .try_reserve_exact(task_count)
+        .map_err(|_| ArgusError::Allocation {
+            resource: "query lowering tasks",
+            count: task_count,
+        })?;
+    values
+        .try_reserve_exact(node_count)
+        .map_err(|_| ArgusError::Allocation {
+            resource: "query lowering values",
+            count: node_count,
+        })?;
+    pending.push(LowerTask::Visit {
+        node: query.root_id(),
+        boost: inherited_boost,
+        topdocs_root,
+    });
+    while let Some(task) = pending.pop() {
+        let LowerTask::Visit {
+            node,
+            boost: inherited_boost,
+            topdocs_root,
+        } = task
+        else {
+            let LowerTask::BuildBoolean { node, topdocs_root } = task else {
+                return Err(invalid_state("invalid query lowering task"));
+            };
+            let QueryNode::Boolean { clauses, .. } = query.node(node) else {
+                return Err(invalid_state("Boolean lowering task lost its query node"));
+            };
+            let mut lowered = Vec::new();
+            lowered
+                .try_reserve_exact(clauses.len())
+                .map_err(|_| invalid_state("could not allocate Boolean clauses"))?;
+            for clause in clauses.iter().rev() {
+                let scorer = values
+                    .pop()
+                    .ok_or_else(|| invalid_state("Boolean lowering lost a child scorer"))?;
+                lowered.push(ScorerClause::new(clause.occur, scorer));
             }
-            lower_boolean(
-                clauses,
+            lowered.reverse();
+            values.push(lower_boolean(
+                lowered,
                 mode,
                 topdocs_root,
                 #[cfg(feature = "pruning-conformance")]
                 Some(checkpoint),
-            )
-        }
-        Query::Phrase {
-            fields,
-            terms,
-            slop,
-            prefix,
-        } => {
-            if *prefix && terms.len() == 1 {
-                return Err(QuillIndexError::UnsupportedQuery {
-                    detail: "phrase prefix requires at least two positioned terms".to_owned(),
-                });
+            )?);
+            continue;
+        };
+
+        let scorer = match query.node(node) {
+            QueryNode::Empty => ReferenceScorer::empty(),
+            QueryNode::AllocationFailure { requested } => {
+                return Err(ArgusError::Allocation {
+                    resource: "query arena",
+                    count: *requested,
+                }
+                .into());
             }
-            if terms.len() == 1 {
-                let term = &terms[0];
+            QueryNode::All => {
+                let (docid_lo, docid_hi) = leaf.docid_range();
+                ReferenceScorer::all_with_boost(
+                    docid_lo,
+                    docid_hi,
+                    leaf.live_document_count()?,
+                    inherited_boost,
+                )?
+            }
+            QueryNode::Term { fields, text } => {
                 let mut clauses = Vec::new();
+                clauses
+                    .try_reserve_exact(fields.len())
+                    .map_err(|_| invalid_state("could not allocate expanded term clauses"))?;
                 for field in fields {
                     clauses.push(ScorerClause::should(lower_leaf_term(
                         leaf,
                         snapshot,
                         schema,
                         field.field_id,
-                        term.text.as_bytes(),
+                        text.as_bytes(),
                         prepared_doc_freqs,
                         inherited_boost * field.boost,
-                        false,
+                        rank_pruning,
                         checkpoint,
                     )?));
                 }
-                return lower_boolean(
+                lower_boolean(
                     clauses,
                     mode,
                     topdocs_root,
                     #[cfg(feature = "pruning-conformance")]
                     Some(checkpoint),
-                );
+                )?
             }
-            let mut clauses = Vec::new();
-            clauses
-                .try_reserve_exact(fields.len())
-                .map_err(|_| invalid_state("could not allocate phrase field clauses"))?;
-            for field in fields {
-                if *prefix {
-                    let final_term = terms.last().ok_or_else(|| {
-                        invalid_state("validated phrase prefix lost its final term")
-                    })?;
-                    let final_bytes = final_term.text.as_bytes();
-                    let expansions = leaf_phrase_prefix_terms(
-                        checkpoint,
-                        leaf,
-                        schema,
-                        field.field_id,
-                        final_bytes,
-                    )?;
-                    // Tantivy scores the fixed phrase once and uses all suffix
-                    // expansions only to gate membership. Lowering one exact
-                    // scored phrase per suffix would both add suffix IDF and
-                    // multiply the fixed score for multi-suffix documents.
-                    clauses.push(ScorerClause::should(lower_leaf_phrase_prefix(
-                        checkpoint,
-                        leaf,
-                        snapshot,
-                        prepared_doc_freqs,
-                        schema,
-                        field.field_id,
-                        field.boost,
-                        terms,
-                        &expansions,
-                        inherited_boost,
-                    )?));
+            QueryNode::Phrase {
+                fields,
+                terms,
+                slop,
+                prefix,
+            } => {
+                if *prefix && terms.len() == 1 {
+                    return Err(QuillIndexError::UnsupportedQuery {
+                        detail: "phrase prefix requires at least two positioned terms".to_owned(),
+                    });
+                }
+                if terms.len() == 1 {
+                    let term = &terms[0];
+                    let mut clauses = Vec::new();
+                    clauses
+                        .try_reserve_exact(fields.len())
+                        .map_err(|_| invalid_state("could not allocate phrase field clauses"))?;
+                    for field in fields {
+                        clauses.push(ScorerClause::should(lower_leaf_term(
+                            leaf,
+                            snapshot,
+                            schema,
+                            field.field_id,
+                            term.text.as_bytes(),
+                            prepared_doc_freqs,
+                            inherited_boost * field.boost,
+                            false,
+                            checkpoint,
+                        )?));
+                    }
+                    lower_boolean(
+                        clauses,
+                        mode,
+                        topdocs_root,
+                        #[cfg(feature = "pruning-conformance")]
+                        Some(checkpoint),
+                    )?
                 } else {
-                    clauses.push(ScorerClause::should(lower_leaf_exact_phrase(
-                        checkpoint,
-                        leaf,
-                        snapshot,
-                        prepared_doc_freqs,
-                        schema,
-                        field.field_id,
-                        field.boost,
-                        terms,
-                        *slop,
-                        inherited_boost,
-                    )?));
+                    let mut clauses = Vec::new();
+                    clauses
+                        .try_reserve_exact(fields.len())
+                        .map_err(|_| invalid_state("could not allocate phrase field clauses"))?;
+                    for field in fields {
+                        if *prefix {
+                            let final_term = terms.last().ok_or_else(|| {
+                                invalid_state("validated phrase prefix lost its final term")
+                            })?;
+                            let final_bytes = final_term.text.as_bytes();
+                            let expansions = leaf_phrase_prefix_terms(
+                                checkpoint,
+                                leaf,
+                                schema,
+                                field.field_id,
+                                final_bytes,
+                            )?;
+                            // Tantivy scores the fixed phrase once and uses all suffix
+                            // expansions only to gate membership. Lowering one exact
+                            // scored phrase per suffix would both add suffix IDF and
+                            // multiply the fixed score for multi-suffix documents.
+                            clauses.push(ScorerClause::should(lower_leaf_phrase_prefix(
+                                checkpoint,
+                                leaf,
+                                snapshot,
+                                prepared_doc_freqs,
+                                schema,
+                                field.field_id,
+                                field.boost,
+                                terms,
+                                &expansions,
+                                inherited_boost,
+                            )?));
+                        } else {
+                            clauses.push(ScorerClause::should(lower_leaf_exact_phrase(
+                                checkpoint,
+                                leaf,
+                                snapshot,
+                                prepared_doc_freqs,
+                                schema,
+                                field.field_id,
+                                field.boost,
+                                terms,
+                                *slop,
+                                inherited_boost,
+                            )?));
+                        }
+                    }
+                    lower_boolean(
+                        clauses,
+                        mode,
+                        topdocs_root,
+                        #[cfg(feature = "pruning-conformance")]
+                        Some(checkpoint),
+                    )?
                 }
             }
-            lower_boolean(
-                clauses,
-                mode,
-                topdocs_root,
-                #[cfg(feature = "pruning-conformance")]
-                Some(checkpoint),
-            )
-        }
-        Query::Boolean { clauses, .. } => {
-            let mut lowered = Vec::new();
-            lowered
-                .try_reserve_exact(clauses.len())
-                .map_err(|_| invalid_state("could not allocate Boolean clauses"))?;
-            for clause in clauses {
-                lowered.push(ScorerClause::new(
-                    clause.occur,
-                    lower_query_with_mode(
-                        cx,
-                        checkpoint,
-                        &clause.query,
-                        inherited_boost,
-                        leaf,
-                        snapshot,
-                        prepared_doc_freqs,
-                        schema,
-                        glob_expansion_limit,
-                        mode,
-                        rank_pruning,
-                        false,
-                    )?,
-                ));
+            QueryNode::Boolean { clauses, .. } => {
+                pending.push(LowerTask::BuildBoolean { node, topdocs_root });
+                pending.extend(clauses.iter().rev().map(|clause| LowerTask::Visit {
+                    node: clause.query,
+                    boost: inherited_boost,
+                    topdocs_root: false,
+                }));
+                continue;
             }
-            lower_boolean(
-                lowered,
-                mode,
-                topdocs_root,
-                #[cfg(feature = "pruning-conformance")]
-                Some(checkpoint),
-            )
-        }
-        Query::Boost { query, factor } => {
-            let boost = inherited_boost * *factor;
-            if !boost.is_finite() {
-                return Err(QuillIndexError::UnsupportedQuery {
-                    detail: format!("non-finite cumulative boost bits 0x{:08x}", boost.to_bits()),
+            QueryNode::Boost {
+                query: child,
+                factor,
+            } => {
+                let boost = inherited_boost * *factor;
+                if !boost.is_finite() {
+                    return Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!(
+                            "non-finite cumulative boost bits 0x{:08x}",
+                            boost.to_bits()
+                        ),
+                    });
+                }
+                pending.push(LowerTask::Visit {
+                    node: *child,
+                    boost,
+                    topdocs_root,
                 });
+                continue;
             }
-            lower_query_with_mode(
+            QueryNode::Range {
+                field_id,
+                lower,
+                upper,
+            } => lower_leaf_range(
                 cx,
                 checkpoint,
-                query,
-                boost,
                 leaf,
                 snapshot,
-                prepared_doc_freqs,
                 schema,
+                *field_id,
+                lower,
+                upper,
+                inherited_boost,
+                mode,
+            )?,
+            QueryNode::Glob { field_ids, pattern } => lower_leaf_glob(
+                checkpoint,
+                leaf,
+                snapshot,
+                schema,
+                field_ids,
+                pattern.as_bytes(),
+                inherited_boost,
                 glob_expansion_limit,
                 mode,
-                rank_pruning,
-                topdocs_root,
-            )
-        }
-        Query::Range {
-            field_id,
-            lower,
-            upper,
-        } => lower_leaf_range(
-            cx,
-            checkpoint,
-            leaf,
-            snapshot,
-            schema,
-            *field_id,
-            lower,
-            upper,
-            inherited_boost,
-            mode,
-        ),
-        Query::Glob { field_ids, pattern } => lower_leaf_glob(
-            checkpoint,
-            leaf,
-            snapshot,
-            schema,
-            field_ids,
-            pattern.as_bytes(),
-            inherited_boost,
-            glob_expansion_limit,
-            mode,
-        ),
-        Query::Set { field_id, values } => lower_leaf_set(
-            checkpoint,
-            leaf,
-            snapshot,
-            schema,
-            *field_id,
-            values,
-            inherited_boost,
-            mode,
-        ),
+            )?,
+            QueryNode::Set { field_id, values } => lower_leaf_set(
+                checkpoint,
+                leaf,
+                snapshot,
+                schema,
+                *field_id,
+                values,
+                inherited_boost,
+                mode,
+            )?,
+        };
+        values.push(scorer);
     }
+    if values.len() != 1 {
+        return Err(invalid_state(
+            "query lowering produced an invalid scorer stack",
+        ));
+    }
+    values
+        .pop()
+        .ok_or_else(|| invalid_state("query lowering produced no root scorer"))
 }
 
 fn lower_leaf_range<'a>(
@@ -14869,83 +15279,79 @@ fn collect_snippet_term_bytes(
     expansion_limit: usize,
     terms: &mut BTreeSet<Vec<u8>>,
 ) -> Result<(), QuillIndexError> {
-    match query {
-        Query::Term { fields, text }
-            if fields.iter().any(|field| field.field_id == CONTENT_FIELD) =>
-        {
-            terms.insert(text.as_bytes().to_vec());
-        }
-        Query::Phrase {
-            fields,
-            terms: phrase_terms,
-            prefix,
-            ..
-        } if fields.iter().any(|field| field.field_id == CONTENT_FIELD) => {
-            let prefix_index = (*prefix).then_some(phrase_terms.len().saturating_sub(1));
-            for (index, term) in phrase_terms.iter().enumerate() {
-                if prefix_index == Some(index) {
-                    let pattern = format!("{}*", term.text);
-                    terms.extend(snapshot_glob_terms(
-                        Some(checkpoint),
-                        snapshot,
-                        schema,
-                        CONTENT_FIELD,
-                        pattern.as_bytes(),
-                        expansion_limit,
-                    )?);
-                } else {
-                    terms.insert(term.text.as_bytes().to_vec());
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(query.node_count())
+        .map_err(|_| ArgusError::Allocation {
+            resource: "snippet query traversal",
+            count: query.node_count(),
+        })?;
+    pending.push(query.root_id());
+    while let Some(node_id) = pending.pop() {
+        match query.node(node_id) {
+            QueryNode::Term { fields, text }
+                if fields.iter().any(|field| field.field_id == CONTENT_FIELD) =>
+            {
+                terms.insert(text.as_bytes().to_vec());
+            }
+            QueryNode::Phrase {
+                fields,
+                terms: phrase_terms,
+                prefix,
+                ..
+            } if fields.iter().any(|field| field.field_id == CONTENT_FIELD) => {
+                let prefix_index = (*prefix).then_some(phrase_terms.len().saturating_sub(1));
+                for (index, term) in phrase_terms.iter().enumerate() {
+                    if prefix_index == Some(index) {
+                        let pattern = format!("{}*", term.text);
+                        terms.extend(snapshot_glob_terms(
+                            Some(checkpoint),
+                            snapshot,
+                            schema,
+                            CONTENT_FIELD,
+                            pattern.as_bytes(),
+                            expansion_limit,
+                        )?);
+                    } else {
+                        terms.insert(term.text.as_bytes().to_vec());
+                    }
                 }
             }
-        }
-        Query::Boolean { clauses, .. } => {
-            for clause in clauses
-                .iter()
-                .filter(|clause| clause.occur != Occur::MustNot)
-            {
-                collect_snippet_term_bytes(
-                    checkpoint,
-                    &clause.query,
+            QueryNode::Boolean { clauses, .. } => {
+                pending.extend(
+                    clauses
+                        .iter()
+                        .rev()
+                        .filter(|clause| clause.occur != Occur::MustNot)
+                        .map(|clause| clause.query),
+                );
+            }
+            QueryNode::Set { field_id, values } if *field_id == CONTENT_FIELD => {
+                terms.extend(values.iter().filter_map(|value| match value {
+                    QueryValue::Str(text) => Some(text.as_bytes().to_vec()),
+                    QueryValue::I64(_) | QueryValue::U64(_) => None,
+                }));
+            }
+            QueryNode::Glob { field_ids, pattern } if field_ids.contains(&CONTENT_FIELD) => {
+                terms.extend(snapshot_glob_terms(
+                    Some(checkpoint),
                     snapshot,
                     schema,
+                    CONTENT_FIELD,
+                    pattern.as_bytes(),
                     expansion_limit,
-                    terms,
-                )?;
+                )?);
             }
+            QueryNode::Boost { query: child, .. } => pending.push(*child),
+            QueryNode::Empty
+            | QueryNode::All
+            | QueryNode::AllocationFailure { .. }
+            | QueryNode::Term { .. }
+            | QueryNode::Phrase { .. }
+            | QueryNode::Range { .. }
+            | QueryNode::Set { .. }
+            | QueryNode::Glob { .. } => {}
         }
-        Query::Set { field_id, values } if *field_id == CONTENT_FIELD => {
-            terms.extend(values.iter().filter_map(|value| match value {
-                QueryValue::Str(text) => Some(text.as_bytes().to_vec()),
-                QueryValue::I64(_) | QueryValue::U64(_) => None,
-            }));
-        }
-        Query::Glob { field_ids, pattern } if field_ids.contains(&CONTENT_FIELD) => {
-            terms.extend(snapshot_glob_terms(
-                Some(checkpoint),
-                snapshot,
-                schema,
-                CONTENT_FIELD,
-                pattern.as_bytes(),
-                expansion_limit,
-            )?);
-        }
-        Query::Boost { query, .. } => {
-            collect_snippet_term_bytes(
-                checkpoint,
-                query,
-                snapshot,
-                schema,
-                expansion_limit,
-                terms,
-            )?;
-        }
-        Query::Empty
-        | Query::All
-        | Query::Term { .. }
-        | Query::Phrase { .. }
-        | Query::Range { .. }
-        | Query::Set { .. }
-        | Query::Glob { .. } => {}
     }
     Ok(())
 }
@@ -16798,10 +17204,7 @@ mod tests {
         assert!(get_raw(4, "rust", 10, 3, false).is_none());
         assert!(get_raw(4, "rust", 10, 2, true).is_none());
 
-        let query = Query::Boost {
-            query: Box::new(Query::All),
-            factor: 2.0,
-        };
+        let query = Query::boost(Query::all(), 2.0);
         let preparsed_result = QuillSearchResult {
             hits: Arc::from([]),
             total_count: Some(11),
@@ -16816,16 +17219,7 @@ mod tests {
         assert!(cache.get_preparsed(5, &query, 0, 0, true).is_none());
         assert!(
             cache
-                .get_preparsed(
-                    4,
-                    &Query::Boost {
-                        query: Box::new(Query::All),
-                        factor: 2.5,
-                    },
-                    0,
-                    0,
-                    true,
-                )
+                .get_preparsed(4, &Query::boost(Query::all(), 2.5), 0, 0, true,)
                 .is_none()
         );
     }
@@ -16857,10 +17251,7 @@ mod tests {
                     .commit(&cx)
                     .await
                     .expect("commit ranked-cache trace index");
-                let query = Query::Term {
-                    fields: vec![QueryField::new(1, 1.0)],
-                    text: "alpha".to_owned(),
-                };
+                let query = Query::term(Vec::from([QueryField::new(1, 1.0)]), "alpha".to_owned());
 
                 let run_raw = |trace_case: &'static str, request_cx: &Cx| {
                     let span = tracing::info_span!(
@@ -17259,10 +17650,7 @@ mod tests {
                 .expect("Delta-only glob-tail snapshot is authoritative");
             assert_eq!(snapshot.keeper_snapshot().segments().len(), 0);
             assert_eq!(snapshot.delta_count(), 2);
-            let query = Query::Glob {
-                field_ids: vec![CONTENT_FIELD],
-                pattern: "alpha*".to_owned(),
-            };
+            let query = Query::glob(Vec::from([CONTENT_FIELD]), "alpha*".to_owned());
             let ranked = index
                 .execute_ranked_query(&cx, &query, &snapshot, 10, 0, false, Vec::new())
                 .expect("supported typed glob must rank both Delta documents before the tail");
@@ -17328,10 +17716,10 @@ mod tests {
         let snapshot =
             QuillSearchSnapshot::compose(0, Arc::clone(&keeper), vec![Arc::clone(&frozen)])
                 .expect("compose tombstone-heavy Delta snapshot");
-        let query = Query::Term {
-            fields: vec![crate::query::QueryField::new(CONTENT_FIELD, 1.0)],
-            text: "alpha".to_owned(),
-        };
+        let query = Query::term(
+            Vec::from([crate::query::QueryField::new(CONTENT_FIELD, 1.0)]),
+            "alpha".to_owned(),
+        );
         let work_budget = query_work_upper_bound(
             &query,
             &snapshot,
@@ -20596,25 +20984,25 @@ mod tests {
             let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("open dynamic isolation profile reader");
-            let query = Query::Boolean {
-                clauses: vec![
+            let query = Query::boolean(
+                Vec::from([
                     crate::query::BooleanClause::new(
                         Occur::Should,
-                        Query::Term {
-                            fields: vec![crate::query::QueryField::new(CONTENT_FIELD, 1.0)],
-                            text: "alpha".to_owned(),
-                        },
+                        Query::term(
+                            Vec::from([crate::query::QueryField::new(CONTENT_FIELD, 1.0)]),
+                            "alpha".to_owned(),
+                        ),
                     ),
                     crate::query::BooleanClause::new(
                         Occur::Should,
-                        Query::Set {
-                            field_id: CONTENT_FIELD,
-                            values: vec![QueryValue::Str("alpha".to_owned())],
-                        },
+                        Query::set(
+                            CONTENT_FIELD,
+                            Vec::from([QueryValue::Str("alpha".to_owned())]),
+                        ),
                     ),
-                ],
-                operator: None,
-            };
+                ]),
+                None,
+            );
             let profile = QuillProfileSession::new(
                 snapshot.snapshot_epoch(),
                 snapshot
@@ -26570,9 +26958,11 @@ mod tests {
                 .expect("accumulate algebra corpus");
             index.commit(&cx).await.expect("seal algebra corpus");
 
-            let content_term = |text: &str| Query::Term {
-                fields: vec![QueryField::new(CONTENT_FIELD, 1.0)],
-                text: text.to_owned(),
+            let content_term = |text: &str| {
+                Query::term(
+                    Vec::from([QueryField::new(CONTENT_FIELD, 1.0)]),
+                    text.to_owned(),
+                )
             };
 
             let mut nonempty_should = 0_usize;
@@ -26589,12 +26979,16 @@ mod tests {
                 }
                 let terms = [VOCAB[chosen[0]], VOCAB[chosen[1]], VOCAB[chosen[2]]];
 
-                let should = |order: [usize; 3]| Query::Boolean {
-                    clauses: order
-                        .into_iter()
-                        .map(|slot| BooleanClause::new(Occur::Should, content_term(terms[slot])))
-                        .collect(),
-                    operator: None,
+                let should = |order: [usize; 3]| {
+                    Query::boolean(
+                        order
+                            .into_iter()
+                            .map(|slot| {
+                                BooleanClause::new(Occur::Should, content_term(terms[slot]))
+                            })
+                            .collect(),
+                        None,
+                    )
                 };
                 let baseline = index
                     .search_preparsed_paginated(&cx, &should([0, 1, 2]), DOCS, 0, true)
@@ -26619,40 +27013,30 @@ mod tests {
                 }
 
                 let must = |query: Query| BooleanClause::new(Occur::Must, query);
-                let flat = Query::Boolean {
-                    clauses: vec![
+                let flat = Query::boolean(
+                    Vec::from([
                         must(content_term(terms[0])),
                         must(content_term(terms[1])),
                         must(content_term(terms[2])),
-                    ],
-                    operator: None,
-                };
-                let right_nested = Query::Boolean {
-                    clauses: vec![
-                        must(content_term(terms[0])),
-                        must(Query::Boolean {
-                            clauses: vec![
-                                must(content_term(terms[1])),
-                                must(content_term(terms[2])),
-                            ],
-                            operator: None,
-                        }),
-                    ],
-                    operator: None,
-                };
-                let left_nested = Query::Boolean {
-                    clauses: vec![
-                        must(Query::Boolean {
-                            clauses: vec![
-                                must(content_term(terms[0])),
-                                must(content_term(terms[1])),
-                            ],
-                            operator: None,
-                        }),
-                        must(content_term(terms[2])),
-                    ],
-                    operator: None,
-                };
+                    ]),
+                    None,
+                );
+                let right_inner = Query::boolean(
+                    Vec::from([must(content_term(terms[1])), must(content_term(terms[2]))]),
+                    None,
+                );
+                let right_nested = Query::boolean(
+                    Vec::from([must(content_term(terms[0])), must(right_inner)]),
+                    None,
+                );
+                let left_inner = Query::boolean(
+                    Vec::from([must(content_term(terms[0])), must(content_term(terms[1]))]),
+                    None,
+                );
+                let left_nested = Query::boolean(
+                    Vec::from([must(left_inner), must(content_term(terms[2]))]),
+                    None,
+                );
                 let flat_result = index
                     .search_preparsed_paginated(&cx, &flat, DOCS, 0, true)
                     .expect("flat Must intersection");
@@ -27157,79 +27541,67 @@ mod tests {
 
             let queries = [
                 (
-                    Query::Boost {
-                        query: Box::new(Query::Range {
-                            field_id: 2,
-                            lower: Bound::Included(QueryValue::U64(11)),
-                            upper: Bound::Included(QueryValue::U64(17)),
-                        }),
-                        factor: 2.5,
-                    },
+                    Query::boost(
+                        Query::range(
+                            2,
+                            Bound::Included(QueryValue::U64(11)),
+                            Bound::Included(QueryValue::U64(17)),
+                        ),
+                        2.5,
+                    ),
                     2.5_f32,
                 ),
                 (
-                    Query::Range {
-                        field_id: 1,
-                        lower: Bound::Included(QueryValue::Str("alpha".to_owned())),
-                        upper: Bound::Included(QueryValue::Str("alpine".to_owned())),
-                    },
+                    Query::range(
+                        1,
+                        Bound::Included(QueryValue::Str("alpha".to_owned())),
+                        Bound::Included(QueryValue::Str("alpine".to_owned())),
+                    ),
                     1.0,
                 ),
                 (
-                    Query::Range {
-                        field_id: 5,
-                        lower: Bound::Included(QueryValue::U64(11)),
-                        upper: Bound::Included(QueryValue::U64(17)),
-                    },
+                    Query::range(
+                        5,
+                        Bound::Included(QueryValue::U64(11)),
+                        Bound::Included(QueryValue::U64(17)),
+                    ),
                     1.0,
                 ),
                 (
-                    Query::Set {
-                        field_id: 1,
-                        values: vec![
+                    Query::set(
+                        1,
+                        Vec::from([
                             QueryValue::Str("alpha".to_owned()),
                             QueryValue::Str("alpine".to_owned()),
                             QueryValue::Str("alpha".to_owned()),
-                        ],
-                    },
+                        ]),
+                    ),
                     1.0,
                 ),
                 (
-                    Query::Set {
-                        field_id: 2,
-                        values: vec![
+                    Query::set(
+                        2,
+                        Vec::from([
                             QueryValue::U64(11),
                             QueryValue::U64(17),
                             QueryValue::U64(11),
-                        ],
-                    },
+                        ]),
+                    ),
                     1.0,
                 ),
                 (
-                    Query::Set {
-                        field_id: 5,
-                        values: vec![
+                    Query::set(
+                        5,
+                        Vec::from([
                             QueryValue::U64(11),
                             QueryValue::U64(17),
                             QueryValue::U64(11),
-                        ],
-                    },
+                        ]),
+                    ),
                     1.0,
                 ),
-                (
-                    Query::Glob {
-                        field_ids: vec![1],
-                        pattern: "alp*".to_owned(),
-                    },
-                    1.0,
-                ),
-                (
-                    Query::Glob {
-                        field_ids: vec![1, 1],
-                        pattern: "alp*".to_owned(),
-                    },
-                    2.0,
-                ),
+                (Query::glob(Vec::from([1]), "alp*".to_owned()), 1.0),
+                (Query::glob(Vec::from([1, 1]), "alp*".to_owned()), 2.0),
             ];
             for (query, expected_score) in &queries {
                 let delta_evidence = execute_typed_query(&all_delta, &cx, query);
@@ -27248,15 +27620,15 @@ mod tests {
                 );
             }
 
-            let phrase_prefix = Query::Phrase {
-                fields: vec![crate::query::QueryField::new(1, 1.0)],
-                terms: vec![
+            let phrase_prefix = Query::phrase(
+                Vec::from([crate::query::QueryField::new(1, 1.0)]),
+                Vec::from([
                     crate::query::PositionedTerm::new(0, "alpha"),
                     crate::query::PositionedTerm::new(1, "alp"),
-                ],
-                slop: 0,
-                prefix: true,
-            };
+                ]),
+                0,
+                true,
+            );
             let delta_evidence = execute_typed_query(&all_delta, &cx, &phrase_prefix);
             let mixed_evidence = execute_typed_query(&mixed, &cx, &phrase_prefix);
             let sealed_evidence = execute_typed_query(&all_sealed, &cx, &phrase_prefix);
@@ -27266,16 +27638,16 @@ mod tests {
             assert_eq!(delta_evidence.0.total_count, Some(1));
 
             for empty_range in [
-                Query::Range {
-                    field_id: 1,
-                    lower: Bound::Included(QueryValue::Str("zeta".to_owned())),
-                    upper: Bound::Included(QueryValue::Str("alpha".to_owned())),
-                },
-                Query::Range {
-                    field_id: 1,
-                    lower: Bound::Excluded(QueryValue::Str("alpha".to_owned())),
-                    upper: Bound::Included(QueryValue::Str("alpha".to_owned())),
-                },
+                Query::range(
+                    1,
+                    Bound::Included(QueryValue::Str("zeta".to_owned())),
+                    Bound::Included(QueryValue::Str("alpha".to_owned())),
+                ),
+                Query::range(
+                    1,
+                    Bound::Excluded(QueryValue::Str("alpha".to_owned())),
+                    Bound::Included(QueryValue::Str("alpha".to_owned())),
+                ),
             ] {
                 let (ranked, docids) = execute_typed_query(&mixed, &cx, &empty_range);
                 assert!(ranked.hits.is_empty());
@@ -27284,36 +27656,33 @@ mod tests {
             }
 
             let invalid_queries = [
-                Query::Range {
-                    field_id: 99,
-                    lower: Bound::Included(QueryValue::U64(0)),
-                    upper: Bound::Included(QueryValue::U64(1)),
-                },
-                Query::Range {
-                    field_id: 2,
-                    lower: Bound::Included(QueryValue::Str("wrong".to_owned())),
-                    upper: Bound::Unbounded,
-                },
-                Query::Boost {
-                    query: Box::new(Query::All),
-                    factor: f32::INFINITY,
-                },
-                Query::Phrase {
-                    fields: vec![crate::query::QueryField::new(1, 1.0)],
-                    terms: vec![
+                Query::range(
+                    99,
+                    Bound::Included(QueryValue::U64(0)),
+                    Bound::Included(QueryValue::U64(1)),
+                ),
+                Query::range(
+                    2,
+                    Bound::Included(QueryValue::Str("wrong".to_owned())),
+                    Bound::Unbounded,
+                ),
+                Query::boost(Query::all(), f32::INFINITY),
+                Query::phrase(
+                    Vec::from([crate::query::QueryField::new(1, 1.0)]),
+                    Vec::from([
                         crate::query::PositionedTerm::new(1, "alpha"),
                         crate::query::PositionedTerm::new(0, "beta"),
-                    ],
-                    slop: 1,
-                    prefix: false,
-                },
-                Query::Range {
-                    field_id: 1,
-                    lower: Bound::Included(QueryValue::Str(
+                    ]),
+                    1,
+                    false,
+                ),
+                Query::range(
+                    1,
+                    Bound::Included(QueryValue::Str(
                         "x".repeat(crate::grimoire::MAX_TERM_BYTES + 1),
                     )),
-                    upper: Bound::Unbounded,
-                },
+                    Bound::Unbounded,
+                ),
             ];
             for query in &invalid_queries {
                 let errors = [&empty, &all_delta, &mixed, &all_sealed].map(|index| {
@@ -27343,10 +27712,7 @@ mod tests {
             let snapshot = bounded
                 .search_snapshot()
                 .expect("bounded typed snapshot is authoritative");
-            let glob = Query::Glob {
-                field_ids: vec![1],
-                pattern: "alp*".to_owned(),
-            };
+            let glob = Query::glob(Vec::from([1]), "alp*".to_owned());
             assert!(matches!(
                 bounded.execute_ranked_query(&cx, &glob, &snapshot, 10, 0, true, Vec::new()),
                 Err(QuillIndexError::Dictionary(
@@ -28166,23 +28532,20 @@ mod tests {
                 (
                     4,
                     (4, 4, 1, 3, 0, 0),
-                    Query::Glob {
-                        field_ids: vec![CONTENT_FIELD],
-                        pattern: "rust*".to_owned(),
-                    },
+                    Query::glob(Vec::from([CONTENT_FIELD]), "rust*".to_owned()),
                 ),
                 (
                     7,
                     (7, 7, 1, 4, 2, 0),
-                    Query::Phrase {
-                        fields: vec![crate::query::QueryField::new(CONTENT_FIELD, 1.0)],
-                        terms: vec![
+                    Query::phrase(
+                        Vec::from([crate::query::QueryField::new(CONTENT_FIELD, 1.0)]),
+                        Vec::from([
                             crate::query::PositionedTerm::new(0, "rust"),
                             crate::query::PositionedTerm::new(1, "ownership"),
-                        ],
-                        slop: 0,
-                        prefix: false,
-                    },
+                        ]),
+                        0,
+                        false,
+                    ),
                 ),
             ];
             for (budget, expected, query) in &queries {
@@ -28349,11 +28712,7 @@ mod tests {
             // Exercise the same production lower-and-collect path for a
             // preparsed tree: neither endpoint can proxy its cardinality, so
             // the snapshot ceiling is required.
-            let fully_unbounded = Query::Range {
-                field_id: CONTENT_FIELD,
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            };
+            let fully_unbounded = Query::range(CONTENT_FIELD, Bound::Unbounded, Bound::Unbounded);
             let upper_bound = query_work_upper_bound(
                 &fully_unbounded,
                 &snapshot,
@@ -28606,14 +28965,20 @@ mod tests {
                     .expect("construct phrase-prefix parser")
                     .parse("content:\"a b c\"*")
                     .query;
-                let mut ignored_slop_prefix = zero_slop_prefix.clone();
+                let ignored_slop_prefix = Query::phrase(
+                    Vec::from([crate::query::QueryField::new(CONTENT_FIELD, 1.0)]),
+                    Vec::from([
+                        crate::query::PositionedTerm::new(0, "a"),
+                        crate::query::PositionedTerm::new(1, "b"),
+                        crate::query::PositionedTerm::new(2, "c"),
+                    ]),
+                    u32::MAX,
+                    true,
+                );
                 assert!(matches!(
-                    &ignored_slop_prefix,
-                    Query::Phrase { prefix: true, .. }
+                    ignored_slop_prefix.root(),
+                    QueryNode::Phrase { prefix: true, .. }
                 ));
-                if let Query::Phrase { slop, .. } = &mut ignored_slop_prefix {
-                    *slop = u32::MAX;
-                }
 
                 let zero_slop = quill
                     .search_preparsed_paginated(&cx, &zero_slop_prefix, corpus.len(), 0, true)
@@ -32649,6 +33014,182 @@ mod tests {
                 matches!(mixed, SearchError::SubsystemError { subsystem, .. }
                     if subsystem == "quill.hydration"),
             );
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn qg4_directory_sync_receipt_binds_real_commit_and_fresh_reopen() {
+        let directory = tempfile::tempdir().expect("temporary QG-4 directory");
+        let root = directory.path().to_path_buf();
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::create(&cx, &root, deterministic_config())
+                .await
+                .expect("create QG-4 Quill index");
+            index
+                .index_document(&cx, &IndexableDocument::new("warm", "warm QG-4 document"))
+                .await
+                .expect("stage warm QG-4 document");
+            index.commit(&cx).await.expect("commit warm QG-4 document");
+
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("qg4-staged", "staged QG-4 document"),
+                )
+                .await
+                .expect("stage QG-4 probe document");
+            let mut arm = index
+                .benchmark_arm_qg4_directory_sync()
+                .expect("arm QG-4 Quill directory sync");
+            index
+                .benchmark_commit_qg4_directory_sync(&cx, &mut arm)
+                .await
+                .expect("commit staged QG-4 probe");
+            let receipt = arm.finish().expect("one real MANIFEST directory sync");
+            assert_eq!(receipt.root, root);
+            assert_ne!(receipt.session_nonce, 0);
+            assert_eq!(receipt.observed_sync_count, 1);
+            assert_eq!(
+                receipt.manifest_generation,
+                index
+                    .snapshot()
+                    .expect("committed QG-4 snapshot")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                "receipt generation must be the generation installed by the public commit"
+            );
+
+            assert!(matches!(
+                arm.finish(),
+                Err(QuillIndexError::Config(SearchError::InvalidConfig { value, .. }))
+                    if value == "foreign_or_disarmed_session"
+            ));
+
+            drop(index);
+            let reopened = QuillIndex::open(&cx, &root, deterministic_config())
+                .await
+                .expect("fresh reopen after QG-4 commit");
+            assert_eq!(reopened.doc_count().expect("reopened document count"), 2);
+            let staged = reopened
+                .search_doc_ids(&cx, "id:qg4-staged", 2)
+                .expect("exact staged-id query after fresh reopen");
+            assert_eq!(staged.len(), 1, "fresh reopen must retain staged ID");
+            assert_eq!(staged[0].document_id, "qg4-staged");
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn qg4_directory_sync_receipt_rejects_zero_and_multiple_real_syncs() {
+        let zero_directory = tempfile::tempdir().expect("temporary zero-sync QG-4 directory");
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::create(&cx, zero_directory.path(), deterministic_config())
+                .await
+                .expect("create zero-sync QG-4 index");
+            let mut arm = index
+                .benchmark_arm_qg4_directory_sync()
+                .expect("arm zero-sync QG-4 observation");
+            index
+                .benchmark_commit_qg4_directory_sync(&cx, &mut arm)
+                .await
+                .expect("empty public commit");
+            assert!(matches!(
+                arm.finish(),
+                Err(QuillIndexError::Config(SearchError::InvalidConfig { value, .. }))
+                    if value == "zero_syncs"
+            ));
+        });
+
+        let multiple_directory =
+            tempfile::tempdir().expect("temporary multiple-sync QG-4 directory");
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::create(&cx, multiple_directory.path(), deterministic_config())
+                .await
+                .expect("create multiple-sync QG-4 index");
+            index
+                .index_document(&cx, &IndexableDocument::new("first", "first QG-4 document"))
+                .await
+                .expect("stage first QG-4 document");
+            let mut arm = index
+                .benchmark_arm_qg4_directory_sync()
+                .expect("arm multiple-sync QG-4 observation");
+            index
+                .benchmark_commit_qg4_directory_sync(&cx, &mut arm)
+                .await
+                .expect("first public QG-4 commit");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("second", "second QG-4 document"),
+                )
+                .await
+                .expect("stage second QG-4 document");
+            index.commit(&cx).await.expect("second real public commit");
+            assert!(matches!(
+                arm.finish(),
+                Err(QuillIndexError::Config(SearchError::InvalidConfig { value, .. }))
+                    if value == "multiple_syncs"
+            ));
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn qg4_directory_sync_receipt_rejects_foreign_and_failed_after_sync_commits() {
+        let first_directory = tempfile::tempdir().expect("temporary first QG-4 directory");
+        let second_directory = tempfile::tempdir().expect("temporary second QG-4 directory");
+        run_with_cx(|cx| async move {
+            let first = QuillIndex::create(&cx, first_directory.path(), deterministic_config())
+                .await
+                .expect("create first QG-4 index");
+            let second = QuillIndex::create(&cx, second_directory.path(), deterministic_config())
+                .await
+                .expect("create second QG-4 index");
+            let mut foreign_arm = first
+                .benchmark_arm_qg4_directory_sync()
+                .expect("arm first QG-4 index");
+            assert!(matches!(
+                second
+                    .benchmark_commit_qg4_directory_sync(&cx, &mut foreign_arm)
+                    .await,
+                Err(QuillIndexError::Config(SearchError::InvalidConfig { value, .. }))
+                    if value == "foreign_arm"
+            ));
+            assert!(matches!(
+                foreign_arm.finish(),
+                Err(QuillIndexError::Config(SearchError::InvalidConfig { value, .. }))
+                    if value == "zero_syncs"
+            ));
+
+            first
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("failed", "failed-after-sync QG-4 document"),
+                )
+                .await
+                .expect("stage failed-after-sync QG-4 document");
+            let mut failed_arm = first
+                .benchmark_arm_qg4_directory_sync()
+                .expect("arm failed-after-sync QG-4 observation");
+            failed_arm.fail_after_commit = true;
+            let failed_commit = first
+                .benchmark_commit_qg4_directory_sync(&cx, &mut failed_arm)
+                .await;
+            assert!(
+                matches!(
+                    &failed_commit,
+                    Err(QuillIndexError::Config(SearchError::InvalidConfig { value, .. }))
+                        if value == "test_failure_after_commit"
+                ),
+                "unexpected post-directory-sync failure: {failed_commit:?}"
+            );
+            assert!(matches!(
+                failed_arm.finish(),
+                Err(QuillIndexError::Config(SearchError::InvalidConfig { value, .. }))
+                    if value == "commit_failed_after_sync"
+            ));
         });
     }
 }

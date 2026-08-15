@@ -13,7 +13,10 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
+#[cfg(feature = "bench-internals")]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
@@ -114,6 +117,237 @@ const MAX_TOMBSTONE_CHUNKS: usize = 65_536;
 // cannot release same-directory serialization before that work exits.
 static PUBLISH_LOCKS: OnceLock<std::sync::Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
     OnceLock::new();
+
+/// High bit marks a benchmark directory-sync nonce as armed but unobserved.
+#[cfg(feature = "bench-internals")]
+const BENCHMARK_QG4_DIRECTORY_SYNC_ARMED: u64 = 1 << 63;
+
+/// Terminal armed-session state after more than one MANIFEST directory sync.
+#[cfg(feature = "bench-internals")]
+const BENCHMARK_QG4_DIRECTORY_SYNC_AMBIGUOUS: u64 = u64::MAX;
+
+#[cfg(feature = "bench-internals")]
+const BENCHMARK_QG4_COMMIT_PENDING: u8 = 0;
+#[cfg(feature = "bench-internals")]
+const BENCHMARK_QG4_COMMIT_SUCCEEDED: u8 = 1;
+#[cfg(feature = "bench-internals")]
+const BENCHMARK_QG4_COMMIT_FAILED: u8 = 2;
+
+/// Shared benchmark-only state for one live Quill MANIFEST directory-sync arm.
+///
+/// Only the post-`sync_directory` MANIFEST checkpoint calls
+/// [`Self::observe_successful_manifest_sync`]. The public benchmark commit
+/// wrapper records whether the encompassing commit returned successfully.
+#[cfg(feature = "bench-internals")]
+#[derive(Debug)]
+pub(crate) struct BenchmarkQuillDirectorySyncState {
+    next_nonce: AtomicU64,
+    session: AtomicU64,
+    root: PathBuf,
+    observed_generation: AtomicU64,
+    commit_outcome: AtomicU8,
+}
+
+#[cfg(feature = "bench-internals")]
+impl BenchmarkQuillDirectorySyncState {
+    pub(crate) fn new(root: PathBuf) -> Self {
+        Self {
+            next_nonce: AtomicU64::new(1),
+            session: AtomicU64::new(0),
+            root,
+            observed_generation: AtomicU64::new(0),
+            commit_outcome: AtomicU8::new(BENCHMARK_QG4_COMMIT_PENDING),
+        }
+    }
+
+    pub(crate) fn arm(&self) -> SearchResult<u64> {
+        let nonce = self
+            .next_nonce
+            .try_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |current| (current < BENCHMARK_QG4_DIRECTORY_SYNC_ARMED - 1).then_some(current + 1),
+            )
+            .map_err(|_| SearchError::InvalidConfig {
+                field: "quill.qg4.directory_sync_nonce".to_owned(),
+                value: "exhausted".to_owned(),
+                reason: "benchmark directory-sync session nonce space exhausted".to_owned(),
+            })?;
+        self.session
+            .compare_exchange(
+                0,
+                nonce | BENCHMARK_QG4_DIRECTORY_SYNC_ARMED,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .map_err(|_| SearchError::InvalidConfig {
+                field: "quill.qg4.directory_sync_session".to_owned(),
+                value: "already_armed".to_owned(),
+                reason: "a previous benchmark directory-sync observation is still active"
+                    .to_owned(),
+            })?;
+        self.observed_generation.store(0, AtomicOrdering::Release);
+        self.commit_outcome
+            .store(BENCHMARK_QG4_COMMIT_PENDING, AtomicOrdering::Release);
+        Ok(nonce)
+    }
+
+    /// Record only the successful directory sync that follows MANIFEST install.
+    pub(crate) fn observe_successful_manifest_sync(&self, generation: u64) {
+        loop {
+            let current = self.session.load(AtomicOrdering::Acquire);
+            if current == 0 || current == BENCHMARK_QG4_DIRECTORY_SYNC_AMBIGUOUS {
+                return;
+            }
+            if current & BENCHMARK_QG4_DIRECTORY_SYNC_ARMED != 0 {
+                self.observed_generation
+                    .store(generation, AtomicOrdering::Release);
+                if self
+                    .session
+                    .compare_exchange(
+                        current,
+                        current & !BENCHMARK_QG4_DIRECTORY_SYNC_ARMED,
+                        AtomicOrdering::AcqRel,
+                        AtomicOrdering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+                continue;
+            }
+            if self
+                .session
+                .compare_exchange(
+                    current,
+                    BENCHMARK_QG4_DIRECTORY_SYNC_AMBIGUOUS,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn record_commit_success(&self, nonce: u64) -> SearchResult<()> {
+        let session = self.session.load(AtomicOrdering::Acquire);
+        if session != nonce
+            && session != (nonce | BENCHMARK_QG4_DIRECTORY_SYNC_ARMED)
+            && session != BENCHMARK_QG4_DIRECTORY_SYNC_AMBIGUOUS
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "quill.qg4.directory_sync_receipt".to_owned(),
+                value: "foreign_or_disarmed_session".to_owned(),
+                reason:
+                    "the QG-4 directory-sync arm was replaced or cleared before commit completion"
+                        .to_owned(),
+            });
+        }
+        self.commit_outcome
+            .compare_exchange(
+                BENCHMARK_QG4_COMMIT_PENDING,
+                BENCHMARK_QG4_COMMIT_SUCCEEDED,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .map_err(|_| SearchError::InvalidConfig {
+                field: "quill.qg4.directory_sync_receipt".to_owned(),
+                value: "commit_reused".to_owned(),
+                reason: "a QG-4 directory-sync arm may complete only one benchmark commit"
+                    .to_owned(),
+            })
+            .map(|_| ())
+    }
+
+    pub(crate) fn record_commit_failure(&self, nonce: u64) {
+        let session = self.session.load(AtomicOrdering::Acquire);
+        if session == nonce
+            || session == (nonce | BENCHMARK_QG4_DIRECTORY_SYNC_ARMED)
+            || session == BENCHMARK_QG4_DIRECTORY_SYNC_AMBIGUOUS
+        {
+            self.commit_outcome
+                .store(BENCHMARK_QG4_COMMIT_FAILED, AtomicOrdering::Release);
+        }
+    }
+
+    pub(crate) fn finish(&self, nonce: u64) -> SearchResult<(PathBuf, u64)> {
+        let observed = self.session.swap(0, AtomicOrdering::AcqRel);
+        if observed == nonce {
+            match self.commit_outcome.load(AtomicOrdering::Acquire) {
+                BENCHMARK_QG4_COMMIT_SUCCEEDED => {
+                    let generation = self.observed_generation.load(AtomicOrdering::Acquire);
+                    if generation != 0 {
+                        return Ok((self.root.clone(), generation));
+                    }
+                    Err(SearchError::InvalidConfig {
+                        field: "quill.qg4.directory_sync_receipt".to_owned(),
+                        value: "missing_generation".to_owned(),
+                        reason: "the observed QG-4 directory sync did not stamp its MANIFEST generation"
+                            .to_owned(),
+                    })
+                }
+                BENCHMARK_QG4_COMMIT_FAILED => Err(SearchError::InvalidConfig {
+                    field: "quill.qg4.directory_sync_receipt".to_owned(),
+                    value: "commit_failed_after_sync".to_owned(),
+                    reason: "the armed QG-4 commit failed after the observed MANIFEST directory sync"
+                        .to_owned(),
+                }),
+                _ => Err(SearchError::InvalidConfig {
+                    field: "quill.qg4.directory_sync_receipt".to_owned(),
+                    value: "commit_not_completed".to_owned(),
+                    reason: "the armed QG-4 directory sync was not completed through the benchmark commit API"
+                        .to_owned(),
+                }),
+            }
+        } else {
+            let (value, reason) = if observed == (nonce | BENCHMARK_QG4_DIRECTORY_SYNC_ARMED) {
+                (
+                    "zero_syncs",
+                    "the timed commit returned without an observed MANIFEST directory sync",
+                )
+            } else if observed == BENCHMARK_QG4_DIRECTORY_SYNC_AMBIGUOUS {
+                (
+                    "multiple_syncs",
+                    "more than one MANIFEST directory sync occurred while the session was armed",
+                )
+            } else {
+                (
+                    "foreign_or_disarmed_session",
+                    "the QG-4 directory-sync session was replaced or cleared before finalization",
+                )
+            };
+            Err(SearchError::InvalidConfig {
+                field: "quill.qg4.directory_sync_receipt".to_owned(),
+                value: value.to_owned(),
+                reason: reason.to_owned(),
+            })
+        }
+    }
+
+    pub(crate) fn disarm(&self, nonce: u64) {
+        let armed = nonce | BENCHMARK_QG4_DIRECTORY_SYNC_ARMED;
+        let _ = self.session.compare_exchange(
+            armed,
+            0,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+        let _ = self.session.compare_exchange(
+            nonce,
+            0,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+        let _ = self.session.compare_exchange(
+            BENCHMARK_QG4_DIRECTORY_SYNC_AMBIGUOUS,
+            0,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+}
 
 /// Pack semantic-version components into the durable `engine_version` word.
 ///
@@ -1999,6 +2233,51 @@ fn required_identity_section<'a>(
         })
 }
 
+fn validate_identity_section_range(
+    path: &Path,
+    reader: &RecoveredSegmentBacking,
+    kind: SectionKind,
+    validated_bytes: &[u8],
+) -> Result<Range<usize>, KeeperError> {
+    let entry = reader
+        .section_entries()
+        .iter()
+        .find(|entry| entry.kind == kind)
+        .ok_or_else(|| KeeperError::MissingIdentitySection {
+            path: path.to_path_buf(),
+            kind,
+        })?;
+    let start =
+        usize::try_from(entry.offset).map_err(|_| KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: format!("{kind:?} offset does not fit host usize"),
+        })?;
+    let len = usize::try_from(entry.len).map_err(|_| KeeperError::SegmentMetadataMismatch {
+        path: path.to_path_buf(),
+        detail: format!("{kind:?} length does not fit host usize"),
+    })?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: format!("{kind:?} byte range overflowed"),
+        })?;
+    let range = start..end;
+    let ranged = reader.source_bytes().get(range.clone()).ok_or_else(|| {
+        KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: format!("{kind:?} byte range exceeds the immutable backing"),
+        }
+    })?;
+    if !std::ptr::eq(ranged, validated_bytes) {
+        return Err(KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: format!("{kind:?} validated bytes disagree with its section-table range"),
+        });
+    }
+    Ok(range)
+}
+
 fn required_section_length(
     path: &Path,
     reader: &RecoveredSegmentBacking,
@@ -2403,6 +2682,7 @@ pub struct RecoveredSegment {
     reader: Arc<RecoveredSegmentBacking>,
     tombstone_index: TombstoneIndex,
     id_lookup: IdHashLookupPlan,
+    identity_sections: IdentitySectionRanges,
     live_doc_count: u32,
     rank_pruning_cache: Arc<RankPruningCache>,
     term_dictionary_metadata: Arc<ValidatedTermDictionaryMetadata>,
@@ -2416,6 +2696,19 @@ pub struct RecoveredSegment {
     /// Test-only call/attempt counter; range and tombstone misses are included.
     #[cfg(test)]
     document_id_materialization_calls: Arc<AtomicU64>,
+}
+
+/// Exact IDMAP/IDHASH byte ranges validated against one immutable backing.
+///
+/// Identity lookup is a high-frequency admission path. Retaining these ranges
+/// avoids re-entering the generic checked-section dispatcher for every probe;
+/// the pair was checksum-validated and cross-validated before this value was
+/// constructed, and the backing remains owned or read-only mapped for the
+/// lifetime of the binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IdentitySectionRanges {
+    id_map: Range<usize>,
+    id_hash: Range<usize>,
 }
 
 impl RecoveredSegment {
@@ -2542,6 +2835,8 @@ impl RecoveredSegment {
             });
         }
         let id_map_bytes = required_identity_section(&path, &reader, SectionKind::IDMAP)?;
+        let id_map_range =
+            validate_identity_section_range(&path, &reader, SectionKind::IDMAP, id_map_bytes)?;
         let id_map = IdMapSection::parse(id_map_bytes, manifest.docid_lo, manifest.docid_hi)
             .map_err(|source| KeeperError::IdMapCorrupted {
                 path: path.clone(),
@@ -2571,6 +2866,8 @@ impl RecoveredSegment {
             });
         }
         let id_hash_bytes = required_identity_section(&path, &reader, SectionKind::IDHASH)?;
+        let id_hash_range =
+            validate_identity_section_range(&path, &reader, SectionKind::IDHASH, id_hash_bytes)?;
         let id_hash = IdHashSection::parse(id_hash_bytes, id_map).map_err(|source| {
             KeeperError::IdHashCorrupted {
                 path: path.clone(),
@@ -2663,6 +2960,10 @@ impl RecoveredSegment {
             reader,
             tombstone_index,
             id_lookup,
+            identity_sections: IdentitySectionRanges {
+                id_map: id_map_range,
+                id_hash: id_hash_range,
+            },
             live_doc_count,
             rank_pruning_cache,
             term_dictionary_metadata,
@@ -2952,8 +3253,19 @@ impl RecoveredSegment {
     }
 
     fn lookup_document_id(&self, document_id: &str) -> Result<Option<(u32, u64)>, KeeperError> {
-        let id_map = required_identity_section(&self.path, &self.reader, SectionKind::IDMAP)?;
-        let id_hash = required_identity_section(&self.path, &self.reader, SectionKind::IDHASH)?;
+        let source = self.reader.source_bytes();
+        let id_map = source
+            .get(self.identity_sections.id_map.clone())
+            .ok_or_else(|| KeeperError::SegmentMetadataMismatch {
+                path: self.path.clone(),
+                detail: "validated IDMAP range exceeds the immutable backing".to_owned(),
+            })?;
+        let id_hash = source
+            .get(self.identity_sections.id_hash.clone())
+            .ok_or_else(|| KeeperError::SegmentMetadataMismatch {
+                path: self.path.clone(),
+                detail: "validated IDHASH range exceeds the immutable backing".to_owned(),
+            })?;
         self.id_lookup
             .lookup_with_content_hash(id_map, id_hash, document_id)
             .map(|(global_docid, content_hash)| {
@@ -4353,6 +4665,9 @@ pub struct KeeperWriter {
     snapshot: KeeperSnapshot,
     garbage_options: GarbageCollectionOptions,
     protection: WriterProtection,
+    /// Benchmark-only observer for the exact post-MANIFEST-sync checkpoint.
+    #[cfg(feature = "bench-internals")]
+    benchmark_qg4_directory_sync_state: Option<Arc<BenchmarkQuillDirectorySyncState>>,
     /// Bound only by the process-local Quill facade. Standalone Keeper users
     /// have no `ArcSwap` reader to coordinate, so they do not install this
     /// state word.
@@ -4605,6 +4920,8 @@ impl KeeperWriter {
             snapshot,
             garbage_options,
             protection,
+            #[cfg(feature = "bench-internals")]
+            benchmark_qg4_directory_sync_state: None,
             publication_read_state: None,
             pending_publication: None,
         })
@@ -4646,6 +4963,14 @@ impl KeeperWriter {
     /// constructs the matching immutable reader `Arc`.
     pub(crate) fn bind_publication_read_state(&mut self, state: PublicationReadState) {
         self.publication_read_state = Some(state);
+    }
+
+    #[cfg(feature = "bench-internals")]
+    pub(crate) fn bind_benchmark_qg4_directory_sync_state(
+        &mut self,
+        state: Arc<BenchmarkQuillDirectorySyncState>,
+    ) {
+        self.benchmark_qg4_directory_sync_state = Some(state);
     }
 
     fn publication_read_state_is_stable_at(&self, generation: u64) -> bool {
@@ -4789,6 +5114,10 @@ impl KeeperWriter {
         let publisher = ManifestPublisher::with_publication_read_state(
             &directory,
             self.publication_read_state.clone(),
+        );
+        #[cfg(feature = "bench-internals")]
+        let publisher = publisher.with_benchmark_qg4_directory_sync_state(
+            self.benchmark_qg4_directory_sync_state.clone(),
         );
         // Written in the same poll that reaches the publication and never
         // behind an await: dropping, unwinding, or cancelling out of anything
@@ -12013,6 +12342,8 @@ struct ManifestPublisher {
     #[cfg(test)]
     publish_lock_override: Option<Arc<Mutex<()>>>,
     publication_read_state: Option<PublicationReadState>,
+    #[cfg(feature = "bench-internals")]
+    benchmark_qg4_directory_sync_state: Option<Arc<BenchmarkQuillDirectorySyncState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -12031,6 +12362,8 @@ impl ManifestPublisher {
             #[cfg(test)]
             publish_lock_override: None,
             publication_read_state: None,
+            #[cfg(feature = "bench-internals")]
+            benchmark_qg4_directory_sync_state: None,
         }
     }
 
@@ -12047,7 +12380,19 @@ impl ManifestPublisher {
             #[cfg(test)]
             publish_lock_override: None,
             publication_read_state,
+            #[cfg(feature = "bench-internals")]
+            benchmark_qg4_directory_sync_state: None,
         }
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[must_use]
+    fn with_benchmark_qg4_directory_sync_state(
+        mut self,
+        state: Option<Arc<BenchmarkQuillDirectorySyncState>>,
+    ) -> Self {
+        self.benchmark_qg4_directory_sync_state = state;
+        self
     }
 
     #[cfg(test)]
@@ -12059,6 +12404,8 @@ impl ManifestPublisher {
             directory: directory.into(),
             publish_lock_override: Some(publish_lock),
             publication_read_state: None,
+            #[cfg(feature = "bench-internals")]
+            benchmark_qg4_directory_sync_state: None,
         }
     }
 
@@ -12197,6 +12544,8 @@ impl ManifestPublisher {
         #[cfg(not(test))]
         let publish_lock = publish_lock_for_normalized_directory(directory.clone());
         let publication_read_state = self.publication_read_state.clone();
+        #[cfg(feature = "bench-internals")]
+        let benchmark_qg4_directory_sync_state = self.benchmark_qg4_directory_sync_state.clone();
         let guard = OwnedMutexGuard::lock(publish_lock, cx)
             .await
             .map_err(|source| KeeperError::PublishLock { source })?;
@@ -12226,6 +12575,8 @@ impl ManifestPublisher {
         let bytes = manifest
             .to_bytes()
             .map_err(|source| KeeperError::InvalidManifest { source })?;
+        #[cfg(feature = "bench-internals")]
+        let manifest_generation = manifest.generation;
         if cx.is_cancel_requested() {
             return Err(KeeperError::PublishLock {
                 source: LockError::Cancelled,
@@ -12237,9 +12588,17 @@ impl ManifestPublisher {
             // fsync; resolving it again could split a late alias from its
             // lock after the claim boundary.
             match protection {
-                ManifestProtection::Disabled => {
-                    publish_manifest_locked(directory, &bytes, guard, claim, publication_read_state)
-                }
+                ManifestProtection::Disabled => publish_manifest_locked(
+                    directory,
+                    &bytes,
+                    guard,
+                    claim,
+                    publication_read_state,
+                    #[cfg(feature = "bench-internals")]
+                    benchmark_qg4_directory_sync_state.as_ref(),
+                    #[cfg(feature = "bench-internals")]
+                    manifest_generation,
+                ),
                 #[cfg(feature = "durability")]
                 ManifestProtection::Enabled(protector) => publish_manifest_durable_locked(
                     directory,
@@ -12248,6 +12607,10 @@ impl ManifestPublisher {
                     claim,
                     &protector,
                     publication_read_state,
+                    #[cfg(feature = "bench-internals")]
+                    benchmark_qg4_directory_sync_state.as_ref(),
+                    #[cfg(feature = "bench-internals")]
+                    manifest_generation,
                 ),
             }
         })
@@ -12343,12 +12706,29 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
+#[cfg(feature = "bench-internals")]
+fn observe_benchmark_qg4_directory_sync(
+    state: Option<&Arc<BenchmarkQuillDirectorySyncState>>,
+    checkpoint: PublishCheckpoint,
+    generation: u64,
+) {
+    if checkpoint == PublishCheckpoint::DirectorySynced {
+        if let Some(state) = state {
+            state.observe_successful_manifest_sync(generation);
+        }
+    }
+}
+
 fn publish_manifest_locked<C, F>(
     directory: PathBuf,
     bytes: &[u8],
     _guard: OwnedMutexGuard<()>,
     claim: F,
     publication_read_state: Option<PublicationReadState>,
+    #[cfg(feature = "bench-internals")] benchmark_qg4_directory_sync_state: Option<
+        &Arc<BenchmarkQuillDirectorySyncState>,
+    >,
+    #[cfg(feature = "bench-internals")] manifest_generation: u64,
 ) -> Result<LoadedManifest, KeeperError>
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
@@ -12371,6 +12751,12 @@ where
                     _ => {}
                 }
             }
+            #[cfg(feature = "bench-internals")]
+            observe_benchmark_qg4_directory_sync(
+                benchmark_qg4_directory_sync_state,
+                checkpoint,
+                manifest_generation,
+            );
             observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint)
         });
         if result.is_err() {
@@ -12390,6 +12776,12 @@ where
                     _ => {}
                 }
             }
+            #[cfg(feature = "bench-internals")]
+            observe_benchmark_qg4_directory_sync(
+                benchmark_qg4_directory_sync_state,
+                checkpoint,
+                manifest_generation,
+            );
             Ok(())
         });
         if result.is_err() {
@@ -12409,6 +12801,10 @@ fn publish_manifest_durable_locked<C, F>(
     claim: F,
     protector: &FileProtector,
     publication_read_state: Option<PublicationReadState>,
+    #[cfg(feature = "bench-internals")] benchmark_qg4_directory_sync_state: Option<
+        &Arc<BenchmarkQuillDirectorySyncState>,
+    >,
+    #[cfg(feature = "bench-internals")] manifest_generation: u64,
 ) -> Result<LoadedManifest, KeeperError>
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
@@ -12436,6 +12832,12 @@ where
                         _ => {}
                     }
                 }
+                #[cfg(feature = "bench-internals")]
+                observe_benchmark_qg4_directory_sync(
+                    benchmark_qg4_directory_sync_state,
+                    checkpoint,
+                    manifest_generation,
+                );
                 observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint)
             },
         );
@@ -12461,6 +12863,12 @@ where
                         _ => {}
                     }
                 }
+                #[cfg(feature = "bench-internals")]
+                observe_benchmark_qg4_directory_sync(
+                    benchmark_qg4_directory_sync_state,
+                    checkpoint,
+                    manifest_generation,
+                );
                 Ok(())
             },
         );
@@ -18501,6 +18909,89 @@ mod tests {
         assert_eq!(
             mapped.materialize_document_id(61),
             Some(DocId::new("mapped-hole"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bound_identity_ranges_drive_lookup_across_owned_rebind() -> TestResult {
+        let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let encoded =
+            encoded_identity_test_segment(0xb21, 0, &[Some("range-a"), None, Some("range-b")])?;
+        let mut proposed = original.next_manifest()?;
+        proposed.docid_high_watermark = 3;
+        proposed.segments = vec![manifest_segment(&encoded, 10)];
+        let published = original.publish_owned_segments(&proposed, vec![encoded])?;
+        let segment = &published.segments()[0];
+        let expected_range = |kind| {
+            let entry = segment
+                .section_entries()
+                .iter()
+                .find(|entry| entry.kind == kind)
+                .expect("identity section entry");
+            let start = usize::try_from(entry.offset).expect("section offset fits usize");
+            let len = usize::try_from(entry.len).expect("section length fits usize");
+            start..start + len
+        };
+        assert_eq!(
+            segment.identity_sections.id_map,
+            expected_range(SectionKind::IDMAP)
+        );
+        assert_eq!(
+            segment.identity_sections.id_hash,
+            expected_range(SectionKind::IDHASH)
+        );
+        assert_eq!(
+            published
+                .resolve_document_id("range-a")?
+                .map(|row| row.global_docid),
+            Some(0)
+        );
+        assert_eq!(published.resolve_document_id("missing")?, None);
+
+        let backing_len = segment.reader.source_bytes().len();
+        let mut invalid_id_map_range = published.clone();
+        invalid_id_map_range.segments[0].identity_sections.id_map =
+            backing_len..backing_len.saturating_add(1);
+        assert!(matches!(
+            invalid_id_map_range.segments[0].lookup_document_id("range-a"),
+            Err(KeeperError::SegmentMetadataMismatch { ref detail, .. })
+                if detail == "validated IDMAP range exceeds the immutable backing"
+        ));
+
+        let mut invalid_id_hash_range = published.clone();
+        invalid_id_hash_range.segments[0].identity_sections.id_hash =
+            backing_len..backing_len.saturating_add(1);
+        assert!(matches!(
+            invalid_id_hash_range.segments[0].lookup_document_id("range-a"),
+            Err(KeeperError::SegmentMetadataMismatch { ref detail, .. })
+                if detail == "validated IDHASH range exceeds the immutable backing"
+        ));
+
+        let mut invalid = published.next_manifest()?;
+        assert!(invalid.segments[0].insert_tombstone(1)?);
+        assert!(matches!(
+            published.publish_owned_segments(&invalid, Vec::new()),
+            Err(KeeperError::TombstoneReferencesHole {
+                global_docid: 1,
+                ..
+            })
+        ));
+
+        let mut tombstoned = published.next_manifest()?;
+        assert!(tombstoned.segments[0].insert_tombstone(0)?);
+        let rebound = published.publish_owned_segments(&tombstoned, Vec::new())?;
+        assert_eq!(
+            rebound.segments()[0].identity_sections,
+            published.segments()[0].identity_sections,
+            "an owned tombstone-only rebind must preserve the exact validated byte ranges"
+        );
+        assert_eq!(rebound.resolve_document_id("range-a")?, None);
+        assert_eq!(
+            rebound
+                .resolve_document_id("range-b")?
+                .map(|row| row.global_docid),
+            Some(2)
         );
         Ok(())
     }

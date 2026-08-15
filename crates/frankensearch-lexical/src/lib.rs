@@ -50,9 +50,11 @@ pub use tantivy::{
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "bench-internals")]
+use std::sync::Arc;
 use std::sync::RwLock;
 #[cfg(feature = "bench-internals")]
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asupersync::Cx;
@@ -62,6 +64,14 @@ use frankensearch_core::traits::{LexicalCandidateBatch, LexicalHydrationContext,
 use frankensearch_core::types::{DocId, IndexableDocument, ScoreSource, ScoredResult};
 use serde::{Deserialize, Serialize};
 use tantivy::collector::DocSetCollector;
+#[cfg(feature = "bench-internals")]
+use tantivy::directory::error::{
+    DeleteError, LockError, OpenDirectoryError, OpenReadError, OpenWriteError,
+};
+#[cfg(feature = "bench-internals")]
+use tantivy::directory::{
+    Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
+};
 use tantivy::query::QueryParser;
 use tantivy::schema::{FAST, STORED, STRING, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{TextAnalyzer, Token, TokenStream, Tokenizer};
@@ -1592,6 +1602,261 @@ pub struct OracleSegmentLayout {
     pub num_docs: u32,
 }
 
+/// High bit marks a nonce as armed but not yet observed by the directory.
+#[cfg(feature = "bench-internals")]
+const BENCHMARK_DIRECTORY_SYNC_ARMED: u64 = 1 << 63;
+
+/// Terminal state for an armed nonce that saw more than one directory sync.
+#[cfg(feature = "bench-internals")]
+const BENCHMARK_DIRECTORY_SYNC_AMBIGUOUS: u64 = u64::MAX;
+
+/// Shared state between the benchmark-only directory wrapper and its caller.
+///
+/// The arm is installed before the timed interval. A successful real
+/// `Directory::sync_directory` changes `ARMED(nonce)` into `OBSERVED(nonce)`;
+/// a second successful call changes it into the ambiguous terminal state. The
+/// state intentionally records neither a caller-supplied treatment label nor a
+/// timestamp: Tantivy's real directory call is the observation.
+#[cfg(feature = "bench-internals")]
+#[derive(Debug)]
+struct BenchmarkDirectorySyncState {
+    next_nonce: AtomicU64,
+    session: AtomicU64,
+}
+
+#[cfg(feature = "bench-internals")]
+impl BenchmarkDirectorySyncState {
+    fn new() -> Self {
+        Self {
+            next_nonce: AtomicU64::new(1),
+            session: AtomicU64::new(0),
+        }
+    }
+
+    fn arm(&self) -> SearchResult<u64> {
+        let nonce = self
+            .next_nonce
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < BENCHMARK_DIRECTORY_SYNC_ARMED - 1).then_some(current + 1)
+            })
+            .map_err(|_| SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync_nonce".to_owned(),
+                value: "exhausted".to_owned(),
+                reason: "benchmark directory-sync session nonce space exhausted".to_owned(),
+            })?;
+        self.session
+            .compare_exchange(
+                0,
+                nonce | BENCHMARK_DIRECTORY_SYNC_ARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync_session".to_owned(),
+                value: "already_armed".to_owned(),
+                reason: "a previous benchmark directory-sync observation is still active"
+                    .to_owned(),
+            })?;
+        Ok(nonce)
+    }
+
+    fn observe_successful_sync(&self) {
+        loop {
+            let current = self.session.load(Ordering::Acquire);
+            if current == 0 || current == BENCHMARK_DIRECTORY_SYNC_AMBIGUOUS {
+                return;
+            }
+            let next = if current & BENCHMARK_DIRECTORY_SYNC_ARMED != 0 {
+                current & !BENCHMARK_DIRECTORY_SYNC_ARMED
+            } else {
+                BENCHMARK_DIRECTORY_SYNC_AMBIGUOUS
+            };
+            if self
+                .session
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+}
+
+/// Transparent `MmapDirectory` observer used only by the QG-4 benchmark path.
+///
+/// It delegates all Tantivy directory behavior. Only a successful delegated
+/// directory sync updates the shared observation state.
+#[cfg(feature = "bench-internals")]
+#[derive(Clone, Debug)]
+struct ObservedMmapDirectory {
+    inner: MmapDirectory,
+    state: Arc<BenchmarkDirectorySyncState>,
+}
+
+#[cfg(feature = "bench-internals")]
+impl ObservedMmapDirectory {
+    fn open(
+        path: &Path,
+        state: Arc<BenchmarkDirectorySyncState>,
+    ) -> Result<Self, OpenDirectoryError> {
+        Ok(Self {
+            inner: MmapDirectory::open(path)?,
+            state,
+        })
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl Directory for ObservedMmapDirectory {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        self.inner.get_file_handle(path)
+    }
+
+    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+        self.inner.delete(path)
+    }
+
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        self.inner.exists(path)
+    }
+
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        self.inner.open_write(path)
+    }
+
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        self.inner.atomic_read(path)
+    }
+
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+        self.inner.atomic_write(path, data)
+    }
+
+    fn sync_directory(&self) -> std::io::Result<()> {
+        let result = self.inner.sync_directory();
+        if result.is_ok() {
+            self.state.observe_successful_sync();
+        }
+        result
+    }
+
+    fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
+        self.inner.acquire_lock(lock)
+    }
+
+    fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        self.inner.watch(watch_callback)
+    }
+}
+
+/// Live arm for one controlled QG-4 Tantivy commit observation.
+///
+/// Construct this immediately before the timed benchmark commit and call
+/// [`Self::finish`] after the timer stops. It is neither serializable nor
+/// cloneable, so a caller cannot replay it as a declarative receipt.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct BenchmarkTantivyDirectorySyncArm {
+    state: Arc<BenchmarkDirectorySyncState>,
+    root: PathBuf,
+    nonce: u64,
+    commit_opstamp: Option<u64>,
+    finished: bool,
+}
+
+/// Engine-observed result of one controlled QG-4 Tantivy commit.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BenchmarkTantivyDirectorySyncReceipt {
+    /// On-disk root whose wrapped Tantivy directory emitted the observation.
+    pub root: PathBuf,
+    /// Opaque session identity minted before the timed commit.
+    pub session_nonce: u64,
+    /// Opstamp returned by the same blocking Tantivy commit.
+    pub commit_opstamp: u64,
+    /// Successful directory-sync calls observed in the armed session.
+    pub observed_sync_count: u8,
+}
+
+#[cfg(feature = "bench-internals")]
+impl BenchmarkTantivyDirectorySyncArm {
+    /// Finalize the receipt outside the timed interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the timed commit did not retain its opstamp or
+    /// the armed directory-sync session observed anything other than exactly
+    /// one successful sync for this arm.
+    pub fn finish(&mut self) -> SearchResult<BenchmarkTantivyDirectorySyncReceipt> {
+        let observed = self.state.session.swap(0, Ordering::AcqRel);
+        self.finished = true;
+        if observed == self.nonce {
+            let commit_opstamp =
+                self.commit_opstamp
+                    .take()
+                    .ok_or_else(|| SearchError::InvalidConfig {
+                        field: "tantivy.qg4.directory_sync_receipt".to_owned(),
+                        value: "missing_commit_opstamp".to_owned(),
+                        reason: "the armed QG-4 commit did not stamp Tantivy's returned opstamp"
+                            .to_owned(),
+                    })?;
+            return Ok(BenchmarkTantivyDirectorySyncReceipt {
+                root: self.root.clone(),
+                session_nonce: self.nonce,
+                commit_opstamp,
+                observed_sync_count: 1,
+            });
+        }
+        let (value, reason) = if observed == (self.nonce | BENCHMARK_DIRECTORY_SYNC_ARMED) {
+            (
+                "zero_syncs",
+                "the timed commit returned without an observed successful directory sync",
+            )
+        } else if observed == BENCHMARK_DIRECTORY_SYNC_AMBIGUOUS {
+            (
+                "multiple_syncs",
+                "more than one successful directory sync occurred while the session was armed",
+            )
+        } else {
+            (
+                "foreign_or_disarmed_session",
+                "the armed directory-sync session was replaced or cleared before finalization",
+            )
+        };
+        Err(SearchError::InvalidConfig {
+            field: "tantivy.qg4.directory_sync_receipt".to_owned(),
+            value: value.to_owned(),
+            reason: reason.to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl Drop for BenchmarkTantivyDirectorySyncArm {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let armed = self.nonce | BENCHMARK_DIRECTORY_SYNC_ARMED;
+        let _ = self
+            .state
+            .session
+            .compare_exchange(armed, 0, Ordering::AcqRel, Ordering::Acquire);
+        let _ =
+            self.state
+                .session
+                .compare_exchange(self.nonce, 0, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self.state.session.compare_exchange(
+            BENCHMARK_DIRECTORY_SYNC_AMBIGUOUS,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
 /// A Tantivy-backed full-text search index implementing [`LexicalSearch`].
 ///
 /// Thread-safe for concurrent reads. Writes are serialized internally via
@@ -1620,6 +1885,12 @@ pub struct TantivyIndex {
     /// One-shot live attestation for the benchmark writer construction.
     #[cfg(feature = "bench-internals")]
     benchmark_writer_attestation: Option<BenchmarkWriterAttestation>,
+    /// Shared only with the benchmark-created on-disk directory wrapper.
+    #[cfg(feature = "bench-internals")]
+    benchmark_directory_sync_state: Option<Arc<BenchmarkDirectorySyncState>>,
+    /// Set only by the fresh-fixture QG-4 no-merge setup API.
+    #[cfg(feature = "bench-internals")]
+    benchmark_qg4_no_merge_prepared: AtomicBool,
     /// Which Tantivy writer constructor this index actually invoked.
     ///
     /// Per-instance and test-only: a plan or receipt records what the caller
@@ -1774,6 +2045,7 @@ impl TantivyIndex {
             None,
             writer_heap_bytes,
             WriterPlan::BenchmarkShippingAuto,
+            None,
         )
     }
 
@@ -1877,6 +2149,8 @@ impl TantivyIndex {
             // An ordinary single-threaded oracle, not a benchmark candidate:
             // it really does pin width 1, and claims no screening receipt.
             WriterPlan::PinnedWidth(1),
+            #[cfg(feature = "bench-internals")]
+            None,
         )
     }
 
@@ -1973,6 +2247,7 @@ impl TantivyIndex {
             None,
             writer_heap_bytes,
             WriterPlan::BenchmarkFixed(writer_threads),
+            None,
         )
     }
 
@@ -1997,12 +2272,17 @@ impl TantivyIndex {
             subsystem: "tantivy",
             source: Box::new(error),
         })?;
-        let index = Index::create_in_dir(path, schema.clone()).map_err(|error| {
-            SearchError::SubsystemError {
+        let benchmark_directory_sync_state = Arc::new(BenchmarkDirectorySyncState::new());
+        let directory = ObservedMmapDirectory::open(path, benchmark_directory_sync_state.clone())
+            .map_err(|error| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(error),
+        })?;
+        let index = Index::create(directory, schema.clone(), tantivy::IndexSettings::default())
+            .map_err(|error| SearchError::SubsystemError {
                 subsystem: "tantivy",
                 source: Box::new(error),
-            }
-        })?;
+            })?;
         reject_positions_disagreement(&index, positions)?;
         Self::from_index_with_writer_threads(
             index,
@@ -2011,6 +2291,7 @@ impl TantivyIndex {
             Some(path.to_path_buf()),
             writer_heap_bytes,
             WriterPlan::BenchmarkFixed(writer_threads),
+            Some(benchmark_directory_sync_state),
         )
     }
 
@@ -2035,7 +2316,13 @@ impl TantivyIndex {
             });
         }
         let (schema, fields) = build_schema_with_positions(positions);
-        let index = Index::open_in_dir(path).map_err(|error| SearchError::SubsystemError {
+        let benchmark_directory_sync_state = Arc::new(BenchmarkDirectorySyncState::new());
+        let directory = ObservedMmapDirectory::open(path, benchmark_directory_sync_state.clone())
+            .map_err(|error| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(error),
+        })?;
+        let index = Index::open(directory).map_err(|error| SearchError::SubsystemError {
             subsystem: "tantivy",
             source: Box::new(error),
         })?;
@@ -2047,6 +2334,7 @@ impl TantivyIndex {
             Some(path.to_path_buf()),
             writer_heap_bytes,
             WriterPlan::BenchmarkFixed(writer_threads),
+            Some(benchmark_directory_sync_state),
         )
     }
 
@@ -2082,6 +2370,8 @@ impl TantivyIndex {
             benchmark_writer_threads: _,
             benchmark_writer_receipt,
             benchmark_writer_attestation: _,
+            benchmark_directory_sync_state,
+            benchmark_qg4_no_merge_prepared: _,
             #[cfg(test)]
                 observed_writer_call: _,
         } = self;
@@ -2128,6 +2418,8 @@ impl TantivyIndex {
                 benchmark_writer_threads: Some(writer_threads),
                 benchmark_writer_receipt,
                 benchmark_writer_attestation,
+                benchmark_directory_sync_state,
+                benchmark_qg4_no_merge_prepared: AtomicBool::new(false),
                 #[cfg(test)]
                 observed_writer_call,
             },
@@ -2163,6 +2455,8 @@ impl TantivyIndex {
             benchmark_writer_threads,
             benchmark_writer_receipt,
             benchmark_writer_attestation: _,
+            benchmark_directory_sync_state: _,
+            benchmark_qg4_no_merge_prepared: _,
             #[cfg(test)]
                 observed_writer_call: _,
         } = self;
@@ -2244,6 +2538,181 @@ impl TantivyIndex {
         Ok(())
     }
 
+    /// Prepare a fresh benchmark index for a causally bound QG-4 directory-sync observation.
+    ///
+    /// This must run before any document is indexed. It installs Tantivy's real
+    /// `NoMergePolicy`, so the one armed commit cannot be confused with an
+    /// asynchronous merge-completion metadata save.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn benchmark_prepare_qg4_no_merge_directory_sync(&self, cx: &Cx) -> SearchResult<()> {
+        if self.benchmark_directory_sync_state.is_none() {
+            return Err(SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync".to_owned(),
+                value: "not_on_disk_benchmark_index".to_owned(),
+                reason: "QG-4 directory-sync observation requires an on-disk benchmark index"
+                    .to_owned(),
+            });
+        }
+        let writer = self.writer.lock(cx).await.map_err(|error| {
+            Self::map_writer_lock_error("tantivy.qg4.directory_sync_no_merge", error)
+        })?;
+        if self.doc_count.load(Ordering::Acquire) != 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync_no_merge".to_owned(),
+                value: "documents_already_indexed".to_owned(),
+                reason: "QG-4 no-merge setup must precede the warm fixture".to_owned(),
+            });
+        }
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+        self.benchmark_qg4_no_merge_prepared
+            .store(true, Ordering::Release);
+        debug!(
+            has_shared_observer = true,
+            "prepared QG-4 Tantivy no-merge fixture"
+        );
+        Ok(())
+    }
+
+    /// Arm a shared directory observer immediately before the timed QG-4 commit.
+    ///
+    /// Receipt construction is deliberately deferred to
+    /// [`BenchmarkTantivyDirectorySyncArm::finish`], after the timed call
+    /// returns its actual Tantivy opstamp.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn benchmark_arm_qg4_directory_sync(
+        &self,
+    ) -> SearchResult<BenchmarkTantivyDirectorySyncArm> {
+        if !self.benchmark_qg4_no_merge_prepared.load(Ordering::Acquire) {
+            return Err(SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync_no_merge".to_owned(),
+                value: "not_prepared".to_owned(),
+                reason:
+                    "call benchmark_prepare_qg4_no_merge_directory_sync before warming the fixture"
+                        .to_owned(),
+            });
+        }
+        let state = self
+            .benchmark_directory_sync_state
+            .as_ref()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync".to_owned(),
+                value: "not_on_disk_benchmark_index".to_owned(),
+                reason: "QG-4 directory-sync observation requires an on-disk benchmark index"
+                    .to_owned(),
+            })?
+            .clone();
+        let root = self
+            .path
+            .clone()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync".to_owned(),
+                value: "missing_index_root".to_owned(),
+                reason: "the benchmark index has no on-disk root to bind into the receipt"
+                    .to_owned(),
+            })?;
+        let nonce = state.arm()?;
+        Ok(BenchmarkTantivyDirectorySyncArm {
+            state,
+            root,
+            nonce,
+            commit_opstamp: None,
+            finished: false,
+        })
+    }
+
+    /// Execute the same commit path as [`LexicalWrite::commit`] while an already-armed
+    /// QG-4 observer watches Tantivy's real directory sync.
+    ///
+    /// The only observation work in the timed commit is the fixed atomic state
+    /// transition performed by the wrapped successful `sync_directory` call.
+    /// The returned opstamp is stamped into the supplied arm and finalized into
+    /// a receipt after timing.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn benchmark_commit_qg4_directory_sync(
+        &self,
+        cx: &Cx,
+        arm: &mut BenchmarkTantivyDirectorySyncArm,
+    ) -> SearchResult<()> {
+        let state = self
+            .benchmark_directory_sync_state
+            .as_ref()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync".to_owned(),
+                value: "not_on_disk_benchmark_index".to_owned(),
+                reason: "QG-4 directory-sync observation requires an on-disk benchmark index"
+                    .to_owned(),
+            })?;
+        if !Arc::ptr_eq(state, &arm.state) {
+            return Err(SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync".to_owned(),
+                value: "foreign_arm".to_owned(),
+                reason: "the supplied QG-4 directory-sync arm belongs to another index".to_owned(),
+            });
+        }
+
+        let opstamp = {
+            let mut writer = self
+                .writer
+                .lock(cx)
+                .await
+                .map_err(|error| Self::map_writer_lock_error("tantivy.qg4.commit", error))?;
+            writer
+                .commit()
+                .map_err(|error| SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    source: Box::new(error),
+                })?
+        };
+
+        self.reader
+            .reload()
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            })?;
+        let searcher = self.reader.searcher();
+        let actual = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
+        self.doc_count.store(actual, Ordering::Relaxed);
+        self.persist_ord_table();
+        arm.commit_opstamp = Some(opstamp);
+        debug!(doc_count = actual, opstamp, "QG-4 Tantivy commit completed");
+        Ok(())
+    }
+
+    /// Drive a second real wrapped sync in a focused ambiguity test.
+    #[cfg(all(test, feature = "bench-internals"))]
+    fn benchmark_test_second_armed_directory_sync(&self) -> SearchResult<()> {
+        let state = self
+            .benchmark_directory_sync_state
+            .as_ref()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync".to_owned(),
+                value: "not_on_disk_benchmark_index".to_owned(),
+                reason: "QG-4 directory-sync observation requires an on-disk benchmark index"
+                    .to_owned(),
+            })?
+            .clone();
+        let root = self
+            .path
+            .as_deref()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "tantivy.qg4.directory_sync".to_owned(),
+                value: "missing_index_root".to_owned(),
+                reason: "the benchmark index has no on-disk root to bind into the receipt"
+                    .to_owned(),
+            })?;
+        ObservedMmapDirectory::open(root, state)
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            })?
+            .sync_directory()
+            .map_err(SearchError::from)
+    }
+
     /// Force-merge every currently searchable segment and reload the reader.
     ///
     /// This exists only for QG-5's same-binary oracle arm. It invokes
@@ -2322,6 +2791,8 @@ impl TantivyIndex {
             path,
             writer_heap_bytes,
             WriterPlan::Shipping,
+            #[cfg(feature = "bench-internals")]
+            None,
         )
     }
 
@@ -2332,6 +2803,9 @@ impl TantivyIndex {
         path: Option<PathBuf>,
         writer_heap_bytes: usize,
         plan: WriterPlan,
+        #[cfg(feature = "bench-internals")] benchmark_directory_sync_state: Option<
+            Arc<BenchmarkDirectorySyncState>,
+        >,
     ) -> SearchResult<Self> {
         // Resolve the `ord` fast field against the *actual* index schema so
         // indexes created before this field existed (no `ord`) cleanly fall back
@@ -2491,6 +2965,10 @@ impl TantivyIndex {
             benchmark_writer_receipt,
             #[cfg(feature = "bench-internals")]
             benchmark_writer_attestation,
+            #[cfg(feature = "bench-internals")]
+            benchmark_directory_sync_state,
+            #[cfg(feature = "bench-internals")]
+            benchmark_qg4_no_merge_prepared: AtomicBool::new(false),
             #[cfg(test)]
             observed_writer_call,
         })
@@ -6201,6 +6679,8 @@ mod benchmark_writer_mode_tests {
         TOKENIZER_NAME, TantivyIndex, positions_from_live_schema,
     };
     use frankensearch_core::SearchError;
+    use frankensearch_core::traits::{LexicalRead, LexicalWrite};
+    use frankensearch_core::types::IndexableDocument;
 
     /// Tantivy requires a per-writer floor, so an eight-thread pool needs at
     /// least `8 * 15_000_000` bytes. Ask for that plus headroom, or the widest
@@ -6655,6 +7135,114 @@ mod benchmark_writer_mode_tests {
                 .positions,
             "the reopened receipt must carry the live schema's positions option"
         );
+    }
+
+    #[test]
+    fn qg4_directory_sync_requires_fresh_no_merge_preparation() {
+        let directory = tempfile::tempdir().expect("temporary index directory");
+        let path = directory.path().join("qg4");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = TantivyIndex::create_with_benchmark_config(&path, HEAP, 1, true)
+                .expect("create QG-4 index");
+
+            assert!(matches!(
+                index.benchmark_arm_qg4_directory_sync(),
+                Err(SearchError::InvalidConfig { value, .. }) if value == "not_prepared"
+            ));
+
+            index
+                .index_document(&cx, &IndexableDocument::new("warm", "warm document"))
+                .await
+                .expect("stage warm document");
+            assert!(matches!(
+                index.benchmark_prepare_qg4_no_merge_directory_sync(&cx).await,
+                Err(SearchError::InvalidConfig { value, .. }) if value == "documents_already_indexed"
+            ));
+        });
+    }
+
+    #[test]
+    fn qg4_directory_sync_receipt_binds_real_sync_opstamp_and_reopen() {
+        let directory = tempfile::tempdir().expect("temporary index directory");
+        let path = directory.path().join("qg4");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = TantivyIndex::create_with_benchmark_config(&path, HEAP, 1, true)
+                .expect("create QG-4 index");
+            index
+                .benchmark_prepare_qg4_no_merge_directory_sync(&cx)
+                .await
+                .expect("prepare no-merge QG-4 fixture");
+
+            index
+                .index_document(&cx, &IndexableDocument::new("warm", "warm document"))
+                .await
+                .expect("stage warm document");
+            index.commit(&cx).await.expect("commit warm document");
+
+            index
+                .index_document(&cx, &IndexableDocument::new("staged", "staged document"))
+                .await
+                .expect("stage probe document");
+            let mut arm = index
+                .benchmark_arm_qg4_directory_sync()
+                .expect("arm QG-4 directory observation");
+            index
+                .benchmark_commit_qg4_directory_sync(&cx, &mut arm)
+                .await
+                .expect("commit staged QG-4 document");
+            let receipt = arm.finish().expect("one real directory sync");
+            assert_eq!(receipt.root, path);
+            assert_ne!(receipt.commit_opstamp, 0);
+            assert_ne!(receipt.session_nonce, 0);
+            assert_eq!(receipt.observed_sync_count, 1);
+
+            drop(index);
+            let reopened = TantivyIndex::open_with_benchmark_config(&path, HEAP, 1, true)
+                .expect("fresh reopen");
+            assert_eq!(reopened.doc_count().expect("reopened count"), 2);
+            let staged_hits = reopened
+                .search_doc_ids(&cx, "id:staged", 2)
+                .expect("explicit staged-id query");
+            assert_eq!(
+                staged_hits.len(),
+                1,
+                "fresh reopen must retain exactly the staged ID"
+            );
+            assert_eq!(staged_hits[0].doc_id.as_str(), "staged");
+        });
+    }
+
+    #[test]
+    fn qg4_directory_sync_rejects_a_second_real_armed_sync() {
+        let directory = tempfile::tempdir().expect("temporary index directory");
+        let path = directory.path().join("qg4");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = TantivyIndex::create_with_benchmark_config(&path, HEAP, 1, true)
+                .expect("create QG-4 index");
+            index
+                .benchmark_prepare_qg4_no_merge_directory_sync(&cx)
+                .await
+                .expect("prepare no-merge QG-4 fixture");
+            index
+                .index_document(&cx, &IndexableDocument::new("staged", "staged document"))
+                .await
+                .expect("stage probe document");
+
+            let mut arm = index
+                .benchmark_arm_qg4_directory_sync()
+                .expect("arm QG-4 directory observation");
+            index
+                .benchmark_test_second_armed_directory_sync()
+                .expect("first real wrapped sync");
+            index
+                .benchmark_commit_qg4_directory_sync(&cx, &mut arm)
+                .await
+                .expect("commit staged QG-4 document");
+            assert!(matches!(
+                arm.finish(),
+                Err(SearchError::InvalidConfig { value, .. }) if value == "multiple_syncs"
+            ));
+        });
     }
 }
 
