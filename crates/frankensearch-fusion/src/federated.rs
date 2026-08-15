@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use ahash::AHashMap;
 use asupersync::Cx;
-use asupersync::time::{timeout, wall_now};
+use asupersync::time::timeout;
 use frankensearch_core::{ScoreSource, ScoredResult, SearchError, SearchResult};
 use tracing::{debug, warn};
 
@@ -331,10 +331,7 @@ impl FederatedSearcher {
                 let index_weight = index.weight;
                 let searcher = Arc::clone(&index.searcher);
                 Box::pin(async move {
-                    let timeout_start = cx
-                        .timer_driver()
-                        .as_ref()
-                        .map_or_else(wall_now, asupersync::time::TimerDriverHandle::now);
+                    let timeout_start = cx.now();
                     let future = Box::pin(searcher.search_collect_with_text(
                         cx,
                         query,

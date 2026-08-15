@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
-use asupersync::time::{timeout, wall_now};
+use asupersync::time::timeout;
 use tracing::instrument;
 use unicode_normalization::UnicodeNormalization;
 
@@ -1187,10 +1187,7 @@ impl TwoTierSearcher {
                 telemetry_initial_event_id.clone(),
             ));
             let timeout_budget = Duration::from_millis(self.config.quality_timeout_ms);
-            let timeout_start = cx
-                .timer_driver()
-                .as_ref()
-                .map_or_else(wall_now, asupersync::time::TimerDriverHandle::now);
+            let timeout_start = cx.now();
             let phase2_result = timeout(timeout_start, timeout_budget, phase2_future).await;
 
             match phase2_result {
