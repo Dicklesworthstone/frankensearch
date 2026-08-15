@@ -19096,3 +19096,28 @@ bench-only selector were reverted. This measured retry closes the prior
 ledger-approved aggregate-staging escape hatch. Unless the retry predicate
 above is satisfied, do not retry bounded direct aggregate streaming, simple
 per-term scratch reuse, or a cosmetic variant of either design.
+
+### 2026-08-14 — AUDIT / NO DECISION: exact QG-1 incumbent screen could not select a fixed-width Tantivy baseline
+
+The diagnostic-only x86 lane ran the exact full QG-1
+`bulk/medium/8/positions_on` screen with the pinned Tantivy 0.27 oracle and
+executing ELF SHA-256
+`cd8e475991638f80810c6cb8951b4c2c4a01b9af045215f25b12e97636e3741a`.
+The harness completed 809 genuine Tantivy arm executions, then failed closed
+before any Quill, T/Q, or Q/Q decision stream was timed:
+
+> QG-1 x86 diagnostic incumbent screen made no fixed-width decision: fastest
+> candidate is tied within the predeclared 95% median confidence intervals
+
+The raw stdout/stderr are preserved under
+`/data/tmp/frankensearch/qg1-idrange-diagnostic.P8l8CO/`. This run therefore
+contains no Quill-over-Tantivy effect estimate and cannot accept or reject the
+identity-section range optimization as a competitive QG-1 result.
+
+**Decision: AUDIT / ESTIMATOR NO-DECISION / NO QG-1 CLAIM.** Do not weaken the
+incumbent screen, choose a tied Tantivy width after the fact, or report the
+absence of a Quill row as a loss or win. Do not repeat the same configuration
+until it happens to select a favorable incumbent. Retry only after a material,
+predeclared change to the incumbent-selection experiment or on the registered
+reference runner, while retaining the same live Tantivy screen and independent
+T/T and Q/Q controls.
