@@ -5603,7 +5603,11 @@ impl FsfsRuntime {
         // the per-client I/O timeouts.
         std::thread::scope(|scope| {
             loop {
+                // Cooperative cancel: this loop holds Cx across a blocking
+                // accept poll. checkpoint() is the blessed observe point;
+                // is_cancel_requested() stays as a cheap second read.
                 if stop_requested.load(std::sync::atomic::Ordering::Relaxed)
+                    || cx.checkpoint().is_err()
                     || cx.is_cancel_requested()
                     || shutdown.is_some_and(|coordinator| coordinator.is_shutting_down())
                 {
