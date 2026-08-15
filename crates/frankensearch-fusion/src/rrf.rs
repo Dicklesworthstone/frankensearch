@@ -738,6 +738,18 @@ pub fn pool_minmax_fuse_merge(
     offset: usize,
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
+    pool_minmax_fuse_merge_for_vector_lane(lexical, semantic, limit, offset, config, false)
+}
+
+#[allow(clippy::similar_names)] // `lex_map` (contribution map) vs `lex_max` (pool max)
+fn pool_minmax_fuse_merge_for_vector_lane(
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+    vector_is_hash: bool,
+) -> Vec<FusedHit> {
     let lexical_weight = sanitize_tier_weight(config.lexical_weight);
     let semantic_weight = sanitize_tier_weight(config.semantic_weight);
     let tiebreak = config.tiebreak;
@@ -771,17 +783,19 @@ pub fn pool_minmax_fuse_merge(
         if let Some((_, lex_score)) = lex {
             fused += lexical_weight * minmax_norm(lex_score, lex_min, lex_max);
         }
+        let (semantic_rank, semantic_score, hash_rank, hash_score) =
+            FusedHitScratch::vector_fields(rank, hit.score, vector_is_hash);
         results.push(FusedHitScratch {
             doc_id,
             rrf_score: fused,
             lexical_rank: lex.map(|(r, _)| r),
-            semantic_rank: Some(rank),
-            hash_rank: None,
+            semantic_rank,
+            hash_rank,
             semantic_index: Some(hit.index),
             graph_rank: None,
             lexical_score: lex.map(|(_, s)| s),
-            semantic_score: Some(hit.score),
-            hash_score: None,
+            semantic_score,
+            hash_score,
             graph_score: None,
             in_both_sources: lex.is_some(),
         });
@@ -914,9 +928,14 @@ pub fn fuse_by_strategy_for_vector_lane(
     vector_is_hash: bool,
 ) -> Vec<FusedHit> {
     let mut fused = match strategy {
-        FusionStrategy::PoolMinMax if graph.is_empty() => {
-            pool_minmax_fuse_merge(lexical, semantic, limit, offset, config)
-        }
+        FusionStrategy::PoolMinMax if graph.is_empty() => pool_minmax_fuse_merge_for_vector_lane(
+            lexical,
+            semantic,
+            limit,
+            offset,
+            config,
+            vector_is_hash,
+        ),
         FusionStrategy::Rrf | FusionStrategy::PoolMinMax => rrf_fuse_merge_inner(
             lexical,
             semantic,
@@ -1230,6 +1249,22 @@ mod tests {
         let semantic_lane = rrf_fuse(&[], &semantic, 10, 0, &RrfConfig::default());
         assert_eq!(semantic_lane[0].semantic_rank, Some(0));
         assert_eq!(semantic_lane[0].hash_rank, None);
+
+        let pool = fuse_by_strategy_for_vector_lane(
+            FusionStrategy::PoolMinMax,
+            &[],
+            &semantic,
+            &[],
+            0.0,
+            10,
+            0,
+            &RrfConfig::default(),
+            true,
+        );
+        assert_eq!(pool[0].hash_rank, Some(0));
+        assert_eq!(pool[0].semantic_rank, None);
+        assert_eq!(pool[0].hash_score, Some(0.9));
+        assert_eq!(pool[0].semantic_score, None);
     }
 
     fn lexical_hit(doc_id: &str, score: f32) -> ScoredResult {
