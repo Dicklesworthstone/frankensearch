@@ -4639,14 +4639,20 @@ mod tests {
                 exceptional_numerator,
                 denominator,
             } if comparison == crate::Qg6Comparison::QuillNull
-                && sample.arm == PerfSampleArm::Treatment =>
+                && sample.arm == PerfSampleArm::Treatment
+                && sample.group_id
+                    == Some(crate::QG6_QUERY_GROUP_IDS[crate::QG6_QUERY_GROUPS - 1]) =>
             {
                 let mut leaves = uniform();
                 let exceptional_latency_ns = parent_latency_ns
                     .checked_mul(exceptional_numerator)
                     .expect("bounded QG-6 exceptional null latency")
                     / denominator;
-                for leaf in leaves.iter_mut().rev().take(2) {
+                let exceptional_leaf_count = searches_per_sample
+                    .checked_div(2)
+                    .and_then(|half| half.checked_sub(1))
+                    .expect("Quill-null p99 fixture requires at least four timing leaves");
+                for leaf in leaves.iter_mut().rev().take(exceptional_leaf_count) {
                     *leaf = exceptional_latency_ns;
                 }
                 leaves
