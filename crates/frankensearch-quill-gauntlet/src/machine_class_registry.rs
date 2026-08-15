@@ -16,7 +16,11 @@ use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::perf::{PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfMatrixSpec};
+use crate::perf::{
+    PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfGate, PerfMatrixSpec, PerfRawSample,
+    PerfSampleArm, PerfSamplePhase,
+};
+use crate::perf_evidence::{EvidenceCellBody, PerfEvidenceArtifact};
 
 /// Reviewed commit containing the normative registry.
 pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "d251ddea584519aba64922d9720e02d941a9385d";
@@ -638,6 +642,10 @@ pub struct VerifiedRunnerIdentity {
     durability: Value,
     completion: Value,
     artifact_manifest: Option<RunnerArtifactManifestBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qg5_durability_witnesses: Option<Qg5DurabilityWitnessSet>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qg5_durability_witness_scope: Option<Qg5DurabilityWitnessScope>,
     derived_sha256: MachineClassDerivedHashes,
 }
 
@@ -656,11 +664,31 @@ impl PreSpawnAdmission {
     /// Prove that terminal receipt admission retained the exact pre-spawn
     /// hardware, execution, durability, gate, and class identity.
     pub fn verify_final(&self, identity: &VerifiedRunnerIdentity) -> Result<(), MachineClassError> {
+        let expected_pending_qg5_durability = serde_json::to_value(qg5_pending_runner_durability())
+            .map_err(|error| {
+                MachineClassError::new(MachineClassReason::DerivedHashMismatch, error.to_string())
+            })?;
+        let durability_matches = if self.admission_context.gate == "QG-5" {
+            self.durability == expected_pending_qg5_durability
+                && identity
+                    .qg5_durability_witnesses
+                    .as_ref()
+                    .is_some_and(|witnesses| {
+                        witnesses.to_json_bytes().is_ok_and(|bytes| {
+                            serde_json::from_value::<RunnerDurability>(identity.durability.clone())
+                                .is_ok_and(|durability| {
+                                    durability == qg5_post_exit_runner_durability(&bytes)
+                                })
+                        })
+                    })
+        } else {
+            identity.durability == self.durability
+        };
         if identity.admission_context != self.admission_context
             || identity.profile != self.profile
             || identity.derived_sha256.hardware != self.hardware_sha256
             || identity.derived_sha256.identity != self.execution_identity_sha256
-            || identity.durability != self.durability
+            || !durability_matches
         {
             return Err(MachineClassError::new(
                 MachineClassReason::PrePostIdentityDrift,
@@ -1080,7 +1108,29 @@ impl VerifiedRunnerIdentity {
     /// never admitted by the frozen registry.
     pub fn verify(&self) -> Result<(), MachineClassError> {
         let registry = MachineClassRegistry::frozen()?;
-        let recomputed = registry.admit(self.receipt_json.as_bytes(), &self.admission_context)?;
+        let recomputed = match (
+            &self.qg5_durability_witnesses,
+            &self.qg5_durability_witness_scope,
+        ) {
+            (Some(witnesses), Some(scope)) => {
+                let bytes = witnesses.to_json_bytes()?;
+                registry.admit_qg5_post_exit_with_scope(
+                    self.receipt_json.as_bytes(),
+                    &self.admission_context,
+                    &bytes,
+                    scope,
+                )?
+            }
+            (None, None) => {
+                registry.admit(self.receipt_json.as_bytes(), &self.admission_context)?
+            }
+            _ => {
+                return Err(MachineClassError::new(
+                    MachineClassReason::DerivedHashMismatch,
+                    "stored QG-5 witness and its independently retained admission scope disagree",
+                ));
+            }
+        };
         let mut receipt_only = self.clone();
         receipt_only.artifact_manifest = None;
         if recomputed != receipt_only {
@@ -1108,6 +1158,55 @@ impl VerifiedRunnerIdentity {
             && self.derived_sha256.hardware == other.derived_sha256.hardware
             && self.derived_sha256.identity == other.derived_sha256.identity
             && self.durability == other.durability
+    }
+}
+
+/// Parent-retained QG-5 run scope used to recheck persisted witnesses.
+///
+/// The witness bytes are sealed by the benchmark child, but the run ID and
+/// canonical selected-cell census originate outside that child at the parent
+/// admission boundary. Retaining them separately prevents a resealed witness
+/// from another run or a different cell census from becoming self-authenticating.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Qg5DurabilityWitnessScope {
+    run_id: String,
+    selected_cell_ids: Vec<String>,
+    expected_census_sha256: String,
+}
+
+impl Qg5DurabilityWitnessScope {
+    fn new(
+        run_id: &str,
+        selected_cell_ids: &[String],
+        expected_census: &Qg5ExpectedDurabilityCensus,
+    ) -> Result<Self, MachineClassError> {
+        let scope = Self {
+            run_id: run_id.to_owned(),
+            selected_cell_ids: selected_cell_ids.to_vec(),
+            expected_census_sha256: expected_census.binding_sha256()?,
+        };
+        if !valid_qg5_identity(&scope.run_id)
+            || scope.selected_cell_ids.is_empty()
+            || scope.selected_cell_ids.len()
+                != scope
+                    .selected_cell_ids
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+            || scope
+                .selected_cell_ids
+                .iter()
+                .any(|cell| !valid_qg5_cell(cell))
+            || !is_sha256(&scope.expected_census_sha256)
+            || expected_census.run_id != scope.run_id
+            || expected_census.cell_ids() != scope.selected_cell_ids.iter().cloned().collect()
+        {
+            return Err(qg5_witness_error(
+                "QG-5 witness admission scope has an invalid run ID, selected cell census, or evidence binding",
+            ));
+        }
+        Ok(scope)
     }
 }
 
@@ -1232,6 +1331,13 @@ fn validate_artifact_manifest_binding(
         return Err(MachineClassError::new(
             MachineClassReason::CompletionUnverified,
             "artifact manifest does not match the receipt completion or admission gate",
+        ));
+    }
+    if let Some(scope) = &identity.qg5_durability_witness_scope
+        && manifest.run_id != scope.run_id
+    {
+        return Err(qg5_witness_error(
+            "QG-5 artifact manifest run ID differs from the retained witness admission scope",
         ));
     }
     Ok(())
@@ -1447,6 +1553,911 @@ pub struct RunnerDurability {
     pub(crate) control_treatment: String,
     pub(crate) candidate_treatment: String,
     pub(crate) symmetric: bool,
+}
+
+const QG5_PENDING_DURABILITY_TREATMENT: &str = "qg5-post-exit-witness-required";
+const QG5_POST_EXIT_DURABILITY_PREFIX: &str = "qg5-post-exit-witness-set-v2:";
+const QG5_RAW_SAMPLE_HASH_DOMAIN: &[u8] = b"frankensearch.quill.qg5-raw-sample.v2\0";
+const QG5_CENSUS_HASH_DOMAIN: &[u8] = b"frankensearch.quill.qg5-sample-census.v2\0";
+const QG5_MAX_SAMPLES_PER_CELL: usize = 400;
+const QG5_MAX_PROBE_DOCUMENT_ID_BYTES: usize = 128;
+/// Exact canonical child artifact required before QG-5 may bind promotion
+/// evidence. The child writes this file below `QUILL_PERF_OUTPUT_DIR`.
+pub const QG5_DURABILITY_WITNESS_FILE_NAME: &str = "QG-5.durability-witnesses.json";
+/// Strict schema for the sealed QG-5 post-exit measured-sample census.
+pub const QG5_DURABILITY_WITNESS_SCHEMA_VERSION: &str = "frankensearch.qg5-durability-witnesses.v2";
+
+/// Engine named by a QG-5 durability witness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qg5DurabilityEngine {
+    /// The Quill compaction arm.
+    Quill,
+    /// The Tantivy force-merge arm.
+    Tantivy,
+}
+
+/// Retained paired stream containing one measured QG-5 sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qg5StreamRole {
+    /// Tantivy control versus Quill treatment.
+    Effect,
+    /// Tantivy control versus Tantivy treatment.
+    OracleNull,
+}
+
+/// Typed facts observed after deletes are durably published and before the
+/// maintenance timer starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg5DeletePublicationObservation {
+    /// Documents present before deletion.
+    pub source_document_count: u64,
+    /// Exact number of requested deletions.
+    pub requested_delete_count: u64,
+    /// Authoritative live count after publication.
+    pub published_live_document_count: u64,
+    /// Authoritative segment count presented to maintenance.
+    pub published_segment_count: u64,
+    /// Exact deleted document used by the visibility probe.
+    pub deleted_probe_document_id: String,
+    /// Matches for the deleted probe after publication; policy requires zero.
+    pub deleted_probe_match_count: u64,
+    /// Exact retained document used by the visibility probe.
+    pub live_probe_document_id: String,
+    /// Matches for the live probe after publication; policy requires one.
+    pub live_probe_match_count: u64,
+}
+
+/// Engine-specific timed maintenance facts. The elapsed interval is the exact
+/// duration converted into the parent [`PerfRawSample::observed_value`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Qg5TimedMaintenanceObservation {
+    /// Quill compacted the published segment set.
+    QuillCompaction {
+        /// Exact inner maintenance interval.
+        elapsed_ns: u64,
+        /// MANIFEST generation inspected by the pass.
+        generation_before: u64,
+        /// Successor generation published by the changed pass.
+        generation_after: u64,
+        /// Immutable segments examined by the density policy.
+        examined_segments: u64,
+        /// Eligible segments rewritten or removed.
+        compacted_segments: u64,
+        /// Fully deleted segments removed without replacement files.
+        removed_segments: u64,
+        /// Physical rows folded out of rewritten segments.
+        dropped_documents: u64,
+        /// Source bytes read for eligible segments.
+        input_bytes: u64,
+        /// Replacement bytes emitted for surviving compacted segments.
+        output_bytes: u64,
+        /// Segments visible immediately before compaction.
+        input_segment_count: u64,
+        /// Segments visible immediately after compaction.
+        output_segment_count: u64,
+    },
+    /// Tantivy force-merged the published segment set.
+    TantivyForceMerge {
+        /// Exact inner maintenance interval.
+        elapsed_ns: u64,
+        /// Segments visible immediately before force-merge.
+        input_segment_count: u64,
+        /// Segments visible immediately after force-merge.
+        output_segment_count: u64,
+    },
+}
+
+impl Qg5TimedMaintenanceObservation {
+    fn engine(&self) -> Qg5DurabilityEngine {
+        match self {
+            Self::QuillCompaction { .. } => Qg5DurabilityEngine::Quill,
+            Self::TantivyForceMerge { .. } => Qg5DurabilityEngine::Tantivy,
+        }
+    }
+
+    fn elapsed_ns(&self) -> u64 {
+        match self {
+            Self::QuillCompaction { elapsed_ns, .. }
+            | Self::TantivyForceMerge { elapsed_ns, .. } => *elapsed_ns,
+        }
+    }
+}
+
+/// Typed facts observed from a fresh post-maintenance reopen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg5ReopenValidationObservation {
+    /// Authoritative live count from the reopened index.
+    pub reopened_live_document_count: u64,
+    /// Authoritative segment count from the reopened index.
+    pub reopened_segment_count: u64,
+    /// The same deleted probe used before maintenance.
+    pub deleted_probe_document_id: String,
+    /// Reopened-index matches for the deleted probe; policy requires zero.
+    pub deleted_probe_match_count: u64,
+    /// The same live probe used before maintenance.
+    pub live_probe_document_id: String,
+    /// Reopened-index matches for the live probe; policy requires one.
+    pub live_probe_match_count: u64,
+}
+
+/// Policy-checkable three-stage observation for one measured QG-5 operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg5DurabilityObservation {
+    /// Durable delete-publication facts captured before timing.
+    pub delete_publication: Qg5DeletePublicationObservation,
+    /// Exact engine-specific maintenance interval and topology transition.
+    pub timed_maintenance: Qg5TimedMaintenanceObservation,
+    /// Fresh-reopen count, topology, and visibility facts.
+    pub reopen_validation: Qg5ReopenValidationObservation,
+}
+
+impl Qg5DurabilityObservation {
+    /// Construct and validate one typed three-stage observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineClassError`] when the publication, timed maintenance,
+    /// and reopened-index facts do not form a valid engine-specific QG-5
+    /// observation.
+    pub fn new(
+        delete_publication: Qg5DeletePublicationObservation,
+        timed_maintenance: Qg5TimedMaintenanceObservation,
+        reopen_validation: Qg5ReopenValidationObservation,
+    ) -> Result<Self, MachineClassError> {
+        let observation = Self {
+            delete_publication,
+            timed_maintenance,
+            reopen_validation,
+        };
+        observation.validate(observation.timed_maintenance.engine())?;
+        Ok(observation)
+    }
+
+    fn validate(&self, engine: Qg5DurabilityEngine) -> Result<(), MachineClassError> {
+        let delete = &self.delete_publication;
+        let reopen = &self.reopen_validation;
+        let valid_probe = |value: &str| {
+            !value.is_empty()
+                && value.len() <= QG5_MAX_PROBE_DOCUMENT_ID_BYTES
+                && value.trim() == value
+                && value.bytes().all(|byte| byte.is_ascii_graphic())
+        };
+        if self.timed_maintenance.engine() != engine
+            || self.timed_maintenance.elapsed_ns() == 0
+            || delete.source_document_count < 2
+            || delete.requested_delete_count == 0
+            || delete.requested_delete_count >= delete.source_document_count
+            || delete.published_live_document_count
+                != delete.source_document_count - delete.requested_delete_count
+            || delete.published_segment_count < 2
+            || reopen.reopened_live_document_count != delete.published_live_document_count
+            || !valid_probe(&delete.deleted_probe_document_id)
+            || !valid_probe(&delete.live_probe_document_id)
+            || delete.deleted_probe_document_id == delete.live_probe_document_id
+            || delete.deleted_probe_match_count != 0
+            || delete.live_probe_match_count != 1
+            || reopen.deleted_probe_document_id != delete.deleted_probe_document_id
+            || reopen.live_probe_document_id != delete.live_probe_document_id
+            || reopen.deleted_probe_match_count != 0
+            || reopen.live_probe_match_count != 1
+        {
+            return Err(qg5_witness_error(
+                "QG-5 observation does not prove published deletes, engine-specific maintenance, and a consistent fresh reopen",
+            ));
+        }
+        let output_segment_count = match &self.timed_maintenance {
+            Qg5TimedMaintenanceObservation::QuillCompaction {
+                generation_before,
+                generation_after,
+                examined_segments,
+                compacted_segments,
+                removed_segments,
+                dropped_documents,
+                input_bytes,
+                output_bytes,
+                input_segment_count,
+                output_segment_count,
+                ..
+            } => {
+                let expected_output = input_segment_count.checked_sub(*removed_segments);
+                let surviving_compactions = compacted_segments.saturating_sub(*removed_segments);
+                if *input_segment_count != delete.published_segment_count
+                    || examined_segments != input_segment_count
+                    || *compacted_segments == 0
+                    || compacted_segments != examined_segments
+                    || removed_segments > compacted_segments
+                    || generation_after <= generation_before
+                    || *dropped_documents == 0
+                    || *dropped_documents > delete.requested_delete_count
+                    || *input_bytes == 0
+                    || (surviving_compactions == 0) != (*output_bytes == 0)
+                    || expected_output != Some(*output_segment_count)
+                    || *output_segment_count == 0
+                {
+                    return Err(qg5_witness_error(
+                        "QG-5 Quill observation is not a changed, internally consistent CompactionReport",
+                    ));
+                }
+                *output_segment_count
+            }
+            Qg5TimedMaintenanceObservation::TantivyForceMerge {
+                input_segment_count,
+                output_segment_count,
+                ..
+            } => {
+                if *input_segment_count != delete.published_segment_count
+                    || *output_segment_count == 0
+                    || output_segment_count >= input_segment_count
+                {
+                    return Err(qg5_witness_error(
+                        "QG-5 Tantivy force-merge did not reduce the published segment topology",
+                    ));
+                }
+                *output_segment_count
+            }
+        };
+        if reopen.reopened_segment_count != output_segment_count {
+            return Err(qg5_witness_error(
+                "QG-5 fresh reopen does not preserve the post-maintenance topology",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_against_expected(
+        &self,
+        expected: &Qg5ExpectedSample,
+    ) -> Result<(), MachineClassError> {
+        self.validate(expected.binding.engine)?;
+        let elapsed_ns = self.timed_maintenance.elapsed_ns();
+        let observed_ms = std::time::Duration::from_nanos(elapsed_ns).as_secs_f64() * 1_000.0;
+        if elapsed_ns > expected.sample_interval_ns
+            || observed_ms.to_bits() != expected.observed_value_bits
+        {
+            return Err(qg5_witness_error(
+                "QG-5 maintenance interval does not equal the exact retained PerfRawSample value",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct Qg5SampleBinding {
+    stream: Qg5StreamRole,
+    block_id: u64,
+    sample_id: u64,
+    engine: Qg5DurabilityEngine,
+    raw_sample_sha256: String,
+}
+
+impl Qg5SampleBinding {
+    const fn key(&self) -> (Qg5StreamRole, u64, u64) {
+        (self.stream, self.block_id, self.sample_id)
+    }
+}
+
+/// One measured-sample durability witness emitted after the sample timer has
+/// closed. The enclosing witness-set seal authenticates the complete census.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg5SampleDurabilityWitness {
+    stream: Qg5StreamRole,
+    block_id: u64,
+    sample_id: u64,
+    engine: Qg5DurabilityEngine,
+    raw_sample_sha256: String,
+    observation: Qg5DurabilityObservation,
+}
+
+impl Qg5SampleDurabilityWitness {
+    /// Bind one completed typed engine observation to the exact raw sample.
+    ///
+    /// Callers must invoke this only after capturing the sample's terminal
+    /// timestamp, so serialization and hashing never enter the timed interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineClassError`] when the raw sample is not a valid
+    /// measured row, the engine disagrees with its stream and arm, the typed
+    /// observation is invalid, or its elapsed latency differs from the sample.
+    pub fn seal(
+        stream: Qg5StreamRole,
+        engine: Qg5DurabilityEngine,
+        raw_sample: &PerfRawSample,
+        observation: Qg5DurabilityObservation,
+    ) -> Result<Self, MachineClassError> {
+        let expected = qg5_expected_sample(stream, raw_sample)?;
+        if engine != expected.binding.engine {
+            return Err(qg5_witness_error(
+                "QG-5 sample engine does not match its stream role and measured arm",
+            ));
+        }
+        observation.validate_against_expected(&expected)?;
+        let witness = Self {
+            stream,
+            block_id: raw_sample.block_id,
+            sample_id: raw_sample.sample_id,
+            engine,
+            raw_sample_sha256: expected.binding.raw_sample_sha256,
+            observation,
+        };
+        witness.verify()?;
+        Ok(witness)
+    }
+
+    fn binding(&self) -> Qg5SampleBinding {
+        Qg5SampleBinding {
+            stream: self.stream,
+            block_id: self.block_id,
+            sample_id: self.sample_id,
+            engine: self.engine,
+            raw_sample_sha256: self.raw_sample_sha256.clone(),
+        }
+    }
+
+    fn key(&self) -> (Qg5StreamRole, u64, u64) {
+        (self.stream, self.block_id, self.sample_id)
+    }
+
+    fn verify(&self) -> Result<(), MachineClassError> {
+        if !is_sha256(&self.raw_sample_sha256) {
+            return Err(qg5_witness_error(
+                "QG-5 measured-sample witness has an invalid raw-sample binding",
+            ));
+        }
+        self.observation.validate(self.engine)
+    }
+}
+
+/// Canonical measured-sample durability census for one QG-5 cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg5CellDurabilityWitness {
+    cell: String,
+    samples: Vec<Qg5SampleDurabilityWitness>,
+}
+
+impl Qg5CellDurabilityWitness {
+    /// Sort and validate the complete measured-sample census for one cell.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineClassError`] when the cell identity is invalid, the
+    /// census is empty or oversized, an exact sample key is duplicated, or a
+    /// retained sample witness is invalid.
+    pub fn new(
+        cell: impl Into<String>,
+        mut samples: Vec<Qg5SampleDurabilityWitness>,
+    ) -> Result<Self, MachineClassError> {
+        samples.sort_by_key(Qg5SampleDurabilityWitness::key);
+        let witness = Self {
+            cell: cell.into(),
+            samples,
+        };
+        witness.verify()?;
+        Ok(witness)
+    }
+
+    fn verify(&self) -> Result<(), MachineClassError> {
+        if !valid_qg5_cell(&self.cell)
+            || self.samples.is_empty()
+            || self.samples.len() > QG5_MAX_SAMPLES_PER_CELL
+            || self
+                .samples
+                .windows(2)
+                .any(|pair| pair[0].key() >= pair[1].key())
+        {
+            return Err(qg5_witness_error(
+                "QG-5 cell sample census is empty, oversized, unsorted, or contains duplicate keys",
+            ));
+        }
+        for sample in &self.samples {
+            sample.verify()?;
+        }
+        Ok(())
+    }
+
+    fn bindings(&self) -> Vec<Qg5SampleBinding> {
+        self.samples
+            .iter()
+            .map(Qg5SampleDurabilityWitness::binding)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Qg5ExpectedSample {
+    binding: Qg5SampleBinding,
+    observed_value_bits: u64,
+    sample_interval_ns: u64,
+}
+
+/// Parent-derived projection of the exact retained QG-5 raw samples.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qg5ExpectedDurabilityCensus {
+    run_id: String,
+    cells: BTreeMap<String, Vec<Qg5ExpectedSample>>,
+}
+
+impl Qg5ExpectedDurabilityCensus {
+    /// Derive the independent expected census from already verified canonical
+    /// evidence. No child witness fields participate in this construction.
+    pub(super) fn from_evidence(
+        run_id: &str,
+        selected_cell_ids: &[String],
+        evidence: &PerfEvidenceArtifact,
+    ) -> Result<Self, MachineClassError> {
+        let selected = selected_cell_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if evidence.gate != PerfGate::Qg5
+            || evidence.provenance.run_id != run_id
+            || !valid_qg5_identity(run_id)
+            || selected.is_empty()
+            || selected.len() != selected_cell_ids.len()
+            || selected.iter().any(|cell| !valid_qg5_cell(cell))
+        {
+            return Err(qg5_witness_error(
+                "QG-5 expected census does not name the verified run and selected cells",
+            ));
+        }
+
+        let mut cells = BTreeMap::new();
+        for cell in &evidence.cells {
+            if !selected.contains(&cell.cell_id) || cells.contains_key(&cell.cell_id) {
+                return Err(qg5_witness_error(
+                    "QG-5 evidence cell census contains an extra or duplicate cell",
+                ));
+            }
+            let EvidenceCellBody::Paired { paired, .. } = &cell.body else {
+                return Err(qg5_witness_error(
+                    "QG-5 evidence cell does not retain paired effect and oracle-null samples",
+                ));
+            };
+            cells.insert(
+                cell.cell_id.clone(),
+                qg5_expected_cell_samples(run_id, &paired.effect_samples, &paired.null_samples)?,
+            );
+        }
+        let census = Self {
+            run_id: run_id.to_owned(),
+            cells,
+        };
+        if census.cell_ids() != selected {
+            return Err(qg5_witness_error(
+                "QG-5 evidence is missing one or more selected cells",
+            ));
+        }
+        let _ = census.binding_sha256()?;
+        Ok(census)
+    }
+
+    fn cell_ids(&self) -> BTreeSet<String> {
+        self.cells.keys().cloned().collect()
+    }
+
+    fn binding_cells(&self) -> BTreeMap<String, Vec<Qg5SampleBinding>> {
+        self.cells
+            .iter()
+            .map(|(cell, samples)| {
+                (
+                    cell.clone(),
+                    samples
+                        .iter()
+                        .map(|sample| sample.binding.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn binding_sha256(&self) -> Result<String, MachineClassError> {
+        qg5_census_binding_sha256(&self.run_id, &self.binding_cells())
+    }
+}
+
+fn qg5_expected_engine(stream: Qg5StreamRole, arm: PerfSampleArm) -> Qg5DurabilityEngine {
+    match (stream, arm) {
+        (Qg5StreamRole::Effect, PerfSampleArm::Treatment) => Qg5DurabilityEngine::Quill,
+        (Qg5StreamRole::Effect, PerfSampleArm::Control) | (Qg5StreamRole::OracleNull, _) => {
+            Qg5DurabilityEngine::Tantivy
+        }
+    }
+}
+
+fn qg5_raw_sample_sha256(sample: &PerfRawSample) -> Result<String, MachineClassError> {
+    let encoded = serde_json::to_vec(sample).map_err(|error| {
+        qg5_witness_error(format!("QG-5 raw sample serialization failed: {error}"))
+    })?;
+    qg5_domain_sha256(QG5_RAW_SAMPLE_HASH_DOMAIN, &encoded)
+}
+
+fn qg5_expected_sample(
+    stream: Qg5StreamRole,
+    sample: &PerfRawSample,
+) -> Result<Qg5ExpectedSample, MachineClassError> {
+    let observed_value = sample.observed_value.ok_or_else(|| {
+        qg5_witness_error("QG-5 raw sample is missing its measured maintenance value")
+    })?;
+    let sample_interval_ns = sample
+        .ended_ns
+        .checked_sub(sample.started_ns)
+        .ok_or_else(|| qg5_witness_error("QG-5 raw sample has a reversed monotonic interval"))?;
+    if sample.phase != PerfSamplePhase::Measurement
+        || sample_interval_ns == 0
+        || !observed_value.is_finite()
+        || observed_value <= 0.0
+    {
+        return Err(qg5_witness_error(
+            "QG-5 census may contain only finite positive decision samples",
+        ));
+    }
+    Ok(Qg5ExpectedSample {
+        binding: Qg5SampleBinding {
+            stream,
+            block_id: sample.block_id,
+            sample_id: sample.sample_id,
+            engine: qg5_expected_engine(stream, sample.arm),
+            raw_sample_sha256: qg5_raw_sample_sha256(sample)?,
+        },
+        observed_value_bits: observed_value.to_bits(),
+        sample_interval_ns,
+    })
+}
+
+fn qg5_expected_cell_samples(
+    run_id: &str,
+    effect_samples: &[PerfRawSample],
+    null_samples: &[PerfRawSample],
+) -> Result<Vec<Qg5ExpectedSample>, MachineClassError> {
+    if effect_samples.is_empty()
+        || effect_samples.len() % 2 != 0
+        || effect_samples.len() != null_samples.len()
+        || effect_samples.len() + null_samples.len() > QG5_MAX_SAMPLES_PER_CELL
+    {
+        return Err(qg5_witness_error(
+            "QG-5 evidence must retain equally sized non-empty T/Q and T/T paired streams",
+        ));
+    }
+
+    let stream_blocks = |samples: &[PerfRawSample]| {
+        let mut blocks = BTreeMap::<u64, u8>::new();
+        for sample in samples {
+            let arm_bit = match sample.arm {
+                PerfSampleArm::Control => 0b01,
+                PerfSampleArm::Treatment => 0b10,
+            };
+            let observed_arms = blocks.entry(sample.block_id).or_default();
+            if *observed_arms & arm_bit != 0 {
+                return Err(qg5_witness_error(
+                    "QG-5 evidence stream contains a duplicate arm in one measured block",
+                ));
+            }
+            *observed_arms |= arm_bit;
+        }
+        if blocks.values().any(|observed_arms| *observed_arms != 0b11) {
+            return Err(qg5_witness_error(
+                "QG-5 evidence stream does not contain one control and one treatment in every measured block",
+            ));
+        }
+        Ok(blocks.keys().copied().collect::<BTreeSet<_>>())
+    };
+    let effect_blocks = stream_blocks(effect_samples)?;
+    let null_blocks = stream_blocks(null_samples)?;
+    if effect_blocks != null_blocks || effect_blocks.len() != effect_samples.len() / 2 {
+        return Err(qg5_witness_error(
+            "QG-5 effect and oracle-null streams do not retain the same exact round census",
+        ));
+    }
+
+    let mut sample_ids = BTreeSet::new();
+    let mut sample_keys = BTreeSet::new();
+    let mut expected = Vec::with_capacity(effect_samples.len() + null_samples.len());
+    for (stream, samples) in [
+        (Qg5StreamRole::Effect, effect_samples),
+        (Qg5StreamRole::OracleNull, null_samples),
+    ] {
+        for sample in samples {
+            if sample.provenance.run_id != run_id
+                || !sample_ids.insert(sample.sample_id)
+                || !sample_keys.insert((stream, sample.block_id, sample.sample_id))
+            {
+                return Err(qg5_witness_error(
+                    "QG-5 raw samples contain a foreign run, duplicate sample ID, or duplicate exact key",
+                ));
+            }
+            expected.push(qg5_expected_sample(stream, sample)?);
+        }
+    }
+    expected.sort_by_key(|sample| sample.binding.key());
+    if expected
+        .windows(2)
+        .any(|pair| pair[0].binding.key() >= pair[1].binding.key())
+    {
+        return Err(qg5_witness_error(
+            "QG-5 expected sample census contains a duplicate key",
+        ));
+    }
+    Ok(expected)
+}
+
+/// Sealed census of every measured QG-5 sample emitted by one benchmark child.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg5DurabilityWitnessSet {
+    schema_version: String,
+    gate: String,
+    run_id: String,
+    cells: BTreeMap<String, Qg5CellDurabilityWitness>,
+    seal_sha256: String,
+}
+
+impl Qg5DurabilityWitnessSet {
+    /// Seal the full selected-cell measured-sample census emitted by a QG-5 child.
+    ///
+    /// The benchmark writes [`Self::to_json_bytes`] to
+    /// [`QG5_DURABILITY_WITNESS_FILE_NAME`] only after all selected cells have
+    /// completed their real delete-publication, timed maintenance, and reopen
+    /// validation events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineClassError`] when the run identity or cell census is
+    /// invalid, a retained sample witness fails validation, or the canonical
+    /// seal cannot be produced.
+    pub fn seal(
+        run_id: impl Into<String>,
+        cells: BTreeMap<String, Qg5CellDurabilityWitness>,
+    ) -> Result<Self, MachineClassError> {
+        let mut set = Self {
+            schema_version: QG5_DURABILITY_WITNESS_SCHEMA_VERSION.to_owned(),
+            gate: "QG-5".to_owned(),
+            run_id: run_id.into(),
+            cells,
+            seal_sha256: String::new(),
+        };
+        set.refresh_seal()?;
+        set.verify()?;
+        Ok(set)
+    }
+
+    /// Return the exact canonical bytes the child must publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineClassError`] when the witness set no longer verifies
+    /// or cannot be serialized into canonical JSON.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, MachineClassError> {
+        self.verify()?;
+        qg5_canonical_bytes(self)
+    }
+
+    /// Strictly parse and verify exact child-published witness bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineClassError`] when the bytes are malformed, contain
+    /// unknown fields, are not exact canonical compact JSON, or describe an
+    /// invalid or incorrectly sealed witness set.
+    pub fn from_verified_slice(bytes: &[u8]) -> Result<Self, MachineClassError> {
+        let value = parse_strict_json(bytes).map_err(|error| {
+            qg5_witness_error(format!("QG-5 witness set is not strict JSON: {error}"))
+        })?;
+        let set = serde_json::from_value::<Self>(value).map_err(|error| {
+            qg5_witness_error(format!("QG-5 witness set is malformed: {error}"))
+        })?;
+        let canonical = qg5_canonical_bytes(&set)?;
+        if bytes != canonical {
+            return Err(qg5_witness_error(
+                "QG-5 witness set bytes are not exact canonical compact JSON",
+            ));
+        }
+        set.verify()?;
+        Ok(set)
+    }
+
+    fn verify_for_run(
+        &self,
+        run_id: &str,
+        selected_cell_ids: &[String],
+    ) -> Result<(), MachineClassError> {
+        self.verify()?;
+        let selected = selected_cell_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if !valid_qg5_identity(run_id)
+            || self.run_id != run_id
+            || selected.is_empty()
+            || selected.len() != selected_cell_ids.len()
+            || selected.iter().any(|cell| !valid_qg5_cell(cell))
+            || self.cells.keys().cloned().collect::<BTreeSet<_>>() != selected
+        {
+            return Err(qg5_witness_error(
+                "QG-5 witness set does not bind the exact runner ID and selected cell census",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify exact one-to-one binding against the parent-derived raw-sample
+    /// census retained in canonical evidence.
+    pub(crate) fn verify_for_run_and_census(
+        &self,
+        run_id: &str,
+        selected_cell_ids: &[String],
+        expected: &Qg5ExpectedDurabilityCensus,
+    ) -> Result<(), MachineClassError> {
+        self.verify_for_run(run_id, selected_cell_ids)?;
+        if expected.run_id != run_id
+            || expected.cell_ids() != selected_cell_ids.iter().cloned().collect()
+            || self.census_binding_sha256()? != expected.binding_sha256()?
+        {
+            return Err(qg5_witness_error(
+                "QG-5 witness sample keys do not exactly equal the evidence-derived census",
+            ));
+        }
+        for (cell, witness) in &self.cells {
+            let expected_samples = expected.cells.get(cell).ok_or_else(|| {
+                qg5_witness_error("QG-5 witness contains a cell absent from canonical evidence")
+            })?;
+            if witness.samples.len() != expected_samples.len() {
+                return Err(qg5_witness_error(
+                    "QG-5 witness has a missing or extra measured sample",
+                ));
+            }
+            for (observed, expected_sample) in witness.samples.iter().zip(expected_samples.iter()) {
+                if observed.binding() != expected_sample.binding {
+                    return Err(qg5_witness_error(
+                        "QG-5 witness has a duplicate, missing, extra, or stream-swapped sample",
+                    ));
+                }
+                observed
+                    .observation
+                    .validate_against_expected(expected_sample)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_for_scope(&self, scope: &Qg5DurabilityWitnessScope) -> Result<(), MachineClassError> {
+        self.verify_for_run(&scope.run_id, &scope.selected_cell_ids)?;
+        if self.census_binding_sha256()? != scope.expected_census_sha256 {
+            return Err(qg5_witness_error(
+                "QG-5 witness sample census differs from the parent-retained evidence binding",
+            ));
+        }
+        Ok(())
+    }
+
+    fn census_binding_sha256(&self) -> Result<String, MachineClassError> {
+        let cells = self
+            .cells
+            .iter()
+            .map(|(cell, witness)| (cell.clone(), witness.bindings()))
+            .collect();
+        qg5_census_binding_sha256(&self.run_id, &cells)
+    }
+
+    fn seal_preimage(&self) -> Result<Vec<u8>, MachineClassError> {
+        let mut unsealed = self.clone();
+        unsealed.seal_sha256.clear();
+        qg5_canonical_bytes(&unsealed)
+    }
+
+    fn refresh_seal(&mut self) -> Result<(), MachineClassError> {
+        self.seal_sha256 = sha256_hex(&self.seal_preimage()?);
+        Ok(())
+    }
+
+    fn verify(&self) -> Result<(), MachineClassError> {
+        if self.schema_version != QG5_DURABILITY_WITNESS_SCHEMA_VERSION
+            || self.gate != "QG-5"
+            || !valid_qg5_identity(&self.run_id)
+            || self.cells.is_empty()
+            || !is_sha256(&self.seal_sha256)
+            || self.seal_sha256 != sha256_hex(&self.seal_preimage()?)
+        {
+            return Err(qg5_witness_error(
+                "QG-5 witness set is malformed, unsealed, or has no arm witnesses",
+            ));
+        }
+        for (cell, witness) in &self.cells {
+            if witness.cell != *cell {
+                return Err(qg5_witness_error(
+                    "QG-5 witness set has a cell identity mismatch",
+                ));
+            }
+            witness.verify()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct Qg5CensusBinding<'a> {
+    schema_version: &'static str,
+    run_id: &'a str,
+    cells: &'a BTreeMap<String, Vec<Qg5SampleBinding>>,
+}
+
+fn qg5_census_binding_sha256(
+    run_id: &str,
+    cells: &BTreeMap<String, Vec<Qg5SampleBinding>>,
+) -> Result<String, MachineClassError> {
+    let binding = Qg5CensusBinding {
+        schema_version: QG5_DURABILITY_WITNESS_SCHEMA_VERSION,
+        run_id,
+        cells,
+    };
+    let bytes = qg5_canonical_bytes(&binding)?;
+    qg5_domain_sha256(QG5_CENSUS_HASH_DOMAIN, &bytes)
+}
+
+fn qg5_domain_sha256(domain: &[u8], payload: &[u8]) -> Result<String, MachineClassError> {
+    let payload_len = u64::try_from(payload.len())
+        .map_err(|_| qg5_witness_error("QG-5 hash payload length does not fit u64"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(payload_len.to_le_bytes());
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    Ok(output)
+}
+
+fn qg5_canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, MachineClassError> {
+    let value = serde_json::to_value(value).map_err(|error| {
+        qg5_witness_error(format!("QG-5 witness serialization failed: {error}"))
+    })?;
+    canonical_json_bytes(&value).map_err(|error| {
+        qg5_witness_error(format!("QG-5 witness canonicalization failed: {error}"))
+    })
+}
+
+fn qg5_witness_error(detail: impl Into<String>) -> MachineClassError {
+    MachineClassError::new(MachineClassReason::DurabilityAsymmetric, detail)
+}
+
+fn valid_qg5_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value.trim() == value
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn valid_qg5_cell(value: &str) -> bool {
+    value.starts_with("QG-5/") && valid_qg5_identity(value) && value.len() <= 240
+}
+
+pub fn qg5_pending_runner_durability() -> RunnerDurability {
+    RunnerDurability {
+        adjacent: true,
+        control_treatment: QG5_PENDING_DURABILITY_TREATMENT.to_owned(),
+        candidate_treatment: QG5_PENDING_DURABILITY_TREATMENT.to_owned(),
+        symmetric: false,
+    }
+}
+
+pub fn qg5_post_exit_runner_durability(witness_bytes: &[u8]) -> RunnerDurability {
+    let treatment = format!(
+        "{QG5_POST_EXIT_DURABILITY_PREFIX}{}",
+        sha256_hex(witness_bytes)
+    );
+    RunnerDurability {
+        adjacent: true,
+        control_treatment: treatment.clone(),
+        candidate_treatment: treatment,
+        symmetric: true,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2550,8 +3561,8 @@ impl MachineClassRegistry {
         })?;
         let resolved = self.resolve_profile(receipt.requested_profile)?;
         validate_admission_envelope(&receipt, &resolved, context)?;
-        validate_durability(&receipt.durability)?;
-        validate_gate_profile_policy(&resolved, context)?;
+        validate_pre_spawn_durability(&receipt.durability, context)?;
+        validate_pre_spawn_gate_profile_policy(&resolved, context)?;
         validate_destination(context, receipt.derived_profile)?;
         let derived = derive_hashes(&receipt)?;
         Ok(PreSpawnAdmission {
@@ -2575,6 +3586,62 @@ impl MachineClassRegistry {
         &self,
         receipt_bytes: &[u8],
         context: &MachineClassAdmissionContext,
+    ) -> Result<VerifiedRunnerIdentity, MachineClassError> {
+        self.admit_inner(receipt_bytes, context, None)
+    }
+
+    /// Admit QG-5 evidence only after the child has exited and published a
+    /// complete sealed durability-witness census for its exact selected cells.
+    pub(crate) fn admit_qg5_post_exit(
+        &self,
+        receipt_bytes: &[u8],
+        context: &MachineClassAdmissionContext,
+        run_id: &str,
+        selected_cell_ids: &[String],
+        witness_bytes: &[u8],
+        expected_census: &Qg5ExpectedDurabilityCensus,
+    ) -> Result<VerifiedRunnerIdentity, MachineClassError> {
+        if context.gate != "QG-5" {
+            return Err(qg5_witness_error(
+                "post-exit QG-5 durability admission cannot authenticate another gate",
+            ));
+        }
+        let witnesses = Qg5DurabilityWitnessSet::from_verified_slice(witness_bytes)?;
+        witnesses.verify_for_run_and_census(run_id, selected_cell_ids, expected_census)?;
+        let scope = Qg5DurabilityWitnessScope::new(run_id, selected_cell_ids, expected_census)?;
+        self.admit_inner(
+            receipt_bytes,
+            context,
+            Some((&witnesses, witness_bytes, &scope)),
+        )
+    }
+
+    fn admit_qg5_post_exit_with_scope(
+        &self,
+        receipt_bytes: &[u8],
+        context: &MachineClassAdmissionContext,
+        witness_bytes: &[u8],
+        scope: &Qg5DurabilityWitnessScope,
+    ) -> Result<VerifiedRunnerIdentity, MachineClassError> {
+        if context.gate != "QG-5" {
+            return Err(qg5_witness_error(
+                "post-exit QG-5 durability admission cannot authenticate another gate",
+            ));
+        }
+        let witnesses = Qg5DurabilityWitnessSet::from_verified_slice(witness_bytes)?;
+        witnesses.verify_for_scope(scope)?;
+        self.admit_inner(
+            receipt_bytes,
+            context,
+            Some((&witnesses, witness_bytes, scope)),
+        )
+    }
+
+    fn admit_inner(
+        &self,
+        receipt_bytes: &[u8],
+        context: &MachineClassAdmissionContext,
+        qg5_witness: Option<(&Qg5DurabilityWitnessSet, &[u8], &Qg5DurabilityWitnessScope)>,
     ) -> Result<VerifiedRunnerIdentity, MachineClassError> {
         let receipt_value = parse_strict_json(receipt_bytes)?;
         let receipt_schema_refs = self.receipt_shapes.iter().collect::<Vec<_>>();
@@ -2624,9 +3691,25 @@ impl MachineClassRegistry {
         let resolved = self.resolve_profile(receipt.requested_profile)?;
         validate_admission_envelope(&receipt, &resolved, context)?;
         validate_source_identity(&receipt)?;
-        validate_durability(&receipt.durability)?;
+        if context.gate == "QG-5" {
+            let (witnesses, witness_bytes, scope) = qg5_witness.ok_or_else(|| {
+                MachineClassError::new(
+                    MachineClassReason::ClassUnavailable,
+                    "QG-5 is not promotion-admissible until both arms emit a non-declarative symmetric durability-treatment witness",
+                )
+            })?;
+            witnesses.verify_for_scope(scope)?;
+            validate_qg5_post_exit_durability(&receipt.durability, witnesses, witness_bytes)?;
+        } else {
+            if qg5_witness.is_some() {
+                return Err(qg5_witness_error(
+                    "post-exit QG-5 durability witnesses cannot authenticate another gate",
+                ));
+            }
+            validate_durability(&receipt.durability)?;
+        }
         validate_completion(&receipt.completion)?;
-        validate_gate_profile_policy(&resolved, context)?;
+        validate_gate_profile_policy(&resolved, context, qg5_witness.is_some())?;
         validate_destination(context, receipt.derived_profile)?;
 
         let receipt_json = std::str::from_utf8(receipt_bytes)
@@ -2675,6 +3758,8 @@ impl MachineClassRegistry {
                 MachineClassError::new(MachineClassReason::DerivedHashMismatch, error.to_string())
             })?,
             artifact_manifest: None,
+            qg5_durability_witnesses: qg5_witness.map(|(witnesses, _, _)| witnesses.clone()),
+            qg5_durability_witness_scope: qg5_witness.map(|(_, _, scope)| scope.clone()),
             derived_sha256: derived,
         })
     }
@@ -3671,7 +4756,44 @@ fn validate_admission_envelope(
     Ok(())
 }
 
+fn validate_pre_spawn_gate_profile_policy(
+    resolved: &ResolvedProfile<'_>,
+    context: &MachineClassAdmissionContext,
+) -> Result<(), MachineClassError> {
+    validate_gate_profile_policy_base(resolved, context)?;
+    if matches!(context.gate.as_str(), "QG-3" | "QG-4") {
+        return Err(MachineClassError::new(
+            MachineClassReason::ClassUnavailable,
+            format!(
+                "{} is not promotion-admissible until both arms emit a non-declarative symmetric durability-treatment witness",
+                context.gate
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_gate_profile_policy(
+    resolved: &ResolvedProfile<'_>,
+    context: &MachineClassAdmissionContext,
+    qg5_witness_verified: bool,
+) -> Result<(), MachineClassError> {
+    validate_gate_profile_policy_base(resolved, context)?;
+    if matches!(context.gate.as_str(), "QG-3" | "QG-4")
+        || (context.gate == "QG-5" && !qg5_witness_verified)
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::ClassUnavailable,
+            format!(
+                "{} is not promotion-admissible until both arms emit a non-declarative symmetric durability-treatment witness",
+                context.gate
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gate_profile_policy_base(
     resolved: &ResolvedProfile<'_>,
     context: &MachineClassAdmissionContext,
 ) -> Result<(), MachineClassError> {
@@ -3698,15 +4820,6 @@ fn validate_gate_profile_policy(
         return Err(MachineClassError::new(
             MachineClassReason::ClassHomogeneityUnproven,
             "diagnostic-only execution profiles cannot promote history",
-        ));
-    }
-    if matches!(context.gate.as_str(), "QG-3" | "QG-4" | "QG-5") {
-        return Err(MachineClassError::new(
-            MachineClassReason::ClassUnavailable,
-            format!(
-                "{} is not promotion-admissible until both arms emit a non-declarative symmetric durability-treatment witness",
-                context.gate
-            ),
         ));
     }
     if resolved.profile.key.hardware_class_id != HardwareClassId::M4Macos {
@@ -3770,6 +4883,37 @@ fn validate_durability(durability: &RunnerDurability) -> Result<(), MachineClass
         return Err(MachineClassError::new(
             MachineClassReason::DurabilityAsymmetric,
             "durability-adjacent arms must use identical sync treatment",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pre_spawn_durability(
+    durability: &RunnerDurability,
+    context: &MachineClassAdmissionContext,
+) -> Result<(), MachineClassError> {
+    if context.gate != "QG-5" {
+        return validate_durability(durability);
+    }
+    let pending = qg5_pending_runner_durability();
+    if durability != &pending {
+        return Err(qg5_witness_error(
+            "QG-5 pre-spawn admission requires the exact pending post-exit witness token",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_qg5_post_exit_durability(
+    durability: &RunnerDurability,
+    witnesses: &Qg5DurabilityWitnessSet,
+    witness_bytes: &[u8],
+) -> Result<(), MachineClassError> {
+    witnesses.verify()?;
+    let expected = qg5_post_exit_runner_durability(witness_bytes);
+    if durability != &expected {
+        return Err(qg5_witness_error(
+            "QG-5 final receipt does not bind the exact sealed post-exit witness set",
         ));
     }
     Ok(())
@@ -4243,11 +5387,264 @@ fn materialize_receipt_vector(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::time::Duration;
 
     use super::*;
+    use crate::perf::{
+        PerfMetricSemantics, PerfOperationScope, PerfSampleOrder, PerfSampleProvenance,
+    };
 
     fn expected_reason(value: &Value) -> MachineClassReason {
         serde_json::from_value(value.clone()).expect("known expected reason")
+    }
+
+    fn qg5_test_raw_sample(
+        run_id: &str,
+        block_id: u64,
+        sample_id: u64,
+        arm: PerfSampleArm,
+        order: PerfSampleOrder,
+        elapsed_ns: u64,
+    ) -> PerfRawSample {
+        let started_ns = sample_id
+            .checked_mul(20_000_000)
+            .expect("test timestamp fits u64");
+        PerfRawSample {
+            block_id,
+            sample_id,
+            arm,
+            order,
+            phase: PerfSamplePhase::Measurement,
+            scope: PerfOperationScope {
+                operation_id: "qg5.compaction".to_owned(),
+                version: 1,
+                semantics: PerfMetricSemantics::GaugeLowerIsBetter,
+                unit: "ms".to_owned(),
+            },
+            provenance: PerfSampleProvenance {
+                run_id: run_id.to_owned(),
+                executable_sha256: "a".repeat(64),
+                corpus_sha256: "b".repeat(64),
+                input_identity: None,
+                worker_id: "qg5-test-worker".to_owned(),
+                build_profile: "release".to_owned(),
+            },
+            started_ns,
+            ended_ns: started_ns + 10_000_000,
+            work_units: None,
+            byte_count: None,
+            observed_value: Some(Duration::from_nanos(elapsed_ns).as_secs_f64() * 1_000.0),
+            group_id: None,
+            qg6_sample_binding: None,
+            qg1_sample_binding: None,
+            tantivy_config_sha256: None,
+        }
+    }
+
+    fn qg5_test_observation(
+        engine: Qg5DurabilityEngine,
+        elapsed_ns: u64,
+    ) -> Qg5DurabilityObservation {
+        let (timed_maintenance, reopened_segment_count) = match engine {
+            Qg5DurabilityEngine::Quill => (
+                Qg5TimedMaintenanceObservation::QuillCompaction {
+                    elapsed_ns,
+                    generation_before: 7,
+                    generation_after: 8,
+                    examined_segments: 4,
+                    compacted_segments: 4,
+                    removed_segments: 0,
+                    dropped_documents: 20,
+                    input_bytes: 10_000,
+                    output_bytes: 8_000,
+                    input_segment_count: 4,
+                    output_segment_count: 4,
+                },
+                4,
+            ),
+            Qg5DurabilityEngine::Tantivy => (
+                Qg5TimedMaintenanceObservation::TantivyForceMerge {
+                    elapsed_ns,
+                    input_segment_count: 4,
+                    output_segment_count: 1,
+                },
+                1,
+            ),
+        };
+        Qg5DurabilityObservation::new(
+            Qg5DeletePublicationObservation {
+                source_document_count: 100,
+                requested_delete_count: 20,
+                published_live_document_count: 80,
+                published_segment_count: 4,
+                deleted_probe_document_id: "qg5-deleted-probe".to_owned(),
+                deleted_probe_match_count: 0,
+                live_probe_document_id: "qg5-live-probe".to_owned(),
+                live_probe_match_count: 1,
+            },
+            timed_maintenance,
+            Qg5ReopenValidationObservation {
+                reopened_live_document_count: 80,
+                reopened_segment_count,
+                deleted_probe_document_id: "qg5-deleted-probe".to_owned(),
+                deleted_probe_match_count: 0,
+                live_probe_document_id: "qg5-live-probe".to_owned(),
+                live_probe_match_count: 1,
+            },
+        )
+        .expect("valid typed QG-5 observation")
+    }
+
+    fn qg5_test_raw_streams(run_id: &str, rounds: u64) -> (Vec<PerfRawSample>, Vec<PerfRawSample>) {
+        let elapsed_ns = 2_000_000;
+        let mut effect = Vec::new();
+        let mut oracle_null = Vec::new();
+        for round in 0..rounds {
+            let control_order = if round % 2 == 0 {
+                PerfSampleOrder::First
+            } else {
+                PerfSampleOrder::Second
+            };
+            let treatment_order = if control_order == PerfSampleOrder::First {
+                PerfSampleOrder::Second
+            } else {
+                PerfSampleOrder::First
+            };
+            let effect_control_id = round * 2;
+            effect.push(qg5_test_raw_sample(
+                run_id,
+                round,
+                effect_control_id,
+                PerfSampleArm::Control,
+                control_order,
+                elapsed_ns,
+            ));
+            effect.push(qg5_test_raw_sample(
+                run_id,
+                round,
+                effect_control_id + 1,
+                PerfSampleArm::Treatment,
+                treatment_order,
+                elapsed_ns,
+            ));
+            let null_control_id = 1_000_000 + round * 2;
+            oracle_null.push(qg5_test_raw_sample(
+                run_id,
+                round,
+                null_control_id,
+                PerfSampleArm::Control,
+                control_order,
+                elapsed_ns,
+            ));
+            oracle_null.push(qg5_test_raw_sample(
+                run_id,
+                round,
+                null_control_id + 1,
+                PerfSampleArm::Treatment,
+                treatment_order,
+                elapsed_ns,
+            ));
+        }
+        (effect, oracle_null)
+    }
+
+    fn qg5_test_fixture_for_cells(
+        run_id: &str,
+        cell_ids: &[&str],
+        rounds: u64,
+    ) -> (Qg5DurabilityWitnessSet, Qg5ExpectedDurabilityCensus) {
+        let mut witness_cells = BTreeMap::new();
+        let mut expected_cells = BTreeMap::new();
+        for cell in cell_ids {
+            let (effect, oracle_null) = qg5_test_raw_streams(run_id, rounds);
+            let mut sample_witnesses = Vec::new();
+            for (stream, samples) in [
+                (Qg5StreamRole::Effect, effect.as_slice()),
+                (Qg5StreamRole::OracleNull, oracle_null.as_slice()),
+            ] {
+                for sample in samples {
+                    let engine = qg5_expected_engine(stream, sample.arm);
+                    sample_witnesses.push(
+                        Qg5SampleDurabilityWitness::seal(
+                            stream,
+                            engine,
+                            sample,
+                            qg5_test_observation(engine, 2_000_000),
+                        )
+                        .expect("seal measured QG-5 sample witness"),
+                    );
+                }
+            }
+            witness_cells.insert(
+                (*cell).to_owned(),
+                Qg5CellDurabilityWitness::new(*cell, sample_witnesses)
+                    .expect("canonical QG-5 sample census"),
+            );
+            expected_cells.insert(
+                (*cell).to_owned(),
+                qg5_expected_cell_samples(run_id, &effect, &oracle_null)
+                    .expect("expected QG-5 raw-sample census"),
+            );
+        }
+        let witnesses =
+            Qg5DurabilityWitnessSet::seal(run_id, witness_cells).expect("seal QG-5 witness set");
+        let expected = Qg5ExpectedDurabilityCensus {
+            run_id: run_id.to_owned(),
+            cells: expected_cells,
+        };
+        (witnesses, expected)
+    }
+
+    fn qg5_test_fixture(
+        run_id: &str,
+        cell: &str,
+    ) -> (Qg5DurabilityWitnessSet, Qg5ExpectedDurabilityCensus) {
+        qg5_test_fixture_for_cells(run_id, &[cell], 2)
+    }
+
+    fn qg5_post_exit_receipt(witness_bytes: &[u8]) -> (Vec<u8>, MachineClassAdmissionContext) {
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        let vector = registry.raw()["test_vectors"]
+            .as_array()
+            .expect("receipt vectors")
+            .iter()
+            .find(|vector| vector["id"].as_str() == Some("MCV-001-trj-physical-64-admitted"))
+            .expect("registered Threadripper vector");
+        let (bytes, mut context) = materialize_receipt_vector(registry.raw(), vector);
+        let mut receipt: Value = serde_json::from_slice(&bytes).expect("materialized receipt");
+        let profile =
+            serde_json::from_value::<MachineProfileKey>(receipt["derived_profile"].clone())
+                .expect("registered profile");
+        let max_width = registry
+            .execution_profile(profile)
+            .expect("registered execution profile")
+            .gate_policy("QG-5")
+            .and_then(MachineProfileGatePolicy::max_exercised_cell_width)
+            .expect("QG-5 maximum width");
+        set_path(
+            &mut receipt,
+            "execution.request.max_exercised_cell_width",
+            Value::from(max_width),
+        );
+        set_path(
+            &mut receipt,
+            "durability",
+            serde_json::to_value(qg5_post_exit_runner_durability(witness_bytes))
+                .expect("serialize QG-5 durability binding"),
+        );
+        set_path(
+            &mut receipt,
+            "execution.identity_sha256",
+            Value::String("$DERIVE_EXECUTION_IDENTITY_SHA256".to_owned()),
+        );
+        derive_receipt_placeholders(&mut receipt);
+        context.gate = "QG-5".to_owned();
+        context.expected_profile = profile;
+        context.destination_basename = profile.latest_basename("QG-5").expect("QG-5 destination");
+        (
+            serde_json::to_vec(&receipt).expect("serialize QG-5 receipt"),
+            context,
+        )
     }
 
     #[test]
@@ -4756,6 +6153,249 @@ mod tests {
             )
             .expect_err("wrong hardware must reject before a child can spawn");
         assert_eq!(error.reason, MachineClassReason::HardwareCpuVendorMismatch);
+    }
+
+    #[test]
+    fn qg5_schema_v2_admits_exact_eight_row_census_for_two_rounds() {
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        let run_id = "qg5-post-exit-test";
+        let cell = "QG-5/compaction/xlarge/20pct/wall_clock_ms";
+        let (witnesses, expected) = qg5_test_fixture(run_id, cell);
+        assert_eq!(
+            witnesses.cells[cell].samples.len(),
+            8,
+            "two rounds retain effect control/treatment plus oracle-null control/treatment"
+        );
+        let witness_bytes = witnesses.to_json_bytes().expect("canonical QG-5 witnesses");
+        let (receipt_bytes, context) = qg5_post_exit_receipt(&witness_bytes);
+        let receipt =
+            serde_json::from_slice::<RunnerReceipt>(&receipt_bytes).expect("QG-5 runner receipt");
+
+        let pre_spawn = registry
+            .preflight(
+                receipt.requested_profile,
+                receipt.hardware.clone(),
+                receipt.execution.request.clone(),
+                receipt.execution.start.clone(),
+                qg5_pending_runner_durability(),
+                &context,
+            )
+            .expect("QG-5 pre-spawn envelope may only defer witness admission");
+        let ordinary_error = registry
+            .admit(&receipt_bytes, &context)
+            .expect_err("QG-5 must not admit before parent verifies child witnesses");
+        assert_eq!(ordinary_error.reason, MachineClassReason::ClassUnavailable);
+
+        let identity = registry
+            .admit_qg5_post_exit(
+                &receipt_bytes,
+                &context,
+                run_id,
+                &[cell.to_owned()],
+                &witness_bytes,
+                &expected,
+            )
+            .expect("matching observed Quill/Tantivy QG-5 witnesses admit");
+        pre_spawn
+            .verify_final(&identity)
+            .expect("post-exit QG-5 admission retains the pre-spawn host envelope");
+        identity
+            .verify()
+            .expect("stored QG-5 identity re-verifies its sealed witnesses");
+    }
+
+    #[test]
+    fn qg5_parent_rejects_missing_duplicate_and_stream_swapped_exact_keys() {
+        let run_id = "qg5-census-hostiles";
+        let cell = "QG-5/compaction/xlarge/20pct/wall_clock_ms";
+        let selected = [cell.to_owned()];
+        let (witnesses, expected) = qg5_test_fixture(run_id, cell);
+
+        let mut missing_effect_treatment = witnesses.clone();
+        missing_effect_treatment
+            .cells
+            .get_mut(cell)
+            .expect("fixture cell")
+            .samples
+            .retain(|sample| {
+                !(sample.stream == Qg5StreamRole::Effect
+                    && sample.block_id == 0
+                    && sample.sample_id == 1)
+            });
+        missing_effect_treatment
+            .refresh_seal()
+            .expect("reseal missing-row hostile");
+        assert!(
+            missing_effect_treatment
+                .verify_for_run_and_census(run_id, &selected, &expected)
+                .is_err(),
+            "a missing effect-treatment row must reject"
+        );
+
+        let mut duplicate_exact_key = witnesses.clone();
+        let duplicate = duplicate_exact_key.cells[cell].samples[0].clone();
+        let duplicate_cell = duplicate_exact_key
+            .cells
+            .get_mut(cell)
+            .expect("fixture cell");
+        duplicate_cell.samples.push(duplicate);
+        duplicate_cell
+            .samples
+            .sort_by_key(Qg5SampleDurabilityWitness::key);
+        duplicate_exact_key
+            .refresh_seal()
+            .expect("reseal duplicate-key hostile");
+        assert!(
+            duplicate_exact_key
+                .verify_for_run_and_census(run_id, &selected, &expected)
+                .is_err(),
+            "a duplicate exact stream/block/sample key must reject"
+        );
+
+        let mut swapped_controls = witnesses;
+        let swapped_cell = swapped_controls.cells.get_mut(cell).expect("fixture cell");
+        let effect_control = swapped_cell
+            .samples
+            .iter()
+            .position(|sample| {
+                sample.stream == Qg5StreamRole::Effect
+                    && sample.block_id == 0
+                    && sample.sample_id == 0
+            })
+            .expect("effect control row");
+        let oracle_null_control = swapped_cell
+            .samples
+            .iter()
+            .position(|sample| {
+                sample.stream == Qg5StreamRole::OracleNull
+                    && sample.block_id == 0
+                    && sample.sample_id == 1_000_000
+            })
+            .expect("oracle-null control row");
+        swapped_cell.samples[effect_control].stream = Qg5StreamRole::OracleNull;
+        swapped_cell.samples[oracle_null_control].stream = Qg5StreamRole::Effect;
+        swapped_cell
+            .samples
+            .sort_by_key(Qg5SampleDurabilityWitness::key);
+        swapped_controls
+            .refresh_seal()
+            .expect("reseal stream-swap hostile");
+        assert!(
+            swapped_controls
+                .verify_for_run_and_census(run_id, &selected, &expected)
+                .is_err(),
+            "Effect/Control/Tantivy cannot swap with OracleNull/Control/Tantivy"
+        );
+    }
+
+    #[test]
+    fn qg5_parent_rejects_warmup_rows_and_exact_latency_bit_drift() {
+        let run_id = "qg5-latency-hostiles";
+        let cell = "QG-5/compaction/xlarge/20pct/wall_clock_ms";
+        let selected = [cell.to_owned()];
+        let (mut effect, oracle_null) = qg5_test_raw_streams(run_id, 2);
+        effect[0].phase = PerfSamplePhase::Warmup;
+        assert!(
+            qg5_expected_cell_samples(run_id, &effect, &oracle_null).is_err(),
+            "warmup rows must never enter the expected durability census"
+        );
+
+        let (mut witnesses, expected) = qg5_test_fixture(run_id, cell);
+        let sample = witnesses
+            .cells
+            .get_mut(cell)
+            .expect("fixture cell")
+            .samples
+            .first_mut()
+            .expect("fixture sample");
+        match &mut sample.observation.timed_maintenance {
+            Qg5TimedMaintenanceObservation::QuillCompaction { elapsed_ns, .. }
+            | Qg5TimedMaintenanceObservation::TantivyForceMerge { elapsed_ns, .. } => {
+                *elapsed_ns += 1;
+            }
+        }
+        witnesses
+            .refresh_seal()
+            .expect("reseal latency-bit hostile");
+        assert!(
+            witnesses
+                .verify_for_run_and_census(run_id, &selected, &expected)
+                .is_err(),
+            "typed elapsed latency must equal the exact parent raw-sample f64 bits"
+        );
+    }
+
+    #[test]
+    fn qg5_typed_maintenance_accepts_quill_tombstone_fold_same_count_only() {
+        let same_count = qg5_test_observation(Qg5DurabilityEngine::Quill, 2_000_000);
+        same_count
+            .validate(Qg5DurabilityEngine::Quill)
+            .expect("Quill may rewrite tombstones without removing a segment");
+
+        let mut false_quill_topology = same_count.clone();
+        let Qg5TimedMaintenanceObservation::QuillCompaction {
+            output_segment_count,
+            ..
+        } = &mut false_quill_topology.timed_maintenance
+        else {
+            panic!("Quill fixture must carry a compaction report");
+        };
+        *output_segment_count -= 1;
+        assert!(
+            false_quill_topology
+                .validate(Qg5DurabilityEngine::Quill)
+                .is_err(),
+            "Quill output count must equal input count minus removed segments"
+        );
+
+        let mut unchanged_generation = same_count.clone();
+        let Qg5TimedMaintenanceObservation::QuillCompaction {
+            generation_before,
+            generation_after,
+            ..
+        } = &mut unchanged_generation.timed_maintenance
+        else {
+            panic!("Quill fixture must carry a compaction report");
+        };
+        *generation_after = *generation_before;
+        assert!(
+            unchanged_generation
+                .validate(Qg5DurabilityEngine::Quill)
+                .is_err(),
+            "changed Quill compaction must advance generation"
+        );
+
+        let mut partial_quill_work = same_count.clone();
+        let Qg5TimedMaintenanceObservation::QuillCompaction {
+            compacted_segments, ..
+        } = &mut partial_quill_work.timed_maintenance
+        else {
+            panic!("Quill fixture must carry a compaction report");
+        };
+        *compacted_segments -= 1;
+        assert!(
+            partial_quill_work
+                .validate(Qg5DurabilityEngine::Quill)
+                .is_err(),
+            "Quill must compact every examined segment before comparison with Tantivy force-merge"
+        );
+
+        let mut unchanged_tantivy = qg5_test_observation(Qg5DurabilityEngine::Tantivy, 2_000_000);
+        let Qg5TimedMaintenanceObservation::TantivyForceMerge {
+            input_segment_count,
+            output_segment_count,
+            ..
+        } = &mut unchanged_tantivy.timed_maintenance
+        else {
+            panic!("Tantivy fixture must carry a force-merge observation");
+        };
+        *output_segment_count = *input_segment_count;
+        assert!(
+            unchanged_tantivy
+                .validate(Qg5DurabilityEngine::Tantivy)
+                .is_err(),
+            "Tantivy force merge must strictly reduce segment count"
+        );
     }
 
     #[test]

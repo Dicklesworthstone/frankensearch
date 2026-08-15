@@ -15,6 +15,8 @@
 //! ```
 
 use std::borrow::Borrow;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::hint::black_box;
@@ -38,7 +40,7 @@ use frankensearch_lexical::{
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
 use frankensearch_quill::{
     Analyzer, CompactionPolicy, DEFAULT_SCHEMA, FieldDescriptor, FieldKind, QuillConfig,
-    QuillIndex, SchemaDescriptor,
+    QuillIndex, SchemaDescriptor, SegmentStatsProvider,
 };
 use frankensearch_quill_gauntlet::{
     BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
@@ -47,20 +49,24 @@ use frankensearch_quill_gauntlet::{
     EvidenceCellSpec, EvidencePolicy, EvidenceProvenance, EvidenceRole, ExecutionCapacitySemantics,
     ExecutionProfileId, HardwareClassId, HierarchicalLatencyEstimate, MachineClassRegistry,
     MachineIdentity, MachineProfileAvailability, MachineProfileKey, NativeTieKey,
-    PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PairedEstimatorConfig, PairedEvidenceStatus,
-    PeakRssEvidence, PerfApplicabilityPlan, PerfCellApplicability, PerfCellResult, PerfCellSpec,
-    PerfConcurrencyEngine, PerfConcurrencyObserver, PerfConcurrencyWitness, PerfCorpus,
-    PerfEvidenceArtifact, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
-    PerfMetricSemantics, PerfOperationScope, PerfQueryClass, PerfRawSample, PerfSampleArm,
-    PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology, PositionMode,
-    QG1_QUILL_ENGINE_ID, QG1_STREAM_ROLE_EFFECT, QG1_STREAM_ROLE_QUILL_NULL,
-    QG1_STREAM_ROLE_TANTIVY_NULL, QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
-    QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, QG1_TANTIVY_ENGINE_ID, QG6_QUERY_GROUP_IDS,
-    QG6_QUERY_GROUPS, QG6_TIMED_SEARCHES_PER_SAMPLE, Qg1AuthorityRegisterEntryV1, Qg1BatchCoverage,
-    Qg1ExpectedAuthority, Qg1IncumbentScreenEvidence, Qg1LifecycleProducer, Qg1LifecycleWitness,
-    Qg1SampleBinding, Qg1StartupHandshakeV1, Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind,
+    PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PairedEstimatorConfig, PairedEstimatorError,
+    PairedEvidenceStatus, PeakRssEvidence, PerfApplicabilityPlan, PerfCellApplicability,
+    PerfCellResult, PerfCellSpec, PerfConcurrencyEngine, PerfConcurrencyObserver,
+    PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
+    PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
+    PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
+    PerfTopology, PositionMode, QG1_QUILL_ENGINE_ID, QG1_STREAM_ROLE_EFFECT,
+    QG1_STREAM_ROLE_QUILL_NULL, QG1_STREAM_ROLE_TANTIVY_NULL, QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
+    QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, QG1_TANTIVY_ENGINE_ID, QG5_DURABILITY_WITNESS_FILE_NAME,
+    QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, QG6_TIMED_SEARCHES_PER_SAMPLE,
+    Qg1AuthorityRegisterEntryV1, Qg1BatchCoverage, Qg1ExpectedAuthority,
+    Qg1IncumbentScreenEvidence, Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding,
+    Qg1StartupHandshakeV1, Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind,
     Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentPilot, Qg1TantivyIncumbentScreen,
-    Qg1TantivyIncumbentScreenPlan, Qg1TantivySemanticContract, Qg1TantivyWriterMode, Qg6ArmRole,
+    Qg1TantivyIncumbentScreenPlan, Qg1TantivySemanticContract, Qg1TantivyWriterMode,
+    Qg5CellDurabilityWitness, Qg5DeletePublicationObservation, Qg5DurabilityEngine,
+    Qg5DurabilityObservation, Qg5DurabilityWitnessSet, Qg5ReopenValidationObservation,
+    Qg5SampleDurabilityWitness, Qg5StreamRole, Qg5TimedMaintenanceObservation, Qg6ArmRole,
     Qg6Comparison, Qg6ExperimentIdentity, Qg6FormalProtocolEvidence, Qg6Phase,
     Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6ScheduleAuthority,
     Qg6SearchHit, Qg6SearchResult, Qg6SemanticContract, Qg6StartupAuthoritySetV1, RankClass,
@@ -73,6 +79,7 @@ use frankensearch_quill_gauntlet::{
     query_manifest_sha256, seeded_balanced_pair_order, seeded_interleaved_six_arm_schedule,
     validate_matrix,
 };
+use rustix::fs::{RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1646,17 +1653,45 @@ enum Qg2QuiescenceBasis {
     TantivyWorkersJoined { rearmed: bool },
 }
 
+/// One continuous QG-3 update-to-searchable interval.
+///
+/// QG-3 asks how long an update takes to become searchable. That question is
+/// answered by ONE monotonic span: opened immediately before the measured feed,
+/// closed only after the exact updated document has been proven searchable.
+/// Both published QG-3 metrics — `updates_per_second` and
+/// `update_to_searchable_ms` — are derived from `elapsed_ns`, so the rate and
+/// the latency are two readings of the same measured time and can never
+/// disagree about what was measured.
+struct Qg3ContinuousMeasurement {
+    /// Updates carried by this interval; the throughput denominator.
+    work_units: u64,
+    origin: Instant,
+    elapsed_ns: u64,
+    /// The retired shape, measured in this same invocation: the feed's own
+    /// timing, plus the commit/join's own timing, plus the visibility probe's
+    /// own timing, each started on its own clock and summed. Retained ONLY as a
+    /// diagnostic. Its sum silently drops every inter-phase gap, and an update
+    /// sitting in a gap is precisely an update that is not yet searchable, so
+    /// the published value is never computed from this.
+    component_sum_ns: u64,
+}
+
 /// One measured cell value, plus the continuous interval behind it when the
 /// producer actually measured one.
 ///
 /// QG-1's engine-indexing cells carry `continuous`; QG-2's update cells carry
-/// `qg2_continuous`. Every other cell in this matrix reports a value assembled
-/// from independently timed calls, and the absence of an interval here is what
-/// stops such a value from being typed as throughput downstream.
+/// `qg2_continuous`; QG-3's update-to-searchable cells carry `qg3_continuous`.
+/// QG-5 compaction cells additionally carry the typed durability observation
+/// captured around the one maintenance call timed by the sample. Every other
+/// cell in this matrix reports a value assembled from independently timed
+/// calls, and the absence of an interval here is what stops such a value from
+/// being typed as throughput downstream.
 struct MetricMeasurement {
     value: f64,
     continuous: Option<Qg1ContinuousMeasurement>,
     qg2_continuous: Option<Qg2ContinuousMeasurement>,
+    qg3_continuous: Option<Qg3ContinuousMeasurement>,
+    qg5_observation: Option<Qg5DurabilityObservation>,
     /// Construction-specific witness of the exact Tantivy index timed by this
     /// measurement. Quill measurements carry no witness.
     tantivy_writer_witness_sha256: Option<String>,
@@ -1672,6 +1707,8 @@ impl MetricMeasurement {
             value,
             continuous: None,
             qg2_continuous: None,
+            qg3_continuous: None,
+            qg5_observation: None,
             tantivy_writer_witness_sha256: None,
             tantivy_writer_receipt: None,
         }
@@ -3110,6 +3147,8 @@ fn qg1_bulk_metric_continuous(
         value: throughput_per_second(measurement.work_units, measurement.elapsed_ns),
         continuous: Some(measurement),
         qg2_continuous: None,
+        qg3_continuous: None,
+        qg5_observation: None,
         tantivy_writer_witness_sha256,
         tantivy_writer_receipt,
     }
@@ -3290,6 +3329,8 @@ fn qg2_bulk_metric_continuous_with_planted_tail_delay(
             feed_and_commit_ns,
             quiescence,
         }),
+        qg3_continuous: None,
+        qg5_observation: None,
         tantivy_writer_witness_sha256: None,
         tantivy_writer_receipt: None,
     }
@@ -3457,7 +3498,35 @@ fn tokenize_metric(context: &BenchContext, spec: &PerfCellSpec) -> f64 {
     count as f64 / measured.as_secs_f64().max(f64::MIN_POSITIVE)
 }
 
-fn watch_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+/// The measured span of one QG-3 update, and the retired summed shape beside it.
+///
+/// `origin` opens immediately before the measured feed; `elapsed_ns` closes only
+/// after the exact updated document has answered a search. `component_sum_ns` is
+/// the same invocation's per-phase timings added together, kept solely so the
+/// gap this gate exists to measure can be shown against the interval that
+/// produced it rather than against a second run.
+struct Qg3MeasuredUpdate {
+    origin: Instant,
+    elapsed_ns: u64,
+    component_sum_ns: u64,
+}
+
+fn watch_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> MetricMeasurement {
+    watch_metric_with_planted_gap(context, spec, arm, None)
+}
+
+/// The production QG-3 path, with an optional planted inter-phase gap.
+///
+/// The gap is `None` on every production call. Under the self-check it is
+/// `Some`, and it is planted BETWEEN the timed phases — exactly where the
+/// retired summed shape was blind. A continuous interval must absorb it; a sum
+/// of separately started timers cannot.
+fn watch_metric_with_planted_gap(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    planted_gap: Option<Duration>,
+) -> MetricMeasurement {
     let warm_count = context
         .scale
         .document_count(PerfCorpus::Medium.document_count());
@@ -3467,29 +3536,48 @@ fn watch_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> 
     let corpus = corpus_for(warm_count);
     let topology = spec.topology.expect("watch topology");
     let (probe_query, expected_doc_id) = update_probe(&corpus, update_count, 1);
-    let elapsed = match (arm, topology) {
+    let measured = match (arm, topology) {
         (EngineArm::Quill, PerfTopology::InProcess) => {
             let index = quill_in_memory(spec);
             let _ = index_batches(context, &index, &corpus, warm_count, None);
             let _ = commit(context, &index);
-            let mut elapsed = index_batches(context, &index, &corpus, update_count, Some(1));
-            elapsed += commit(context, &index);
-            let timer = Instant::now();
+            // Warm fixture is complete and nothing below is preparation: the
+            // update-to-searchable interval opens here and does not stop until
+            // the update answers a query.
+            let origin = Instant::now();
+            let feed = index_batches(context, &index, &corpus, update_count, Some(1));
+            plant_qg3_gap(planted_gap);
+            let commit_elapsed = commit(context, &index);
+            plant_qg3_gap(planted_gap);
+            let visibility_timer = Instant::now();
             assert_exact_visibility(context, &index, &probe_query, &expected_doc_id);
-            elapsed + timer.elapsed()
+            let visibility = visibility_timer.elapsed();
+            Qg3MeasuredUpdate {
+                origin,
+                elapsed_ns: monotonic_ns_since(origin),
+                component_sum_ns: duration_sum_ns(&[feed, commit_elapsed, visibility]),
+            }
         }
         (EngineArm::Tantivy, PerfTopology::InProcess) => {
             let index = tantivy_in_memory(spec);
             let _ = index_batches(context, &index, &corpus, warm_count, None);
             let _ = commit(context, &index);
             let (index, _) = fence_tantivy_lifecycle(index, spec, "warm_fixture");
-            let mut elapsed = index_batches(context, &index, &corpus, update_count, Some(1));
-            elapsed += commit(context, &index);
-            let (index, join_elapsed) = fence_tantivy_lifecycle(index, spec, "measured_update");
-            elapsed += join_elapsed;
-            let timer = Instant::now();
+            let origin = Instant::now();
+            let feed = index_batches(context, &index, &corpus, update_count, Some(1));
+            plant_qg3_gap(planted_gap);
+            let commit_elapsed = commit(context, &index);
+            plant_qg3_gap(planted_gap);
+            let (index, join) = fence_tantivy_lifecycle(index, spec, "measured_update");
+            plant_qg3_gap(planted_gap);
+            let visibility_timer = Instant::now();
             assert_exact_visibility(context, &index, &probe_query, &expected_doc_id);
-            elapsed + timer.elapsed()
+            let visibility = visibility_timer.elapsed();
+            Qg3MeasuredUpdate {
+                origin,
+                elapsed_ns: monotonic_ns_since(origin),
+                component_sum_ns: duration_sum_ns(&[feed, commit_elapsed, join, visibility]),
+            }
         }
         (EngineArm::Quill, PerfTopology::FreshProcess) => measure_quill_fresh_process(
             context,
@@ -3499,6 +3587,7 @@ fn watch_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> 
             update_count,
             &probe_query,
             &expected_doc_id,
+            planted_gap,
         ),
         (EngineArm::Tantivy, PerfTopology::FreshProcess) => measure_tantivy_fresh_process(
             context,
@@ -3508,13 +3597,68 @@ fn watch_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> 
             update_count,
             &probe_query,
             &expected_doc_id,
+            planted_gap,
         ),
     };
-    if spec.metric == "updates_per_second" {
-        update_count as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
+    assert!(
+        measured.elapsed_ns > 0,
+        "QG-3 update-to-searchable interval must span positive monotonic time"
+    );
+    assert!(
+        measured.elapsed_ns >= measured.component_sum_ns,
+        "QG-3 continuous interval must contain every phase it is built from"
+    );
+    // Both QG-3 metrics read the SAME interval. `updates_per_second` and
+    // `update_to_searchable_ms` are a rate and a latency over one measured span,
+    // so they cannot disagree about what was measured.
+    //
+    // THESE TWO EXPRESSIONS ARE LOAD-BEARING. `PerfRawSample` validation
+    // recomputes a QG-3 update value from the sample's own window and demands
+    // bit-for-bit equality, so it must evaluate the identical expression tree
+    // over the identical inputs: `elapsed_ns` as f64 (never routed through
+    // `Duration::as_secs_f64`, which rounds once more) and `work_units` as f64.
+    // Any edit here that is not mirrored in `perf.rs::validate_and_value` makes
+    // every QG-3 sample unpublishable rather than silently approximate.
+    #[allow(clippy::cast_precision_loss)]
+    let elapsed_ns = measured.elapsed_ns as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let value = if spec.metric == "updates_per_second" {
+        update_count as f64 * 1_000_000_000.0 / elapsed_ns
     } else {
-        elapsed.as_secs_f64() * 1_000.0
+        elapsed_ns / 1_000_000.0
+    };
+    MetricMeasurement {
+        value,
+        continuous: None,
+        qg2_continuous: None,
+        qg3_continuous: Some(Qg3ContinuousMeasurement {
+            work_units: update_count,
+            origin: measured.origin,
+            elapsed_ns: measured.elapsed_ns,
+            component_sum_ns: measured.component_sum_ns,
+        }),
+        qg5_observation: None,
+        tantivy_writer_witness_sha256: None,
+        tantivy_writer_receipt: None,
     }
+}
+
+fn monotonic_ns_since(origin: Instant) -> u64 {
+    u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns")
+}
+
+/// Sleep an inter-phase gap. `None` on every production path.
+fn plant_qg3_gap(delay: Option<Duration>) {
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
+    }
+}
+
+fn duration_sum_ns(components: &[Duration]) -> u64 {
+    components
+        .iter()
+        .map(|component| u64::try_from(component.as_nanos()).expect("component ns"))
+        .sum()
 }
 
 fn update_probe(corpus: &SyntheticCorpus, update_count: u64, generation: u64) -> (String, String) {
@@ -3537,15 +3681,6 @@ fn assert_exact_visibility<E: LexicalRead>(
         doc_ids,
         [expected_doc_id.to_owned()],
         "visibility fence accepted stale, missing, or ambiguous state"
-    );
-    black_box(doc_ids);
-}
-
-fn assert_absent<E: LexicalRead>(context: &BenchContext, index: &E, query: &str) {
-    let doc_ids = search_doc_ids(context, index, query);
-    assert!(
-        doc_ids.is_empty(),
-        "deleted QG fixture document remained query-visible: {doc_ids:?}"
     );
     black_box(doc_ids);
 }
@@ -3592,7 +3727,8 @@ fn measure_quill_fresh_process(
     update_count: u64,
     probe_query: &str,
     expected_doc_id: &str,
-) -> Duration {
+    planted_gap: Option<Duration>,
+) -> Qg3MeasuredUpdate {
     let path = scratch_path("qg3-quill");
     let index =
         context
@@ -3601,10 +3737,23 @@ fn measure_quill_fresh_process(
     let index = index.expect("create on-disk Quill watch fixture");
     let _ = index_batches(context, &index, corpus, warm_count, None);
     let _ = commit(context, &index);
-    let mut elapsed = index_batches(context, &index, corpus, update_count, Some(1));
-    elapsed += commit(context, &index);
+    // Fresh-process readers only see what a restart can see, so the interval
+    // must also contain the close and the reopen. It opens before the feed and
+    // closes when the child process proves the update searchable.
+    let origin = Instant::now();
+    let feed = index_batches(context, &index, corpus, update_count, Some(1));
+    plant_qg3_gap(planted_gap);
+    let commit_elapsed = commit(context, &index);
+    plant_qg3_gap(planted_gap);
     drop(index);
-    elapsed + fresh_process_search(&path, spec, EngineArm::Quill, probe_query, expected_doc_id)
+    plant_qg3_gap(planted_gap);
+    let visibility =
+        fresh_process_search(&path, spec, EngineArm::Quill, probe_query, expected_doc_id);
+    Qg3MeasuredUpdate {
+        origin,
+        elapsed_ns: monotonic_ns_since(origin),
+        component_sum_ns: duration_sum_ns(&[feed, commit_elapsed, visibility]),
+    }
 }
 
 fn measure_tantivy_fresh_process(
@@ -3615,25 +3764,34 @@ fn measure_tantivy_fresh_process(
     update_count: u64,
     probe_query: &str,
     expected_doc_id: &str,
-) -> Duration {
+    planted_gap: Option<Duration>,
+) -> Qg3MeasuredUpdate {
     let path = scratch_path("qg3-tantivy");
     let index = tantivy_create(&path, spec);
     let _ = index_batches(context, &index, corpus, warm_count, None);
     let _ = commit(context, &index);
     let (index, _) = fence_tantivy_lifecycle(index, spec, "warm_fixture");
-    let mut elapsed = index_batches(context, &index, corpus, update_count, Some(1));
-    elapsed += commit(context, &index);
-    let (index, join_elapsed) = fence_tantivy_lifecycle(index, spec, "measured_update");
-    elapsed += join_elapsed;
+    let origin = Instant::now();
+    let feed = index_batches(context, &index, corpus, update_count, Some(1));
+    plant_qg3_gap(planted_gap);
+    let commit_elapsed = commit(context, &index);
+    plant_qg3_gap(planted_gap);
+    let (index, join) = fence_tantivy_lifecycle(index, spec, "measured_update");
+    plant_qg3_gap(planted_gap);
     drop(index);
-    elapsed
-        + fresh_process_search(
-            &path,
-            spec,
-            EngineArm::Tantivy,
-            probe_query,
-            expected_doc_id,
-        )
+    plant_qg3_gap(planted_gap);
+    let visibility = fresh_process_search(
+        &path,
+        spec,
+        EngineArm::Tantivy,
+        probe_query,
+        expected_doc_id,
+    );
+    Qg3MeasuredUpdate {
+        origin,
+        elapsed_ns: monotonic_ns_since(origin),
+        component_sum_ns: duration_sum_ns(&[feed, commit_elapsed, join, visibility]),
+    }
 }
 
 fn fresh_process_search(
@@ -3645,6 +3803,7 @@ fn fresh_process_search(
 ) -> Duration {
     let timer = Instant::now();
     let output = Command::new(std::env::current_exe().expect("QG benchmark executable"))
+        .env_remove("QUILL_PERF_QG3_SELF_CHECK")
         .env("QUILL_PERF_CHILD_MODE", "search")
         .env("QUILL_PERF_CHILD_ENGINE", arm.label())
         .env("QUILL_PERF_CHILD_PATH", path)
@@ -3778,43 +3937,292 @@ fn fresh_process_open(path: &Path, spec: &PerfCellSpec, arm: EngineArm) -> Durat
     Duration::from_nanos(nanos)
 }
 
-fn commit_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+#[derive(Debug)]
+struct Qg4OnDiskCommitObservation {
+    elapsed: Duration,
+    #[cfg(test)]
+    root: PathBuf,
+    #[cfg(test)]
+    root_was_directory: bool,
+    #[cfg(test)]
+    reopened_doc_count: usize,
+}
+
+#[derive(Debug)]
+struct Qg4TimedCommitObservation {
+    elapsed: Duration,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static QG4_TIMED_COMMIT_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+struct Qg4TimedCommitTestGuard;
+
+#[cfg(test)]
+impl Qg4TimedCommitTestGuard {
+    fn start() -> Self {
+        QG4_TIMED_COMMIT_ACTIVE.with(|active| {
+            assert!(
+                !active.replace(true),
+                "nested QG-4 timed-commit interval would obscure receipt finalization"
+            );
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for Qg4TimedCommitTestGuard {
+    fn drop(&mut self) {
+        QG4_TIMED_COMMIT_ACTIVE.with(|active| active.set(false));
+    }
+}
+
+#[cfg(test)]
+fn assert_qg4_receipt_finalizes_after_timed_commit() {
+    QG4_TIMED_COMMIT_ACTIVE.with(|active| {
+        assert!(
+            !active.get(),
+            "QG-4 receipt finalization must stay outside the timed commit interval"
+        );
+    });
+}
+
+fn time_qg4_receipted_commit<Arm, TimedCommit, Finish>(
+    arm: &mut Arm,
+    timed_commit: TimedCommit,
+    finish: Finish,
+) -> Qg4TimedCommitObservation
+where
+    TimedCommit: FnOnce(&mut Arm),
+    Finish: FnOnce(&mut Arm),
+{
+    #[cfg(test)]
+    let timed_commit_guard = Qg4TimedCommitTestGuard::start();
+    let started = Instant::now();
+    timed_commit(arm);
+    let elapsed = started.elapsed();
+    #[cfg(test)]
+    drop(timed_commit_guard);
+    #[cfg(test)]
+    assert_qg4_receipt_finalizes_after_timed_commit();
+    finish(arm);
+    Qg4TimedCommitObservation { elapsed }
+}
+
+fn observe_qg4_on_disk_commit_then_reopen<E, Create, TimedCommit, Reopen>(
+    context: &BenchContext,
+    warm_count: u64,
+    scratch_prefix: &str,
+    create: Create,
+    timed_commit: TimedCommit,
+    reopen: Reopen,
+) -> Qg4OnDiskCommitObservation
+where
+    E: LexicalRead + LexicalWrite,
+    Create: FnOnce(&Path) -> E,
+    TimedCommit: FnOnce(&E, &Path) -> Qg4TimedCommitObservation,
+    Reopen: FnOnce(&Path) -> E,
+{
+    let directory = scratch_tempdir(scratch_prefix);
+    let root = directory.path().to_path_buf();
+    let root_was_directory = root.is_dir();
+    assert!(
+        root_was_directory,
+        "QG-4 arm requires an on-disk scratch root"
+    );
+
+    let corpus = corpus_for(warm_count.saturating_add(1));
+    let index = create(&root);
+    let _ = index_batches(context, &index, &corpus, warm_count, None);
+    let _ = commit(context, &index);
+
+    let document = generated_batch(&corpus, warm_count, 1, None);
+    let expected_document_id = document
+        .first()
+        .expect("QG-4 generated staged probe")
+        .id
+        .clone();
+    context.runtime.block_on(async {
+        index
+            .index_documents(&context.cx, &document)
+            .await
+            .expect("stage QG-4 generated commit probe");
+    });
+    let timed_commit = timed_commit(&index, &root);
+    drop(index);
+
+    let reopened = reopen(&root);
+    assert_exact_visibility(
+        context,
+        &reopened,
+        &format!("id:{expected_document_id}"),
+        &expected_document_id,
+    );
+    let reopened_doc_count = LexicalRead::doc_count(&reopened)
+        .expect("freshly reopened QG-4 index has an authoritative document count");
+    let expected_doc_count = usize::try_from(warm_count)
+        .expect("QG-4 warm document count fits usize")
+        .checked_add(1)
+        .expect("QG-4 staged document count fits usize");
+    assert_eq!(
+        reopened_doc_count, expected_doc_count,
+        "QG-4 fresh reopen lost or duplicated the staged document"
+    );
+
+    Qg4OnDiskCommitObservation {
+        elapsed: timed_commit.elapsed,
+        #[cfg(test)]
+        root,
+        #[cfg(test)]
+        root_was_directory,
+        #[cfg(test)]
+        reopened_doc_count,
+    }
+}
+
+fn qg4_on_disk_commit_then_reopen_observation(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+) -> Qg4OnDiskCommitObservation {
     let warm_count = context
         .scale
         .document_count(spec.document_count.expect("commit warm count"));
-    let corpus = corpus_for(warm_count.saturating_add(1));
-    let elapsed = match arm {
-        EngineArm::Quill => {
-            let index = quill_in_memory(spec);
-            let _ = index_batches(context, &index, &corpus, warm_count, None);
-            let _ = commit(context, &index);
-            let document = generated_batch(&corpus, warm_count, 1, None);
-            context.runtime.block_on(async {
+    match arm {
+        EngineArm::Quill => observe_qg4_on_disk_commit_then_reopen(
+            context,
+            warm_count,
+            "qg4-quill-",
+            |path| {
+                context
+                    .runtime
+                    .block_on(QuillIndex::create(&context.cx, path, quill_config(spec)))
+                    .expect("create QG-4 on-disk Quill fixture")
+            },
+            |index, root| {
+                let mut receipt_arm = index
+                    .benchmark_arm_qg4_directory_sync()
+                    .expect("arm QG-4 Quill directory sync");
+                time_qg4_receipted_commit(
+                    &mut receipt_arm,
+                    |receipt_arm| {
+                        context
+                            .runtime
+                            .block_on(
+                                index.benchmark_commit_qg4_directory_sync(&context.cx, receipt_arm),
+                            )
+                            .expect("commit staged QG-4 Quill probe");
+                    },
+                    |receipt_arm| {
+                        #[cfg(test)]
+                        assert_qg4_receipt_finalizes_after_timed_commit();
+                        let receipt = receipt_arm
+                            .finish()
+                            .expect("one QG-4 Quill MANIFEST directory sync");
+                        assert_eq!(
+                            receipt.root.as_path(),
+                            root,
+                            "QG-4 Quill receipt root drifted"
+                        );
+                        assert_eq!(
+                            receipt.observed_sync_count, 1,
+                            "QG-4 Quill receipt must observe exactly one directory sync"
+                        );
+                        assert!(
+                            receipt.manifest_generation > 0,
+                            "QG-4 Quill receipt must identify a published MANIFEST generation"
+                        );
+                    },
+                )
+            },
+            |path| {
+                context
+                    .runtime
+                    .block_on(QuillIndex::open(&context.cx, path, quill_config(spec)))
+                    .expect("reopen QG-4 on-disk Quill fixture")
+            },
+        ),
+        EngineArm::Tantivy => observe_qg4_on_disk_commit_then_reopen(
+            context,
+            warm_count,
+            "qg4-tantivy-",
+            |path| {
+                let index = tantivy_create(path, spec);
+                context
+                    .runtime
+                    .block_on(index.benchmark_prepare_qg4_no_merge_directory_sync(&context.cx))
+                    .expect("prepare fresh no-merge QG-4 Tantivy fixture");
                 index
-                    .index_documents(&context.cx, &document)
-                    .await
-                    .expect("stage Quill commit probe");
-            });
-            commit(context, &index)
-        }
-        EngineArm::Tantivy => {
-            let index = tantivy_in_memory(spec);
-            let _ = index_batches(context, &index, &corpus, warm_count, None);
-            let _ = commit(context, &index);
-            let document = generated_batch(&corpus, warm_count, 1, None);
-            context.runtime.block_on(async {
-                index
-                    .index_documents(&context.cx, &document)
-                    .await
-                    .expect("stage Tantivy commit probe");
-            });
-            commit(context, &index)
-        }
-    };
-    elapsed.as_secs_f64() * 1_000.0
+            },
+            |index, root| {
+                let mut receipt_arm = index
+                    .benchmark_arm_qg4_directory_sync()
+                    .expect("arm QG-4 Tantivy directory sync");
+                time_qg4_receipted_commit(
+                    &mut receipt_arm,
+                    |receipt_arm| {
+                        context
+                            .runtime
+                            .block_on(
+                                index.benchmark_commit_qg4_directory_sync(&context.cx, receipt_arm),
+                            )
+                            .expect("commit staged QG-4 Tantivy probe");
+                    },
+                    |receipt_arm| {
+                        #[cfg(test)]
+                        assert_qg4_receipt_finalizes_after_timed_commit();
+                        let receipt = receipt_arm
+                            .finish()
+                            .expect("one QG-4 Tantivy directory sync");
+                        assert_eq!(
+                            receipt.root.as_path(),
+                            root,
+                            "QG-4 Tantivy receipt root drifted"
+                        );
+                        assert_eq!(
+                            receipt.observed_sync_count, 1,
+                            "QG-4 Tantivy receipt must observe exactly one directory sync"
+                        );
+                        assert!(
+                            receipt.commit_opstamp > 0,
+                            "QG-4 Tantivy receipt must carry the timed commit opstamp"
+                        );
+                    },
+                )
+            },
+            |path| {
+                TantivyIndex::open_with_benchmark_config(
+                    path,
+                    spec.writer_heap_bytes.unwrap_or(50_000_000),
+                    spec.threads.unwrap_or(1),
+                    spec.positions.unwrap_or(PositionMode::On).enabled(),
+                )
+                .expect("reopen QG-4 on-disk Tantivy fixture")
+            },
+        ),
+    }
 }
 
-fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+fn commit_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+    let observation = qg4_on_disk_commit_then_reopen_observation(context, spec, arm);
+    #[cfg(test)]
+    black_box((
+        &observation.root,
+        observation.root_was_directory,
+        observation.reopened_doc_count,
+    ));
+    observation.elapsed.as_secs_f64() * 1_000.0
+}
+
+fn compaction_metric(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+) -> MetricMeasurement {
     let count = context
         .scale
         .document_count(spec.document_count.expect("compaction count"));
@@ -3826,7 +4234,8 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
     let docs_per_segment = usize::try_from(count)
         .expect("compaction count fits usize")
         .div_ceil(segments);
-    let elapsed = match arm {
+    let requested_delete_count = count.saturating_mul(u64::from(density)) / 100;
+    let (elapsed_ns, observation) = match arm {
         EngineArm::Quill => {
             let directory = scratch_tempdir("qg5-quill-");
             let index = context
@@ -3855,18 +4264,54 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
                 });
             }
             stage_deletes(context, &index, &corpus, count, density);
+            let pre_stats = index
+                .segment_stats()
+                .expect("QG-5 published Quill segment stats");
+            let (deleted_document_id, deleted_hits, live_document_id, live_hits) =
+                qg5_probe_hits(context, &index, &corpus, count);
+            let delete_publication = Qg5DeletePublicationObservation {
+                source_document_count: count,
+                requested_delete_count,
+                published_live_document_count: u64::try_from(pre_stats.live_docs)
+                    .expect("QG-5 Quill live document count"),
+                published_segment_count: u64::try_from(pre_stats.total_segments())
+                    .expect("QG-5 Quill input segment count"),
+                deleted_probe_document_id: deleted_document_id.clone(),
+                deleted_probe_match_count: deleted_hits,
+                live_probe_document_id: live_document_id.clone(),
+                live_probe_match_count: live_hits,
+            };
             let threshold = (f64::from(density) / 100.0 - 0.001).max(0.000_001);
-            let timer = Instant::now();
-            context.runtime.block_on(async {
-                black_box(
-                    index
-                        .compact(&context.cx, CompactionPolicy::new(threshold))
-                        .await
-                        .expect("Quill full compaction"),
-                );
+            let (report, elapsed) = context.runtime.block_on(async {
+                let timer = Instant::now();
+                let report = index
+                    .compact(&context.cx, CompactionPolicy::new(threshold))
+                    .await
+                    .expect("Quill full compaction");
+                (report, timer.elapsed())
             });
-            let elapsed = timer.elapsed();
-            validate_compaction_outcome(context, &index, &corpus, count);
+            let elapsed_ns = u64::try_from(elapsed.as_nanos()).expect("QG-5 Quill elapsed ns");
+            let post_stats = index
+                .segment_stats()
+                .expect("QG-5 post-compaction Quill segment stats");
+            assert_eq!(report.generation_before, pre_stats.published_generation);
+            assert_eq!(report.generation_after, post_stats.published_generation);
+            assert_eq!(report.examined_segments, pre_stats.sealed_segments);
+            assert_eq!(
+                report.compacted_segments, report.examined_segments,
+                "QG-5 Quill must compact every examined segment before comparison with Tantivy force-merge"
+            );
+            assert_eq!(
+                post_stats.total_segments(),
+                pre_stats
+                    .total_segments()
+                    .checked_sub(report.removed_segments)
+                    .expect("QG-5 Quill removed segment accounting")
+            );
+            assert_eq!(
+                post_stats.live_docs, pre_stats.live_docs,
+                "QG-5 Quill compaction must preserve published live documents"
+            );
             drop(index);
             let reopened = context
                 .runtime
@@ -3876,8 +4321,44 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
                     quill_config(spec),
                 ))
                 .expect("reopen compacted Quill fixture");
-            validate_compaction_outcome(context, &reopened, &corpus, count);
-            elapsed
+            let reopen_stats = reopened
+                .segment_stats()
+                .expect("QG-5 reopened Quill segment stats");
+            let (reopened_deleted_id, reopened_deleted_hits, reopened_live_id, reopened_live_hits) =
+                qg5_probe_hits(context, &reopened, &corpus, count);
+            let observation = Qg5DurabilityObservation::new(
+                delete_publication,
+                Qg5TimedMaintenanceObservation::QuillCompaction {
+                    elapsed_ns,
+                    generation_before: report.generation_before,
+                    generation_after: report.generation_after,
+                    examined_segments: u64::try_from(report.examined_segments)
+                        .expect("QG-5 examined segment count"),
+                    compacted_segments: u64::try_from(report.compacted_segments)
+                        .expect("QG-5 compacted segment count"),
+                    removed_segments: u64::try_from(report.removed_segments)
+                        .expect("QG-5 removed segment count"),
+                    dropped_documents: report.dropped_documents,
+                    input_bytes: report.input_bytes,
+                    output_bytes: report.output_bytes,
+                    input_segment_count: u64::try_from(pre_stats.total_segments())
+                        .expect("QG-5 Quill input segment count"),
+                    output_segment_count: u64::try_from(post_stats.total_segments())
+                        .expect("QG-5 Quill output segment count"),
+                },
+                Qg5ReopenValidationObservation {
+                    reopened_live_document_count: u64::try_from(reopen_stats.live_docs)
+                        .expect("QG-5 reopened Quill live document count"),
+                    reopened_segment_count: u64::try_from(reopen_stats.total_segments())
+                        .expect("QG-5 reopened Quill segment count"),
+                    deleted_probe_document_id: reopened_deleted_id,
+                    deleted_probe_match_count: reopened_deleted_hits,
+                    live_probe_document_id: reopened_live_id,
+                    live_probe_match_count: reopened_live_hits,
+                },
+            )
+            .expect("valid QG-5 Quill durability observation");
+            (elapsed_ns, observation)
         }
         EngineArm::Tantivy => {
             let directory = scratch_tempdir("qg5-tantivy-");
@@ -3908,9 +4389,8 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
                         .expect("Tantivy fixture seal");
                 });
             }
-            let deleted = count.saturating_mul(u64::from(density)) / 100;
-            for ordinal in 0..deleted {
-                let source = ordinal.saturating_mul(count / deleted.max(1));
+            for ordinal in 0..requested_delete_count {
+                let source = ordinal.saturating_mul(count / requested_delete_count.max(1));
                 let id = corpus
                     .document_at(source.min(count.saturating_sub(1)))
                     .expect("Tantivy deleted document")
@@ -3923,15 +4403,52 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
                 });
             }
             let _ = commit(context, &index);
-            let timer = Instant::now();
-            context.runtime.block_on(async {
+            let (pre_segment_count, pre_index_bytes) = index
+                .benchmark_index_layout()
+                .expect("QG-5 published Tantivy layout");
+            assert!(pre_index_bytes > 0, "QG-5 Tantivy input layout is nonempty");
+            let pre_live_documents = u64::try_from(
+                index
+                    .doc_count()
+                    .expect("QG-5 published Tantivy live document count"),
+            )
+            .expect("QG-5 Tantivy live document count fits u64");
+            let (deleted_document_id, deleted_hits, live_document_id, live_hits) =
+                qg5_probe_hits(context, &index, &corpus, count);
+            let delete_publication = Qg5DeletePublicationObservation {
+                source_document_count: count,
+                requested_delete_count,
+                published_live_document_count: pre_live_documents,
+                published_segment_count: u64::try_from(pre_segment_count)
+                    .expect("QG-5 Tantivy input segment count"),
+                deleted_probe_document_id: deleted_document_id.clone(),
+                deleted_probe_match_count: deleted_hits,
+                live_probe_document_id: live_document_id.clone(),
+                live_probe_match_count: live_hits,
+            };
+            let elapsed = context.runtime.block_on(async {
+                let timer = Instant::now();
                 index
                     .benchmark_force_merge(&context.cx)
                     .await
                     .expect("Tantivy force merge");
+                timer.elapsed()
             });
-            let elapsed = timer.elapsed();
-            validate_compaction_outcome(context, &index, &corpus, count);
+            let elapsed_ns = u64::try_from(elapsed.as_nanos()).expect("QG-5 Tantivy elapsed ns");
+            let (post_segment_count, post_index_bytes) = index
+                .benchmark_index_layout()
+                .expect("QG-5 post-merge Tantivy layout");
+            assert!(
+                post_index_bytes > 0,
+                "QG-5 Tantivy output layout is nonempty"
+            );
+            let post_live_documents = u64::try_from(
+                index
+                    .doc_count()
+                    .expect("QG-5 post-merge Tantivy live document count"),
+            )
+            .expect("QG-5 post-merge live document count fits u64");
+            assert_eq!(post_live_documents, pre_live_documents);
             drop(index);
             let reopened = TantivyIndex::open_with_benchmark_config(
                 directory.path(),
@@ -3940,32 +4457,84 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
                 spec.positions.unwrap_or(PositionMode::On).enabled(),
             )
             .expect("reopen compacted Tantivy fixture");
-            validate_compaction_outcome(context, &reopened, &corpus, count);
-            elapsed
+            let (reopen_segment_count, reopen_index_bytes) = reopened
+                .benchmark_index_layout()
+                .expect("QG-5 reopened Tantivy layout");
+            assert!(
+                reopen_index_bytes > 0,
+                "QG-5 reopened Tantivy layout is nonempty"
+            );
+            let reopen_live_documents = u64::try_from(
+                reopened
+                    .doc_count()
+                    .expect("QG-5 reopened Tantivy live document count"),
+            )
+            .expect("QG-5 reopened live document count fits u64");
+            let (reopened_deleted_id, reopened_deleted_hits, reopened_live_id, reopened_live_hits) =
+                qg5_probe_hits(context, &reopened, &corpus, count);
+            let observation = Qg5DurabilityObservation::new(
+                delete_publication,
+                Qg5TimedMaintenanceObservation::TantivyForceMerge {
+                    elapsed_ns,
+                    input_segment_count: u64::try_from(pre_segment_count)
+                        .expect("QG-5 Tantivy input segment count"),
+                    output_segment_count: u64::try_from(post_segment_count)
+                        .expect("QG-5 Tantivy output segment count"),
+                },
+                Qg5ReopenValidationObservation {
+                    reopened_live_document_count: reopen_live_documents,
+                    reopened_segment_count: u64::try_from(reopen_segment_count)
+                        .expect("QG-5 reopened Tantivy segment count"),
+                    deleted_probe_document_id: reopened_deleted_id,
+                    deleted_probe_match_count: reopened_deleted_hits,
+                    live_probe_document_id: reopened_live_id,
+                    live_probe_match_count: reopened_live_hits,
+                },
+            )
+            .expect("valid QG-5 Tantivy durability observation");
+            (elapsed_ns, observation)
         }
     };
-    elapsed.as_secs_f64() * 1_000.0
+    MetricMeasurement {
+        value: Duration::from_nanos(elapsed_ns).as_secs_f64() * 1_000.0,
+        continuous: None,
+        qg2_continuous: None,
+        qg3_continuous: None,
+        qg5_observation: Some(observation),
+        tantivy_writer_witness_sha256: None,
+        tantivy_writer_receipt: None,
+    }
 }
 
-fn validate_compaction_outcome<E: LexicalRead>(
+fn qg5_probe_hits<E: LexicalRead>(
     context: &BenchContext,
     index: &E,
     corpus: &SyntheticCorpus,
     count: u64,
-) {
+) -> (String, u64, String, u64) {
     let deleted_ordinal = 0_u64;
     let live_ordinal = count.saturating_sub(1);
+    let deleted_doc_id = corpus
+        .document_at(deleted_ordinal)
+        .expect("QG-5 deleted probe document")
+        .id;
     let live_doc_id = corpus
         .document_at(live_ordinal)
         .expect("QG-5 live probe document")
         .id;
-    assert_absent(context, index, &format!("qgupdateg5d{deleted_ordinal}"));
-    assert_exact_visibility(
-        context,
-        index,
-        &format!("qgupdateg5d{live_ordinal}"),
-        &live_doc_id,
+    let deleted_matches = search_doc_ids(context, index, &format!("qgupdateg5d{deleted_ordinal}"));
+    let live_matches = search_doc_ids(context, index, &format!("qgupdateg5d{live_ordinal}"));
+    assert!(
+        deleted_matches.is_empty(),
+        "QG-5 deleted probe must be absent"
     );
+    assert_eq!(live_matches.as_slice(), std::slice::from_ref(&live_doc_id));
+    (
+        deleted_doc_id,
+        u64::try_from(deleted_matches.len()).expect("QG-5 deleted probe hit count"),
+        live_doc_id,
+        u64::try_from(live_matches.len()).expect("QG-5 live probe hit count"),
+    )
 }
 
 fn stage_deletes(
@@ -4178,24 +4747,86 @@ fn cargo_tree_line_is_tantivy_family(line: &str) -> bool {
     false
 }
 
-fn dependency_surface_metric() -> f64 {
+/// Count Tantivy-family nodes in one `frankensearch` feature graph.
+///
+/// The classifier is the only fact QG-10 decides on, so it is applied through
+/// this single seam for both the measured graph and its positive control.
+fn dependency_surface_tantivy_nodes(features: &str) -> usize {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
-        .args([
-            "tree",
-            "--locked",
-            "-p",
-            "frankensearch",
-            "--features",
-            "lexical",
-        ])
+        .args(["tree", "--locked", "-p", "frankensearch", "--features"])
+        .arg(features)
         .output()
         .expect("run QG-10 cargo tree");
-    assert!(output.status.success(), "QG-10 cargo tree failed");
+    assert!(
+        output.status.success(),
+        "QG-10 cargo tree failed for features {features:?}"
+    );
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| cargo_tree_line_is_tantivy_family(line))
-        .count() as f64
+        .count()
+}
+
+/// The measured graph, and the control that makes its zero admissible.
+const QG10_MEASURED_FEATURES: &str = "lexical";
+const QG10_POSITIVE_CONTROL_FEATURES: &str = "lexical-tantivy";
+
+/// Exact text the fail-closed branch panics with.
+///
+/// Shared with the planted negative so that test can require *this* refusal
+/// rather than accepting any panic, which would let an unrelated `cargo tree`
+/// failure impersonate the guard.
+const QG10_POSITIVE_CONTROL_REFUSAL: &str = "QG-10 positive control found no Tantivy nodes";
+
+#[cfg(test)]
+thread_local! {
+    /// Self-check-only control-graph override.
+    ///
+    /// Pointing the control at a Tantivy-free graph is what a silenced
+    /// classifier looks like from inside the producer, which is the only way
+    /// to prove the fail-closed branch actually fires.
+    static QG10_CONTROL_FEATURES_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn qg10_positive_control_features() -> String {
+    #[cfg(test)]
+    if let Some(features) = QG10_CONTROL_FEATURES_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return features;
+    }
+    QG10_POSITIVE_CONTROL_FEATURES.to_owned()
+}
+
+#[cfg(test)]
+fn with_qg10_control_features_override<R>(features: &str, body: impl FnOnce() -> R) -> R {
+    QG10_CONTROL_FEATURES_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(features.to_owned()));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    QG10_CONTROL_FEATURES_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    match outcome {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn dependency_surface_metric() -> f64 {
+    let measured = dependency_surface_tantivy_nodes(QG10_MEASURED_FEATURES);
+    if measured == 0 {
+        // A zero is only evidence of a clean surface if the classifier can
+        // still recognize a Tantivy node at all. `lexical-tantivy` pulls
+        // `frankensearch-lexical`, so its graph is Tantivy-bearing by
+        // construction; a zero there means the classifier -- not the
+        // dependency surface -- went silent, and QG-10 must fail closed
+        // rather than report the clean result that silence imitates.
+        let control_features = qg10_positive_control_features();
+        let control = dependency_surface_tantivy_nodes(&control_features);
+        assert!(
+            control > 0,
+            "{QG10_POSITIVE_CONTROL_REFUSAL} in the {control_features:?} feature \
+             graph, so the measured {QG10_MEASURED_FEATURES:?} count of 0 is unproven"
+        );
+    }
+    measured as f64
 }
 
 fn measure_metric(
@@ -4242,9 +4873,9 @@ fn measure_metric_with_query_and_qg1_writer_mode(
         PerfGate::Qg2 => bulk_metric(context, spec, arm),
         PerfGate::Qg8 => bulk_metric(context, spec, arm),
         PerfGate::Qg3 if spec.metric == "docs_per_second" => bulk_metric(context, spec, arm),
-        PerfGate::Qg3 => MetricMeasurement::gauge(watch_metric(context, spec, arm)),
+        PerfGate::Qg3 => watch_metric(context, spec, arm),
         PerfGate::Qg4 => MetricMeasurement::gauge(commit_metric(context, spec, arm)),
-        PerfGate::Qg5 => MetricMeasurement::gauge(compaction_metric(context, spec, arm)),
+        PerfGate::Qg5 => compaction_metric(context, spec, arm),
         PerfGate::Qg6 => MetricMeasurement::gauge(query_metric(context, spec, arm, query_override)),
         PerfGate::Qg7 => MetricMeasurement::gauge(memory_metric(context, spec, arm)),
         PerfGate::Qg9 => MetricMeasurement::gauge(cold_open_metric(context, spec, arm)),
@@ -4296,12 +4927,19 @@ fn metric_semantics(spec: &PerfCellSpec) -> PerfMetricSemantics {
     // A QG-1 engine-indexing cell and a QG-2 update cell each derive their rate
     // from one continuous first-feed-through-searchable-and-quiescent interval
     // over an exact document count, so both are native throughput operations
-    // and the estimator recomputes them from the sample itself. Every other rate
-    // in this matrix — the QG-1 tokenizer diagnostic, QG-3/QG-8 bulk indexing,
-    // QG-3 updates — is still a sum of independently timed calls that excludes
-    // the gaps between them. Typing one of those as Throughput would silently
-    // redefine it as work over the outer sample window, a different and
-    // unmeasured quantity, so they stay gauges.
+    // and the estimator recomputes them from the sample itself. The QG-1
+    // tokenizer diagnostic and QG-3/QG-8 bulk indexing are still sums of
+    // independently timed calls that exclude the gaps between them; typing one
+    // of those as Throughput would silently redefine it as work over the outer
+    // sample window, a different and unmeasured quantity, so they stay gauges.
+    //
+    // QG-3 UPDATE CELLS ARE NO LONGER SUCH A SUM. `watch_metric` now measures
+    // one continuous interval over an exact update count and binds that window
+    // onto the raw sample, so `updates_per_second` would satisfy the native
+    // throughput contract. It is deliberately left a gauge here: retyping it
+    // changes what the estimator recomputes and therefore what the QG-3
+    // thresholds mean, which is a separate decision from correcting the
+    // measurement. This comment records that the reason is scope, not shape.
     if qg1_producer_coverage(spec) == Some(Qg1ProducerCoverage::EngineIndexingLifecycle)
         || is_qg2_continuous_update_cell(spec)
     {
@@ -5167,14 +5805,26 @@ fn qg1_sample_window(
     continuous: Option<Qg1IntervalOffsets>,
 ) -> Result<Qg1SampleWindow, String> {
     match (semantics, continuous) {
-        (PerfMetricSemantics::Throughput, Some(interval)) => {
+        // A measured engine interval is admitted for Throughput and for either
+        // gauge orientation, under IDENTICAL checks. A gauge that carries one is
+        // not storing an unverifiable rate: QG-3's update cells publish a rate
+        // and a latency read off this exact window, and `PerfRawSample`
+        // validation recomputes the published value from `ended - started` and
+        // `work_units`, so the window is the thing that makes those bytes
+        // checkable rather than merely asserted.
+        (
+            PerfMetricSemantics::Throughput
+            | PerfMetricSemantics::GaugeHigherIsBetter
+            | PerfMetricSemantics::GaugeLowerIsBetter,
+            Some(interval),
+        ) => {
             if interval.elapsed_ns == 0 {
                 return Err("continuous engine interval spans no monotonic time".to_owned());
             }
             if declared_work_units != Some(interval.work_units) {
                 return Err(format!(
-                    "throughput sample declares work_units {declared_work_units:?} but its \
-                     continuous interval processed {}",
+                    "sample declares work_units {declared_work_units:?} but its continuous \
+                     interval processed {}",
                     interval.work_units
                 ));
             }
@@ -5201,14 +5851,12 @@ fn qg1_sample_window(
                                                         per-call duration is not work over \
                                                         elapsed time"
             .to_owned()),
-        (
-            PerfMetricSemantics::Duration
-            | PerfMetricSemantics::GaugeHigherIsBetter
-            | PerfMetricSemantics::GaugeLowerIsBetter,
-            Some(_),
-        ) => Err(format!(
-            "a continuous engine interval must be published as Throughput, not as {semantics:?}, \
-             which stores the rate without ever recomputing it from that interval"
+        // Duration keeps the old refusal. Nothing recomputes a Duration cell
+        // from a window, so publishing one there would still be storing a number
+        // beside an interval that never checks it.
+        (PerfMetricSemantics::Duration, Some(_)) => Err(format!(
+            "a continuous engine interval must not be published as {semantics:?}, which stores \
+             the value without ever recomputing it from that interval"
         )),
         (
             PerfMetricSemantics::Duration
@@ -5254,6 +5902,7 @@ struct StreamPlan<'a> {
     group_id: Option<u64>,
     query_override: Option<&'a str>,
     qg1_stream_role: Option<&'a str>,
+    qg5_stream_role: Option<Qg5StreamRole>,
 }
 
 /// Round-stepping executor for one paired raw-sample stream with a seeded
@@ -5279,6 +5928,7 @@ struct PairedStreamRunner<'a> {
     qg1_producer: Option<&'a Qg1LifecycleProducer>,
     consumed_qg1_sequences: BTreeSet<u64>,
     samples: Vec<PerfRawSample>,
+    qg5_witnesses: Vec<Qg5SampleDurabilityWitness>,
 }
 
 impl<'a> PairedStreamRunner<'a> {
@@ -5312,6 +5962,11 @@ impl<'a> PairedStreamRunner<'a> {
             ));
         }
         let samples = Vec::with_capacity(plan.rounds * 2);
+        let qg5_witnesses = Vec::with_capacity(if plan.qg5_stream_role.is_some() {
+            plan.rounds * 2
+        } else {
+            0
+        });
         Self {
             context,
             spec,
@@ -5326,6 +5981,7 @@ impl<'a> PairedStreamRunner<'a> {
             qg1_producer,
             consumed_qg1_sequences: BTreeSet::new(),
             samples,
+            qg5_witnesses,
         }
     }
 
@@ -5402,6 +6058,23 @@ impl<'a> PairedStreamRunner<'a> {
         let (work_units, byte_count, continuous) = if let Some(interval) =
             measurement.qg2_continuous.as_ref()
         {
+            (
+                Some(interval.work_units),
+                self.byte_count,
+                Some(Qg1IntervalOffsets {
+                    work_units: interval.work_units,
+                    started_ns: u64::try_from(
+                        interval.origin.duration_since(self.origin).as_nanos(),
+                    )
+                    .expect("monotonic ns"),
+                    elapsed_ns: interval.elapsed_ns,
+                }),
+            )
+        } else if let Some(interval) = measurement.qg3_continuous.as_ref() {
+            // A QG-3 cell publishes a rate and a latency read off ONE measured
+            // span, so the raw sample must carry that same span. Binding the
+            // window here is what stops an update-to-searchable number from
+            // being attached to time the interval did not cover.
             (
                 Some(interval.work_units),
                 self.byte_count,
@@ -5494,7 +6167,7 @@ impl<'a> PairedStreamRunner<'a> {
                 "QG-1 observed throughput must equal the rate derived from its published interval"
             );
         }
-        PerfRawSample {
+        let sample = PerfRawSample {
             block_id,
             sample_id,
             arm: sample_arm,
@@ -5511,10 +6184,30 @@ impl<'a> PairedStreamRunner<'a> {
             qg6_sample_binding: None,
             qg1_sample_binding,
             tantivy_config_sha256: None,
+        };
+        match (self.plan.qg5_stream_role, measurement.qg5_observation) {
+            (Some(stream), Some(observation)) => {
+                let durability_engine = match engine {
+                    EngineArm::Quill => Qg5DurabilityEngine::Quill,
+                    EngineArm::Tantivy => Qg5DurabilityEngine::Tantivy,
+                };
+                self.qg5_witnesses.push(
+                    Qg5SampleDurabilityWitness::seal(
+                        stream,
+                        durability_engine,
+                        &sample,
+                        observation,
+                    )
+                    .expect("seal QG-5 measured-sample durability witness"),
+                );
+            }
+            (None, None) => {}
+            _ => panic!("QG-5 observation and stream role must be present together"),
         }
+        sample
     }
 
-    fn into_samples(self) -> Vec<PerfRawSample> {
+    fn into_parts(self) -> (Vec<PerfRawSample>, Vec<Qg5SampleDurabilityWitness>) {
         if qg1_producer_coverage(self.spec) == Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
             let stream_role = self
                 .plan
@@ -5535,7 +6228,16 @@ impl<'a> PairedStreamRunner<'a> {
                 "QG-1 runner must consume every pre-issued transcript row exactly once"
             );
         }
-        self.samples
+        (self.samples, self.qg5_witnesses)
+    }
+
+    fn into_samples(self) -> Vec<PerfRawSample> {
+        let (samples, qg5_witnesses) = self.into_parts();
+        assert!(
+            qg5_witnesses.is_empty(),
+            "a sample-only stream must not discard QG-5 measured witnesses"
+        );
+        samples
     }
 }
 
@@ -6526,6 +7228,7 @@ fn qg1_incumbent_stream_runner<'a>(
             group_id: None,
             query_override: None,
             qg1_stream_role: Some(stream_role),
+            qg5_stream_role: None,
         },
         estimator_config,
         Some(producer),
@@ -6994,6 +7697,45 @@ struct CellCollection {
     evidence: Option<EvidenceCell>,
     qg1_incumbent_screen: Option<Qg1TantivyIncumbentScreen>,
     qg1_incumbent_decision: Option<Qg1TantivyIncumbentDecision>,
+    qg5_durability: Option<Qg5CellDurabilityWitness>,
+}
+
+fn publish_qg5_durability_witnesses(output_dir: &Path, bytes: &[u8]) {
+    fs::create_dir_all(output_dir).expect("create QG-5 witness output directory");
+    let directory = fs::File::open(output_dir).expect("open QG-5 witness output directory");
+    let pending_name = format!(
+        ".{QG5_DURABILITY_WITNESS_FILE_NAME}.pending.{}",
+        std::process::id()
+    );
+    let pending_path = output_dir.join(&pending_name);
+    let mut pending = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending_path)
+        .unwrap_or_else(|error| panic!("create {}: {error}", pending_path.display()));
+    pending
+        .write_all(bytes)
+        .unwrap_or_else(|error| panic!("write {}: {error}", pending_path.display()));
+    pending
+        .sync_all()
+        .unwrap_or_else(|error| panic!("sync {}: {error}", pending_path.display()));
+    drop(pending);
+    renameat_with(
+        &directory,
+        pending_name.as_str(),
+        &directory,
+        QG5_DURABILITY_WITNESS_FILE_NAME,
+        RenameFlags::NOREPLACE,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "publish {} without replacement: {error}",
+            output_dir.join(QG5_DURABILITY_WITNESS_FILE_NAME).display()
+        )
+    });
+    directory
+        .sync_all()
+        .expect("sync QG-5 witness output directory");
 }
 
 fn collect_cell(
@@ -7037,6 +7779,7 @@ fn collect_cell(
             evidence: Some(cell),
             qg1_incumbent_screen: None,
             qg1_incumbent_decision: None,
+            qg5_durability: None,
         };
     }
 
@@ -7054,6 +7797,7 @@ fn collect_cell(
                 evidence: Some(selected_cell),
                 qg1_incumbent_screen: Some(incumbent.screen),
                 qg1_incumbent_decision: incumbent.decision,
+                qg5_durability: None,
             };
         }
         assert!(
@@ -7102,6 +7846,7 @@ fn collect_cell(
         input_identity,
         qg6_semantic_contract,
         qg6_quill_null_samples,
+        qg5_witnesses,
     ) = if spec.gate == PerfGate::Qg6 {
         let schedule_authority = qg6_schedule_authority
             .expect("selected QG-6 cell must consume its parent-acknowledged startup authority");
@@ -7122,6 +7867,7 @@ fn collect_cell(
             Some(input_identity),
             Some(semantic_contract),
             Some(quill_null),
+            Vec::new(),
         )
     } else {
         assert!(
@@ -7146,6 +7892,7 @@ fn collect_cell(
                 group_id: None,
                 query_override: None,
                 qg1_stream_role: (spec.gate == PerfGate::Qg1).then_some("qg1.null.tantivy.v1"),
+                qg5_stream_role: (spec.gate == PerfGate::Qg5).then_some(Qg5StreamRole::OracleNull),
             },
             &estimator_config,
             qg1_lifecycle_producer,
@@ -7169,6 +7916,7 @@ fn collect_cell(
                     group_id: None,
                     query_override: None,
                     qg1_stream_role: Some("qg1.null.quill.v1"),
+                    qg5_stream_role: None,
                 },
                 &estimator_config,
                 qg1_lifecycle_producer,
@@ -7193,6 +7941,7 @@ fn collect_cell(
                 query_override: None,
                 qg1_stream_role: (spec.gate == PerfGate::Qg1)
                     .then_some("qg1.effect.tantivy_vs_quill.v1"),
+                qg5_stream_role: (spec.gate == PerfGate::Qg5).then_some(Qg5StreamRole::Effect),
             },
             &estimator_config,
             qg1_lifecycle_producer,
@@ -7210,13 +7959,17 @@ fn collect_cell(
                 }
             }
         }
+        let (oracle_null_samples, mut qg5_witnesses) = oracle_null.into_parts();
+        let (effect_samples, effect_qg5_witnesses) = effect.into_parts();
+        qg5_witnesses.extend(effect_qg5_witnesses);
         (
-            oracle_null.into_samples(),
+            oracle_null_samples,
             treatment_null.map(PairedStreamRunner::into_samples),
-            effect.into_samples(),
+            effect_samples,
             None,
             None,
             None,
+            qg5_witnesses,
         )
     };
 
@@ -7417,11 +8170,29 @@ fn collect_cell(
             distribution,
         });
     }
+    let qg5_durability = if spec.gate == PerfGate::Qg5 {
+        assert_eq!(
+            qg5_witnesses.len(),
+            runs.checked_mul(4).expect("QG-5 witness count"),
+            "QG-5 must retain exactly the effect and oracle-null measured rows"
+        );
+        Some(
+            Qg5CellDurabilityWitness::new(
+                format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric),
+                qg5_witnesses,
+            )
+            .expect("seal complete QG-5 cell durability witness"),
+        )
+    } else {
+        assert!(qg5_witnesses.is_empty());
+        None
+    };
     CellCollection {
         results,
         evidence: Some(cell),
         qg1_incumbent_screen: qg1_no_decision_screen,
         qg1_incumbent_decision: None,
+        qg5_durability,
     }
 }
 
@@ -8333,6 +9104,11 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             run_id.clone(),
             revision.clone(),
             source_worktree_clean,
+            selected_specs
+                .iter()
+                .filter(|spec| spec.gate == PerfGate::Qg6)
+                .map(|spec| format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric))
+                .collect(),
             retained_qg6_schedule_authorities.clone(),
         )
         .expect("seal the complete selected QG-6 startup authority set");
@@ -8405,6 +9181,7 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
     let mut by_gate: BTreeMap<PerfGate, Vec<PerfCellResult>> = BTreeMap::new();
     let mut evidence_by_gate: BTreeMap<PerfGate, Vec<EvidenceCell>> = BTreeMap::new();
     let mut qg1_incumbent_evidence = BTreeMap::new();
+    let mut qg5_durability_cells = BTreeMap::new();
     for planned in &selected {
         let spec = &planned.spec;
         let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
@@ -8422,6 +9199,7 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             evidence,
             qg1_incumbent_screen,
             qg1_incumbent_decision,
+            qg5_durability,
         } = collection;
         by_gate.entry(spec.gate).or_default().extend(results);
         if let Some(cell) = evidence {
@@ -8437,7 +9215,7 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             let previous = qg1_incumbent_evidence.insert(
                 cell_id.clone(),
                 Qg1IncumbentScreenEvidence {
-                    cell_id,
+                    cell_id: cell_id.clone(),
                     semantic_contract,
                     screen,
                     decision: qg1_incumbent_decision,
@@ -8450,7 +9228,31 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
         } else {
             assert!(qg1_incumbent_decision.is_none());
         }
+        if let Some(witness) = qg5_durability {
+            assert_eq!(spec.gate, PerfGate::Qg5);
+            assert!(
+                qg5_durability_cells.insert(cell_id, witness).is_none(),
+                "every selected QG-5 cell must contribute exactly one durability witness"
+            );
+        } else {
+            assert_ne!(spec.gate, PerfGate::Qg5);
+        }
         register_criterion_cell(c, &context, spec);
+    }
+    if runner.plan.binding().gate == PerfGate::Qg5 {
+        assert_eq!(
+            qg5_durability_cells.len(),
+            selected.len(),
+            "the QG-5 durability set must cover every selected cell"
+        );
+        let witness_set = Qg5DurabilityWitnessSet::seal(run_id.clone(), qg5_durability_cells)
+            .expect("seal complete selected-cell QG-5 durability witness set");
+        let bytes = witness_set
+            .to_json_bytes()
+            .expect("serialize canonical QG-5 durability witness set");
+        publish_qg5_durability_witnesses(&output_dir, &bytes);
+    } else {
+        assert!(qg5_durability_cells.is_empty());
     }
     machine.finish();
     flush_tantivy_lifecycle_receipts(&output_dir);
@@ -10232,6 +11034,40 @@ fn main() {
         qg2_continuous_tests::assert_qg2_summed_shape_excludes_the_planted_tail();
         return;
     }
+    // QG-3's contract runs here for the same reason QG-2's does: `harness =
+    // false` strips `#[test]` items, so a `#[test]` would never execute and
+    // could never be evidence.
+    #[cfg(test)]
+    if std::env::var_os("QUILL_PERF_QG3_SELF_CHECK").is_some() {
+        qg3_continuous_tests::assert_qg3_publish_seam_admits_the_gauge_window();
+        qg3_continuous_tests::assert_qg3_continuous_interval_contract();
+        qg3_continuous_tests::assert_qg3_summed_shape_excludes_the_planted_gap();
+        return;
+    }
+    // QG-8's producer proof runs here for the same reason the others do:
+    // `harness = false` strips `#[test]`, so the delegate in `mod tests` never
+    // executes in this binary and could not be evidence on its own.
+    #[cfg(test)]
+    if std::env::var("QUILL_PERF_QG8_PRODUCER_SELF_CHECK").as_deref() == Ok("1") {
+        qg8_producer_tests::assert_qg8_witness_is_emitted_for_every_scaling_cell();
+        qg8_producer_tests::assert_non_scaling_cells_emit_no_witness();
+        return;
+    }
+    #[cfg(test)]
+    if std::env::var("QUILL_PERF_QG4_SELF_CHECK").as_deref() == Ok("1") {
+        tests::assert_qg4_receipted_on_disk_commit_then_reopen();
+        return;
+    }
+    #[cfg(test)]
+    if std::env::var_os("QUILL_PERF_QG5_PRODUCER_SELF_CHECK").is_some() {
+        tests::assert_qg5_real_producer_observation_census();
+        return;
+    }
+    #[cfg(test)]
+    if std::env::var_os("QUILL_PERF_QG10_PRODUCER_SELF_CHECK").is_some() {
+        tests::assert_qg10_dependency_surface_positive_control();
+        return;
+    }
     #[cfg(test)]
     if std::env::var_os("QUILL_PERF_H1_PRODUCER_SELF_CHECK").is_some() {
         tests::assert_qg1_continuous_interval_contract();
@@ -10303,6 +11139,406 @@ fn main() {
     let mut criterion = Criterion::default().configure_from_args();
     bench_matrix(&mut criterion, &identity);
     criterion.final_summary();
+}
+
+/// THE QG-8 PRODUCER PROOF.
+///
+/// QG-8's consumers are covered by lib tests, but its producer side is one
+/// predicate — `take_concurrency_witness` — and nothing that executes asserted
+/// it. `EvidenceCell::evaluate` refuses a QG-8 cell whose witness is absent, so
+/// a producer that silently stopped emitting one would fail far downstream, at
+/// evidence assembly, with no indication that the benchmark was the cause.
+#[cfg(test)]
+mod qg8_producer_tests {
+    use frankensearch_quill_gauntlet::{
+        PerfConcurrencyEngine, PerfConcurrencyObserver, PerfGate, PerfMatrixSpec,
+    };
+
+    /// Every canonical QG-8 scaling cell must emit a witness, produced by the
+    /// REAL benchmark path.
+    ///
+    /// This runs `bulk_metric` — the exact function `measure_metric` dispatches
+    /// QG-8 to — for both engine arms, then drains the witness. Nothing here
+    /// calls `record_concurrency` itself: if either production arm stops
+    /// recording, `take_concurrency_witness` panics on the missing arm and this
+    /// fails. A helper that hand-fed the observation map would stay green
+    /// through exactly that deletion, which is the failure this replaces.
+    ///
+    /// Only `document_count` is reduced, to keep the run tiny. Thread width,
+    /// fixture, metric, and gate are the frozen matrix's own, because those are
+    /// what the witness is asserted against.
+    pub fn assert_qg8_witness_is_emitted_for_every_scaling_cell() {
+        let matrix = PerfMatrixSpec::complete();
+        let canonical = matrix.for_gate(PerfGate::Qg8);
+        assert!(
+            !canonical.is_empty(),
+            "the frozen matrix must ship at least one QG-8 scaling cell"
+        );
+        const TINY_DOCUMENT_COUNT: u64 = 64;
+        let specs = canonical
+            .into_iter()
+            .map(|spec| {
+                let mut spec = spec.clone();
+                spec.document_count = Some(TINY_DOCUMENT_COUNT);
+                spec
+            })
+            .collect::<Vec<_>>();
+        let context = super::BenchContext::for_selected(super::MatrixScale::Smoke, &specs);
+
+        for spec in &specs {
+            let configured = spec
+                .threads
+                .expect("every QG-8 scaling cell declares its thread width");
+            // PRODUCTION EXECUTION. Both arms, through the real dispatch target.
+            for arm in [super::EngineArm::Quill, super::EngineArm::Tantivy] {
+                let _ = super::black_box(super::bulk_metric(&context, spec, arm));
+            }
+            let witness = super::take_concurrency_witness(spec).unwrap_or_else(|| {
+                panic!(
+                    "QG-8 cell {}/{} emitted no concurrency witness",
+                    spec.fixture, spec.metric
+                )
+            });
+            assert_eq!(
+                witness.configured_threads, configured,
+                "QG-8 cell {}/{} witness names the wrong configured width",
+                spec.fixture, spec.metric
+            );
+            assert_eq!(
+                witness.observations.len(),
+                2,
+                "QG-8 cell {}/{} must witness both engine arms",
+                spec.fixture,
+                spec.metric
+            );
+            for (observation, (engine, observer)) in witness.observations.iter().zip([
+                (
+                    PerfConcurrencyEngine::Quill,
+                    PerfConcurrencyObserver::RayonCurrentPoolWidth,
+                ),
+                (
+                    PerfConcurrencyEngine::Tantivy,
+                    PerfConcurrencyObserver::TantivyWriterConstruction,
+                ),
+            ]) {
+                assert_eq!(
+                    observation.engine, engine,
+                    "QG-8 cell {}/{} witnesses the wrong engine, or in the wrong order",
+                    spec.fixture, spec.metric
+                );
+                assert_eq!(
+                    observation.observer, observer,
+                    "QG-8 cell {}/{} witnesses {engine:?} through the wrong observer",
+                    spec.fixture, spec.metric
+                );
+                // EXACTLY ONE production execution per arm. Zero means the
+                // production arm stopped calling `record_concurrency`; more
+                // than one means an arm recorded twice in a single run, which
+                // the Quill path invites because it records in the pinned pool
+                // and then calls `bulk_metric_unpooled` inside it. A duplicate
+                // leaves min and max equal, so this count is the only assertion
+                // here that can see it.
+                assert_eq!(
+                    observation.observation_count, 1,
+                    "{engine:?} recorded {} observations for {}/{}, expected exactly one \
+                     production execution; zero means the arm stopped calling \
+                     record_concurrency, more than one means it recorded twice in a single run",
+                    observation.observation_count, spec.fixture, spec.metric
+                );
+                // EXACT, both arms. Neither width is a host measurement: the
+                // Quill arm records inside a Rayon pool it built at
+                // `spec.threads` and asserts `current_num_threads` equals it
+                // before recording, and the Tantivy arm records
+                // `benchmark_materialized_writer_threads`, the constructor's
+                // own count. A host with fewer cores still constructs the
+                // requested worker count, so anything but equality here is a
+                // producer that stopped pinning the width it claims to measure.
+                assert_eq!(
+                    (
+                        observation.min_observed_worker_pool_threads,
+                        observation.max_observed_worker_pool_threads
+                    ),
+                    (configured, configured),
+                    "{engine:?} observed pool width for {}/{} is not the configured width \
+                     {configured}",
+                    spec.fixture,
+                    spec.metric
+                );
+            }
+            // THE STALE-DRAIN NEGATIVE. The witness above removed both arms, so
+            // the process-global map must no longer hold either key for this
+            // cell; a surviving entry would let a later cell witness from an
+            // earlier cell's production run.
+            //
+            // Inspected directly rather than by catching a second take's panic:
+            // `take_concurrency_witness` panics while still holding this
+            // mutex, which would poison it for every remaining cell in the
+            // loop and turn one real failure into a cascade of unrelated ones.
+            let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
+            let observations = super::CONCURRENCY_OBSERVATIONS
+                .get()
+                .expect("the production run initialized the observation map")
+                .lock()
+                .expect("lock concurrency observations");
+            for arm in [super::EngineArm::Quill, super::EngineArm::Tantivy] {
+                assert!(
+                    !observations.contains_key(&(cell_id.clone(), arm.label().to_owned())),
+                    "QG-8 cell {cell_id} retained its {} observation after being witnessed; the \
+                     observation map leaks across cells",
+                    arm.label()
+                );
+            }
+            drop(observations);
+        }
+    }
+
+    /// The predicate's carve-outs, asserted in both directions so the witness
+    /// requirement cannot silently widen or narrow.
+    pub fn assert_non_scaling_cells_emit_no_witness() {
+        let matrix = PerfMatrixSpec::complete();
+        // Gate-level negative: QG-3 is not a scaling gate.
+        let qg3 = matrix
+            .for_gate(PerfGate::Qg3)
+            .into_iter()
+            .next()
+            .expect("the frozen matrix ships a QG-3 cell");
+        assert!(
+            super::take_concurrency_witness(qg3).is_none(),
+            "a QG-3 cell must not demand a concurrency witness"
+        );
+        // Metric-level negative: the QG-1 tokenizer diagnostic is the exact
+        // carve-out inside the scaling gate itself.
+        let tokenizer = matrix
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .find(|spec| spec.metric == "tokenize_docs_per_second")
+            .expect("the frozen matrix ships a QG-1 tokenizer diagnostic cell");
+        assert!(
+            super::take_concurrency_witness(tokenizer).is_none(),
+            "the QG-1 tokenizer diagnostic must not demand a concurrency witness"
+        );
+    }
+}
+
+#[cfg(test)]
+mod qg3_continuous_tests {
+    /// The normative in-process QG-3 update cell, taken from the frozen matrix
+    /// so the check cannot drift onto a shape the manifest does not ship.
+    fn qg3_spec_for(
+        metric: &str,
+        topology: frankensearch_quill_gauntlet::PerfTopology,
+    ) -> frankensearch_quill_gauntlet::PerfCellSpec {
+        frankensearch_quill_gauntlet::PerfMatrixSpec::complete()
+            .for_gate(frankensearch_quill_gauntlet::PerfGate::Qg3)
+            .into_iter()
+            .find(|spec| spec.metric == metric && spec.topology == Some(topology))
+            .cloned()
+            .unwrap_or_else(|| panic!("the frozen matrix ships a {topology:?} QG-3 {metric} cell"))
+    }
+
+    fn qg3_spec(metric: &str) -> frankensearch_quill_gauntlet::PerfCellSpec {
+        qg3_spec_for(
+            metric,
+            frankensearch_quill_gauntlet::PerfTopology::InProcess,
+        )
+    }
+
+    /// THE PUBLISH SEAM, exercised directly rather than only through
+    /// `watch_metric`. A measured engine window must survive publication under
+    /// gauge semantics and arrive as the EXACT engine interval, because the
+    /// QG-3 recomputation contract in `perf.rs` holds the persisted value to
+    /// that window and nothing else.
+    pub fn assert_qg3_publish_seam_admits_the_gauge_window() {
+        use frankensearch_quill_gauntlet::PerfMetricSemantics;
+        let call_started_ns = 1_000;
+        let call_ended_ns = 9_000;
+        let interval = super::Qg1IntervalOffsets {
+            work_units: 5_000,
+            started_ns: 2_000,
+            elapsed_ns: 6_000,
+        };
+        for semantics in [
+            PerfMetricSemantics::GaugeHigherIsBetter,
+            PerfMetricSemantics::GaugeLowerIsBetter,
+        ] {
+            let window = super::qg1_sample_window(
+                semantics,
+                Some(interval.work_units),
+                call_started_ns,
+                call_ended_ns,
+                Some(interval),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{semantics:?} must publish its measured engine window: {error}")
+            });
+            assert_eq!(
+                (window.started_ns, window.ended_ns),
+                (2_000, 8_000),
+                "{semantics:?} must publish the exact engine interval, not the outer call"
+            );
+        }
+        // The same checks still bite for gauges.
+        assert!(
+            super::qg1_sample_window(
+                PerfMetricSemantics::GaugeLowerIsBetter,
+                Some(interval.work_units + 1),
+                call_started_ns,
+                call_ended_ns,
+                Some(interval),
+            )
+            .is_err(),
+            "a gauge window whose declared work disagrees with its interval must fail closed"
+        );
+        // Duration keeps the old refusal, and Throughput still requires one.
+        assert!(
+            super::qg1_sample_window(
+                PerfMetricSemantics::Duration,
+                Some(interval.work_units),
+                call_started_ns,
+                call_ended_ns,
+                Some(interval),
+            )
+            .is_err(),
+            "a Duration cell must still refuse a continuous engine interval"
+        );
+        assert!(
+            super::qg1_sample_window(
+                PerfMetricSemantics::Throughput,
+                Some(interval.work_units),
+                call_started_ns,
+                call_ended_ns,
+                None,
+            )
+            .is_err(),
+            "a throughput cell must still require one continuous engine interval"
+        );
+    }
+
+    /// THE PRODUCTION PATH: one interval, carrying the updates it processed,
+    /// with both published metrics read off that same interval.
+    pub fn assert_qg3_continuous_interval_contract() {
+        for metric in ["updates_per_second", "update_to_searchable_ms"] {
+            let spec = qg3_spec(metric);
+            let context = super::BenchContext::for_selected(
+                super::MatrixScale::Smoke,
+                std::slice::from_ref(&spec),
+            );
+            let update_count = context
+                .scale
+                .document_count(spec.document_count.expect("QG-3 update count"));
+            for arm in [super::EngineArm::Quill, super::EngineArm::Tantivy] {
+                let measurement = super::watch_metric(&context, &spec, arm);
+                assert!(
+                    measurement.continuous.is_none() && measurement.qg2_continuous.is_none(),
+                    "{arm:?} QG-3 interval must not present itself as QG-1 or QG-2 evidence"
+                );
+                let interval = measurement
+                    .qg3_continuous
+                    .as_ref()
+                    .expect("every QG-3 arm publishes its continuous interval");
+                assert_eq!(
+                    interval.work_units, update_count,
+                    "{arm:?} QG-3 interval must cover the exact requested update count"
+                );
+                assert!(
+                    interval.elapsed_ns > 0,
+                    "{arm:?} QG-3 interval must span positive monotonic time"
+                );
+                assert!(
+                    interval.elapsed_ns >= interval.component_sum_ns,
+                    "{arm:?} QG-3 interval must contain every phase it is built from"
+                );
+                assert!(
+                    measurement.value.is_finite() && measurement.value > 0.0,
+                    "{arm:?} QG-3 {metric} must be positive and finite"
+                );
+                // The published value is a reading of THIS interval, not of the
+                // component sum. It must reproduce BIT-FOR-BIT from `elapsed_ns`
+                // under the same expressions `perf.rs` validation uses, because
+                // that is the equality reload enforces. Asserting it here means
+                // a producer-side drift is caught in this binary rather than as
+                // an unpublishable sample later.
+                let elapsed_ns = interval.elapsed_ns as f64;
+                let expected = if metric == "updates_per_second" {
+                    update_count as f64 * 1_000_000_000.0 / elapsed_ns
+                } else {
+                    elapsed_ns / 1_000_000.0
+                };
+                assert_eq!(
+                    measurement.value.to_bits(),
+                    expected.to_bits(),
+                    "{arm:?} QG-3 {metric} {} is not bit-identical to the value its own interval \
+                     produces ({expected}); producer and validator formulas have drifted",
+                    measurement.value
+                );
+            }
+        }
+    }
+
+    /// THE DISCRIMINATOR. A gap is planted BETWEEN the timed phases — exactly
+    /// where the retired summed shape was blind. An update sitting in that gap
+    /// is an update that is not yet searchable, so the continuous interval must
+    /// absorb it while the sum of separately started timers cannot. If this
+    /// file ever reverts to publishing the summed shape, this fails.
+    pub fn assert_qg3_summed_shape_excludes_the_planted_gap() {
+        const PLANTED_GAP: std::time::Duration = std::time::Duration::from_millis(150);
+        let planted_ns = u64::try_from(PLANTED_GAP.as_nanos()).expect("planted gap fits u64 ns");
+        // Both topologies. The fresh-process arms close and reopen the index
+        // around the gap, which is where an inter-phase gap is largest and where
+        // a summed shape hides the most.
+        for topology in [
+            frankensearch_quill_gauntlet::PerfTopology::InProcess,
+            frankensearch_quill_gauntlet::PerfTopology::FreshProcess,
+        ] {
+            assert_qg3_planted_gap_for_topology(topology, PLANTED_GAP, planted_ns);
+        }
+    }
+
+    fn assert_qg3_planted_gap_for_topology(
+        topology: frankensearch_quill_gauntlet::PerfTopology,
+        planted_gap: std::time::Duration,
+        planted_ns: u64,
+    ) {
+        let spec = qg3_spec_for("update_to_searchable_ms", topology);
+        let context = super::BenchContext::for_selected(
+            super::MatrixScale::Smoke,
+            std::slice::from_ref(&spec),
+        );
+
+        for arm in [super::EngineArm::Quill, super::EngineArm::Tantivy] {
+            let measurement =
+                super::watch_metric_with_planted_gap(&context, &spec, arm, Some(planted_gap));
+            let interval = measurement
+                .qg3_continuous
+                .as_ref()
+                .expect("the continuous path publishes its interval");
+
+            // Each component timer stops when its own call returns, so no
+            // component can have observed one nanosecond of a planted gap.
+            assert!(
+                interval.elapsed_ns > interval.component_sum_ns,
+                "{arm:?} continuous interval must strictly exceed the summed phases it contains"
+            );
+            let gap_ns = interval.elapsed_ns - interval.component_sum_ns;
+            assert!(
+                gap_ns >= planted_ns,
+                "{arm:?} continuous interval must include the planted {planted_ns}ns inter-phase \
+                 gap, but it covered only {gap_ns}ns beyond the summed calls, so the update was \
+                 reported searchable during time the interval did not measure"
+            );
+
+            // The same fact as the consequence that matters, on this one
+            // invocation's own numbers: the retired shape reports the update as
+            // arriving sooner than it did, purely by dropping the gaps.
+            let summed_ms =
+                std::time::Duration::from_nanos(interval.component_sum_ns).as_secs_f64() * 1_000.0;
+            assert!(
+                summed_ms < measurement.value,
+                "{arm:?} summed shape must report the faster update-to-searchable latency it \
+                 obtains by dropping inter-phase gaps"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10519,6 +11755,245 @@ mod tests {
     // below would otherwise have to be re-imported per function. Bringing the
     // parent scope in is the module-structure fix, not a lint silencer.
     use super::*;
+
+    /// Normal-harness delegate for the QG-8 producer proof.
+    ///
+    /// `harness = false` strips this item in the benchmark binary, which is why
+    /// `QUILL_PERF_QG8_PRODUCER_SELF_CHECK=1` is the path that actually
+    /// executes it. The delegate is kept so the same assertions run unchanged
+    /// under any normal test harness that ever compiles this file, and so the
+    /// helper has a caller that is not an env-gated branch.
+    #[test]
+    fn qg8_producer_emits_exact_concurrency_witnesses() {
+        super::qg8_producer_tests::assert_qg8_witness_is_emitted_for_every_scaling_cell();
+    }
+
+    #[test]
+    fn qg8_witness_requirement_does_not_widen_to_non_scaling_cells() {
+        super::qg8_producer_tests::assert_non_scaling_cells_emit_no_witness();
+    }
+
+    /// QG-10 decides on exactly one fact: how many Tantivy-family nodes
+    /// `cargo_tree_line_is_tantivy_family` finds in the `lexical` graph, with
+    /// the gate target being `== 0`. A classifier that silently stops matching
+    /// therefore manufactures a passing result out of nothing, and no parser
+    /// unit test can tell that apart from a genuinely clean surface. This
+    /// exercises the real `cargo tree` on both graphs and then proves the
+    /// fail-closed branch fires. Run via
+    /// `QUILL_PERF_QG10_PRODUCER_SELF_CHECK=1`.
+    pub fn assert_qg10_dependency_surface_positive_control() {
+        for line in [
+            "tantivy v0.26.1",
+            "│   ├── tantivy v0.26.1",
+            "├── tantivy-query-grammar v0.26.1",
+            "│   └── tantivy-stacker v0.26.1 (*)",
+        ] {
+            assert!(
+                cargo_tree_line_is_tantivy_family(line),
+                "QG-10 classifier must match Tantivy-family line {line:?}"
+            );
+        }
+        for line in [
+            "",
+            "frankensearch v0.2.1 (/data/projects/frankensearch)",
+            "├── tantivy-like-not-a-package",
+            "├── nottantivy v1.0.0",
+            "└── tokenizer-api v0.3.1",
+        ] {
+            assert!(
+                !cargo_tree_line_is_tantivy_family(line),
+                "QG-10 classifier must not match non-Tantivy line {line:?}"
+            );
+        }
+
+        let control = dependency_surface_tantivy_nodes(QG10_POSITIVE_CONTROL_FEATURES);
+        assert!(
+            control > 0,
+            "QG-10 positive control graph {QG10_POSITIVE_CONTROL_FEATURES:?} must \
+             contain Tantivy nodes"
+        );
+        let measured = dependency_surface_tantivy_nodes(QG10_MEASURED_FEATURES);
+        assert_eq!(
+            measured, 0,
+            "QG-10 measured graph {QG10_MEASURED_FEATURES:?} must be Tantivy-free"
+        );
+        assert!(
+            dependency_surface_metric().abs() < f64::EPSILON,
+            "QG-10 producer must report its corroborated zero"
+        );
+        eprintln!(
+            "[qg10-self-check] measured={measured} control={control} \
+             measured_features={QG10_MEASURED_FEATURES:?} \
+             control_features={QG10_POSITIVE_CONTROL_FEATURES:?}"
+        );
+
+        // Parent-red. Pointing the control at the Tantivy-free measured graph
+        // is exactly what a silenced classifier looks like from inside the
+        // producer. Without the fail-closed guard this returns 0.0 and QG-10
+        // passes having proven nothing.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let refused = std::panic::catch_unwind(|| {
+            with_qg10_control_features_override(QG10_MEASURED_FEATURES, dependency_surface_metric)
+        });
+        std::panic::set_hook(hook);
+        // `is_err()` alone would accept ANY panic, so an unrelated `cargo tree`
+        // failure inside the control call would masquerade as the fail-closed
+        // branch. Decode the payload and require the exact refusal text.
+        let payload = match refused {
+            Err(payload) => payload,
+            Ok(value) => panic!(
+                "QG-10 must fail closed when its positive control finds no \
+                 Tantivy nodes, but it returned {value:?}"
+            ),
+        };
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+        assert!(
+            message.contains(QG10_POSITIVE_CONTROL_REFUSAL),
+            "QG-10 fail-closed panic must be the positive-control refusal \
+             {QG10_POSITIVE_CONTROL_REFUSAL:?}, got {message:?}"
+        );
+        eprintln!("[qg10-self-check] fail-closed branch fired on a silenced control: {message:?}");
+    }
+
+    pub fn assert_qg5_real_producer_observation_census() {
+        const ROUNDS: usize = 2;
+        let mut spec = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg5)
+            .into_iter()
+            .next()
+            .expect("canonical QG-5 compaction cell")
+            .clone();
+        spec.document_count = Some(200);
+        let context = BenchContext::for_selected(MatrixScale::Full, std::slice::from_ref(&spec));
+        let evidence = EvidenceContext {
+            config: PairedEstimatorConfig::predeclared(0x5147_3550_524f_4455),
+            policy: EvidencePolicy::predeclared(),
+            sample_provenance: PerfSampleProvenance {
+                run_id: "qg5-real-producer-observation".to_owned(),
+                executable_sha256: "a".repeat(64),
+                corpus_sha256: "b".repeat(64),
+                input_identity: None,
+                worker_id: "qg5-producer-test".to_owned(),
+                build_profile: "release-perf".to_owned(),
+            },
+        };
+        let scope = operation_scope(&spec);
+        let origin = Instant::now();
+        let mut oracle_null = PairedStreamRunner::new(
+            &context,
+            &spec,
+            &evidence,
+            &scope,
+            origin,
+            StreamPlan {
+                control: EngineArm::Tantivy,
+                treatment: EngineArm::Tantivy,
+                control_qg1_tantivy_writer_mode: None,
+                treatment_qg1_tantivy_writer_mode: None,
+                rounds: ROUNDS,
+                seed: 0x5147_354f_5241_434c,
+                block_id_base: 0,
+                sample_id_base: 1_000_000,
+                group_id: None,
+                query_override: None,
+                qg1_stream_role: None,
+                qg5_stream_role: Some(Qg5StreamRole::OracleNull),
+            },
+            &evidence.config,
+            None,
+        );
+        let mut effect = PairedStreamRunner::new(
+            &context,
+            &spec,
+            &evidence,
+            &scope,
+            origin,
+            StreamPlan {
+                control: EngineArm::Tantivy,
+                treatment: EngineArm::Quill,
+                control_qg1_tantivy_writer_mode: None,
+                treatment_qg1_tantivy_writer_mode: None,
+                rounds: ROUNDS,
+                seed: 0x5147_3545_4646_4543,
+                block_id_base: 0,
+                sample_id_base: 0,
+                group_id: None,
+                query_override: None,
+                qg1_stream_role: None,
+                qg5_stream_role: Some(Qg5StreamRole::Effect),
+            },
+            &evidence.config,
+            None,
+        );
+        assert!(oracle_null.qg5_witnesses.is_empty());
+        assert!(effect.qg5_witnesses.is_empty());
+        for round in 0..ROUNDS {
+            oracle_null.run_round(round);
+            effect.run_round(round);
+        }
+        let (_, mut oracle_witnesses) = oracle_null.into_parts();
+        let (_, effect_witnesses) = effect.into_parts();
+        assert_eq!(oracle_witnesses.len(), 2 * ROUNDS);
+        assert_eq!(effect_witnesses.len(), 2 * ROUNDS);
+        oracle_witnesses.extend(effect_witnesses);
+        assert_eq!(oracle_witnesses.len(), 4 * ROUNDS);
+        Qg5CellDurabilityWitness::new(
+            format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric),
+            oracle_witnesses,
+        )
+        .expect("complete R=2 QG-5 cell has eight effect/null witnesses");
+    }
+
+    #[test]
+    fn qg5_real_producer_observations_complete_the_eight_row_census() {
+        assert_qg5_real_producer_observation_census();
+    }
+
+    pub fn assert_qg4_receipted_on_disk_commit_then_reopen() {
+        let mut spec = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg4)
+            .into_iter()
+            .next()
+            .expect("canonical QG-4 commit cell")
+            .clone();
+        spec.document_count = Some(2);
+        let context = BenchContext::for_selected(MatrixScale::Full, std::slice::from_ref(&spec));
+
+        let quill = qg4_on_disk_commit_then_reopen_observation(&context, &spec, EngineArm::Quill);
+        let tantivy =
+            qg4_on_disk_commit_then_reopen_observation(&context, &spec, EngineArm::Tantivy);
+
+        assert!(
+            quill.root_was_directory,
+            "Quill must use an on-disk scratch root"
+        );
+        assert!(
+            tantivy.root_was_directory,
+            "Tantivy must use an on-disk scratch root"
+        );
+        assert_ne!(
+            quill.root, tantivy.root,
+            "QG-4 arms must not share a scratch index directory"
+        );
+        assert_eq!(
+            quill.reopened_doc_count, 3,
+            "Quill fresh reopen must retain warm and staged documents"
+        );
+        assert_eq!(
+            tantivy.reopened_doc_count, 3,
+            "Tantivy fresh reopen must retain warm and staged documents"
+        );
+    }
+
+    #[test]
+    fn qg4_receipted_on_disk_commit_then_reopen_uses_distinct_roots_and_preserves_visibility() {
+        assert_qg4_receipted_on_disk_commit_then_reopen();
+    }
 
     fn qg1_handshake_test_producer() -> frankensearch_quill_gauntlet::Qg1LifecycleProducer {
         use frankensearch_quill_gauntlet::{
@@ -11770,6 +13245,27 @@ mod tests {
             })
             .expect("real QG-1 screen measured Fixed(1)")
             .clone();
+        let fixed_one_expected_authority = startup
+            .incumbent
+            .as_ref()
+            .expect("real QG-1 screen has startup pilot authorities")
+            .pilots
+            .iter()
+            .find(|pilot| pilot.writer_mode == Qg1TantivyWriterMode::Fixed { writer_threads: 1 })
+            .expect("Fixed(1) startup pilot retains its producer authority")
+            .authority
+            .producer
+            .expected_authority();
+        assert_eq!(
+            estimate_paired_experiment_against_qg1_authority(
+                &fixed_one.experiment.effect_samples,
+                &fixed_one.experiment.null_samples,
+                &fixed_one.experiment.config,
+                Some(fixed_one_expected_authority),
+            ),
+            Ok(fixed_one.experiment.clone()),
+            "original Fixed(1) samples must be admissible under their retained startup authority",
+        );
         let detached_fixed_one = qg1_bulk_metric_continuous(
             &context,
             &spec,
@@ -11827,31 +13323,20 @@ mod tests {
             fixed_one.writer_witness_transcript_sha256,
             "detached substitution must not preserve the original pilot transcript"
         );
-        let retained_authorities = startups.retained_authorities();
-        let mut tampered_screen = collected.screen.clone();
-        let fixed_one_slot = tampered_screen
-            .pilots
-            .iter()
-            .position(|pilot| pilot.candidate == fixed_one.candidate)
-            .expect("sealed Fixed(1) pilot is present in the screen");
-        tampered_screen.pilots[fixed_one_slot] = substituted_pilot;
-        let tampered_result = Qg1TantivyIncumbentScreen::screen_against_qg1_authorities(
-            &spec,
-            tampered_screen.screen_plan.clone(),
-            &tampered_screen.candidates[0].semantic_contract,
-            tampered_screen.pilots.clone(),
-            &retained_authorities,
-        )
-        .expect("authority failure is represented as a safe no-decision screen");
-        assert!(tampered_result.selected_candidate.is_none());
-        assert!(
-            tampered_result
-                .no_decision_reason
-                .as_deref()
-                .is_some_and(|reason| {
-                    reason.contains("valid configuration-bound throughput evidence")
-                })
+        assert_eq!(
+            estimate_paired_experiment_against_qg1_authority(
+                &substituted_experiment.effect_samples,
+                &substituted_experiment.null_samples,
+                &substituted_experiment.config,
+                Some(fixed_one_expected_authority),
+            ),
+            Err(PairedEstimatorError::InvalidProvenance {
+                reason: "QG-1 estimation requires an independently retained expected authority"
+                    .to_owned(),
+            }),
+            "detached Fixed(1) receipt must fail exact authority-capability validation",
         );
+        let retained_authorities = startups.retained_authorities();
         let replayed: Qg1TantivyIncumbentScreen = serde_json::from_slice(
             &serde_json::to_vec(&collected.screen)
                 .expect("serialize live QG-1 screen with timed writer receipts"),
@@ -12077,18 +13562,23 @@ mod tests {
             "the published window must be the interval, not the enclosing call"
         );
 
-        // Planted negative: the same real interval filed as a gauge.
-        let gauge_error = super::qg1_sample_window(
-            PerfMetricSemantics::GaugeHigherIsBetter,
-            Some(500),
-            10,
-            400,
-            Some(interval),
-        )
-        .expect_err("a continuous interval must not be published as a gauge");
-        assert!(
-            gauge_error.contains("must be published as Throughput"),
-            "unexpected gauge rejection: {gauge_error}"
+        // QG-3 publishes both a rate and a latency from one real continuous
+        // interval under gauge orientation, so gauge typing must retain that
+        // exact window just as throughput does.
+        assert_eq!(
+            super::qg1_sample_window(
+                PerfMetricSemantics::GaugeHigherIsBetter,
+                Some(500),
+                10,
+                400,
+                Some(interval),
+            )
+            .expect("a continuous gauge publishes its own window"),
+            super::Qg1SampleWindow {
+                started_ns: 40,
+                ended_ns: 140,
+            },
+            "a continuous gauge must publish the interval, not the enclosing call"
         );
 
         // Planted negative: throughput semantics offered a summed per-call

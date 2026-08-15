@@ -44,10 +44,12 @@ use crate::machine_class_registry::{
     ExecutionCapacitySemantics, ExecutionProfileId, HardwareClassId,
     LOCAL_PERF_PRODUCER_CONTRACT_VERSION, MACHINE_CLASS_REGISTRY_SHA256,
     MachineClassAdmissionContext, MachineClassError, MachineClassRegistry,
-    MachineProfileAvailability, MachineProfileKey, RUNNER_RECEIPT_SCHEMA_VERSION,
+    MachineProfileAvailability, MachineProfileKey, QG5_DURABILITY_WITNESS_FILE_NAME,
+    Qg5DurabilityWitnessSet, Qg5ExpectedDurabilityCensus, RUNNER_RECEIPT_SCHEMA_VERSION,
     RunnerArtifactManifest, RunnerBuild, RunnerCompletion, RunnerDurability, RunnerExecution,
     RunnerExecutionRequest, RunnerExecutionSnapshot, RunnerHardware, RunnerProducer, RunnerReceipt,
-    VerifiedRunnerIdentity, seal_runner_receipt, sha256_hex,
+    VerifiedRunnerIdentity, qg5_pending_runner_durability, qg5_post_exit_runner_durability,
+    seal_runner_receipt, sha256_hex,
 };
 use crate::perf::{
     Qg1AuthorityRegisterEntryV1, Qg1AuthorityRoleV1, Qg1ExpectedAuthority,
@@ -64,7 +66,7 @@ use crate::{PerfCellApplicability, PerfCellApplicabilityReason};
 const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
 /// Strict wire schema for one local-run process-attempt receipt.
-pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v10";
+pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v11";
 /// Strict wire schema for the post-unlock lease-release receipt.
 pub const LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION: &str =
     "frankensearch.perf-runner-lease-release.v1";
@@ -148,9 +150,11 @@ pub struct Qg6StartupAuthoritySetV1 {
 impl Qg6StartupAuthoritySetV1 {
     /// Seal one complete pre-timing authority set.
     ///
-    /// The map key is the exact canonical selected QG-6 cell ID. Map ordering
-    /// and the duplicated ordered `selected_cell_ids` census make omission,
-    /// duplication, or cell/value swapping visible to the outer self-seal.
+    /// The map key is the exact selected QG-6 cell ID. The caller supplies the
+    /// canonical runner-selection order separately because `BTreeMap` key
+    /// order is lexical rather than matrix order. The duplicated ordered
+    /// `selected_cell_ids` census makes omission, duplication, reordering, or
+    /// cell/value swapping visible to the outer self-seal.
     ///
     /// # Errors
     ///
@@ -160,9 +164,9 @@ impl Qg6StartupAuthoritySetV1 {
         campaign_run_id: String,
         source_git_revision: String,
         source_worktree_clean: bool,
+        selected_cell_ids: Vec<String>,
         authorities: BTreeMap<String, Qg6ScheduleAuthority>,
     ) -> Result<Self, String> {
-        let selected_cell_ids = authorities.keys().cloned().collect::<Vec<_>>();
         let mut set = Self {
             schema_version: QG6_STARTUP_AUTHORITY_SET_SCHEMA_VERSION.to_owned(),
             campaign_run_id,
@@ -218,6 +222,11 @@ impl Qg6StartupAuthoritySetV1 {
     pub fn verify(&self) -> Result<(), String> {
         validate_component(&self.campaign_run_id, "QG-6 campaign run ID")
             .map_err(|error| error.to_string())?;
+        let selected_cell_set = self
+            .selected_cell_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         if self.schema_version != QG6_STARTUP_AUTHORITY_SET_SCHEMA_VERSION
             || !self.source_worktree_clean
             || !(40..=64).contains(&self.source_git_revision.len())
@@ -228,7 +237,8 @@ impl Qg6StartupAuthoritySetV1 {
             || self.authorities.is_empty()
             || self.authorities.len() > MAX_QG6_STARTUP_AUTHORITIES
             || self.selected_cell_ids.len() != self.authorities.len()
-            || self.selected_cell_ids != self.authorities.keys().cloned().collect::<Vec<_>>()
+            || selected_cell_set.len() != self.selected_cell_ids.len()
+            || selected_cell_set != self.authorities.keys().cloned().collect()
         {
             return Err(
                 "QG-6 startup authority set has invalid schema, provenance, or cell census"
@@ -884,19 +894,31 @@ struct AcceptedQg1Authorities {
 }
 
 #[derive(Debug)]
+struct RetainedQg6AuthoritySet {
+    set: Qg6StartupAuthoritySetV1,
+    canonical_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct AcceptedQg6Authorities {
-    set: Option<Qg6StartupAuthoritySetV1>,
+    retained: Option<RetainedQg6AuthoritySet>,
 }
 
 impl AcceptedQg6Authorities {
     const fn new() -> Self {
-        Self { set: None }
+        Self { retained: None }
     }
 
     fn authority_refs(&self) -> Vec<&Qg6ScheduleAuthority> {
-        self.set
+        self.retained
             .as_ref()
-            .map_or_else(Vec::new, Qg6StartupAuthoritySetV1::authority_refs)
+            .map_or_else(Vec::new, |retained| retained.set.authority_refs())
+    }
+
+    fn canonical_bytes(&self) -> Option<&[u8]> {
+        self.retained
+            .as_ref()
+            .map(|retained| retained.canonical_bytes.as_slice())
     }
 }
 
@@ -1411,6 +1433,8 @@ pub struct LocalPerfAttemptReceipt {
     unsupported_controls: Vec<LocalPerfUnsupportedControl>,
     run_log_sha256: Option<String>,
     bound_evidence_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qg6_startup_authority_set_sha256: Option<String>,
     runner_receipt_sha256: Option<String>,
     runner_artifact_manifest_sha256: Option<String>,
     started_at_utc: String,
@@ -1652,6 +1676,27 @@ impl LocalPerfAttemptReceipt {
         Ok(receipt)
     }
 
+    /// Admit one completed QG-6 attempt only when its exact canonical receipt,
+    /// bound evidence, and durably retained startup authority-set bytes verify
+    /// together.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid receipt or any missing, substituted, foreign, or
+    /// noncanonical evidence/authority-set input.
+    pub fn from_verified_qg6_bound_slices(
+        receipt_bytes: &[u8],
+        bound_evidence_bytes: &[u8],
+        qg6_authority_set_bytes: &[u8],
+    ) -> Result<Self, LocalPerfRunError> {
+        let receipt = Self::from_verified_slice(receipt_bytes)?;
+        receipt.verify_qg6_bound_evidence_and_authority_set(
+            bound_evidence_bytes,
+            qg6_authority_set_bytes,
+        )?;
+        Ok(receipt)
+    }
+
     /// Load and independently verify one exact attempt receipt.
     ///
     /// # Errors
@@ -1789,6 +1834,57 @@ impl LocalPerfAttemptReceipt {
         })?;
         self.verify_completed_runner_identity(identity)?;
         Ok(())
+    }
+
+    /// Prove that a completed QG-6 attempt binds both the exact admitted
+    /// evidence bytes and the exact canonical authority-set bytes durably
+    /// retained before the benchmark received its startup acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-QG-6 or failed attempts, substituted authority-set bytes,
+    /// foreign run/source/selection sets, substituted evidence, or evidence
+    /// that does not replay against every authority in the exact retained set.
+    pub fn verify_qg6_bound_evidence_and_authority_set(
+        &self,
+        bound_evidence_bytes: &[u8],
+        qg6_authority_set_bytes: &[u8],
+    ) -> Result<(), LocalPerfRunError> {
+        if self.gate != PerfGate::Qg6.label() || self.outcome != LocalPerfAttemptOutcome::Completed
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "only a completed QG-6 attempt can bind a startup authority set".to_owned(),
+            ));
+        }
+        let expected = self
+            .qg6_startup_authority_set_sha256
+            .as_deref()
+            .ok_or_else(|| {
+                LocalPerfRunError::Invalid(
+                    "completed QG-6 attempt omits its startup authority-set digest".to_owned(),
+                )
+            })?;
+        if sha256_hex(qg6_authority_set_bytes) != expected {
+            return Err(LocalPerfRunError::Invalid(
+                "QG-6 startup authority-set bytes differ from the sealed process receipt"
+                    .to_owned(),
+            ));
+        }
+        let set = Qg6StartupAuthoritySetV1::from_verified_slice(qg6_authority_set_bytes)
+            .map_err(LocalPerfRunError::Invalid)?;
+        if set.campaign_run_id() != self.run_id
+            || set.source_git_revision() != self.build.git_revision
+            || !set.source_worktree_clean()
+            || self.build.git_dirty
+            || set.selected_cell_ids() != self.selected_cell_ids
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "QG-6 startup authority set differs from the sealed attempt run, source, or selection"
+                    .to_owned(),
+            ));
+        }
+        let authorities = set.authority_refs();
+        self.verify_bound_evidence_against_authorities(bound_evidence_bytes, &[], &authorities)
     }
 
     /// Prove that exact pre-build booking-receipt bytes describe the same
@@ -2025,6 +2121,14 @@ impl LocalPerfAttemptReceipt {
         self.bound_evidence_sha256.as_deref()
     }
 
+    /// SHA-256 of the exact canonical QG-6 startup authority-set bytes
+    /// durably retained before the child received its final startup ACK.
+    /// Present only for completed QG-6 attempts.
+    #[must_use]
+    pub fn qg6_startup_authority_set_sha256(&self) -> Option<&str> {
+        self.qg6_startup_authority_set_sha256.as_deref()
+    }
+
     /// SHA-256 of the exact strict runner-receipt bytes admitted inside a
     /// completed bound-evidence artifact.
     #[must_use]
@@ -2053,6 +2157,10 @@ impl LocalPerfAttemptReceipt {
             || !is_sha256(&self.booking_receipt_sha256)
             || self
                 .run_log_sha256
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest))
+            || self
+                .qg6_startup_authority_set_sha256
                 .as_deref()
                 .is_some_and(|digest| !is_sha256(digest))
             || !is_sha256(&self.seal_sha256)
@@ -2100,12 +2208,21 @@ impl LocalPerfAttemptReceipt {
             expected_profile: self.profile,
             destination_basename: self.profile.latest_basename(&self.gate)?,
         };
+        // QG-5 preflight happens before the child can emit its final witnessed
+        // durability receipt. Recheck the pre-spawn envelope against that
+        // pending token, while `verify_completed_runner_identity` below still
+        // compares the final nested receipt with `self.durability`.
+        let preflight_durability = if gate == PerfGate::Qg5 {
+            qg5_pending_runner_durability()
+        } else {
+            self.durability.clone()
+        };
         registry.preflight(
             self.profile,
             self.hardware.clone(),
             self.execution_request.clone(),
             self.execution_start.clone(),
-            self.durability.clone(),
+            preflight_durability.clone(),
             &context,
         )?;
         if let Some(end) = &self.execution_end {
@@ -2114,7 +2231,7 @@ impl LocalPerfAttemptReceipt {
                 self.hardware.clone(),
                 self.execution_request.clone(),
                 end.clone(),
-                self.durability.clone(),
+                preflight_durability,
                 &context,
             )?;
         }
@@ -2166,12 +2283,23 @@ impl LocalPerfAttemptReceipt {
         let (expected_retry, unavailable) = attempt_derived_facts(self.outcome)?;
         match (
             self.outcome,
+            gate,
             self.bound_evidence_sha256.as_deref(),
+            self.qg6_startup_authority_set_sha256.as_deref(),
             self.runner_receipt_sha256.as_deref(),
             self.runner_artifact_manifest_sha256.as_deref(),
         ) {
-            (LocalPerfAttemptOutcome::Completed, Some(bound), Some(runner), Some(manifest))
-                if is_sha256(bound) && is_sha256(runner) && is_sha256(manifest) =>
+            (
+                LocalPerfAttemptOutcome::Completed,
+                PerfGate::Qg6,
+                Some(bound),
+                Some(qg6_authority_set),
+                Some(runner),
+                Some(manifest),
+            ) if is_sha256(bound)
+                && is_sha256(qg6_authority_set)
+                && is_sha256(runner)
+                && is_sha256(manifest) =>
             {
                 if self.execution_end.is_none()
                     || self.end_capture_error.is_some()
@@ -2186,16 +2314,41 @@ impl LocalPerfAttemptReceipt {
                     ));
                 }
             }
-            (LocalPerfAttemptOutcome::Completed, _, _, _) => {
+            (
+                LocalPerfAttemptOutcome::Completed,
+                _,
+                Some(bound),
+                None,
+                Some(runner),
+                Some(manifest),
+            ) if gate != PerfGate::Qg6
+                && is_sha256(bound)
+                && is_sha256(runner)
+                && is_sha256(manifest) =>
+            {
+                if self.execution_end.is_none()
+                    || self.end_capture_error.is_some()
+                    || !self.post_run_identity_verified
+                    || self.post_run_identity_error.is_some()
+                    || self.run_log_sha256.is_none()
+                    || self.finished_timestamp_error.is_some()
+                {
+                    return Err(LocalPerfRunError::Invalid(
+                        "completed attempt requires a terminal snapshot, verified post-run identity, and exact run log"
+                            .to_owned(),
+                    ));
+                }
+            }
+            (LocalPerfAttemptOutcome::Completed, _, _, _, _, _) => {
                 return Err(LocalPerfRunError::Invalid(
-                    "completed attempt must bind exact bound-evidence, runner-receipt, and artifact-manifest bytes"
+                    "completed attempt must bind exact evidence and runner bytes, with an authority-set digest exactly for QG-6"
                         .to_owned(),
                 ));
             }
-            (_, None, None, None) => {}
-            (_, _, _, _) => {
+            (_, _, None, None, None, None) => {}
+            (_, _, _, _, _, _) => {
                 return Err(LocalPerfRunError::Invalid(
-                    "failed attempt must not claim completed bound evidence or nested runner identities"
+                    "failed attempt must not claim completed evidence, QG-6 authority, or nested runner identities"
                         .to_owned(),
                 ));
             }
@@ -2814,7 +2967,7 @@ fn run_local_perf_command_inner(
         return Err(post_exit_rejection(stage)?);
     }
     if config.gate == PerfGate::Qg6
-        && (qg6_handshake_failure.is_some() || qg6_accepted_authorities.set.is_none())
+        && (qg6_handshake_failure.is_some() || qg6_accepted_authorities.retained.is_none())
     {
         return Err(post_exit_rejection(
             LocalPerfRejectionStage::AuthorityHandshake,
@@ -2952,6 +3105,17 @@ fn run_local_perf_command_inner(
     };
     let threshold_bytes = durable_child_artifacts.threshold_bytes;
     let evidence_bytes = durable_child_artifacts.evidence_bytes;
+    let qg5_witness_bytes = if config.gate == PerfGate::Qg5 {
+        match read_and_sync_child_artifact(
+            &run_directories.artifacts.handle,
+            QG5_DURABILITY_WITNESS_FILE_NAME,
+        ) {
+            Ok(bytes) => Some(bytes),
+            Err(stage) => return Err(post_exit_rejection(stage)?),
+        }
+    } else {
+        None
+    };
     let threshold = match read_canonical_threshold(&threshold_bytes) {
         Ok(threshold) => threshold,
         Err(_) => {
@@ -2987,6 +3151,37 @@ fn run_local_perf_command_inner(
             LocalPerfRejectionStage::ArtifactVerification,
         )?);
     }
+    let qg5_expected_census = if let Some(witness_bytes) = qg5_witness_bytes.as_deref() {
+        let expected = match Qg5ExpectedDurabilityCensus::from_evidence(
+            &config.run_id,
+            &run_selection.selected_cell_ids,
+            &evidence,
+        ) {
+            Ok(expected) => expected,
+            Err(_) => {
+                return Err(post_exit_rejection(
+                    LocalPerfRejectionStage::ArtifactVerification,
+                )?);
+            }
+        };
+        if Qg5DurabilityWitnessSet::from_verified_slice(witness_bytes)
+            .and_then(|witnesses| {
+                witnesses.verify_for_run_and_census(
+                    &config.run_id,
+                    &run_selection.selected_cell_ids,
+                    &expected,
+                )
+            })
+            .is_err()
+        {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::ArtifactVerification,
+            )?);
+        }
+        Some(expected)
+    } else {
+        None
+    };
 
     let artifact_manifest = match RunnerArtifactManifest::from_artifacts(
         &run_profile.applicability_plan,
@@ -3024,6 +3219,9 @@ fn run_local_perf_command_inner(
             )?);
         }
     };
+    let final_durability = qg5_witness_bytes
+        .as_deref()
+        .map_or_else(|| durability.clone(), qg5_post_exit_runner_durability);
     let receipt = RunnerReceipt {
         schema_version: RUNNER_RECEIPT_SCHEMA_VERSION.to_owned(),
         requested_profile: config.profile,
@@ -3037,7 +3235,7 @@ fn run_local_perf_command_inner(
             identity_sha256: String::new(),
         },
         build: captured_build.receipt.clone(),
-        durability: durability.clone(),
+        durability: final_durability.clone(),
         completion: RunnerCompletion {
             verified: true,
             exit_status: exit_code,
@@ -3056,7 +3254,23 @@ fn run_local_perf_command_inner(
             )?);
         }
     };
-    let identity = match registry.admit(&receipt_bytes, &context) {
+    let admission = match (qg5_witness_bytes.as_deref(), qg5_expected_census.as_ref()) {
+        (None, None) => registry.admit(&receipt_bytes, &context),
+        (Some(witness_bytes), Some(expected_census)) => registry.admit_qg5_post_exit(
+            &receipt_bytes,
+            &context,
+            &config.run_id,
+            &run_selection.selected_cell_ids,
+            witness_bytes,
+            expected_census,
+        ),
+        _ => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::ArtifactVerification,
+            )?);
+        }
+    };
+    let identity = match admission {
         Ok(identity) => identity,
         Err(_) => {
             return Err(post_exit_rejection(
@@ -3152,7 +3366,7 @@ fn run_local_perf_command_inner(
         config,
         &run_profile,
         &run_selection,
-        &durability,
+        &final_durability,
         &captured_build,
         &start,
         &end,
@@ -3160,6 +3374,7 @@ fn run_local_perf_command_inner(
         &bound_evidence_bytes,
         &qg1_expected_authorities,
         &qg6_expected_authorities,
+        qg6_accepted_authorities.canonical_bytes(),
         &run_log_bytes,
         process_lifecycle,
         root_process_identity,
@@ -3312,11 +3527,22 @@ fn run_local_perf_command_inner(
             }
         };
     if completed_attempt.verify_run_log(&run_log_bytes).is_err()
-        || completed_attempt
-            .verify_bound_evidence_against_authorities(
-                &persisted_bound,
-                &qg1_expected_authorities,
-                &qg6_expected_authorities,
+        || qg6_accepted_authorities
+            .canonical_bytes()
+            .map_or_else(
+                || {
+                    completed_attempt.verify_bound_evidence_against_authorities(
+                        &persisted_bound,
+                        &qg1_expected_authorities,
+                        &qg6_expected_authorities,
+                    )
+                },
+                |authority_set_bytes| {
+                    completed_attempt.verify_qg6_bound_evidence_and_authority_set(
+                        &persisted_bound,
+                        authority_set_bytes,
+                    )
+                },
             )
             .is_err()
         || verify_external_paths(&external_paths).is_err()
@@ -3358,10 +3584,20 @@ fn run_local_perf_command_inner(
     if persisted_attempt != completed_attempt_bytes
         || LocalPerfAttemptReceipt::from_verified_slice(&persisted_attempt)
             .and_then(|receipt| {
-                receipt.verify_bound_evidence_against_authorities(
-                    &persisted_bound,
-                    &qg1_expected_authorities,
-                    &qg6_expected_authorities,
+                qg6_accepted_authorities.canonical_bytes().map_or_else(
+                    || {
+                        receipt.verify_bound_evidence_against_authorities(
+                            &persisted_bound,
+                            &qg1_expected_authorities,
+                            &qg6_expected_authorities,
+                        )
+                    },
+                    |authority_set_bytes| {
+                        receipt.verify_qg6_bound_evidence_and_authority_set(
+                            &persisted_bound,
+                            authority_set_bytes,
+                        )
+                    },
                 )
             })
             .is_err()
@@ -3509,7 +3745,7 @@ fn validate_component(value: &str, field: &str) -> Result<(), LocalPerfRunError>
 }
 
 fn validate_platform_gate_policy(config: &LocalPerfRunConfig) -> Result<(), LocalPerfRunError> {
-    if matches!(config.gate, PerfGate::Qg3 | PerfGate::Qg4 | PerfGate::Qg5) {
+    if matches!(config.gate, PerfGate::Qg3 | PerfGate::Qg4) {
         return Err(LocalPerfRunError::Invalid(format!(
             "{} cannot run promotion-grade on any host until both benchmark arms emit a non-declarative symmetric durability-treatment witness",
             config.gate
@@ -4259,7 +4495,7 @@ fn try_read_bounded_qg6_startup_sidecar(
 fn persist_qg6_startup_authority_set(
     run: &PinnedDirectory,
     set: &Qg6StartupAuthoritySetV1,
-) -> Result<Qg6StartupAuthoritySetV1, LocalPerfRunError> {
+) -> Result<RetainedQg6AuthoritySet, LocalPerfRunError> {
     let canonical = set.to_json_bytes().map_err(LocalPerfRunError::Invalid)?;
     verify_pinned_directory(run)?;
     write_new_sync_at(&run.handle, Qg6StartupHandshakeV1::FILE_NAME, &canonical)?;
@@ -4277,7 +4513,10 @@ fn persist_qg6_startup_authority_set(
             "QG-6 startup authority set did not round-trip to the exact retained set".to_owned(),
         ));
     }
-    Ok(reloaded)
+    Ok(RetainedQg6AuthoritySet {
+        set: reloaded,
+        canonical_bytes: persisted,
+    })
 }
 
 /// Stable role identity for accepted keys, refusals, and persisted records.
@@ -4931,7 +5170,7 @@ fn wait_for_qg6_authority_child(
                         );
                     }
                 };
-                accepted.set = Some(retained);
+                accepted.retained = Some(retained);
                 let ack_result = child
                     .stdin
                     .take()
@@ -6094,11 +6333,14 @@ fn capture_platform(config: &LocalPerfRunConfig) -> Result<PlatformCapture, Loca
 }
 
 fn durability_for_run(config: &LocalPerfRunConfig) -> Result<RunnerDurability, LocalPerfRunError> {
-    if matches!(config.gate, PerfGate::Qg3 | PerfGate::Qg4 | PerfGate::Qg5) {
+    if matches!(config.gate, PerfGate::Qg3 | PerfGate::Qg4) {
         return Err(LocalPerfRunError::Invalid(format!(
             "{} is durability-adjacent and requires an observed symmetric treatment witness",
             config.gate
         )));
+    }
+    if config.gate == PerfGate::Qg5 {
+        return Ok(qg5_pending_runner_durability());
     }
     Ok(RunnerDurability {
         adjacent: false,
@@ -6990,25 +7232,26 @@ fn read_and_sync_child_artifacts(
     threshold_name: &str,
     evidence_name: &str,
 ) -> Result<DurableChildArtifacts, LocalPerfRejectionStage> {
-    let (threshold_file, threshold_bytes) =
-        read_file_with_handle_at(artifact_directory, threshold_name)
-            .map_err(|_| LocalPerfRejectionStage::ArtifactRead)?;
-    threshold_file
-        .sync_all()
-        .map_err(|_| LocalPerfRejectionStage::ArtifactDurability)?;
-    let (evidence_file, evidence_bytes) =
-        read_file_with_handle_at(artifact_directory, evidence_name)
-            .map_err(|_| LocalPerfRejectionStage::ArtifactRead)?;
-    evidence_file
-        .sync_all()
-        .map_err(|_| LocalPerfRejectionStage::ArtifactDurability)?;
-    artifact_directory
-        .sync_all()
-        .map_err(|_| LocalPerfRejectionStage::ArtifactDurability)?;
+    let threshold_bytes = read_and_sync_child_artifact(artifact_directory, threshold_name)?;
+    let evidence_bytes = read_and_sync_child_artifact(artifact_directory, evidence_name)?;
     Ok(DurableChildArtifacts {
         threshold_bytes,
         evidence_bytes,
     })
+}
+
+fn read_and_sync_child_artifact(
+    artifact_directory: &File,
+    name: &str,
+) -> Result<Vec<u8>, LocalPerfRejectionStage> {
+    let (file, bytes) = read_file_with_handle_at(artifact_directory, name)
+        .map_err(|_| LocalPerfRejectionStage::ArtifactRead)?;
+    file.sync_all()
+        .map_err(|_| LocalPerfRejectionStage::ArtifactDurability)?;
+    artifact_directory
+        .sync_all()
+        .map_err(|_| LocalPerfRejectionStage::ArtifactDurability)?;
+    Ok(bytes)
 }
 
 fn verify_environment_policy(
@@ -7181,6 +7424,7 @@ fn completed_attempt_receipt_bytes(
     bound_evidence_bytes: &[u8],
     external_qg1_authorities: &[&Qg1ExpectedAuthority],
     external_qg6_authorities: &[&Qg6ScheduleAuthority],
+    qg6_authority_set_bytes: Option<&[u8]>,
     run_log_bytes: &[u8],
     process_lifecycle: LocalPerfProcessLifecycle,
     root_process_identity: LocalPerfRootProcessIdentity,
@@ -7241,6 +7485,7 @@ fn completed_attempt_receipt_bytes(
         Some(bound_evidence_bytes),
         external_qg1_authorities,
         external_qg6_authorities,
+        qg6_authority_set_bytes,
         started_at_utc,
         finished_at_utc,
         None,
@@ -7289,6 +7534,7 @@ fn persist_attempt_receipt(
         completed_bound_evidence,
         &[],
         &[],
+        None,
         started_at_utc,
         finished_at_utc,
         finished_timestamp_error,
@@ -7324,11 +7570,53 @@ fn build_attempt_receipt_bytes(
     completed_bound_evidence: Option<&[u8]>,
     external_qg1_authorities: &[&Qg1ExpectedAuthority],
     external_qg6_authorities: &[&Qg6ScheduleAuthority],
+    qg6_authority_set_bytes: Option<&[u8]>,
     started_at_utc: &str,
     finished_at_utc: &str,
     finished_timestamp_error: Option<String>,
 ) -> Result<Vec<u8>, LocalPerfRunError> {
     let (retry, unavailable) = attempt_derived_facts(outcome)?;
+    let qg6_startup_authority_set_sha256 = match (
+        config.gate,
+        outcome,
+        completed_bound_evidence,
+        qg6_authority_set_bytes,
+    ) {
+        (PerfGate::Qg6, LocalPerfAttemptOutcome::Completed, Some(_), Some(authority_set_bytes)) => {
+            let set = Qg6StartupAuthoritySetV1::from_verified_slice(authority_set_bytes)
+                .map_err(LocalPerfRunError::Invalid)?;
+            if set.campaign_run_id() != config.run_id
+                || set.source_git_revision() != build.revision
+                || !set.source_worktree_clean()
+                || build.receipt.git_dirty
+                || set.selected_cell_ids() != run_selection.selected_cell_ids
+            {
+                return Err(LocalPerfRunError::Invalid(
+                    "completed QG-6 authority set differs from the frozen runner run, source, or selection"
+                        .to_owned(),
+                ));
+            }
+            Some(sha256_hex(authority_set_bytes))
+        }
+        (PerfGate::Qg6, LocalPerfAttemptOutcome::Completed, _, _) => {
+            return Err(LocalPerfRunError::Invalid(
+                "completed QG-6 attempt requires exact evidence and retained authority-set bytes"
+                    .to_owned(),
+            ));
+        }
+        (_, LocalPerfAttemptOutcome::Completed, Some(_), None) => None,
+        (_, LocalPerfAttemptOutcome::Completed, _, Some(_)) => {
+            return Err(LocalPerfRunError::Invalid(
+                "non-QG-6 completed attempt cannot bind a QG-6 authority set".to_owned(),
+            ));
+        }
+        (_, _, _, None) => None,
+        (_, _, _, Some(_)) => {
+            return Err(LocalPerfRunError::Invalid(
+                "failed attempt cannot bind a QG-6 authority set".to_owned(),
+            ));
+        }
+    };
     let (bound_evidence_sha256, runner_receipt_sha256, runner_artifact_manifest_sha256) =
         if let Some(bound_evidence_bytes) = completed_bound_evidence {
             let evidence = PerfEvidenceArtifact::from_verified_slice_against_authorities(
@@ -7393,6 +7681,7 @@ fn build_attempt_receipt_bytes(
         ],
         run_log_sha256: run_log_bytes.map(sha256_hex),
         bound_evidence_sha256,
+        qg6_startup_authority_set_sha256,
         runner_receipt_sha256,
         runner_artifact_manifest_sha256,
         started_at_utc: started_at_utc.to_owned(),
@@ -7406,11 +7695,18 @@ fn build_attempt_receipt_bytes(
         verified.verify_run_log(run_log_bytes)?;
     }
     if let Some(bound_evidence_bytes) = completed_bound_evidence {
-        verified.verify_bound_evidence_against_authorities(
-            bound_evidence_bytes,
-            external_qg1_authorities,
-            external_qg6_authorities,
-        )?;
+        if let Some(authority_set_bytes) = qg6_authority_set_bytes {
+            verified.verify_qg6_bound_evidence_and_authority_set(
+                bound_evidence_bytes,
+                authority_set_bytes,
+            )?;
+        } else {
+            verified.verify_bound_evidence_against_authorities(
+                bound_evidence_bytes,
+                external_qg1_authorities,
+                external_qg6_authorities,
+            )?;
+        }
     }
     Ok(receipt_bytes)
 }
@@ -8354,6 +8650,7 @@ pub fn completed_attempt_receipt_for_test(
         ],
         run_log_sha256: Some(sha256_hex(run_log_bytes)),
         bound_evidence_sha256: Some(sha256_hex(bound_bytes)),
+        qg6_startup_authority_set_sha256: None,
         runner_receipt_sha256: Some(identity.receipt_sha256().to_owned()),
         runner_artifact_manifest_sha256: Some(manifest.manifest_sha256().to_owned()),
         started_at_utc: runner.completion.started_at_utc,
@@ -8418,6 +8715,7 @@ pub fn failed_attempt_receipt_for_test(
         pending_zero: unavailable,
     };
     receipt.bound_evidence_sha256 = None;
+    receipt.qg6_startup_authority_set_sha256 = None;
     receipt.runner_receipt_sha256 = None;
     receipt.runner_artifact_manifest_sha256 = None;
     let bytes = seal_attempt_receipt(receipt).expect("seal failed H2 test receipt");
@@ -8526,6 +8824,10 @@ mod tests {
             "candidate-1".to_owned(),
             "d".repeat(40),
             true,
+            vec![
+                "QG-6/phrase-k10-100k/latency_ms".to_owned(),
+                "QG-6/boolean-k10-100k/latency_ms".to_owned(),
+            ],
             BTreeMap::from([
                 (
                     "QG-6/boolean-k10-100k/latency_ms".to_owned(),
@@ -8538,6 +8840,44 @@ mod tests {
             ]),
         )
         .expect("construct canonical QG-6 startup authority set")
+    }
+
+    fn qg6_test_set_for_cells(
+        run_id: &str,
+        revision: &str,
+        cell_ids: &[String],
+        salt: u64,
+    ) -> Qg6StartupAuthoritySetV1 {
+        let authorities = cell_ids
+            .iter()
+            .enumerate()
+            .map(|(index, cell_id)| {
+                let seed = salt + u64::try_from(index).expect("QG-6 test index fits u64");
+                let authority = Qg6ScheduleAuthority::for_experiment(
+                    crate::qg6_prepared::Qg6ExperimentIdentity {
+                        corpus_sha256: format!("{seed:064x}"),
+                        query_manifest_sha256: format!("{:064x}", seed + 1),
+                        config_contract_sha256: format!("{:064x}", seed + 2),
+                        document_count: 100_000,
+                        k: 10,
+                    },
+                    1,
+                    2,
+                    1,
+                    seed + 3,
+                )
+                .expect("construct cell-unique QG-6 authority");
+                (cell_id.clone(), authority)
+            })
+            .collect();
+        Qg6StartupAuthoritySetV1::new(
+            run_id.to_owned(),
+            revision.to_owned(),
+            true,
+            cell_ids.to_vec(),
+            authorities,
+        )
+        .expect("construct selection-complete QG-6 authority set")
     }
 
     fn retained_test_directory(prefix: &str) -> PinnedDirectory {
@@ -8563,11 +8903,21 @@ mod tests {
     }
 
     #[test]
-    fn qg6_startup_authority_set_rejects_absent_wrong_duplicate_swapped_and_malformed_inputs() {
+    fn qg6_startup_authority_set_preserves_runner_selection_order() {
         let valid = qg6_test_set();
+        let expected_runner_order = vec![
+            "QG-6/phrase-k10-100k/latency_ms".to_owned(),
+            "QG-6/boolean-k10-100k/latency_ms".to_owned(),
+        ];
+        let lexical_map_order = valid.authorities.keys().cloned().collect::<Vec<_>>();
+        assert_ne!(
+            valid.selected_cell_ids, lexical_map_order,
+            "the retained runner-selection order must not be rewritten into BTreeMap key order"
+        );
+        assert_eq!(valid.selected_cell_ids, expected_runner_order);
         let selection = ResolvedRunSelection {
             fixture: None,
-            selected_cell_ids: valid.selected_cell_ids.clone(),
+            selected_cell_ids: expected_runner_order,
         };
         validate_qg6_startup_authority_set_for_run(
             &valid,
@@ -8577,6 +8927,15 @@ mod tests {
             true,
         )
         .expect("exact retained QG-6 set binds its run and source");
+    }
+
+    #[test]
+    fn qg6_startup_authority_set_rejects_absent_wrong_duplicate_swapped_and_malformed_inputs() {
+        let valid = qg6_test_set();
+        let selection = ResolvedRunSelection {
+            fixture: None,
+            selected_cell_ids: valid.selected_cell_ids.clone(),
+        };
 
         let absent = AcceptedQg6Authorities::new();
         assert!(absent.authority_refs().is_empty());
@@ -8616,6 +8975,10 @@ mod tests {
             "candidate-1".to_owned(),
             "d".repeat(40),
             true,
+            vec![
+                "QG-6/phrase-k10-100k/latency_ms".to_owned(),
+                "QG-6/boolean-k10-100k/latency_ms".to_owned(),
+            ],
             BTreeMap::from([
                 (
                     "QG-6/boolean-k10-100k/latency_ms".to_owned(),
@@ -8728,7 +9091,11 @@ mod tests {
         assert_eq!(wait_error, None);
         assert_eq!(recovery, LocalPerfProcessGroupRecovery::NotRequired);
         assert!(failure.is_none());
-        assert_eq!(accepted.set.as_ref(), Some(&set));
+        assert_eq!(
+            accepted.retained.as_ref().map(|retained| &retained.set),
+            Some(&set)
+        );
+        assert_eq!(accepted.canonical_bytes(), Some(set_bytes.as_slice()));
         assert_eq!(echoed_ack, Qg6StartupHandshakeV1::final_ack_frame());
         let persisted = read_file_at(&directories.run.handle, Qg6StartupHandshakeV1::FILE_NAME)
             .expect("reread parent-retained QG-6 set after child exit");
@@ -8751,7 +9118,7 @@ mod tests {
             .find("persist_qg6_startup_authority_set(")
             .expect("durable authority publication");
         let reread = body
-            .find("accepted.set = Some(retained);")
+            .find("accepted.retained = Some(retained);")
             .expect("verified durable set retention");
         let acknowledge = body
             .find("write_all(&Qg6StartupHandshakeV1::final_ack_frame())")
@@ -10299,6 +10666,7 @@ mod tests {
                 .run_log_captured
                 .then(|| sha256_hex(&run_log_bytes)),
             bound_evidence_sha256: bound_evidence_bytes.map(sha256_hex),
+            qg6_startup_authority_set_sha256: None,
             runner_receipt_sha256: completed.then(|| identity.receipt_sha256().to_owned()),
             runner_artifact_manifest_sha256: completed.then_some(manifest_sha256),
             started_at_utc,
@@ -10340,7 +10708,7 @@ mod tests {
 
             let error = validate_platform_gate_policy(&config)
                 .expect_err("every current M4 promotion path must reject");
-            if matches!(gate, PerfGate::Qg3 | PerfGate::Qg4 | PerfGate::Qg5) {
+            if matches!(gate, PerfGate::Qg3 | PerfGate::Qg4) {
                 assert!(error.to_string().contains("any host"));
             } else {
                 assert!(error.to_string().contains("actual executing image"));
@@ -10357,6 +10725,55 @@ mod tests {
                 assert!(error.to_string().contains("does not attest a live M4 host"));
             }
         }
+    }
+
+    #[test]
+    fn qg5_registered_host_defers_durability_admission_until_post_exit_witnesses() {
+        let config = LocalPerfRunConfig {
+            gate: PerfGate::Qg5,
+            profile: profile(
+                HardwareClassId::TrjZen35995wx,
+                ExecutionProfileId::Physical64,
+            ),
+            run_id: "qg5-post-exit-test".to_owned(),
+            run_window: "window-1".to_owned(),
+            measurement_runs: MIN_MEASUREMENT_RUNS,
+            output_dir: PathBuf::from("/tmp/frankensearch-qg5-post-exit-test"),
+        };
+        validate_platform_gate_policy(&config)
+            .expect("registered QG-5 host may reach post-exit witness verification");
+        assert_eq!(
+            durability_for_run(&config).expect("QG-5 pending durability token"),
+            qg5_pending_runner_durability(),
+            "the pre-spawn receipt cannot claim a witness the child has not emitted"
+        );
+    }
+
+    #[test]
+    fn completed_qg5_attempt_self_verification_uses_pending_preflight_durability() {
+        let (mut attempt, _, _) = attempt_fixture(
+            LocalPerfAttemptOutcome::Completed,
+            Some(b"QG-5 bound evidence"),
+        );
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        let plan = PerfMatrixSpec::complete()
+            .applicability_plan(&registry, attempt.profile, PerfGate::Qg5)
+            .expect("canonical QG-5 plan");
+        let final_durability = qg5_post_exit_runner_durability(b"sealed QG-5 arm witnesses");
+        assert_ne!(final_durability, qg5_pending_runner_durability());
+
+        attempt.gate = PerfGate::Qg5.label().to_owned();
+        attempt.applicability_plan = plan.binding().clone();
+        attempt.selected_cell_ids = selected_cell_ids(&plan);
+        attempt.execution_request.max_exercised_cell_width = plan
+            .max_exercised_cell_width
+            .expect("QG-5 registered profile has a width bound");
+        attempt.durability = final_durability.clone();
+
+        let bytes = seal_attempt_receipt(attempt).expect("seal completed QG-5 attempt");
+        let verified = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+            .expect("completed QG-5 receipt reuses pending durability only for preflight");
+        assert_eq!(verified.durability, final_durability);
     }
 
     #[test]
@@ -11489,6 +11906,148 @@ mod tests {
         ] {
             assert!(attempt_derived_facts(outcome).is_err());
         }
+    }
+
+    #[test]
+    fn qg6_attempt_receipt_requires_only_the_exact_pre_timing_authority_set() {
+        let (evidence, bound, authority) =
+            crate::perf_evidence::qg6_test_fixture::verified_terminal_artifact();
+        let identity = evidence
+            .machine_class
+            .identity()
+            .expect("terminal QG-6 evidence has a runner identity")
+            .clone();
+        let runner: RunnerReceipt =
+            serde_json::from_str(identity.receipt_json()).expect("QG-6 runner receipt JSON");
+        let selected_cell_ids = evidence_cell_ids(&evidence);
+        assert_eq!(selected_cell_ids.len(), 1, "focused QG-6 terminal fixture");
+        let retained = Qg6StartupAuthoritySetV1::new(
+            evidence.provenance.run_id.clone(),
+            evidence.provenance.build.git_revision.clone(),
+            true,
+            selected_cell_ids.clone(),
+            BTreeMap::from([(selected_cell_ids[0].clone(), authority)]),
+        )
+        .expect("selection-complete retained QG-6 authority set");
+        let retained_bytes = retained.to_json_bytes().expect("canonical retained set");
+        let retained_sha256 = sha256_hex(&retained_bytes);
+
+        let (mut completed, _, _) =
+            attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(&bound));
+        completed.gate = PerfGate::Qg6.label().to_owned();
+        completed.profile = identity.profile();
+        completed.applicability_plan = evidence.applicability_plan.clone();
+        completed.fixture_selector = Some(evidence.cells[0].spec.fixture.clone());
+        completed.selected_cell_ids = selected_cell_ids;
+        completed.run_id = evidence.provenance.run_id.clone();
+        completed.run_window = evidence.provenance.run_window.clone();
+        completed.hardware = runner.hardware.clone();
+        completed.execution_request = runner.execution.request.clone();
+        completed.execution_start = runner.execution.start.clone();
+        completed.execution_end = Some(runner.execution.end.clone());
+        completed.build = runner.build.clone();
+        completed.durability = runner.durability.clone();
+        completed.run_log_sha256 = Some(sha256_hex(b"runner-log:qg6-primary"));
+        completed.bound_evidence_sha256 = Some(sha256_hex(&bound));
+        completed.qg6_startup_authority_set_sha256 = Some(retained_sha256.clone());
+        completed.runner_receipt_sha256 = Some(identity.receipt_sha256().to_owned());
+        completed.runner_artifact_manifest_sha256 = Some(
+            identity
+                .artifact_manifest()
+                .expect("QG-6 runner artifact manifest")
+                .manifest_sha256()
+                .to_owned(),
+        );
+        completed.started_at_utc = runner.completion.started_at_utc;
+        completed.finished_at_utc = runner.completion.finished_at_utc;
+        let completed_bytes =
+            seal_attempt_receipt(completed.clone()).expect("seal completed QG-6 attempt");
+        let verified = LocalPerfAttemptReceipt::from_verified_qg6_bound_slices(
+            &completed_bytes,
+            &bound,
+            &retained_bytes,
+        )
+        .expect("completed QG-6 receipt admits exact evidence and retained authority set");
+        assert_eq!(
+            verified.qg6_startup_authority_set_sha256(),
+            Some(retained_sha256.as_str())
+        );
+
+        let mut mutated_evidence = bound.clone();
+        let last = mutated_evidence
+            .last_mut()
+            .expect("nonempty canonical QG-6 evidence");
+        *last ^= 1;
+        assert!(
+            LocalPerfAttemptReceipt::from_verified_qg6_bound_slices(
+                &completed_bytes,
+                &mutated_evidence,
+                &retained_bytes,
+            )
+            .is_err(),
+            "terminal admission must reject mutated QG-6 evidence"
+        );
+
+        let reconstructed = qg6_test_set_for_cells(
+            &completed.run_id,
+            &completed.build.git_revision,
+            &completed.selected_cell_ids,
+            10_000,
+        );
+        let reconstructed_bytes = reconstructed
+            .to_json_bytes()
+            .expect("canonical postmeasurement reconstruction");
+        let reconstruction_error = LocalPerfAttemptReceipt::from_verified_qg6_bound_slices(
+            &completed_bytes,
+            &bound,
+            &reconstructed_bytes,
+        )
+        .expect_err("postmeasurement authority reconstruction must not replace retained bytes");
+        assert!(
+            reconstruction_error
+                .to_string()
+                .contains("authority-set bytes differ from the sealed process receipt")
+        );
+
+        let mut missing = completed.clone();
+        missing.qg6_startup_authority_set_sha256 = None;
+        let missing_bytes =
+            seal_attempt_receipt(missing).expect("reseal missing QG-6 authority digest");
+        assert!(
+            LocalPerfAttemptReceipt::from_verified_slice(&missing_bytes).is_err(),
+            "resealed completed QG-6 receipt without its authority digest must refuse"
+        );
+
+        let (mut non_qg6, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(&bound));
+        non_qg6.qg6_startup_authority_set_sha256 = Some(retained_sha256);
+        let non_qg6_bytes = seal_attempt_receipt(non_qg6).expect("reseal non-QG-6 authority claim");
+        assert!(
+            LocalPerfAttemptReceipt::from_verified_slice(&non_qg6_bytes).is_err(),
+            "completed non-QG-6 receipt must require no QG-6 authority digest"
+        );
+
+        let mut failed = completed;
+        let failed_outcome = LocalPerfAttemptOutcome::ExitedNonzero { code: 1 };
+        let (failed_retry, unavailable) =
+            attempt_derived_facts(failed_outcome).expect("valid failed QG-6 outcome");
+        failed.outcome = failed_outcome;
+        failed.retry = failed_retry;
+        failed.bound_evidence_sha256 = None;
+        failed.runner_receipt_sha256 = None;
+        failed.runner_artifact_manifest_sha256 = None;
+        failed.internal_lifecycle_gaps = LocalPerfInternalLifecycleGaps {
+            actual_work: unavailable,
+            queue: unavailable,
+            workers_joined: unavailable,
+            feed_drained: unavailable,
+            pending_zero: unavailable,
+        };
+        let failed_bytes =
+            seal_attempt_receipt(failed).expect("reseal failed QG-6 authority claim");
+        assert!(
+            LocalPerfAttemptReceipt::from_verified_slice(&failed_bytes).is_err(),
+            "every noncompleted QG-6 receipt must require no authority digest"
+        );
     }
 
     #[test]

@@ -12,13 +12,14 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use frankensearch_quill_gauntlet::{
-    ExecutionProfileId, HardwareClassId, MachineClassAdmissionContext, MachineClassRegistry,
-    MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES,
-    PERF_EVIDENCE_SCHEMA_VERSION, PERF_HISTORY_POINTER_SCHEMA_VERSION, PerfEvidenceArtifact,
-    PerfEvidenceFile, PerfGate, PerfGateArtifact, PerfGateDecision, PerfRatchetMode,
-    PerfRatchetQg1AuthoritySets, PerfRatchetQg6AuthoritySets, PerfRatchetRequest,
-    Qg1AuthorityRegisterEntryV1, Qg1ExpectedAuthority, Qg1StartupHandshakeV1, Qg1TargetPinV1,
-    Qg6ScheduleAuthority, Qg6StartupAuthoritySetV1, Qg6StartupHandshakeV1, VerifiedRunnerIdentity,
+    ExecutionProfileId, HardwareClassId, LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+    LocalPerfAttemptReceipt, MachineClassAdmissionContext, MachineClassRegistry, MachineProfileKey,
+    PERF_ARTIFACT_SCHEMA_VERSION, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES, PERF_EVIDENCE_SCHEMA_VERSION,
+    PERF_HISTORY_POINTER_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile, PerfGate,
+    PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetQg1AuthoritySets,
+    PerfRatchetQg6AuthoritySets, PerfRatchetRequest, Qg1AuthorityRegisterEntryV1,
+    Qg1ExpectedAuthority, Qg1StartupHandshakeV1, Qg1TargetPinV1, Qg6ScheduleAuthority,
+    Qg6StartupAuthoritySetV1, Qg6StartupHandshakeV1, VerifiedRunnerIdentity,
     evaluate_perf_ratchet_against_authorities, is_explicit_bootstrap, is_explicit_bootstrap_for,
     perf_manifest_contract_sha256,
 };
@@ -43,6 +44,9 @@ Usage:
     [--baseline-qg6-authority-set <baseline.qg6-authorities.json>] \\
     [--candidate-qg6-authority-set <candidate.qg6-authorities.json>] \\
     [--rerun-qg6-authority-set <rerun.qg6-authorities.json>] \\
+    [--baseline-qg6-attempt-receipt <baseline.attempt.json>] \\
+    [--candidate-qg6-attempt-receipt <candidate.attempt.json>] \\
+    [--rerun-qg6-attempt-receipt <rerun.attempt.json>] \\
     [--candidate-runner-receipt <candidate.runner.json>] \\
     [--rerun-runner-receipt <rerun.runner.json>] \\
     [--candidate-artifact-manifest <candidate.artifacts.json>] \\
@@ -63,6 +67,7 @@ Exit status: 0=Allow, 1=Block, 2=Quarantine, 64=invalid invocation.";
 type LoadedEvidence = (PerfEvidenceArtifact, Vec<u8>);
 type AdmittedRunnerReceipt = (VerifiedRunnerIdentity, Vec<u8>, Vec<u8>, Vec<u8>);
 type LoadedQg6AuthoritySet = (Qg6StartupAuthoritySetV1, Vec<u8>, PerfEvidenceFile);
+type LoadedQg6AttemptReceipt = (LocalPerfAttemptReceipt, Vec<u8>, PerfEvidenceFile);
 
 fn current_bootstrap_basename(gate: PerfGate) -> String {
     let Some(version) = PERF_ARTIFACT_SCHEMA_VERSION.strip_prefix("quill-perf-artifact-") else {
@@ -103,6 +108,9 @@ struct Args {
     baseline_qg6_authority_set: Option<PathBuf>,
     candidate_qg6_authority_set: Option<PathBuf>,
     rerun_qg6_authority_set: Option<PathBuf>,
+    baseline_qg6_attempt_receipt: Option<PathBuf>,
+    candidate_qg6_attempt_receipt: Option<PathBuf>,
+    rerun_qg6_attempt_receipt: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +130,14 @@ struct HistoryPointer {
     threshold_sha256: String,
     evidence_file: String,
     evidence_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qg6_authority_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qg6_authority_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qg6_attempt_receipt_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qg6_attempt_receipt_sha256: Option<String>,
 }
 
 #[derive(Debug)]
@@ -131,6 +147,10 @@ struct LoadedBaseline {
     artifact_path: PathBuf,
     evidence_bytes: Option<Vec<u8>>,
     evidence_path: Option<PathBuf>,
+    qg6_authority_bytes: Option<Vec<u8>>,
+    qg6_authority_path: Option<PathBuf>,
+    qg6_attempt_receipt_bytes: Option<Vec<u8>>,
+    qg6_attempt_receipt_path: Option<PathBuf>,
     pointer: Option<(PathBuf, Vec<u8>)>,
 }
 
@@ -432,6 +452,8 @@ struct HistoryPublicationPlan {
     evidence_bytes: Vec<u8>,
     rolling_qg6_authority: Option<PathBuf>,
     qg6_authority_bytes: Option<Vec<u8>>,
+    rolling_qg6_attempt_receipt: Option<PathBuf>,
+    qg6_attempt_receipt_bytes: Option<Vec<u8>>,
     latest_pointer: PathBuf,
     pointer_bytes: Vec<u8>,
 }
@@ -479,6 +501,10 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     let baseline_artifact_path = loaded_baseline.artifact_path;
     let baseline_evidence_bytes = loaded_baseline.evidence_bytes;
     let baseline_evidence_path = loaded_baseline.evidence_path;
+    let baseline_history_qg6_authority_bytes = loaded_baseline.qg6_authority_bytes;
+    let baseline_history_qg6_authority_path = loaded_baseline.qg6_authority_path;
+    let baseline_history_qg6_attempt_receipt_bytes = loaded_baseline.qg6_attempt_receipt_bytes;
+    let baseline_history_qg6_attempt_receipt_path = loaded_baseline.qg6_attempt_receipt_path;
     let baseline_pointer = loaded_baseline.pointer;
     let (candidate, candidate_bytes) = read_artifact(&args.candidate)?;
     let candidate_evidence_bytes = args
@@ -541,12 +567,28 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     let candidate_authority_refs = candidate_authorities.iter().collect::<Vec<_>>();
     let rerun_authority_refs = rerun_authorities.iter().collect::<Vec<_>>();
 
-    let baseline_qg6_set = resolve_arm_qg6_authority_set(
-        "baseline",
+    let baseline_qg6_set = match (
+        baseline_history_qg6_authority_path.as_deref(),
+        baseline_history_qg6_authority_bytes,
         args.baseline_qg6_authority_set.as_deref(),
-        &baseline,
-        baseline_evidence_bytes.is_some(),
-    )?;
+    ) {
+        (Some(path), Some(bytes), None) => Some(load_qg6_authority_set_from_bytes(
+            "baseline", path, bytes, &baseline,
+        )?),
+        (Some(_), Some(_), Some(_)) => {
+            return Err(
+                "a QG-6 history-pointer baseline resolves its own authority set; omit --baseline-qg6-authority-set"
+                    .into(),
+            );
+        }
+        (None, None, explicit) => resolve_arm_qg6_authority_set(
+            "baseline",
+            explicit,
+            &baseline,
+            baseline_evidence_bytes.is_some(),
+        )?,
+        _ => return Err("loaded baseline QG-6 authority path/bytes are incomplete".into()),
+    };
     let candidate_qg6_set = resolve_arm_qg6_authority_set(
         "candidate",
         args.candidate_qg6_authority_set.as_deref(),
@@ -562,6 +604,58 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         )?,
         None if args.rerun_qg6_authority_set.is_some() => {
             return Err("--rerun-qg6-authority-set requires --rerun and --rerun-evidence".into());
+        }
+        None => None,
+    };
+    let baseline_qg6_attempt = match (
+        baseline_history_qg6_attempt_receipt_path.as_deref(),
+        baseline_history_qg6_attempt_receipt_bytes,
+        args.baseline_qg6_attempt_receipt.as_deref(),
+    ) {
+        (Some(path), Some(bytes), None) => Some(load_qg6_attempt_receipt_from_bytes(
+            "baseline",
+            path,
+            bytes,
+            &baseline,
+            baseline_evidence_bytes
+                .as_deref()
+                .ok_or("QG-6 history-pointer baseline omitted its retained evidence")?,
+            baseline_qg6_set
+                .as_ref()
+                .ok_or("QG-6 history-pointer baseline omitted its retained authority set")?,
+        )?),
+        (Some(_), Some(_), Some(_)) => {
+            return Err(
+                "a QG-6 history-pointer baseline resolves its own attempt receipt; omit --baseline-qg6-attempt-receipt"
+                    .into(),
+            );
+        }
+        (None, None, explicit) => resolve_arm_qg6_attempt_receipt(
+            "baseline",
+            explicit,
+            &baseline,
+            baseline_evidence_bytes.as_deref(),
+            baseline_qg6_set.as_ref(),
+        )?,
+        _ => return Err("loaded baseline QG-6 attempt-receipt path/bytes are incomplete".into()),
+    };
+    let candidate_qg6_attempt = resolve_arm_qg6_attempt_receipt(
+        "candidate",
+        args.candidate_qg6_attempt_receipt.as_deref(),
+        &candidate,
+        candidate_evidence_bytes.as_deref(),
+        candidate_qg6_set.as_ref(),
+    )?;
+    let rerun_qg6_attempt = match rerun.as_ref() {
+        Some((artifact, _)) => resolve_arm_qg6_attempt_receipt(
+            "rerun",
+            args.rerun_qg6_attempt_receipt.as_deref(),
+            artifact,
+            rerun_evidence_bytes.as_deref(),
+            rerun_qg6_set.as_ref(),
+        )?,
+        None if args.rerun_qg6_attempt_receipt.is_some() => {
+            return Err("--rerun-qg6-attempt-receipt requires --rerun and --rerun-evidence".into());
         }
         None => None,
     };
@@ -615,6 +709,24 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         (None, None) => None,
         _ => return Err("rerun evidence path/bytes are incomplete".into()),
     };
+    let candidate_qg6_bound_identity = (args.mode == PerfRatchetMode::Promotion
+        && candidate.gate == PerfGate::Qg6)
+        .then(|| {
+            candidate_evidence
+                .as_ref()
+                .and_then(|(artifact, _)| artifact.machine_class.identity())
+                .cloned()
+        })
+        .flatten();
+    let rerun_qg6_bound_identity = (args.mode == PerfRatchetMode::Promotion
+        && candidate.gate == PerfGate::Qg6)
+        .then(|| {
+            rerun_evidence
+                .as_ref()
+                .and_then(|(artifact, _)| artifact.machine_class.identity())
+                .cloned()
+        })
+        .flatten();
     let candidate_runner = read_runner_identity(
         registry.as_ref(),
         args.candidate_runner_receipt.as_deref(),
@@ -626,6 +738,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         candidate_evidence
             .as_ref()
             .map(|(_, bytes)| bytes.as_slice()),
+        candidate_qg6_bound_identity.as_ref(),
     )?;
     let rerun_runner = read_runner_identity(
         registry.as_ref(),
@@ -636,28 +749,53 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         args.machine_profile,
         rerun.as_ref().map(|(_, bytes)| bytes.as_slice()),
         rerun_evidence.as_ref().map(|(_, bytes)| bytes.as_slice()),
+        rerun_qg6_bound_identity.as_ref(),
     )?;
     let candidate_evidence_source = candidate_evidence.as_ref().map(|(_, bytes)| bytes.clone());
     let rerun_evidence_source = rerun_evidence.as_ref().map(|(_, bytes)| bytes.clone());
     if args.mode == PerfRatchetMode::Promotion {
-        bind_evidence_to_runner(
+        if candidate.gate == PerfGate::Qg6 {
+            if candidate_qg6_attempt.is_none() || rerun_qg6_attempt.is_none() {
+                return Err(
+                    "QG-6 promotion requires attempt-bound candidate and rerun evidence".into(),
+                );
+            }
+        } else {
+            bind_evidence_to_runner(
+                "candidate",
+                &candidate_bytes,
+                &mut candidate_evidence,
+                candidate_runner.as_ref(),
+                &candidate_authority_refs,
+                &candidate_qg6_refs,
+            )?;
+            bind_evidence_to_runner(
+                "rerun",
+                rerun
+                    .as_ref()
+                    .map(|(_, bytes)| bytes.as_slice())
+                    .ok_or("promotion rerun bytes are missing")?,
+                &mut rerun_evidence,
+                rerun_runner.as_ref(),
+                &rerun_authority_refs,
+                &rerun_qg6_refs,
+            )?;
+        }
+    }
+    if candidate.gate == PerfGate::Qg6 {
+        verify_qg6_consumed_evidence_bytes(
             "candidate",
-            &candidate_bytes,
-            &mut candidate_evidence,
-            candidate_runner.as_ref(),
-            &candidate_authority_refs,
-            &candidate_qg6_refs,
+            candidate_evidence_source.as_deref(),
+            candidate_evidence.as_ref(),
+            candidate_qg6_attempt.as_ref(),
+            candidate_qg6_set.as_ref(),
         )?;
-        bind_evidence_to_runner(
+        verify_qg6_consumed_evidence_bytes(
             "rerun",
-            rerun
-                .as_ref()
-                .map(|(_, bytes)| bytes.as_slice())
-                .ok_or("promotion rerun bytes are missing")?,
-            &mut rerun_evidence,
-            rerun_runner.as_ref(),
-            &rerun_authority_refs,
-            &rerun_qg6_refs,
+            rerun_evidence_source.as_deref(),
+            rerun_evidence.as_ref(),
+            rerun_qg6_attempt.as_ref(),
+            rerun_qg6_set.as_ref(),
         )?;
     }
 
@@ -803,6 +941,16 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     {
         evaluation.evidence.push(set.2.clone());
     }
+    for attempt in [
+        baseline_qg6_attempt.as_ref(),
+        candidate_qg6_attempt.as_ref(),
+        rerun_qg6_attempt.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        evaluation.evidence.push(attempt.2.clone());
+    }
 
     let history_plan = plan_history_if_allowed(
         &args,
@@ -813,6 +961,9 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
             .as_ref()
             .map(|(_, bytes)| bytes.as_slice()),
         candidate_qg6_set
+            .as_ref()
+            .map(|(_, bytes, _)| bytes.as_slice()),
+        candidate_qg6_attempt
             .as_ref()
             .map(|(_, bytes, _)| bytes.as_slice()),
         candidate_runner
@@ -907,6 +1058,9 @@ where
     let mut baseline_qg6_authority_set = None;
     let mut candidate_qg6_authority_set = None;
     let mut rerun_qg6_authority_set = None;
+    let mut baseline_qg6_attempt_receipt = None;
+    let mut candidate_qg6_attempt_receipt = None;
+    let mut rerun_qg6_attempt_receipt = None;
 
     while let Some(flag) = values.next() {
         match flag.to_string_lossy().as_ref() {
@@ -975,6 +1129,26 @@ where
                 let path = PathBuf::from(next_value(&mut values, "--rerun-qg6-authority-set")?);
                 if rerun_qg6_authority_set.replace(path).is_some() {
                     return Err("duplicate --rerun-qg6-authority-set".into());
+                }
+            }
+            "--baseline-qg6-attempt-receipt" => {
+                let path =
+                    PathBuf::from(next_value(&mut values, "--baseline-qg6-attempt-receipt")?);
+                if baseline_qg6_attempt_receipt.replace(path).is_some() {
+                    return Err("duplicate --baseline-qg6-attempt-receipt".into());
+                }
+            }
+            "--candidate-qg6-attempt-receipt" => {
+                let path =
+                    PathBuf::from(next_value(&mut values, "--candidate-qg6-attempt-receipt")?);
+                if candidate_qg6_attempt_receipt.replace(path).is_some() {
+                    return Err("duplicate --candidate-qg6-attempt-receipt".into());
+                }
+            }
+            "--rerun-qg6-attempt-receipt" => {
+                let path = PathBuf::from(next_value(&mut values, "--rerun-qg6-attempt-receipt")?);
+                if rerun_qg6_attempt_receipt.replace(path).is_some() {
+                    return Err("duplicate --rerun-qg6-attempt-receipt".into());
                 }
             }
             "--candidate" => {
@@ -1164,6 +1338,9 @@ where
         baseline_qg6_authority_set,
         candidate_qg6_authority_set,
         rerun_qg6_authority_set,
+        baseline_qg6_attempt_receipt,
+        candidate_qg6_attempt_receipt,
+        rerun_qg6_attempt_receipt,
     })
 }
 
@@ -1198,7 +1375,8 @@ fn qg6_selected_cell_ids_from_threshold(
     if artifact.gate != PerfGate::Qg6 {
         return Ok(Vec::new());
     }
-    let mut selected = BTreeSet::new();
+    let mut selected = Vec::new();
+    let mut seen = BTreeSet::new();
     for cell in &artifact.cells {
         if cell.engine != "paired_ab" {
             continue;
@@ -1213,14 +1391,15 @@ fn qg6_selected_cell_ids_from_threshold(
                 )
             })?;
         let cell_id = format!("QG-6/{}/{metric}", cell.fixture);
-        if !selected.insert(cell_id.clone()) {
+        if !seen.insert(cell_id.clone()) {
             return Err(format!("QG-6 threshold repeats selected cell {cell_id:?}").into());
         }
+        selected.push(cell_id);
     }
     if selected.is_empty() {
         return Err("measured QG-6 threshold selects no paired effect cells".into());
     }
-    Ok(selected.into_iter().collect())
+    Ok(selected)
 }
 
 fn load_qg6_authority_set(
@@ -1229,6 +1408,15 @@ fn load_qg6_authority_set(
     artifact: &PerfGateArtifact,
 ) -> Result<LoadedQg6AuthoritySet, Box<dyn Error>> {
     let bytes = read_no_follow(path, Qg6StartupHandshakeV1::MAX_SET_BYTES)?;
+    load_qg6_authority_set_from_bytes(arm, path, bytes, artifact)
+}
+
+fn load_qg6_authority_set_from_bytes(
+    arm: &str,
+    path: &Path,
+    bytes: Vec<u8>,
+    artifact: &PerfGateArtifact,
+) -> Result<LoadedQg6AuthoritySet, Box<dyn Error>> {
     let set = Qg6StartupAuthoritySetV1::from_verified_slice(&bytes)
         .map_err(|error| format!("{arm} QG-6 authority set was rejected: {error}"))?;
     if set.campaign_run_id() != artifact.run_id {
@@ -1261,6 +1449,121 @@ fn load_qg6_authority_set(
     }
     let record = evidence(&format!("{arm}_qg6_authority_set"), path, &bytes);
     Ok((set, bytes, record))
+}
+
+fn load_qg6_attempt_receipt(
+    arm: &str,
+    path: &Path,
+    artifact: &PerfGateArtifact,
+    bound_evidence_bytes: &[u8],
+    authority_set: &LoadedQg6AuthoritySet,
+) -> Result<LoadedQg6AttemptReceipt, Box<dyn Error>> {
+    let bytes = read_no_follow(path, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES)?;
+    load_qg6_attempt_receipt_from_bytes(
+        arm,
+        path,
+        bytes,
+        artifact,
+        bound_evidence_bytes,
+        authority_set,
+    )
+}
+
+fn load_qg6_attempt_receipt_from_bytes(
+    arm: &str,
+    path: &Path,
+    bytes: Vec<u8>,
+    artifact: &PerfGateArtifact,
+    bound_evidence_bytes: &[u8],
+    authority_set: &LoadedQg6AuthoritySet,
+) -> Result<LoadedQg6AttemptReceipt, Box<dyn Error>> {
+    let receipt = LocalPerfAttemptReceipt::from_verified_qg6_bound_slices(
+        &bytes,
+        bound_evidence_bytes,
+        &authority_set.1,
+    )
+    .map_err(|error| {
+        format!(
+            "{arm} QG-6 attempt receipt does not bind its exact evidence and authority set: {error}"
+        )
+    })?;
+    if receipt.gate() != artifact.gate.label()
+        || receipt.run_id() != artifact.run_id
+        || artifact
+            .applicability_plan
+            .as_ref()
+            .is_none_or(|binding| binding.profile != receipt.profile())
+    {
+        return Err(format!(
+            "{arm} QG-6 attempt receipt differs from its threshold gate, run, or profile"
+        )
+        .into());
+    }
+    let record = evidence(&format!("{arm}_qg6_attempt_receipt"), path, &bytes);
+    Ok((receipt, bytes, record))
+}
+
+fn resolve_arm_qg6_attempt_receipt(
+    arm: &str,
+    path: Option<&Path>,
+    artifact: &PerfGateArtifact,
+    bound_evidence_bytes: Option<&[u8]>,
+    authority_set: Option<&LoadedQg6AuthoritySet>,
+) -> Result<Option<LoadedQg6AttemptReceipt>, Box<dyn Error>> {
+    match (artifact.gate, bound_evidence_bytes, authority_set, path) {
+        (PerfGate::Qg6, Some(evidence), Some(set), Some(path)) => {
+            load_qg6_attempt_receipt(arm, path, artifact, evidence, set).map(Some)
+        }
+        (PerfGate::Qg6, Some(_), Some(_), None) => {
+            Err(format!("QG-6 {arm} evidence requires --{arm}-qg6-attempt-receipt").into())
+        }
+        (PerfGate::Qg6, None, None, None) => Ok(None),
+        (PerfGate::Qg6, None, _, Some(_)) => Err(format!(
+            "--{arm}-qg6-attempt-receipt cannot be used without {arm} QG-6 evidence"
+        )
+        .into()),
+        (PerfGate::Qg6, _, _, _) => {
+            Err(format!("QG-6 {arm} attempt-receipt admission inputs are incomplete").into())
+        }
+        (_, _, _, Some(_)) => Err(format!(
+            "--{arm}-qg6-attempt-receipt cannot authenticate a non-QG-6 threshold"
+        )
+        .into()),
+        (_, _, _, None) => Ok(None),
+    }
+}
+
+fn verify_qg6_consumed_evidence_bytes(
+    arm: &str,
+    source_bytes: Option<&[u8]>,
+    consumed: Option<&LoadedEvidence>,
+    attempt: Option<&LoadedQg6AttemptReceipt>,
+    authority_set: Option<&LoadedQg6AuthoritySet>,
+) -> Result<(), Box<dyn Error>> {
+    match (source_bytes, consumed, attempt, authority_set) {
+        (None, None, None, None) => Ok(()),
+        (
+            Some(source),
+            Some((_, consumed_bytes)),
+            Some((receipt, _, _)),
+            Some((_, set_bytes, _)),
+        ) => {
+            if source != consumed_bytes {
+                return Err(
+                    format!("QG-6 {arm} evidence changed after attempt-receipt admission").into(),
+                );
+            }
+            receipt
+                .verify_qg6_bound_evidence_and_authority_set(consumed_bytes, set_bytes)
+                .map_err(|error| -> Box<dyn Error> {
+                    format!(
+                        "QG-6 {arm} consumed evidence lost its exact attempt/authority binding: {error}"
+                    )
+                    .into()
+                })
+        }
+        _ => Err(format!("QG-6 {arm} consumed-evidence binding is incomplete").into()),
+    }
 }
 
 fn resolve_arm_qg6_authority_set(
@@ -1303,9 +1606,11 @@ fn verify_qg6_authority_cell_mapping(
         .cells
         .iter()
         .map(|cell| cell.cell_id.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect::<Vec<_>>();
+    let unique = selected.iter().cloned().collect::<BTreeSet<_>>();
+    if unique.len() != selected.len() {
+        return Err(format!("QG-6 {arm} evidence repeats a selected cell").into());
+    }
     if selected != set.selected_cell_ids() {
         return Err(format!(
             "{arm} QG-6 evidence cell order/selection {:?} differs from its external set {:?}",
@@ -1439,6 +1744,9 @@ fn validate_decision_output_is_separate(args: &Args) -> Result<(), Box<dyn Error
         args.baseline_qg6_authority_set.as_deref(),
         args.candidate_qg6_authority_set.as_deref(),
         args.rerun_qg6_authority_set.as_deref(),
+        args.baseline_qg6_attempt_receipt.as_deref(),
+        args.candidate_qg6_attempt_receipt.as_deref(),
+        args.rerun_qg6_attempt_receipt.as_deref(),
     ];
     for input in inputs.into_iter().flatten() {
         if output == normalize_path(input)? {
@@ -1563,7 +1871,7 @@ fn validate_promotion_baseline_authority(
         }
         if !baseline_is_history_pointer || baseline_is_bootstrap {
             return Err(format!(
-                "authoritative promotion baseline {} must be a measured v2 history pointer",
+                "authoritative promotion baseline {} must be a measured {PERF_HISTORY_POINTER_SCHEMA_VERSION} history pointer",
                 authoritative_latest.display()
             )
             .into());
@@ -1608,6 +1916,10 @@ fn read_baseline(
             artifact_path: path.to_path_buf(),
             evidence_bytes,
             evidence_path: explicit_evidence_path.map(Path::to_path_buf),
+            qg6_authority_bytes: None,
+            qg6_authority_path: None,
+            qg6_attempt_receipt_bytes: None,
+            qg6_attempt_receipt_path: None,
             pointer: None,
         });
     }
@@ -1644,6 +1956,59 @@ fn read_baseline(
         240,
     )?;
     validate_filename_component(&pointer.evidence_file, "history pointer evidence file", 240)?;
+    match (
+        pointer.gate,
+        pointer.qg6_authority_file.as_deref(),
+        pointer.qg6_authority_sha256.as_deref(),
+        pointer.qg6_attempt_receipt_file.as_deref(),
+        pointer.qg6_attempt_receipt_sha256.as_deref(),
+    ) {
+        (
+            PerfGate::Qg6,
+            Some(authority_file),
+            Some(authority_digest),
+            Some(attempt_file),
+            Some(attempt_digest),
+        ) => {
+            validate_filename_component(
+                authority_file,
+                "history pointer QG-6 authority file",
+                240,
+            )?;
+            validate_filename_component(
+                attempt_file,
+                "history pointer QG-6 attempt-receipt file",
+                240,
+            )?;
+            for (digest, role) in [
+                (authority_digest, "authority"),
+                (attempt_digest, "attempt-receipt"),
+            ] {
+                if digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(
+                        format!("QG-6 history pointer has a malformed {role} digest").into(),
+                    );
+                }
+            }
+        }
+        (PerfGate::Qg6, _, _, _, _) => {
+            return Err(
+                "QG-6 history pointer must bind both authority and attempt-receipt filename/SHA-256 pairs"
+                    .into(),
+            );
+        }
+        (_, None, None, None, None) => {}
+        (_, _, _, _, _) => {
+            return Err(
+                "non-QG-6 history pointer cannot bind QG-6 authority or attempt-receipt bytes"
+                    .into(),
+            );
+        }
+    }
     let expected_pointer_name = pointer.profile.latest_basename(pointer.gate.label())?;
     if path.file_name().and_then(|name| name.to_str()) != Some(expected_pointer_name.as_str()) {
         return Err(format!(
@@ -1659,10 +2024,33 @@ fn read_baseline(
         .unwrap_or_else(|| Path::new("."));
     let threshold_path = parent.join(&pointer.threshold_file);
     let evidence_path = parent.join(&pointer.evidence_file);
+    let qg6_authority_path = pointer
+        .qg6_authority_file
+        .as_deref()
+        .map(|file| parent.join(file));
+    let qg6_attempt_receipt_path = pointer
+        .qg6_attempt_receipt_file
+        .as_deref()
+        .map(|file| parent.join(file));
     let (artifact, artifact_bytes) = read_artifact(&threshold_path)?;
     let evidence_bytes = read_perf_artifact_file(&evidence_path)?;
+    let qg6_authority_bytes = qg6_authority_path
+        .as_deref()
+        .map(|authority_path| read_no_follow(authority_path, Qg6StartupHandshakeV1::MAX_SET_BYTES))
+        .transpose()?;
+    let qg6_attempt_receipt_bytes = qg6_attempt_receipt_path
+        .as_deref()
+        .map(|attempt_path| read_no_follow(attempt_path, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES))
+        .transpose()?;
     if sha256_hex(&artifact_bytes) != pointer.threshold_sha256
         || sha256_hex(&evidence_bytes) != pointer.evidence_sha256
+        || qg6_authority_bytes.as_deref().map(sha256_hex).as_deref()
+            != pointer.qg6_authority_sha256.as_deref()
+        || qg6_attempt_receipt_bytes
+            .as_deref()
+            .map(sha256_hex)
+            .as_deref()
+            != pointer.qg6_attempt_receipt_sha256.as_deref()
         || artifact.gate != pointer.gate
         || artifact.run_id != pointer.run_id
         || artifact
@@ -1671,10 +2059,18 @@ fn read_baseline(
             .is_none_or(|binding| binding.profile != pointer.profile)
     {
         return Err(format!(
-            "history pointer {} does not bind its exact threshold/evidence generation",
+            "history pointer {} does not bind its exact threshold/evidence/authority/attempt generation",
             path.display()
         )
         .into());
+    }
+    if let Some(authority_bytes) = qg6_authority_bytes.as_deref() {
+        Qg6StartupAuthoritySetV1::from_verified_slice(authority_bytes).map_err(|error| {
+            format!(
+                "history pointer {} names an invalid QG-6 authority set: {error}",
+                path.display()
+            )
+        })?;
     }
     Ok(LoadedBaseline {
         artifact,
@@ -1682,6 +2078,10 @@ fn read_baseline(
         artifact_path: threshold_path,
         evidence_bytes: Some(evidence_bytes),
         evidence_path: Some(evidence_path),
+        qg6_authority_bytes,
+        qg6_authority_path,
+        qg6_attempt_receipt_bytes,
+        qg6_attempt_receipt_path,
         pointer: Some((path.to_path_buf(), bytes)),
     })
 }
@@ -1856,12 +2256,14 @@ fn read_runner_identity(
     expected_profile: Option<MachineProfileKey>,
     threshold_artifact_bytes: Option<&[u8]>,
     evidence_artifact_bytes: Option<&[u8]>,
+    bound_evidence_identity: Option<&VerifiedRunnerIdentity>,
 ) -> Result<Option<AdmittedRunnerReceipt>, Box<dyn Error>> {
     if registry.is_none()
         && receipt_path.is_none()
         && artifact_manifest_path.is_none()
         && run_log_path.is_none()
         && expected_profile.is_none()
+        && bound_evidence_identity.is_none()
     {
         return Ok(None);
     }
@@ -1894,14 +2296,31 @@ fn read_runner_identity(
         expected_profile,
         destination_basename: expected_profile.latest_basename(gate)?,
     };
-    let identity = registry
-        .admit(&receipt_bytes, &context)?
-        .bind_artifact_manifest(
+    let admitted = registry.admit(&receipt_bytes, &context)?;
+    let identity = if let Some(bound_identity) = bound_evidence_identity {
+        bound_identity.verify()?;
+        let manifest = bound_identity
+            .artifact_manifest()
+            .ok_or("bound QG-6 evidence has no exact artifact-manifest binding")?;
+        if admitted.receipt_sha256() != bound_identity.receipt_sha256()
+            || sha256_hex(&artifact_manifest_bytes) != manifest.manifest_sha256()
+        {
+            return Err(
+                "runner receipt or artifact manifest differs from the identity sealed in QG-6 evidence"
+                    .into(),
+            );
+        }
+        bound_identity.verify_run_log(&run_log_bytes)?;
+        bound_identity.verify_threshold_artifact(threshold_artifact_bytes)?;
+        bound_identity.clone()
+    } else {
+        admitted.bind_artifact_manifest(
             &artifact_manifest_bytes,
             &run_log_bytes,
             threshold_artifact_bytes,
             evidence_artifact_bytes,
-        )?;
+        )?
+    };
     if identity.profile() != expected_profile {
         return Err(format!(
             "runner receipt derives machine profile {:?}, expected {expected_profile:?}",
@@ -2047,6 +2466,10 @@ fn validate_manifest_schema_bindings(manifest: &toml::Value) -> Result<(), Box<d
         ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
         ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
         ("history_pointer", PERF_HISTORY_POINTER_SCHEMA_VERSION),
+        (
+            "runner_attempt_receipt",
+            LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+        ),
     ] {
         let found = schemas
             .get(field)
@@ -2100,6 +2523,7 @@ fn plan_history_if_requested(
     candidate_bytes: &[u8],
     candidate_evidence_bytes: Option<&[u8]>,
     candidate_qg6_authority_bytes: Option<&[u8]>,
+    candidate_qg6_attempt_receipt_bytes: Option<&[u8]>,
     verified_machine_profile: Option<MachineProfileKey>,
     updates: &mut Vec<PerfEvidenceFile>,
 ) -> Result<Option<HistoryPublicationPlan>, Box<dyn Error>> {
@@ -2112,13 +2536,22 @@ fn plan_history_if_requested(
     };
     let evidence_bytes =
         candidate_evidence_bytes.ok_or("allowed promotion is missing receipt-bound evidence")?;
-    match (gate, candidate_qg6_authority_bytes) {
-        (PerfGate::Qg6, None) => {
-            return Err("allowed QG-6 promotion is missing its external authority set".into());
+    match (
+        gate,
+        candidate_qg6_authority_bytes,
+        candidate_qg6_attempt_receipt_bytes,
+    ) {
+        (PerfGate::Qg6, Some(_), Some(_)) | (_, None, None) => {}
+        (PerfGate::Qg6, _, _) => {
+            return Err(
+                "allowed QG-6 promotion requires both its external authority set and attempt receipt"
+                    .into(),
+            );
         }
-        (PerfGate::Qg6, Some(_)) | (_, None) => {}
-        (_, Some(_)) => {
-            return Err("non-QG-6 history cannot archive a QG-6 authority set".into());
+        (_, _, _) => {
+            return Err(
+                "non-QG-6 history cannot archive QG-6 authority or attempt-receipt bytes".into(),
+            );
         }
     }
     validate_component(candidate_run_id, "candidate run ID")?;
@@ -2134,14 +2567,24 @@ fn plan_history_if_requested(
     let evidence_file = format!("{rolling_stem}.evidence.json");
     let qg6_authority_file =
         candidate_qg6_authority_bytes.map(|_| format!("{rolling_stem}.qg6-authorities.json"));
+    let qg6_attempt_receipt_file =
+        candidate_qg6_attempt_receipt_bytes.map(|_| format!("{rolling_stem}.attempt.json"));
     validate_filename_component(&threshold_file, "rolling threshold filename", 240)?;
     validate_filename_component(&evidence_file, "rolling evidence filename", 240)?;
     if let Some(file) = qg6_authority_file.as_deref() {
         validate_filename_component(file, "rolling QG-6 authority filename", 240)?;
     }
+    if let Some(file) = qg6_attempt_receipt_file.as_deref() {
+        validate_filename_component(file, "rolling QG-6 attempt-receipt filename", 240)?;
+    }
     let rolling_threshold = history_dir.join(&threshold_file);
     let rolling_evidence = history_dir.join(&evidence_file);
-    let rolling_qg6_authority = qg6_authority_file.map(|file| history_dir.join(file));
+    let rolling_qg6_authority = qg6_authority_file
+        .as_deref()
+        .map(|file| history_dir.join(file));
+    let rolling_qg6_attempt_receipt = qg6_attempt_receipt_file
+        .as_deref()
+        .map(|file| history_dir.join(file));
     let latest_pointer = history_dir.join(format!("{stem}.latest.json"));
     let pointer = HistoryPointer {
         schema_version: PERF_HISTORY_POINTER_SCHEMA_VERSION.to_owned(),
@@ -2152,6 +2595,10 @@ fn plan_history_if_requested(
         threshold_sha256: sha256_hex(candidate_bytes),
         evidence_file,
         evidence_sha256: sha256_hex(evidence_bytes),
+        qg6_authority_file,
+        qg6_authority_sha256: candidate_qg6_authority_bytes.map(sha256_hex),
+        qg6_attempt_receipt_file,
+        qg6_attempt_receipt_sha256: candidate_qg6_attempt_receipt_bytes.map(sha256_hex),
     };
     let pointer_bytes = serde_json::to_vec_pretty(&pointer)?;
     updates.push(evidence(
@@ -2170,6 +2617,12 @@ fn plan_history_if_requested(
     ) {
         updates.push(evidence("history_qg6_authority_window", path, bytes));
     }
+    if let (Some(path), Some(bytes)) = (
+        rolling_qg6_attempt_receipt.as_ref(),
+        candidate_qg6_attempt_receipt_bytes,
+    ) {
+        updates.push(evidence("history_qg6_attempt_receipt_window", path, bytes));
+    }
     updates.push(evidence(
         "history_latest_pointer",
         &latest_pointer,
@@ -2182,6 +2635,8 @@ fn plan_history_if_requested(
         evidence_bytes: evidence_bytes.to_vec(),
         rolling_qg6_authority,
         qg6_authority_bytes: candidate_qg6_authority_bytes.map(<[u8]>::to_vec),
+        rolling_qg6_attempt_receipt,
+        qg6_attempt_receipt_bytes: candidate_qg6_attempt_receipt_bytes.map(<[u8]>::to_vec),
         latest_pointer,
         pointer_bytes,
     }))
@@ -2194,6 +2649,7 @@ fn plan_history_if_allowed(
     candidate_bytes: &[u8],
     candidate_evidence_bytes: Option<&[u8]>,
     candidate_qg6_authority_bytes: Option<&[u8]>,
+    candidate_qg6_attempt_receipt_bytes: Option<&[u8]>,
     verified_machine_profile: Option<MachineProfileKey>,
     evaluation: &mut frankensearch_quill_gauntlet::PerfRatchetEvaluation,
 ) -> Result<Option<HistoryPublicationPlan>, Box<dyn Error>> {
@@ -2207,6 +2663,7 @@ fn plan_history_if_allowed(
         candidate_bytes,
         candidate_evidence_bytes,
         candidate_qg6_authority_bytes,
+        candidate_qg6_attempt_receipt_bytes,
         verified_machine_profile,
         &mut evaluation.history_updates,
     )
@@ -2218,6 +2675,12 @@ fn apply_history_plan(plan: &HistoryPublicationPlan) -> Result<(), Box<dyn Error
     if let (Some(path), Some(bytes)) = (
         plan.rolling_qg6_authority.as_ref(),
         plan.qg6_authority_bytes.as_deref(),
+    ) {
+        write_immutable_file(path, bytes)?;
+    }
+    if let (Some(path), Some(bytes)) = (
+        plan.rolling_qg6_attempt_receipt.as_ref(),
+        plan.qg6_attempt_receipt_bytes.as_deref(),
     ) {
         write_immutable_file(path, bytes)?;
     }
@@ -2293,6 +2756,7 @@ const fn mode_label(mode: PerfRatchetMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch_quill_gauntlet::PerfMatrixSpec;
     use std::collections::BTreeMap;
 
     fn canonical_manifest_path() -> PathBuf {
@@ -2348,6 +2812,9 @@ mod tests {
             baseline_qg6_authority_set: None,
             candidate_qg6_authority_set: None,
             rerun_qg6_authority_set: None,
+            baseline_qg6_attempt_receipt: None,
+            candidate_qg6_attempt_receipt: None,
+            rerun_qg6_attempt_receipt: None,
         }
     }
 
@@ -2507,6 +2974,24 @@ mod tests {
             "unexpected stale history-pointer schema error: {stale_history_pointer_error}"
         );
 
+        let mut stale_attempt_receipt = manifest.clone();
+        stale_attempt_receipt
+            .get_mut("schemas")
+            .and_then(toml::Value::as_table_mut)
+            .expect("schema table")
+            .insert(
+                "runner_attempt_receipt".to_owned(),
+                toml::Value::String("frankensearch.perf-runner-attempt.v10".to_owned()),
+            );
+        let stale_attempt_receipt_error = validate_manifest_schema_bindings(&stale_attempt_receipt)
+            .expect_err("stale attempt-receipt schema must fail closed")
+            .to_string();
+        assert!(
+            stale_attempt_receipt_error.contains("schemas.runner_attempt_receipt")
+                && stale_attempt_receipt_error.contains(LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION),
+            "unexpected stale attempt-receipt schema error: {stale_attempt_receipt_error}"
+        );
+
         let mut unreviewed_schema = manifest.clone();
         unreviewed_schema
             .get_mut("schemas")
@@ -2595,18 +3080,24 @@ mod tests {
                 "baseline.evidence.json",
                 "--baseline-qg6-authority-set",
                 "baseline.qg6-authorities.json",
+                "--baseline-qg6-attempt-receipt",
+                "baseline.attempt.json",
                 "--candidate",
                 "candidate.json",
                 "--candidate-evidence",
                 "candidate.evidence.json",
                 "--candidate-qg6-authority-set",
                 "candidate.qg6-authorities.json",
+                "--candidate-qg6-attempt-receipt",
+                "candidate.attempt.json",
                 "--rerun",
                 "rerun.json",
                 "--rerun-evidence",
                 "rerun.evidence.json",
                 "--rerun-qg6-authority-set",
                 "rerun.qg6-authorities.json",
+                "--rerun-qg6-attempt-receipt",
+                "rerun.attempt.json",
                 "--output",
                 "ratchet.json",
                 "--mode",
@@ -2627,6 +3118,18 @@ mod tests {
         assert_eq!(
             args.rerun_qg6_authority_set.as_deref(),
             Some(Path::new("rerun.qg6-authorities.json"))
+        );
+        assert_eq!(
+            args.baseline_qg6_attempt_receipt.as_deref(),
+            Some(Path::new("baseline.attempt.json"))
+        );
+        assert_eq!(
+            args.candidate_qg6_attempt_receipt.as_deref(),
+            Some(Path::new("candidate.attempt.json"))
+        );
+        assert_eq!(
+            args.rerun_qg6_attempt_receipt.as_deref(),
+            Some(Path::new("rerun.attempt.json"))
         );
 
         let duplicate = parse_args(
@@ -2654,6 +3157,33 @@ mod tests {
             duplicate
                 .to_string()
                 .contains("duplicate --candidate-qg6-authority-set")
+        );
+
+        let duplicate_receipt = parse_args(
+            [
+                "--manifest",
+                "manifest.toml",
+                "--baseline",
+                "baseline.json",
+                "--candidate",
+                "candidate.json",
+                "--candidate-qg6-attempt-receipt",
+                "first.attempt.json",
+                "--candidate-qg6-attempt-receipt",
+                "second.attempt.json",
+                "--output",
+                "ratchet.json",
+                "--mode",
+                "regression-alarm",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect_err("duplicate per-arm QG-6 attempt receipt must refuse");
+        assert!(
+            duplicate_receipt
+                .to_string()
+                .contains("duplicate --candidate-qg6-attempt-receipt")
         );
     }
 
@@ -2805,6 +3335,10 @@ mod tests {
             threshold_sha256: sha256_hex(&threshold_bytes),
             evidence_file: "oversize.evidence.json".to_owned(),
             evidence_sha256: "0".repeat(64),
+            qg6_authority_file: None,
+            qg6_authority_sha256: None,
+            qg6_attempt_receipt_file: None,
+            qg6_attempt_receipt_sha256: None,
         };
         fs::write(
             &pointer_path,
@@ -2852,6 +3386,10 @@ mod tests {
             threshold_sha256: "0".repeat(64),
             evidence_file: "unreached-evidence.json".to_owned(),
             evidence_sha256: "0".repeat(64),
+            qg6_authority_file: None,
+            qg6_authority_sha256: None,
+            qg6_attempt_receipt_file: None,
+            qg6_attempt_receipt_sha256: None,
         };
         fs::write(
             &pointer_path,
@@ -2869,6 +3407,107 @@ mod tests {
         assert_eq!(
             error.incompatibility.retry_predicate,
             REBASELINE_RETRY_PREDICATE
+        );
+    }
+
+    #[test]
+    fn qg6_history_pointer_retains_exact_trust_files_and_rejects_each_substitution() {
+        let directory = tempfile::tempdir().expect("QG-6 history directory");
+        let profile = test_profile();
+        let revision = "a".repeat(40);
+        let run_id = "history-qg6-run";
+        let cell = "QG-6/query/natural/k10/1k/latency_ms";
+        let mut threshold = qg6_threshold(run_id, &revision, &["query/natural/k10/1k"]);
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        threshold.applicability_plan = Some(
+            PerfMatrixSpec::complete()
+                .applicability_plan(&registry, profile, PerfGate::Qg6)
+                .expect("canonical QG-6 history plan")
+                .binding()
+                .clone(),
+        );
+        let threshold_file = "history-qg6-threshold.json";
+        let threshold_path = directory.path().join(threshold_file);
+        let threshold_bytes = serde_json::to_vec_pretty(&threshold).expect("canonical threshold");
+        fs::write(&threshold_path, &threshold_bytes).expect("write QG-6 history threshold");
+        let evidence_file = "history-qg6-evidence.json";
+        let evidence_bytes = b"receipt-bound QG-6 history evidence";
+        fs::write(directory.path().join(evidence_file), evidence_bytes)
+            .expect("write QG-6 history evidence");
+        let authority_file = "history-qg6-authorities.json";
+        let authority_path = directory.path().join(authority_file);
+        let retained_bytes = qg6_set(run_id, &revision, &[(cell, 41)])
+            .to_json_bytes()
+            .expect("canonical retained authority set");
+        fs::write(&authority_path, &retained_bytes).expect("write retained authority set");
+        let attempt_file = "history-qg6-attempt.json";
+        let attempt_path = directory.path().join(attempt_file);
+        let attempt_bytes = b"bounded retained QG-6 attempt-receipt bytes";
+        fs::write(&attempt_path, attempt_bytes).expect("write retained attempt receipt");
+
+        let pointer_path = directory.path().join(
+            profile
+                .latest_basename(PerfGate::Qg6.label())
+                .expect("QG-6 latest basename"),
+        );
+        let pointer = HistoryPointer {
+            schema_version: PERF_HISTORY_POINTER_SCHEMA_VERSION.to_owned(),
+            gate: PerfGate::Qg6,
+            profile,
+            run_id: run_id.to_owned(),
+            threshold_file: threshold_file.to_owned(),
+            threshold_sha256: sha256_hex(&threshold_bytes),
+            evidence_file: evidence_file.to_owned(),
+            evidence_sha256: sha256_hex(evidence_bytes),
+            qg6_authority_file: Some(authority_file.to_owned()),
+            qg6_authority_sha256: Some(sha256_hex(&retained_bytes)),
+            qg6_attempt_receipt_file: Some(attempt_file.to_owned()),
+            qg6_attempt_receipt_sha256: Some(sha256_hex(attempt_bytes)),
+        };
+        fs::write(
+            &pointer_path,
+            serde_json::to_vec_pretty(&pointer).expect("canonical QG-6 history pointer"),
+        )
+        .expect("write QG-6 history pointer");
+        let loaded = read_baseline(&pointer_path, None)
+            .expect("pointer admits its exact retained authority bytes");
+        assert_eq!(
+            loaded.qg6_authority_bytes.as_deref(),
+            Some(retained_bytes.as_slice())
+        );
+        assert_eq!(
+            loaded.qg6_attempt_receipt_bytes.as_deref(),
+            Some(attempt_bytes.as_slice())
+        );
+        assert_eq!(
+            loaded.qg6_attempt_receipt_path.as_deref(),
+            Some(attempt_path.as_path())
+        );
+
+        fs::write(
+            &attempt_path,
+            b"different bounded QG-6 attempt-receipt bytes",
+        )
+        .expect("substitute attempt receipt bytes");
+        let error = read_baseline(&pointer_path, None)
+            .expect_err("pointer must reject substituted attempt-receipt bytes")
+            .to_string();
+        assert!(
+            error.contains("exact threshold/evidence/authority/attempt generation"),
+            "unexpected attempt-substitution error: {error}"
+        );
+        fs::write(&attempt_path, attempt_bytes).expect("restore retained attempt receipt");
+
+        let substituted_bytes = qg6_set(run_id, &revision, &[(cell, 99)])
+            .to_json_bytes()
+            .expect("canonical substituted authority set");
+        fs::write(&authority_path, substituted_bytes).expect("substitute authority bytes");
+        let error = read_baseline(&pointer_path, None)
+            .expect_err("pointer must reject substituted authority bytes")
+            .to_string();
+        assert!(
+            error.contains("exact threshold/evidence/authority/attempt generation"),
+            "unexpected authority-substitution error: {error}"
         );
     }
 
@@ -3141,10 +3780,15 @@ mod tests {
             validate_promotion_baseline_authority(&measured_args, PerfGate::Qg2, false, true)
                 .is_ok()
         );
-        assert!(
+        let direct_threshold_error =
             validate_promotion_baseline_authority(&measured_args, PerfGate::Qg2, false, false)
-                .is_err(),
-            "a direct threshold cannot masquerade at the authoritative pointer path"
+                .expect_err(
+                    "a direct threshold cannot masquerade at the authoritative pointer path",
+                )
+                .to_string();
+        assert!(
+            direct_threshold_error.contains(PERF_HISTORY_POINTER_SCHEMA_VERSION),
+            "stale pointer-schema denial: {direct_threshold_error}"
         );
     }
 
@@ -3197,6 +3841,7 @@ mod tests {
             "candidate-1",
             b"forbidden-candidate",
             Some(b"forbidden-evidence"),
+            None,
             None,
             Some(test_profile()),
             &mut evaluation,
@@ -3251,6 +3896,7 @@ mod tests {
             b"forbidden-candidate",
             Some(b"forbidden-receipt-bound-evidence"),
             None,
+            None,
             Some(test_profile()),
             &mut evaluation,
         )
@@ -3262,6 +3908,44 @@ mod tests {
     }
 
     #[test]
+    fn history_qg6_trust_pair_is_all_or_nothing() {
+        let directory = tempfile::tempdir().expect("history directory");
+        let args = test_args(directory.path());
+        let mut missing_attempt = evaluation(PerfGateDecision::Allow);
+        assert!(
+            plan_history_if_allowed(
+                &args,
+                PerfGate::Qg6,
+                "candidate-1",
+                b"threshold",
+                Some(b"evidence"),
+                Some(b"qg6-authority"),
+                None,
+                Some(test_profile()),
+                &mut missing_attempt,
+            )
+            .is_err()
+        );
+
+        let mut foreign_attempt = evaluation(PerfGateDecision::Allow);
+        assert!(
+            plan_history_if_allowed(
+                &args,
+                PerfGate::Qg2,
+                "candidate-1",
+                b"threshold",
+                Some(b"evidence"),
+                None,
+                Some(b"qg6-attempt"),
+                Some(test_profile()),
+                &mut foreign_attempt,
+            )
+            .is_err()
+        );
+        assert!(snapshot(directory.path()).is_empty());
+    }
+
+    #[test]
     fn allowed_promotion_plans_immutable_generation_then_advances_one_pointer() {
         let directory = tempfile::tempdir().expect("history directory");
         let args = test_args(directory.path());
@@ -3270,6 +3954,7 @@ mod tests {
         let unverified_producer_evidence = b"candidate-unverified-producer-evidence\n";
         let receipt_bound_evidence = b"candidate-receipt-bound-evidence\n";
         let qg6_authority = b"candidate-qg6-authority-set\n";
+        let qg6_attempt_receipt = b"candidate-qg6-attempt-receipt\n";
 
         let plan = plan_history_if_allowed(
             &args,
@@ -3278,6 +3963,7 @@ mod tests {
             candidate,
             Some(receipt_bound_evidence),
             Some(qg6_authority),
+            Some(qg6_attempt_receipt),
             Some(test_profile()),
             &mut evaluation,
         )
@@ -3305,6 +3991,15 @@ mod tests {
             .expect("rolling QG-6 authority bytes"),
             qg6_authority
         );
+        assert_eq!(
+            fs::read(
+                plan.rolling_qg6_attempt_receipt
+                    .as_ref()
+                    .expect("rolling QG-6 attempt receipt")
+            )
+            .expect("rolling QG-6 attempt-receipt bytes"),
+            qg6_attempt_receipt
+        );
         let pointer_bytes = fs::read(&paths[2]).expect("latest pointer");
         let pointer =
             serde_json::from_slice::<HistoryPointer>(&pointer_bytes).expect("typed latest pointer");
@@ -3317,6 +4012,22 @@ mod tests {
         assert_eq!(
             pointer.evidence_file,
             "QG-6.trj-zen3-5995wx.smt2-128.2026-07-29.candidate-1.evidence.json"
+        );
+        assert_eq!(
+            pointer.qg6_authority_file.as_deref(),
+            Some("QG-6.trj-zen3-5995wx.smt2-128.2026-07-29.candidate-1.qg6-authorities.json")
+        );
+        assert_eq!(
+            pointer.qg6_authority_sha256,
+            Some(sha256_hex(qg6_authority))
+        );
+        assert_eq!(
+            pointer.qg6_attempt_receipt_file.as_deref(),
+            Some("QG-6.trj-zen3-5995wx.smt2-128.2026-07-29.candidate-1.attempt.json")
+        );
+        assert_eq!(
+            pointer.qg6_attempt_receipt_sha256,
+            Some(sha256_hex(qg6_attempt_receipt))
         );
         assert!(
             snapshot(directory.path())
@@ -3334,6 +4045,7 @@ mod tests {
                 "history_window",
                 "history_evidence_window",
                 "history_qg6_authority_window",
+                "history_qg6_attempt_receipt_window",
                 "history_latest_pointer",
             ]
         );
@@ -3357,6 +4069,7 @@ mod tests {
             b"threshold",
             Some(b"bound-evidence"),
             Some(b"qg6-authority"),
+            Some(b"qg6-attempt"),
             Some(test_profile()),
             &mut evaluation,
         )
@@ -3381,6 +4094,7 @@ mod tests {
             b"threshold-one",
             Some(b"evidence-one"),
             Some(b"qg6-authority-one"),
+            Some(b"qg6-attempt-one"),
             Some(test_profile()),
             &mut first_evaluation,
         )
@@ -3397,6 +4111,7 @@ mod tests {
             b"threshold-two",
             Some(b"evidence-two"),
             Some(b"qg6-authority-two"),
+            Some(b"qg6-attempt-two"),
             Some(test_profile()),
             &mut second_evaluation,
         )
@@ -3425,6 +4140,7 @@ mod tests {
                     b"threshold",
                     Some(b"evidence"),
                     Some(b"qg6-authority"),
+                    Some(b"qg6-attempt"),
                     Some(test_profile()),
                     &mut evaluation,
                 )
@@ -3440,6 +4156,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("history directory");
         let mut args = test_args(directory.path());
         args.output = args.candidate.clone();
+        assert!(validate_decision_output_is_separate(&args).is_err());
+
+        args.candidate_qg6_attempt_receipt = Some(PathBuf::from("candidate.attempt.json"));
+        args.output = PathBuf::from("candidate.attempt.json");
         assert!(validate_decision_output_is_separate(&args).is_err());
 
         args.output = directory.path().join("decision.json");
@@ -3503,6 +4223,10 @@ mod tests {
             true,
             cells
                 .iter()
+                .map(|(cell_id, _)| (*cell_id).to_owned())
+                .collect(),
+            cells
+                .iter()
                 .map(|(cell_id, seed)| ((*cell_id).to_owned(), qg6_authority(*seed)))
                 .collect(),
         )
@@ -3513,8 +4237,13 @@ mod tests {
     fn qg6_authority_set_is_mandatory_and_bound_to_run_source_and_selection() {
         let directory = tempfile::tempdir().expect("authority directory");
         let revision = "a".repeat(40);
-        let cell = "QG-6/query/natural/k10/1k/latency_ms";
-        let threshold = qg6_threshold("candidate-run", &revision, &["query/natural/k10/1k"]);
+        let cell = "QG-6/query/phrase/k10/1k/latency_ms";
+        let second_cell = "QG-6/query/boolean/k10/1k/latency_ms";
+        let threshold = qg6_threshold(
+            "candidate-run",
+            &revision,
+            &["query/phrase/k10/1k", "query/boolean/k10/1k"],
+        );
 
         let missing = resolve_arm_qg6_authority_set("candidate", None, &threshold, true)
             .expect_err("QG-6 evidence without an external set must refuse");
@@ -3527,22 +4256,34 @@ mod tests {
         let valid_path = directory.path().join("candidate.qg6-authorities.json");
         fs::write(
             &valid_path,
-            qg6_set("candidate-run", &revision, &[(cell, 11)])
+            qg6_set("candidate-run", &revision, &[(cell, 11), (second_cell, 15)])
                 .to_json_bytes()
                 .expect("canonical set"),
         )
         .expect("write valid set");
-        let (_, retained_bytes, record) =
-            load_qg6_authority_set("candidate", &valid_path, &threshold)
-                .expect("exact run/source/selection set");
-        assert_eq!(record.role, "candidate_qg6_authority_set");
-        assert_eq!(record.sha256, sha256_hex(&retained_bytes));
-        assert_eq!(record.path, valid_path.to_string_lossy());
+        let loaded = load_qg6_authority_set("candidate", &valid_path, &threshold)
+            .expect("exact run/source/selection set");
+        assert_eq!(loaded.2.role, "candidate_qg6_authority_set");
+        assert_eq!(loaded.2.sha256, sha256_hex(&loaded.1));
+        assert_eq!(loaded.2.path, valid_path.to_string_lossy());
+        let missing_attempt = resolve_arm_qg6_attempt_receipt(
+            "candidate",
+            None,
+            &threshold,
+            Some(b"bound QG-6 evidence"),
+            Some(&loaded),
+        )
+        .expect_err("QG-6 evidence and authority without its attempt receipt must refuse");
+        assert!(
+            missing_attempt
+                .to_string()
+                .contains("--candidate-qg6-attempt-receipt")
+        );
 
         let wrong_run_path = directory.path().join("wrong-run.qg6-authorities.json");
         fs::write(
             &wrong_run_path,
-            qg6_set("rerun", &revision, &[(cell, 12)])
+            qg6_set("rerun", &revision, &[(cell, 12), (second_cell, 16)])
                 .to_json_bytes()
                 .expect("canonical wrong-run set"),
         )
@@ -3552,9 +4293,13 @@ mod tests {
         let wrong_source_path = directory.path().join("wrong-source.qg6-authorities.json");
         fs::write(
             &wrong_source_path,
-            qg6_set("candidate-run", &"b".repeat(40), &[(cell, 13)])
-                .to_json_bytes()
-                .expect("canonical wrong-source set"),
+            qg6_set(
+                "candidate-run",
+                &"b".repeat(40),
+                &[(cell, 13), (second_cell, 17)],
+            )
+            .to_json_bytes()
+            .expect("canonical wrong-source set"),
         )
         .expect("write wrong-source set");
         assert!(load_qg6_authority_set("candidate", &wrong_source_path, &threshold).is_err());

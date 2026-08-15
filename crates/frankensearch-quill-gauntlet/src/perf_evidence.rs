@@ -5101,6 +5101,21 @@ pub mod qg6_test_fixture {
         query_manifest_sha256,
     };
 
+    pub fn verified_terminal_artifact() -> (PerfEvidenceArtifact, Vec<u8>, Qg6ScheduleAuthority) {
+        let (artifact, authority) = super::tests::qg6_artifact();
+        let bytes = artifact
+            .sealed_json()
+            .expect("sealed canonical terminal QG-6 artifact")
+            .into_bytes();
+        let verified = PerfEvidenceArtifact::from_verified_slice_against_authorities(
+            &bytes,
+            &[],
+            &[&authority],
+        )
+        .expect("authority-verified terminal QG-6 artifact");
+        (verified, bytes, authority)
+    }
+
     pub fn contract(
         query_class: crate::PerfQueryClass,
     ) -> (PerfInputIdentity, Qg6SemanticContract) {
@@ -6311,7 +6326,7 @@ mod tests {
         artifact
     }
 
-    fn qg6_artifact() -> (PerfEvidenceArtifact, Qg6ScheduleAuthority) {
+    pub(super) fn qg6_artifact() -> (PerfEvidenceArtifact, Qg6ScheduleAuthority) {
         let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
         let input_identity = spec.input_identity.as_ref().expect("QG-6 input identity");
         let semantic_contract = spec
@@ -8208,21 +8223,20 @@ mod tests {
             .into_iter()
             .flat_map(|group_id| [(group_id, 100.0, 98.0); 100])
             .collect::<Vec<_>>();
+        // Ninety-five exact-identity pairs plus five tail pairs per query. The
+        // flat paired estimator sees a null whose center is exactly 1.0 and
+        // whose dispersion is small enough to stay Valid/Eligible, so nothing
+        // in the ordinary inference can reject this fixture. Only the formal
+        // true-leaf p99 can: five percent of the leaves sit at 125, which is
+        // above the 99th percentile boundary, so the joint-tail null is the
+        // sole rejection. The tail pairs are spread across the block order
+        // rather than appended, so the flat null carries no order or drift
+        // signal that could reject it for the wrong reason.
         let mut null_pairs = Vec::new();
         for group_id in QG6_QUERY_GROUP_IDS {
-            for _ in 0..10 {
-                null_pairs.extend([
-                    (group_id, 100.0, 80.0),
-                    (group_id, 100.0, 100.0),
-                    (group_id, 100.0, 100.0),
-                    (group_id, 100.0, 125.0),
-                    (group_id, 100.0, 100.0),
-                    (group_id, 100.0, 100.0),
-                    (group_id, 100.0, 80.0),
-                    (group_id, 100.0, 100.0),
-                    (group_id, 100.0, 125.0),
-                    (group_id, 100.0, 100.0),
-                ]);
+            for index in 0..100 {
+                let treatment = if index % 20 == 19 { 125.0 } else { 100.0 };
+                null_pairs.push((group_id, 100.0, treatment));
             }
         }
         let quill_null_pairs = QG6_QUERY_GROUP_IDS
@@ -8284,17 +8298,22 @@ mod tests {
         assert!(null.ci95_low_ratio >= 0.95 && null.ci95_high_ratio <= 1.05);
         assert_eq!(cell.status, EvidenceDecisionStatus::NoDecision);
         assert!(!cell.claim_eligible());
-        assert!(cell.reasons.iter().any(|reason| {
-            reason.code == "qg6.joint_tail_null_invalid"
-                && reason.severity == EvidenceSeverity::NoClaim
-        }));
+        let no_claim = cell
+            .reasons
+            .iter()
+            .filter(|reason| reason.severity == EvidenceSeverity::NoClaim)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            no_claim.len(),
+            1,
+            "the formal joint-tail check must be the only no-claim source, and must fire once: {:?}",
+            cell.reasons
+        );
+        assert_eq!(no_claim[0].code, "qg6.joint_tail_null_invalid");
         assert!(
-            cell.reasons
-                .iter()
-                .filter(|reason| reason.severity == EvidenceSeverity::NoClaim)
-                .all(|reason| reason.code == "qg6.joint_tail_null_invalid"),
-            "the formal joint-tail check must be the only no-claim source: {:?}",
-            cell.reasons
+            no_claim[0].message.contains("Tantivy/Tantivy") && no_claim[0].message.contains("p99"),
+            "the sole rejection must be the Tantivy/Tantivy true-leaf p99, not another arm or quantile: {}",
+            no_claim[0].message
         );
         assert!(
             !cell

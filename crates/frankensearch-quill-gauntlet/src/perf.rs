@@ -5588,12 +5588,57 @@ impl PerfRawSample {
             }
             PerfMetricSemantics::Duration => elapsed_ns,
             PerfMetricSemantics::GaugeHigherIsBetter | PerfMetricSemantics::GaugeLowerIsBetter => {
-                self.observed_value
+                let observed = self
+                    .observed_value
                     .filter(|value| value.is_finite() && *value > 0.0)
                     .ok_or_else(|| PairedEstimatorError::InvalidValue {
                         sample_id: self.sample_id,
                         reason: "gauge samples require a finite positive observed_value".to_owned(),
-                    })?
+                    })?;
+                // A canonical QG-3 update cell publishes a rate or a latency
+                // read off ONE measured update-to-searchable window, and that
+                // window is this sample's own [started_ns, ended_ns]. Recompute
+                // it here so persisted gauge bytes cannot claim a number the
+                // window they were published with does not produce. Every other
+                // gauge in the matrix is a genuine observation with no window
+                // behind it and is left exactly as it was.
+                if let Some(metric) = canonical_qg3_update_metric(&self.scope) {
+                    let work_units =
+                        self.work_units.filter(|value| *value > 0).ok_or_else(|| {
+                            PairedEstimatorError::InvalidValue {
+                                sample_id: self.sample_id,
+                                reason: "QG-3 update samples require positive work_units"
+                                    .to_owned(),
+                            }
+                        })?;
+                    #[allow(clippy::cast_precision_loss)]
+                    let work_units = work_units as f64;
+                    let expected = match metric {
+                        Qg3UpdateMetric::UpdatesPerSecond => {
+                            work_units * 1_000_000_000.0 / elapsed_ns
+                        }
+                        Qg3UpdateMetric::UpdateToSearchableMs => elapsed_ns / 1_000_000.0,
+                    };
+                    // EXACT bits, no tolerance. The producer evaluates these
+                    // same two expression trees over these same two f64 inputs,
+                    // so IEEE-754 binary64 gives a bit-identical result and any
+                    // slack here would be slack a mutated gauge could hide in.
+                    if !expected.is_finite()
+                        || expected <= 0.0
+                        || observed.to_bits() != expected.to_bits()
+                    {
+                        return Err(PairedEstimatorError::InvalidValue {
+                            sample_id: self.sample_id,
+                            reason: format!(
+                                "QG-3 update sample published {observed}, which is not the exact \
+                                 value its own window produces ({expected}); a QG-3 update value \
+                                 must be a bit-identical reading of the interval it was measured \
+                                 over"
+                            ),
+                        });
+                    }
+                }
+                observed
             }
         };
         if !value.is_finite() || value <= 0.0 {
@@ -7659,6 +7704,36 @@ fn is_canonical_qg1_throughput_scope(scope: &PerfOperationScope) -> bool {
                     semantics: PerfMetricSemantics::Throughput,
                     unit: "docs/s".to_owned(),
                 }
+        })
+}
+
+/// Which QG-3 update metric a canonical update scope publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qg3UpdateMetric {
+    /// Updates carried by the window, per second of that window.
+    UpdatesPerSecond,
+    /// The window itself, in milliseconds.
+    UpdateToSearchableMs,
+}
+
+/// Recognize the exact canonical QG-3 update scopes.
+///
+/// Rebuilt from the frozen matrix rather than treating a `QG-3.*` string prefix
+/// as an admission authority, for the same reason
+/// [`is_canonical_qg1_throughput_scope`] is: a scope that merely looks like one
+/// of these must not inherit the recomputation contract below.
+fn canonical_qg3_update_metric(scope: &PerfOperationScope) -> Option<Qg3UpdateMetric> {
+    PerfMatrixSpec::complete()
+        .for_gate(PerfGate::Qg3)
+        .into_iter()
+        .find_map(|cell| {
+            let metric = match cell.metric.as_str() {
+                "updates_per_second" => Qg3UpdateMetric::UpdatesPerSecond,
+                "update_to_searchable_ms" => Qg3UpdateMetric::UpdateToSearchableMs,
+                _ => return None,
+            };
+            (scope == &perf_operation_scope(PerfGate::Qg3, &cell.fixture, &cell.metric))
+                .then_some(metric)
         })
 }
 
@@ -12618,6 +12693,138 @@ mod tests {
         let qg10 = matrix.for_gate(PerfGate::Qg10);
         assert_eq!(qg10.len(), 1);
         assert_eq!(qg10[0].threads, Some(1));
+    }
+
+    /// Build one QG-3 update sample the way the producer publishes it: the
+    /// sample's own window IS the measured update-to-searchable interval, and
+    /// `observed_value` is a reading of that window.
+    fn qg3_update_sample(metric: &str, elapsed_ns: u64, update_count: u64) -> PerfRawSample {
+        let cell = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg3)
+            .into_iter()
+            .find(|cell| cell.metric == metric && cell.topology == Some(PerfTopology::InProcess))
+            .cloned()
+            .unwrap_or_else(|| panic!("the frozen matrix ships an in-process QG-3 {metric} cell"));
+        let started_ns = 4_000;
+        // The producer's exact expressions, mirrored here on purpose: this
+        // helper stands in for `watch_metric`, so if it drifts, the seam test
+        // stops proving anything about the producer it represents.
+        #[allow(clippy::cast_precision_loss)]
+        let elapsed_ns_f64 = elapsed_ns as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let observed_value = if metric == "updates_per_second" {
+            update_count as f64 * 1_000_000_000.0 / elapsed_ns_f64
+        } else {
+            elapsed_ns_f64 / 1_000_000.0
+        };
+        PerfRawSample {
+            block_id: 0,
+            sample_id: 1,
+            arm: PerfSampleArm::Treatment,
+            order: PerfSampleOrder::First,
+            phase: PerfSamplePhase::Measurement,
+            scope: perf_operation_scope(PerfGate::Qg3, &cell.fixture, &cell.metric),
+            provenance: provenance("qg3-update-window"),
+            started_ns,
+            ended_ns: started_ns + elapsed_ns,
+            work_units: Some(update_count),
+            byte_count: None,
+            observed_value: Some(observed_value),
+            group_id: None,
+            qg6_sample_binding: None,
+            qg1_sample_binding: None,
+            tantivy_config_sha256: None,
+        }
+    }
+
+    /// THE PUBLISH/VALIDATION SEAM. A QG-3 update gauge is admitted only when it
+    /// recomputes from the window it was published with, so persisted bytes
+    /// cannot claim a rate or a latency the interval does not produce.
+    #[test]
+    fn qg3_update_gauges_must_recompute_from_their_own_published_window() {
+        for (metric, elapsed_ns, update_count) in [
+            ("updates_per_second", 250_000_000_u64, 5_000_u64),
+            ("update_to_searchable_ms", 250_000_000_u64, 5_000_u64),
+        ] {
+            let honest = qg3_update_sample(metric, elapsed_ns, update_count);
+            assert!(
+                canonical_qg3_update_metric(&honest.scope).is_some(),
+                "{metric} must be recognized as a canonical QG-3 update scope"
+            );
+            let value = honest
+                .validate_and_value()
+                .unwrap_or_else(|error| panic!("honest QG-3 {metric} sample rejected: {error}"));
+            assert!(value.is_finite() && value > 0.0);
+
+            // Plant a lie in the persisted field only: same window, same work,
+            // a value that window cannot produce.
+            let mut lying = qg3_update_sample(metric, elapsed_ns, update_count);
+            lying.observed_value = lying.observed_value.map(|value| value * 0.5);
+            let error = lying
+                .validate_and_value()
+                .expect_err("a QG-3 update value that its own window cannot produce must fail");
+            assert!(
+                matches!(error, PairedEstimatorError::InvalidValue { .. }),
+                "unexpected rejection for a lying QG-3 {metric} sample: {error}"
+            );
+
+            // ONE ULP. This is the case that separates exact-bit equality from
+            // any tolerance: a relative slack of even 1e-15 would admit it. It
+            // is also the smallest possible mutation of a persisted gauge, so
+            // rejecting it is what "no accepted mutable gauge slack" means.
+            let mut nudged = qg3_update_sample(metric, elapsed_ns, update_count);
+            let exact = nudged
+                .observed_value
+                .expect("QG-3 sample publishes a value");
+            let one_ulp = f64::from_bits(exact.to_bits() + 1);
+            assert_ne!(
+                exact.to_bits(),
+                one_ulp.to_bits(),
+                "the ULP nudge must actually change the published bits"
+            );
+            assert!(
+                (one_ulp - exact).abs() < exact.abs() * 1.0e-15,
+                "the ULP nudge must be far smaller than any plausible tolerance, or this test \
+                 proves nothing about exactness"
+            );
+            nudged.observed_value = Some(one_ulp);
+            assert!(
+                nudged.validate_and_value().is_err(),
+                "a QG-3 {metric} gauge mutated by one ULP must be refused; any accepted slack is \
+                 slack a mutated gauge can hide in"
+            );
+
+            // Same lie, but the window is widened to match it. This must be
+            // ACCEPTED: the contract is internal consistency with the published
+            // interval, not agreement with any particular duration.
+            let mut widened = qg3_update_sample(metric, elapsed_ns * 2, update_count);
+            assert!(
+                widened.validate_and_value().is_ok(),
+                "a QG-3 {metric} sample that recomputes from its own wider window must be admitted"
+            );
+            widened.observed_value = Some(1.0);
+            assert!(
+                widened.validate_and_value().is_err(),
+                "a QG-3 {metric} sample must not publish a constant unrelated to its window"
+            );
+        }
+    }
+
+    /// Every other gauge in the matrix is a genuine observation with no window
+    /// behind it, and must remain admissible without recomputation.
+    #[test]
+    fn non_qg3_gauges_are_not_forced_to_recompute_from_their_window() {
+        let mut sample = qg3_update_sample("updates_per_second", 250_000_000, 5_000);
+        sample.scope = perf_operation_scope(PerfGate::Qg7, "rss/medium", "peak_rss_bytes");
+        assert!(
+            canonical_qg3_update_metric(&sample.scope).is_none(),
+            "a QG-7 gauge must not inherit the QG-3 update recomputation contract"
+        );
+        sample.observed_value = Some(1.0);
+        assert!(
+            sample.validate_and_value().is_ok(),
+            "an ordinary gauge must stay admissible without recomputing from its window"
+        );
     }
 
     #[test]

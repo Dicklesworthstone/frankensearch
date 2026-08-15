@@ -26,7 +26,7 @@ use crate::{
 /// Version of the machine-readable ratchet decision artifact.
 pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v4";
 /// Strict schema for the immutable pointer to an admitted history artifact pair.
-pub const PERF_HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v2";
+pub const PERF_HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v3";
 /// Maximum directional pass-over-pass regression admitted for a cell.
 pub const PERF_MAX_REGRESSION_PCT: f64 = 5.0;
 /// Maximum disagreement admitted between same-revision candidate reruns.
@@ -3957,6 +3957,149 @@ mod tests {
             .expect("canonical applicability plan")
     }
 
+    fn qg7_cell(
+        fixture: &str,
+        metric: &str,
+        engine: &str,
+        unit: &str,
+        value: f64,
+    ) -> PerfCellResult {
+        PerfCellResult {
+            fixture: fixture.to_owned(),
+            metric: metric.to_owned(),
+            engine: engine.to_owned(),
+            unit: unit.to_owned(),
+            distribution: distribution(value),
+        }
+    }
+
+    /// Exactly the four rows `evaluate_qg7` reads for one corpus.
+    fn qg7_corpus_cells(
+        corpus: &str,
+        rss_ratio: f64,
+        bytes_ratio: f64,
+        quill_off_bytes: f64,
+        oracle_on_bytes: f64,
+    ) -> Vec<PerfCellResult> {
+        vec![
+            qg7_cell(
+                &format!("memory/{corpus}/positions_on"),
+                "peak_rss_bytes_quill_over_tantivy",
+                "paired_ab",
+                "ratio",
+                rss_ratio,
+            ),
+            qg7_cell(
+                &format!("size/{corpus}/positions_on"),
+                "index_bytes_per_document_quill_over_tantivy",
+                "paired_ab",
+                "ratio",
+                bytes_ratio,
+            ),
+            qg7_cell(
+                &format!("size/{corpus}/positions_off"),
+                "index_bytes_per_document",
+                "quill",
+                "bytes/doc",
+                quill_off_bytes,
+            ),
+            qg7_cell(
+                &format!("size/{corpus}/positions_on"),
+                "index_bytes_per_document",
+                "tantivy",
+                "bytes/doc",
+                oracle_on_bytes,
+            ),
+        ]
+    }
+
+    fn qg7_target_decision(cells: Vec<PerfCellResult>) -> DecisionState {
+        let mut artifact = qg2_artifact("new", 1.0, 1.0);
+        artifact.gate = PerfGate::Qg7;
+        artifact.cells = cells;
+        let cells = artifact
+            .cells
+            .iter()
+            .map(|cell| (CellKey::from(cell), cell))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = DecisionState::default();
+        evaluate_gate_targets(&artifact, &cells, None, true, false, &mut state);
+        state
+    }
+
+    /// The three published QG-7 bounds, pinned at and one step past each, plus
+    /// the fail-closed refusal when the positions-off denominator is absent.
+    ///
+    /// `evaluate_qg7` reads medium and xlarge, and a row it cannot find is
+    /// itself a quarantine, so every case supplies both corpora and varies only
+    /// the medium rows under test.
+    #[test]
+    fn qg7_pins_its_three_thresholds_and_refuses_a_missing_denominator() {
+        let passing = |corpus: &str| qg7_corpus_cells(corpus, 1.0, 1.15, 80.0, 100.0);
+
+        let mut at_threshold = passing("medium");
+        at_threshold.extend(passing("xlarge"));
+        let state = qg7_target_decision(at_threshold);
+        assert!(
+            state.reasons.iter().all(|reason| {
+                reason.code != "perf.ratchet.gate_target_missed"
+                    && reason.code != "perf.ratchet.target_cell_missing"
+            }),
+            "QG-7 must admit exactly its published bounds (1.0, 1.15, 0.80): {:?}",
+            state.reasons
+        );
+
+        for (label, medium, needle) in [
+            (
+                "rss",
+                qg7_corpus_cells("medium", 1.000_001, 1.15, 80.0, 100.0),
+                "RSS ratio",
+            ),
+            (
+                "bytes_per_document",
+                qg7_corpus_cells("medium", 1.0, 1.150_001, 80.0, 100.0),
+                "bytes/doc ratio",
+            ),
+            (
+                "positions_off",
+                qg7_corpus_cells("medium", 1.0, 1.15, 80.001, 100.0),
+                "positions-off/default-oracle ratio",
+            ),
+        ] {
+            let mut cells = medium;
+            cells.extend(passing("xlarge"));
+            let state = qg7_target_decision(cells);
+            assert!(
+                state.reasons.iter().any(|reason| {
+                    reason.code == "perf.ratchet.gate_target_missed"
+                        && reason.message.contains(needle)
+                }),
+                "QG-7 {label} must reject one step past its published bound: {:?}",
+                state.reasons
+            );
+        }
+
+        // Drop the oracle positions-on bytes/doc row that the positions-off
+        // ratio divides by. The gate must refuse the run rather than silently
+        // skip the comparison it can no longer compute.
+        let mut missing = passing("medium");
+        missing.retain(|cell| {
+            !(cell.engine == "tantivy" && cell.metric == "index_bytes_per_document")
+        });
+        missing.extend(passing("xlarge"));
+        let state = qg7_target_decision(missing);
+        assert!(
+            state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.target_cell_missing"
+                    && reason
+                        .message
+                        .contains("size/medium/positions_on/index_bytes_per_document/tantivy")
+            }),
+            "a missing QG-7 denominator must quarantine rather than skip: {:?}",
+            state.reasons
+        );
+    }
+
     fn qg8_cell(threads: u32, docs_per_second: f64) -> PerfCellResult {
         PerfCellResult {
             fixture: format!("scaling/xlarge/{threads}/positions_on"),
@@ -4450,7 +4593,6 @@ mod tests {
         EffectP99 {
             baseline_numerator: u64,
             exceptional_numerator: u64,
-            denominator: u64,
         },
         QuillNullP99 {
             exceptional_numerator: u64,
@@ -4480,25 +4622,34 @@ mod tests {
             Qg6TestLeafProfile::EffectP99 {
                 baseline_numerator,
                 exceptional_numerator,
-                denominator,
             } if comparison == crate::Qg6Comparison::Effect
                 && sample.arm == PerfSampleArm::Treatment =>
             {
-                let numerator = if sample.group_id == Some(crate::QG6_QUERY_GROUP_IDS[0]) {
-                    exceptional_numerator
-                } else {
-                    baseline_numerator
-                };
-                vec![parent_latency_ns * numerator / denominator; searches_per_sample]
+                let mut leaves = uniform();
+                let exceptional_latency_ns = parent_latency_ns
+                    .checked_mul(exceptional_numerator)
+                    .expect("bounded QG-6 exceptional effect latency")
+                    / baseline_numerator;
+                for leaf in leaves.iter_mut().rev().take(2) {
+                    *leaf = exceptional_latency_ns;
+                }
+                leaves
             }
             Qg6TestLeafProfile::QuillNullP99 {
                 exceptional_numerator,
                 denominator,
             } if comparison == crate::Qg6Comparison::QuillNull
-                && sample.arm == PerfSampleArm::Treatment
-                && sample.group_id == Some(crate::QG6_QUERY_GROUP_IDS[0]) =>
+                && sample.arm == PerfSampleArm::Treatment =>
             {
-                vec![parent_latency_ns * exceptional_numerator / denominator; searches_per_sample]
+                let mut leaves = uniform();
+                let exceptional_latency_ns = parent_latency_ns
+                    .checked_mul(exceptional_numerator)
+                    .expect("bounded QG-6 exceptional null latency")
+                    / denominator;
+                for leaf in leaves.iter_mut().rev().take(2) {
+                    *leaf = exceptional_latency_ns;
+                }
+                leaves
             }
             _ => uniform(),
         }
@@ -4826,7 +4977,7 @@ mod tests {
         qg6_complete_pair_with_shape_and_seed_and_leaf_profile(
             run_id,
             group_ratios,
-            1,
+            128,
             crate::perf::PERF_BOOTSTRAP_RESAMPLES,
             false,
             QG6_TEST_SCHEDULE_SEED,
@@ -5044,49 +5195,36 @@ mod tests {
 
     fn evaluate_with_current(
         baseline: &PerfGateArtifact,
+        baseline_evidence: Option<&PerfEvidenceArtifact>,
         candidate: &PerfGateArtifact,
         rerun: Option<&PerfGateArtifact>,
         candidate_evidence: Option<&PerfEvidenceArtifact>,
         rerun_evidence: Option<&PerfEvidenceArtifact>,
+        qg6_authority_sets: PerfRatchetQg6AuthoritySets<'_>,
     ) -> PerfRatchetEvaluation {
-        let qg6_authorities = (candidate.gate == PerfGate::Qg6)
-            .then(qg6_default_fixture_authorities)
-            .unwrap_or_default();
-        let qg6_authority_refs = qg6_authorities.iter().collect::<Vec<_>>();
-        let candidate_qg6 = if candidate_evidence.is_some() {
-            qg6_authority_refs.as_slice()
-        } else {
-            &[]
-        };
-        let rerun_qg6 = if rerun_evidence.is_some() {
-            qg6_authority_refs.as_slice()
-        } else {
-            &[]
-        };
-        evaluate_perf_ratchet_inner(
+        let expected_machine_profile = candidate_evidence
+            .and_then(|evidence| evidence.machine_class.identity())
+            .map(crate::VerifiedRunnerIdentity::profile);
+        evaluate_perf_ratchet_against_authorities(
             PerfRatchetRequest {
                 baseline: Some(baseline),
-                baseline_evidence: None,
+                baseline_evidence,
                 candidate,
                 rerun,
                 candidate_evidence,
                 rerun_evidence,
-                expected_machine_profile: None,
-                candidate_runner_identity: None,
-                rerun_runner_identity: None,
+                expected_machine_profile,
+                candidate_runner_identity: candidate_evidence
+                    .and_then(|evidence| evidence.machine_class.identity()),
+                rerun_runner_identity: rerun_evidence
+                    .and_then(|evidence| evidence.machine_class.identity()),
                 gate_activated: true,
                 mode: PerfRatchetMode::Promotion,
                 expected_manifest_sha256: &normalized_manifest_sha256(),
                 evidence: Vec::new(),
             },
             PerfRatchetQg1AuthoritySets::empty(),
-            PerfRatchetQg6AuthoritySets {
-                baseline: &[],
-                candidate: candidate_qg6,
-                rerun: rerun_qg6,
-            },
-            DecisionState::default(),
-            false,
+            qg6_authority_sets,
         )
     }
 
@@ -5094,11 +5232,10 @@ mod tests {
         artifact: &PerfGateArtifact,
         evidence: &PerfEvidenceArtifact,
         role: &str,
+        qg6_authority_refs: &[&Qg6ScheduleAuthority],
     ) {
-        let authorities = qg6_default_fixture_authorities();
-        let authority_refs = authorities.iter().collect::<Vec<_>>();
         evidence
-            .verify_integrity_against_authorities(&[], &authority_refs)
+            .verify_integrity_against_authorities(&[], qg6_authority_refs)
             .expect("QG-6 test evidence must be bound and resealed against its schedule authority");
 
         let mut state = DecisionState::default();
@@ -5126,34 +5263,12 @@ mod tests {
 
     fn evaluate_verified_promotion_request(
         request: PerfRatchetRequest<'_>,
+        qg6_authority_sets: PerfRatchetQg6AuthoritySets<'_>,
     ) -> PerfRatchetEvaluation {
-        let qg6_authorities = (request.candidate.gate == PerfGate::Qg6)
-            .then(qg6_default_fixture_authorities)
-            .unwrap_or_default();
-        let qg6_authority_refs = qg6_authorities.iter().collect::<Vec<_>>();
-        let baseline_qg6 = if request.baseline_evidence.is_some() {
-            qg6_authority_refs.as_slice()
-        } else {
-            &[]
-        };
-        let candidate_qg6 = if request.candidate_evidence.is_some() {
-            qg6_authority_refs.as_slice()
-        } else {
-            &[]
-        };
-        let rerun_qg6 = if request.rerun_evidence.is_some() {
-            qg6_authority_refs.as_slice()
-        } else {
-            &[]
-        };
         evaluate_perf_ratchet_against_authorities(
             request,
             PerfRatchetQg1AuthoritySets::empty(),
-            PerfRatchetQg6AuthoritySets {
-                baseline: baseline_qg6,
-                candidate: candidate_qg6,
-                rerun: rerun_qg6,
-            },
+            qg6_authority_sets,
         )
     }
 
@@ -5165,22 +5280,26 @@ mod tests {
         rerun: &PerfGateArtifact,
         rerun_evidence: &PerfEvidenceArtifact,
         expected_machine_profile: MachineProfileKey,
+        qg6_authority_sets: PerfRatchetQg6AuthoritySets<'_>,
     ) -> PerfRatchetEvaluation {
-        evaluate_verified_promotion_request(PerfRatchetRequest {
-            baseline: Some(baseline),
-            baseline_evidence: Some(baseline_evidence),
-            candidate,
-            rerun: Some(rerun),
-            candidate_evidence: Some(candidate_evidence),
-            rerun_evidence: Some(rerun_evidence),
-            expected_machine_profile: Some(expected_machine_profile),
-            candidate_runner_identity: candidate_evidence.machine_class.identity(),
-            rerun_runner_identity: rerun_evidence.machine_class.identity(),
-            gate_activated: true,
-            mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &normalized_manifest_sha256(),
-            evidence: Vec::new(),
-        })
+        evaluate_verified_promotion_request(
+            PerfRatchetRequest {
+                baseline: Some(baseline),
+                baseline_evidence: Some(baseline_evidence),
+                candidate,
+                rerun: Some(rerun),
+                candidate_evidence: Some(candidate_evidence),
+                rerun_evidence: Some(rerun_evidence),
+                expected_machine_profile: Some(expected_machine_profile),
+                candidate_runner_identity: candidate_evidence.machine_class.identity(),
+                rerun_runner_identity: rerun_evidence.machine_class.identity(),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            qg6_authority_sets,
+        )
     }
 
     /// bd-h4sqj: the whole point of the quarantine. This artifact is INTACT —
@@ -5293,6 +5412,13 @@ mod tests {
             .identity()
             .expect("candidate identity")
             .profile();
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
+        let retained_authority_sets = PerfRatchetQg6AuthoritySets {
+            baseline: &retained_authority_refs,
+            candidate: &retained_authority_refs,
+            rerun: &retained_authority_refs,
+        };
 
         let result = evaluate_verified_promotion(
             &baseline,
@@ -5302,6 +5428,7 @@ mod tests {
             &rerun,
             &rerun_evidence,
             expected_profile,
+            retained_authority_sets,
         );
 
         assert_eq!(result.decision, PerfGateDecision::Allow, "{result:#?}");
@@ -5323,6 +5450,7 @@ mod tests {
             &rerun,
             &rerun_evidence,
             expected_profile,
+            retained_authority_sets,
         );
         assert_eq!(
             tampered.decision,
@@ -5335,6 +5463,54 @@ mod tests {
                 .iter()
                 .any(|reason| { reason.code == "perf.ratchet.machine_evidence_integrity_failed" })
         );
+    }
+
+    #[test]
+    fn qg6_fixture_evaluator_requires_explicit_external_authorities() {
+        let ratios = [[1.0; 3]; 4];
+        let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
+        let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
+        let (rerun, rerun_evidence) = qg6_complete_pair("rerun", ratios);
+        let expected_profile = candidate_evidence
+            .machine_class
+            .identity()
+            .expect("candidate identity")
+            .profile();
+
+        let missing = evaluate_verified_promotion(
+            &baseline,
+            &baseline_evidence,
+            &candidate,
+            &candidate_evidence,
+            &rerun,
+            &rerun_evidence,
+            expected_profile,
+            PerfRatchetQg6AuthoritySets::empty(),
+        );
+        assert_eq!(missing.decision, PerfGateDecision::Block, "{missing:#?}");
+        assert!(missing.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.machine_evidence_integrity_failed"
+                && reason.message.contains("independently retained")
+        }));
+        assert!(missing.comparisons.is_empty());
+
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
+        let retained = evaluate_verified_promotion(
+            &baseline,
+            &baseline_evidence,
+            &candidate,
+            &candidate_evidence,
+            &rerun,
+            &rerun_evidence,
+            expected_profile,
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
+        );
+        assert_eq!(retained.decision, PerfGateDecision::Allow, "{retained:#?}");
     }
 
     #[test]
@@ -5441,6 +5617,8 @@ mod tests {
             .identity()
             .expect("candidate identity")
             .profile();
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
         let result = evaluate_verified_promotion(
             &baseline,
@@ -5450,6 +5628,11 @@ mod tests {
             &rerun,
             &rerun_evidence,
             expected_profile,
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
         );
 
         assert_eq!(result.decision, PerfGateDecision::Block, "{result:#?}");
@@ -5599,6 +5782,8 @@ mod tests {
             .identity()
             .expect("candidate identity")
             .profile();
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
         let result = evaluate_verified_promotion(
             &baseline,
@@ -5608,6 +5793,11 @@ mod tests {
             &rerun,
             &rerun_evidence,
             expected_profile,
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
         );
 
         assert_eq!(result.decision, PerfGateDecision::Block, "{result:#?}");
@@ -5630,6 +5820,8 @@ mod tests {
             .identity()
             .expect("candidate identity")
             .profile();
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
         let result = evaluate_verified_promotion(
             &baseline,
@@ -5639,6 +5831,11 @@ mod tests {
             &rerun,
             &rerun_evidence,
             expected_profile,
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
         );
 
         assert_eq!(result.decision, PerfGateDecision::Block, "{result:#?}");
@@ -5664,6 +5861,8 @@ mod tests {
             .identity()
             .expect("candidate identity")
             .profile();
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
         let result = evaluate_verified_promotion(
             &baseline,
@@ -5673,6 +5872,11 @@ mod tests {
             &rerun,
             &rerun_evidence,
             expected_profile,
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
         );
 
         assert_eq!(result.decision, PerfGateDecision::Quarantine, "{result:#?}");
@@ -5702,6 +5906,8 @@ mod tests {
             .identity()
             .expect("candidate identity")
             .profile();
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
         let result = evaluate_verified_promotion(
             &baseline,
@@ -5711,6 +5917,11 @@ mod tests {
             &rerun,
             &rerun_evidence,
             expected_profile,
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
         );
 
         assert!(
@@ -5755,6 +5966,11 @@ mod tests {
             &rerun,
             &rerun_evidence,
             expected_profile,
+            PerfRatchetQg6AuthoritySets {
+                baseline: &candidate_qg6_authority_refs,
+                candidate: &candidate_qg6_authority_refs,
+                rerun: &candidate_qg6_authority_refs,
+            },
         );
 
         assert_eq!(result.decision, PerfGateDecision::Block);
@@ -5837,6 +6053,8 @@ mod tests {
         let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
         let (rerun, rerun_evidence) = qg6_complete_pair("rerun", ratios);
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
         let result = evaluate_verified_promotion(
             &baseline,
@@ -5850,6 +6068,11 @@ mod tests {
                 crate::ExecutionProfileId::Smt2_128,
             )
             .expect("canonical mismatched profile"),
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
         );
 
         assert_eq!(result.decision, PerfGateDecision::Block);
@@ -5871,22 +6094,31 @@ mod tests {
             .identity()
             .expect("candidate identity")
             .profile();
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
-        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
-            baseline: Some(&baseline),
-            baseline_evidence: None,
-            candidate: &candidate,
-            rerun: Some(&rerun),
-            candidate_evidence: Some(&candidate_evidence),
-            rerun_evidence: Some(&rerun_evidence),
-            expected_machine_profile: Some(expected_profile),
-            candidate_runner_identity: candidate_evidence.machine_class.identity(),
-            rerun_runner_identity: rerun_evidence.machine_class.identity(),
-            gate_activated: true,
-            mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &normalized_manifest_sha256(),
-            evidence: Vec::new(),
-        });
+        let result = evaluate_verified_promotion_request(
+            PerfRatchetRequest {
+                baseline: Some(&baseline),
+                baseline_evidence: None,
+                candidate: &candidate,
+                rerun: Some(&rerun),
+                candidate_evidence: Some(&candidate_evidence),
+                rerun_evidence: Some(&rerun_evidence),
+                expected_machine_profile: Some(expected_profile),
+                candidate_runner_identity: candidate_evidence.machine_class.identity(),
+                rerun_runner_identity: rerun_evidence.machine_class.identity(),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
+        );
 
         assert_eq!(result.decision, PerfGateDecision::Quarantine);
         assert!(result.reasons.iter().any(|reason| {
@@ -5915,22 +6147,31 @@ mod tests {
         candidate_evidence.machine_class =
             serde_json::from_value(binding).expect("stale binding JSON");
         reseal_evidence_without_verification(&mut candidate_evidence);
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
-        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
-            baseline: Some(&baseline),
-            baseline_evidence: Some(&baseline_evidence),
-            candidate: &candidate,
-            rerun: Some(&rerun),
-            candidate_evidence: Some(&candidate_evidence),
-            rerun_evidence: Some(&rerun_evidence),
-            expected_machine_profile: Some(expected_profile),
-            candidate_runner_identity: Some(&external_candidate),
-            rerun_runner_identity: rerun_evidence.machine_class.identity(),
-            gate_activated: true,
-            mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &normalized_manifest_sha256(),
-            evidence: Vec::new(),
-        });
+        let result = evaluate_verified_promotion_request(
+            PerfRatchetRequest {
+                baseline: Some(&baseline),
+                baseline_evidence: Some(&baseline_evidence),
+                candidate: &candidate,
+                rerun: Some(&rerun),
+                candidate_evidence: Some(&candidate_evidence),
+                rerun_evidence: Some(&rerun_evidence),
+                expected_machine_profile: Some(expected_profile),
+                candidate_runner_identity: Some(&external_candidate),
+                rerun_runner_identity: rerun_evidence.machine_class.identity(),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
+        );
 
         assert_eq!(result.decision, PerfGateDecision::Block);
         assert!(result.reasons.iter().any(|reason| {
@@ -5956,22 +6197,31 @@ mod tests {
             .identity()
             .expect("candidate identity")
             .profile();
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
-        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
-            baseline: Some(&baseline),
-            baseline_evidence: Some(&baseline_evidence),
-            candidate: &candidate,
-            rerun: Some(&rerun),
-            candidate_evidence: Some(&candidate_evidence),
-            rerun_evidence: Some(&rerun_evidence),
-            expected_machine_profile: Some(expected_profile),
-            candidate_runner_identity: candidate_evidence.machine_class.identity(),
-            rerun_runner_identity: rerun_evidence.machine_class.identity(),
-            gate_activated: true,
-            mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &normalized_manifest_sha256(),
-            evidence: Vec::new(),
-        });
+        let result = evaluate_verified_promotion_request(
+            PerfRatchetRequest {
+                baseline: Some(&baseline),
+                baseline_evidence: Some(&baseline_evidence),
+                candidate: &candidate,
+                rerun: Some(&rerun),
+                candidate_evidence: Some(&candidate_evidence),
+                rerun_evidence: Some(&rerun_evidence),
+                expected_machine_profile: Some(expected_profile),
+                candidate_runner_identity: candidate_evidence.machine_class.identity(),
+                rerun_runner_identity: rerun_evidence.machine_class.identity(),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
+        );
 
         assert_eq!(result.decision, PerfGateDecision::Block);
         assert!(result.reasons.iter().any(|reason| {
@@ -6262,10 +6512,12 @@ mod tests {
 
         let result = evaluate_with_current(
             &baseline,
+            None,
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
             Some(&rerun_evidence),
+            PerfRatchetQg6AuthoritySets::empty(),
         );
 
         assert_ne!(result.decision, PerfGateDecision::Allow);
@@ -6335,21 +6587,28 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
-            baseline: Some(&baseline),
-            baseline_evidence: Some(&baseline_evidence),
-            candidate: &candidate,
-            rerun: Some(&rerun),
-            candidate_evidence: Some(&candidate_evidence),
-            rerun_evidence: Some(&rerun_evidence),
-            expected_machine_profile: Some(expected_profile),
-            candidate_runner_identity: candidate_evidence.machine_class.identity(),
-            rerun_runner_identity: Some(&alternate_producer),
-            gate_activated: true,
-            mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &normalized_manifest_sha256(),
-            evidence: Vec::new(),
-        });
+        let result = evaluate_verified_promotion_request(
+            PerfRatchetRequest {
+                baseline: Some(&baseline),
+                baseline_evidence: Some(&baseline_evidence),
+                candidate: &candidate,
+                rerun: Some(&rerun),
+                candidate_evidence: Some(&candidate_evidence),
+                rerun_evidence: Some(&rerun_evidence),
+                expected_machine_profile: Some(expected_profile),
+                candidate_runner_identity: candidate_evidence.machine_class.identity(),
+                rerun_runner_identity: Some(&alternate_producer),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            PerfRatchetQg6AuthoritySets {
+                baseline: &rerun_qg6_authority_refs,
+                candidate: &rerun_qg6_authority_refs,
+                rerun: &rerun_qg6_authority_refs,
+            },
+        );
 
         assert_eq!(result.decision, PerfGateDecision::Block);
         assert!(
@@ -6425,21 +6684,28 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
-            baseline: Some(&baseline),
-            baseline_evidence: Some(&baseline_evidence),
-            candidate: &candidate,
-            rerun: Some(&rerun),
-            candidate_evidence: Some(&candidate_evidence),
-            rerun_evidence: Some(&rerun_evidence),
-            expected_machine_profile: Some(expected_profile),
-            candidate_runner_identity: candidate_evidence.machine_class.identity(),
-            rerun_runner_identity: Some(&alternate_benchmark),
-            gate_activated: true,
-            mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &normalized_manifest_sha256(),
-            evidence: Vec::new(),
-        });
+        let result = evaluate_verified_promotion_request(
+            PerfRatchetRequest {
+                baseline: Some(&baseline),
+                baseline_evidence: Some(&baseline_evidence),
+                candidate: &candidate,
+                rerun: Some(&rerun),
+                candidate_evidence: Some(&candidate_evidence),
+                rerun_evidence: Some(&rerun_evidence),
+                expected_machine_profile: Some(expected_profile),
+                candidate_runner_identity: candidate_evidence.machine_class.identity(),
+                rerun_runner_identity: Some(&alternate_benchmark),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            PerfRatchetQg6AuthoritySets {
+                baseline: &rerun_qg6_authority_refs,
+                candidate: &rerun_qg6_authority_refs,
+                rerun: &rerun_qg6_authority_refs,
+            },
+        );
 
         assert_eq!(result.decision, PerfGateDecision::Block);
         assert!(result.reasons.iter().any(|reason| {
@@ -6472,21 +6738,28 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
-            baseline: Some(&baseline),
-            baseline_evidence: Some(&baseline_evidence),
-            candidate: &candidate,
-            rerun: Some(&rerun),
-            candidate_evidence: Some(&candidate_evidence),
-            rerun_evidence: Some(&rerun_evidence),
-            expected_machine_profile: Some(expected_profile),
-            candidate_runner_identity: candidate_evidence.machine_class.identity(),
-            rerun_runner_identity: rerun_evidence.machine_class.identity(),
-            gate_activated: true,
-            mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &normalized_manifest_sha256(),
-            evidence: Vec::new(),
-        });
+        let result = evaluate_verified_promotion_request(
+            PerfRatchetRequest {
+                baseline: Some(&baseline),
+                baseline_evidence: Some(&baseline_evidence),
+                candidate: &candidate,
+                rerun: Some(&rerun),
+                candidate_evidence: Some(&candidate_evidence),
+                rerun_evidence: Some(&rerun_evidence),
+                expected_machine_profile: Some(expected_profile),
+                candidate_runner_identity: candidate_evidence.machine_class.identity(),
+                rerun_runner_identity: rerun_evidence.machine_class.identity(),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            PerfRatchetQg6AuthoritySets {
+                baseline: &candidate_qg6_authority_refs,
+                candidate: &candidate_qg6_authority_refs,
+                rerun: &candidate_qg6_authority_refs,
+            },
+        );
 
         assert_eq!(result.decision, PerfGateDecision::Quarantine);
         assert!(
@@ -6515,22 +6788,31 @@ mod tests {
             .identity()
             .expect("candidate identity")
             .profile();
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
-        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
-            baseline: Some(&baseline),
-            baseline_evidence: Some(&baseline_evidence),
-            candidate: &candidate,
-            rerun: Some(&rerun),
-            candidate_evidence: Some(&candidate_evidence),
-            rerun_evidence: Some(&rerun_evidence),
-            expected_machine_profile: Some(expected_profile),
-            candidate_runner_identity: candidate_evidence.machine_class.identity(),
-            rerun_runner_identity: rerun_evidence.machine_class.identity(),
-            gate_activated: true,
-            mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &normalized_manifest_sha256(),
-            evidence: Vec::new(),
-        });
+        let result = evaluate_verified_promotion_request(
+            PerfRatchetRequest {
+                baseline: Some(&baseline),
+                baseline_evidence: Some(&baseline_evidence),
+                candidate: &candidate,
+                rerun: Some(&rerun),
+                candidate_evidence: Some(&candidate_evidence),
+                rerun_evidence: Some(&rerun_evidence),
+                expected_machine_profile: Some(expected_profile),
+                candidate_runner_identity: candidate_evidence.machine_class.identity(),
+                rerun_runner_identity: rerun_evidence.machine_class.identity(),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
+        );
 
         assert_eq!(result.decision, PerfGateDecision::Block);
         assert!(
@@ -6571,21 +6853,28 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
-            baseline: Some(&baseline),
-            baseline_evidence: Some(&baseline_evidence),
-            candidate: &candidate,
-            rerun: Some(&rerun),
-            candidate_evidence: Some(&candidate_evidence),
-            rerun_evidence: Some(&rerun_evidence),
-            expected_machine_profile: Some(expected_profile),
-            candidate_runner_identity: candidate_evidence.machine_class.identity(),
-            rerun_runner_identity: rerun_evidence.machine_class.identity(),
-            gate_activated: true,
-            mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &normalized_manifest_sha256(),
-            evidence: Vec::new(),
-        });
+        let result = evaluate_verified_promotion_request(
+            PerfRatchetRequest {
+                baseline: Some(&baseline),
+                baseline_evidence: Some(&baseline_evidence),
+                candidate: &candidate,
+                rerun: Some(&rerun),
+                candidate_evidence: Some(&candidate_evidence),
+                rerun_evidence: Some(&rerun_evidence),
+                expected_machine_profile: Some(expected_profile),
+                candidate_runner_identity: candidate_evidence.machine_class.identity(),
+                rerun_runner_identity: rerun_evidence.machine_class.identity(),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            PerfRatchetQg6AuthoritySets {
+                baseline: &baseline_qg6_authority_refs,
+                candidate: &baseline_qg6_authority_refs,
+                rerun: &baseline_qg6_authority_refs,
+            },
+        );
 
         assert_eq!(result.decision, PerfGateDecision::Quarantine);
         assert!(
@@ -6644,21 +6933,28 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
-            baseline: Some(&baseline),
-            baseline_evidence: Some(&baseline_evidence),
-            candidate: &candidate,
-            rerun: Some(&rerun),
-            candidate_evidence: Some(&candidate_evidence),
-            rerun_evidence: Some(&rerun_evidence),
-            expected_machine_profile: Some(expected_profile),
-            candidate_runner_identity: candidate_evidence.machine_class.identity(),
-            rerun_runner_identity: rerun_evidence.machine_class.identity(),
-            gate_activated: true,
-            mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &normalized_manifest_sha256(),
-            evidence: Vec::new(),
-        });
+        let result = evaluate_verified_promotion_request(
+            PerfRatchetRequest {
+                baseline: Some(&baseline),
+                baseline_evidence: Some(&baseline_evidence),
+                candidate: &candidate,
+                rerun: Some(&rerun),
+                candidate_evidence: Some(&candidate_evidence),
+                rerun_evidence: Some(&rerun_evidence),
+                expected_machine_profile: Some(expected_profile),
+                candidate_runner_identity: candidate_evidence.machine_class.identity(),
+                rerun_runner_identity: rerun_evidence.machine_class.identity(),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            PerfRatchetQg6AuthoritySets {
+                baseline: &baseline_qg6_authority_refs,
+                candidate: &baseline_qg6_authority_refs,
+                rerun: &baseline_qg6_authority_refs,
+            },
+        );
 
         assert_eq!(result.decision, PerfGateDecision::Block);
         assert!(
@@ -6700,10 +6996,12 @@ mod tests {
         let (rerun, rerun_evidence) = qg2_current_pair("new", "rerun", 161.0, 100.0);
         let result = evaluate_with_current(
             &baseline,
+            None,
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
             Some(&rerun_evidence),
+            PerfRatchetQg6AuthoritySets::empty(),
         );
         assert_eq!(result.decision, PerfGateDecision::Allow);
     }
@@ -6723,10 +7021,12 @@ mod tests {
 
         let result = evaluate_with_current(
             &baseline,
+            None,
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
             Some(&rerun_evidence),
+            PerfRatchetQg6AuthoritySets::empty(),
         );
 
         assert_eq!(result.decision, PerfGateDecision::Block);
@@ -6828,10 +7128,12 @@ mod tests {
         candidate.bench_elf_sha256 = "f".repeat(64);
         let result = evaluate_with_current(
             &baseline,
+            None,
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
             Some(&rerun_evidence),
+            PerfRatchetQg6AuthoritySets::empty(),
         );
         assert_eq!(result.decision, PerfGateDecision::Quarantine);
         assert!(
@@ -6934,15 +7236,15 @@ mod tests {
 
     #[test]
     fn qg6_promotion_requires_rerun_hierarchical_ci_to_pass_independently() {
+        let (baseline, baseline_evidence) = qg6_complete_pair("baseline", [[1.0; 3]; 4]);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", [[1.0; 3]; 4]);
         let mut rerun_ratios = [[1.0; 3]; crate::QG6_QUERY_GROUPS];
         for ratios in &mut rerun_ratios[..7] {
             *ratios = [0.80; 3];
         }
         let (rerun, rerun_evidence) = qg6_complete_pair("rerun", rerun_ratios);
-        let mut baseline = candidate.clone();
-        baseline.run_id = "baseline".to_owned();
-        baseline.git_rev = "0".repeat(40);
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
         let candidate_hierarchy =
             exact_qg6_hierarchical_cell(&candidate_evidence, "query/identifier/k10/100k")
@@ -6966,10 +7268,16 @@ mod tests {
 
         let result = evaluate_with_current(
             &baseline,
+            Some(&baseline_evidence),
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
             Some(&rerun_evidence),
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
         );
         assert_eq!(result.decision, PerfGateDecision::Quarantine);
         assert!(result.reasons.iter().any(|reason| {
@@ -6984,18 +7292,24 @@ mod tests {
 
     #[test]
     fn qg6_promotion_requires_rerun_absolute_p99_to_pass_independently() {
+        let (baseline, baseline_evidence) = qg6_complete_pair("baseline", [[1.0; 3]; 4]);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", [[1.0; 3]; 4]);
         let (rerun, rerun_evidence) = qg6_complete_pair("rerun", [[1.01; 3]; 4]);
-        let mut baseline = candidate.clone();
-        baseline.run_id = "baseline".to_owned();
-        baseline.git_rev = "0".repeat(40);
+        let retained_authorities = qg6_default_fixture_authorities();
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
 
         let result = evaluate_with_current(
             &baseline,
+            Some(&baseline_evidence),
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
             Some(&rerun_evidence),
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
         );
         assert_eq!(result.decision, PerfGateDecision::Block);
         assert!(
@@ -7332,14 +7646,21 @@ mod tests {
 
     #[test]
     fn qg6_reproduction_rejects_p99_only_effect_tail_drift_after_independent_target_passes() {
-        let ratios = [[1.0; 3]; 4];
+        let ratios = [[0.98; 3]; 4];
+        let (baseline, baseline_evidence) = qg6_complete_pair_with_leaf_profile(
+            "baseline",
+            ratios,
+            Qg6TestLeafProfile::EffectP99 {
+                baseline_numerator: 98,
+                exceptional_numerator: 98,
+            },
+        );
         let (candidate, candidate_evidence) = qg6_complete_pair_with_leaf_profile(
             "candidate",
             ratios,
             Qg6TestLeafProfile::EffectP99 {
                 baseline_numerator: 98,
                 exceptional_numerator: 98,
-                denominator: 100,
             },
         );
         let (rerun, rerun_evidence) = qg6_complete_pair_with_leaf_profile(
@@ -7348,11 +7669,17 @@ mod tests {
             Qg6TestLeafProfile::EffectP99 {
                 baseline_numerator: 98,
                 exceptional_numerator: 100,
-                denominator: 100,
             },
         );
-        assert_qg6_target_passes(&candidate, &candidate_evidence, "candidate");
-        assert_qg6_target_passes(&rerun, &rerun_evidence, "rerun");
+        let retained_authorities = qg6_fixture_authorities_for_shape::<3>(128, false);
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
+        assert_qg6_target_passes(
+            &candidate,
+            &candidate_evidence,
+            "candidate",
+            &retained_authority_refs,
+        );
+        assert_qg6_target_passes(&rerun, &rerun_evidence, "rerun", &retained_authority_refs);
 
         let candidate_tail =
             exact_qg6_joint_tail_cell(&candidate_evidence, "query/identifier/k10/100k")
@@ -7378,15 +7705,18 @@ mod tests {
         assert_eq!(candidate_tail.tantivy_null, rerun_tail.tantivy_null);
         assert_eq!(candidate_tail.quill_null, rerun_tail.quill_null);
 
-        let mut baseline = candidate.clone();
-        baseline.run_id = "baseline".to_owned();
-        baseline.git_rev = "0".repeat(40);
         let result = evaluate_with_current(
             &baseline,
+            Some(&baseline_evidence),
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
             Some(&rerun_evidence),
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
         );
         assert_eq!(result.decision, PerfGateDecision::Quarantine, "{result:#?}");
         assert!(result.reasons.iter().any(|reason| {
@@ -7404,6 +7734,8 @@ mod tests {
     #[test]
     fn qg6_reproduction_rejects_p99_only_quill_null_tail_drift_after_independent_target_passes() {
         let ratios = [[1.0; 3]; 4];
+        let (baseline, baseline_evidence) =
+            qg6_complete_pair_with_leaf_profile("baseline", ratios, Qg6TestLeafProfile::Uniform);
         let (candidate, candidate_evidence) =
             qg6_complete_pair_with_leaf_profile("candidate", ratios, Qg6TestLeafProfile::Uniform);
         let (rerun, rerun_evidence) = qg6_complete_pair_with_leaf_profile(
@@ -7414,8 +7746,15 @@ mod tests {
                 denominator: 1_000,
             },
         );
-        assert_qg6_target_passes(&candidate, &candidate_evidence, "candidate");
-        assert_qg6_target_passes(&rerun, &rerun_evidence, "rerun");
+        let retained_authorities = qg6_fixture_authorities_for_shape::<3>(128, false);
+        let retained_authority_refs = retained_authorities.iter().collect::<Vec<_>>();
+        assert_qg6_target_passes(
+            &candidate,
+            &candidate_evidence,
+            "candidate",
+            &retained_authority_refs,
+        );
+        assert_qg6_target_passes(&rerun, &rerun_evidence, "rerun", &retained_authority_refs);
 
         let candidate_tail =
             exact_qg6_joint_tail_cell(&candidate_evidence, "query/identifier/k10/100k")
@@ -7441,15 +7780,18 @@ mod tests {
         assert_eq!(candidate_tail.effect, rerun_tail.effect);
         assert_eq!(candidate_tail.tantivy_null, rerun_tail.tantivy_null);
 
-        let mut baseline = candidate.clone();
-        baseline.run_id = "baseline".to_owned();
-        baseline.git_rev = "0".repeat(40);
         let result = evaluate_with_current(
             &baseline,
+            Some(&baseline_evidence),
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
             Some(&rerun_evidence),
+            PerfRatchetQg6AuthoritySets {
+                baseline: &retained_authority_refs,
+                candidate: &retained_authority_refs,
+                rerun: &retained_authority_refs,
+            },
         );
         assert_eq!(result.decision, PerfGateDecision::Quarantine, "{result:#?}");
         assert!(result.reasons.iter().any(|reason| {

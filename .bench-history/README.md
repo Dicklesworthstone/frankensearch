@@ -2,11 +2,13 @@
 
 For current measured history,
 `QG-<n>.<hardware-class>.<execution-profile>.latest.json` is one canonical
-`frankensearch.perf-history-pointer.v2` pointer to an immutable
+`frankensearch.perf-history-pointer.v3` pointer to an immutable
 `QG-<n>.<hardware-class>.<execution-profile>.<date>.<run-id>.json` threshold
-object and its matching `.evidence.json` object. Its `profile` object carries
-both `hardware_class_id` and `execution_profile_id`, and the pointer hashes both
-artifacts, so the ratchet never reads a mixed generation or crosses an
+object and its matching `.evidence.json` object. For QG-6, the same pointer
+also names and hashes the exact pre-timing authority set and terminal attempt
+receipt; non-QG-6 pointers omit both pairs. Its `profile` object carries both
+`hardware_class_id` and `execution_profile_id`, and the pointer hashes every
+required object, so the ratchet never reads a mixed generation or crosses an
 immutable profile key. Initial activation and target attainment are separate
 facts: a complete, admissible candidate plus a same-revision reproduction
 establishes the first measured baseline whether the target verdict is PASS or
@@ -25,11 +27,11 @@ sentinel inside this directory; once a latest pointer exists, only that exact
 canonical pointer is authoritative for promotion. Copied, directly supplied,
 stale, and bootstrap-replay baselines fail promotion before a decision or
 history write. Under the held lock, a promotion Allow creates the
-run-ID-qualified threshold and evidence objects with no-clobber, byte-exact
-retry semantics and atomically replaces the one latest pointer last. A crash
-therefore leaves either the old complete pointer or the new complete pointer
-authoritative. A colliding immutable filename with different bytes is a hard
-error.
+run-ID-qualified threshold and evidence objects and, for QG-6, its authority
+set and attempt receipt, all with no-clobber, byte-exact retry semantics. It
+atomically replaces the one latest pointer last. A crash therefore leaves
+either the old complete pointer or the new complete pointer authoritative. A
+colliding immutable filename with different bytes is a hard error.
 
 Full, sealed runs that do not earn promotion live under
 `attempts/<date>/QG-<n>/<run-id>/`. These attempts are durable measurement

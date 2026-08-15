@@ -33,7 +33,7 @@ pub const LEXICAL_CONTRACT_COMPARISON_SCHEMA_VERSION: &str = "lexical-contract-c
 /// decision authority. Only a separate future authenticated supervisor receipt,
 /// issued after independent policy and provenance checks, could do that.
 pub const CASS_LEXICAL_PROFILE_OBSERVATION_SCHEMA_VERSION: &str =
-    "cass-lexical-layer-a-observation-v2";
+    "cass-lexical-layer-a-observation-v3";
 /// Stable schema identifier for the live, method-bound Quill cancellation
 /// receipt owned by bd-fjpu.
 ///
@@ -5178,6 +5178,7 @@ pub enum CassProfileDiagnosticKind {
     InvalidBoost,
     AllNegativeRepair,
     DepthLimit,
+    AllocationFailure,
     TermLengthLimit,
 }
 
@@ -5194,6 +5195,7 @@ impl From<frankensearch_quill::query::QueryDiagnosticKind> for CassProfileDiagno
             QueryDiagnosticKind::InvalidBoost => Self::InvalidBoost,
             QueryDiagnosticKind::AllNegativeRepair => Self::AllNegativeRepair,
             QueryDiagnosticKind::DepthLimit => Self::DepthLimit,
+            QueryDiagnosticKind::AllocationFailure => Self::AllocationFailure,
             QueryDiagnosticKind::TermLengthLimit => Self::TermLengthLimit,
         }
     }
@@ -7044,6 +7046,18 @@ pub const fn ast_lowering_kind(
         QueryDiagnosticKind::AllNegativeRepair => None,
         // UNRULED: a depth cap reached is a bound, not yet a reviewed class.
         QueryDiagnosticKind::DepthLimit => None,
+        // UNRULED, and on a different axis from every arm above: a failed
+        // bounded arena reservation is a CONSTRUCTION REFUSAL, not a lowering.
+        // The other kinds all describe an AST that was built and means
+        // something narrower than the source; here no AST was built at all,
+        // which is why `Query` carries the failure as its own root rather than
+        // letting it masquerade as match-none. Forcing it into an
+        // `AstLoweringKind` would assert a semantic change that never
+        // happened. Ruling it needs a decision on which axis it belongs to
+        // (run validity / refusal, not AST lowering) before any register entry
+        // could describe it, so it stays unruled here rather than being
+        // classified on the wrong one.
+        QueryDiagnosticKind::AllocationFailure => None,
     }
 }
 
@@ -11388,6 +11402,7 @@ mod tests {
             QueryDiagnosticKind::InvalidBoost,
             QueryDiagnosticKind::AllNegativeRepair,
             QueryDiagnosticKind::DepthLimit,
+            QueryDiagnosticKind::AllocationFailure,
         ] {
             assert_eq!(
                 ast_lowering_kind(unruled),
@@ -11395,6 +11410,19 @@ mod tests {
                 "{unruled:?} is UNRULED; mapping it needs a reviewed register entry first"
             );
         }
+    }
+
+    #[test]
+    fn allocation_failure_diagnostic_is_bound_to_cass_profile_v3() {
+        assert_eq!(
+            CASS_LEXICAL_PROFILE_OBSERVATION_SCHEMA_VERSION,
+            "cass-lexical-layer-a-observation-v3"
+        );
+        assert_eq!(
+            serde_json::to_value(CassProfileDiagnosticKind::AllocationFailure)
+                .expect("serialize allocation-failure diagnostic"),
+            serde_json::json!("allocation_failure")
+        );
     }
 
     /// D1(c) option (i): the oracle's silence is recorded, never implied.

@@ -5038,69 +5038,69 @@ mod tests {
             },
             E55QueryCase {
                 id: "boost-range-i64",
-                input: E55QueryInput::Preparsed(Query::Boost {
-                    query: Box::new(Query::Range {
-                        field_id: E55_I64_FIELD,
-                        lower: Bound::Included(QueryValue::I64(-7)),
-                        upper: Bound::Excluded(QueryValue::I64(8)),
-                    }),
-                    factor: 2.5,
-                }),
+                input: E55QueryInput::Preparsed(Query::boost(
+                    Query::range(
+                        E55_I64_FIELD,
+                        Bound::Included(QueryValue::I64(-7)),
+                        Bound::Excluded(QueryValue::I64(8)),
+                    ),
+                    2.5,
+                )),
             },
             E55QueryCase {
                 id: "range-str",
-                input: E55QueryInput::Preparsed(Query::Range {
-                    field_id: E55_TAG_FIELD,
-                    lower: Bound::Included(QueryValue::Str("blue".to_owned())),
-                    upper: Bound::Included(QueryValue::Str("green".to_owned())),
-                }),
+                input: E55QueryInput::Preparsed(Query::range(
+                    E55_TAG_FIELD,
+                    Bound::Included(QueryValue::Str("blue".to_owned())),
+                    Bound::Included(QueryValue::Str("green".to_owned())),
+                )),
             },
             E55QueryCase {
                 id: "range-i64",
-                input: E55QueryInput::Preparsed(Query::Range {
-                    field_id: E55_I64_FIELD,
-                    lower: Bound::Included(QueryValue::I64(-7)),
-                    upper: Bound::Excluded(QueryValue::I64(8)),
-                }),
+                input: E55QueryInput::Preparsed(Query::range(
+                    E55_I64_FIELD,
+                    Bound::Included(QueryValue::I64(-7)),
+                    Bound::Excluded(QueryValue::I64(8)),
+                )),
             },
             E55QueryCase {
                 id: "range-u64",
-                input: E55QueryInput::Preparsed(Query::Range {
-                    field_id: E55_U64_FIELD,
-                    lower: Bound::Included(QueryValue::U64(2)),
-                    upper: Bound::Included(QueryValue::U64(8)),
-                }),
+                input: E55QueryInput::Preparsed(Query::range(
+                    E55_U64_FIELD,
+                    Bound::Included(QueryValue::U64(2)),
+                    Bound::Included(QueryValue::U64(8)),
+                )),
             },
             E55QueryCase {
                 id: "set-str",
-                input: E55QueryInput::Preparsed(Query::Set {
-                    field_id: E55_TAG_FIELD,
-                    values: vec![
+                input: E55QueryInput::Preparsed(Query::set(
+                    E55_TAG_FIELD,
+                    vec![
                         QueryValue::Str("blue".to_owned()),
                         QueryValue::Str("red".to_owned()),
                     ],
-                }),
+                )),
             },
             E55QueryCase {
                 id: "set-i64",
-                input: E55QueryInput::Preparsed(Query::Set {
-                    field_id: E55_I64_FIELD,
-                    values: vec![QueryValue::I64(-7), QueryValue::I64(9)],
-                }),
+                input: E55QueryInput::Preparsed(Query::set(
+                    E55_I64_FIELD,
+                    vec![QueryValue::I64(-7), QueryValue::I64(9)],
+                )),
             },
             E55QueryCase {
                 id: "set-u64",
-                input: E55QueryInput::Preparsed(Query::Set {
-                    field_id: E55_U64_FIELD,
-                    values: vec![QueryValue::U64(2), QueryValue::U64(13)],
-                }),
+                input: E55QueryInput::Preparsed(Query::set(
+                    E55_U64_FIELD,
+                    vec![QueryValue::U64(2), QueryValue::U64(13)],
+                )),
             },
             E55QueryCase {
                 id: "glob",
-                input: E55QueryInput::Preparsed(Query::Glob {
-                    field_ids: vec![E55_CONTENT_FIELD, E55_TITLE_FIELD],
-                    pattern: "*lpha*".to_owned(),
-                }),
+                input: E55QueryInput::Preparsed(Query::glob(
+                    vec![E55_CONTENT_FIELD, E55_TITLE_FIELD],
+                    "*lpha*".to_owned(),
+                )),
             },
         ]
     }
@@ -5822,10 +5822,10 @@ mod tests {
                 "retired Q1 row {retired_docid} became visible"
             );
         }
-        let replacement_query = Query::Term {
-            fields: vec![QueryField::new(E55_ID_FIELD, 1.0)],
-            text: E55_HISTORICAL_ID.to_owned(),
-        };
+        let replacement_query = Query::term(
+            vec![QueryField::new(E55_ID_FIELD, 1.0)],
+            E55_HISTORICAL_ID.to_owned(),
+        );
         assert_eq!(
             index
                 .collect_preparsed_docids(cx, &replacement_query)
@@ -12068,7 +12068,7 @@ mod tests {
             );
             assert_ne!(
                 asymmetry.recovered_quill_ast,
-                Query::Empty,
+                Query::empty(),
                 "this nested malformed query must recover a usable Quill AST rather than vanish"
             );
             assert_eq!(

@@ -159,7 +159,11 @@ pub use machine_class_registry::{
     MachineClassCanonicalizationBinding, MachineClassDecision, MachineClassDerivedHashes,
     MachineClassError, MachineClassEvidenceBinding, MachineClassLookup, MachineClassReason,
     MachineClassRegistry, MachineExecutionProfile, MachineProfileAvailability,
-    MachineProfileGatePolicy, MachineProfileKey, RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION,
+    MachineProfileGatePolicy, MachineProfileKey, QG5_DURABILITY_WITNESS_FILE_NAME,
+    QG5_DURABILITY_WITNESS_SCHEMA_VERSION, Qg5CellDurabilityWitness,
+    Qg5DeletePublicationObservation, Qg5DurabilityEngine, Qg5DurabilityObservation,
+    Qg5DurabilityWitnessSet, Qg5ReopenValidationObservation, Qg5SampleDurabilityWitness,
+    Qg5StreamRole, Qg5TimedMaintenanceObservation, RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION,
     RUNNER_RECEIPT_SCHEMA_VERSION, RunnerArtifactManifest, RunnerArtifactManifestBinding,
     VerifiedRunnerIdentity,
 };

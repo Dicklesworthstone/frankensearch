@@ -38,7 +38,7 @@ reconstruction rather than falling back to explanatory text.
 ```
 .bench-history/
   QG-<n>.<hardware-class>.<execution-profile>.latest.json
-      # v2 atomic pointer to the complete immutable baseline generation
+      # v3 pointer to the immutable threshold/evidence/authority/attempt generation
   QG-<n>.<hardware-class>.<execution-profile>.<date>.<run-id>.json
       # immutable threshold object
   QG-<n>.<hardware-class>.<execution-profile>.<date>.<run-id>.evidence.json
@@ -47,12 +47,16 @@ reconstruction rather than falling back to explanatory text.
   QG-<n>.unmeasured.latest.json          # immutable historical v6 placeholder
 ```
 Measured latest pointers use schema
-`frankensearch.perf-history-pointer.v2` and fields
+`frankensearch.perf-history-pointer.v3` and fields
 `{schema_version, gate, profile: {hardware_class_id, execution_profile_id},
 run_id, threshold_file,
-threshold_sha256, evidence_file, evidence_sha256}` and resolve both halves of
-one generation from the same directory. Neither half, its A/A band, nor its
-destination may cross the immutable hardware/profile key. Current threshold
+threshold_sha256, evidence_file, evidence_sha256, qg6_authority_file?,
+qg6_authority_sha256?, qg6_attempt_receipt_file?,
+qg6_attempt_receipt_sha256?}` and resolve the threshold, evidence, and required
+QG-6 authority and attempt-receipt objects of one generation from the same
+directory. QG-6 requires both filename/SHA-256 pairs; non-QG-6 omits all four
+optional fields. None of those objects, the A/A band, or the destination may
+cross the immutable hardware/profile key. Current threshold
 schema `quill-perf-artifact-v8` uses
 `{schema_version, gate, applicability_plan, bench_elf_sha256,
 machine_fingerprint, execution, git_rev,
@@ -322,7 +326,7 @@ NUL-delimited process-argv hash while the child runs. The producer keeps the
 lease and held roots/images across the exact child, log synchronization, end
 probes, manifest construction, receipt sealing, terminal registry admission,
 and an in-memory bind-and-reverify preview. A nonzero or signaled child writes a
-separately sealed `frankensearch.perf-runner-attempt.v2` diagnostic receipt and
+separately sealed `frankensearch.perf-runner-attempt.v11` diagnostic receipt and
 can never emit or be parsed as a promotion completion. After every promotion
 check passes, the producer writes the manifest and diagnostic-only
 `frankensearch.perf-run-precommit.v5` `PRECOMMIT.json`, syncs them, rechecks the
@@ -375,7 +379,7 @@ publication and latest-pointer replacement. Under the lock, a profile with no
 measured latest pointer accepts only the canonical
 `QG-<n>.v8.unmeasured.latest.json` bootstrap in that promotion directory. Once a
 profile-qualified latest pointer exists, the baseline path must canonicalize to
-that exact pointer and parse as its measured v2 generation; copied, direct,
+that exact pointer and parse as its measured v3 generation; copied, direct,
 stale, and bootstrap-replay baselines are rejected without a history write.
 Promotion also requires one registry-verified execution identity across every
 measured role before admitting any candidate generation. The candidate and
@@ -392,11 +396,14 @@ therefore starts with
 plus the platform-required bounded options. On `Allow`, the complete decision
 JSON first records and hashes the publication plan and reaches stable storage
 outside history. The ratchet then uses create-new/idempotent-exact writes for
-the run-ID-qualified threshold and evidence objects and atomically advances the
-one profile-qualified measured latest pointer last.
-The pointer binds both immutable hashes, so no crash can publish a mixed
-threshold/evidence generation. `Block`, `Quarantine`, receipt rejection, destination
-mismatch, and legacy/current mixtures leave every history byte unchanged.
+the run-ID-qualified threshold and evidence objects; for QG-6 it also writes
+the exact retained authority-set and attempt-receipt objects. It atomically
+advances the one profile-qualified measured latest pointer last. The v3 pointer
+binds the threshold/evidence filenames and hashes for non-QG-6, and all four
+threshold/evidence/authority-set/attempt-receipt filenames and hashes for QG-6,
+so no crash can publish a mixed generation. `Block`, `Quarantine`, receipt
+rejection, destination mismatch, and legacy/current mixtures leave every
+history byte unchanged.
 Historical v3 threshold artifacts remain audit-readable only through the
 library's explicit `load_legacy_gate_artifact_v3` API; the CLI ratchet rejects
 them in both modes. Regression-alarm mode may consume a direct current-schema
