@@ -533,6 +533,7 @@ impl ApiEmbedder {
 
         let mut last_err = None;
         'retry: for attempt in 0..=self.config.max_retries {
+            embed_checkpoint(cx, "api.request_batch")?;
             let mut nonce_entropy = [0_u8; 32];
             cx.random_bytes(&mut nonce_entropy);
             let challenge = self.build_challenge_with_entropy(texts, &nonce_entropy)?;
@@ -1220,9 +1221,19 @@ fn encode_lower_hex(bytes: &[u8]) -> String {
 }
 
 /// L2-normalize a vector in place.
+fn embed_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: phase.to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
+}
+
 impl Embedder for ApiEmbedder {
     fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
+            embed_checkpoint(cx, "api.embed")?;
             let results = self.request_batch(cx, &[text]).await?;
             results
                 .into_iter()
@@ -1244,6 +1255,7 @@ impl Embedder for ApiEmbedder {
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
+            embed_checkpoint(cx, "api.embed_batch")?;
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
@@ -1252,6 +1264,7 @@ impl Embedder for ApiEmbedder {
             let mut all_embeddings = Vec::with_capacity(texts.len());
 
             for chunk in texts.chunks(batch_size) {
+                embed_checkpoint(cx, "api.embed_batch")?;
                 let mut batch = self.request_batch(cx, chunk).await?;
                 for v in &mut batch {
                     l2_normalize_in_place(v);
@@ -1325,6 +1338,20 @@ mod tests {
     const TEST_ATTESTATION_KEY: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
     const TEST_KEY_ID: &str = "gateway-key-2026-07";
     const TEST_GENERATION: u64 = 41;
+
+    #[test]
+    fn embed_checkpoint_observes_cancel_before_http() {
+        run_test_with_cx(|cx| async move {
+            cx.cancel_fast(asupersync::CancelKind::User);
+            let err = super::embed_checkpoint(&cx, "api.embed").unwrap_err();
+            match err {
+                SearchError::Cancelled { phase, .. } => {
+                    assert_eq!(phase, "api.embed");
+                }
+                other => panic!("expected Cancelled, got {other:?}"),
+            }
+        });
+    }
 
     #[derive(Debug, Clone)]
     struct TestGatewayProvider {
