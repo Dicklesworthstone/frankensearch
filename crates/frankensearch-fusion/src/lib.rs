@@ -100,8 +100,9 @@ pub use queue::{
 };
 pub use refresh::{RefreshMetrics, RefreshMetricsSnapshot, RefreshWorker, RefreshWorkerConfig};
 pub use rrf::{
-    RrfConfig, candidate_count, fuse_by_strategy, pool_minmax_fuse, pool_minmax_fuse_merge,
-    rrf_fuse, rrf_fuse_with_graph,
+    RrfConfig, candidate_count, fuse_by_strategy, fuse_by_strategy_for_vector_lane,
+    pool_minmax_fuse, pool_minmax_fuse_merge, rrf_fuse, rrf_fuse_for_vector_lane,
+    rrf_fuse_with_graph,
 };
 pub use searcher::TwoTierSearcher;
 pub use smooth::{SmoothConfig, neighbor_smooth, neighbor_smooth_ranked};

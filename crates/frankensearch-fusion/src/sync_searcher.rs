@@ -30,7 +30,9 @@ use frankensearch_index::{
 
 use crate::blend::{blend_two_tier, blend_two_tier_aligned_vector_index, compute_rank_changes};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
-use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
+use crate::rrf::{
+    RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy, fuse_by_strategy_for_vector_lane,
+};
 
 /// The per-tier query embeddings this search is authorized to read with
 /// (bd-sync-searcher-tiered-query-embeddings-dbp10).
@@ -709,7 +711,7 @@ impl SyncTwoTierSearcher {
             },
             |lexical| {
                 fused_hits_to_scored_results(
-                    fuse_by_strategy(
+                    fuse_by_strategy_for_vector_lane(
                         self.config.fusion_strategy,
                         lexical,
                         &fast_hits,
@@ -723,6 +725,9 @@ impl SyncTwoTierSearcher {
                             semantic_weight: query_semantic_weight,
                             tiebreak: self.rrf_tiebreak,
                         },
+                        frankensearch_core::is_hash_generation_id(sync_fast_embedder_id(
+                            &self.index,
+                        )),
                     ),
                     k,
                     &self.config,

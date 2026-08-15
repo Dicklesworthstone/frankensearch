@@ -66,7 +66,9 @@ use crate::mmr::mmr_rerank;
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
 use crate::prf::{PrfConfig, prf_expand};
-use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
+use crate::rrf::{
+    RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy, fuse_by_strategy_for_vector_lane,
+};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -1946,7 +1948,7 @@ impl TwoTierSearcher {
                                 )
                             },
                             |graph| {
-                                let fused = fuse_by_strategy(
+                                let fused = fuse_by_strategy_for_vector_lane(
                                     self.config.fusion_strategy,
                                     &[],
                                     &fast_hits,
@@ -1955,6 +1957,9 @@ impl TwoTierSearcher {
                                     base_candidates,
                                     0,
                                     &rrf_config,
+                                    frankensearch_core::is_hash_generation_id(
+                                        self.fast_embedder.id(),
+                                    ),
                                 );
                                 fused_hits_to_scored_results(
                                     &fused,
@@ -1976,7 +1981,7 @@ impl TwoTierSearcher {
                         };
                         let fused = graph_candidates.as_ref().map_or_else(
                             || {
-                                fuse_by_strategy(
+                                fuse_by_strategy_for_vector_lane(
                                     self.config.fusion_strategy,
                                     lexical,
                                     &fast_hits,
@@ -1985,10 +1990,13 @@ impl TwoTierSearcher {
                                     base_candidates,
                                     0,
                                     &rrf_config,
+                                    frankensearch_core::is_hash_generation_id(
+                                        self.fast_embedder.id(),
+                                    ),
                                 )
                             },
                             |graph| {
-                                fuse_by_strategy(
+                                fuse_by_strategy_for_vector_lane(
                                     self.config.fusion_strategy,
                                     lexical,
                                     &fast_hits,
@@ -1997,6 +2005,9 @@ impl TwoTierSearcher {
                                     base_candidates,
                                     0,
                                     &rrf_config,
+                                    frankensearch_core::is_hash_generation_id(
+                                        self.fast_embedder.id(),
+                                    ),
                                 )
                             },
                         );
