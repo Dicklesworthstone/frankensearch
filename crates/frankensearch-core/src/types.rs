@@ -3897,6 +3897,10 @@ pub struct FusedHit {
     /// Rank in the lexical (BM25) source, if present.
     pub lexical_rank: Option<usize>,
     /// Rank in the semantic (vector) source, if present.
+    ///
+    /// Omitted when absent so a remapped hash-control hit does not publish a
+    /// `semantic_rank` key. Hash ranks live on [`Self::hash_rank`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_rank: Option<usize>,
     /// Rank in the hash-control vector list. Never set together with
     /// `semantic_rank`: a hash generation is not a semantic source.
@@ -3907,6 +3911,10 @@ pub struct FusedHit {
     /// Raw BM25 score from lexical search, if applicable.
     pub lexical_score: Option<f32>,
     /// Raw cosine similarity from semantic search, if applicable.
+    ///
+    /// Omitted when absent so a remapped hash-control hit does not publish a
+    /// `semantic_score` key. Hash scores live on [`Self::hash_score`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_score: Option<f32>,
     /// Vector score from a hash-control generation. Never set together with
     /// `semantic_score`.
@@ -6686,9 +6694,15 @@ mod tests {
         let hash_decoded: FusedHit = serde_json::from_str(&hash_json).unwrap();
         assert_eq!(hash_decoded.hash_rank, Some(7));
         assert_eq!(hash_decoded.semantic_rank, None);
+        assert_eq!(hash_decoded.hash_score, Some(0.72));
+        assert_eq!(hash_decoded.semantic_score, None);
         assert!(
-            hash_json.contains("hash_rank"),
-            "remapped hash hit must serialize hash_rank: {hash_json}"
+            hash_json.contains("hash_rank") && hash_json.contains("hash_score"),
+            "remapped hash hit must serialize hash fields: {hash_json}"
+        );
+        assert!(
+            !hash_json.contains("semantic_rank") && !hash_json.contains("semantic_score"),
+            "remapped hash hit must not publish semantic keys: {hash_json}"
         );
     }
 

@@ -408,9 +408,9 @@ pub struct SearchHitPayload {
     pub score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lexical_rank: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub semantic_rank: Option<usize>,
     /// Rank in the hash-control vector list. Never set together with
     /// `semantic_rank`: a hash generation is not a semantic source.
