@@ -404,6 +404,15 @@ impl FastEmbedEmbedder {
     }
 }
 
+fn embed_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: phase.to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
+}
+
 fn normalize_in_place(vec: &mut [f32]) {
     let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
     if norm_sq.is_finite() && norm_sq > f32::EPSILON {
@@ -419,6 +428,7 @@ fn normalize_in_place(vec: &mut [f32]) {
 impl Embedder for FastEmbedEmbedder {
     fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
+            embed_checkpoint(cx, "fastembed.embed")?;
             if text.is_empty() {
                 return Ok(vec![0.0; self.dimension]);
             }
@@ -432,6 +442,7 @@ impl Embedder for FastEmbedEmbedder {
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
+            embed_checkpoint(cx, "fastembed.embed_batch")?;
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
@@ -654,6 +665,20 @@ mod tests {
     fn map_lock_error_cancelled_to_search_cancelled() {
         let err = map_lock_error("all-MiniLM-L6-v2", "fastembed.embed", LockError::Cancelled);
         assert!(matches!(err, SearchError::Cancelled { .. }));
+    }
+
+    #[test]
+    fn embed_checkpoint_observes_cancel_before_onnx() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            cx.cancel_fast(asupersync::CancelKind::User);
+            let err = super::embed_checkpoint(&cx, "fastembed.embed").unwrap_err();
+            match err {
+                SearchError::Cancelled { phase, .. } => {
+                    assert_eq!(phase, "fastembed.embed");
+                }
+                other => panic!("expected Cancelled, got {other:?}"),
+            }
+        });
     }
 
     #[test]
