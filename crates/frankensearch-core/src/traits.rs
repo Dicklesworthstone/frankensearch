@@ -516,17 +516,32 @@ pub trait SyncEmbed: Send + Sync {
 /// blocking ONNX inference when called from a `spawn_blocking` context.
 pub struct SyncEmbedderAdapter<T: SyncEmbed>(pub T);
 
+fn sync_embed_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: phase.to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
+}
+
 impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
-    fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
-        Box::pin(async move { self.0.embed_sync(text) })
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            sync_embed_checkpoint(cx, "sync_embed.embed")?;
+            self.0.embed_sync(text)
+        })
     }
 
     fn embed_batch<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
-        Box::pin(async move { self.0.embed_batch_sync(texts) })
+        Box::pin(async move {
+            sync_embed_checkpoint(cx, "sync_embed.embed_batch")?;
+            self.0.embed_batch_sync(texts)
+        })
     }
 
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
@@ -1366,6 +1381,27 @@ mod tests {
             identity,
         };
         assert!(bound.validate().is_err());
+    }
+
+    #[test]
+    fn sync_embed_adapter_observes_cancel_before_blocking_work() {
+        run_test_with_cx(|cx| async move {
+            cx.cancel_fast(asupersync::CancelKind::User);
+            let adapter = SyncEmbedderAdapter(BoundSyncEmbedder {
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("cancel-sync-fixture", 3),
+                output_dimension: 3,
+            });
+            let error = adapter
+                .embed(&cx, "text")
+                .await
+                .expect_err("cancelled sync adapter must fail closed");
+            match error {
+                SearchError::Cancelled { phase, .. } => {
+                    assert_eq!(phase, "sync_embed.embed");
+                }
+                other => panic!("expected Cancelled, got {other:?}"),
+            }
+        });
     }
 
     #[test]
