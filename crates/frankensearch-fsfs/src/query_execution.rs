@@ -846,7 +846,7 @@ impl QueryExecutionOrchestrator {
     }
 
     fn fuse_rankings_with_priors_lane(
-        &self,
+        self,
         lexical: &[LexicalCandidate],
         semantic: &[SemanticCandidate],
         limit: usize,
