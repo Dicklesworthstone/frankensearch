@@ -5178,7 +5178,10 @@ impl FsfsRuntime {
                 .execute_expanded_search(cx, query, limit)
                 .await?
         } else if search_runtime.cli_input.daemon {
-            match search_runtime.search_payloads_via_daemon(query, limit) {
+            match search_runtime
+                .search_payloads_via_daemon(cx, query, limit)
+                .await
+            {
                 Ok(payloads) => payloads,
                 Err(error) => {
                     warn!(
@@ -6028,8 +6031,9 @@ impl FsfsRuntime {
         }
     }
 
-    fn search_payloads_via_daemon(
+    async fn search_payloads_via_daemon(
         &self,
+        cx: &Cx,
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
@@ -6040,7 +6044,7 @@ impl FsfsRuntime {
                 stream
             } else {
                 self.spawn_search_daemon(&socket_path)?;
-                Self::wait_for_daemon_connection(&socket_path)?
+                Self::wait_for_daemon_connection(cx, &socket_path).await?
             };
 
             let request = SearchServeRequest {
@@ -6103,7 +6107,7 @@ impl FsfsRuntime {
 
         #[cfg(not(unix))]
         {
-            let _ = (query, limit);
+            let _ = (cx, query, limit);
             Err(SearchError::InvalidConfig {
                 field: "cli.daemon".to_owned(),
                 value: "search".to_owned(),
@@ -6217,14 +6221,26 @@ impl FsfsRuntime {
     }
 
     #[cfg(unix)]
-    fn wait_for_daemon_connection(socket_path: &Path) -> SearchResult<UnixStream> {
+    async fn wait_for_daemon_connection(cx: &Cx, socket_path: &Path) -> SearchResult<UnixStream> {
         let mut last_error: Option<std::io::Error> = None;
         for _ in 0..FSFS_DAEMON_CONNECT_MAX_ATTEMPTS {
+            if let Err(error) = cx.checkpoint() {
+                return Err(SearchError::Cancelled {
+                    phase: "daemon.connect".to_owned(),
+                    reason: cx
+                        .cancel_reason()
+                        .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+                });
+            }
             match UnixStream::connect(socket_path) {
                 Ok(stream) => return Ok(stream),
                 Err(error) => {
                     last_error = Some(error);
-                    std::thread::sleep(Duration::from_millis(FSFS_DAEMON_CONNECT_RETRY_DELAY_MS));
+                    asupersync::time::sleep(
+                        cx.now(),
+                        Duration::from_millis(FSFS_DAEMON_CONNECT_RETRY_DELAY_MS),
+                    )
+                    .await;
                 }
             }
         }
@@ -20142,6 +20158,7 @@ mod tests {
         for forbidden in [
             format!("{blocking_call}(Duration::from_millis(poll_ms))"),
             format!("{blocking_call}(Duration::from_millis(backoff_ms))"),
+            format!("{blocking_call}(Duration::from_millis(FSFS_DAEMON_CONNECT_RETRY_DELAY_MS))"),
         ] {
             assert!(
                 !source.contains(&forbidden),
@@ -20150,11 +20167,35 @@ mod tests {
         }
 
         assert!(
-            source.contains(
-                "std::thread::sleep(Duration::from_millis(FSFS_DAEMON_CONNECT_RETRY_DELAY_MS))"
-            ),
-            "the synchronous daemon connection retry remains intentionally blocking"
+            source.contains("FSFS_DAEMON_CONNECT_RETRY_DELAY_MS")
+                && source.contains("asupersync::time::sleep"),
+            "daemon connection retry must sleep through Cx so cancel is observed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_daemon_connection_observes_cancel() {
+        run_test_with_cx(|cx| async move {
+            cx.cancel_fast(asupersync::CancelKind::User);
+            let started = Instant::now();
+            let error = FsfsRuntime::wait_for_daemon_connection(
+                &cx,
+                Path::new("/tmp/fsfs-no-such-daemon.sock"),
+            )
+            .await
+            .expect_err("cancelled daemon connect must fail closed");
+            match error {
+                frankensearch_core::SearchError::Cancelled { phase, .. } => {
+                    assert_eq!(phase, "daemon.connect");
+                }
+                other => panic!("expected Cancelled, got {other:?}"),
+            }
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "cancel must not wait out the full daemon connect retry budget"
+            );
+        });
     }
 
     #[test]
