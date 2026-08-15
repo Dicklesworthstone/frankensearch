@@ -1220,7 +1220,7 @@ fn encode_lower_hex(bytes: &[u8]) -> String {
     output
 }
 
-/// L2-normalize a vector in place.
+/// Refuse cooperatively before starting work when the caller has cancelled.
 fn embed_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
     cx.checkpoint().map_err(|error| SearchError::Cancelled {
         phase: phase.to_owned(),
@@ -1338,6 +1338,33 @@ mod tests {
     const TEST_ATTESTATION_KEY: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
     const TEST_KEY_ID: &str = "gateway-key-2026-07";
     const TEST_GENERATION: u64 = 41;
+
+    /// The PUBLIC entry points must observe cancel themselves.
+    ///
+    /// `embed_checkpoint` is also called inside `request_batch`, so asserting
+    /// only that some `Cancelled` came back would still pass if the `api.embed`
+    /// and `api.embed_batch` call sites were deleted. Pinning the phase is what
+    /// proves the refusal happened at the public boundary, before any HTTP work
+    /// is attempted: this embedder points at the real provider endpoint, so a
+    /// request that was actually started would surface as a transport failure
+    /// rather than as `Cancelled`.
+    #[test]
+    fn public_embed_entrypoints_observe_cancel_before_any_request() {
+        let embedder = verified_test_embedder(4);
+        run_test_with_cx(|cx| async move {
+            cx.cancel_fast(asupersync::CancelKind::User);
+            match embedder.embed(&cx, "alpha").await.unwrap_err() {
+                SearchError::Cancelled { phase, .. } => assert_eq!(phase, "api.embed"),
+                other => panic!("expected Cancelled at api.embed, got {other:?}"),
+            }
+            match embedder.embed_batch(&cx, &["alpha"]).await.unwrap_err() {
+                SearchError::Cancelled { phase, .. } => {
+                    assert_eq!(phase, "api.embed_batch");
+                }
+                other => panic!("expected Cancelled at api.embed_batch, got {other:?}"),
+            }
+        });
+    }
 
     #[test]
     fn embed_checkpoint_observes_cancel_before_http() {
