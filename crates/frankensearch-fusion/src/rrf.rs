@@ -165,10 +165,12 @@ struct FusedHitScratch<'a> {
     rrf_score: f64,
     lexical_rank: Option<usize>,
     semantic_rank: Option<usize>,
+    hash_rank: Option<usize>,
     semantic_index: Option<u32>,
     graph_rank: Option<usize>,
     lexical_score: Option<f32>,
     semantic_score: Option<f32>,
+    hash_score: Option<f32>,
     graph_score: Option<f32>,
     in_both_sources: bool,
 }
@@ -201,12 +203,24 @@ impl FusedHitScratch<'_> {
             rrf_score: self.rrf_score,
             lexical_rank: self.lexical_rank,
             semantic_rank: self.semantic_rank,
-            hash_rank: None,
+            hash_rank: self.hash_rank,
             semantic_index: self.semantic_index,
             lexical_score: self.lexical_score,
             semantic_score: self.semantic_score,
-            hash_score: None,
+            hash_score: self.hash_score,
             in_both_sources: self.in_both_sources,
+        }
+    }
+
+    const fn vector_fields(
+        rank: usize,
+        score: f32,
+        vector_is_hash: bool,
+    ) -> (Option<usize>, Option<f32>, Option<usize>, Option<f32>) {
+        if vector_is_hash {
+            (None, None, Some(rank), Some(score))
+        } else {
+            (Some(rank), Some(score), None, None)
         }
     }
 }
@@ -272,7 +286,17 @@ pub fn rrf_fuse_for_vector_lane(
     config: &RrfConfig,
     vector_is_hash: bool,
 ) -> Vec<FusedHit> {
-    let mut fused = rrf_fuse_with_graph_merge(lexical, semantic, &[], 0.0, limit, offset, config);
+    let mut fused = rrf_fuse_merge_inner(
+        lexical,
+        semantic,
+        &[],
+        0.0,
+        limit,
+        offset,
+        config,
+        true,
+        vector_is_hash,
+    );
     remap_fused_hits_for_hash_lane(&mut fused, vector_is_hash);
     fused
 }
@@ -348,10 +372,12 @@ pub fn rrf_fuse_with_graph(
                     rrf_score: rrf_contribution,
                     lexical_rank: Some(rank),
                     semantic_rank: None,
+                    hash_rank: None,
                     semantic_index: None,
                     graph_rank: None,
                     lexical_score: Some(result.score),
                     semantic_score: None,
+                    hash_score: None,
                     graph_score: None,
                     in_both_sources: false,
                 });
@@ -385,10 +411,12 @@ pub fn rrf_fuse_with_graph(
                     rrf_score: rrf_contribution,
                     lexical_rank: None,
                     semantic_rank: Some(rank),
+                    hash_rank: None,
                     semantic_index: Some(hit.index),
                     graph_rank: None,
                     lexical_score: None,
                     semantic_score: Some(hit.score),
+                    hash_score: None,
                     graph_score: None,
                     in_both_sources: false,
                 });
@@ -417,10 +445,12 @@ pub fn rrf_fuse_with_graph(
                         rrf_score: rrf_contribution,
                         lexical_rank: None,
                         semantic_rank: None,
+                        hash_rank: None,
                         semantic_index: None,
                         graph_rank: Some(rank),
                         lexical_score: None,
                         semantic_score: None,
+                        hash_score: None,
                         graph_score: Some(result.score),
                         in_both_sources: false,
                     });
@@ -591,10 +621,12 @@ pub fn pool_minmax_fuse(
                     rrf_score: 0.0,
                     lexical_rank: Some(rank),
                     semantic_rank: None,
+                    hash_rank: None,
                     semantic_index: None,
                     graph_rank: None,
                     lexical_score: Some(result.score),
                     semantic_score: None,
+                    hash_score: None,
                     graph_score: None,
                     in_both_sources: false,
                 });
@@ -621,10 +653,12 @@ pub fn pool_minmax_fuse(
                     rrf_score: 0.0,
                     lexical_rank: None,
                     semantic_rank: Some(rank),
+                    hash_rank: None,
                     semantic_index: Some(hit.index),
                     graph_rank: None,
                     lexical_score: None,
                     semantic_score: Some(hit.score),
+                    hash_score: None,
                     graph_score: None,
                     in_both_sources: false,
                 });
@@ -742,10 +776,12 @@ pub fn pool_minmax_fuse_merge(
             rrf_score: fused,
             lexical_rank: lex.map(|(r, _)| r),
             semantic_rank: Some(rank),
+            hash_rank: None,
             semantic_index: Some(hit.index),
             graph_rank: None,
             lexical_score: lex.map(|(_, s)| s),
             semantic_score: Some(hit.score),
+            hash_score: None,
             graph_score: None,
             in_both_sources: lex.is_some(),
         });
@@ -759,10 +795,12 @@ pub fn pool_minmax_fuse_merge(
             rrf_score: lexical_weight * minmax_norm(lex_score, lex_min, lex_max),
             lexical_rank: Some(lex_rank),
             semantic_rank: None,
+            hash_rank: None,
             semantic_index: None,
             graph_rank: None,
             lexical_score: Some(lex_score),
             semantic_score: None,
+            hash_score: None,
             graph_score: None,
             in_both_sources: false,
         });
@@ -823,6 +861,7 @@ pub fn rrf_fuse_with_graph_merge(
         offset,
         config,
         true,
+        false,
     )
 }
 
@@ -878,7 +917,7 @@ pub fn fuse_by_strategy_for_vector_lane(
         FusionStrategy::PoolMinMax if graph.is_empty() => {
             pool_minmax_fuse_merge(lexical, semantic, limit, offset, config)
         }
-        FusionStrategy::Rrf | FusionStrategy::PoolMinMax => rrf_fuse_with_graph_merge_unique(
+        FusionStrategy::Rrf | FusionStrategy::PoolMinMax => rrf_fuse_merge_inner(
             lexical,
             semantic,
             graph,
@@ -886,6 +925,8 @@ pub fn fuse_by_strategy_for_vector_lane(
             limit,
             offset,
             config,
+            false,
+            vector_is_hash,
         ),
     };
     remap_fused_hits_for_hash_lane(&mut fused, vector_is_hash);
@@ -918,6 +959,7 @@ pub fn rrf_fuse_with_graph_merge_unique(
         offset,
         config,
         false,
+        false,
     )
 }
 
@@ -932,6 +974,7 @@ fn rrf_fuse_merge_inner(
     offset: usize,
     config: &RrfConfig,
     dedup_semantic: bool,
+    vector_is_hash: bool,
 ) -> Vec<FusedHit> {
     let k = sanitize_rrf_k(config.k);
     let lexical_weight = sanitize_tier_weight(config.lexical_weight);
@@ -987,15 +1030,19 @@ fn rrf_fuse_merge_inner(
         if let Some((graph_rank, _)) = gr {
             rrf_score += rank_contribution(k, graph_rank) * graph_weight;
         }
+        let (semantic_rank, semantic_score, hash_rank, hash_score) =
+            FusedHitScratch::vector_fields(rank, hit.score, vector_is_hash);
         results.push(FusedHitScratch {
             doc_id,
             rrf_score,
             lexical_rank: lex.map(|(r, _)| r),
-            semantic_rank: Some(rank),
+            semantic_rank,
+            hash_rank,
             semantic_index: Some(hit.index),
             graph_rank: gr.map(|(r, _)| r),
             lexical_score: lex.map(|(_, s)| s),
-            semantic_score: Some(hit.score),
+            semantic_score,
+            hash_score,
             graph_score: gr.map(|(_, s)| s),
             in_both_sources: lex.is_some(),
         });
@@ -1017,10 +1064,12 @@ fn rrf_fuse_merge_inner(
             rrf_score,
             lexical_rank: Some(lex_rank),
             semantic_rank: None,
+            hash_rank: None,
             semantic_index: None,
             graph_rank: gr.map(|(r, _)| r),
             lexical_score: Some(lex_score),
             semantic_score: None,
+            hash_score: None,
             graph_score: gr.map(|(_, s)| s),
             in_both_sources: false,
         });
@@ -1034,10 +1083,12 @@ fn rrf_fuse_merge_inner(
                 rrf_score: rank_contribution(k, graph_rank) * graph_weight,
                 lexical_rank: None,
                 semantic_rank: None,
+                hash_rank: None,
                 semantic_index: None,
                 graph_rank: Some(graph_rank),
                 lexical_score: None,
                 semantic_score: None,
+                hash_score: None,
                 graph_score: Some(graph_score),
                 in_both_sources: false,
             });
@@ -1157,6 +1208,24 @@ mod tests {
         assert_eq!(fused[0].semantic_rank, None);
         assert_eq!(fused[0].hash_score, Some(0.9));
         assert_eq!(fused[0].semantic_score, None);
+        let json = serde_json::to_string(&fused[0]).expect("serialize hash-lane fused hit");
+        assert!(
+            json.contains("hash_rank") && !json.contains("semantic_rank"),
+            "hash-lane fuse must not publish semantic_rank: {json}"
+        );
+
+        let both = rrf_fuse_for_vector_lane(
+            &[lexical_hit("doc-a", 4.0)],
+            &semantic,
+            10,
+            0,
+            &RrfConfig::default(),
+            true,
+        );
+        assert!(both[0].in_both_sources);
+        assert_eq!(both[0].lexical_rank, Some(0));
+        assert_eq!(both[0].hash_rank, Some(0));
+        assert_eq!(both[0].semantic_rank, None);
 
         let semantic_lane = rrf_fuse(&[], &semantic, 10, 0, &RrfConfig::default());
         assert_eq!(semantic_lane[0].semantic_rank, Some(0));
