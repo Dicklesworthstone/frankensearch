@@ -148,7 +148,7 @@ pub(crate) fn classify_fused_hit_source(hit: &FusedHit, fast_embedder_id: &str) 
         ScoreSource::Hybrid
     } else if hit.lexical_rank.is_some() {
         ScoreSource::Lexical
-    } else if hit.semantic_rank.is_some() {
+    } else if hit.semantic_rank.is_some() || hit.hash_rank.is_some() {
         if is_hash_generation_id(fast_embedder_id) {
             ScoreSource::HashControl
         } else {
@@ -201,9 +201,11 @@ impl FusedHitScratch<'_> {
             rrf_score: self.rrf_score,
             lexical_rank: self.lexical_rank,
             semantic_rank: self.semantic_rank,
+            hash_rank: None,
             semantic_index: self.semantic_index,
             lexical_score: self.lexical_score,
             semantic_score: self.semantic_score,
+            hash_score: None,
             in_both_sources: self.in_both_sources,
         }
     }
@@ -1051,9 +1053,11 @@ mod tests {
             rrf_score: 1.0,
             lexical_rank,
             semantic_rank,
+            hash_rank: None,
             semantic_index: semantic_rank.map(|_| 0),
             lexical_score: lexical_rank.map(|_| 1.0),
             semantic_score: semantic_rank.map(|_| 0.5),
+            hash_score: None,
             in_both_sources,
         }
     }
@@ -1070,6 +1074,14 @@ mod tests {
         );
         assert_eq!(
             classify_fused_hit_source(&fused("hash", None, Some(0), false), "fnv1a-256"),
+            ScoreSource::HashControl
+        );
+        let mut remapped = fused("hash-remapped", None, Some(2), false);
+        remapped.remap_hash_control_ranks();
+        assert_eq!(remapped.hash_rank, Some(2));
+        assert_eq!(remapped.semantic_rank, None);
+        assert_eq!(
+            classify_fused_hit_source(&remapped, "fnv1a-256"),
             ScoreSource::HashControl
         );
         assert_eq!(
@@ -2130,9 +2142,11 @@ mod tests {
                     rrf_score: rrf_contribution,
                     lexical_rank: Some(rank),
                     semantic_rank: None,
+                    hash_rank: None,
                     semantic_index: result.index,
                     lexical_score: Some(result.score),
                     semantic_score: None,
+                    hash_score: None,
                     in_both_sources: false,
                 });
         }
@@ -2158,9 +2172,11 @@ mod tests {
                     rrf_score: rrf_contribution,
                     lexical_rank: None,
                     semantic_rank: Some(rank),
+                    hash_rank: None,
                     semantic_index: Some(hit.index),
                     lexical_score: None,
                     semantic_score: Some(hit.score),
+                    hash_score: None,
                     in_both_sources: false,
                 });
         }

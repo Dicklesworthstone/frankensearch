@@ -3523,9 +3523,13 @@ fn fused_hits_to_scored_results(
     fused
         .iter()
         .map(|fh| {
+            let mut fh = fh.clone();
+            if frankensearch_core::is_hash_generation_id(fast_embedder_id) {
+                fh.remap_hash_control_ranks();
+            }
             #[allow(clippy::cast_possible_truncation)]
             let score = fh.rrf_score as f32;
-            let source = crate::rrf::classify_fused_hit_source(fh, fast_embedder_id);
+            let source = crate::rrf::classify_fused_hit_source(&fh, fast_embedder_id);
             let explanation = explain.then(|| {
                 let mut components = Vec::new();
 
@@ -3543,7 +3547,13 @@ fn fused_hits_to_scored_results(
                     });
                 }
 
-                if let (Some(rank), Some(raw_score)) = (fh.semantic_rank, fh.semantic_score) {
+                let (vector_rank, vector_score) =
+                    if frankensearch_core::is_hash_generation_id(fast_embedder_id) {
+                        (fh.hash_rank, fh.hash_score)
+                    } else {
+                        (fh.semantic_rank, fh.semantic_score)
+                    };
+                if let (Some(rank), Some(raw_score)) = (vector_rank, vector_score) {
                     components.push(ScoreComponent {
                         source: ExplainedSource::vector_fast(
                             fast_embedder_id,
@@ -3568,7 +3578,7 @@ fn fused_hits_to_scored_results(
                 score,
                 source,
                 index: fh.semantic_index,
-                fast_score: fh.semantic_score,
+                fast_score: fh.hash_score.or(fh.semantic_score),
                 quality_score: None,
                 lexical_score: fh.lexical_score,
                 rerank_score: None,
@@ -7550,9 +7560,11 @@ mod tests {
                 rrf_score: 1.5,
                 lexical_rank: Some(0),
                 semantic_rank: None,
+                hash_rank: None,
                 semantic_index: None,
                 lexical_score: Some(3.0),
                 semantic_score: None,
+                hash_score: None,
                 in_both_sources: false,
             },
             frankensearch_core::types::FusedHit {
@@ -7560,9 +7572,11 @@ mod tests {
                 rrf_score: 1.0,
                 lexical_rank: None,
                 semantic_rank: Some(0),
+                hash_rank: None,
                 semantic_index: Some(0),
                 lexical_score: None,
                 semantic_score: Some(0.8),
+                hash_score: None,
                 in_both_sources: false,
             },
         ];
@@ -8738,9 +8752,11 @@ mod tests {
             rrf_score: 2.0,
             lexical_rank: Some(0),
             semantic_rank: Some(1),
+            hash_rank: None,
             semantic_index: Some(1),
             lexical_score: Some(3.0),
             semantic_score: Some(0.8),
+            hash_score: None,
             in_both_sources: true,
         }];
         let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
@@ -8756,9 +8772,11 @@ mod tests {
             rrf_score: 1.0,
             lexical_rank: None,
             semantic_rank: Some(0),
+            hash_rank: None,
             semantic_index: Some(0),
             lexical_score: None,
             semantic_score: Some(0.9),
+            hash_score: None,
             in_both_sources: false,
         }];
         let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
@@ -8807,9 +8825,11 @@ mod tests {
             rrf_score: 1.0,
             lexical_rank: None,
             semantic_rank: Some(0),
+            hash_rank: None,
             semantic_index: Some(0),
             lexical_score: None,
             semantic_score: Some(0.9),
+            hash_score: None,
             in_both_sources: false,
         }];
         let results = fused_hits_to_scored_results(&fused, &[], true, "fnv1a-256", 60.0);
@@ -8826,6 +8846,23 @@ mod tests {
         );
         let semantic = fused_hits_to_scored_results(&fused, &[], false, "minilm-l6-v2", 60.0);
         assert_eq!(semantic[0].source, ScoreSource::SemanticFast);
+
+        let remapped = vec![frankensearch_core::types::FusedHit {
+            doc_id: "hash-only".into(),
+            rrf_score: 1.0,
+            lexical_rank: None,
+            semantic_rank: None,
+            hash_rank: Some(0),
+            semantic_index: Some(0),
+            lexical_score: None,
+            semantic_score: None,
+            hash_score: Some(0.9),
+            in_both_sources: false,
+        }];
+        let remapped_results =
+            fused_hits_to_scored_results(&remapped, &[], true, "fnv1a-256", 60.0);
+        assert_eq!(remapped_results[0].source, ScoreSource::HashControl);
+        assert_eq!(remapped_results[0].fast_score, Some(0.9));
     }
 
     #[test]
@@ -8835,9 +8872,11 @@ mod tests {
             rrf_score: 1.0,
             lexical_rank: Some(0),
             semantic_rank: None,
+            hash_rank: None,
             semantic_index: None,
             lexical_score: Some(2.5),
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         }];
         let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
@@ -8851,9 +8890,11 @@ mod tests {
             rrf_score: 1.0,
             lexical_rank: None,
             semantic_rank: None,
+            hash_rank: None,
             semantic_index: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         }];
         let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
@@ -8867,9 +8908,11 @@ mod tests {
             rrf_score: 1.25,
             lexical_rank: Some(1),
             semantic_rank: Some(3),
+            hash_rank: None,
             semantic_index: Some(3),
             lexical_score: Some(2.0),
             semantic_score: Some(0.5),
+            hash_score: None,
             in_both_sources: true,
         }];
 

@@ -1253,7 +1253,10 @@ fn fused_hits_to_scored_results(
     // temporary here, so there is no need to keep them alive.
     hits.into_iter()
         .take(k)
-        .map(|hit| {
+        .map(|mut hit| {
+            if frankensearch_core::is_hash_generation_id(fast_embedder_id) {
+                hit.remap_hash_control_ranks();
+            }
             let score = saturating_f64_to_f32(hit.rrf_score);
             let source = crate::rrf::classify_fused_hit_source(&hit, fast_embedder_id);
             let explanation = config.explain.then(|| {
@@ -1271,7 +1274,13 @@ fn fused_hits_to_scored_results(
                         weight: 1.0,
                     });
                 }
-                if let (Some(rank), Some(raw_score)) = (hit.semantic_rank, hit.semantic_score) {
+                let (vector_rank, vector_score) =
+                    if frankensearch_core::is_hash_generation_id(fast_embedder_id) {
+                        (hit.hash_rank, hit.hash_score)
+                    } else {
+                        (hit.semantic_rank, hit.semantic_score)
+                    };
+                if let (Some(rank), Some(raw_score)) = (vector_rank, vector_score) {
                     components.push(ScoreComponent {
                         source: ExplainedSource::vector_fast(
                             fast_embedder_id,
@@ -1295,7 +1304,7 @@ fn fused_hits_to_scored_results(
                 score,
                 source,
                 index: hit.semantic_index,
-                fast_score: hit.semantic_score,
+                fast_score: hit.hash_score.or(hit.semantic_score),
                 quality_score: None,
                 lexical_score: hit.lexical_score,
                 rerank_score: None,

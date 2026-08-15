@@ -3898,17 +3898,40 @@ pub struct FusedHit {
     pub lexical_rank: Option<usize>,
     /// Rank in the semantic (vector) source, if present.
     pub semantic_rank: Option<usize>,
+    /// Rank in the hash-control vector list. Never set together with
+    /// `semantic_rank`: a hash generation is not a semantic source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_rank: Option<usize>,
     /// Internal vector index, if present.
     pub semantic_index: Option<u32>,
     /// Raw BM25 score from lexical search, if applicable.
     pub lexical_score: Option<f32>,
     /// Raw cosine similarity from semantic search, if applicable.
     pub semantic_score: Option<f32>,
+    /// Vector score from a hash-control generation. Never set together with
+    /// `semantic_score`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_score: Option<f32>,
     /// True if this document appeared in both lexical and semantic results.
     pub in_both_sources: bool,
 }
 
 impl FusedHit {
+    /// Move vector ranks and scores off semantic fields when this hit is
+    /// hash control.
+    pub fn remap_hash_control_ranks(&mut self) {
+        if self.hash_rank.is_none() {
+            self.hash_rank = self.semantic_rank.take();
+        } else {
+            self.semantic_rank = None;
+        }
+        if self.hash_score.is_none() {
+            self.hash_score = self.semantic_score.take();
+        } else {
+            self.semantic_score = None;
+        }
+    }
+
     /// Four-level deterministic tie-breaking for RRF results:
     /// 1. Higher RRF score first
     /// 2. Documents in both sources preferred
@@ -6254,9 +6277,11 @@ mod tests {
             rrf_score: 0.02,
             lexical_rank: Some(1),
             semantic_rank: Some(3),
+            hash_rank: None,
             semantic_index: Some(3),
             lexical_score: Some(5.0),
             semantic_score: Some(0.8),
+            hash_score: None,
             in_both_sources: true,
         };
         let hit_semantic_only = FusedHit {
@@ -6264,9 +6289,11 @@ mod tests {
             rrf_score: 0.02, // Same RRF score
             lexical_rank: None,
             semantic_rank: Some(2),
+            hash_rank: None,
             semantic_index: Some(2),
             lexical_score: None,
             semantic_score: Some(0.9),
+            hash_score: None,
             in_both_sources: false,
         };
         // Same RRF -> in_both_sources wins
@@ -6283,9 +6310,11 @@ mod tests {
             rrf_score: 0.03,
             lexical_rank: None,
             semantic_rank: Some(1),
+            hash_rank: None,
             semantic_index: Some(1),
             lexical_score: None,
             semantic_score: Some(0.9),
+            hash_score: None,
             in_both_sources: false,
         };
         let low = FusedHit {
@@ -6293,9 +6322,11 @@ mod tests {
             rrf_score: 0.01,
             lexical_rank: Some(1),
             semantic_rank: Some(1),
+            hash_rank: None,
             semantic_index: Some(1),
             lexical_score: Some(10.0),
             semantic_score: Some(0.99),
+            hash_score: None,
             in_both_sources: true,
         };
         // Higher RRF always wins regardless of other fields.
@@ -6312,9 +6343,11 @@ mod tests {
             rrf_score: 0.02,
             lexical_rank: None,
             semantic_rank: None,
+            hash_rank: None,
             semantic_index: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         };
         let b = FusedHit {
@@ -6322,9 +6355,11 @@ mod tests {
             rrf_score: 0.02,
             lexical_rank: None,
             semantic_rank: None,
+            hash_rank: None,
             semantic_index: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         };
         // All else equal -> lexicographic doc_id ascending.
@@ -6622,9 +6657,11 @@ mod tests {
             rrf_score: 0.025,
             lexical_rank: Some(3),
             semantic_rank: Some(7),
+            hash_rank: None,
             semantic_index: Some(7),
             lexical_score: Some(8.5),
             semantic_score: Some(0.72),
+            hash_score: None,
             in_both_sources: true,
         };
         let json = serde_json::to_string(&hit).unwrap();
@@ -6633,6 +6670,26 @@ mod tests {
         assert!((decoded.rrf_score - 0.025).abs() < f64::EPSILON);
         assert!(decoded.in_both_sources);
         assert_eq!(decoded.lexical_rank, Some(3));
+        assert_eq!(decoded.hash_rank, None);
+        assert!(
+            !json.contains("hash_rank") && !json.contains("hash_score"),
+            "zero hash fields should omit the keys: {json}"
+        );
+
+        let mut hash_hit = hit;
+        hash_hit.remap_hash_control_ranks();
+        assert_eq!(hash_hit.hash_rank, Some(7));
+        assert_eq!(hash_hit.semantic_rank, None);
+        assert_eq!(hash_hit.hash_score, Some(0.72));
+        assert_eq!(hash_hit.semantic_score, None);
+        let hash_json = serde_json::to_string(&hash_hit).unwrap();
+        let hash_decoded: FusedHit = serde_json::from_str(&hash_json).unwrap();
+        assert_eq!(hash_decoded.hash_rank, Some(7));
+        assert_eq!(hash_decoded.semantic_rank, None);
+        assert!(
+            hash_json.contains("hash_rank"),
+            "remapped hash hit must serialize hash_rank: {hash_json}"
+        );
     }
 
     #[test]
@@ -6643,9 +6700,11 @@ mod tests {
             rrf_score: 0.02,
             lexical_rank: Some(1),
             semantic_rank: None,
+            hash_rank: None,
             semantic_index: None,
             lexical_score: Some(15.0),
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         };
         let low_lex = FusedHit {
@@ -6653,9 +6712,11 @@ mod tests {
             rrf_score: 0.02,
             lexical_rank: Some(5),
             semantic_rank: None,
+            hash_rank: None,
             semantic_index: None,
             lexical_score: Some(3.0),
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         };
         // Higher lexical_score wins (level 3)
@@ -6669,9 +6730,11 @@ mod tests {
             rrf_score: 0.01,
             lexical_rank: None,
             semantic_rank: Some(5),
+            hash_rank: None,
             semantic_index: Some(5),
             lexical_score: None,
             semantic_score: Some(0.6),
+            hash_score: None,
             in_both_sources: false,
         };
         let cloned = hit.clone();
@@ -7025,9 +7088,11 @@ mod tests {
             rrf_score: 0.02,
             lexical_rank: Some(3),
             semantic_rank: Some(5),
+            hash_rank: None,
             semantic_index: Some(5),
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: true,
         };
         let single = FusedHit {
@@ -7035,9 +7100,11 @@ mod tests {
             rrf_score: 0.02,
             lexical_rank: Some(1),
             semantic_rank: None,
+            hash_rank: None,
             semantic_index: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         };
         // Same RRF -> in_both_sources=true wins (level 2)
