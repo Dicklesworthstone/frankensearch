@@ -17,9 +17,9 @@ use frankensearch_quill_gauntlet::{
     PERF_ARTIFACT_SCHEMA_VERSION, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES, PERF_EVIDENCE_SCHEMA_VERSION,
     PERF_HISTORY_POINTER_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile, PerfGate,
     PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetQg1AuthoritySets,
-    PerfRatchetQg6AuthoritySets, PerfRatchetRequest, Qg1AuthorityRegisterEntryV1,
-    Qg1ExpectedAuthority, Qg1StartupHandshakeV1, Qg1TargetPinV1, Qg6ScheduleAuthority,
-    Qg6StartupAuthoritySetV1, Qg6StartupHandshakeV1, VerifiedRunnerIdentity,
+    PerfRatchetQg6AuthoritySets, PerfRatchetRequest, QG6_TIMED_SEARCHES_PER_SAMPLE,
+    Qg1AuthorityRegisterEntryV1, Qg1ExpectedAuthority, Qg1StartupHandshakeV1, Qg1TargetPinV1,
+    Qg6ScheduleAuthority, Qg6StartupAuthoritySetV1, Qg6StartupHandshakeV1, VerifiedRunnerIdentity,
     evaluate_perf_ratchet_against_authorities, is_explicit_bootstrap, is_explicit_bootstrap_for,
     perf_manifest_contract_sha256,
 };
@@ -1419,6 +1419,17 @@ fn load_qg6_authority_set_from_bytes(
 ) -> Result<LoadedQg6AuthoritySet, Box<dyn Error>> {
     let set = Qg6StartupAuthoritySetV1::from_verified_slice(&bytes)
         .map_err(|error| format!("{arm} QG-6 authority set was rejected: {error}"))?;
+    if let Some((cell_id, authority)) = set
+        .authorities()
+        .iter()
+        .find(|(_, authority)| authority.searches_per_sample != QG6_TIMED_SEARCHES_PER_SAMPLE)
+    {
+        return Err(format!(
+            "{arm} QG-6 authority set cell {cell_id:?} has searches_per_sample {}; expected {}",
+            authority.searches_per_sample, QG6_TIMED_SEARCHES_PER_SAMPLE
+        )
+        .into());
+    }
     if set.campaign_run_id() != artifact.run_id {
         return Err(format!(
             "{arm} QG-6 authority set names run {}, but its threshold names {}",
@@ -4210,7 +4221,7 @@ mod tests {
             },
             1,
             2,
-            1,
+            QG6_TIMED_SEARCHES_PER_SAMPLE,
             seed,
         )
         .expect("valid focused QG-6 authority")
@@ -4231,6 +4242,52 @@ mod tests {
                 .collect(),
         )
         .expect("valid focused QG-6 authority set")
+    }
+
+    #[test]
+    fn qg6_cli_loader_rejects_structurally_valid_underfilled_authority_set() {
+        let revision = "a".repeat(40);
+        let cell = "QG-6/query/natural/k10/1k/latency_ms";
+        let threshold = qg6_threshold("candidate-run", &revision, &["query/natural/k10/1k"]);
+        let underfilled_authority = Qg6ScheduleAuthority::for_experiment(
+            frankensearch_quill_gauntlet::Qg6ExperimentIdentity {
+                corpus_sha256: "1".repeat(64),
+                query_manifest_sha256: "2".repeat(64),
+                config_contract_sha256: "3".repeat(64),
+                document_count: 100,
+                k: 10,
+            },
+            1,
+            2,
+            QG6_TIMED_SEARCHES_PER_SAMPLE - 1,
+            71,
+        )
+        .expect("127-leaf authority remains structurally valid");
+        let underfilled_set = Qg6StartupAuthoritySetV1::new(
+            "candidate-run".to_owned(),
+            revision,
+            true,
+            vec![cell.to_owned()],
+            BTreeMap::from([(cell.to_owned(), underfilled_authority)]),
+        )
+        .expect("127-leaf set remains structurally valid");
+        let bytes = underfilled_set.to_json_bytes().expect("canonical set");
+        Qg6StartupAuthoritySetV1::from_verified_slice(&bytes)
+            .expect("generic set verification must remain cardinality-flexible");
+
+        let error = load_qg6_authority_set_from_bytes(
+            "candidate",
+            Path::new("candidate.qg6-authorities.json"),
+            bytes,
+            &threshold,
+        )
+        .expect_err("shipping CLI admission must require exact timing-leaf cardinality")
+        .to_string();
+        assert!(error.contains(cell), "refusal must name the cell: {error}");
+        assert!(
+            error.contains("searches_per_sample 127; expected 128"),
+            "refusal must name observed and expected cardinality: {error}"
+        );
     }
 
     #[test]
