@@ -467,6 +467,52 @@ const FSFS_SERVE_ACCEPT_POLL_MS: u64 = 50;
 const FSFS_DAEMON_CONNECT_MAX_ATTEMPTS: usize = 80;
 const FSFS_DAEMON_CONNECT_RETRY_DELAY_MS: u64 = 25;
 
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Test-only daemon-spawn suppression.
+    ///
+    /// Reaching the `daemon.connect` checkpoint through the public
+    /// `run_search_command` otherwise requires `spawn_search_daemon` to fork
+    /// `current_exe()`, which would escape a child process from the test
+    /// binary. Suppressing only the fork keeps the rest of the public path --
+    /// socket resolution, the failed connect, and the cancellation
+    /// checkpoint -- exactly as production runs it.
+    static DAEMON_SPAWN_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, unix))]
+fn daemon_spawn_suppressed() -> bool {
+    DAEMON_SPAWN_SUPPRESSED.with(std::cell::Cell::get)
+}
+
+/// RAII arm for [`DAEMON_SPAWN_SUPPRESSED`].
+///
+/// The suppressed call is awaited and then asserted on, so an unwinding
+/// assertion would otherwise leave the thread-local poisoned `true` and
+/// silently suppress spawning for every later test on this thread.
+#[cfg(all(test, unix))]
+struct DaemonSpawnSuppression;
+
+#[cfg(all(test, unix))]
+impl DaemonSpawnSuppression {
+    fn armed() -> Self {
+        DAEMON_SPAWN_SUPPRESSED.with(|suppressed| suppressed.set(true));
+        Self
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for DaemonSpawnSuppression {
+    fn drop(&mut self) {
+        DAEMON_SPAWN_SUPPRESSED.with(|suppressed| suppressed.set(false));
+    }
+}
+
+#[cfg(all(not(test), unix))]
+const fn daemon_spawn_suppressed() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardSearchStage {
     Idle,
@@ -5183,6 +5229,12 @@ impl FsfsRuntime {
                 .await
             {
                 Ok(payloads) => payloads,
+                // An observed cancellation is not daemon unavailability. Falling
+                // back would start a second search after cancel was already
+                // observed and would relabel the cancellation as a daemon
+                // outage, so the daemon wait's fail-closed result must
+                // propagate instead of being retried in process.
+                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
                 Err(error) => {
                     warn!(
                         error = %error,
@@ -6043,7 +6095,9 @@ impl FsfsRuntime {
             let mut stream = if let Ok(stream) = UnixStream::connect(&socket_path) {
                 stream
             } else {
-                self.spawn_search_daemon(&socket_path)?;
+                if !daemon_spawn_suppressed() {
+                    self.spawn_search_daemon(&socket_path)?;
+                }
                 Self::wait_for_daemon_connection(cx, &socket_path).await?
             };
 
@@ -20171,6 +20225,60 @@ mod tests {
                 && source.contains("asupersync::time::sleep"),
             "daemon connection retry must sleep through Cx so cancel is observed"
         );
+    }
+
+    /// The public contract, not just the helper: a cancelled daemon wait must
+    /// leave `run_search_command` as `Cancelled { phase: "daemon.connect" }`
+    /// and must NOT be downgraded into the in-process fallback.
+    ///
+    /// The exact phase is also the isolation witness. Nothing between
+    /// `run_search_command` and the daemon branch touches `cx` once index
+    /// artifacts exist (`ensure_search_index_ready` returns early), so an
+    /// upstream checkpoint stealing the cancellation would surface as a
+    /// different phase, and a fallback would surface as `Ok` or as the
+    /// fallback's own error.
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_daemon_search_propagates_without_in_process_fallback() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("daemon cancel tempdir");
+            let index_root = directory.path().join("index");
+            // Satisfies `index_artifacts_exist`, so the pre-daemon path takes
+            // its early return and never checkpoints.
+            std::fs::create_dir_all(index_root.join("lexical")).expect("index artifacts");
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("cancelled-daemon-query".to_owned()),
+                daemon: true,
+                daemon_socket: Some(directory.path().join("absent-daemon.sock")),
+                index_dir: Some(index_root),
+                format: OutputFormat::Jsonl,
+                ..CliInput::default()
+            });
+
+            // RAII: the assertions below unwind on failure, and a leaked `true`
+            // would suppress daemon spawning for every later test on this thread.
+            let _suppression = super::DaemonSpawnSuppression::armed();
+            cx.cancel_fast(asupersync::CancelKind::User);
+            let outcome = runtime.run_search_command(&cx).await;
+
+            match outcome {
+                Err(frankensearch_core::SearchError::Cancelled { phase, .. }) => {
+                    assert_eq!(
+                        phase, "daemon.connect",
+                        "cancellation must be reported at the daemon-connect boundary"
+                    );
+                }
+                Err(other) => panic!(
+                    "expected Cancelled at daemon.connect, got {other:?}; an in-process \
+                     fallback or an upstream checkpoint consumed the cancellation"
+                ),
+                Ok(()) => panic!(
+                    "cancelled daemon search fell back to in-process retrieval instead of \
+                     failing closed"
+                ),
+            }
+        });
     }
 
     #[cfg(unix)]
