@@ -20,7 +20,7 @@
 //! Legacy sidecars and any load failure fall back to the
 //! rebuild-from-`VectorIndex` path.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1651,7 +1651,7 @@ fn validate_hnsw_topology(
     }
 
     // Retain one Arc per point, indexed below by origin id. Neighborhoods are
-    // still cloned only one point at a time, so reachability does not require a
+    // still cloned only one point at a time, so connectivity does not require a
     // second O(edges) adjacency graph.
     let points = hnsw.get_point_indexation().into_iter().collect::<Vec<_>>();
     let identities = points
@@ -1681,7 +1681,7 @@ fn validate_hnsw_topology(
             &point_by_internal_id,
         )?;
     }
-    validate_directed_base_reachability(entry_origin, expected_points, |origin_id| {
+    validate_weak_base_connectivity(entry_origin, expected_points, |origin_id| {
         let point = points_by_origin[origin_id]
             .as_ref()
             .ok_or_else(|| format!("missing origin id {origin_id} during reachability walk"))?;
@@ -1731,7 +1731,7 @@ fn validate_hnsw_topology_observations(
             &point_by_internal_id,
         )?;
     }
-    validate_directed_base_reachability(entry_origin, expected_points, |origin_id| {
+    validate_weak_base_connectivity(entry_origin, expected_points, |origin_id| {
         let point = points_by_origin[origin_id]
             .ok_or_else(|| format!("missing origin id {origin_id} during reachability walk"))?;
         Ok(point
@@ -1774,43 +1774,76 @@ fn validate_hnsw_entry_point(
     Ok(entry_origin)
 }
 
-fn validate_directed_base_reachability(
+/// HNSW's bounded neighbour pruning does not promise a strongly connected
+/// directed base layer: a valid graph may retain the reverse traversal only
+/// indirectly. Treating one-way reachability from the entry point as an
+/// integrity condition therefore rejects usable native graphs. Topology
+/// validation still requires one weak base-layer component, while recall is
+/// measured separately by [`HnswIndex::certify_ef_search`].
+fn validate_weak_base_connectivity(
     entry_origin: usize,
     expected_points: usize,
     mut base_neighbors: impl FnMut(usize) -> Result<Vec<usize>, String>,
 ) -> Result<(), String> {
-    let mut reached = vec![false; expected_points];
-    let mut queue = VecDeque::with_capacity(expected_points.min(4_096));
-    reached[entry_origin] = true;
-    queue.push_back(entry_origin);
-    let mut reached_count = 1_usize;
-
-    while let Some(origin_id) = queue.pop_front() {
+    let mut parent = (0..expected_points).collect::<Vec<_>>();
+    let mut rank = vec![0_u8; expected_points];
+    for origin_id in 0..expected_points {
         for neighbor_id in base_neighbors(origin_id)? {
             if neighbor_id >= expected_points {
                 return Err(format!(
-                    "origin id {origin_id} reaches out-of-range base neighbor {neighbor_id}"
+                    "origin id {origin_id} references out-of-range base neighbor {neighbor_id}"
                 ));
             }
-            if !reached[neighbor_id] {
-                reached[neighbor_id] = true;
-                reached_count += 1;
-                queue.push_back(neighbor_id);
-            }
+            union_base_component(&mut parent, &mut rank, origin_id, neighbor_id);
         }
     }
 
-    if reached_count != expected_points {
-        let first_unreachable = reached
-            .iter()
-            .position(|is_reached| !is_reached)
-            .unwrap_or(expected_points);
+    let entry_component = base_component_root(&mut parent, entry_origin);
+    let mut connected_count = 0_usize;
+    let mut first_disconnected = expected_points;
+    for origin_id in 0..expected_points {
+        if base_component_root(&mut parent, origin_id) == entry_component {
+            connected_count += 1;
+        } else {
+            first_disconnected = first_disconnected.min(origin_id);
+        }
+    }
+    if connected_count != expected_points {
         return Err(format!(
-            "search entry origin {entry_origin} reaches only {reached_count}/{expected_points} \
-             points at the base layer; first unreachable origin is {first_unreachable}"
+            "base layer has a weakly disconnected component: entry origin {entry_origin} connects \
+             only {connected_count}/{expected_points} points when edge direction is ignored; \
+             first disconnected origin is {first_disconnected}"
         ));
     }
     Ok(())
+}
+
+fn base_component_root(parent: &mut [usize], origin_id: usize) -> usize {
+    if parent[origin_id] != origin_id {
+        let root = base_component_root(parent, parent[origin_id]);
+        parent[origin_id] = root;
+    }
+    parent[origin_id]
+}
+
+fn union_base_component(
+    parent: &mut [usize],
+    rank: &mut [u8],
+    left_origin: usize,
+    right_origin: usize,
+) {
+    let mut left_root = base_component_root(parent, left_origin);
+    let mut right_root = base_component_root(parent, right_origin);
+    if left_root == right_root {
+        return;
+    }
+    if rank[left_root] < rank[right_root] {
+        std::mem::swap(&mut left_root, &mut right_root);
+    }
+    parent[right_root] = left_root;
+    if rank[left_root] == rank[right_root] {
+        rank[left_root] = rank[left_root].saturating_add(1);
+    }
 }
 
 fn validate_hnsw_identity_table(
@@ -4362,7 +4395,32 @@ mod tests {
         ];
         let detail = validate_hnsw_topology_observations(&edgeless, 2, Some((0, PointId(0, 0))))
             .expect_err("edgeless multi-point graph must fail");
-        assert!(detail.contains("unreachable"), "{detail}");
+        assert!(detail.contains("weakly disconnected"), "{detail}");
+    }
+
+    #[test]
+    fn topology_validator_accepts_weakly_connected_one_way_base_chain() {
+        let ids = [PointId(0, 0), PointId(0, 1), PointId(0, 2)];
+        let points = vec![
+            HnswTopologyPoint {
+                origin_id: 0,
+                point_id: ids[0],
+                neighborhoods: vec![Vec::new()],
+            },
+            HnswTopologyPoint {
+                origin_id: 1,
+                point_id: ids[1],
+                neighborhoods: vec![vec![Neighbour::new(0, 1.0, ids[0])]],
+            },
+            HnswTopologyPoint {
+                origin_id: 2,
+                point_id: ids[2],
+                neighborhoods: vec![vec![Neighbour::new(1, 1.0, ids[1])]],
+            },
+        ];
+
+        validate_hnsw_topology_observations(&points, 3, Some((0, ids[0])))
+            .expect("one-way HNSW base chain remains weakly connected");
     }
 
     #[test]
@@ -4417,8 +4475,11 @@ mod tests {
 
         let detail = validate_hnsw_topology_observations(&points, 4, Some((0, ids[0])))
             .expect_err("two locally valid components must fail entry-point reachability");
-        assert!(detail.contains("reaches only 2/4"), "{detail}");
-        assert!(detail.contains("first unreachable origin is 2"), "{detail}");
+        assert!(detail.contains("connects only 2/4"), "{detail}");
+        assert!(
+            detail.contains("first disconnected origin is 2"),
+            "{detail}"
+        );
     }
 
     #[test]
