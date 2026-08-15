@@ -237,6 +237,10 @@ impl FusedHitScratch<'_> {
         self.hash_score = hash_score;
         self.semantic_index = Some(index);
     }
+
+    fn vector_score(&self) -> Option<f32> {
+        self.hash_score.or(self.semantic_score)
+    }
 }
 
 // ─── RRF Fusion ─────────────────────────────────────────────────────────────
@@ -626,6 +630,17 @@ pub fn pool_minmax_fuse(
     offset: usize,
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
+    pool_minmax_fuse_for_vector_lane(lexical, semantic, limit, offset, config, false)
+}
+
+fn pool_minmax_fuse_for_vector_lane(
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+    vector_is_hash: bool,
+) -> Vec<FusedHit> {
     let lexical_weight = sanitize_tier_weight(config.lexical_weight);
     let semantic_weight = sanitize_tier_weight(config.semantic_weight);
     let tiebreak = config.tiebreak;
@@ -647,7 +662,7 @@ pub fn pool_minmax_fuse(
                 }
                 hit.lexical_rank = Some(rank);
                 hit.lexical_score = Some(result.score);
-                if hit.semantic_rank.is_some() {
+                if hit.has_vector_rank() {
                     hit.in_both_sources = true;
                 }
             }
@@ -673,28 +688,28 @@ pub fn pool_minmax_fuse(
         match hits.entry(hit.doc_id.as_str()) {
             Entry::Occupied(mut e) => {
                 let fh = e.get_mut();
-                if fh.semantic_rank.is_some() {
+                if fh.has_vector_rank() {
                     continue;
                 }
-                fh.semantic_rank = Some(rank);
-                fh.semantic_score = Some(hit.score);
-                fh.semantic_index = Some(hit.index);
+                fh.assign_vector(rank, hit.score, hit.index, vector_is_hash);
                 if fh.lexical_rank.is_some() {
                     fh.in_both_sources = true;
                 }
             }
             Entry::Vacant(e) => {
+                let (semantic_rank, semantic_score, hash_rank, hash_score) =
+                    FusedHitScratch::vector_fields(rank, hit.score, vector_is_hash);
                 e.insert(FusedHitScratch {
                     doc_id: hit.doc_id.as_str(),
                     rrf_score: 0.0,
                     lexical_rank: None,
-                    semantic_rank: Some(rank),
-                    hash_rank: None,
+                    semantic_rank,
+                    hash_rank,
                     semantic_index: Some(hit.index),
                     graph_rank: None,
                     lexical_score: None,
-                    semantic_score: Some(hit.score),
-                    hash_score: None,
+                    semantic_score,
+                    hash_score,
                     graph_score: None,
                     in_both_sources: false,
                 });
@@ -712,7 +727,7 @@ pub fn pool_minmax_fuse(
             .lexical_score
             .map_or(0.0_f64, |s| minmax_norm(s, lex_min, lex_max));
         let sem_norm = h
-            .semantic_score
+            .vector_score()
             .map_or(0.0_f64, |s| minmax_norm(s, sem_min, sem_max));
         h.rrf_score = lexical_weight * lex_norm + semantic_weight * sem_norm;
     }
@@ -1317,6 +1332,23 @@ mod tests {
         assert_eq!(mapped[0].semantic_rank, None);
         assert_eq!(mapped[0].hash_score, Some(0.9));
         assert_eq!(mapped[0].semantic_score, None);
+
+        let pool_map = pool_minmax_fuse_for_vector_lane(
+            &[],
+            &[semantic_hit("doc-a", 0.9), semantic_hit("doc-b", 0.1)],
+            10,
+            0,
+            &RrfConfig::default(),
+            true,
+        );
+        assert_eq!(pool_map[0].hash_rank, Some(0));
+        assert_eq!(pool_map[0].semantic_rank, None);
+        assert_eq!(pool_map[0].hash_score, Some(0.9));
+        assert_eq!(pool_map[0].semantic_score, None);
+        assert!(
+            pool_map[0].rrf_score > pool_map[1].rrf_score,
+            "hash-lane pool-minmax must keep the vector score in the fused norm"
+        );
     }
 
     fn lexical_hit(doc_id: &str, score: f32) -> ScoredResult {
