@@ -436,6 +436,20 @@ impl FusedCandidate {
             self.semantic_score = None;
         }
     }
+
+    const fn already_has_vector_rank(&self) -> bool {
+        self.semantic_rank.is_some() || self.hash_rank.is_some()
+    }
+
+    fn assign_vector_rank(&mut self, rank: usize, score: f32, vector_is_hash: bool) {
+        if vector_is_hash {
+            self.hash_rank = Some(rank);
+            self.hash_score = Some(score);
+        } else {
+            self.semantic_rank = Some(rank);
+            self.semantic_score = Some(score);
+        }
+    }
 }
 
 /// Optional prior signals attached to a candidate.
@@ -795,20 +809,15 @@ impl QueryExecutionOrchestrator {
         offset: usize,
         vector_is_hash: bool,
     ) -> Vec<FusedCandidate> {
-        let mut fused = self.fuse_rankings_with_priors(
+        self.fuse_rankings_with_priors_lane(
             lexical,
             semantic,
             limit,
             offset,
             &HashMap::new(),
             RankingPriorTuning::default(),
-        );
-        if vector_is_hash {
-            for candidate in &mut fused {
-                candidate.remap_hash_control_ranks();
-            }
-        }
-        fused
+            vector_is_hash,
+        )
     }
 
     /// Fuse lexical + semantic rankings and apply optional prior boosts.
@@ -825,6 +834,27 @@ impl QueryExecutionOrchestrator {
         prior_signals: &HashMap<String, RankingPriorSignals>,
         tuning: RankingPriorTuning,
     ) -> Vec<FusedCandidate> {
+        self.fuse_rankings_with_priors_lane(
+            lexical,
+            semantic,
+            limit,
+            offset,
+            prior_signals,
+            tuning,
+            false,
+        )
+    }
+
+    fn fuse_rankings_with_priors_lane(
+        &self,
+        lexical: &[LexicalCandidate],
+        semantic: &[SemanticCandidate],
+        limit: usize,
+        offset: usize,
+        prior_signals: &HashMap<String, RankingPriorSignals>,
+        tuning: RankingPriorTuning,
+        vector_is_hash: bool,
+    ) -> Vec<FusedCandidate> {
         let k = self.fusion_policy.effective_k();
         let tuning = tuning.normalized();
         // Production keeps the original `get`+`entry` merge (`merge_ranked_orig`). The `get_mut`
@@ -833,7 +863,7 @@ impl QueryExecutionOrchestrator {
         // inside the null p5 ~0.85 (single-threaded, so a quiet worker should decide it; the
         // tightening re-run was killed by target eviction). NOT robustly decidable → retained for
         // the A/B, not shipped. See docs/NEGATIVE_EVIDENCE.md 2026-07-11.
-        let merged = Self::merge_ranked_orig(k, lexical, semantic);
+        let merged = Self::merge_ranked_orig(k, lexical, semantic, vector_is_hash);
 
         let mut fused: Vec<FusedCandidate> = merged
             .into_values()
@@ -848,6 +878,11 @@ impl QueryExecutionOrchestrator {
                 candidate
             })
             .collect();
+        if vector_is_hash {
+            for candidate in &mut fused {
+                candidate.remap_hash_control_ranks();
+            }
+        }
         // `fused_cmp` is a strict total order (fused_score/tier scores, ending in the
         // unique `doc_id` tiebreak), so `select_nth`/`sort_unstable` are bit-identical
         // to the stable sort. For a large fused pool we only need the top `offset+limit`
@@ -881,6 +916,7 @@ impl QueryExecutionOrchestrator {
         k: f64,
         lexical: &[LexicalCandidate],
         semantic: &[SemanticCandidate],
+        vector_is_hash: bool,
     ) -> HashMap<String, FusedCandidate> {
         let mut merged: HashMap<String, FusedCandidate> =
             HashMap::with_capacity(lexical.len() + semantic.len());
@@ -929,31 +965,29 @@ impl QueryExecutionOrchestrator {
         });
         for (rank, candidate) in semantic_ranked.iter().enumerate() {
             let contribution = rrf_contribution(k, rank);
-            let semantic_score = sanitize_score(candidate.score);
+            let vector_score = sanitize_score(candidate.score);
             if let Some(hit) = merged.get_mut(&candidate.doc_id) {
-                if hit.semantic_rank.is_some() {
+                if hit.already_has_vector_rank() {
                     continue;
                 }
                 hit.fused_score += contribution;
-                hit.semantic_rank = Some(rank);
-                hit.semantic_score = Some(semantic_score);
+                hit.assign_vector_rank(rank, vector_score, vector_is_hash);
                 hit.in_both_sources = true;
             } else {
-                merged.insert(
-                    candidate.doc_id.clone(),
-                    FusedCandidate {
-                        doc_id: candidate.doc_id.clone(),
-                        fused_score: contribution,
-                        prior_boost: 0.0,
-                        lexical_rank: None,
-                        semantic_rank: Some(rank),
-                        hash_rank: None,
-                        lexical_score: None,
-                        semantic_score: Some(semantic_score),
-                        hash_score: None,
-                        in_both_sources: false,
-                    },
-                );
+                let mut row = FusedCandidate {
+                    doc_id: candidate.doc_id.clone(),
+                    fused_score: contribution,
+                    prior_boost: 0.0,
+                    lexical_rank: None,
+                    semantic_rank: None,
+                    hash_rank: None,
+                    lexical_score: None,
+                    semantic_score: None,
+                    hash_score: None,
+                    in_both_sources: false,
+                };
+                row.assign_vector_rank(rank, vector_score, vector_is_hash);
+                merged.insert(candidate.doc_id.clone(), row);
             }
         }
 
@@ -970,6 +1004,7 @@ impl QueryExecutionOrchestrator {
         k: f64,
         lexical: &[LexicalCandidate],
         semantic: &[SemanticCandidate],
+        vector_is_hash: bool,
     ) -> HashMap<String, FusedCandidate> {
         let mut merged: HashMap<String, FusedCandidate> =
             HashMap::with_capacity(lexical.len() + semantic.len());
@@ -1018,31 +1053,34 @@ impl QueryExecutionOrchestrator {
         });
         for (rank, candidate) in semantic_ranked.iter().enumerate() {
             if let Some(existing) = merged.get(&candidate.doc_id)
-                && existing.semantic_rank.is_some()
+                && existing.already_has_vector_rank()
             {
                 continue;
             }
             let contribution = rrf_contribution(k, rank);
-            let semantic_score = sanitize_score(candidate.score);
+            let vector_score = sanitize_score(candidate.score);
             merged
                 .entry(candidate.doc_id.clone())
                 .and_modify(|hit| {
                     hit.fused_score += contribution;
-                    hit.semantic_rank = Some(rank);
-                    hit.semantic_score = Some(semantic_score);
+                    hit.assign_vector_rank(rank, vector_score, vector_is_hash);
                     hit.in_both_sources = true;
                 })
-                .or_insert_with(|| FusedCandidate {
-                    doc_id: candidate.doc_id.clone(),
-                    fused_score: contribution,
-                    prior_boost: 0.0,
-                    lexical_rank: None,
-                    semantic_rank: Some(rank),
-                    hash_rank: None,
-                    lexical_score: None,
-                    semantic_score: Some(semantic_score),
-                    hash_score: None,
-                    in_both_sources: false,
+                .or_insert_with(|| {
+                    let mut row = FusedCandidate {
+                        doc_id: candidate.doc_id.clone(),
+                        fused_score: contribution,
+                        prior_boost: 0.0,
+                        lexical_rank: None,
+                        semantic_rank: None,
+                        hash_rank: None,
+                        lexical_score: None,
+                        semantic_score: None,
+                        hash_score: None,
+                        in_both_sources: false,
+                    };
+                    row.assign_vector_rank(rank, vector_score, vector_is_hash);
+                    row
                 });
         }
 
@@ -1384,12 +1422,19 @@ mod tests {
         ];
         for k in [0.0_f64, 60.0, 1.5] {
             for (lex, sem) in &cases {
-                let new = QueryExecutionOrchestrator::merge_ranked(k, lex, sem);
-                let orig = QueryExecutionOrchestrator::merge_ranked_orig(k, lex, sem);
+                let new = QueryExecutionOrchestrator::merge_ranked(k, lex, sem, false);
+                let orig = QueryExecutionOrchestrator::merge_ranked_orig(k, lex, sem, false);
                 assert_eq!(
                     sorted(new),
                     sorted(orig),
                     "merge mismatch k={k} lex={lex:?} sem={sem:?}"
+                );
+                let new_hash = QueryExecutionOrchestrator::merge_ranked(k, lex, sem, true);
+                let orig_hash = QueryExecutionOrchestrator::merge_ranked_orig(k, lex, sem, true);
+                assert_eq!(
+                    sorted(new_hash),
+                    sorted(orig_hash),
+                    "hash-lane merge mismatch k={k} lex={lex:?} sem={sem:?}"
                 );
             }
         }

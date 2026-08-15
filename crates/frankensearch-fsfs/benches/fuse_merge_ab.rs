@@ -62,11 +62,12 @@ fn bench(_c: &mut Criterion) {
         let (lexical, semantic) = make_candidates(n, overlap);
 
         // Byte-identity assert before timing.
-        let mut new_v: Vec<_> = QueryExecutionOrchestrator::merge_ranked(K, &lexical, &semantic)
-            .into_values()
-            .collect();
+        let mut new_v: Vec<_> =
+            QueryExecutionOrchestrator::merge_ranked(K, &lexical, &semantic, false)
+                .into_values()
+                .collect();
         let mut orig_v: Vec<_> =
-            QueryExecutionOrchestrator::merge_ranked_orig(K, &lexical, &semantic)
+            QueryExecutionOrchestrator::merge_ranked_orig(K, &lexical, &semantic, false)
                 .into_values()
                 .collect();
         new_v.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
@@ -81,6 +82,7 @@ fn bench(_c: &mut Criterion) {
                 K,
                 black_box(&lexical),
                 black_box(&semantic),
+                false,
             ));
         };
         let run_cand = || {
@@ -88,6 +90,7 @@ fn bench(_c: &mut Criterion) {
                 K,
                 black_box(&lexical),
                 black_box(&semantic),
+                false,
             ));
         };
 
