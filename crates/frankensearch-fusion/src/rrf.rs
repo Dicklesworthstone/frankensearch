@@ -223,6 +223,20 @@ impl FusedHitScratch<'_> {
             (Some(rank), Some(score), None, None)
         }
     }
+
+    const fn has_vector_rank(&self) -> bool {
+        self.semantic_rank.is_some() || self.hash_rank.is_some()
+    }
+
+    fn assign_vector(&mut self, rank: usize, score: f32, index: u32, vector_is_hash: bool) {
+        let (semantic_rank, semantic_score, hash_rank, hash_score) =
+            Self::vector_fields(rank, score, vector_is_hash);
+        self.semantic_rank = semantic_rank;
+        self.semantic_score = semantic_score;
+        self.hash_rank = hash_rank;
+        self.hash_score = hash_score;
+        self.semantic_index = Some(index);
+    }
 }
 
 // ─── RRF Fusion ─────────────────────────────────────────────────────────────
@@ -335,6 +349,28 @@ pub fn rrf_fuse_with_graph(
     offset: usize,
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
+    rrf_fuse_with_graph_for_vector_lane(
+        lexical,
+        semantic,
+        graph,
+        graph_weight,
+        limit,
+        offset,
+        config,
+        false,
+    )
+}
+
+fn rrf_fuse_with_graph_for_vector_lane(
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    graph: &[ScoredResult],
+    graph_weight: f64,
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+    vector_is_hash: bool,
+) -> Vec<FusedHit> {
     let k = sanitize_rrf_k(config.k);
     let lexical_weight = sanitize_tier_weight(config.lexical_weight);
     let semantic_weight = sanitize_tier_weight(config.semantic_weight);
@@ -361,8 +397,8 @@ pub fn rrf_fuse_with_graph(
                 hit.rrf_score += rrf_contribution;
                 hit.lexical_rank = Some(rank);
                 hit.lexical_score = Some(result.score);
-                // Compute in_both_sources inline: if semantic was already seen.
-                if hit.semantic_rank.is_some() {
+                // Compute in_both_sources inline: if the vector lane was already seen.
+                if hit.has_vector_rank() {
                     hit.in_both_sources = true;
                 }
             }
@@ -389,34 +425,34 @@ pub fn rrf_fuse_with_graph(
     for (rank, hit) in semantic.iter().enumerate() {
         let rrf_contribution = rank_contribution(k, rank) * semantic_weight;
 
-        // Single hash lookup (see lexical loop): skip if already seen in semantic.
+        // Single hash lookup (see lexical loop): skip if already seen in the vector lane.
         match hits.entry(hit.doc_id.as_str()) {
             Entry::Occupied(mut e) => {
                 let fh = e.get_mut();
-                if fh.semantic_rank.is_some() {
+                if fh.has_vector_rank() {
                     continue;
                 }
                 fh.rrf_score += rrf_contribution;
-                fh.semantic_rank = Some(rank);
-                fh.semantic_score = Some(hit.score);
-                fh.semantic_index = Some(hit.index);
+                fh.assign_vector(rank, hit.score, hit.index, vector_is_hash);
                 // Compute in_both_sources inline: if lexical was already seen.
                 if fh.lexical_rank.is_some() {
                     fh.in_both_sources = true;
                 }
             }
             Entry::Vacant(e) => {
+                let (semantic_rank, semantic_score, hash_rank, hash_score) =
+                    FusedHitScratch::vector_fields(rank, hit.score, vector_is_hash);
                 e.insert(FusedHitScratch {
                     doc_id: hit.doc_id.as_str(),
                     rrf_score: rrf_contribution,
                     lexical_rank: None,
-                    semantic_rank: Some(rank),
-                    hash_rank: None,
+                    semantic_rank,
+                    hash_rank,
                     semantic_index: Some(hit.index),
                     graph_rank: None,
                     lexical_score: None,
-                    semantic_score: Some(hit.score),
-                    hash_score: None,
+                    semantic_score,
+                    hash_score,
                     graph_score: None,
                     in_both_sources: false,
                 });
@@ -1265,6 +1301,22 @@ mod tests {
         assert_eq!(pool[0].semantic_rank, None);
         assert_eq!(pool[0].hash_score, Some(0.9));
         assert_eq!(pool[0].semantic_score, None);
+
+        let mapped = rrf_fuse_with_graph_for_vector_lane(
+            &[lexical_hit("doc-a", 4.0)],
+            &semantic,
+            &[],
+            0.0,
+            10,
+            0,
+            &RrfConfig::default(),
+            true,
+        );
+        assert!(mapped[0].in_both_sources);
+        assert_eq!(mapped[0].hash_rank, Some(0));
+        assert_eq!(mapped[0].semantic_rank, None);
+        assert_eq!(mapped[0].hash_score, Some(0.9));
+        assert_eq!(mapped[0].semantic_score, None);
     }
 
     fn lexical_hit(doc_id: &str, score: f32) -> ScoredResult {
