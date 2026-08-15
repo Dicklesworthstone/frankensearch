@@ -272,8 +272,7 @@ pub fn rrf_fuse_for_vector_lane(
     config: &RrfConfig,
     vector_is_hash: bool,
 ) -> Vec<FusedHit> {
-    let mut fused =
-        rrf_fuse_with_graph_merge(lexical, semantic, &[], 0.0, limit, offset, config);
+    let mut fused = rrf_fuse_with_graph_merge(lexical, semantic, &[], 0.0, limit, offset, config);
     remap_fused_hits_for_hash_lane(&mut fused, vector_is_hash);
     fused
 }
@@ -1147,6 +1146,21 @@ mod tests {
             classify_fused_hit_source(&fused("sem", None, Some(0), false), "minilm-l6-v2"),
             ScoreSource::SemanticFast
         );
+    }
+
+    #[test]
+    fn rrf_fuse_hash_lane_writes_hash_rank_not_semantic_rank() {
+        let semantic = vec![semantic_hit("doc-a", 0.9)];
+        let fused = rrf_fuse_for_vector_lane(&[], &semantic, 10, 0, &RrfConfig::default(), true);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].hash_rank, Some(0));
+        assert_eq!(fused[0].semantic_rank, None);
+        assert_eq!(fused[0].hash_score, Some(0.9));
+        assert_eq!(fused[0].semantic_score, None);
+
+        let semantic_lane = rrf_fuse(&[], &semantic, 10, 0, &RrfConfig::default());
+        assert_eq!(semantic_lane[0].semantic_rank, Some(0));
+        assert_eq!(semantic_lane[0].hash_rank, None);
     }
 
     fn lexical_hit(doc_id: &str, score: f32) -> ScoredResult {
