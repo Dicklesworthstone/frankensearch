@@ -387,6 +387,8 @@ impl Query {
         let remap = |id: QueryNodeId| {
             if id == QueryNodeId::ROOT {
                 QueryNodeId(child_root)
+            } else if matches!(id, QueryNodeId::ALL | QueryNodeId::EMPTY) {
+                id
             } else {
                 QueryNodeId(base.saturating_add(id.index()))
             }
@@ -3984,15 +3986,20 @@ fn negative_boolean_dedup_key(child: SyntaxKey) -> SyntaxKey {
 /// exactly. A non-`Should` occurrence or a mixed-occurrence child is a
 /// boundary, as is any non-boolean node (boosts included).
 fn flatten_should_of_should(query: &mut Query) {
-    for index in 0..=query.nodes.len() {
-        let node_id = if index == query.nodes.len() {
-            query.root_id()
-        } else {
-            Query::node_id(index)
-        };
+    let mut pending = Vec::new();
+    if pending.try_reserve_exact(query.node_count()).is_err() {
+        return;
+    }
+    pending.push((query.root_id(), false));
+    while let Some((node_id, visited)) = pending.pop() {
         let QueryNode::Boolean { clauses, .. } = query.node(node_id) else {
             continue;
         };
+        if !visited {
+            pending.push((node_id, true));
+            pending.extend(clauses.iter().rev().map(|clause| (clause.query, false)));
+            continue;
+        }
         let flattened_len = clauses.iter().fold(0_usize, |len, clause| {
             if clause.occur == Occur::Should
                 && let QueryNode::Boolean {
@@ -8823,6 +8830,40 @@ mod tests {
                 Bound::Included(QueryValue::I64(high)),
             ),
         )
+    }
+
+    #[test]
+    fn arena_append_preserves_all_and_empty_sentinels() {
+        let child = Query::boolean(
+            Vec::from([
+                BooleanClause::new(Occur::Should, Query::all()),
+                BooleanClause::new(Occur::Should, Query::empty()),
+                term_clause(Occur::Should, 1, "child"),
+            ]),
+            None,
+        );
+        let query = Query::boolean(
+            Vec::from([
+                term_clause(Occur::Should, 1, "root"),
+                BooleanClause::new(Occur::Should, child),
+            ]),
+            Some(BooleanOperator::Or),
+        );
+        let QueryNode::Boolean { clauses, .. } = query.root() else {
+            panic!("outer query stays Boolean")
+        };
+        let QueryNode::Boolean {
+            clauses: child_clauses,
+            ..
+        } = query.node(clauses[1].query)
+        else {
+            panic!("nested query stays Boolean")
+        };
+        assert!(matches!(query.node(child_clauses[0].query), QueryNode::All));
+        assert!(matches!(
+            query.node(child_clauses[1].query),
+            QueryNode::Empty
+        ));
     }
 
     #[test]
