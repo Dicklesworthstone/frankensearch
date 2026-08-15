@@ -258,7 +258,33 @@ pub fn rrf_fuse(
     // (proven by `merge_matches_map_fusion`) but feeds the final sort a
     // near-sorted (semantic-ordered) input — 1.31-1.46× faster on the limit_all
     // shape, growing with N (`rrf_merge_fuse` bench).
-    rrf_fuse_with_graph_merge(lexical, semantic, &[], 0.0, limit, offset, config)
+    rrf_fuse_for_vector_lane(lexical, semantic, limit, offset, config, false)
+}
+
+/// Fuse lexical and vector results, placing the vector rank on `hash_rank`
+/// when the vector lane is a hash-control generation.
+#[must_use]
+pub fn rrf_fuse_for_vector_lane(
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+    vector_is_hash: bool,
+) -> Vec<FusedHit> {
+    let mut fused =
+        rrf_fuse_with_graph_merge(lexical, semantic, &[], 0.0, limit, offset, config);
+    remap_fused_hits_for_hash_lane(&mut fused, vector_is_hash);
+    fused
+}
+
+fn remap_fused_hits_for_hash_lane(hits: &mut [FusedHit], vector_is_hash: bool) {
+    if !vector_is_hash {
+        return;
+    }
+    for hit in hits {
+        hit.remap_hash_control_ranks();
+    }
 }
 
 /// Fuse lexical, semantic, and optional graph-ranked results with weighted RRF.
@@ -822,7 +848,34 @@ pub fn fuse_by_strategy(
     offset: usize,
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
-    match strategy {
+    fuse_by_strategy_for_vector_lane(
+        strategy,
+        lexical,
+        semantic,
+        graph,
+        graph_weight,
+        limit,
+        offset,
+        config,
+        false,
+    )
+}
+
+/// Fuse by strategy, remapping the vector rank onto `hash_rank` when the
+/// vector lane is a hash-control generation.
+#[must_use]
+pub fn fuse_by_strategy_for_vector_lane(
+    strategy: FusionStrategy,
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    graph: &[ScoredResult],
+    graph_weight: f64,
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+    vector_is_hash: bool,
+) -> Vec<FusedHit> {
+    let mut fused = match strategy {
         FusionStrategy::PoolMinMax if graph.is_empty() => {
             pool_minmax_fuse_merge(lexical, semantic, limit, offset, config)
         }
@@ -835,7 +888,9 @@ pub fn fuse_by_strategy(
             offset,
             config,
         ),
-    }
+    };
+    remap_fused_hits_for_hash_lane(&mut fused, vector_is_hash);
+    fused
 }
 
 /// Like [`rrf_fuse_with_graph_merge`] but **assumes the `semantic` slice has no
