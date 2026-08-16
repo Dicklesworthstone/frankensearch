@@ -6531,7 +6531,7 @@ mod tests {
             result.reasons.iter().any(|reason| {
                 reason.code == "perf.ratchet.threshold_verified_reload_failed"
                     || reason.code == "perf.ratchet.incomplete_matrix"
-                    || reason.code == "perf.ratchet.current_evidence_integrity_failed"
+                    || reason.code == "perf.ratchet.machine_evidence_integrity_failed"
                     || reason.code == "perf.ratchet.current_evidence_incomplete_plan"
             }),
             "filtered artifacts escaped every strict rejection seam: {:?}",
@@ -6997,24 +6997,32 @@ mod tests {
 
     #[test]
     fn current_evidence_reconciles_with_threshold_projection_and_rerun() {
-        let baseline = qg2_artifact("old", 160.0, 100.0);
+        // A measured baseline must itself resolve to a bound
+        // threshold/evidence generation with a verified runner receipt, so the
+        // baseline is supplied as a full pair rather than a bare artifact.
+        let (baseline, baseline_evidence) = qg2_current_pair("old", "baseline", 160.0, 100.0);
         let (candidate, candidate_evidence) = qg2_current_pair("new", "candidate", 161.0, 100.0);
         let (rerun, rerun_evidence) = qg2_current_pair("new", "rerun", 161.0, 100.0);
         let result = evaluate_with_current(
             &baseline,
-            None,
+            Some(&baseline_evidence),
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
             Some(&rerun_evidence),
             PerfRatchetQg6AuthoritySets::empty(),
         );
-        assert_eq!(result.decision, PerfGateDecision::Allow);
+        assert_eq!(
+            result.decision,
+            PerfGateDecision::Allow,
+            "reasons: {:?}",
+            result.reasons
+        );
     }
 
     #[test]
     fn post_seal_current_evidence_mutation_blocks_before_target_evaluation() {
-        let baseline = qg2_artifact("old", 160.0, 100.0);
+        let (baseline, baseline_evidence) = qg2_current_pair("old", "baseline", 160.0, 100.0);
         let (candidate, mut candidate_evidence) =
             qg2_current_pair("new", "candidate", 161.0, 100.0);
         let (rerun, rerun_evidence) = qg2_current_pair("new", "rerun", 161.0, 100.0);
@@ -7027,7 +7035,7 @@ mod tests {
 
         let result = evaluate_with_current(
             &baseline,
-            None,
+            Some(&baseline_evidence),
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
@@ -7036,10 +7044,14 @@ mod tests {
         );
 
         assert_eq!(result.decision, PerfGateDecision::Block);
-        assert!(result.reasons.iter().any(|reason| {
-            reason.code == "perf.ratchet.current_evidence_integrity_failed"
-                && reason.message.contains("hash seal")
-        }));
+        assert!(
+            result.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.machine_evidence_integrity_failed"
+                    && reason.message.contains("hash seal")
+            }),
+            "reasons: {:?}",
+            result.reasons
+        );
         assert!(
             result.comparisons.is_empty(),
             "integrity failure must short-circuit before baseline or target evaluation"
@@ -7127,21 +7139,26 @@ mod tests {
 
     #[test]
     fn current_evidence_elf_projection_mismatch_quarantines() {
-        let baseline = qg2_artifact("old", 160.0, 100.0);
+        let (baseline, baseline_evidence) = qg2_current_pair("old", "baseline", 160.0, 100.0);
         let (mut candidate, candidate_evidence) =
             qg2_current_pair("new", "candidate", 161.0, 100.0);
         let (rerun, rerun_evidence) = qg2_current_pair("new", "rerun", 161.0, 100.0);
         candidate.bench_elf_sha256 = "f".repeat(64);
         let result = evaluate_with_current(
             &baseline,
-            None,
+            Some(&baseline_evidence),
             &candidate,
             Some(&rerun),
             Some(&candidate_evidence),
             Some(&rerun_evidence),
             PerfRatchetQg6AuthoritySets::empty(),
         );
-        assert_eq!(result.decision, PerfGateDecision::Quarantine);
+        assert_eq!(
+            result.decision,
+            PerfGateDecision::Quarantine,
+            "reasons: {:?}",
+            result.reasons
+        );
         assert!(
             result
                 .reasons
