@@ -99,7 +99,8 @@ use crate::quiver::{
 use crate::schema::{Analyzer, DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
     AccumulatorError, ArenaSpan, ColumnarAccumulator, DEFAULT_ARENA_CHUNK_BYTES,
-    DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator, DocIdSpan, FIELD_PREFIX_BYTES,
+    DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator, DocIdSpan, DocumentAccumulation,
+    FIELD_PREFIX_BYTES,
     FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput, FrankensearchTokenizer,
     IndexedFieldValue, IndexedNumericValue, ShardRouter, StoredFieldValue,
     TERM_BUCKET_BYTES_ESTIMATE, TokenAnalyzer, flush_accumulator_with_mode, flush_delta_snapshot,
@@ -2289,7 +2290,7 @@ enum IngestParallelismPolicy {
 /// construct it directly to isolate planner and budget behavior.
 #[derive(Debug, Clone, Copy)]
 struct ValidatedBatchAdmission<'a> {
-    documents: &'a [IndexableDocument],
+    documents: IngestBatch<'a>,
 }
 
 #[derive(Clone)]
@@ -6242,9 +6243,15 @@ impl QuillWriterState {
     fn parallel_budget_admission(
         &self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
         active_shards: usize,
     ) -> Result<Option<ParallelBudgetAdmission>, QuillIndexError> {
+        // A schema wider than the five-field shipping shape has no parallel
+        // budget model, so a schema batch keeps the scalar route by
+        // construction rather than by a per-document refusal.
+        let IngestBatch::Default(documents) = documents else {
+            return Ok(None);
+        };
         // The first budget-safe activation accepts only a pristine Scribe
         // generation. Retained leases or logical rows from an earlier routed
         // batch would make the scalar counterfactual depend on prior shard
@@ -6470,7 +6477,7 @@ impl QuillWriterState {
     pub async fn index_documents(
         &mut self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
     ) -> Result<(), QuillIndexError> {
         let replacement_ids = BTreeSet::new();
         self.index_documents_with_replacements(
@@ -6501,7 +6508,7 @@ impl QuillWriterState {
     async fn index_documents_with_scalar_topology_conformance(
         &mut self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
     ) -> Result<(), QuillIndexError> {
         let replacement_ids = BTreeSet::new();
         self.index_documents_with_replacements(
@@ -6747,7 +6754,7 @@ impl QuillWriterState {
         self.pending_field_stats = pending_field_stats;
         self.next_seal_seq = next_seal_seq;
         self.uncommitted_ids
-            .extend(documents.iter().map(|document| document.id.clone()));
+            .extend(documents.iter().map(|document| document.id().to_owned()));
         self.unpublished_since.get_or_insert_with(Instant::now);
 
         if allow_automatic_publication {
@@ -7012,7 +7019,7 @@ impl QuillWriterState {
         self.next_lease_base = self.docid_allocator.watermark();
 
         self.uncommitted_ids
-            .extend(documents.iter().map(|document| document.id.clone()));
+            .extend(documents.iter().map(|document| document.id().to_owned()));
         self.unpublished_since.get_or_insert_with(Instant::now);
         let visibility_due = self.unpublished_since.is_some_and(|started| {
             started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
@@ -7042,7 +7049,7 @@ impl QuillWriterState {
 
     fn accumulate_parallel_shard(
         state: &mut ScribeShardState,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
         prepared_metadata: Option<Vec<Option<Vec<u8>>>>,
         #[cfg(test)] metadata_observation: Option<&ParallelBatchObservation>,
         assignment: ParallelShardAssignment,
@@ -7051,7 +7058,7 @@ impl QuillWriterState {
     ) -> Result<(), QuillIndexError> {
         checkpoint.check(cx)?;
         let shard_documents = documents
-            .get(assignment.document_start..assignment.document_end)
+            .try_slice(assignment.document_start..assignment.document_end)
             .ok_or_else(|| invalid_state("parallel shard document range is outside the batch"))?;
         let mut prepared_metadata = prepared_metadata.map(Vec::into_iter);
         if shard_documents.len()
@@ -7109,25 +7116,17 @@ impl QuillWriterState {
                     metadata.as_slice()
                 }
                 Some(None) | None => {
-                    fallback_metadata = canonical_metadata(&document.metadata)?;
+                    document.write_canonical_metadata(&mut fallback_metadata)?;
                     fallback_metadata.as_slice()
                 }
             };
-            let title = document.title.as_deref().unwrap_or("");
-            let indexed = [
-                IndexedFieldValue::new(ID_FIELD, &document.id),
-                IndexedFieldValue::new(CONTENT_FIELD, &document.content),
-                IndexedFieldValue::new(TITLE_FIELD, title),
-            ];
-            let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
-            let stored = [StoredFieldValue::new(METADATA_FIELD, metadata)];
             state
                 .accumulator
-                .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
-            let content_hash = canonical_document_content_hash(document, metadata)?;
+                .add_document_with_values_from(document, doc_ord, global_docid, metadata)?;
+            let content_hash = document.content_hash(metadata)?;
             state.identities.push(PendingIdentity {
                 doc_ord,
-                document_id: document.id.clone(),
+                document_id: document.id().to_owned(),
                 content_hash,
             });
         }
@@ -7137,7 +7136,7 @@ impl QuillWriterState {
     async fn index_documents_with_replacements(
         &mut self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
         replacement_ids: &BTreeSet<&str>,
         allow_automatic_publication: bool,
         parallelism_policy: IngestParallelismPolicy,
@@ -7433,24 +7432,24 @@ impl QuillWriterState {
     fn validate_batch_admission<'a>(
         &self,
         cx: &Cx,
-        documents: &'a [IndexableDocument],
+        documents: IngestBatch<'a>,
         replacement_ids: &BTreeSet<&str>,
     ) -> Result<ValidatedBatchAdmission<'a>, QuillIndexError> {
         let authority = self.authority_snapshot()?;
         let mut batch_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "index admission")?;
-            if document.id.is_empty() {
+            if document.id().is_empty() {
                 return Err(invalid_state("document id must be nonempty"));
             }
-            if !batch_ids.insert(document.id.as_str())
-                || self.uncommitted_ids.contains(&document.id)
-                || authority.resolve_document_id(&document.id)?.is_some()
-                    && !replacement_ids.contains(document.id.as_str())
+            if !batch_ids.insert(document.id())
+                || self.uncommitted_ids.contains(document.id())
+                || authority.resolve_document_id(document.id())?.is_some()
+                    && !replacement_ids.contains(document.id())
             {
                 return Err(invalid_state(format!(
                     "duplicate live document id {:?}",
-                    document.id
+                    document.id()
                 )));
             }
         }
@@ -7475,7 +7474,7 @@ impl QuillWriterState {
     async fn index_batch_serial(
         &mut self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
         allow_automatic_publication: bool,
     ) -> Result<(usize, usize), QuillIndexError> {
         let shard_id = self.shard_router.route_batch();
@@ -7509,7 +7508,9 @@ impl QuillWriterState {
             }
             self.shards[shard_id].current_lease_base = Some(span.lease_base);
             for span_offset in 0..span.len {
-                let document = &documents[document_index];
+                let document = documents
+                    .get(document_index)
+                    .ok_or_else(|| invalid_state("shard document index is outside the batch"))?;
                 document_index += 1;
                 check_cancel(cx, "index")?;
                 let doc_ord = span
@@ -7526,20 +7527,14 @@ impl QuillWriterState {
                     let shard = &mut self.shards[shard_id];
                     shard.scratch_metadata.clear();
                     write_canonical_metadata(&mut shard.scratch_metadata, &document.metadata)?;
-                    let title = document.title.as_deref().unwrap_or("");
-                    let indexed = [
-                        IndexedFieldValue::new(ID_FIELD, &document.id),
-                        IndexedFieldValue::new(CONTENT_FIELD, &document.content),
-                        IndexedFieldValue::new(TITLE_FIELD, title),
-                    ];
-                    let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
-                    let stored = [StoredFieldValue::new(
-                        METADATA_FIELD,
-                        &shard.scratch_metadata,
-                    )];
-                    let accumulated = shard
-                        .accumulator
-                        .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
+                    let values =
+                        default_schema_values(document, global_docid, &shard.scratch_metadata);
+                    let accumulated = shard.accumulator.add_document_with_values(
+                        doc_ord,
+                        &values.indexed,
+                        &values.numeric,
+                        &values.stored,
+                    )?;
                     let content_hash =
                         canonical_document_content_hash(document, &shard.scratch_metadata)?;
                     shard.identities.push(PendingIdentity {
@@ -7609,7 +7604,7 @@ impl QuillWriterState {
     async fn index_batch_fanout(
         &mut self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
         allow_automatic_publication: bool,
         shard_count: usize,
         observation: &ParallelBatchObservation,
@@ -7621,7 +7616,7 @@ impl QuillWriterState {
         // is left, and it happens in input order.
         for document in documents {
             check_cancel(cx, "index")?;
-            self.uncommitted_ids.insert(document.id.clone());
+            self.uncommitted_ids.insert(document.id().to_owned());
         }
         if !documents.is_empty() {
             self.unpublished_since.get_or_insert_with(Instant::now);
@@ -7645,7 +7640,9 @@ impl QuillWriterState {
             check_cancel(cx, "index")?;
             let wave_len = (documents.len() - wave_start)
                 .min(FANOUT_WAVE_SHARD_DOCUMENTS.saturating_mul(shard_count));
-            let wave = &documents[wave_start..wave_start + wave_len];
+            let wave = documents
+                .try_slice(wave_start..wave_start + wave_len)
+                .ok_or_else(|| invalid_state("fan-out wave is outside the batch"))?;
             wave_start += wave_len;
 
             // Contiguous partition in ascending shard order: every shard sees
@@ -7703,7 +7700,7 @@ impl QuillWriterState {
                 // borrows are carved out in ascending shard order, scoped so
                 // the shard-vector borrow ends before the seal pass below.
                 let outcomes = {
-                    let mut work: Vec<(&mut ScribeShardState, &[IndexableDocument], DocIdSpan)> =
+                    let mut work: Vec<(&mut ScribeShardState, IngestBatch<'_>, DocIdSpan)> =
                         Vec::with_capacity(allocations.len());
                     let mut rest: &mut [ScribeShardState] = &mut self.shards;
                     let mut taken = 0_usize;
@@ -8223,7 +8220,7 @@ impl QuillWriterState {
     async fn upsert_documents(
         &mut self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
     ) -> Result<(), QuillIndexError> {
         check_cancel(cx, "upsert documents")?;
         // Publish an unrelated pending batch before replacing a live document.
@@ -8286,8 +8283,8 @@ impl QuillWriterState {
         let mut replacement_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "upsert document batch")?;
-            if snapshot.delete_document(&mut manifest, &document.id)? {
-                replacement_ids.insert(document.id.as_str());
+            if snapshot.delete_document(&mut manifest, document.id())? {
+                replacement_ids.insert(document.id());
             }
         }
         if replacement_ids.is_empty() {
@@ -8360,18 +8357,18 @@ impl QuillWriterState {
     /// would have been one step later.
     fn validate_commit_invariant_batch_shape(
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
     ) -> Result<(), QuillIndexError> {
         let mut batch_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "upsert admission preflight")?;
-            if document.id.is_empty() {
+            if document.id().is_empty() {
                 return Err(invalid_state("document id must be nonempty"));
             }
-            if !batch_ids.insert(document.id.as_str()) {
+            if !batch_ids.insert(document.id()) {
                 return Err(invalid_state(format!(
                     "duplicate live document id {:?}",
-                    document.id
+                    document.id()
                 )));
             }
         }
@@ -8391,12 +8388,12 @@ impl QuillWriterState {
     fn batch_replaces_published_document(
         &self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
     ) -> Result<bool, QuillIndexError> {
         let snapshot = self.authority_snapshot()?;
         for document in documents {
             check_cancel(cx, "upsert replacement probe")?;
-            if snapshot.resolve_document_id(&document.id)?.is_some() {
+            if snapshot.resolve_document_id(document.id())?.is_some() {
                 return Ok(true);
             }
         }
@@ -11493,7 +11490,7 @@ impl QuillIndex {
     pub async fn index_documents(
         &self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
     ) -> Result<(), QuillIndexError> {
         let mut writer = self.lock_writer(cx, "index writer lock").await?;
         writer.index_documents(cx, documents).await
@@ -11520,7 +11517,7 @@ impl QuillIndex {
     pub async fn index_documents_with_scalar_topology_conformance(
         &self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
     ) -> Result<(), QuillIndexError> {
         let mut writer = self
             .lock_writer(cx, "scalar topology conformance writer lock")
@@ -11733,7 +11730,7 @@ impl QuillIndex {
     async fn upsert_documents(
         &self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: IngestBatch<'_>,
     ) -> Result<(), QuillIndexError> {
         check_cancel(cx, "upsert documents")?;
         let mut final_positions = HashMap::new();
@@ -11742,27 +11739,27 @@ impl QuillIndex {
             .map_err(|_| invalid_state("could not reserve upsert identity map"))?;
         for (position, document) in documents.iter().enumerate() {
             check_cancel(cx, "upsert documents")?;
-            final_positions.insert(document.id.as_str(), position);
+            final_positions.insert(document.id(), position);
         }
 
         let canonical = if final_positions.len() == documents.len() {
             None
         } else {
-            let mut canonical = Vec::new();
-            canonical
-                .try_reserve_exact(final_positions.len())
-                .map_err(|_| invalid_state("could not reserve canonical upsert batch"))?;
+            let mut canonical =
+                OwnedIngestBatch::with_capacity_like(documents, final_positions.len())?;
             for (position, document) in documents.iter().enumerate() {
                 check_cancel(cx, "upsert documents")?;
-                if final_positions.get(document.id.as_str()) == Some(&position) {
-                    canonical.push(document.clone());
+                if final_positions.get(document.id()) == Some(&position) {
+                    canonical.push(document)?;
                 }
             }
             Some(canonical)
         };
         drop(final_positions);
 
-        let documents = canonical.as_deref().unwrap_or(documents);
+        let documents = canonical
+            .as_ref()
+            .map_or(documents, OwnedIngestBatch::as_batch);
         let mut writer = self.lock_writer(cx, "upsert writer lock").await?;
         writer.upsert_documents(cx, documents).await
     }
@@ -12888,7 +12885,7 @@ const FANOUT_WAVE_SHARD_DOCUMENTS: usize = 256;
 /// and docid allocation have already happened on the serial path.
 fn accumulate_shard_run(
     state: &mut ScribeShardState,
-    documents: &[IndexableDocument],
+    documents: IngestBatch<'_>,
     span: DocIdSpan,
 ) -> Result<(usize, usize), QuillIndexError> {
     // Disjoint field borrows: the accumulator, the identity log and the
@@ -12914,28 +12911,365 @@ fn accumulate_shard_run(
             .checked_add(u64::from(doc_ord))
             .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
             .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
-        scratch_metadata.clear();
-        write_canonical_metadata(scratch_metadata, &document.metadata)?;
-        let title = document.title.as_deref().unwrap_or("");
-        let indexed = [
-            IndexedFieldValue::new(ID_FIELD, &document.id),
-            IndexedFieldValue::new(CONTENT_FIELD, &document.content),
-            IndexedFieldValue::new(TITLE_FIELD, title),
-        ];
-        let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
-        let stored = [StoredFieldValue::new(METADATA_FIELD, scratch_metadata)];
+        document.write_canonical_metadata(scratch_metadata)?;
         let accumulated =
-            accumulator.add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
+            document.accumulate(accumulator, doc_ord, global_docid, scratch_metadata)?;
         bytes_used_high_water = bytes_used_high_water.max(accumulated.bytes_used);
         bytes_reserved_high_water = bytes_reserved_high_water.max(accumulated.bytes_reserved);
-        let content_hash = canonical_document_content_hash(document, scratch_metadata)?;
+        let content_hash = document.content_hash(scratch_metadata)?;
         identities.push(PendingIdentity {
             doc_ord,
-            document_id: document.id.clone(),
+            document_id: document.id().to_owned(),
             content_hash,
         });
     }
     Ok((bytes_used_high_water, bytes_reserved_high_water))
+}
+
+/// One document already projected onto an arbitrary compiled schema.
+///
+/// [`IndexableDocument`] is the five-field shipping shape and stays the input
+/// type for [`QuillIndex::upsert_documents`]. This is its schema-general
+/// sibling for indexes opened through [`QuillIndex::create_with_schema`]: every
+/// value carries its own stable field ordinal, so a caller with a wider schema
+/// — the CASS profile in [`crate::cass`], for instance — supplies each column
+/// directly instead of squeezing it through `content`/`title`/`metadata`.
+///
+/// `id` is deliberately not a schema column here. It is the identity Quill uses
+/// for dedup, tombstones, and IDMAP witnesses regardless of schema; supply it
+/// in `indexed` as well when the schema also indexes it as a searchable field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaDocument {
+    /// Unique document identifier (caller-defined).
+    pub id: String,
+    /// Indexed string columns as `(field_ord, text)`.
+    pub indexed: Vec<(u16, String)>,
+    /// Indexed or fast numeric columns as `(field_ord, value)`.
+    pub numeric: Vec<(u16, NumericValue)>,
+    /// Stored-only columns as `(field_ord, bytes)`.
+    pub stored: Vec<(u16, Vec<u8>)>,
+}
+
+/// Domain separator for [`SchemaDocument`] content witnesses.
+///
+/// Distinct from [`CONTENT_HASH_DOMAIN`] so that a five-field document and a
+/// schema document sharing an id can never collide into a false "unchanged"
+/// verdict if both shapes are written to one index.
+const SCHEMA_CONTENT_HASH_DOMAIN: &[u8] = b"frankensearch.quill.idmap-content.schema.v1\0";
+
+/// One ingest batch, in either supported document shape.
+///
+/// `Copy` so it substitutes for the `&[IndexableDocument]` it replaced without
+/// disturbing the ingest routes' borrow structure.
+#[derive(Debug, Clone, Copy)]
+enum IngestBatch<'a> {
+    Default(&'a [IndexableDocument]),
+    Schema(&'a [SchemaDocument]),
+}
+
+/// One document from an [`IngestBatch`].
+#[derive(Debug, Clone, Copy)]
+enum IngestDoc<'a> {
+    Default(&'a IndexableDocument),
+    Schema(&'a SchemaDocument),
+}
+
+impl<'a> IngestBatch<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Default(documents) => documents.len(),
+            Self::Schema(documents) => documents.len(),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(self, index: usize) -> Option<IngestDoc<'a>> {
+        match self {
+            Self::Default(documents) => documents.get(index).map(IngestDoc::Default),
+            Self::Schema(documents) => documents.get(index).map(IngestDoc::Schema),
+        }
+    }
+
+    /// Sub-batch over `range`, used to hand each shard its fan-out span.
+    ///
+    /// `None` when the range is outside the batch, so a bad shard assignment
+    /// surfaces as a typed refusal rather than a slice panic.
+    fn try_slice(self, range: std::ops::Range<usize>) -> Option<Self> {
+        match self {
+            Self::Default(documents) => documents.get(range).map(Self::Default),
+            Self::Schema(documents) => documents.get(range).map(Self::Schema),
+        }
+    }
+
+    /// Successive sub-batches of at most `size` documents.
+    fn chunks(self, size: usize) -> impl Iterator<Item = Self> {
+        let size = size.max(1);
+        let len = self.len();
+        (0..len)
+            .step_by(size)
+            .filter_map(move |start| self.try_slice(start..(start + size).min(len)))
+    }
+
+    fn iter(self) -> IngestBatchIter<'a> {
+        IngestBatchIter {
+            batch: self,
+            next: 0,
+        }
+    }
+}
+
+/// An owned ingest batch.
+///
+/// The facade materializes one only when its input carries repeated ids and a
+/// last-write-wins canonicalization has to be handed to the writer as a
+/// contiguous batch.
+enum OwnedIngestBatch {
+    Default(Vec<IndexableDocument>),
+    Schema(Vec<SchemaDocument>),
+}
+
+impl OwnedIngestBatch {
+    /// An empty batch of the same shape as `batch`, with `capacity` reserved.
+    fn with_capacity_like(
+        batch: IngestBatch<'_>,
+        capacity: usize,
+    ) -> Result<Self, QuillIndexError> {
+        let reserve_failed = || invalid_state("could not reserve canonical upsert batch");
+        match batch {
+            IngestBatch::Default(_) => {
+                let mut documents = Vec::new();
+                documents
+                    .try_reserve_exact(capacity)
+                    .map_err(|_| reserve_failed())?;
+                Ok(Self::Default(documents))
+            }
+            IngestBatch::Schema(_) => {
+                let mut documents = Vec::new();
+                documents
+                    .try_reserve_exact(capacity)
+                    .map_err(|_| reserve_failed())?;
+                Ok(Self::Schema(documents))
+            }
+        }
+    }
+
+    /// Append `document`, which must share this batch's shape.
+    fn push(&mut self, document: IngestDoc<'_>) -> Result<(), QuillIndexError> {
+        match (self, document) {
+            (Self::Default(batch), IngestDoc::Default(document)) => {
+                batch.push(document.clone());
+                Ok(())
+            }
+            (Self::Schema(batch), IngestDoc::Schema(document)) => {
+                batch.push(document.clone());
+                Ok(())
+            }
+            _ => Err(invalid_state(
+                "canonical upsert batch received a document of another shape",
+            )),
+        }
+    }
+
+    fn as_batch(&self) -> IngestBatch<'_> {
+        match self {
+            Self::Default(documents) => IngestBatch::Default(documents),
+            Self::Schema(documents) => IngestBatch::Schema(documents),
+        }
+    }
+}
+
+impl<'a> IntoIterator for IngestBatch<'a> {
+    type Item = IngestDoc<'a>;
+    type IntoIter = IngestBatchIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+struct IngestBatchIter<'a> {
+    batch: IngestBatch<'a>,
+    next: usize,
+}
+
+impl<'a> Iterator for IngestBatchIter<'a> {
+    type Item = IngestDoc<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let document = self.batch.get(self.next)?;
+        self.next += 1;
+        Some(document)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.batch.len().saturating_sub(self.next);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for IngestBatchIter<'_> {}
+
+impl<'a> IngestDoc<'a> {
+    /// Schema-independent identity used for dedup, tombstones, and IDMAP.
+    fn id(self) -> &'a str {
+        match self {
+            Self::Default(document) => document.id.as_str(),
+            Self::Schema(document) => document.id.as_str(),
+        }
+    }
+
+    /// Canonicalize this document's metadata into the caller's reused buffer.
+    ///
+    /// Schema documents carry their stored bytes explicitly, so they leave the
+    /// buffer empty; the buffer is cleared either way so a caller reusing one
+    /// allocation across a run never observes a previous document's bytes.
+    fn write_canonical_metadata(self, out: &mut Vec<u8>) -> Result<(), serde_json::Error> {
+        out.clear();
+        match self {
+            Self::Default(document) => write_canonical_metadata(out, &document.metadata),
+            Self::Schema(_) => Ok(()),
+        }
+    }
+
+    /// Project onto the index schema and hand the values to Scribe.
+    fn accumulate(
+        self,
+        accumulator: &mut ColumnarAccumulator,
+        doc_ord: u32,
+        global_docid: u64,
+        canonical_metadata: &[u8],
+    ) -> Result<DocumentAccumulation, AccumulatorError> {
+        match self {
+            Self::Default(document) => {
+                let values = default_schema_values(document, global_docid, canonical_metadata);
+                accumulator.add_document_with_values(
+                    doc_ord,
+                    &values.indexed,
+                    &values.numeric,
+                    &values.stored,
+                )
+            }
+            Self::Schema(document) => {
+                let indexed = document
+                    .indexed
+                    .iter()
+                    .map(|(field_ord, text)| IndexedFieldValue::new(*field_ord, text))
+                    .collect::<Vec<_>>();
+                let numeric = document
+                    .numeric
+                    .iter()
+                    .map(|(field_ord, value)| IndexedNumericValue {
+                        field_ord: *field_ord,
+                        value: *value,
+                    })
+                    .collect::<Vec<_>>();
+                let stored = document
+                    .stored
+                    .iter()
+                    .map(|(field_ord, bytes)| StoredFieldValue::new(*field_ord, bytes))
+                    .collect::<Vec<_>>();
+                accumulator.add_document_with_values(doc_ord, &indexed, &numeric, &stored)
+            }
+        }
+    }
+
+    /// The exact IDMAP content witness Quill persists for this document.
+    fn content_hash(self, canonical_metadata: &[u8]) -> Result<u64, QuillIndexError> {
+        match self {
+            Self::Default(document) => {
+                canonical_document_content_hash(document, canonical_metadata)
+            }
+            Self::Schema(document) => {
+                let mut hasher = Xxh3::new();
+                hasher.update(SCHEMA_CONTENT_HASH_DOMAIN);
+                schema_witness_field(&mut hasher, u16::MAX, document.id.as_bytes())?;
+                for (field_ord, text) in &document.indexed {
+                    schema_witness_field(&mut hasher, *field_ord, text.as_bytes())?;
+                }
+                for (field_ord, value) in &document.numeric {
+                    let bytes = match value {
+                        NumericValue::U64(value) => value.to_le_bytes(),
+                        NumericValue::I64(value) => value.to_le_bytes(),
+                    };
+                    schema_witness_field(&mut hasher, *field_ord, &bytes)?;
+                }
+                for (field_ord, bytes) in &document.stored {
+                    schema_witness_field(&mut hasher, *field_ord, bytes)?;
+                }
+                Ok(hasher.digest())
+            }
+        }
+    }
+
+    /// Logical arena bound for the parallel route, or `None` to force scalar.
+    ///
+    /// Schema documents always force the scalar route: the parallel budget is
+    /// derived from the exact five-field shipping shape, which a wider schema
+    /// is not, and [`parallel_document_logical_upper_bound`] would refuse it
+    /// anyway.
+    fn parallel_budget_bound(
+        self,
+        schema: SchemaDescriptor,
+        analyzer: &mut FrankensearchTokenizer,
+        exclusive_ceiling: usize,
+    ) -> Result<Option<ParallelDocumentBudgetBound>, QuillIndexError> {
+        match self {
+            Self::Default(document) => parallel_document_logical_upper_bound(
+                schema,
+                analyzer,
+                document,
+                exclusive_ceiling,
+            ),
+            Self::Schema(_) => Ok(None),
+        }
+    }
+}
+
+/// Absorb one length- and ordinal-tagged field into a schema content witness.
+fn schema_witness_field(
+    hasher: &mut Xxh3,
+    field_ord: u16,
+    bytes: &[u8],
+) -> Result<(), QuillIndexError> {
+    let len = u64::try_from(bytes.len())
+        .map_err(|_| invalid_state("schema document field length does not fit u64"))?;
+    hasher.update(&field_ord.to_le_bytes());
+    hasher.update(&len.to_le_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+/// One document's borrowed FSLX values under [`DEFAULT_SCHEMA`].
+struct DefaultSchemaValues<'a> {
+    indexed: [IndexedFieldValue<'a>; 3],
+    numeric: [IndexedNumericValue; 1],
+    stored: [StoredFieldValue<'a>; 1],
+}
+
+/// Project one [`IndexableDocument`] onto [`DEFAULT_SCHEMA`].
+///
+/// Every ingest route — serial, sharded fan-out, and the parallel accumulator
+/// helper — reaches Scribe through this one projection, so the routes cannot
+/// drift apart in which fields they populate or how an absent title is spelled.
+/// `metadata` is the already-canonicalized JSON; the caller owns that buffer so
+/// the shard paths can reuse a single allocation per shard.
+fn default_schema_values<'a>(
+    document: &'a IndexableDocument,
+    global_docid: u64,
+    metadata: &'a [u8],
+) -> DefaultSchemaValues<'a> {
+    DefaultSchemaValues {
+        indexed: [
+            IndexedFieldValue::new(ID_FIELD, &document.id),
+            IndexedFieldValue::new(CONTENT_FIELD, &document.content),
+            IndexedFieldValue::new(TITLE_FIELD, document.title.as_deref().unwrap_or("")),
+        ],
+        numeric: [IndexedNumericValue::u64(ORD_FIELD, global_docid)],
+        stored: [StoredFieldValue::new(METADATA_FIELD, metadata)],
+    }
 }
 
 /// Append canonical metadata JSON to `out`.
