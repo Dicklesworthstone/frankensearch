@@ -7138,12 +7138,18 @@ mod tests {
     }
 
     #[test]
-    fn current_evidence_elf_projection_mismatch_quarantines() {
+    fn current_evidence_elf_projection_mismatch_blocks_on_receipt_binding() {
         let (baseline, baseline_evidence) = qg2_current_pair("old", "baseline", 160.0, 100.0);
-        let (mut candidate, candidate_evidence) =
+        let (candidate, mut candidate_evidence) =
             qg2_current_pair("new", "candidate", 161.0, 100.0);
         let (rerun, rerun_evidence) = qg2_current_pair("new", "rerun", 161.0, 100.0);
-        candidate.bench_elf_sha256 = "f".repeat(64);
+        // Diverge the EVIDENCE-side ELF projection and reseal, rather than
+        // rewriting the threshold artifact. Mutating the threshold also breaks
+        // the runner receipt that seals its exact bytes, which Blocks on a
+        // tamper signal before this softer identity check is ever reached — so
+        // that shape stops exercising the projection-mismatch path at all.
+        candidate_evidence.provenance.build.executable_sha256 = "f".repeat(64);
+        reseal_evidence_without_verification(&mut candidate_evidence);
         let result = evaluate_with_current(
             &baseline,
             Some(&baseline_evidence),
@@ -7153,17 +7159,26 @@ mod tests {
             Some(&rerun_evidence),
             PerfRatchetQg6AuthoritySets::empty(),
         );
+        // The v10/v11 runner receipt seals the build identity on BOTH sides,
+        // so an ELF divergence can no longer reach the softer
+        // `current_evidence_identity_mismatch` quarantine: whichever side is
+        // moved, the receipt disagrees first and the run is refused outright.
+        // Blocking is the stronger answer and the one worth pinning; the
+        // quarantine path remains reachable only through identity fields the
+        // receipt does not bind.
         assert_eq!(
             result.decision,
-            PerfGateDecision::Quarantine,
+            PerfGateDecision::Block,
             "reasons: {:?}",
             result.reasons
         );
         assert!(
-            result
-                .reasons
-                .iter()
-                .any(|reason| reason.code == "perf.ratchet.current_evidence_identity_mismatch")
+            result.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.machine_evidence_integrity_failed"
+                    && reason.message.contains("build identity")
+            }),
+            "reasons: {:?}",
+            result.reasons
         );
     }
 
