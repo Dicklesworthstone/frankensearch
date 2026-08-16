@@ -38,8 +38,7 @@ pub const CASS_SCHEMA_VERSION: &str = "v9-quill";
 /// difference. It names the engine because the engine determines the on-disk
 /// format, and the analyzer family because a tokenizer change silently
 /// invalidates every posting.
-pub const CASS_SCHEMA_HASH: &str =
-    "quill-fslx-schema-v9-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
+pub const CASS_SCHEMA_HASH: &str = "quill-fslx-schema-v9-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
 
 /// Longest preview retained in the stored `preview` column, in characters.
 pub const PREVIEW_MAX_CHARS: usize = 400;
@@ -173,6 +172,16 @@ pub struct CassDerivedColumns {
     pub content_prefix: String,
     /// Character-bounded, ellipsized content preview.
     pub preview: String,
+    /// `conversation_id` rendered for the stored column.
+    ///
+    /// The field is `I64 { indexed: false, fast: false }` with `stored: true`,
+    /// so it owns no numeric column and reaches disk as opaque bytes. This
+    /// records the encoding as base-10 text rather than raw little-endian:
+    /// the bytes are only ever read back by a consumer that must agree with
+    /// the writer, and a self-describing form is one that a human debugging a
+    /// stored payload can actually read. It is owned here so the borrowed
+    /// value slices have something to point at.
+    pub conversation_id_text: Option<String>,
 }
 
 impl CassDerivedColumns {
@@ -181,9 +190,142 @@ impl CassDerivedColumns {
     pub fn derive(document: CassDocumentRef<'_>) -> Self {
         let (content_prefix, preview) = cass_build_content_prefix_and_preview(document.content);
         Self {
-            title_prefix: document.title.map_or_else(String::new, cass_generate_edge_ngrams),
+            title_prefix: document
+                .title
+                .map_or_else(String::new, cass_generate_edge_ngrams),
             content_prefix,
             preview,
+            conversation_id_text: document.conversation_id.map(|id| id.to_string()),
+        }
+    }
+}
+
+/// Field ordinals of [`crate::schema::CASS_SEMANTIC_SCHEMA`], by name.
+///
+/// The ordinals are fixed by the compiled descriptor, so the CASS profile needs
+/// no runtime field-handle lookup: this replaces the incumbent `CassFields`
+/// struct outright. They are named rather than inlined so a schema reordering
+/// is a compile-time edit in one place instead of a silent column swap.
+pub mod field {
+    /// `agent`, keyword.
+    pub const AGENT: u16 = 0;
+    /// `workspace`, keyword.
+    pub const WORKSPACE: u16 = 1;
+    /// `workspace_original`, stored only.
+    pub const WORKSPACE_ORIGINAL: u16 = 2;
+    /// `source_path`, stored only.
+    pub const SOURCE_PATH: u16 = 3;
+    /// `msg_idx`, indexed unsigned.
+    pub const MSG_IDX: u16 = 4;
+    /// `created_at`, indexed and fast signed.
+    pub const CREATED_AT: u16 = 5;
+    /// `title`, hyphen-normalized text.
+    pub const TITLE: u16 = 6;
+    /// `content`, hyphen-normalized text.
+    pub const CONTENT: u16 = 7;
+    /// `title_prefix`, prefix-normalized text.
+    pub const TITLE_PREFIX: u16 = 8;
+    /// `content_prefix`, prefix-normalized text.
+    pub const CONTENT_PREFIX: u16 = 9;
+    /// `preview`, stored only.
+    pub const PREVIEW: u16 = 10;
+    /// `source_id`, keyword.
+    pub const SOURCE_ID: u16 = 11;
+    /// `origin_kind`, keyword.
+    pub const ORIGIN_KIND: u16 = 12;
+    /// `origin_host`, keyword.
+    pub const ORIGIN_HOST: u16 = 13;
+    /// `conversation_id`, stored signed.
+    pub const CONVERSATION_ID: u16 = 14;
+}
+
+/// The complete column set for one CASS document, ready for accumulation.
+///
+/// This is the value-construction half of CASS ingest, deliberately separated
+/// from the ingest pipeline so it can be built and asserted on without a live
+/// index. Text and byte columns borrow — from the document for source columns
+/// and from [`CassDerivedColumns`] for derived ones — so building these copies
+/// nothing.
+///
+/// Absent optional columns are omitted rather than written as empty strings: an
+/// empty keyword is a real, matchable term, so writing one would make
+/// "no workspace recorded" indistinguishable from "workspace is the empty
+/// string" at query time.
+#[derive(Debug, Clone)]
+pub struct CassFieldValues<'a> {
+    /// Analyzed and keyword text columns.
+    pub indexed: Vec<crate::scribe::IndexedFieldValue<'a>>,
+    /// Numeric columns.
+    pub numeric: Vec<crate::scribe::IndexedNumericValue>,
+    /// Stored-only byte columns.
+    pub stored: Vec<crate::scribe::StoredFieldValue<'a>>,
+}
+
+impl<'a> CassFieldValues<'a> {
+    /// Build every column for `document`, borrowing derived text from `derived`.
+    #[must_use]
+    pub fn build(document: CassDocumentRef<'a>, derived: &'a CassDerivedColumns) -> Self {
+        use crate::scribe::{IndexedFieldValue, IndexedNumericValue, StoredFieldValue};
+
+        let mut indexed = Vec::with_capacity(10);
+        let mut numeric = Vec::with_capacity(2);
+        let mut stored = Vec::with_capacity(4);
+
+        indexed.push(IndexedFieldValue::new(field::AGENT, document.agent));
+        indexed.push(IndexedFieldValue::new(field::SOURCE_ID, document.source_id));
+        indexed.push(IndexedFieldValue::new(
+            field::ORIGIN_KIND,
+            document.origin_kind,
+        ));
+        indexed.push(IndexedFieldValue::new(field::CONTENT, document.content));
+        indexed.push(IndexedFieldValue::new(
+            field::CONTENT_PREFIX,
+            &derived.content_prefix,
+        ));
+        if let Some(workspace) = document.workspace {
+            indexed.push(IndexedFieldValue::new(field::WORKSPACE, workspace));
+        }
+        if let Some(origin_host) = document.origin_host {
+            indexed.push(IndexedFieldValue::new(field::ORIGIN_HOST, origin_host));
+        }
+        if let Some(title) = document.title {
+            indexed.push(IndexedFieldValue::new(field::TITLE, title));
+            indexed.push(IndexedFieldValue::new(
+                field::TITLE_PREFIX,
+                &derived.title_prefix,
+            ));
+        }
+
+        numeric.push(IndexedNumericValue::u64(field::MSG_IDX, document.msg_idx));
+        if let Some(created_at) = document.created_at {
+            numeric.push(IndexedNumericValue::i64(field::CREATED_AT, created_at));
+        }
+
+        stored.push(StoredFieldValue::new(
+            field::SOURCE_PATH,
+            document.source_path.as_bytes(),
+        ));
+        stored.push(StoredFieldValue::new(
+            field::PREVIEW,
+            derived.preview.as_bytes(),
+        ));
+        if let Some(workspace_original) = document.workspace_original {
+            stored.push(StoredFieldValue::new(
+                field::WORKSPACE_ORIGINAL,
+                workspace_original.as_bytes(),
+            ));
+        }
+        if let Some(conversation_id) = derived.conversation_id_text.as_deref() {
+            stored.push(StoredFieldValue::new(
+                field::CONVERSATION_ID,
+                conversation_id.as_bytes(),
+            ));
+        }
+
+        Self {
+            indexed,
+            numeric,
+            stored,
         }
     }
 }
@@ -268,7 +410,7 @@ mod tests {
         for bound in 0..=wide.len() {
             let slice = cass_prefix_source(wide, bound);
             assert!(wide.is_char_boundary(slice.len()), "bound {bound}");
-            assert!(slice.len() <= bound.max(0));
+            assert!(slice.len() <= bound);
         }
     }
 
@@ -314,6 +456,177 @@ mod tests {
             "the Tantivy-era sentinel must force a rebuild, never be accepted as current"
         );
         assert!(!cass_schema_hash_matches(""));
+    }
+
+    /// The ported derivation must be byte-identical to the incumbent.
+    ///
+    /// `preview` and `content_prefix` are persisted columns: any divergence
+    /// silently changes what a rebuilt index matches and what a user is shown,
+    /// and would do so without failing anything else. Parity is checked
+    /// against the shipped Tantivy implementation rather than against
+    /// hand-written expectations, so the assertion cannot drift with it.
+    ///
+    /// Only `cass_build_preview` is reachable — the incumbent keeps its prefix
+    /// walk private — so the prefix boundary rule is pinned separately by
+    /// `prefix_source_never_splits_a_scalar_and_is_bounded`, which checks every
+    /// bound in `0..=len` rather than sampling.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn derivation_is_byte_identical_to_the_tantivy_incumbent() {
+        use frankensearch_lexical::cass_compat::cass_build_preview as oracle_preview;
+
+        let samples = [
+            "",
+            "a",
+            "short content",
+            "日本語のテキストとascii mixed",
+            "hyphen-joined words and CamelCase Tokens",
+            &"x".repeat(10_000),
+            &"日".repeat(3_000),
+        ];
+        for sample in samples {
+            assert_eq!(
+                cass_build_preview(sample, PREVIEW_MAX_CHARS),
+                oracle_preview(sample, PREVIEW_MAX_CHARS),
+                "preview diverged for {} bytes",
+                sample.len()
+            );
+        }
+    }
+
+    /// Every emitted ordinal must exist in the compiled schema with a matching
+    /// storage shape, and absent optionals must emit nothing at all.
+    ///
+    /// The ordinals are hand-written constants, so nothing else stops
+    /// `field::TITLE` from drifting onto the `content` column after a schema
+    /// edit — this checks each one against the descriptor by name rather than
+    /// trusting the constants.
+    #[test]
+    fn field_values_match_the_compiled_schema_and_omit_absent_columns() {
+        use crate::schema::{CASS_SEMANTIC_SCHEMA, FieldKind};
+
+        let named = |ordinal: u16| {
+            CASS_SEMANTIC_SCHEMA
+                .fields
+                .iter()
+                .find(|field| field.id == ordinal)
+                .unwrap_or_else(|| panic!("ordinal {ordinal} is absent from the CASS schema"))
+        };
+        assert_eq!(named(field::AGENT).name, "agent");
+        assert_eq!(named(field::CONTENT).name, "content");
+        assert_eq!(named(field::TITLE).name, "title");
+        assert_eq!(named(field::TITLE_PREFIX).name, "title_prefix");
+        assert_eq!(named(field::CONTENT_PREFIX).name, "content_prefix");
+        assert_eq!(named(field::PREVIEW).name, "preview");
+        assert_eq!(named(field::MSG_IDX).name, "msg_idx");
+        assert_eq!(named(field::CREATED_AT).name, "created_at");
+        assert_eq!(named(field::CONVERSATION_ID).name, "conversation_id");
+        assert_eq!(named(field::SOURCE_PATH).name, "source_path");
+        assert_eq!(named(field::WORKSPACE).name, "workspace");
+        assert_eq!(named(field::WORKSPACE_ORIGINAL).name, "workspace_original");
+        assert_eq!(named(field::SOURCE_ID).name, "source_id");
+        assert_eq!(named(field::ORIGIN_KIND).name, "origin_kind");
+        assert_eq!(named(field::ORIGIN_HOST).name, "origin_host");
+
+        let full = CassDocument {
+            agent: "claude".to_owned(),
+            workspace: Some("/repo".to_owned()),
+            workspace_original: Some("/Repo".to_owned()),
+            source_path: "/tmp/s.jsonl".to_owned(),
+            msg_idx: 7,
+            created_at: Some(1_700_000_000),
+            title: Some("a title".to_owned()),
+            content: "body text".to_owned(),
+            source_id: "local".to_owned(),
+            origin_kind: "local".to_owned(),
+            origin_host: Some("host".to_owned()),
+            conversation_id: Some(-3),
+        };
+        let derived = CassDerivedColumns::derive(full.as_ref());
+        let values = CassFieldValues::build(full.as_ref(), &derived);
+
+        // Every emitted column must be a real, correctly-shaped schema field.
+        for value in &values.indexed {
+            let field = named(value.field_ord);
+            assert!(
+                matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }),
+                "{} is not an indexable column",
+                field.name
+            );
+        }
+        for value in &values.numeric {
+            let field = named(value.field_ord);
+            assert!(
+                matches!(field.kind, FieldKind::I64 { .. } | FieldKind::U64 { .. }),
+                "{} is not numeric",
+                field.name
+            );
+            assert!(
+                field.kind.has_numeric_column(),
+                "{} owns no numeric column, so it must be written as stored bytes",
+                field.name
+            );
+        }
+        for value in &values.stored {
+            assert!(named(value.field_ord).stored, "column is not stored");
+        }
+        // A signed conversation id must survive as readable text.
+        assert_eq!(derived.conversation_id_text.as_deref(), Some("-3"));
+
+        // Absent optionals emit nothing: an empty keyword is a matchable term,
+        // so writing one would make "absent" indistinguishable from "empty".
+        let sparse = CassDocument {
+            workspace: None,
+            workspace_original: None,
+            title: None,
+            created_at: None,
+            origin_host: None,
+            conversation_id: None,
+            ..full
+        };
+        let sparse_derived = CassDerivedColumns::derive(sparse.as_ref());
+        let sparse_values = CassFieldValues::build(sparse.as_ref(), &sparse_derived);
+        for absent in [
+            field::WORKSPACE,
+            field::TITLE,
+            field::TITLE_PREFIX,
+            field::ORIGIN_HOST,
+        ] {
+            assert!(
+                !sparse_values
+                    .indexed
+                    .iter()
+                    .any(|value| value.field_ord == absent),
+                "absent optional {absent} must not be written"
+            );
+        }
+        assert!(
+            !sparse_values
+                .numeric
+                .iter()
+                .any(|value| value.field_ord == field::CREATED_AT)
+        );
+        for absent in [field::WORKSPACE_ORIGINAL, field::CONVERSATION_ID] {
+            assert!(
+                !sparse_values
+                    .stored
+                    .iter()
+                    .any(|value| value.field_ord == absent)
+            );
+        }
+        // Required columns are still present in the sparse case.
+        assert!(
+            sparse_values
+                .indexed
+                .iter()
+                .any(|value| value.field_ord == field::CONTENT)
+        );
+        assert!(
+            sparse_values
+                .numeric
+                .iter()
+                .any(|value| value.field_ord == field::MSG_IDX)
+        );
     }
 
     #[test]
