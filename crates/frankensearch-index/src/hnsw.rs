@@ -17,6 +17,10 @@
 //! superseded by a successful metadata publication.
 //! Format v6 attests the native graph's point and layer topology, invalidating
 //! graphs produced by `hnsw_rs` versions that could misfile reverse edges.
+//! Connectivity is attested as one weak base-layer component; directed
+//! coverage from the search entry is measured and warned about but is not an
+//! admission condition, because bounded neighbour pruning legitimately orphans
+//! in-edges at scale (#32).
 //! Legacy sidecars and any load failure fall back to the
 //! rebuild-from-`VectorIndex` path.
 
@@ -1651,8 +1655,8 @@ fn validate_hnsw_topology(
     }
 
     // Retain one Arc per point, indexed below by origin id. Neighborhoods are
-    // still cloned only one point at a time, so reachability does not require a
-    // second O(edges) adjacency graph.
+    // still cloned only one point at a time, so the connectivity and coverage
+    // walks below never materialize a second O(edges) adjacency graph.
     let points = hnsw.get_point_indexation().into_iter().collect::<Vec<_>>();
     let identities = points
         .iter()
@@ -1681,10 +1685,10 @@ fn validate_hnsw_topology(
             &point_by_internal_id,
         )?;
     }
-    validate_directed_base_reachability(entry_origin, expected_points, |origin_id| {
+    let mut base_neighbors = |origin_id: usize| -> Result<Vec<usize>, String> {
         let point = points_by_origin[origin_id]
             .as_ref()
-            .ok_or_else(|| format!("missing origin id {origin_id} during reachability walk"))?;
+            .ok_or_else(|| format!("missing origin id {origin_id} during connectivity walk"))?;
         Ok(point
             .get_neighborhood_id()
             .first()
@@ -1692,7 +1696,9 @@ fn validate_hnsw_topology(
             .flatten()
             .map(|neighbor| neighbor.d_id)
             .collect())
-    })
+    };
+    validate_weak_base_connectivity(entry_origin, expected_points, &mut base_neighbors)?;
+    report_directed_base_coverage(entry_origin, expected_points, &mut base_neighbors)
 }
 
 #[cfg(test)]
@@ -1731,9 +1737,9 @@ fn validate_hnsw_topology_observations(
             &point_by_internal_id,
         )?;
     }
-    validate_directed_base_reachability(entry_origin, expected_points, |origin_id| {
+    let mut base_neighbors = |origin_id: usize| -> Result<Vec<usize>, String> {
         let point = points_by_origin[origin_id]
-            .ok_or_else(|| format!("missing origin id {origin_id} during reachability walk"))?;
+            .ok_or_else(|| format!("missing origin id {origin_id} during connectivity walk"))?;
         Ok(point
             .neighborhoods
             .first()
@@ -1741,7 +1747,9 @@ fn validate_hnsw_topology_observations(
             .flatten()
             .map(|neighbor| neighbor.d_id)
             .collect())
-    })
+    };
+    validate_weak_base_connectivity(entry_origin, expected_points, &mut base_neighbors)?;
+    report_directed_base_coverage(entry_origin, expected_points, &mut base_neighbors)
 }
 
 fn validate_hnsw_entry_point(
@@ -1774,11 +1782,140 @@ fn validate_hnsw_entry_point(
     Ok(entry_origin)
 }
 
-fn validate_directed_base_reachability(
+/// Attest that the base layer forms a single weak component containing the
+/// search entry.
+///
+/// Universal *directed* reachability from the entry point is deliberately NOT
+/// required here (#32). `hnsw_rs` mirrors every forward edge with a reverse
+/// edge, but a neighbour list that exceeds its cap (`M`, or `2M` at the base
+/// layer) is sorted by distance and its farthest edge popped, so later
+/// insertions can legitimately prune away *all* of a point's in-edges. Such a
+/// point becomes a directed "source": still weakly attached through its own
+/// out-edges, but invisible to a directed walk from the entry. That outcome
+/// is intrinsic to bounded-degree HNSW construction — serial builds exhibit
+/// it as readily as parallel ones — so treating it as an integrity failure
+/// rejects every sufficiently large or duplicate-heavy corpus.
+///
+/// A genuinely broken build (edgeless points, disjoint islands from misfiled
+/// reverse edges) still fails this gate: those graphs split into multiple
+/// weak components. Partial *directed* coverage is measured separately by
+/// [`report_directed_base_coverage`] and surfaced as a warning, and observed
+/// ANN quality has its own certificate in [`HnswIndex::certify_ef_search`].
+fn validate_weak_base_connectivity(
     entry_origin: usize,
     expected_points: usize,
     mut base_neighbors: impl FnMut(usize) -> Result<Vec<usize>, String>,
 ) -> Result<(), String> {
+    let mut components = WeakComponents::new(expected_points);
+    for origin_id in 0..expected_points {
+        for neighbor_id in base_neighbors(origin_id)? {
+            if neighbor_id >= expected_points {
+                return Err(format!(
+                    "origin id {origin_id} references out-of-range base neighbor {neighbor_id}"
+                ));
+            }
+            components.merge(origin_id, neighbor_id);
+        }
+    }
+
+    let entry_component = components.root(entry_origin);
+    let mut attached_count = 0_usize;
+    let mut first_detached = None;
+    for origin_id in 0..expected_points {
+        if components.root(origin_id) == entry_component {
+            attached_count += 1;
+        } else if first_detached.is_none() {
+            first_detached = Some(origin_id);
+        }
+    }
+    if let Some(first_detached) = first_detached {
+        return Err(format!(
+            "base layer splits into multiple weak components: entry origin {entry_origin}'s \
+             component holds only {attached_count}/{expected_points} points ignoring edge \
+             direction; first detached origin is {first_detached}"
+        ));
+    }
+    Ok(())
+}
+
+/// Disjoint-set forest over base-layer origin ids, used to attest weak
+/// connectivity in O(points) memory without materializing an adjacency graph.
+struct WeakComponents {
+    parent: Vec<usize>,
+    size: Vec<u32>,
+}
+
+impl WeakComponents {
+    fn new(count: usize) -> Self {
+        Self {
+            parent: (0..count).collect(),
+            size: vec![1; count],
+        }
+    }
+
+    /// Iterative find with path halving; no recursion regardless of scale.
+    fn root(&mut self, mut origin_id: usize) -> usize {
+        while self.parent[origin_id] != origin_id {
+            self.parent[origin_id] = self.parent[self.parent[origin_id]];
+            origin_id = self.parent[origin_id];
+        }
+        origin_id
+    }
+
+    fn merge(&mut self, left_origin: usize, right_origin: usize) {
+        let mut small = self.root(left_origin);
+        let mut large = self.root(right_origin);
+        if small == large {
+            return;
+        }
+        if self.size[small] > self.size[large] {
+            std::mem::swap(&mut small, &mut large);
+        }
+        self.parent[small] = large;
+        self.size[large] = self.size[large].saturating_add(self.size[small]);
+    }
+}
+
+/// Measure how much of the base layer a *directed* walk from the search entry
+/// covers, and warn loudly when coverage is partial.
+///
+/// Partial coverage is admissible (see [`validate_weak_base_connectivity`])
+/// but never silent: the points outside the covered set cannot be visited by
+/// greedy base-layer expansion, so operators sizing a corpus should see the
+/// exact count and follow up with [`HnswIndex::certify_ef_search`] to bound
+/// the observed quality impact.
+fn report_directed_base_coverage(
+    entry_origin: usize,
+    expected_points: usize,
+    mut base_neighbors: impl FnMut(usize) -> Result<Vec<usize>, String>,
+) -> Result<(), String> {
+    let coverage =
+        measure_directed_base_coverage(entry_origin, expected_points, &mut base_neighbors)?;
+    if coverage.reached_count != expected_points {
+        tracing::warn!(
+            entry_origin,
+            reached = coverage.reached_count,
+            expected = expected_points,
+            first_unreachable = ?coverage.first_unreachable,
+            "HNSW base layer is weakly connected but a directed walk from the search entry \
+             does not cover it; bounded neighbour pruning orphans in-edges at scale, so this \
+             is not an integrity failure — verify quality via certify_ef_search"
+        );
+    }
+    Ok(())
+}
+
+/// Outcome of the directed base-layer walk from the search entry.
+struct DirectedBaseCoverage {
+    reached_count: usize,
+    first_unreachable: Option<usize>,
+}
+
+fn measure_directed_base_coverage(
+    entry_origin: usize,
+    expected_points: usize,
+    mut base_neighbors: impl FnMut(usize) -> Result<Vec<usize>, String>,
+) -> Result<DirectedBaseCoverage, String> {
     let mut reached = vec![false; expected_points];
     let mut queue = VecDeque::with_capacity(expected_points.min(4_096));
     reached[entry_origin] = true;
@@ -1800,17 +1937,11 @@ fn validate_directed_base_reachability(
         }
     }
 
-    if reached_count != expected_points {
-        let first_unreachable = reached
-            .iter()
-            .position(|is_reached| !is_reached)
-            .unwrap_or(expected_points);
-        return Err(format!(
-            "search entry origin {entry_origin} reaches only {reached_count}/{expected_points} \
-             points at the base layer; first unreachable origin is {first_unreachable}"
-        ));
-    }
-    Ok(())
+    let first_unreachable = reached.iter().position(|is_reached| !is_reached);
+    Ok(DirectedBaseCoverage {
+        reached_count,
+        first_unreachable,
+    })
 }
 
 fn validate_hnsw_identity_table(
@@ -4362,7 +4493,68 @@ mod tests {
         ];
         let detail = validate_hnsw_topology_observations(&edgeless, 2, Some((0, PointId(0, 0))))
             .expect_err("edgeless multi-point graph must fail");
-        assert!(detail.contains("unreachable"), "{detail}");
+        assert!(detail.contains("weak components"), "{detail}");
+        assert!(detail.contains("only 1/2"), "{detail}");
+    }
+
+    /// #32: bounded neighbour pruning can strip every in-edge from a point,
+    /// leaving a directed "source" that no walk from the entry can visit even
+    /// though the graph is one weak component. Real serial and parallel builds
+    /// of large corpora produce exactly this shape, so attestation must admit
+    /// it (coverage is reported separately) instead of rejecting the build.
+    #[test]
+    fn topology_validator_admits_directed_source_points_in_one_weak_component() {
+        let ids = [PointId(0, 0), PointId(0, 1), PointId(0, 2)];
+        let points = vec![
+            // Entry keeps no out-edges at the base layer; every other point
+            // kept only its out-edge toward the entry (in-edges pruned away).
+            HnswTopologyPoint {
+                origin_id: 0,
+                point_id: ids[0],
+                neighborhoods: vec![Vec::new()],
+            },
+            HnswTopologyPoint {
+                origin_id: 1,
+                point_id: ids[1],
+                neighborhoods: vec![vec![Neighbour::new(0, 1.0, ids[0])]],
+            },
+            HnswTopologyPoint {
+                origin_id: 2,
+                point_id: ids[2],
+                neighborhoods: vec![vec![Neighbour::new(0, 1.0, ids[0])]],
+            },
+        ];
+
+        validate_hnsw_topology_observations(&points, 3, Some((0, ids[0])))
+            .expect("weakly connected graph with directed source points must be admitted");
+    }
+
+    #[test]
+    fn directed_base_coverage_reports_unreached_points_without_failing() {
+        // Same shape as the admission test above: entry 0 has no out-edges.
+        let adjacency: Vec<Vec<usize>> = vec![Vec::new(), vec![0], vec![0]];
+        let coverage =
+            measure_directed_base_coverage(0, 3, |origin_id| Ok(adjacency[origin_id].clone()))
+                .expect("coverage walk must succeed");
+        assert_eq!(coverage.reached_count, 1);
+        assert_eq!(coverage.first_unreachable, Some(1));
+
+        // A directed cycle covers everything.
+        let cycle: Vec<Vec<usize>> = vec![vec![1], vec![2], vec![0]];
+        let coverage =
+            measure_directed_base_coverage(0, 3, |origin_id| Ok(cycle[origin_id].clone()))
+                .expect("coverage walk must succeed");
+        assert_eq!(coverage.reached_count, 3);
+        assert_eq!(coverage.first_unreachable, None);
+    }
+
+    #[test]
+    fn weak_connectivity_rejects_out_of_range_neighbor() {
+        let adjacency: Vec<Vec<usize>> = vec![vec![1], vec![7]];
+        let detail =
+            validate_weak_base_connectivity(0, 2, |origin_id| Ok(adjacency[origin_id].clone()))
+                .expect_err("out-of-range neighbor must fail");
+        assert!(detail.contains("out-of-range base neighbor 7"), "{detail}");
     }
 
     #[test]
@@ -4416,9 +4608,9 @@ mod tests {
         ];
 
         let detail = validate_hnsw_topology_observations(&points, 4, Some((0, ids[0])))
-            .expect_err("two locally valid components must fail entry-point reachability");
-        assert!(detail.contains("reaches only 2/4"), "{detail}");
-        assert!(detail.contains("first unreachable origin is 2"), "{detail}");
+            .expect_err("two locally valid components must fail weak connectivity");
+        assert!(detail.contains("only 2/4"), "{detail}");
+        assert!(detail.contains("first detached origin is 2"), "{detail}");
     }
 
     #[test]
