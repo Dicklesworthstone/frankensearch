@@ -658,7 +658,7 @@ fn fresh_process_contract_binds_pinned_dependency_and_source_identities() {
     let root = workspace_root();
     let lock = std::fs::read_to_string(root.join("Cargo.lock"))
         .expect("fresh-process contract must read the workspace Cargo.lock");
-    for (name, version) in [("asupersync", "0.4.4"), ("tokenizers", "0.23.1")] {
+    for (name, version) in [("asupersync", "0.4.5"), ("tokenizers", "0.23.1")] {
         let block = lock_package_block(&lock, name, version);
         assert!(
             block.contains("source = \"registry+https://github.com/rust-lang/crates.io-index\""),
