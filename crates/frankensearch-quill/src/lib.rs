@@ -19,6 +19,7 @@ compile_error!(
 );
 
 pub mod argus;
+pub mod cass;
 pub mod config;
 pub mod contract;
 pub mod delta;
