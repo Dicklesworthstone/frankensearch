@@ -5229,6 +5229,47 @@ impl QuillWriterState {
         .await
     }
 
+    /// Open an existing on-disk index bound to an explicit compiled schema.
+    ///
+    /// The schema is not inferred from the persisted MANIFEST: Keeper verifies
+    /// the supplied descriptor against the stored `schema_id`, so passing the
+    /// wrong descriptor is a typed schema failure rather than a silent
+    /// misread.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed configuration, admission, recovery, or schema
+    /// failures as [`Self::open`].
+    pub(crate) async fn open_with_schema(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+        config: QuillConfig,
+    ) -> Result<Self, QuillIndexError> {
+        validate_config(&config)?;
+        validate_non_durable_quarantine(&config)?;
+        let open_span = tracing::info_span!(
+            target: crate::tracing_conventions::TARGET,
+            crate::tracing_conventions::KEEPER_OPEN,
+            phase = "open",
+            durability = false,
+            generation = tracing::field::Empty,
+            segment_count = tracing::field::Empty,
+            doc_count = tracing::field::Empty,
+            duration_us = tracing::field::Empty,
+        );
+        let _open_timer = crate::tracing_conventions::StageTimer::new(&open_span);
+        let instrumented = open_span.clone();
+        async move {
+            let writer = KeeperWriter::open(cx, directory, schema).await?;
+            let index = Self::from_backend(IndexBackend::Durable(writer), schema, config)?;
+            record_snapshot_fields(&open_span, index.authority_snapshot()?);
+            Ok(index)
+        }
+        .instrument(instrumented)
+        .await
+    }
+
     /// Open an existing shipping-schema index with FEC repair enabled.
     ///
     /// # Errors
@@ -5325,7 +5366,17 @@ impl QuillWriterState {
         .await
     }
 
-    async fn create_with_schema(
+    /// Create an on-disk index bound to an explicit compiled schema.
+    ///
+    /// [`Self::create`] pins [`DEFAULT_SCHEMA`]; this is the seam for the other
+    /// compiled descriptors, notably `CASS_SEMANTIC_SCHEMA`, whose durable
+    /// indexes were previously constructible only in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed configuration, admission, and durability
+    /// failures as [`Self::create`].
+    pub(crate) async fn create_with_schema(
         cx: &Cx,
         directory: impl Into<PathBuf>,
         schema: SchemaDescriptor,
@@ -5423,7 +5474,27 @@ impl QuillWriterState {
         schema: SchemaDescriptor,
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
-        let parser = Some(DefaultQueryParser::new(schema)?);
+        // The shipping string-query parser is bound only for schemas that
+        // actually carry its mandatory default fields. A compiled descriptor
+        // may legitimately analyze `content`/`title` with a different
+        // pipeline — `CASS_SEMANTIC_SCHEMA` uses the CASS analyzers — and such
+        // an index is still a perfectly valid index for ingest, preparsed
+        // queries, and its own parser. Absence is already a first-class state:
+        // `default_parser()` returns a typed "string query APIs are
+        // unavailable" refusal rather than panicking, and another construction
+        // path already binds `None`.
+        //
+        // Only the two field-shape refusals fall back. `InvalidSchema` means
+        // the descriptor itself violates the dense-ID contract, which is a real
+        // defect for every schema, so it still propagates.
+        let parser = match DefaultQueryParser::new(schema) {
+            Ok(parser) => Some(parser),
+            Err(
+                QueryParserConfigError::MissingDefaultField { .. }
+                | QueryParserConfigError::InvalidDefaultField { .. },
+            ) => None,
+            Err(error) => return Err(error.into()),
+        };
         let initial_snapshot = backend.retained_snapshot_for_bookkeeping().clone();
         let manifest = &initial_snapshot.loaded_manifest().manifest;
         let initial_generation = manifest.generation;
@@ -11110,6 +11181,49 @@ impl QuillIndex {
         Ok(Self::from_writer(QuillWriterState::in_memory_with_schema(
             schema, config,
         )?))
+    }
+
+    /// Create an on-disk index bound to an explicit compiled schema.
+    ///
+    /// [`Self::create`] pins [`DEFAULT_SCHEMA`]. Consumers that index a
+    /// different compiled descriptor — `CASS_SEMANTIC_SCHEMA` being the one
+    /// with a live consumer — need a durable index, not the bench-gated
+    /// in-memory seam, so this is ordinary shipping API.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed configuration, admission, and durability
+    /// failures as [`Self::create`].
+    pub async fn create_with_schema(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+        config: QuillConfig,
+    ) -> Result<Self, QuillIndexError> {
+        Ok(Self::from_writer(
+            QuillWriterState::create_with_schema(cx, directory, schema, config).await?,
+        ))
+    }
+
+    /// Open an existing on-disk index bound to an explicit compiled schema.
+    ///
+    /// The descriptor is checked against the persisted `schema_id` rather than
+    /// inferred, so opening a CASS index with the shipping descriptor is a
+    /// typed schema failure instead of a silent misread.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed configuration, admission, recovery, or schema
+    /// failures as [`Self::open`].
+    pub async fn open_with_schema(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+        config: QuillConfig,
+    ) -> Result<Self, QuillIndexError> {
+        Ok(Self::from_writer(
+            QuillWriterState::open_with_schema(cx, directory, schema, config).await?,
+        ))
     }
 
     /// Bind an existing owned Keeper snapshot to the private writer facade.
@@ -20521,6 +20635,50 @@ mod tests {
                 ],
             )
             .expect("distinct nonempty ids are not this check's business");
+        });
+    }
+
+    /// A durable index can be created and reopened on the CASS descriptor.
+    ///
+    /// This is the seam the cass migration needs: the schema-parameterized
+    /// constructors were previously in-memory only and bench-gated, so a
+    /// CASS-schema index could not survive a process boundary at all. The
+    /// reopen is the real assertion — it proves the descriptor was persisted
+    /// and re-validated, not merely accepted at create time.
+    #[test]
+    fn cass_schema_index_is_creatable_and_reopenable_on_disk() {
+        run_with_cx(|cx| async move {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path().join("cass-quill");
+            drop(
+                QuillIndex::create_with_schema(
+                    &cx,
+                    &root,
+                    crate::schema::CASS_SEMANTIC_SCHEMA,
+                    deterministic_config(),
+                )
+                .await
+                .expect("create durable CASS-schema index"),
+            );
+            let reopened = QuillIndex::open_with_schema(
+                &cx,
+                &root,
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                deterministic_config(),
+            )
+            .await
+            .expect("reopen durable CASS-schema index");
+            assert_eq!(reopened.doc_count().expect("count"), 0);
+
+            // The descriptor is verified, not inferred: opening the same
+            // directory with the shipping schema must fail rather than
+            // silently reinterpret CASS segments.
+            assert!(
+                QuillIndex::open_with_schema(&cx, &root, DEFAULT_SCHEMA, deterministic_config())
+                    .await
+                    .is_err(),
+                "a mismatched descriptor must be a typed failure, not a silent misread"
+            );
         });
     }
 
