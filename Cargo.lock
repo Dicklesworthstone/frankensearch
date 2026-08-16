@@ -179,7 +179,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -190,7 +190,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -282,9 +282,9 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c53eee30b6bef44faeabf2ca88e98680e81e3527452bb811491161377de17a35"
+checksum = "58465f2cbc04317c79f29b2a595901c935deccdbe6bb9c9268280ea6e289385d"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",
@@ -344,9 +344,9 @@ dependencies = [
 
 [[package]]
 name = "asupersync-macros"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ff5aa29d22c53e0dc039c213364fbacc8e44a47fcc8086997b069d74b1bc7ed"
+checksum = "ab5d220ba0636e58e4ed749dda9dcabc34392d0f42c94b2ade66854970ffcb72"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1456,7 +1456,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1621,9 +1621,9 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ea97cf32e8847a084dccfb4f29332e4351aadb3f8685b50b1144ecee9d0a4b5"
+checksum = "f9aa607e90a50cac071cc5f1548bc8febfdc01f895155282d17de30f94c94849"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -1632,9 +1632,9 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4832bb8c44a6ec2a58bae9349353eed8ad0cfb6330f2616a05279ac5d7f6146"
+checksum = "08518a6466664a9169423794f1a9fd197776662f375d472a0a1203f340dcfe7b"
 dependencies = [
  "serde",
  "serde_json",
@@ -1642,9 +1642,9 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a327f092ec1ad7d17692fbcd490a9b53e5659ede88abd2351443a38723fe0ce"
+checksum = "6b059747003a68b67e635acfc348578b801c3f95323d4094d0ef81034b281fd5"
 dependencies = [
  "serde",
 ]
@@ -3691,7 +3691,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4312,7 +4312,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4655,7 +4655,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4978,7 +4978,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5297,10 +5297,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6097,7 +6097,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
