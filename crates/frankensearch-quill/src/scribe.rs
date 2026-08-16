@@ -846,6 +846,81 @@ pub struct CassAnalyzer {
 
 impl sealed::Sealed for CassAnalyzer {}
 
+/// Every analyzer pipeline compiled into this build, in one family.
+///
+/// `ColumnarAccumulator` is generic over its analyzer but monomorphizes to a
+/// single type per accumulator, so a family that answers `supports` for only
+/// one kind cannot ingest a schema that mixes pipelines —
+/// [`crate::schema::CASS_SEMANTIC_SCHEMA`] analyzes `title`/`content` with the
+/// CASS hyphen pipeline and the `_prefix` columns with the CASS prefix
+/// pipeline. This family is the default ingest analyzer so every compiled
+/// descriptor is indexable.
+///
+/// Dispatch is per analyzed FIELD VALUE, not per token: the kind is a
+/// parameter of `analyze`/`analyze_borrowed`, which each tokenize a whole
+/// field. `analyze_borrowed` is forwarded rather than inherited so the default
+/// pipeline keeps its borrowed fast path into the term interner — inheriting
+/// the trait's owned-token bridge would silently regress shipping ingest.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledAnalyzerFamily {
+    default: FrankensearchTokenizer,
+    cass: CassAnalyzer,
+}
+
+impl sealed::Sealed for CompiledAnalyzerFamily {}
+
+impl TokenAnalyzer for CompiledAnalyzerFamily {
+    fn supports(&self, analyzer: AnalyzerKind) -> bool {
+        match analyzer {
+            AnalyzerKind::FrankensearchDefault => self.default.supports(analyzer),
+            AnalyzerKind::CassHyphenNormalize | AnalyzerKind::CassPrefixNormalize => {
+                self.cass.supports(analyzer)
+            }
+        }
+    }
+
+    fn analyze(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn FnMut(&AnalyzedToken),
+    ) {
+        match analyzer {
+            AnalyzerKind::FrankensearchDefault => self.default.analyze(analyzer, text, sink),
+            AnalyzerKind::CassHyphenNormalize | AnalyzerKind::CassPrefixNormalize => {
+                self.cass.analyze(analyzer, text, sink);
+            }
+        }
+    }
+
+    fn analyze_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+    ) {
+        match analyzer {
+            AnalyzerKind::FrankensearchDefault => {
+                self.default.analyze_borrowed(analyzer, text, sink);
+            }
+            AnalyzerKind::CassHyphenNormalize | AnalyzerKind::CassPrefixNormalize => {
+                self.cass.analyze_borrowed(analyzer, text, sink);
+            }
+        }
+    }
+
+    fn bytes_reserved(&self) -> usize {
+        self.default
+            .bytes_reserved()
+            .saturating_add(self.cass.bytes_reserved())
+    }
+
+    fn reset(&mut self) {
+        self.default.reset();
+        self.cass.reset();
+    }
+}
+
 /// Exact CJK ranges recognized by the incumbent CASS tokenizer.
 ///
 /// Keep this predicate shared inside Quill: broadening it to later Unicode
@@ -2320,7 +2395,7 @@ impl NumericFieldColumns {
 /// term-ID assignment deterministic. The supplied `doc_ord` remains relative
 /// to its Keeper lease until the flush/seal stage rebases it.
 #[derive(Debug)]
-pub struct ColumnarAccumulator<A = FrankensearchTokenizer> {
+pub struct ColumnarAccumulator<A = CompiledAnalyzerFamily> {
     schema: SchemaDescriptor,
     terms: TermInterner,
     fields: Vec<FieldTokenColumns>,
@@ -2332,7 +2407,7 @@ pub struct ColumnarAccumulator<A = FrankensearchTokenizer> {
     analyzer: A,
 }
 
-impl ColumnarAccumulator<FrankensearchTokenizer> {
+impl ColumnarAccumulator<CompiledAnalyzerFamily> {
     /// Create an empty accumulator for a validated compile-time schema.
     ///
     /// # Errors
@@ -2341,7 +2416,7 @@ impl ColumnarAccumulator<FrankensearchTokenizer> {
     /// dense-ID and field-shape invariants, or [`QuillError::Resource`] when
     /// the default family does not implement every requested analyzer.
     pub fn new(schema: SchemaDescriptor) -> Result<Self, QuillError> {
-        Self::with_analyzer(schema, FrankensearchTokenizer::default())
+        Self::with_analyzer(schema, CompiledAnalyzerFamily::default())
     }
 
     /// Create an empty accumulator whose term arena is sized for one bounded
@@ -2357,7 +2432,7 @@ impl ColumnarAccumulator<FrankensearchTokenizer> {
     ) -> Result<Self, QuillError> {
         Self::with_analyzer_and_arena_chunk_size(
             schema,
-            FrankensearchTokenizer::default(),
+            CompiledAnalyzerFamily::default(),
             arena_chunk_size,
         )
     }
@@ -7835,8 +7910,17 @@ mod tests {
         assert_eq!(accumulator.document_count(), 1);
         assert_eq!(accumulator.token_count(), token_count);
 
+        // The analyzer-availability guard is bound to the FAMILY, not to the
+        // accumulator: `ColumnarAccumulator::new` now uses
+        // `CompiledAnalyzerFamily`, which implements every compiled pipeline so
+        // that CASS-schema indexes are ingestable. The refusal therefore has to
+        // be exercised through a deliberately narrow family — the default-only
+        // tokenizer — which is what a caller supplying its own analyzer gets.
         assert!(matches!(
-            ColumnarAccumulator::new(UNSUPPORTED_ANALYZER_SCHEMA),
+            ColumnarAccumulator::with_analyzer(
+                UNSUPPORTED_ANALYZER_SCHEMA,
+                FrankensearchTokenizer::default()
+            ),
             Err(QuillError::Resource {
                 resource: "analyzer pipeline",
                 detail,
@@ -7844,6 +7928,9 @@ mod tests {
                 if detail.contains("field 0 (cass_text)")
                     && detail.contains("CassHyphenNormalize")
         ));
+        // The complete family accepts the same schema, which is the point of
+        // the change: no compiled descriptor is unindexable.
+        assert!(ColumnarAccumulator::new(UNSUPPORTED_ANALYZER_SCHEMA).is_ok());
     }
 
     #[test]
