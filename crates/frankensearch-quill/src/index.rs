@@ -10980,6 +10980,24 @@ impl QuillSearchIndex {
         &self.directory
     }
 
+    /// Live segment count in the proven-readable published snapshot.
+    ///
+    /// A consumer's compaction policy reads this to decide whether merging is
+    /// worthwhile.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed reconciliation-required failure when publication
+    /// authority cannot prove the process-local snapshot readable.
+    pub fn segment_count(&self) -> Result<usize, QuillIndexError> {
+        Ok(self
+            .reader
+            .checked_published_snapshot()?
+            .keeper_snapshot()
+            .segments()
+            .len())
+    }
+
     /// Number of live documents in the proven-readable published snapshot.
     ///
     /// # Errors
