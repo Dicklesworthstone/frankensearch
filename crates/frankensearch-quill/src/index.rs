@@ -11037,8 +11037,11 @@ impl QuillSearchIndex {
     pub async fn refresh(&self, cx: &Cx) -> Result<bool, QuillIndexError> {
         check_cancel(cx, "read-only index refresh")?;
         let directory = self.directory.clone();
-        let snapshot =
-            spawn_blocking(move || KeeperSnapshot::open(directory, DEFAULT_SCHEMA)).await?;
+        // Refresh with the schema this reader was OPENED with, not the shipping
+        // default: a reader bound to a wider schema (the CASS profile) would
+        // otherwise fail every refresh with a manifest schema mismatch.
+        let schema = self.reader.schema;
+        let snapshot = spawn_blocking(move || KeeperSnapshot::open(directory, schema)).await?;
         check_cancel(cx, "read-only index refresh")?;
 
         Ok(self
