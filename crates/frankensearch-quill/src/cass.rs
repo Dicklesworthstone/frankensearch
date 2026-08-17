@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::index::SchemaDocument;
 use crate::scribe::cass_generate_edge_ngrams;
 
 /// Schema generation namespace for Quill-backed CASS indexes.
@@ -172,16 +173,15 @@ pub struct CassDerivedColumns {
     pub content_prefix: String,
     /// Character-bounded, ellipsized content preview.
     pub preview: String,
-    /// `conversation_id` rendered for the stored column.
+    /// `conversation_id` in the canonical encoding for its stored column.
     ///
-    /// The field is `I64 { indexed: false, fast: false }` with `stored: true`,
-    /// so it owns no numeric column and reaches disk as opaque bytes. This
-    /// records the encoding as base-10 text rather than raw little-endian:
-    /// the bytes are only ever read back by a consumer that must agree with
-    /// the writer, and a self-describing form is one that a human debugging a
-    /// stored payload can actually read. It is owned here so the borrowed
-    /// value slices have something to point at.
-    pub conversation_id_text: Option<String>,
+    /// The field is `I64 { indexed: false, fast: false }` with `stored: true`.
+    /// Scribe validates a stored numeric column as exactly eight little-endian
+    /// bytes, so this is the required encoding rather than a chosen one: a
+    /// friendlier base-10 rendering is refused at accumulation with
+    /// `InvalidNumericBytes`. Owned here so the borrowed value slices have
+    /// something to point at.
+    pub conversation_id_bytes: Option<[u8; 8]>,
 }
 
 impl CassDerivedColumns {
@@ -195,7 +195,7 @@ impl CassDerivedColumns {
                 .map_or_else(String::new, cass_generate_edge_ngrams),
             content_prefix,
             preview,
-            conversation_id_text: document.conversation_id.map(|id| id.to_string()),
+            conversation_id_bytes: document.conversation_id.map(i64::to_le_bytes),
         }
     }
 }
@@ -315,10 +315,10 @@ impl<'a> CassFieldValues<'a> {
                 workspace_original.as_bytes(),
             ));
         }
-        if let Some(conversation_id) = derived.conversation_id_text.as_deref() {
+        if let Some(conversation_id) = derived.conversation_id_bytes.as_ref() {
             stored.push(StoredFieldValue::new(
                 field::CONVERSATION_ID,
-                conversation_id.as_bytes(),
+                conversation_id,
             ));
         }
 
@@ -326,6 +326,38 @@ impl<'a> CassFieldValues<'a> {
             indexed,
             numeric,
             stored,
+        }
+    }
+}
+
+impl CassDocument {
+    /// Project onto the owned form Quill ingests.
+    ///
+    /// This derives the computed columns and copies every value, because
+    /// [`SchemaDocument`] owns its columns while [`CassFieldValues`] borrows
+    /// them. A caller that already holds its documents in memory for the whole
+    /// batch can skip the copy by building [`CassFieldValues`] directly.
+    #[must_use]
+    pub fn to_schema_document(&self) -> SchemaDocument {
+        let derived = CassDerivedColumns::derive(self.as_ref());
+        let values = CassFieldValues::build(self.as_ref(), &derived);
+        SchemaDocument {
+            id: cass_document_identity(&self.source_id, self.msg_idx),
+            indexed: values
+                .indexed
+                .iter()
+                .map(|value| (value.field_ord, value.text.to_owned()))
+                .collect(),
+            numeric: values
+                .numeric
+                .iter()
+                .map(|value| (value.field_ord, value.value))
+                .collect(),
+            stored: values
+                .stored
+                .iter()
+                .map(|value| (value.field_ord, value.bytes.to_vec()))
+                .collect(),
         }
     }
 }
@@ -382,6 +414,151 @@ pub fn cass_build_preview(content: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_document(
+        source_id: &str,
+        msg_idx: u64,
+        agent: &str,
+        title: &str,
+        content: &str,
+    ) -> CassDocument {
+        CassDocument {
+            agent: agent.to_owned(),
+            workspace: Some("frankensearch".to_owned()),
+            workspace_original: Some("FrankenSearch".to_owned()),
+            source_path: format!("/transcripts/{source_id}.jsonl"),
+            msg_idx,
+            created_at: Some(1_700_000_000 + i64::try_from(msg_idx).expect("fixture ordinal")),
+            title: Some(title.to_owned()),
+            content: content.to_owned(),
+            source_id: source_id.to_owned(),
+            origin_kind: "local".to_owned(),
+            origin_host: None,
+            conversation_id: Some(42),
+        }
+    }
+
+    /// A CASS-schema index must ingest and answer queries through the same
+    /// writer the shipping five-field shape uses.
+    ///
+    /// This is the end-to-end claim the whole schema-document path exists to
+    /// support: an index whose schema is wider than `IndexableDocument` can
+    /// describe still routes through Quill's admission, accumulation, commit,
+    /// and search. It asserts a field-scoped match *and* a field-scoped
+    /// non-match, so a lowering that ignored field scope entirely would fail
+    /// here rather than pass by accident.
+    #[test]
+    fn cass_schema_index_ingests_and_searches_end_to_end() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+
+            let documents = [
+                sample_document(
+                    "alpha",
+                    0,
+                    "claude",
+                    "Borrow checker session",
+                    "the borrow checker rejected this lifetime in rustc",
+                ),
+                sample_document(
+                    "beta",
+                    1,
+                    "codex",
+                    "Tokenizer throughput",
+                    "tokenizer throughput regressed on long input in rustc",
+                ),
+            ]
+            .iter()
+            .map(CassDocument::to_schema_document)
+            .collect::<Vec<_>>();
+
+            index
+                .index_schema_documents(&cx, &documents)
+                .await
+                .expect("ingest CASS documents");
+            index.commit(&cx).await.expect("publish CASS documents");
+
+            // Read through the shipping reader rather than the writer handle:
+            // that is the path a consumer actually uses, and it additionally
+            // proves the CASS schema survives a reopen from disk.
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("open a CASS-schema reader");
+
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS query parser");
+            let filters = crate::query::CassQueryFilters::default();
+
+            // `lifetime` appears in exactly one document, and in neither
+            // title, so a match here is attributable to the content column.
+            let parsed = parser.parse("lifetime", &filters);
+            let hit = reader
+                .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                .expect("search the CASS index");
+            assert_eq!(
+                hit.total_count,
+                Some(1),
+                "exactly one document mentions a lifetime"
+            );
+            assert_eq!(hit.doc_count, 2, "both documents are published and live");
+
+            // `rustc` is in both documents, so the agent filter is the only
+            // thing that can change this count. Asserting all three of
+            // unfiltered / matching / non-matching is what distinguishes a
+            // filter that restricts from one that is silently ignored (which
+            // would answer 2 every time) or always refuses (0 every time).
+            let shared = parser.parse("rustc", &filters);
+            let shared_hit = reader
+                .search_preparsed_paginated(&cx, &shared.query, 10, 0, true)
+                .expect("search the CASS index for a shared term");
+            assert_eq!(
+                shared_hit.total_count,
+                Some(2),
+                "both documents mention rustc"
+            );
+
+            let by_agent = crate::query::CassQueryFilters {
+                agents: vec!["codex".to_owned()],
+                ..Default::default()
+            };
+            let scoped = parser.parse("rustc", &by_agent);
+            let scoped_hit = reader
+                .search_preparsed_paginated(&cx, &scoped.query, 10, 0, true)
+                .expect("search the CASS index by agent");
+            assert_eq!(
+                scoped_hit.total_count,
+                Some(1),
+                "the agent filter must restrict a term both documents carry"
+            );
+
+            let by_absent_agent = crate::query::CassQueryFilters {
+                agents: vec!["nobody".to_owned()],
+                ..Default::default()
+            };
+            let absent = parser.parse("rustc", &by_absent_agent);
+            let absent_hit = reader
+                .search_preparsed_paginated(&cx, &absent.query, 10, 0, true)
+                .expect("search the CASS index for an absent agent");
+            assert_eq!(
+                absent_hit.total_count,
+                Some(0),
+                "an agent that produced nothing must match nothing"
+            );
+        });
+    }
 
     #[test]
     fn preview_is_character_bounded_and_only_ellipsizes_when_truncating() {
@@ -571,7 +748,13 @@ mod tests {
             assert!(named(value.field_ord).stored, "column is not stored");
         }
         // A signed conversation id must survive as readable text.
-        assert_eq!(derived.conversation_id_text.as_deref(), Some("-3"));
+        // Canonical little-endian, which is what Scribe validates a stored
+        // numeric column against; a negative value must round-trip.
+        assert_eq!(derived.conversation_id_bytes, Some((-3_i64).to_le_bytes()));
+        assert_eq!(
+            derived.conversation_id_bytes.map(i64::from_le_bytes),
+            Some(-3)
+        );
 
         // Absent optionals emit nothing: an empty keyword is a matchable term,
         // so writing one would make "absent" indistinguishable from "empty".

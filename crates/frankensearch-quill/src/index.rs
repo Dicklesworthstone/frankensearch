@@ -100,9 +100,8 @@ use crate::schema::{Analyzer, DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
     AccumulatorError, ArenaSpan, ColumnarAccumulator, DEFAULT_ARENA_CHUNK_BYTES,
     DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator, DocIdSpan, DocumentAccumulation,
-    FIELD_PREFIX_BYTES,
-    FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput, FrankensearchTokenizer,
-    IndexedFieldValue, IndexedNumericValue, ShardRouter, StoredFieldValue,
+    FIELD_PREFIX_BYTES, FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput,
+    FrankensearchTokenizer, IndexedFieldValue, IndexedNumericValue, ShardRouter, StoredFieldValue,
     TERM_BUCKET_BYTES_ESTIMATE, TokenAnalyzer, flush_accumulator_with_mode, flush_delta_snapshot,
 };
 use crate::segment::{EncodedSegment, SectionKind};
@@ -6477,6 +6476,30 @@ impl QuillWriterState {
     pub async fn index_documents(
         &mut self,
         cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> Result<(), QuillIndexError> {
+        self.index_documents_batch(cx, IngestBatch::Default(documents))
+            .await
+    }
+
+    /// Route and accumulate one bounded batch already projected onto this
+    /// index's compiled schema.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Self::index_documents`].
+    pub async fn index_schema_documents(
+        &mut self,
+        cx: &Cx,
+        documents: &[SchemaDocument],
+    ) -> Result<(), QuillIndexError> {
+        self.index_documents_batch(cx, IngestBatch::Schema(documents))
+            .await
+    }
+
+    async fn index_documents_batch(
+        &mut self,
+        cx: &Cx,
         documents: IngestBatch<'_>,
     ) -> Result<(), QuillIndexError> {
         let replacement_ids = BTreeSet::new();
@@ -6508,8 +6531,9 @@ impl QuillWriterState {
     async fn index_documents_with_scalar_topology_conformance(
         &mut self,
         cx: &Cx,
-        documents: IngestBatch<'_>,
+        documents: &[IndexableDocument],
     ) -> Result<(), QuillIndexError> {
+        let documents = IngestBatch::Default(documents);
         let replacement_ids = BTreeSet::new();
         self.index_documents_with_replacements(
             cx,
@@ -7096,7 +7120,7 @@ impl QuillWriterState {
                 .checked_add(u64::from(doc_ord))
                 .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
                 .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
-            let fallback_metadata;
+            let mut fallback_metadata = Vec::new();
             let prepared_metadata_for_document = if let Some(prepared) = prepared_metadata.as_mut()
             {
                 Some(
@@ -7120,9 +7144,7 @@ impl QuillWriterState {
                     fallback_metadata.as_slice()
                 }
             };
-            state
-                .accumulator
-                .add_document_with_values_from(document, doc_ord, global_docid, metadata)?;
+            document.accumulate(&mut state.accumulator, doc_ord, global_docid, metadata)?;
             let content_hash = document.content_hash(metadata)?;
             state.identities.push(PendingIdentity {
                 doc_ord,
@@ -7525,21 +7547,17 @@ impl QuillWriterState {
 
                 let accumulated = {
                     let shard = &mut self.shards[shard_id];
-                    shard.scratch_metadata.clear();
-                    write_canonical_metadata(&mut shard.scratch_metadata, &document.metadata)?;
-                    let values =
-                        default_schema_values(document, global_docid, &shard.scratch_metadata);
-                    let accumulated = shard.accumulator.add_document_with_values(
+                    document.write_canonical_metadata(&mut shard.scratch_metadata)?;
+                    let accumulated = document.accumulate(
+                        &mut shard.accumulator,
                         doc_ord,
-                        &values.indexed,
-                        &values.numeric,
-                        &values.stored,
+                        global_docid,
+                        &shard.scratch_metadata,
                     )?;
-                    let content_hash =
-                        canonical_document_content_hash(document, &shard.scratch_metadata)?;
+                    let content_hash = document.content_hash(&shard.scratch_metadata)?;
                     shard.identities.push(PendingIdentity {
                         doc_ord,
-                        document_id: document.id.clone(),
+                        document_id: document.id().to_owned(),
                         content_hash,
                     });
                     accumulated
@@ -7548,7 +7566,7 @@ impl QuillWriterState {
                     arena_bytes_used_high_water.max(accumulated.bytes_used);
                 arena_bytes_reserved_high_water =
                     arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
-                self.uncommitted_ids.insert(document.id.clone());
+                self.uncommitted_ids.insert(document.id().to_owned());
                 self.unpublished_since.get_or_insert_with(Instant::now);
 
                 if self.shards[shard_id]
@@ -7714,7 +7732,10 @@ impl QuillWriterState {
                         taken = *shard + 1;
                         let begin = *start + consumed[index];
                         let end = begin + span.len as usize;
-                        work.push((&mut head[0], &wave[begin..end], *span));
+                        let assigned = wave.try_slice(begin..end).ok_or_else(|| {
+                            invalid_state("shard span is outside the fan-out wave")
+                        })?;
+                        work.push((&mut head[0], assigned, *span));
                     }
                     work.into_par_iter()
                         .map(|(state, assigned, span)| {
@@ -8217,7 +8238,7 @@ impl QuillWriterState {
         Ok(report)
     }
 
-    async fn upsert_documents(
+    async fn upsert_documents_batch(
         &mut self,
         cx: &Cx,
         documents: IngestBatch<'_>,
@@ -8288,7 +8309,7 @@ impl QuillWriterState {
             }
         }
         if replacement_ids.is_empty() {
-            return self.index_documents(cx, documents).await;
+            return self.index_documents_batch(cx, documents).await;
         }
         // `ingest_retry_required` is checked HERE, next to the pending-state
         // refusal, because `has_uncommitted_changes` does not include it: a
@@ -9756,6 +9777,10 @@ impl QuillReader {
     /// needs the lower AST boundary to cover query classes that the default
     /// shipping parser cannot construct for every compiled schema.
     ///
+    /// A schema with no default field reaches the AST boundary through
+    /// [`Self::search_preparsed_uncached_on`] instead, which is un-gated and
+    /// deliberately does not touch the ranked-query cache.
+    ///
     /// # Errors
     ///
     /// Returns the same typed lowering, collection, and cancellation failures
@@ -9777,6 +9802,47 @@ impl QuillReader {
             offset,
             exact_count,
             published.as_ref(),
+        )
+    }
+
+    /// Execute one already-built query tree without consulting the ranked
+    /// query cache.
+    ///
+    /// This is the shipping AST entry point, for a compiled schema that
+    /// carries its own query language and therefore has no string parser to
+    /// go through — the CASS profile parses via
+    /// [`crate::query::CassQueryParser`]. It bypasses the ranked-query cache
+    /// on purpose: that cache is keyed by the raw query string, which a
+    /// preparsed caller does not have, and its gated key space is measured
+    /// evidence this path must not perturb.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, lowering, scoring, or collection failures.
+    fn search_preparsed_uncached_on(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        check_cancel(cx, "search_preparsed")?;
+        self.execute_ranked_query_inner(
+            cx,
+            query,
+            snapshot,
+            limit,
+            offset,
+            exact_count,
+            Vec::new(),
+            None,
+            None,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+            #[cfg(feature = "profile-internals")]
+            None,
         )
     }
 
@@ -10808,6 +10874,60 @@ impl QuillSearchIndex {
         })
     }
 
+    /// Open the latest published snapshot of an index built on `schema`.
+    ///
+    /// The reader binds the shipping string parser only when `schema` can
+    /// supply it a default field. A schema that cannot — the CASS profile,
+    /// which parses through [`crate::query::CassQueryParser`] — opens without
+    /// one and is read through
+    /// [`Self::search_preparsed_paginated`]; the string entry points then
+    /// return a typed parser failure rather than silently searching the wrong
+    /// fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, configuration, recovery, schema, or parser
+    /// failures.
+    pub async fn open_with_schema(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+        config: QuillConfig,
+    ) -> Result<Self, QuillIndexError> {
+        validate_config(&config)?;
+        validate_non_durable_quarantine(&config)?;
+        check_cancel(cx, "read-only index open")?;
+        let directory = directory.into();
+        let open_directory = directory.clone();
+        let snapshot = spawn_blocking(move || KeeperSnapshot::open(open_directory, schema)).await?;
+        check_cancel(cx, "read-only index open")?;
+        let generation = snapshot.loaded_manifest().manifest.generation;
+        let publication_read_state = PublicationReadState::new(generation)?;
+        let published_snapshot = Arc::new(SnapshotPublisher::new(Arc::new(snapshot), Vec::new())?);
+        let parser = match DefaultQueryParser::new(schema) {
+            Ok(parser) => Some(parser),
+            Err(
+                QueryParserConfigError::MissingDefaultField { .. }
+                | QueryParserConfigError::InvalidDefaultField { .. },
+            ) => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Self {
+            reader: QuillReader {
+                config,
+                schema,
+                parser,
+                published_snapshot,
+                publication_read_state,
+                #[cfg(test)]
+                publication_read_pause: Arc::default(),
+                #[cfg(feature = "conformance-internals")]
+                conformance_controller: Arc::default(),
+            },
+            directory,
+        })
+    }
+
     /// Durable index directory bound to this published snapshot.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -10879,6 +10999,35 @@ impl QuillSearchIndex {
     ) -> Result<QuillSearchResult, QuillIndexError> {
         self.reader
             .search_paginated(cx, query, limit, offset, exact_count)
+    }
+
+    /// Execute one already-built query tree against the pinned publication.
+    ///
+    /// This is the read entry point for a compiled schema that carries its own
+    /// query language — the CASS profile parses through
+    /// [`crate::query::CassQueryParser`] — because such a schema has no
+    /// default field for the shipping string parser to bind.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, lowering, scoring, or collection failures.
+    pub fn search_preparsed_paginated(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        let published = self.reader.published_snapshot.load();
+        self.reader.search_preparsed_uncached_on(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            published.as_ref(),
+        )
     }
 
     /// Execute one ordinary ranked search and retain a diagnostic sidecar receipt.
@@ -11490,10 +11639,29 @@ impl QuillIndex {
     pub async fn index_documents(
         &self,
         cx: &Cx,
-        documents: IngestBatch<'_>,
+        documents: &[IndexableDocument],
     ) -> Result<(), QuillIndexError> {
         let mut writer = self.lock_writer(cx, "index writer lock").await?;
         writer.index_documents(cx, documents).await
+    }
+
+    /// Accumulate one bounded batch already projected onto this index's
+    /// compiled schema.
+    ///
+    /// This is the entry point for an index opened with
+    /// [`Self::create_with_schema`], whose schema is wider than the five-field
+    /// shipping shape [`IndexableDocument`] describes.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Self::index_documents`].
+    pub async fn index_schema_documents(
+        &self,
+        cx: &Cx,
+        documents: &[SchemaDocument],
+    ) -> Result<(), QuillIndexError> {
+        let mut writer = self.lock_writer(cx, "index writer lock").await?;
+        writer.index_schema_documents(cx, documents).await
     }
 
     /// Accumulate one bounded batch through the scalar writer without
@@ -11517,7 +11685,7 @@ impl QuillIndex {
     pub async fn index_documents_with_scalar_topology_conformance(
         &self,
         cx: &Cx,
-        documents: IngestBatch<'_>,
+        documents: &[IndexableDocument],
     ) -> Result<(), QuillIndexError> {
         let mut writer = self
             .lock_writer(cx, "scalar topology conformance writer lock")
@@ -11730,6 +11898,29 @@ impl QuillIndex {
     async fn upsert_documents(
         &self,
         cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> Result<(), QuillIndexError> {
+        self.upsert_documents_batch(cx, IngestBatch::Default(documents))
+            .await
+    }
+
+    /// Upsert one bounded batch already projected onto this index's schema.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Self::upsert_documents`].
+    pub async fn upsert_schema_documents(
+        &self,
+        cx: &Cx,
+        documents: &[SchemaDocument],
+    ) -> Result<(), QuillIndexError> {
+        self.upsert_documents_batch(cx, IngestBatch::Schema(documents))
+            .await
+    }
+
+    async fn upsert_documents_batch(
+        &self,
+        cx: &Cx,
         documents: IngestBatch<'_>,
     ) -> Result<(), QuillIndexError> {
         check_cancel(cx, "upsert documents")?;
@@ -11761,7 +11952,7 @@ impl QuillIndex {
             .as_ref()
             .map_or(documents, OwnedIngestBatch::as_batch);
         let mut writer = self.lock_writer(cx, "upsert writer lock").await?;
-        writer.upsert_documents(cx, documents).await
+        writer.upsert_documents_batch(cx, documents).await
     }
 
     /// Parse and exhaustively execute one query over the published snapshot.
@@ -13004,15 +13195,6 @@ impl<'a> IngestBatch<'a> {
         }
     }
 
-    /// Successive sub-batches of at most `size` documents.
-    fn chunks(self, size: usize) -> impl Iterator<Item = Self> {
-        let size = size.max(1);
-        let len = self.len();
-        (0..len)
-            .step_by(size)
-            .filter_map(move |start| self.try_slice(start..(start + size).min(len)))
-    }
-
     fn iter(self) -> IngestBatchIter<'a> {
         IngestBatchIter {
             batch: self,
@@ -13201,29 +13383,6 @@ impl<'a> IngestDoc<'a> {
                 }
                 Ok(hasher.digest())
             }
-        }
-    }
-
-    /// Logical arena bound for the parallel route, or `None` to force scalar.
-    ///
-    /// Schema documents always force the scalar route: the parallel budget is
-    /// derived from the exact five-field shipping shape, which a wider schema
-    /// is not, and [`parallel_document_logical_upper_bound`] would refuse it
-    /// anyway.
-    fn parallel_budget_bound(
-        self,
-        schema: SchemaDescriptor,
-        analyzer: &mut FrankensearchTokenizer,
-        exclusive_ceiling: usize,
-    ) -> Result<Option<ParallelDocumentBudgetBound>, QuillIndexError> {
-        match self {
-            Self::Default(document) => parallel_document_logical_upper_bound(
-                schema,
-                analyzer,
-                document,
-                exclusive_ceiling,
-            ),
-            Self::Schema(_) => Ok(None),
         }
     }
 }
@@ -20945,9 +21104,12 @@ mod tests {
     fn commit_invariant_batch_shape_refuses_what_publishing_cannot_fix() {
         run_with_cx(|cx| async move {
             let refused = |documents: &[IndexableDocument]| {
-                QuillWriterState::validate_commit_invariant_batch_shape(&cx, documents)
-                    .expect_err("must refuse")
-                    .to_string()
+                QuillWriterState::validate_commit_invariant_batch_shape(
+                    &cx,
+                    IngestBatch::Default(documents),
+                )
+                .expect_err("must refuse")
+                .to_string()
             };
             assert!(
                 refused(&[IndexableDocument::new("", "body")]).contains("nonempty"),
@@ -20963,10 +21125,10 @@ mod tests {
             );
             QuillWriterState::validate_commit_invariant_batch_shape(
                 &cx,
-                &[
+                IngestBatch::Default(&[
                     IndexableDocument::new("alpha", "one"),
                     IndexableDocument::new("beta", "two"),
-                ],
+                ]),
             )
             .expect("distinct nonempty ids are not this check's business");
         });
@@ -29965,7 +30127,7 @@ mod tests {
                 assert_eq!(plan.active_shards, 4);
 
                 let admission = writer
-                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .parallel_budget_admission(&cx, IngestBatch::Default(&documents), plan.active_shards)
                     .expect("estimate parallel budget preflight fixture")
                     .expect("default budget admits preflight fixture");
                 assert!(
@@ -30011,7 +30173,11 @@ mod tests {
 
                 assert!(
                     writer
-                        .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                        .parallel_budget_admission(
+                            &cx,
+                            IngestBatch::Default(&documents),
+                            plan.active_shards
+                        )
                         .expect("evaluate QG-1-shaped budget-refusal fixture")
                         .is_none(),
                     "the 6.25 MB QG-1 budget must reject the 5,000-document fixture",
@@ -30082,7 +30248,11 @@ mod tests {
                 .expect("plan budget threshold fixture");
                 assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
                 let projected = writer
-                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .parallel_budget_admission(
+                        &cx,
+                        IngestBatch::Default(&documents),
+                        plan.active_shards,
+                    )
                     .expect("admit fixture under default budget")
                     .expect("default budget fits fixture")
                     .projected_logical_upper_bound;
@@ -30097,7 +30267,7 @@ mod tests {
                             .try_index_documents_parallel(
                                 &cx,
                                 ValidatedBatchAdmission {
-                                    documents: &documents,
+                                    documents: IngestBatch::Default(&documents),
                                 },
                                 &BTreeSet::new(),
                                 false,
@@ -30146,7 +30316,11 @@ mod tests {
                 .expect("plan budget fit fixture");
                 assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
                 let projected = writer
-                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .parallel_budget_admission(
+                        &cx,
+                        IngestBatch::Default(&documents),
+                        plan.active_shards,
+                    )
                     .expect("estimate budget fit fixture")
                     .expect("default budget fits fixture")
                     .projected_logical_upper_bound;
@@ -30156,7 +30330,7 @@ mod tests {
                     .try_index_documents_parallel(
                         &cx,
                         ValidatedBatchAdmission {
-                            documents: &documents,
+                            documents: IngestBatch::Default(&documents),
                         },
                         &BTreeSet::new(),
                         false,
@@ -30229,7 +30403,11 @@ mod tests {
                 assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
                 assert!(plan.active_shards >= 2);
                 let projected = writer
-                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .parallel_budget_admission(
+                        &cx,
+                        IngestBatch::Default(&documents),
+                        plan.active_shards,
+                    )
                     .expect("estimate production overlap fixture")
                     .expect("default budget fits fixture")
                     .projected_logical_upper_bound;
@@ -30241,7 +30419,7 @@ mod tests {
                     .try_index_documents_parallel(
                         &cx,
                         ValidatedBatchAdmission {
-                            documents: &documents,
+                            documents: IngestBatch::Default(&documents),
                         },
                         &BTreeSet::new(),
                         false,
@@ -30302,7 +30480,7 @@ mod tests {
                     .try_index_documents_parallel(
                         &cx,
                         ValidatedBatchAdmission {
-                            documents: &documents,
+                            documents: IngestBatch::Default(&documents),
                         },
                         &BTreeSet::new(),
                         false,
@@ -31038,7 +31216,7 @@ mod tests {
                 .expect("plan worker witness fixture");
                 assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
                 let projected = writer
-                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .parallel_budget_admission(&cx, IngestBatch::Default(&documents), plan.active_shards)
                     .expect("estimate worker witness fixture")
                     .expect("default budget fits fixture")
                     .projected_logical_upper_bound;
@@ -31049,7 +31227,7 @@ mod tests {
                     .try_index_documents_parallel(
                         &cx,
                         ValidatedBatchAdmission {
-                            documents: &documents,
+                            documents: IngestBatch::Default(&documents),
                         },
                         &BTreeSet::new(),
                         false,
@@ -31155,7 +31333,7 @@ mod tests {
                     .try_index_documents_parallel(
                         &cx,
                         ValidatedBatchAdmission {
-                            documents: &documents,
+                            documents: IngestBatch::Default(&documents),
                         },
                         &BTreeSet::new(),
                         false,
@@ -31249,7 +31427,7 @@ mod tests {
                     .try_index_documents_parallel(
                         &cx,
                         ValidatedBatchAdmission {
-                            documents: &second_documents,
+                            documents: IngestBatch::Default(&second_documents),
                         },
                         &BTreeSet::new(),
                         false,
@@ -31328,7 +31506,7 @@ mod tests {
                         .try_index_documents_parallel(
                             &cx,
                             ValidatedBatchAdmission {
-                                documents: &documents,
+                                documents: IngestBatch::Default(&documents),
                             },
                             &BTreeSet::new(),
                             false,
@@ -31487,7 +31665,11 @@ mod tests {
                     )
                     .expect("plan equality fixture");
                     writer
-                        .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                        .parallel_budget_admission(
+                            &cx,
+                            IngestBatch::Default(&documents),
+                            plan.active_shards,
+                        )
                         .expect("estimate equality fixture")
                         .expect("default budget fits equality fixture")
                         .projected_logical_upper_bound
