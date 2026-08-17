@@ -400,6 +400,12 @@ pub use index_builder::{
     open_hybrid,
 };
 
+// ─── CASS engine-equivalence gate (dev only) ────────────────────────────────
+
+#[cfg(feature = "cass-equivalence")]
+#[doc(hidden)]
+pub mod cass_equivalence;
+
 // ─── Prelude ────────────────────────────────────────────────────────────────
 
 /// Convenience re-exports for common usage.

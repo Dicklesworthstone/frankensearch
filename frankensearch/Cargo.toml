@@ -15,6 +15,17 @@ fastembed = ["frankensearch-embed/fastembed"]
 lexical = ["quill"]
 lexical-tantivy = ["dep:frankensearch-lexical"]
 cass-compat = ["lexical-tantivy"]
+# Dev-only CASS engine-equivalence comparator (Quill vs the Tantivy incumbent).
+# Never a shipping profile: it links both engines into one process on purpose,
+# which a published consumer can never do.
+cass-equivalence = [
+    "quill",
+    "cass-compat",
+    "frankensearch-lexical/tantivy-oracle",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tempfile",
+]
 quill = ["dep:frankensearch-quill", "frankensearch-fusion/quill"]
 graph = ["frankensearch-fusion/graph"]
 storage = ["dep:frankensearch-storage"]
@@ -48,6 +59,10 @@ frankensearch-storage = { workspace = true, optional = true }
 frankensearch-durability = { workspace = true, optional = true }
 asupersync = { workspace = true }
 tracing = { workspace = true }
+# Activated only by the dev-only `cass-equivalence` feature.
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
