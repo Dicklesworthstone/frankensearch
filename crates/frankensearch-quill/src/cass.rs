@@ -71,6 +71,59 @@ pub fn cass_index_dir(base: &Path) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Segment-count threshold at which a CASS index wants compaction.
+pub const CASS_MERGE_SEGMENT_THRESHOLD: usize = 4;
+
+/// Minimum interval between CASS compactions, in milliseconds.
+pub const CASS_MERGE_COOLDOWN_MS: i64 = 300_000;
+
+/// Whether a CASS index currently wants compaction, and why.
+///
+/// Mirrors the incumbent's shape and thresholds so a consumer's merge policy
+/// does not silently change meaning across the engine swap. `last_merge_ts` and
+/// `ms_since_last_merge` are supplied by the caller because Quill does not own
+/// a global merge clock: a negative `ms_since_last_merge` means "never merged",
+/// which the cooldown treats as elapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CassMergeStatus {
+    /// Live segment count in the published snapshot.
+    pub segment_count: usize,
+    /// Epoch milliseconds of the last compaction, or 0 if never.
+    pub last_merge_ts: i64,
+    /// Milliseconds since the last compaction, negative if never.
+    pub ms_since_last_merge: i64,
+    /// Segment count at or above which compaction is wanted.
+    pub merge_threshold: usize,
+    /// Minimum interval between compactions.
+    pub cooldown_ms: i64,
+}
+
+impl CassMergeStatus {
+    /// Whether the segment count has reached the threshold and the cooldown has
+    /// elapsed.
+    #[must_use]
+    pub const fn should_merge(&self) -> bool {
+        self.segment_count >= self.merge_threshold
+            && (self.ms_since_last_merge < 0 || self.ms_since_last_merge >= self.cooldown_ms)
+    }
+
+    /// Build a status from a live segment count and merge clock.
+    #[must_use]
+    pub const fn new(segment_count: usize, last_merge_ts: i64, now_ms: i64) -> Self {
+        Self {
+            segment_count,
+            last_merge_ts,
+            ms_since_last_merge: if last_merge_ts > 0 {
+                now_ms - last_merge_ts
+            } else {
+                -1
+            },
+            merge_threshold: CASS_MERGE_SEGMENT_THRESHOLD,
+            cooldown_ms: CASS_MERGE_COOLDOWN_MS,
+        }
+    }
+}
+
 /// One CASS message, owned.
 ///
 /// The field set mirrors the incumbent ingest DTO exactly. The three derived
