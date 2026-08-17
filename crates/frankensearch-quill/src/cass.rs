@@ -211,10 +211,63 @@ impl CassDocument {
     }
 }
 
-/// Canonical CASS document identity, `"{source_id}#{msg_idx}"`.
+/// Canonical CASS document identity.
+///
+/// # Why this is conversation-scoped
+///
+/// The Tantivy-era identity was `"{source_id}#{msg_idx}"`. That is NOT unique:
+/// `source_id` is the *source*, not the conversation — every locally-discovered
+/// conversation shares `LOCAL_SOURCE_ID` — so message 0 of every local
+/// conversation collides on `"local#0"`. Tantivy tolerated it because a
+/// document id there is an ordinary field with no uniqueness constraint. Quill
+/// treats the document id as a primary key and refuses duplicates, which is how
+/// the collision surfaced at all.
+///
+/// The conversation discriminator is `conversation_id` when the store has
+/// assigned one, and the transcript path otherwise — a conversation always has
+/// one or the other, and both are stable across reindexing.
 #[must_use]
-pub fn cass_document_identity(source_id: &str, msg_idx: u64) -> String {
-    format!("{source_id}#{msg_idx}")
+pub fn cass_document_identity(
+    source_id: &str,
+    conversation: CassConversationKey<'_>,
+    msg_idx: u64,
+) -> String {
+    match conversation.id {
+        Some(id) => format!("{source_id}#{}#{id}#{msg_idx}", conversation.source_path),
+        None => format!("{source_id}#{}#{msg_idx}", conversation.source_path),
+    }
+}
+
+/// What discriminates one conversation from another within a source.
+///
+/// Both axes are carried rather than one: the transcript path alone collides
+/// when a single file holds several conversations, and the assigned id alone
+/// collides when a caller reuses one id across conversations. Neither is
+/// individually guaranteed, so the identity uses the path always and the id
+/// additionally whenever the store has assigned one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CassConversationKey<'a> {
+    /// Absolute transcript path, always present.
+    pub source_path: &'a str,
+    /// The store's assigned conversation id, when it has one.
+    pub id: Option<i64>,
+}
+
+impl<'a> CassConversationKey<'a> {
+    /// The discriminator for `document`.
+    #[must_use]
+    pub const fn for_document(document: CassDocumentRef<'a>) -> Self {
+        Self {
+            source_path: document.source_path,
+            id: document.conversation_id,
+        }
+    }
+
+    /// A discriminator from explicit parts.
+    #[must_use]
+    pub const fn new(source_path: &'a str, id: Option<i64>) -> Self {
+        Self { source_path, id }
+    }
 }
 
 /// The three columns computed from a document rather than supplied with it.
@@ -395,7 +448,11 @@ impl CassDocument {
         let derived = CassDerivedColumns::derive(self.as_ref());
         let values = CassFieldValues::build(self.as_ref(), &derived);
         SchemaDocument {
-            id: cass_document_identity(&self.source_id, self.msg_idx),
+            id: cass_document_identity(
+                &self.source_id,
+                CassConversationKey::for_document(self.as_ref()),
+                self.msg_idx,
+            ),
             indexed: values
                 .indexed
                 .iter()
@@ -1059,13 +1116,70 @@ mod tests {
         );
     }
 
+    /// Identity must discriminate source, conversation, AND ordinal.
+    ///
+    /// The conversation axis is the one that matters most here: every locally
+    /// discovered conversation shares one `source_id`, so an identity built
+    /// only from source and ordinal collides on message 0 of every local
+    /// conversation. Tantivy tolerated that; Quill refuses it as a duplicate
+    /// primary key, which is exactly the bug this shape prevents.
     #[test]
-    fn document_identity_is_source_scoped() {
-        assert_eq!(cass_document_identity("local", 0), "local#0");
+    fn document_identity_discriminates_source_conversation_and_ordinal() {
+        use CassConversationKey as Key;
+        assert_eq!(
+            cass_document_identity("local", Key::new("/a.jsonl", Some(7)), 0),
+            "local#/a.jsonl#7#0"
+        );
+
         assert_ne!(
-            cass_document_identity("local", 1),
-            cass_document_identity("remote", 1),
-            "identity must not collide across sources at the same ordinal"
+            cass_document_identity("local", Key::new("/a.jsonl", Some(1)), 1),
+            cass_document_identity("remote", Key::new("/a.jsonl", Some(1)), 1),
+            "identity must not collide across sources"
+        );
+        assert_ne!(
+            cass_document_identity("local", Key::new("/a.jsonl", Some(1)), 0),
+            cass_document_identity("local", Key::new("/b.jsonl", Some(1)), 0),
+            "message 0 of two conversations in ONE source, sharing a reused id, must not collide"
+        );
+        assert_ne!(
+            cass_document_identity("local", Key::new("/a.jsonl", Some(1)), 0),
+            cass_document_identity("local", Key::new("/a.jsonl", Some(1)), 1),
+            "identity must not collide across ordinals"
+        );
+        // Without an assigned conversation id the transcript path carries the
+        // same discrimination.
+        assert_ne!(
+            cass_document_identity("local", Key::new("/a.jsonl", None), 0),
+            cass_document_identity("local", Key::new("/b.jsonl", None), 0),
+            "message 0 of two unassigned conversations must not collide"
+        );
+    }
+
+    /// A batch of conversations from one source must be ingestable.
+    ///
+    /// This is the regression test for the real defect: under the old
+    /// source-scoped identity every conversation's message 0 was `local#0`, so
+    /// a multi-conversation local batch was refused outright.
+    #[test]
+    fn a_multi_conversation_local_batch_has_unique_identities() {
+        let documents: Vec<CassDocument> = (0..4)
+            .flat_map(|conversation| {
+                (0..3).map(move |msg_idx| {
+                    let mut document =
+                        sample_document("local", msg_idx, "claude", "t", "body");
+                    document.conversation_id = Some(conversation);
+                    document
+                })
+            })
+            .collect();
+        let identities: std::collections::BTreeSet<String> = documents
+            .iter()
+            .map(|document| document.to_schema_document().id)
+            .collect();
+        assert_eq!(
+            identities.len(),
+            documents.len(),
+            "every message in a multi-conversation local batch needs its own identity"
         );
     }
 }
