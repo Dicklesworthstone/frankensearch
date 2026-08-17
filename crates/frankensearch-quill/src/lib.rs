@@ -85,7 +85,8 @@ pub use query::{
     CassSourceFilter, CassWildcardPattern, DefaultQueryParser, MAX_QUERY_DEPTH, MAX_QUERY_LENGTH,
     Occur, ParsedQuery, PositionedTerm, Query, QueryCanonicalizationReport, QueryDiagnostic,
     QueryDiagnosticKind, QueryExplanation, QueryField, QueryParserConfigError, QueryValue,
-    canonicalize_query, cass_sanitize_query, classify_query, truncate_query,
+    canonicalize_query, cass_has_boolean_operators, cass_sanitize_query, classify_query,
+    truncate_query,
 };
 pub use schema::{
     Analyzer, CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor, FieldKind,

@@ -4667,6 +4667,28 @@ impl CassWildcardPattern {
     }
 }
 
+/// Whether `raw` carries an explicit boolean operator.
+///
+/// This is a lexical question, not a shape question: `QueryExplanation::Boolean`
+/// answers "more than one fragment", which is true of `alpha beta` and says
+/// nothing about whether the author wrote `AND`, `OR`, or `NOT`. A consumer
+/// that branches on operator presence — cass does — needs the lexer's answer,
+/// so this runs the same lexer the parser runs and reports whether it produced
+/// an operator token.
+///
+/// Recovery diagnostics from the lex are discarded: a caller asking this
+/// question is deciding how to route the query, not reporting on it.
+#[must_use]
+pub fn cass_has_boolean_operators(raw: &str) -> bool {
+    let mut diagnostics = Vec::new();
+    cass_lex(raw, &mut diagnostics).iter().any(|token| {
+        matches!(
+            token,
+            CassLexToken::And { .. } | CassLexToken::Or { .. } | CassLexToken::Not { .. }
+        )
+    })
+}
+
 /// Sanitize a CASS query using the shipping hyphen-normalize boundary.
 ///
 /// Alphanumeric scalars, wildcards, quotes, and hyphens survive. Every other
