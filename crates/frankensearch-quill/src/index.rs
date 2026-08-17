@@ -21679,6 +21679,8 @@ mod tests {
                     Vec::new(),
                     None,
                     None,
+                    #[cfg(feature = "pruning-conformance")]
+                    None,
                     Some(&profile),
                 )
                 .expect("execute exact-plus-dynamic isolation query");
