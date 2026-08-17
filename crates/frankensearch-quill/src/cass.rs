@@ -438,6 +438,131 @@ mod tests {
         }
     }
 
+    /// Ingest and query throughput for the CASS schema path.
+    ///
+    /// Opt-in (`--ignored`) and release-only to be meaningful. This is a
+    /// measurement probe, not a gate: it asserts nothing about timing, it only
+    /// reports, so it can never fail the suite for being run on a loaded box.
+    #[test]
+    #[ignore = "measurement probe; run explicitly under --release --ignored"]
+    fn cass_schema_ingest_and_query_throughput() {
+        use std::time::Instant;
+
+        const DOCUMENTS: usize = 20_000;
+        const BATCH: usize = 500;
+
+        // Deterministic pseudo-random text: a fixed LCG so the corpus is the
+        // same on every run and two measurements are comparable.
+        let vocabulary: Vec<String> = (0..4096).map(|index| format!("term{index:04}")).collect();
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let agents = ["claude", "codex", "gemini", "local"];
+        let corpus: Vec<CassDocument> = (0..DOCUMENTS)
+            .map(|index| {
+                let content = (0..120)
+                    .map(|_| {
+                        vocabulary[usize::try_from(next() % 4096).expect("vocabulary index")]
+                            .as_str()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                sample_document(
+                    &format!("session{:05}", index / 50),
+                    u64::try_from(index).expect("ordinal"),
+                    agents[index % agents.len()],
+                    "measurement session",
+                    &content,
+                )
+            })
+            .collect();
+        let content_bytes: usize = corpus.iter().map(|document| document.content.len()).sum();
+
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+
+            let projection_start = Instant::now();
+            let projected: Vec<SchemaDocument> =
+                corpus.iter().map(CassDocument::to_schema_document).collect();
+            let projection = projection_start.elapsed();
+
+            let ingest_start = Instant::now();
+            for batch in projected.chunks(BATCH) {
+                index
+                    .index_schema_documents(&cx, batch)
+                    .await
+                    .expect("ingest a CASS batch");
+            }
+            let accumulate = ingest_start.elapsed();
+            index.commit(&cx).await.expect("publish the CASS corpus");
+            let ingest_total = ingest_start.elapsed();
+
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("open a CASS-schema reader");
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS query parser");
+            let filters = crate::query::CassQueryFilters::default();
+
+            let mut latencies = Vec::new();
+            let mut hits = 0_u64;
+            for round in 0..500_usize {
+                let raw = format!("term{:04} term{:04}", round % 4096, (round * 7) % 4096);
+                let parsed = parser.parse(&raw, &filters);
+                let start = Instant::now();
+                let result = reader
+                    .search_preparsed_paginated(&cx, &parsed.query, 10, 0, false)
+                    .expect("query the CASS corpus");
+                latencies.push(start.elapsed());
+                hits += result.hits.len() as u64;
+            }
+            latencies.sort_unstable();
+
+            let mib = content_bytes as f64 / (1024.0 * 1024.0);
+            println!("--- CASS schema path, {DOCUMENTS} docs, {mib:.1} MiB content ---");
+            println!(
+                "projection  {:>8.2?}  ({:.0} docs/s)",
+                projection,
+                DOCUMENTS as f64 / projection.as_secs_f64()
+            );
+            println!(
+                "accumulate  {:>8.2?}  ({:.0} docs/s, {:.1} MiB/s)",
+                accumulate,
+                DOCUMENTS as f64 / accumulate.as_secs_f64(),
+                mib / accumulate.as_secs_f64()
+            );
+            println!(
+                "ingest+commit {:>6.2?}  ({:.0} docs/s, {:.1} MiB/s)",
+                ingest_total,
+                DOCUMENTS as f64 / ingest_total.as_secs_f64(),
+                mib / ingest_total.as_secs_f64()
+            );
+            println!(
+                "query p50 {:>8.2?}  p99 {:>8.2?}  max {:>8.2?}  ({hits} hits over 500 queries)",
+                latencies[latencies.len() / 2],
+                latencies[latencies.len() * 99 / 100],
+                latencies[latencies.len() - 1],
+            );
+        });
+    }
+
     /// A CASS-schema index must ingest and answer queries through the same
     /// writer the shipping five-field shape uses.
     ///
