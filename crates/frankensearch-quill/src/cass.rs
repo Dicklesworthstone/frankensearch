@@ -438,6 +438,73 @@ mod tests {
         }
     }
 
+    /// A conversation at the incumbent's per-conversation indexing cap must be
+    /// admitted, not refused.
+    ///
+    /// cass truncates a conversation's indexed body at 8 MiB and indexes the
+    /// truncated text. Quill's admission refuses rather than truncates, so if
+    /// its budget were tighter than that cap, migrating a real corpus would
+    /// fail on the first large conversation — and fail the whole batch, not
+    /// just that document. This pins that the incumbent's ceiling is inside
+    /// Quill's admission.
+    #[test]
+    fn a_conversation_at_the_incumbent_content_cap_is_admitted() {
+        const CAP_BYTES: usize = 8 * 1024 * 1024;
+
+        // Realistic token mix rather than one repeated word: a single repeated
+        // term would collapse to one dictionary entry and understate the term
+        // bucket pressure a real 8 MiB conversation applies.
+        let mut content = String::with_capacity(CAP_BYTES + 16);
+        let mut ordinal = 0_u32;
+        while content.len() < CAP_BYTES {
+            use std::fmt::Write as _;
+            let _ = write!(content, "token{:07} ", ordinal % 100_000);
+            ordinal += 1;
+        }
+
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+
+            let document = sample_document("bulk", 0, "claude", "a very long session", &content)
+                .to_schema_document();
+            index
+                .index_schema_documents(&cx, std::slice::from_ref(&document))
+                .await
+                .expect("a conversation at the incumbent cap must be admitted");
+            index.commit(&cx).await.expect("publish the large document");
+
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("open the reader");
+            assert_eq!(reader.doc_count().expect("doc count"), 1);
+
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS parser");
+            let parsed = parser.parse("token0000042", &crate::query::CassQueryFilters::default());
+            let result = reader
+                .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                .expect("search the large document");
+            assert_eq!(
+                result.total_count,
+                Some(1),
+                "a term from deep inside the capped body must still be findable"
+            );
+        });
+    }
+
     /// Ingest and query throughput for the CASS schema path.
     ///
     /// Opt-in (`--ignored`) and release-only to be meaningful. This is a
@@ -494,8 +561,10 @@ mod tests {
             .expect("create a CASS-schema index");
 
             let projection_start = Instant::now();
-            let projected: Vec<SchemaDocument> =
-                corpus.iter().map(CassDocument::to_schema_document).collect();
+            let projected: Vec<SchemaDocument> = corpus
+                .iter()
+                .map(CassDocument::to_schema_document)
+                .collect();
             let projection = projection_start.elapsed();
 
             let ingest_start = Instant::now();
