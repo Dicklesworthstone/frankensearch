@@ -997,6 +997,31 @@ impl QuillSearchSnapshot {
             .map(|witness| witness.map(|witness| witness.global_docid))
     }
 
+    /// Read one stored column for a live document.
+    ///
+    /// The five-field shipping schema keeps everything a document stores in a
+    /// single JSON `METADATA` column, so its consumers never name an ordinal. A
+    /// wider schema stores each column separately — the CASS profile stores its
+    /// title and preview as their own columns — and a consumer reading those
+    /// back has to say which one it wants.
+    ///
+    /// Returns `None` when the document is not live in this snapshot or the
+    /// column holds nothing for it. Stored text columns hold their source UTF-8
+    /// bytes; stored numeric columns hold the canonical eight little-endian
+    /// bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed section-validation failure if the segment's STOREDMETA
+    /// section is absent or malformed.
+    pub fn stored_field_value(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+    ) -> Result<Option<Vec<u8>>, QuillIndexError> {
+        self.materialize_stored_value(field_ord, global_docid)
+    }
+
     fn materialize_metadata(
         &self,
         global_docid: u32,
@@ -10926,6 +10951,27 @@ impl QuillSearchIndex {
             },
             directory,
         })
+    }
+
+    /// Read one stored column for a live document in the pinned publication.
+    ///
+    /// See [`QuillSearchSnapshot::stored_field_value`]. This is the entry point
+    /// a wider schema's consumer uses to read back the columns it stored, the
+    /// way the shipping schema's consumers read `metadata`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed reconciliation-required failure when publication
+    /// authority cannot prove the process-local snapshot readable, or a
+    /// section-validation failure from the segment.
+    pub fn stored_field_value(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+    ) -> Result<Option<Vec<u8>>, QuillIndexError> {
+        self.reader
+            .checked_published_snapshot()?
+            .stored_field_value(field_ord, global_docid)
     }
 
     /// Durable index directory bound to this published snapshot.
