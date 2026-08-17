@@ -35,9 +35,12 @@ use frankensearch_quill as quill;
 
 /// Hit limit used for every probe.
 ///
-/// Far above any expected match count so the set comparison is about
-/// membership rather than truncation.
-pub const UNCAPPED_LIMIT: usize = 100_000;
+/// The incumbent refuses `limit + tie_expansion` above `100_000`, so this cannot
+/// be raised without lowering [`TIE_EXPANSION`]. On a corpus whose match counts
+/// exceed it the set comparison degrades into a *prefix* comparison — which is
+/// why every probe records [`CassProbeComparison::saturated`] rather than
+/// letting a truncated agreement read as a membership proof.
+pub const PROBE_LIMIT: usize = 90_000;
 
 /// Cutoff tie-group expansion budget for the incumbent observation.
 pub const TIE_EXPANSION: usize = 256;
@@ -55,15 +58,27 @@ pub struct CassProbeComparison {
     pub only_incumbent: Vec<String>,
     /// Identifiers Quill returned and the incumbent did not.
     pub only_quill: Vec<String>,
+    /// Whether either engine returned a full page at [`PROBE_LIMIT`].
+    ///
+    /// When true, the identifier sets are prefixes rather than complete
+    /// memberships, so `only_incumbent`/`only_quill` reflect where each engine
+    /// cut its list as much as what it matched. `incumbent_total` and
+    /// `quill_total` remain exact and are the authoritative signal.
+    pub saturated: bool,
 }
 
 impl CassProbeComparison {
     /// Whether both engines agreed on count and membership.
+    ///
+    /// A saturated probe is judged on its exact counts alone: comparing two
+    /// truncated lists measures the cut, not membership, so treating a prefix
+    /// difference as a divergence would report noise as a defect.
     #[must_use]
     pub fn agrees(&self) -> bool {
-        self.incumbent_total == self.quill_total
-            && self.only_incumbent.is_empty()
-            && self.only_quill.is_empty()
+        if self.incumbent_total != self.quill_total {
+            return false;
+        }
+        self.saturated || (self.only_incumbent.is_empty() && self.only_quill.is_empty())
     }
 }
 
@@ -96,6 +111,15 @@ impl CassEquivalenceReport {
             .iter()
             .filter(|probe| probe.incumbent_total > 0)
             .count()
+    }
+
+    /// Probes whose identifier sets were truncated at [`PROBE_LIMIT`].
+    ///
+    /// A caller gating a migration should report this: a run where many probes
+    /// saturated proved exact counts but only prefix membership.
+    #[must_use]
+    pub fn saturated_probes(&self) -> usize {
+        self.probes.iter().filter(|probe| probe.saturated).count()
     }
 
     /// Whether the engines agreed on document count and every probe.
@@ -261,25 +285,29 @@ pub async fn cass_engine_equivalence_report(
         let observed = oracle.cass_oracle_observe_query(
             raw,
             &tantivy_cass::CassQueryFilters::default(),
-            UNCAPPED_LIMIT,
+            PROBE_LIMIT,
             TIE_EXPANSION,
         )?;
         incumbent_doc_count = observed.doc_count;
 
         let parsed = parser.parse(raw, &quill::query::CassQueryFilters::default());
-        let result =
-            reader.search_preparsed_paginated(cx, &parsed.query, UNCAPPED_LIMIT, 0, true)?;
+        let result = reader.search_preparsed_paginated(cx, &parsed.query, PROBE_LIMIT, 0, true)?;
 
-        let incumbent_ids: BTreeSet<&str> =
-            observed.hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+        let incumbent_ids: BTreeSet<&str> = observed
+            .hits
+            .iter()
+            .map(|hit| hit.doc_id.as_str())
+            .collect();
         let quill_ids: BTreeSet<&str> = result
             .hits
             .iter()
             .map(|hit| hit.document_id.as_str())
             .collect();
 
+        let saturated = observed.hits.len() >= PROBE_LIMIT || result.hits.len() >= PROBE_LIMIT;
         probes.push(CassProbeComparison {
             query: raw.clone(),
+            saturated,
             incumbent_total: observed.total_count,
             quill_total: usize::try_from(result.total_count.unwrap_or_default())
                 .expect("exact match count fits usize"),
