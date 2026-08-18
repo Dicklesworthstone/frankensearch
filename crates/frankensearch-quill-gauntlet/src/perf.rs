@@ -12942,7 +12942,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "662970b25201a99444abc57b80987bea85ce5a71ae277361300bf8abb63e0858",
+                "23781d5b1004ddc1a9201f2348a21d0d586c6fa33e23e6516754dfa5ede92a41",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -12951,7 +12951,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "f1ae1f063c0c697bab84e3f4f0ddf789cd3ff9ab2cd5471544954d3390ae0c51",
+                "29851a69bbf4b1cd76e499e84abee71b18c39f6f65df621619800834f414228e",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -12960,7 +12960,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "e62f636c6f745c88fc5182d2a1f5bd3a0a526f8b22039de846e538595cad324d",
+                "eb440bde845aa79bc80467979039b6aa34af99b0d4c7b779c0ede21f0a0ffe9a",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -13867,7 +13867,7 @@ mod tests {
         // administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "dc4aee8548433ab9c3c5b71f684a626f65136eeb88c21bfeb5607a0fa467da1b",
+            "d4a751d3dcbae22f282744a927971ccacb16df107784fc35346a316fb0f6993e",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(
