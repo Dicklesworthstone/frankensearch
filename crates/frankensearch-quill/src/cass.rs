@@ -232,10 +232,11 @@ pub fn cass_document_identity(
     conversation: CassConversationKey<'_>,
     msg_idx: u64,
 ) -> String {
-    match conversation.id {
-        Some(id) => format!("{source_id}#{}#{id}#{msg_idx}", conversation.source_path),
-        None => format!("{source_id}#{}#{msg_idx}", conversation.source_path),
-    }
+    let path = conversation.source_path;
+    conversation.id.map_or_else(
+        || format!("{source_id}#{path}#{msg_idx}"),
+        |id| format!("{source_id}#{path}#{id}#{msg_idx}"),
+    )
 }
 
 /// What discriminates one conversation from another within a source.
@@ -1165,8 +1166,7 @@ mod tests {
         let documents: Vec<CassDocument> = (0..4)
             .flat_map(|conversation| {
                 (0..3).map(move |msg_idx| {
-                    let mut document =
-                        sample_document("local", msg_idx, "claude", "t", "body");
+                    let mut document = sample_document("local", msg_idx, "claude", "t", "body");
                     document.conversation_id = Some(conversation);
                     document
                 })
