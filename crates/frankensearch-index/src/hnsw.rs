@@ -1807,8 +1807,17 @@ fn validate_weak_base_connectivity(
     mut base_neighbors: impl FnMut(usize) -> Result<Vec<usize>, String>,
 ) -> Result<(), String> {
     let mut components = WeakComponents::new(expected_points);
+    let mut zero_base_degree_count = 0_usize;
+    let mut first_zero_base_degree = None;
     for origin_id in 0..expected_points {
-        for neighbor_id in base_neighbors(origin_id)? {
+        let neighbors = base_neighbors(origin_id)?;
+        if neighbors.is_empty() {
+            zero_base_degree_count += 1;
+            if first_zero_base_degree.is_none() {
+                first_zero_base_degree = Some(origin_id);
+            }
+        }
+        for neighbor_id in neighbors {
             if neighbor_id >= expected_points {
                 return Err(format!(
                     "origin id {origin_id} references out-of-range base neighbor {neighbor_id}"
@@ -1821,8 +1830,13 @@ fn validate_weak_base_connectivity(
     let entry_component = components.root(entry_origin);
     let mut attached_count = 0_usize;
     let mut first_detached = None;
+    let mut weak_component_count = 0_usize;
     for origin_id in 0..expected_points {
-        if components.root(origin_id) == entry_component {
+        let component = components.root(origin_id);
+        if component == origin_id {
+            weak_component_count += 1;
+        }
+        if component == entry_component {
             attached_count += 1;
         } else if first_detached.is_none() {
             first_detached = Some(origin_id);
@@ -1832,7 +1846,9 @@ fn validate_weak_base_connectivity(
         return Err(format!(
             "base layer splits into multiple weak components: entry origin {entry_origin}'s \
              component holds only {attached_count}/{expected_points} points ignoring edge \
-             direction; first detached origin is {first_detached}"
+             direction; first detached origin is {first_detached}; weak component count is \
+             {weak_component_count}; zero-base-degree points are {zero_base_degree_count}; \
+             first zero-base-degree origin is {first_zero_base_degree:?}"
         ));
     }
     Ok(())
@@ -4495,6 +4511,12 @@ mod tests {
             .expect_err("edgeless multi-point graph must fail");
         assert!(detail.contains("weak components"), "{detail}");
         assert!(detail.contains("only 1/2"), "{detail}");
+        assert!(detail.contains("weak component count is 2"), "{detail}");
+        assert!(detail.contains("zero-base-degree points are 2"), "{detail}");
+        assert!(
+            detail.contains("first zero-base-degree origin is Some(0)"),
+            "{detail}"
+        );
     }
 
     /// #32: bounded neighbour pruning can strip every in-edge from a point,
@@ -4611,6 +4633,27 @@ mod tests {
             .expect_err("two locally valid components must fail weak connectivity");
         assert!(detail.contains("only 2/4"), "{detail}");
         assert!(detail.contains("first detached origin is 2"), "{detail}");
+        assert!(detail.contains("weak component count is 2"), "{detail}");
+        assert!(detail.contains("zero-base-degree points are 0"), "{detail}");
+    }
+
+    #[test]
+    fn weak_connectivity_handles_the_cass_quality_vector_cardinality() {
+        // CASS's published quality tier contains this many vectors. The
+        // production attestation reported a split at this scale, so pin that
+        // the union-find itself neither overflows nor mistakes a single
+        // forward-attached component for multiple weak components. Each
+        // non-entry point has the construction invariant required by HNSW:
+        // one base-layer edge to an already admitted point.
+        const CASS_QUALITY_VECTOR_COUNT: usize = 2_573_003;
+
+        validate_weak_base_connectivity(0, CASS_QUALITY_VECTOR_COUNT, |origin_id| {
+            Ok((origin_id > 0)
+                .then_some(origin_id - 1)
+                .into_iter()
+                .collect())
+        })
+        .expect("a forward-attached HNSW insertion chain is one weak component");
     }
 
     #[test]
