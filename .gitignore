@@ -160,3 +160,8 @@ repro_*.rs
 
 # Accidental empty file created as a literal name `...` at repo root.
 /...
+
+# Skill-loop / repo-janitor scratch
+.skill-loop-progress.md
+.skill-loop-progress-*.md
+
