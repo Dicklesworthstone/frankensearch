@@ -865,6 +865,7 @@ Useful docs:
 - `AGENTS.md`
 - `docs/e2e-artifact-contract.md`
 - `docs/dependency-semantics-policy.md`
+- `docs/planning/UPGRADE_LOG.md` — upgrade history (relocated from repo root)
 
 ## License
 

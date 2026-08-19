@@ -4,6 +4,58 @@ All notable changes to [frankensearch](https://github.com/Dicklesworthstone/fran
 
 Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/frankensearch/releases) unless noted otherwise. Tags that share a commit with another release are called out explicitly. Each entry links to representative commits using full commit URLs.
 
+Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) (2026-08-14) through HEAD on 2026-08-19 ([`450fc2cfc1be20851678d35313681d1336edceab`](https://github.com/Dicklesworthstone/frankensearch/commit/450fc2cfc1be20851678d35313681d1336edceab)), plus missing version rows for the 1.4.x / 1.5.0 spine that shipped after the old "proposed v1.4.0" draft. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.** v1.4.0, v1.4.3, v1.5.0, and v1.6.0 are published Releases.
+
+## Version Timeline
+
+| Version | Kind | Date | Summary |
+|---------|------|------|---------|
+| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.6.0...main) | HEAD | 2026-08-19 | Hash-control fuse follow-through, Quill CASS ingest, janitor docs-reorg |
+| [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) | Release | 2026-08-14 | Hash control no longer presented as semantic search |
+| [v1.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.5.0) | Release | 2026-08-05 | Multi-platform assets; remedy for #31 |
+| [v1.4.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.4.3) | Release | 2026-08-02 | First complete release since v1.2.5 |
+| [v1.4.2](https://github.com/Dicklesworthstone/frankensearch/tree/v1.4.2) | Tag | 2026-08-02 | Windows/macOS installer fixes (no GitHub Release) |
+| [v1.4.1](https://github.com/Dicklesworthstone/frankensearch/tree/v1.4.1) | Tag | 2026-08-02 | Replacement tag for empty v1.4.0 assets (no GitHub Release) |
+| [v1.4.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.4.0) | Release | 2026-07-30 | Quill + native rerank epoch |
+
+---
+
+## [Unreleased] -- development on `main` since [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) (as of 2026-08-19)
+
+Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.6.0...main>
+
+114 non-merge commits after the v1.6.0 tag.
+
+### Janitor docs-reorg (2026-08-19)
+
+- Untracked skill-loop scratch and ignored the workspace pattern ([`0980a48242d89d100058fc1d15d8fa5ac7c303f9`](https://github.com/Dicklesworthstone/frankensearch/commit/0980a48242d89d100058fc1d15d8fa5ac7c303f9)).
+- Relocated remaining root reports: `UPGRADE_LOG.md` → [`docs/planning/UPGRADE_LOG.md`](https://github.com/Dicklesworthstone/frankensearch/blob/main/docs/planning/UPGRADE_LOG.md) ([`450fc2cfc1be20851678d35313681d1336edceab`](https://github.com/Dicklesworthstone/frankensearch/commit/450fc2cfc1be20851678d35313681d1336edceab)).
+
+### Representative commits
+
+- [`450fc2cfc1be20851678d35313681d1336edceab`](https://github.com/Dicklesworthstone/frankensearch/commit/450fc2cfc1be20851678d35313681d1336edceab) — janitor relocate remaining root reports.
+- [`0980a48242d89d100058fc1d15d8fa5ac7c303f9`](https://github.com/Dicklesworthstone/frankensearch/commit/0980a48242d89d100058fc1d15d8fa5ac7c303f9) — untrack skill-loop scratch.
+
+### Hash-control fusion continues past v1.6.0
+
+v1.6.0 stopped presenting hash/FNV/JL generations as semantic search. The follow-on window keeps hash ranks off semantic fields through fuse, persist, explain, and dashboard, and routes hash-control search through lane-aware fuse APIs.
+
+- Hash-control ranks remapped at the RRF fuse boundary ([`00b6452a986f264fcca46c0bfa0588d703dc0202`](https://github.com/Dicklesworthstone/frankensearch/commit/00b6452a986f264fcca46c0bfa0588d703dc0202)); hash-control search routed through lane-aware fuse APIs ([`b1e6409645a079c277b1fb5e26e52402cde28203`](https://github.com/Dicklesworthstone/frankensearch/commit/b1e6409645a079c277b1fb5e26e52402cde28203)).
+- Fused lexical-only and hash-only hits are no longer tagged `Hybrid` ([`03e9431d690440233040ccb3b64ef3bd5589d255`](https://github.com/Dicklesworthstone/frankensearch/commit/03e9431d690440233040ccb3b64ef3bd5589d255)).
+
+### Quill CASS schema-general ingest
+
+- Durable create/open bound to an explicit compiled schema ([`1d0dd64c4e7d0bb56ba4bd2a80bcb9e922fb3aff`](https://github.com/Dicklesworthstone/frankensearch/commit/1d0dd64c4e7d0bb56ba4bd2a80bcb9e922fb3aff)).
+- Native CASS ingest surface with a Quill-only schema generation ([`6fd85d8022cc9089c5d2e2e81e849db5b5590aa5`](https://github.com/Dicklesworthstone/frankensearch/commit/6fd85d8022cc9089c5d2e2e81e849db5b5590aa5)); `conversation_id` stored as 8 LE bytes and `CassDocument` projected onto `SchemaDocument` ([`869ba30572c39915cfa53b0cb0e962f2587be44e`](https://github.com/Dicklesworthstone/frankensearch/commit/869ba30572c39915cfa53b0cb0e962f2587be44e)).
+- Document identity is conversation-scoped, not `source#ordinal` ([`400eabef73bdde38f2058ff03d205e56b3fbb026`](https://github.com/Dicklesworthstone/frankensearch/commit/400eabef73bdde38f2058ff03d205e56b3fbb026)).
+- Differential Quill CASS path against the Tantivy incumbent ([`6d899a6f9510ced8a55878c58edf735c410ece88`](https://github.com/Dicklesworthstone/frankensearch/commit/6d899a6f9510ced8a55878c58edf735c410ece88)); dev-only Quill-vs-Tantivy equivalence comparator behind `cass-equivalence` ([`8db4589ee12b529e35898aa644eff8c9dc88e831`](https://github.com/Dicklesworthstone/frankensearch/commit/8db4589ee12b529e35898aa644eff8c9dc88e831)).
+
+### Cancel, transients, and ANN
+
+- Observe cancel before FastEmbed ONNX work ([`572548eada5ef1534045f59bb61aecaa7b39f02e`](https://github.com/Dicklesworthstone/frankensearch/commit/572548eada5ef1534045f59bb61aecaa7b39f02e)).
+- Lockstep asupersync 0.4.4 and retry FrankenSQLite transients ([`ad0326ed055503bff4e6e9e1c8423007fd7ef790`](https://github.com/Dicklesworthstone/frankensearch/commit/ad0326ed055503bff4e6e9e1c8423007fd7ef790)); asupersync 0.4.4 → 0.4.5 ([`160a7dc750aa46c4325ee3b20551f2de1c189ad3`](https://github.com/Dicklesworthstone/frankensearch/commit/160a7dc750aa46c4325ee3b20551f2de1c189ad3)).
+- Admit HNSW graphs that are weakly connected but not fully directed-reachable ([#32](https://github.com/Dicklesworthstone/frankensearch/issues/32), [`766f45a011ad773df38c3d8079c15f90e1cdcf5b`](https://github.com/Dicklesworthstone/frankensearch/commit/766f45a011ad773df38c3d8079c15f90e1cdcf5b)).
+
 ---
 
 ## [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/compare/v1.5.0...v1.6.0) -- 2026-08-14
@@ -33,20 +85,59 @@ Current storage `SCHEMA_VERSION` is **7** (FTS5 rebuild-version marker). Fresh d
 
 ---
 
-## [Unreleased — proposed v1.4.0](https://github.com/Dicklesworthstone/frankensearch/compare/v1.3.0...HEAD) -- 2026-04-24 through 2026-07-29
+## [v1.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.5.0) -- 2026-08-05 (GitHub Release)
 
-> **Scope window: v1.3.0..HEAD (~1,375 commits), reconstructed as one epoch.** This window is too
+Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.4.3...v1.5.0>
+
+728 non-merge commits since v1.4.3. Remedy for [#31](https://github.com/Dicklesworthstone/frankensearch/issues/31): since v1.2.5 the pipeline shipped only `x86_64-unknown-linux-musl`, so `fsfs update` advertised a new version and then 404'd on every other platform. This release ships an asset for every target triple the self-updater and installer construct (except Windows — the build host ran out of disk).
+
+- `st_nlink` widened to `u64` for musl portability ([`9966b6d876b6926631a97ae6c0323444d090c8bb`](https://github.com/Dicklesworthstone/frankensearch/commit/9966b6d876b6926631a97ae6c0323444d090c8bb)).
+- `frankensearch-fsfs` package version bumped to 1.5.0 ([`6c1140aa04f6ca1dcdf427edbf93f41082a999ff`](https://github.com/Dicklesworthstone/frankensearch/commit/6c1140aa04f6ca1dcdf427edbf93f41082a999ff)).
+- Library API sweep in this window (`LexicalRead` / `LexicalWrite` replacing combined `LexicalSearch`) is breaking for library consumers — hence the minor bump.
+
+---
+
+## [v1.4.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.4.3) -- 2026-08-02 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.4.2...v1.4.3>
+
+First complete GitHub Release since v1.2.5. Native Quill lexical engine in fsfs (no more writer-lock failures on concurrent searches); `fsfs index` terminates cleanly; loader-capable stock default; typed embedding-identity foundation; working Linux self-update (the updater previously requested a nonexistent asset name).
+
+- Self-update requests the lite asset family on lite-only targets ([`a5f464432f7514d54f4e43b31a839b9536ac22f0`](https://github.com/Dicklesworthstone/frankensearch/commit/a5f464432f7514d54f4e43b31a839b9536ac22f0)).
+- Release bump that must carry the self-update asset-family fix ([`4446f75bc6978dd65e4ef4cf0d27d578ba4ebbd8`](https://github.com/Dicklesworthstone/frankensearch/commit/4446f75bc6978dd65e4ef4cf0d27d578ba4ebbd8)).
+
+---
+
+## v1.4.2 -- 2026-08-02 (Tag only — no GitHub Release)
+
+> Git tag `v1.4.2` exists; **no GitHub Release was published for this tag.**
+> Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.4.1...v1.4.2>
+> 8 non-merge commits. Windows-compatible Quill (`stat_dev_as_u64` cfg-gated to unix) and macOS bash 3.2 installer-script compatibility. Tag: [`c74818be81f52031b8106e3331ff3d0eab5a5bed`](https://github.com/Dicklesworthstone/frankensearch/commit/c74818be81f52031b8106e3331ff3d0eab5a5bed).
+
+---
+
+## v1.4.1 -- 2026-08-02 (Tag only — no GitHub Release)
+
+> Git tag `v1.4.1` exists; **no GitHub Release was published for this tag.** The tag message calls it a replacement for the empty v1.4.0 asset set.
+> Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.4.0...v1.4.1>
+> 323 non-merge commits. Four release-blocking CI failures repaired ([`15353948d620b90b699198aaa4d77ea12f8bdb65`](https://github.com/Dicklesworthstone/frankensearch/commit/15353948d620b90b699198aaa4d77ea12f8bdb65)); fsfs bumped to 1.4.1 ([`0b41ec66a7a74628866cc608ea8785bb1f0f1ef3`](https://github.com/Dicklesworthstone/frankensearch/commit/0b41ec66a7a74628866cc608ea8785bb1f0f1ef3)).
+
+---
+
+## [v1.4.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.4.0) -- 2026-07-30 (GitHub Release)
+
+> **Scope window: v1.3.0..v1.4.0 (~1,488 non-merge commits), reconstructed as one epoch.** This window is too
 > large to enumerate commit-by-commit, so this section is organized as capability
 > waves with representative live-linked commits, reconstructed from `git log`,
-> `git diff --stat v1.3.0..HEAD`, and the checked-in beads tracker
+> `git diff --stat v1.3.0..v1.4.0`, and the checked-in beads tracker
 > ([`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankensearch/blob/main/.beads/issues.jsonl)).
 > It is a navigation aid, not an exhaustive record.
 >
-> **Release status:** v1.3.0 is a git tag with **no** GitHub Release; the latest
-> actual GitHub Release is [v1.2.5](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.2.5)
-> (2026-04-08). Crate versions are intentionally decoupled from the v1.x tag
+> **Release status:** [v1.4.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.4.0) is a published GitHub Release (2026-07-30). v1.3.0 remains a git tag with **no** GitHub Release. The previous published release before this epoch was [v1.2.5](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.2.5) (2026-04-08). Crate versions are intentionally decoupled from the v1.x tag
 > series: workspace member crates are at 0.2.x and the `frankensearch` facade
 > crate at 0.3.2 while the repo tag series continues at v1.x.
+>
+> This section was originally drafted as "Unreleased — proposed v1.4.0" before the tag shipped; the body is the v1.4.0 reconstruction and is kept here as the version row.
 
 ### Post-publication scope correction — 2026-07-30
 
