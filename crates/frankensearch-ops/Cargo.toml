@@ -83,8 +83,8 @@ frankensearch-tui = { workspace = true }
 # `AsyncConnection`'s native dedicated-worker `*_sync` entry points; no private
 # executor or compatibility wrapper is involved. `async-api` is not a default
 # feature.
-fsqlite = { version = "0.3.1", features = ["async-api"] }
-fsqlite-types = "0.3.1"
+fsqlite = { version = "0.3.7", features = ["async-api"] }
+fsqlite-types = "0.3.7"
 
 # Terminal UI rendering (FrankenTUI)
 ftui-core = { workspace = true }
