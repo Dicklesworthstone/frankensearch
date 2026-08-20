@@ -33,6 +33,7 @@ use std::time::Instant;
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::generation::ArtifactGenerationIdentityV1;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
+use hnsw_rs::hnswio::ReloadOptions;
 use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo, Neighbour, PointId};
 use serde::{Deserialize, Serialize};
 
@@ -621,16 +622,21 @@ impl HnswIndex {
 
         // `HnswIo::load_hnsw` returns an `Hnsw` borrowed from the `HnswIo`
         // (`'a: 'b`), so to store it in the `'static` field we must keep the
-        // `HnswIo` alive for the program. With the default `ReloadOptions`
-        // (`datamap: false`) the `HnswIo` holds no bulk data — the graph and
-        // vectors are read into the returned `Hnsw`'s owned storage — so the
-        // leaked shell is only a couple of paths plus an `Arc`. Leaking it
-        // (rather than a self-referential struct or unsafe lifetime transmute)
-        // is the simplest sound way to obtain a `'static` graph, and the cost
-        // is negligible because a persisted load happens about once per
-        // process.
-        let native_io: &'static mut HnswIo =
-            Box::leak(Box::new(HnswIo::new(&sidecar_parent, &basename)));
+        // `HnswIo` alive for the program. Load the immutable data sidecar with
+        // `hnsw_rs`' read-only mmap mode: graph topology is still parsed and
+        // attested as owned state, while the duplicate vector payload remains
+        // file-backed instead of adding a second full vector heap to each cold
+        // query process. The existing generation receipt, local-regular-file
+        // checks, source identity, ordered ids, and vector fingerprint all run
+        // before this map is created. Leaking the reloader retains the map for
+        // exactly the graph lifetime without a self-referential struct or an
+        // unsafe lifetime transmute; the operating system releases it when the
+        // process exits.
+        let native_io: &'static mut HnswIo = Box::leak(Box::new(HnswIo::new_with_options(
+            &sidecar_parent,
+            &basename,
+            ReloadOptions::new(true),
+        )));
         let hnsw = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             // Moving the leaked mutable reference into a closure-local binding
             // makes this closure `FnOnce` and lets the parser's returned graph
