@@ -26,6 +26,15 @@ Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.6.0...ma
 
 114 non-merge commits after the v1.6.0 tag.
 
+### Delivered capability
+
+- Hash-control ranks stay off semantic fields through fuse/persist/explain/dashboard.
+- `UPGRADE_LOG.md` relocated to `docs/planning/`; skill-loop scratch untracked.
+
+### Closed workstreams
+
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankensearch/blob/main/.beads/issues.jsonl).
+
 ### Janitor docs-reorg (2026-08-19)
 
 - Untracked skill-loop scratch and ignored the workspace pattern ([`0980a48242d89d100058fc1d15d8fa5ac7c303f9`](https://github.com/Dicklesworthstone/frankensearch/commit/0980a48242d89d100058fc1d15d8fa5ac7c303f9)).
