@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::generation::ArtifactGenerationIdentityV1;
@@ -36,6 +36,7 @@ use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use hnsw_rs::hnswio::ReloadOptions;
 use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo, Neighbour, PointId};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::recall_certificate::{EfCalibration, calibrate_certified_ef};
 use crate::{SHA256_BYTES, VectorIndex};
@@ -83,11 +84,13 @@ impl Default for HnswConfig {
 /// graphs built with the dimension-aware `DistDot` roundoff budget; v4 replaces
 /// the sampled source fingerprint with a digest of every live vector; v5 records
 /// the exact native sidecar generation and basename selected during publication;
-/// v6 attests point/layer invariants after build and native load. Older native
-/// graphs must be rebuilt under the current persistence contract.
-pub(crate) const HNSW_META_FORMAT_CURRENT: u32 = 6;
+/// v6 attests point/layer invariants after build and native load; v7 binds the
+/// graph to the complete source FSVI image and uses the published sidecar
+/// witness on the hot path. Older native graphs must be rebuilt under the
+/// current persistence contract.
+pub(crate) const HNSW_META_FORMAT_CURRENT: u32 = 7;
 
-const HNSW_GENERATION_RECEIPT_VERSION: u32 = 1;
+const HNSW_GENERATION_RECEIPT_VERSION: u32 = 2;
 const HNSW_GENERATION_RECEIPT_FILENAME: &str = ".frankensearch-hnsw-ready.json";
 const HNSW_GENERATION_RECEIPT_MAX_BYTES: usize = 64 * 1024;
 const HNSW_SAVE_LOCK_DIRECTORY: &str = ".frankensearch-hnsw-save-locks";
@@ -147,6 +150,14 @@ struct HnswMeta {
     /// [`HnswSourceIdentityV1::admits`].
     #[serde(default)]
     source_identity: Option<HnswSourceIdentityV1>,
+    /// SHA-256 binding to the complete immutable source FSVI image.
+    ///
+    /// This is required for current-format native loading even when the source
+    /// is legacy FSVI v1 and therefore has no generation identity. It covers
+    /// the raw vectors, document records, and tombstone state in one pass at
+    /// graph build/load time, avoiding per-query f32 materialization.
+    #[serde(default)]
+    source_image: Option<HnswSourceImageV1>,
 }
 
 /// The source-generation identity a persisted ANN sidecar is bound to.
@@ -209,6 +220,37 @@ impl HnswSourceIdentityV1 {
     }
 }
 
+/// Full-image binding for a source FSVI that may not have v2 generation
+/// metadata. The digest is over the complete mapped FSVI byte image; sources
+/// with a live WAL are deliberately not eligible because the WAL is not part
+/// of that immutable image.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HnswSourceImageV1 {
+    image_sha256: [u8; SHA256_BYTES],
+}
+
+impl HnswSourceImageV1 {
+    fn capture(index: &VectorIndex) -> Option<Self> {
+        if !index.wal_entries.is_empty() {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&*index.data);
+        Some(Self {
+            image_sha256: hasher.finalize().into(),
+        })
+    }
+
+    fn admits(persisted: Option<&Self>, live: Option<&Self>) -> bool {
+        match (persisted, live) {
+            (None, None) => true,
+            (Some(persisted), Some(live)) => persisted == live,
+            _ => false,
+        }
+    }
+}
+
 /// Durable proof that an immutable native generation finished writing before
 /// metadata publication was attempted. A later save can validate and reuse the
 /// generation after an interrupted or failed publication without deleting it
@@ -234,6 +276,9 @@ struct HnswGenerationReceipt {
     /// a bound graph: see [`HnswSourceIdentityV1::admits`].
     #[serde(default)]
     source_identity: Option<HnswSourceIdentityV1>,
+    /// Full-image source binding for current-format native loading.
+    #[serde(default)]
+    source_image: Option<HnswSourceImageV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +286,11 @@ struct HnswGenerationReceipt {
 struct HnswSidecarDigest {
     byte_len: u64,
     fnv1a64: u64,
+    /// Stable mutation witness captured after the full build-time digest.
+    /// Current native loads compare it before parsing; maintenance/reuse paths
+    /// still recompute `fnv1a64` in full.
+    #[serde(default)]
+    modified_unix_nanos: u64,
 }
 
 #[derive(Debug)]
@@ -250,6 +300,16 @@ struct ValidatedHnswGeneration {
     graph: PathBuf,
     /// Identity recorded in the generation's own receipt (`bd-21zyj`).
     source_identity: Option<HnswSourceIdentityV1>,
+    source_image: Option<HnswSourceImageV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HnswReceiptValidation {
+    /// Re-hash both sidecars before reusing a staged generation for publication.
+    FullDigest,
+    /// Hot query path: use the immutable-generation witness, then let the
+    /// native parser and topology attestation reject malformed sidecars.
+    FastWitness,
 }
 
 /// How an HNSW load obtained its in-memory graph.
@@ -343,6 +403,10 @@ pub struct HnswIndex {
     /// Exact identity of the source FSVI generation, when it has one
     /// (`bd-r65a`). `None` for a legacy v1 source with no identity to bind.
     source_identity: Option<HnswSourceIdentityV1>,
+    /// Full-image binding for an immutable source FSVI. This lets legacy FSVI
+    /// v1 sources prove the graph still belongs to their exact bytes without
+    /// materializing every vector on the native query path.
+    source_image: Option<HnswSourceImageV1>,
     /// Whether this graph instance has already warned about an underfill.
     ///
     /// Graph instances are per-generation (rebuilt on reload), so gating the
@@ -387,6 +451,7 @@ impl HnswIndex {
         // Bind the graph to the exact generation it was built from, so a later
         // load cannot serve it against a different one (bd-r65a).
         ann.source_identity = HnswSourceIdentityV1::capture(index);
+        ann.source_image = HnswSourceImageV1::capture(index);
         ann.source_record_count = index.record_count();
         ann.source_positions = live_positions
             .into_iter()
@@ -404,10 +469,11 @@ impl HnswIndex {
     /// Load an ANN index from disk, rebuilding the graph from `source_index` when
     /// the native graph/data pair is legacy, stale, missing, or corrupt.
     ///
-    /// The source index validates the persisted document sequence and vector
-    /// fingerprint. A fallback rebuild reads every live row from that same
-    /// source, preserving row-to-vector alignment even when document IDs are
-    /// not unique.
+    /// Current native graphs bind to the complete immutable source image;
+    /// manually assembled graphs retain the legacy document-sequence and
+    /// vector-fingerprint checks. A fallback rebuild reads every live row from
+    /// that same source, preserving row-to-vector alignment even when document
+    /// IDs are not unique.
     ///
     /// # Errors
     ///
@@ -421,12 +487,13 @@ impl HnswIndex {
     /// `source_index`, without ever rebuilding it.
     ///
     /// `Ok(Some(index))` proves the current native graph/data generation,
-    /// digest receipt, ordered document IDs, vector fingerprint, dimension,
-    /// and topology all match `source_index`. `Ok(None)` means the metadata is
-    /// readable but the selected graph is legacy, stale, incomplete, corrupt,
-    /// or otherwise not admissible as that native artifact. This method never
-    /// scans source rows to construct a replacement graph and never writes,
-    /// replaces, renames, or changes permissions or mtimes.
+    /// receipt, source-image binding (or the legacy ordered-ID and vector
+    /// fingerprint checks), dimension, and topology all match `source_index`.
+    /// `Ok(None)` means the metadata is readable but the selected graph is
+    /// legacy, stale, incomplete, corrupt, or otherwise not admissible as that
+    /// native artifact. This method never scans source rows to construct a
+    /// replacement graph and never writes, replaces, renames, or changes
+    /// permissions or mtimes.
     ///
     /// # Errors
     ///
@@ -465,8 +532,8 @@ impl HnswIndex {
 
         // Current format: deserialize the prebuilt native graph directly, skipping the
         // O(n log n) rebuild. Any problem (missing/corrupt sidecars, point-count
-        // mismatch, or stale vector fingerprint) returns None and we fall
-        // through to the rebuild path, so a bad graph sidecar degrades to
+        // mismatch, or stale source binding) returns None and we fall through
+        // to the rebuild path, so a bad graph sidecar degrades to
         // "slow load" rather than a hard failure.
         if meta.format_version == HNSW_META_FORMAT_CURRENT
             && let Some(index) = Self::try_load_native_graph(path, &meta, source_index)
@@ -518,11 +585,9 @@ impl HnswIndex {
     /// - the `.hnsw.graph` / `.hnsw.data` sidecars are absent,
     /// - `hnsw_rs` fails to deserialize them,
     /// - the loaded point count disagrees with the metadata `doc_ids`,
-    /// - the metadata `doc_ids` disagree with the live `VectorIndex`'s
-    ///   doc-id sequence (live tombstones excluded),
-    /// - the persisted vector fingerprint disagrees with the live
-    ///   `VectorIndex`'s fingerprint (i.e. vectors were swapped behind the
-    ///   same doc ids — the case the prompt explicitly calls out).
+    /// - the current-format source-image binding disagrees with the immutable
+    ///   live FSVI, or a manually assembled graph fails its legacy doc-id and
+    ///   vector-fingerprint checks.
     fn try_load_native_graph(
         path: &Path,
         meta: &HnswMeta,
@@ -543,6 +608,9 @@ impl HnswIndex {
             meta.vector_fingerprint,
             meta.dimension,
             meta.config,
+            meta.source_identity.as_ref(),
+            meta.source_image.as_ref(),
+            HnswReceiptValidation::FastWitness,
         ) {
             Ok(Some(validated)) => validated,
             Ok(None) => {
@@ -590,34 +658,45 @@ impl HnswIndex {
             return None;
         }
 
-        // Validate doc-id sequence against the live VectorIndex *before*
-        // touching the (potentially expensive) hnsw_rs load.
-        if !meta_matches_live_doc_ids(meta, source_index).ok()? {
-            tracing::warn!(
-                path = %path.display(),
-                "HNSW sidecar doc_ids disagree with live VectorIndex; native load unavailable"
-            );
-            return None;
-        }
-
-        // Validate the vector-content fingerprint against the live VectorIndex.
-        // This is the critical stale-vectors guard: if a caller swaps the FSVI
-        // contents while keeping the same doc IDs in the same order, the
-        // persisted graph would otherwise silently serve hits against vectors
-        // that no longer exist. `try_load_native_graph` is only called for the
-        // current format, so a missing fingerprint cannot be treated as a
-        // legacy exception: 0 is compared like any other digest value.
-        let live_fp =
-            fingerprint_live_vector_index(source_index, meta.doc_ids.len(), meta.dimension).ok()?;
-        if live_fp != meta.vector_fingerprint {
-            tracing::warn!(
-                path = %path.display(),
-                expected = meta.vector_fingerprint,
-                actual = live_fp,
-                "HNSW sidecar vector fingerprint disagrees with live VectorIndex \
-                 (vectors swapped behind matching doc ids); native load unavailable"
-            );
-            return None;
+        // A v7 source image is a complete FSVI byte binding. It covers ordered
+        // ids, raw vectors, and tombstones in one linear file-backed pass,
+        // replacing the former row-by-row f32 conversion. Graphs produced by
+        // generic `build_from_parts` have no such image and deliberately keep
+        // the older full content verification path.
+        let live_image = HnswSourceImageV1::capture(source_index);
+        if meta.source_image.is_some() {
+            if !HnswSourceImageV1::admits(meta.source_image.as_ref(), live_image.as_ref()) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "HNSW sidecar source-image digest disagrees with live VectorIndex; \
+                     native load unavailable"
+                );
+                return None;
+            }
+        } else {
+            // Preserve the pre-v7 content checks for callers without a stable
+            // source image. This is slower but retains the public API's
+            // fail-closed behavior for manually constructed graphs.
+            if !meta_matches_live_doc_ids(meta, source_index).ok()? {
+                tracing::warn!(
+                    path = %path.display(),
+                    "HNSW sidecar doc_ids disagree with live VectorIndex; native load unavailable"
+                );
+                return None;
+            }
+            let live_fp =
+                fingerprint_live_vector_index(source_index, meta.doc_ids.len(), meta.dimension)
+                    .ok()?;
+            if live_fp != meta.vector_fingerprint {
+                tracing::warn!(
+                    path = %path.display(),
+                    expected = meta.vector_fingerprint,
+                    actual = live_fp,
+                    "HNSW sidecar vector fingerprint disagrees with live VectorIndex \
+                     (vectors swapped behind matching doc ids); native load unavailable"
+                );
+                return None;
+            }
         }
 
         // `HnswIo::load_hnsw` returns an `Hnsw` borrowed from the `HnswIo`
@@ -626,12 +705,11 @@ impl HnswIndex {
         // `hnsw_rs`' read-only mmap mode: graph topology is still parsed and
         // attested as owned state, while the duplicate vector payload remains
         // file-backed instead of adding a second full vector heap to each cold
-        // query process. The existing generation receipt, local-regular-file
-        // checks, source identity, ordered ids, and vector fingerprint all run
-        // before this map is created. Leaking the reloader retains the map for
-        // exactly the graph lifetime without a self-referential struct or an
-        // unsafe lifetime transmute; the operating system releases it when the
-        // process exits.
+        // query process. The generation receipt, local-regular-file checks,
+        // and source binding all run before this map is created. Leaking the
+        // reloader retains the map for exactly the graph lifetime without a
+        // self-referential struct or an unsafe lifetime transmute; the
+        // operating system releases it when the process exits.
         let native_io: &'static mut HnswIo = Box::leak(Box::new(HnswIo::new_with_options(
             &sidecar_parent,
             &basename,
@@ -694,6 +772,7 @@ impl HnswIndex {
             config: meta.config,
             vector_fingerprint: meta.vector_fingerprint,
             source_identity: meta.source_identity.clone(),
+            source_image: meta.source_image.clone(),
         })
     }
 
@@ -807,6 +886,7 @@ impl HnswIndex {
             dimension: self.dimension,
             config: self.config,
             source_identity: self.source_identity.clone(),
+            source_image: self.source_image.clone(),
             graph: fingerprint_hnsw_sidecar(&graph_path)?,
             data: fingerprint_hnsw_sidecar(&data_path)?,
         };
@@ -835,6 +915,7 @@ impl HnswIndex {
             sidecar_generation: Some(generation.to_owned()),
             sidecar_basename: Some(basename.to_owned()),
             source_identity: self.source_identity.clone(),
+            source_image: self.source_image.clone(),
         }
     }
 
@@ -1541,6 +1622,7 @@ impl HnswIndex {
             config,
             vector_fingerprint,
             source_identity: None,
+            source_image: None,
         })
     }
 }
@@ -2296,6 +2378,9 @@ fn reusable_hnsw_generation(
         index.vector_fingerprint,
         index.dimension,
         index.config,
+        index.source_identity.as_ref(),
+        index.source_image.as_ref(),
+        HnswReceiptValidation::FullDigest,
     )?
     else {
         return Ok(None);
@@ -2322,6 +2407,16 @@ fn reusable_hnsw_generation(
             receipt_bound = validated.source_identity.is_some(),
             graph_bound = index.source_identity.is_some(),
             "ignoring HNSW READY generation dumped from a different source generation"
+        );
+        return Ok(None);
+    }
+    if !HnswSourceImageV1::admits(validated.source_image.as_ref(), index.source_image.as_ref()) {
+        tracing::debug!(
+            path = %metadata_path.display(),
+            generation = %generation_path.display(),
+            receipt_bound = validated.source_image.is_some(),
+            graph_bound = index.source_image.is_some(),
+            "ignoring HNSW READY generation dumped from a different source image"
         );
         return Ok(None);
     }
@@ -2361,6 +2456,9 @@ fn validate_hnsw_generation_receipt(
     vector_fingerprint: u64,
     dimension: usize,
     config: HnswConfig,
+    source_identity: Option<&HnswSourceIdentityV1>,
+    source_image: Option<&HnswSourceImageV1>,
+    validation: HnswReceiptValidation,
 ) -> SearchResult<Option<ValidatedHnswGeneration>> {
     let Some(generation_name) = generation_path.file_name().and_then(|name| name.to_str()) else {
         return Ok(None);
@@ -2421,6 +2519,8 @@ fn validate_hnsw_generation_receipt(
         || receipt.vector_fingerprint != vector_fingerprint
         || receipt.dimension != dimension
         || receipt.config != config
+        || !HnswSourceIdentityV1::admits(receipt.source_identity.as_ref(), source_identity)
+        || !HnswSourceImageV1::admits(receipt.source_image.as_ref(), source_image)
     {
         return Ok(None);
     }
@@ -2431,9 +2531,17 @@ fn validate_hnsw_generation_receipt(
     if !native_sidecar_pair_is_local(metadata_path, generation_path, &graph, &data) {
         return Ok(None);
     }
-    if fingerprint_hnsw_sidecar(&graph)? != receipt.graph
-        || fingerprint_hnsw_sidecar(&data)? != receipt.data
-    {
+    let sidecars_match = match validation {
+        HnswReceiptValidation::FullDigest => {
+            fingerprint_hnsw_sidecar(&graph)? == receipt.graph
+                && fingerprint_hnsw_sidecar(&data)? == receipt.data
+        }
+        HnswReceiptValidation::FastWitness => {
+            hnsw_sidecar_matches_witness(&graph, &receipt.graph)?
+                && hnsw_sidecar_matches_witness(&data, &receipt.data)?
+        }
+    };
+    if !sidecars_match {
         return Ok(None);
     }
 
@@ -2441,6 +2549,7 @@ fn validate_hnsw_generation_receipt(
         generation: generation_name,
         basename,
         source_identity: receipt.source_identity.clone(),
+        source_image: receipt.source_image.clone(),
         graph,
     }))
 }
@@ -2778,10 +2887,45 @@ fn fingerprint_hnsw_sidecar(path: &Path) -> SearchResult<HnswSidecarDigest> {
         })?;
         fingerprint = fnv1a_update(fingerprint, &buffer[..read]);
     }
+    let modified_unix_nanos = file
+        .metadata()
+        .map_err(SearchError::Io)?
+        .modified()
+        .map_err(SearchError::Io)?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?
+        .as_nanos()
+        .try_into()
+        .map_err(|_| {
+            SearchError::Io(std::io::Error::other(
+                "HNSW sidecar mtime exceeds u64 nanos",
+            ))
+        })?;
     Ok(HnswSidecarDigest {
         byte_len,
         fnv1a64: fingerprint,
+        modified_unix_nanos,
     })
+}
+
+fn hnsw_sidecar_matches_witness(path: &Path, expected: &HnswSidecarDigest) -> SearchResult<bool> {
+    let metadata = std::fs::symlink_metadata(path).map_err(SearchError::Io)?;
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    let modified_unix_nanos: u64 = metadata
+        .modified()
+        .map_err(SearchError::Io)?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?
+        .as_nanos()
+        .try_into()
+        .map_err(|_| {
+            SearchError::Io(std::io::Error::other(
+                "HNSW sidecar mtime exceeds u64 nanos",
+            ))
+        })?;
+    Ok(metadata.len() == expected.byte_len && modified_unix_nanos == expected.modified_unix_nanos)
 }
 
 /// Feed an `&[f32]` into the FNV-1a state in little-endian byte order without
@@ -5673,6 +5817,7 @@ mod tests {
             sidecar_generation: Some(retained_generation.to_owned()),
             sidecar_basename: Some("vector.fast".to_owned()),
             source_identity: None,
+            source_image: None,
         };
         gc_superseded_hnsw_generations(&parent, "vector.fast", &metadata)
             .expect("GC must skip generation-named symlinks");
@@ -5819,6 +5964,7 @@ mod tests {
             sidecar_generation: None,
             sidecar_basename: None,
             source_identity: None,
+            source_image: None,
         };
         std::fs::write(
             &legacy_path,
@@ -6213,6 +6359,17 @@ mod tests {
         swapped_vectors[7] = normalized_vector(99, 32);
         let swapped_path = temp_path("persist_swap_after", "fsvi");
         let swapped_index = write_index(&swapped_path, &swapped_vectors).expect("swapped");
+
+        // The v7 source-image binding must reject this directly, before any
+        // caller can choose a permissive rebuild fallback. This keeps the
+        // legacy FSVI v1 case fail-closed without re-materializing every
+        // vector just to prove the image changed.
+        assert!(
+            HnswIndex::try_load_native(&save_path, &swapped_index)
+                .expect("inspect stale native graph")
+                .is_none(),
+            "source-image binding must reject vectors swapped beneath matching doc ids"
+        );
 
         // Copy the metadata + graph + data sidecars next to the swapped FSVI
         // so the load path's directory layout is plausible.
