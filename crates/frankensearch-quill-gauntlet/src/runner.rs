@@ -5526,6 +5526,16 @@ impl DifferentialCampaignRunner {
                 ArtifactOracleDependency::DiagnosticUnspecified
             }
             CampaignAdmission::BuiltInEvidence(profile) => {
+                // ArtifactStore v4 F1: typed evidence cannot start without the
+                // sealed Source-to-Build chain. The omission is rejected before
+                // any environment-dependent admission check so the failure is
+                // deterministic wherever the campaign runs, and it precedes
+                // execution authentication by construction.
+                if v4_source_build_binding.is_none() {
+                    return Err(campaign_error(
+                        "typed built-in evidence requires an attached ArtifactStore v4 Source-to-Build chain; collect one with with_collected_v4_source_build_snapshots before running",
+                    ));
+                }
                 engines.bind_builtin_profile(profile.clone())?;
                 producer_build_identity.validate_builtin_engines(&engines)?;
                 engines.validate_builtin_contract()?;
@@ -16156,7 +16166,9 @@ mod tests {
             DivergenceRegistry::default(),
         )
         .expect("CASS production rank-envelope policy")
-        .with_provenance(provenance);
+        .with_provenance(provenance)
+        .with_v4_source_build_snapshots(fixture_v4_source_build_snapshots())
+        .expect("attach fixture v4 Source-to-Build chain");
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let report = campaign
                 .run_cass_quill_tantivy_evidence(
@@ -16183,6 +16195,63 @@ mod tests {
             assert_eq!(
                 report.engines.oracle.config_hash,
                 crate::engine::CASS_TANTIVY_ORACLE_CONFIG_HASH
+            );
+        });
+    }
+
+    /// `ArtifactStore` v4 F1 planted negative: the same admissible CASS campaign
+    /// minus the Source-to-Build chain must be rejected with the chain-omission
+    /// reason (not a later checkout or provenance error) and must never reach
+    /// run reservation. The reason pin is what makes this a discriminator: in
+    /// a dirty or Git-less environment the run would otherwise fail later for
+    /// an unrelated reason and a reason-free assertion would pass vacuously.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn typed_evidence_without_v4_source_build_chain_is_rejected_before_reservation() {
+        let fixture = make_cass_activation_fixture();
+        let semantic_contract = SemanticContract::cass();
+        let config = CampaignConfig {
+            selection: CampaignSelection::CassSyntax,
+            contract_mode: CampaignContractMode::RankEnvelopeOnly,
+            require_provenance: true,
+            index_batch_size: 5,
+            snippet_max_chars: None,
+            ..CampaignConfig::default()
+        };
+        let provenance = fixture_provenance(&fixture, &config, &semantic_contract);
+        let (mut subject, mut oracle) = live_cass_campaign_engines();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(&root),
+            semantic_contract,
+            config,
+            DivergenceRegistry::default(),
+        )
+        .expect("CASS production rank-envelope policy")
+        .with_provenance(provenance);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = campaign
+                .run_cass_quill_tantivy_evidence(
+                    &cx,
+                    "cass-missing-v4-chain",
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                )
+                .await
+                .expect_err("typed evidence without a v4 Source-to-Build chain must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires an attached ArtifactStore v4 Source-to-Build chain"),
+                "unexpected fail-closed reason: {error}"
+            );
+            assert!(
+                !root.join("campaigns").exists(),
+                "no campaign run may be reserved when the v4 chain is missing"
             );
         });
     }
@@ -16643,9 +16712,15 @@ mod tests {
         });
     }
 
-    #[test]
-    fn runner_persists_v4_source_build_binding_before_campaign_reservation() {
-        let fixture = make_fixture();
+    /// A minimal, structurally valid `ArtifactStore` v4 Source-to-Build chain.
+    ///
+    /// It describes one synthetic `Cargo.lock`, not the producer that runs the
+    /// test: campaigns that exercise reservation/report mechanics attach it so
+    /// the typed-evidence chain obligation is satisfied without claiming that
+    /// the test executable is a kernel-held, Git-verified producer. Live
+    /// producer collection stays the job of
+    /// `DifferentialCampaignRunner::with_collected_v4_source_build_snapshots`.
+    fn fixture_v4_source_build_snapshots() -> ArtifactStoreV4SourceBuildSnapshots {
         let source = crate::artifact::ArtifactStoreV4SourceSnapshot::new(vec![
             crate::artifact::ArtifactStoreV4SourceEntry {
                 relative_path: "Cargo.lock".to_owned(),
@@ -16671,8 +16746,13 @@ mod tests {
             }],
         )
         .expect("construct Build snapshot");
-        let snapshots =
-            ArtifactStoreV4SourceBuildSnapshots::new(source, build).expect("bind Source to Build");
+        ArtifactStoreV4SourceBuildSnapshots::new(source, build).expect("bind Source to Build")
+    }
+
+    #[test]
+    fn runner_persists_v4_source_build_binding_before_campaign_reservation() {
+        let fixture = make_fixture();
+        let snapshots = fixture_v4_source_build_snapshots();
         let expected_snapshots = snapshots.clone();
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("gauntlet");
@@ -23369,7 +23449,9 @@ mod tests {
             DivergenceRegistry::default(),
         )
         .expect("live campaign runner")
-        .with_provenance(provenance);
+        .with_provenance(provenance)
+        .with_v4_source_build_snapshots(fixture_v4_source_build_snapshots())
+        .expect("attach fixture v4 Source-to-Build chain");
         campaign
             .run_quill_tantivy_evidence(
                 cx,
@@ -23413,7 +23495,9 @@ mod tests {
             DivergenceRegistry::default(),
         )
         .expect("live CASS campaign runner")
-        .with_provenance(provenance);
+        .with_provenance(provenance)
+        .with_v4_source_build_snapshots(fixture_v4_source_build_snapshots())
+        .expect("attach fixture v4 Source-to-Build chain");
         campaign
             .run_cass_quill_tantivy_evidence(
                 cx,
