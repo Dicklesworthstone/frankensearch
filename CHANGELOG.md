@@ -4,13 +4,14 @@ All notable changes to [frankensearch](https://github.com/Dicklesworthstone/fran
 
 Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/frankensearch/releases) unless noted otherwise. Tags that share a commit with another release are called out explicitly. Each entry links to representative commits using full commit URLs.
 
-Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) (2026-08-14) through HEAD on 2026-08-19 ([`450fc2cfc1be20851678d35313681d1336edceab`](https://github.com/Dicklesworthstone/frankensearch/commit/450fc2cfc1be20851678d35313681d1336edceab)), plus missing version rows for the 1.4.x / 1.5.0 spine that shipped after the old "proposed v1.4.0" draft. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.** v1.4.0, v1.4.3, v1.5.0, and v1.6.0 are published Releases.
+Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) (2026-08-14) through [v1.7.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.7.0) (2026-08-21), plus missing version rows for the 1.4.x / 1.5.0 spine that shipped after the old "proposed v1.4.0" draft. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.** v1.4.0, v1.4.3, v1.5.0, v1.6.0, and v1.7.0 are published Releases.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.6.0...main) | HEAD | 2026-08-19 | Hash-control fuse follow-through, Quill CASS ingest, janitor docs-reorg |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.7.0...main) | HEAD | 2026-08-21 | (no post-1.7.0 changes yet) |
+| [v1.7.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.7.0) | Release | 2026-08-21 | Registry refresh (FrankenSQLite 0.3.7, Asupersync 0.4.9, fastembed 6), hash-control fuse follow-through, Quill CASS ingest |
 | [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) | Release | 2026-08-14 | Hash control no longer presented as semantic search |
 | [v1.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.5.0) | Release | 2026-08-05 | Multi-platform assets; remedy for #31 |
 | [v1.4.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.4.3) | Release | 2026-08-02 | First complete release since v1.2.5 |
@@ -20,16 +21,34 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 ---
 
-## [Unreleased] -- development on `main` since [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) (as of 2026-08-19)
+## [Unreleased] -- development on `main` since [v1.7.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.7.0)
 
-Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.6.0...main>
+Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.7.0...main>
 
-114 non-merge commits after the v1.6.0 tag.
+No post-1.7.0 changes yet.
+
+---
+
+## [1.7.0] -- 2026-08-21
+
+Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.6.0...v1.7.0>
+
+fsfs 1.7.0. About 125 non-merge commits after the v1.6.0 tag.
 
 ### Delivered capability
 
+- Every direct dependency sits at its crates.io latest: FrankenSQLite 0.3.7, Asupersync 0.4.9, fastembed 6.0.0, jsonschema 0.50 (see below).
 - Hash-control ranks stay off semantic fields through fuse/persist/explain/dashboard.
+- Quill schema-general CASS ingest path with conversation-scoped identity.
 - `UPGRADE_LOG.md` relocated to `docs/planning/`; skill-loop scratch untracked.
+
+### Dependency refresh (2026-08-21)
+
+- FrankenSQLite family 0.3.1 → 0.3.7 across storage / durability / fsfs / ops ([`8382ec3e`](https://github.com/Dicklesworthstone/frankensearch/commit/8382ec3e), [`4d701c40`](https://github.com/Dicklesworthstone/frankensearch/commit/4d701c40)). Brings the GH#366 `ReservedEmpty` reopen fix, GH#370 orphaned FTS5 `%_content` reclaim, GH#371 bounded WITHOUT-ROWID teardown, and GH#244 attached-schema transaction writes. All 20 `fsqlite*` lock entries move together.
+- Asupersync 0.4.5 → 0.4.9 in lockstep with `franken-kernel` / `franken-decision` / `franken-evidence`; the fresh-process contract pin now binds `asupersync@0.4.9` ([`4d701c40`](https://github.com/Dicklesworthstone/frankensearch/commit/4d701c40)).
+- fastembed `=5.17.4` → `=6.0.0` on the rustls ORT path; the only upstream break (typed `fastembed::Error`) needs no call-site change ([`57650434`](https://github.com/Dicklesworthstone/frankensearch/commit/57650434)).
+- jsonschema 0.49 → 0.50 in quill-gauntlet and fsfs ([`b32a1087`](https://github.com/Dicklesworthstone/frankensearch/commit/b32a1087)).
+- Thirty semver-compatible transitive bumps via `cargo update`. Details: [`docs/planning/UPGRADE_LOG.md`](https://github.com/Dicklesworthstone/frankensearch/blob/main/docs/planning/UPGRADE_LOG.md).
 
 ### Closed workstreams
 
