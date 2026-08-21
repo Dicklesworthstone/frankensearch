@@ -113,7 +113,7 @@ memmap2 = "0.9"
 # Default features pull in native-tls and network stacks that transitively
 # depend on forbidden Tokio ecosystem crates. Keep only ORT's rustls-backed
 # binary acquisition path; model provisioning is owned by frankensearch.
-fastembed = { version = "=5.17.4", default-features = false, features = [
+fastembed = { version = "=6.0.0", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
 ] }
 safetensors = "0.8.0"
