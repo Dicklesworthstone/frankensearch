@@ -608,14 +608,21 @@ mod tests {
     }
 
     fn index_exists(conn: &AsyncConnection, table_name: &str, index_name: &str) -> bool {
-        // Probe index existence via INDEXED BY hint instead of querying
-        // sqlite_master: FrankenSQLite's VDBE cannot open a storage
-        // cursor on sqlite_master's btree root page. If the index
-        // doesn't exist, the query errors with "no such index".
-        conn.query_sync(&format!(
-            "SELECT 1 FROM \"{table_name}\" INDEXED BY \"{index_name}\" LIMIT 0"
-        ))
-        .is_ok()
+        // Ask the schema catalog directly. The former `INDEXED BY` probe
+        // was not stock-conformant: SQLite, and FrankenSQLite since 0.3.7,
+        // reject `INDEXED BY` on a partial index when the query does not
+        // carry the index's WHERE predicate ("no query solution"), so every
+        // partial index read as missing.
+        let params = [
+            SqliteValue::Text(table_name.to_owned().into()),
+            SqliteValue::Text(index_name.to_owned().into()),
+        ];
+        conn.query_with_params_sync(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 AND name = ?2",
+            &params,
+        )
+        .map(|rows| !rows.is_empty())
+        .unwrap_or(false)
     }
 
     fn seed_historical_schema(conn: &AsyncConnection, version: i64) {
