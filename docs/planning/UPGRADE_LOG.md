@@ -1,5 +1,45 @@
 # Dependency Upgrade Log
 
+## 2026-08-21 — Registry refresh: FrankenSQLite 0.3.7, Asupersync 0.4.9, fastembed 6, jsonschema 0.50
+
+**Scope:** owner-directed refresh of every direct dependency to its crates.io
+latest (bd-r0ar1, bd-lnexf). Verified on remote workers: `cargo check
+--workspace --all-targets`, `cargo clippy --workspace --all-targets -D
+warnings`, the fastembed-gated clippy lane for embed + rerank, and the
+workspace test suite. No frankensearch call-site change was needed.
+
+- **FrankenSQLite 0.3.1 → 0.3.7** (storage / durability / fsfs / ops pins).
+  Ships the fixes surfaced by the cass/frankensearch cross-repo triage:
+  GH#366 `ReservedEmpty` reopen of a coherent populated file, GH#370
+  orphaned FTS5 `%_content` reclaim, GH#371 bounded WITHOUT-ROWID / large
+  `DROP` teardown memory, GH#244 attached-schema writes inside explicit
+  transactions, plus the bd-xv5cm concurrency-hardening facets. The public
+  surface we use (`AsyncConnection`, `FrankenError`, `Row`,
+  `ConnectionEnv`, `raptorq_integration::*`, `Fts5Table`/`snippet`,
+  `cx::Cx`, `value::SqliteValue`) is unchanged. Note: a selective
+  `cargo update -p fsqlite` left seven sub-crates (btree/mvcc/pager/
+  planner/vdbe/vfs/wal) on 0.3.1 because upstream's internal pins are
+  caret `0.3`; the whole 20-crate family must be moved together.
+- **Asupersync 0.4.5 → 0.4.9** (lockfile only; workspace floor stays
+  `>=0.4.4, <0.5`). `asupersync-macros`, `franken-kernel`,
+  `franken-decision`, `franken-evidence` move in lockstep; exactly one
+  `asupersync` identity resolves. The fresh-process contract pin in
+  `frankensearch-embed/tests/scoped_logging_contract.rs` now binds
+  `asupersync@0.4.9` (it deliberately fails on silent lock drift).
+- **fastembed =5.17.4 → =6.0.0.** Sole upstream break: `fastembed::Error`
+  became a typed enum instead of an `anyhow::Error` alias. Every
+  frankensearch consumer formats it through `Display`, so no change; the
+  `ort-download-binaries-rustls-tls` feature and the `ort =2.0.0-rc.13` pin
+  are identical in 6.0.0. Model-bearing tests remain a local/feature lane.
+- **jsonschema 0.49 → 0.50** (quill-gauntlet, fsfs). 0.50's changes are
+  confined to the `CanonicalSchema` set-operation API, which we do not use
+  (`draft202012::new` + `Validator` only).
+- **Transitive in-range sweep** (`cargo update`): 30 semver-compatible
+  bumps (ICU 2.3 family, blake3, cc, either, rangemap, safe_arch, uuid,
+  zerovec …); `arrayref` dropped. Git pins (frankentorch `ft-*`, the
+  `hnsw_rs` fork rev, the tantivy 0.27.0 rev) are deliberate packaging
+  boundaries and were left alone.
+
 ## 2026-08-14 — Asupersync 0.4.4 lockstep + FrankenSQLite 0.3.1 usage
 
 **Scope:** workspace Asupersync floor is now `>=0.4.4, <0.5`. `Cargo.lock`
