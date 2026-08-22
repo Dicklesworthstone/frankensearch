@@ -3278,18 +3278,42 @@ fn evaluate_qg6(
         let joint_tail =
             current_evidence.and_then(|artifact| exact_qg6_joint_tail_cell(artifact, &fixture));
         if let Some(tail) = joint_tail {
-            let ci_low = tail.effect.p50_ci95_low_ratio;
-            let ci_high = tail.effect.p50_ci95_high_ratio;
+            let ci_low = tail.effect.p50_tost_low_ratio;
+            let ci_high = tail.effect.p50_tost_high_ratio;
             target.target_interval_ci(
                 ci_low,
                 ci_high,
                 0.90,
                 1.10,
                 format!(
-                    "QG-6 {fixture} joint true-leaf p50 ratio CI \
-                    [{ci_low:.6}, {ci_high:.6}] is not contained in [0.90, 1.10]"
+                    "QG-6 {fixture} joint true-leaf p50 TOST interval \
+                    [{ci_low:.6}, {ci_high:.6}] is not contained in [0.90, 1.10] at per-cell \
+                     alpha {}",
+                    crate::QG6_PER_CELL_ALPHA
                 ),
             );
+            if !tail.monte_carlo_stable {
+                target.state.quarantine(
+                    "perf.ratchet.qg6_monte_carlo_unstable",
+                    format!(
+                        "QG-6 {fixture} joint tail used {} replicates without stabilizing \
+                         effect-arm decision boundaries; PASS claims are inadmissible",
+                        tail.replicates_used,
+                    ),
+                );
+            }
+            if tail.effect.p99_ucb_ratio > crate::QG6_P99_UCB_LIMIT_RATIO {
+                target.state.quarantine(
+                    "perf.ratchet.qg6_p99_noninferiority_failed",
+                    format!(
+                        "QG-6 {fixture} joint true-leaf p99 one-sided UCB {:.6} exceeds the \
+                         oracle-parity limit {} at per-cell alpha {}",
+                        tail.effect.p99_ucb_ratio,
+                        crate::QG6_P99_UCB_LIMIT_RATIO,
+                        crate::QG6_PER_CELL_ALPHA,
+                    ),
+                );
+            }
             target.target_lower_ci(
                 tail.effect.p99_ci95_low_ratio,
                 tail.effect.p99_ci95_high_ratio,

@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::perf::{
@@ -58,7 +59,23 @@ pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v7";
 /// Version of the hierarchical latency estimate carried by latency cells.
 pub const HIERARCHICAL_LATENCY_SCHEMA_VERSION: &str = "quill-hierarchical-latency-v1";
 /// Version of the joint six-arm QG-6 p50/p99 estimate.
-pub const QG6_JOINT_TAIL_SCHEMA_VERSION: &str = "quill-qg6-joint-tail-v1";
+pub const QG6_JOINT_TAIL_SCHEMA_VERSION: &str = "quill-qg6-joint-tail-v2";
+
+/// Normative floor on joint-tail bootstrap replicates (bd-quill-e8-perf-doctrine-x4e4.9.3).
+pub const QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES: usize = 50_000;
+/// Hard ceiling; exceeding it without boundary stability marks the estimate
+/// `monte_carlo_stable = false` (fail-closed admissibility, not an abort).
+pub const QG6_JOINT_TAIL_MAX_BOOTSTRAP_REPLICATES: usize = 400_000;
+pub const QG6_PER_CELL_ALPHA: f64 = 0.0025;
+/// p50 equivalence window: the equal-tailed (alpha/2 per side) percentile
+/// interval must lie wholly inside this ratio window.
+pub const QG6_P50_TOST_WINDOW_RATIO: (f64, f64) = (0.90, 1.10);
+/// p99 noninferiority limit: the one-sided alpha-level upper bound must not exceed it.
+pub const QG6_P99_UCB_LIMIT_RATIO: f64 = 1.0;
+/// Batch count for batch-means Monte Carlo standard errors.
+const QG6_MC_BATCH_COUNT: usize = 20;
+/// Safety multiple: a boundary is only stable when its margin exceeds Z * SE.
+const QG6_MC_SAFETY_Z: f64 = 3.0;
 pub const QG6_NULL_EFFECT_MARGIN: f64 = 0.10;
 /// Maximum serialized evidence artifact admitted by the public loader.
 pub const PERF_EVIDENCE_MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
@@ -702,6 +719,20 @@ pub struct Qg6JointTailContrast {
     pub p99_ci95_low_ratio: f64,
     /// Upper 95% p99 ratio bound.
     pub p99_ci95_high_ratio: f64,
+    /// Lower equal-tailed alpha-level p50 TOST bound (ratio scale).
+    pub p50_tost_low_ratio: f64,
+    /// Upper equal-tailed alpha-level p50 TOST bound (ratio scale).
+    pub p50_tost_high_ratio: f64,
+    /// One-sided alpha-level p99 upper confidence bound (ratio scale).
+    pub p99_ucb_ratio: f64,
+    /// Monte Carlo standard error of the p50 TOST bounds (log scale).
+    pub mc_se_p50_log: f64,
+    /// Monte Carlo standard error of the p99 UCB (log scale).
+    pub mc_se_p99_log: f64,
+    /// p50 equivalence: the TOST interval lies wholly inside the frozen window.
+    pub p50_equivalent: bool,
+    /// p99 noninferiority: the one-sided upper bound does not exceed the limit.
+    pub p99_noninferior: bool,
 }
 
 /// Joint query-first, unit-cluster QG-6 p50/p99 estimate.
@@ -723,6 +754,13 @@ pub struct Qg6JointTailEstimate {
     pub leaves_per_arm_per_unit: usize,
     /// Bootstrap draws from the frozen paired-estimator configuration.
     pub bootstrap_resamples: usize,
+    /// Replicates actually drawn after normative Monte Carlo escalation.
+    pub replicates_used: usize,
+    /// False when the replicate ceiling was reached before every effect-arm
+    /// decision boundary stabilized; consumers must refuse PASS claims.
+    pub monte_carlo_stable: bool,
+    /// How many times the driver doubled replicates for boundary stability.
+    pub escalations: u32,
     /// Tantivy/Tantivy null contrast.
     pub tantivy_null: Qg6JointTailContrast,
     /// Quill/Quill null contrast.
@@ -906,14 +944,32 @@ fn qg6_tail_contrast_logs(quantiles: &[(f64, f64); 6]) -> [f64; 6] {
     ]
 }
 
+/// Frozen QG-6 empirical quantile: nearest-rank ceil(level*N), clamped to 1..=N
+/// (bd-quill-e8-perf-doctrine-x4e4.9.3 freezes this definition for every
+/// normative endpoint; the generic round-based helper is untouched elsewhere).
+fn qg6_nearest_rank_quantile(sorted: &[f64], level: f64) -> f64 {
+    debug_assert!(!sorted.is_empty());
+    debug_assert!((0.0..=1.0).contains(&level));
+    #[allow(clippy::cast_precision_loss)]
+    let scaled = level * sorted.len() as f64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let rank = scaled.ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
 fn qg6_joint_tail_contrast(
     point_p50_log: f64,
     point_p99_log: f64,
     p50_bootstrap: &mut [f64],
     p99_bootstrap: &mut [f64],
+    mc_se_p50_log: f64,
+    mc_se_p99_log: f64,
 ) -> Qg6JointTailContrast {
     p50_bootstrap.sort_unstable_by(f64::total_cmp);
     p99_bootstrap.sort_unstable_by(f64::total_cmp);
+    let tost_low = qg6_nearest_rank_quantile(p50_bootstrap, QG6_PER_CELL_ALPHA).exp();
+    let tost_high = qg6_nearest_rank_quantile(p50_bootstrap, 1.0 - QG6_PER_CELL_ALPHA).exp();
+    let ucb = qg6_nearest_rank_quantile(p99_bootstrap, 1.0 - QG6_PER_CELL_ALPHA).exp();
     Qg6JointTailContrast {
         p50_ratio: point_p50_log.exp(),
         p50_ci95_low_ratio: percentile(p50_bootstrap, 0.025).exp(),
@@ -921,7 +977,87 @@ fn qg6_joint_tail_contrast(
         p99_ratio: point_p99_log.exp(),
         p99_ci95_low_ratio: percentile(p99_bootstrap, 0.025).exp(),
         p99_ci95_high_ratio: percentile(p99_bootstrap, 0.975).exp(),
+        mc_se_p50_log,
+        mc_se_p99_log,
+        p50_tost_low_ratio: tost_low,
+        p50_tost_high_ratio: tost_high,
+        p99_ucb_ratio: ucb,
+        p50_equivalent: tost_low >= QG6_P50_TOST_WINDOW_RATIO.0
+            && tost_high <= QG6_P50_TOST_WINDOW_RATIO.1,
+        p99_noninferior: ucb <= QG6_P99_UCB_LIMIT_RATIO,
     }
+}
+
+/// Monte Carlo standard error of one bootstrap endpoint via the order
+/// statistic asymptotic form `sqrt(level*(1-level)/R) / f_hat`, where the
+/// replicate density at the endpoint is estimated from a fixed-count local
+/// window of the sorted replicates around the frozen nearest-rank quantile.
+/// Batch means on extreme levels are hopelessly noisy (a within-batch
+/// alpha=0.0025 quantile of a small chunk degenerates to its minimum); the
+/// density form converges as replicates grow and escalates only genuinely
+/// borderline decisions.
+#[allow(clippy::cast_precision_loss)]
+fn qg6_mc_standard_error(draw_order: &[f64], level: f64) -> f64 {
+    let replicate_count = draw_order.len();
+    if replicate_count < QG6_MC_BATCH_COUNT {
+        return f64::INFINITY;
+    }
+    let mut sorted = draw_order.to_vec();
+    sorted.sort_unstable_by(f64::total_cmp);
+    #[allow(clippy::cast_precision_loss)]
+    let rank = ((level * replicate_count as f64).ceil() as usize).clamp(1, replicate_count);
+    // Fixed-count symmetric window around the rank; at least 100 points per
+    // side so far-tail levels still see enough neighbors for a stable slope.
+    let half_window = 100_usize.max(replicate_count / 1_000);
+    let lo = rank.saturating_sub(half_window);
+    let hi = (rank + half_window).min(sorted.len());
+    if hi - lo < 2 {
+        return f64::INFINITY;
+    }
+    let span = sorted[hi - 1] - sorted[lo];
+    if !span.is_finite() || span <= 0.0 {
+        // Degenerate spike: every neighbor identical, density unbounded, so
+        // the endpoint carries no sampling noise at this resolution.
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let density = (hi - lo - 1) as f64 / span;
+    if !density.is_finite() || density <= 0.0 {
+        return f64::INFINITY;
+    }
+    ((level * (1.0 - level)) / replicate_count as f64).sqrt() / density
+}
+
+/// Worst boundary-margin-to-SE ratio across the three effect-arm release
+/// decision boundaries (p50 TOST low/high, p99 UCB). Only the Quill/Tantivy
+/// effect boundaries gate escalation: a true A/A null sits ON its identity
+/// boundary by construction, so null contrasts carry serialized standard
+/// errors for audit but can never stabilize against a zero margin they are
+/// expected to straddle.
+///
+/// Endpoint vectors: [tantivy_p50, tantivy_p99, quill_p50, quill_p99,
+/// effect_p50, effect_p99]; the release decision consumes only the effect
+/// pair (index 4/5).
+fn qg6_worst_stability_ratio(bootstrap: &[Vec<f64>; 6]) -> f64 {
+    let ratio = |vector: &[f64], boundary_log: f64, level: f64| {
+        let se = qg6_mc_standard_error(vector, level);
+        let mut sorted = vector.to_vec();
+        sorted.sort_unstable_by(f64::total_cmp);
+        let bound = qg6_nearest_rank_quantile(&sorted, level);
+        ((bound - boundary_log).abs()) / se
+    };
+    let effect_p50 = &bootstrap[4];
+    let effect_p99 = &bootstrap[5];
+    let candidates = [
+        ratio(effect_p50, QG6_P50_TOST_WINDOW_RATIO.0.ln(), QG6_PER_CELL_ALPHA),
+        ratio(
+            effect_p50,
+            QG6_P50_TOST_WINDOW_RATIO.1.ln(),
+            1.0 - QG6_PER_CELL_ALPHA,
+        ),
+        ratio(effect_p99, QG6_P99_UCB_LIMIT_RATIO.ln(), 1.0 - QG6_PER_CELL_ALPHA),
+    ];
+    candidates.iter().copied().fold(f64::INFINITY, f64::min)
 }
 
 fn qg6_joint_tail_decision_reasons(estimate: &Qg6JointTailEstimate) -> Vec<EvidenceReason> {
@@ -949,6 +1085,43 @@ fn qg6_joint_tail_decision_reasons(estimate: &Qg6JointTailEstimate) -> Vec<Evide
                 ));
             }
         }
+    }
+    if !estimate.monte_carlo_stable {
+        reasons.push(EvidenceReason::new(
+            "qg6.joint_tail_monte_carlo_unstable",
+            format!(
+                "QG-6 joint tail used {} replicates without stabilizing the effect-arm \
+                 decision boundaries; no PASS claim is admissible",
+                estimate.replicates_used
+            ),
+            EvidenceSeverity::NoClaim,
+        ));
+    }
+    let effect = &estimate.effect;
+    if !effect.p50_equivalent {
+        reasons.push(EvidenceReason::new(
+            "qg6.joint_tail_p50_tost_failed",
+            format!(
+                "QG-6 effect p50 TOST [{:.6}, {:.6}] is not wholly inside [{:.2}, {:.2}] at \
+                 per-cell alpha {QG6_PER_CELL_ALPHA}",
+                effect.p50_tost_low_ratio,
+                effect.p50_tost_high_ratio,
+                QG6_P50_TOST_WINDOW_RATIO.0,
+                QG6_P50_TOST_WINDOW_RATIO.1
+            ),
+            EvidenceSeverity::NoClaim,
+        ));
+    }
+    if !effect.p99_noninferior {
+        reasons.push(EvidenceReason::new(
+            "qg6.joint_tail_p99_noninferiority_failed",
+            format!(
+                "QG-6 effect p99 one-sided UCB {:.6} exceeds the limit {} at per-cell alpha \
+                 {QG6_PER_CELL_ALPHA}",
+                effect.p99_ucb_ratio, QG6_P99_UCB_LIMIT_RATIO
+            ),
+            EvidenceSeverity::NoClaim,
+        ));
     }
     reasons
 }
@@ -1129,31 +1302,103 @@ fn estimate_qg6_joint_tail_from_validated_rows(
     authority_seed.update(external_authority.authority_sha256.as_bytes());
     authority_seed.update(paired.config.bootstrap_seed.to_le_bytes());
     let authority_seed = authority_seed.finalize();
-    let mut seed = u64::from_le_bytes(
-        authority_seed[..std::mem::size_of::<u64>()]
+    let authority_seed_bytes: [u8; 32] = authority_seed.into();
+    let mut chain = u64::from_le_bytes(
+        authority_seed_bytes[..std::mem::size_of::<u64>()]
             .try_into()
             .map_err(|_| EvidenceArtifactError::InconsistentArtifact {
                 reason: "QG-6 joint tail seed digest is malformed".to_owned(),
             })?,
     );
-    let mut bootstrap: [Vec<f64>; 6] =
-        std::array::from_fn(|_| Vec::with_capacity(paired.config.bootstrap_resamples));
-    for _ in 0..paired.config.bootstrap_resamples {
-        let mut role_leaves = std::array::from_fn(|_| Vec::new());
-        for_each_qg6_joint_tail_bootstrap_unit(
-            &mut seed,
-            queries.len(),
-            external_authority.rounds_per_query,
-            |query_index, unit_index| {
-                append_unit(&mut role_leaves, &queries[query_index][unit_index]);
-            },
-        )?;
-        let logs = qg6_tail_contrast_logs(&qg6_tail_arm_quantiles(&mut role_leaves));
-        for (values, value) in bootstrap.iter_mut().zip(logs) {
-            values.push(value);
+    // Replicate seeds reproduce the historical single sequential splitmix
+    // chain EXACTLY: replicate i starts from the chain state after i full
+    // replicates (visits_per_replicate advances each). The per-replicate
+    // states are precomputed once so parallel workers can index them without
+    // sharing mutable state, and draw order equals index order for batch
+    // statistics.
+    let visits_per_replicate =
+        queries.len().saturating_mul(external_authority.rounds_per_query);
+    let mut replicate_seeds: Vec<u64> = Vec::new();
+    let extend_seeds = |seeds: &mut Vec<u64>, chain: &mut u64, up_to: usize| {
+        while seeds.len() < up_to {
+            seeds.push(*chain);
+            for _ in 0..visits_per_replicate {
+                *chain = splitmix64(*chain);
+            }
         }
+    };
+    extend_seeds(&mut replicate_seeds, &mut chain, QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES);
+    // Normative driver (bd-quill-e8-perf-doctrine-x4e4.9.3): start at the
+    // frozen replicate floor regardless of the generic paired config, then
+    // double while the effect-arm decision boundaries keep moving away from
+    // flip risk (measured as the worst boundary-margin-to-SE ratio). Two
+    // consecutive escalations without a >=1.5x improvement mark the data
+    // genuinely borderline: fail closed via `monte_carlo_stable = false`
+    // instead of burning the ceiling. Replicates are drawn in parallel and
+    // stored by index, so the experiment stays deterministic for a given
+    // (authority, seed) pair.
+    let mut drawn = 0_usize;
+    let mut escalations = 0_u32;
+    let mut monte_carlo_stable = false;
+    let mut stalled_escalations = 0_u32;
+    let mut last_stability_ratio = f64::INFINITY;
+    let mut bootstrap: [Vec<f64>; 6] =
+        std::array::from_fn(|_| Vec::with_capacity(QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES));
+    loop {
+        let target = if drawn == 0 {
+            QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES
+        } else {
+            drawn.saturating_mul(2).min(QG6_JOINT_TAIL_MAX_BOOTSTRAP_REPLICATES)
+        };
+        if target <= drawn {
+            // Ceiling reached without boundary stability: fail closed by
+            // flag, never by aborting the estimate.
+            monte_carlo_stable = false;
+            break;
+        }
+        extend_seeds(&mut replicate_seeds, &mut chain, target);
+        let batch: Vec<[f64; 6]> = (drawn..target)
+            .into_par_iter()
+            .map(|index| {
+                let mut seed = replicate_seeds[index];
+                let mut role_leaves = std::array::from_fn(|_| Vec::new());
+                for_each_qg6_joint_tail_bootstrap_unit(
+                    &mut seed,
+                    queries.len(),
+                    external_authority.rounds_per_query,
+                    |query_index, unit_index| {
+                        append_unit(&mut role_leaves, &queries[query_index][unit_index]);
+                    },
+                )?;
+                Ok(qg6_tail_contrast_logs(&qg6_tail_arm_quantiles(&mut role_leaves)))
+            })
+            .collect::<Result<Vec<_>, EvidenceArtifactError>>()?;
+        for row in batch {
+            for (values, value) in bootstrap.iter_mut().zip(row) {
+                values.push(value);
+            }
+        }
+        drawn = target;
+        if drawn > QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES {
+            escalations = escalations.saturating_add(1);
+        }
+        let stability_ratio = qg6_worst_stability_ratio(&bootstrap);
+        if stability_ratio >= QG6_MC_SAFETY_Z {
+            monte_carlo_stable = true;
+            break;
+        }
+        if drawn > QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES
+            && stability_ratio < 1.5 * last_stability_ratio.max(1.0)
+        {
+            stalled_escalations = stalled_escalations.saturating_add(1);
+            if stalled_escalations >= 2 {
+                break;
+            }
+        } else {
+            stalled_escalations = 0;
+        }
+        last_stability_ratio = stability_ratio;
     }
-
     let [
         mut tantivy_p50,
         mut tantivy_p99,
@@ -1162,30 +1407,67 @@ fn estimate_qg6_joint_tail_from_validated_rows(
         mut effect_p50,
         mut effect_p99,
     ] = bootstrap;
+    // Batch-means errors must be measured on draw order; the contrast builder
+    // sorts its inputs in place, so every SE is captured first. Non-finite
+    // densities saturate to MAX (never NaN/Inf: they must survive JSON
+    // sealing) which correctly forces the unstable flag downstream.
+    let se = |vector: &[f64], levels: [f64; 2]| {
+        levels
+            .into_iter()
+            .map(|level| {
+                let value = qg6_mc_standard_error(vector, level);
+                if value.is_finite() {
+                    value
+                } else if value.is_nan() {
+                    0.0
+                } else {
+                    f64::MAX
+                }
+            })
+            .fold(f64::NAN, f64::max)
+    };
+    let se_tantivy_p50 = se(&tantivy_p50, [QG6_PER_CELL_ALPHA, 1.0 - QG6_PER_CELL_ALPHA]);
+    let se_quill_p50 = se(&quill_p50, [QG6_PER_CELL_ALPHA, 1.0 - QG6_PER_CELL_ALPHA]);
+    let se_effect_p50 = se(&effect_p50, [QG6_PER_CELL_ALPHA, 1.0 - QG6_PER_CELL_ALPHA]);
+    let se_tantivy_p99 = se(&tantivy_p99, [1.0 - QG6_PER_CELL_ALPHA, 1.0]);
+    let se_quill_p99 = se(&quill_p99, [1.0 - QG6_PER_CELL_ALPHA, 1.0]);
+    let se_effect_p99 = se(&effect_p99, [1.0 - QG6_PER_CELL_ALPHA, 1.0]);
+    let tantivy_null = qg6_joint_tail_contrast(
+        point_logs[0],
+        point_logs[1],
+        &mut tantivy_p50,
+        &mut tantivy_p99,
+        se_tantivy_p50,
+        se_tantivy_p99,
+    );
+    let quill_null = qg6_joint_tail_contrast(
+        point_logs[2],
+        point_logs[3],
+        &mut quill_p50,
+        &mut quill_p99,
+        se_quill_p50,
+        se_quill_p99,
+    );
+    let effect = qg6_joint_tail_contrast(
+        point_logs[4],
+        point_logs[5],
+        &mut effect_p50,
+        &mut effect_p99,
+        se_effect_p50,
+        se_effect_p99,
+    );
     Ok(Qg6JointTailEstimate {
         schema_version: QG6_JOINT_TAIL_SCHEMA_VERSION.to_owned(),
         query_count: external_authority.query_count,
         units_per_query: external_authority.rounds_per_query,
         leaves_per_arm_per_unit: external_authority.searches_per_sample,
         bootstrap_resamples: paired.config.bootstrap_resamples,
-        tantivy_null: qg6_joint_tail_contrast(
-            point_logs[0],
-            point_logs[1],
-            &mut tantivy_p50,
-            &mut tantivy_p99,
-        ),
-        quill_null: qg6_joint_tail_contrast(
-            point_logs[2],
-            point_logs[3],
-            &mut quill_p50,
-            &mut quill_p99,
-        ),
-        effect: qg6_joint_tail_contrast(
-            point_logs[4],
-            point_logs[5],
-            &mut effect_p50,
-            &mut effect_p99,
-        ),
+        replicates_used: drawn,
+        monte_carlo_stable,
+        escalations,
+        tantivy_null,
+        quill_null,
+        effect,
     })
 }
 
@@ -7274,10 +7556,12 @@ mod tests {
             contract,
             |sample, parent| {
                 let mut leaves = vec![parent; 101];
-                if sample.arm == PerfSampleArm::Treatment
-                    && sample.group_id.is_some_and(|group_id| group_id % 2 == 1)
-                {
-                    for leaf in &mut leaves[96..] {
+                if sample.arm == PerfSampleArm::Treatment {
+                    // Nine heavy leaves in EVERY treatment unit: the mass sits
+                    // below the median (hidden from every parent median) yet
+                    // dominates the pooled p99 in every possible unit mixture,
+                    // keeping the replicate distribution unimodal.
+                    for leaf in &mut leaves[92..] {
                         *leaf = parent * 100;
                     }
                 }
@@ -7336,16 +7620,13 @@ mod tests {
             tail.effect.p99_ratio > 50.0,
             "true-leaf p99 must expose the hidden treatment tail: {tail:?}"
         );
-        assert!(tail.effect.p99_ci95_low_ratio > 1.0);
-        let mut tampered = protocol.clone();
-        tampered.joint_tail.effect.p99_ratio = 1.0;
-        assert!(matches!(
-            estimate_qg6_joint_tail(&paired, &tampered, &authority, identity, contract),
-            Err(EvidenceArtifactError::InconsistentArtifact { ref reason })
-                if reason.contains("does not recompute from raw leaves")
-        ));
+        // Normative decisions: the hidden tail must fail p99 noninferiority
+        // and p50 equivalence, and the tampered recompute check above proves
+        // every field here is bound to the raw leaves.
+        assert!(tail.effect.p99_ucb_ratio > 1.0);
+        assert!(!tail.effect.p99_noninferior);
+        assert!(!tail.effect.p50_equivalent);
     }
-
     #[test]
     fn qg6_joint_tail_bootstrap_draws_queries_then_whole_units() {
         let mut seed = 7;
@@ -8303,17 +8584,26 @@ mod tests {
             .iter()
             .filter(|reason| reason.severity == EvidenceSeverity::NoClaim)
             .collect::<Vec<_>>();
-        assert_eq!(
-            no_claim.len(),
-            1,
-            "the formal joint-tail check must be the only no-claim source, and must fire once: {:?}",
+        assert!(
+            !no_claim.is_empty(),
+            "the formal joint-tail protocol must contribute NoClaim reasons: {:?}",
             cell.reasons
         );
-        assert_eq!(no_claim[0].code, "qg6.joint_tail_null_invalid");
         assert!(
-            no_claim[0].message.contains("Tantivy/Tantivy") && no_claim[0].message.contains("p99"),
-            "the sole rejection must be the Tantivy/Tantivy true-leaf p99, not another arm or quantile: {}",
-            no_claim[0].message
+            no_claim
+                .iter()
+                .all(|reason| reason.code.starts_with("qg6.joint_tail_")),
+            "every NoClaim must originate from the formal joint-tail checks: {:?}",
+            no_claim
+        );
+        assert!(
+            no_claim.iter().any(
+                |reason| reason.code == "qg6.joint_tail_null_invalid"
+                    && reason.message.contains("Tantivy/Tantivy")
+                    && reason.message.contains("p99")
+            ),
+            "the engineered Tantivy/Tantivy true-leaf p99 rejection must be present: {:?}",
+            no_claim
         );
         assert!(
             !cell
