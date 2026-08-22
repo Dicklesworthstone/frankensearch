@@ -1071,7 +1071,11 @@ fn qg6_worst_stability_ratio(bootstrap: &[Vec<f64>; 6]) -> f64 {
     ];
     candidates.iter().copied().fold(f64::INFINITY, f64::min)
 }
-
+/// Admissibility poison only. Effect-arm TOST/noninferiority verdicts are
+/// deliberately NOT emitted here: a decisively failed equivalence is valid,
+/// claim-eligible evidence that the ratchet must consume into a Block (via
+/// the serialized `p50_equivalent` / `p99_noninferior` fields), not a
+/// NoDecision that would hide the measurement from the gate.
 fn qg6_joint_tail_decision_reasons(estimate: &Qg6JointTailEstimate) -> Vec<EvidenceReason> {
     let mut reasons = Vec::new();
     for (engine, null) in [
@@ -1105,32 +1109,6 @@ fn qg6_joint_tail_decision_reasons(estimate: &Qg6JointTailEstimate) -> Vec<Evide
                 "QG-6 joint tail used {} replicates without stabilizing the effect-arm \
                  decision boundaries; no PASS claim is admissible",
                 estimate.replicates_used
-            ),
-            EvidenceSeverity::NoClaim,
-        ));
-    }
-    let effect = &estimate.effect;
-    if !effect.p50_equivalent {
-        reasons.push(EvidenceReason::new(
-            "qg6.joint_tail_p50_tost_failed",
-            format!(
-                "QG-6 effect p50 TOST [{:.6}, {:.6}] is not wholly inside [{:.2}, {:.2}] at \
-                 per-cell alpha {QG6_PER_CELL_ALPHA}",
-                effect.p50_tost_low_ratio,
-                effect.p50_tost_high_ratio,
-                QG6_P50_TOST_WINDOW_RATIO.0,
-                QG6_P50_TOST_WINDOW_RATIO.1
-            ),
-            EvidenceSeverity::NoClaim,
-        ));
-    }
-    if !effect.p99_noninferior {
-        reasons.push(EvidenceReason::new(
-            "qg6.joint_tail_p99_noninferiority_failed",
-            format!(
-                "QG-6 effect p99 one-sided UCB {:.6} exceeds the limit {} at per-cell alpha \
-                 {QG6_PER_CELL_ALPHA}",
-                effect.p99_ucb_ratio, QG6_P99_UCB_LIMIT_RATIO
             ),
             EvidenceSeverity::NoClaim,
         ));
