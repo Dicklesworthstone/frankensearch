@@ -862,12 +862,6 @@ run_selfcheck() {
 # A positive control (a genuinely non-conformant staged row) proves the harness
 # actually exercises the linter, so a broken harness can never pass vacuously.
 
-retain_leakcheck_dir() {
-  local dir="$1"
-  if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-leakcheck* ]]; then
-    echo "[ledger-leakcheck] retained temp repo: ${dir}" >&2
-  fi
-}
 
 leakcheck_env() {
   # The pre-commit hook runs with GIT_INDEX_FILE/GIT_DIR/... exported for the
@@ -962,7 +956,11 @@ run_leakcheck() {
     echo "[ledger-leakcheck] BLOCKED mixed-history probe: conformant new row was rejected (exit ${rc}) — per-entry flag leak (79d999ad class)" >&2
     failed=1
   fi
-  retain_leakcheck_dir "${dir}"
+  if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-leakcheck* && ${rc} -ne 0 ]]; then
+    echo "[ledger-leakcheck] retained temp repo: ${dir}" >&2
+  else
+    rm -rf "${dir}" 2>/dev/null || true
+  fi
 
   LEAKCHECK_LAST_DIR=""
   rc=0
@@ -974,8 +972,11 @@ run_leakcheck() {
     echo "[ledger-leakcheck] BLOCKED harness control: expected exit 2, got ${rc} — harness is not exercising the linter" >&2
     failed=1
   fi
-  retain_leakcheck_dir "${dir}"
-
+  if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-leakcheck* && ${rc} -ne 2 ]]; then
+    echo "[ledger-leakcheck] retained temp repo: ${dir}" >&2
+  else
+    rm -rf "${dir}" 2>/dev/null || true
+  fi
   if [[ ${failed} -ne 0 ]]; then
     echo "[ledger-leakcheck] BLOCKED: leak regression detected" >&2
     return 2
@@ -1314,7 +1315,11 @@ run_mergecheck() {
     echo "[ledger-mergecheck] BLOCKED merge probe: second-parent history was re-gated (exit ${rc}) — merge blindness" >&2
     failed=1
   fi
-  retain_mergecheck_dir "${dir}"
+  if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-mergecheck* && ${rc} -ne 0 ]]; then
+    echo "[ledger-mergecheck] retained temp repo: ${dir}" >&2
+  else
+    rm -rf "${dir}" 2>/dev/null || true
+  fi
 
   MERGECHECK_LAST_DIR=""
   rc=0
@@ -1326,7 +1331,11 @@ run_mergecheck() {
     echo "[ledger-mergecheck] BLOCKED merge control: expected exit 2, got ${rc} — the merge path admits ungated rows" >&2
     failed=1
   fi
-  retain_mergecheck_dir "${dir}"
+  if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-mergecheck* && ${rc} -ne 2 ]]; then
+    echo "[ledger-mergecheck] retained temp repo: ${dir}" >&2
+  else
+    rm -rf "${dir}" 2>/dev/null || true
+  fi
 
   MERGECHECK_LAST_DIR=""
   rc=0
@@ -1338,7 +1347,11 @@ run_mergecheck() {
     echo "[ledger-mergecheck] BLOCKED merge stream failure: expected exit 64, got ${rc} — a failing parent diff is invisible and the merge passes vacuously" >&2
     failed=1
   fi
-  retain_mergecheck_dir "${dir}"
+  if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-mergecheck* && ${rc} -ne 64 ]]; then
+    echo "[ledger-mergecheck] retained temp repo: ${dir}" >&2
+  else
+    rm -rf "${dir}" 2>/dev/null || true
+  fi
 
   if [[ ${failed} -ne 0 ]]; then
     echo "[ledger-mergecheck] BLOCKED: merge-blindness regression detected" >&2
@@ -1347,12 +1360,6 @@ run_mergecheck() {
   echo "[ledger-mergecheck] OK: 3/3 merge-awareness cases"
 }
 
-retain_mergecheck_dir() {
-  local dir="$1"
-  if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-mergecheck* ]]; then
-    echo "[ledger-mergecheck] retained temp repo: ${dir}" >&2
-  fi
-}
 
 case "${MODE}" in
   candidate)
