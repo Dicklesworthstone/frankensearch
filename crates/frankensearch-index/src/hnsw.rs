@@ -33,6 +33,7 @@ use std::time::Instant;
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::generation::ArtifactGenerationIdentityV1;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
+use hnsw_rs::hnswio::ReloadOptions;
 use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo, Neighbour, PointId};
 use serde::{Deserialize, Serialize};
 
@@ -621,16 +622,22 @@ impl HnswIndex {
 
         // `HnswIo::load_hnsw` returns an `Hnsw` borrowed from the `HnswIo`
         // (`'a: 'b`), so to store it in the `'static` field we must keep the
-        // `HnswIo` alive for the program. With the default `ReloadOptions`
-        // (`datamap: false`) the `HnswIo` holds no bulk data — the graph and
-        // vectors are read into the returned `Hnsw`'s owned storage — so the
-        // leaked shell is only a couple of paths plus an `Arc`. Leaking it
-        // (rather than a self-referential struct or unsafe lifetime transmute)
-        // is the simplest sound way to obtain a `'static` graph, and the cost
-        // is negligible because a persisted load happens about once per
-        // process.
-        let native_io: &'static mut HnswIo =
-            Box::leak(Box::new(HnswIo::new(&sidecar_parent, &basename)));
+        // `HnswIo` alive for the program. Load with `ReloadOptions::new(true)`
+        // so the immutable `.hnsw.data` sidecar's vector payload stays
+        // file-backed (read-only mmap) instead of being copied into a second
+        // owned per-point heap: at multi-million-vector scale the owned copy
+        // alone is gigabytes per cold process. Graph topology is still parsed
+        // into owned state and attested below, and every admission check
+        // (receipt, locality, doc-id/fingerprint binding) runs before the map
+        // is created. Leaking the reloader (rather than a self-referential
+        // struct or unsafe lifetime transmute) is the simplest sound way to
+        // obtain a `'static` graph, keeps the mmap alive for exactly the graph
+        // lifetime, and happens about once per process.
+        let native_io: &'static mut HnswIo = Box::leak(Box::new(HnswIo::new_with_options(
+            &sidecar_parent,
+            &basename,
+            ReloadOptions::new(true),
+        )));
         let hnsw = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             // Moving the leaked mutable reference into a closure-local binding
             // makes this closure `FnOnce` and lets the parser's returned graph
@@ -1807,8 +1814,21 @@ fn validate_weak_base_connectivity(
     mut base_neighbors: impl FnMut(usize) -> Result<Vec<usize>, String>,
 ) -> Result<(), String> {
     let mut components = WeakComponents::new(expected_points);
+    let mut isolated_count = 0_usize;
+    let mut first_isolated = None;
     for origin_id in 0..expected_points {
-        for neighbor_id in base_neighbors(origin_id)? {
+        let neighbors = base_neighbors(origin_id)?;
+        if neighbors.is_empty() {
+            // A point with zero base out-edges violates the HNSW insertion
+            // invariant (every non-seed insert attaches to an existing point),
+            // so record it: it separates construction faults from
+            // pruning-induced splits when the gate fires.
+            isolated_count += 1;
+            if first_isolated.is_none() {
+                first_isolated = Some(origin_id);
+            }
+        }
+        for neighbor_id in neighbors {
             if neighbor_id >= expected_points {
                 return Err(format!(
                     "origin id {origin_id} references out-of-range base neighbor {neighbor_id}"
@@ -1821,7 +1841,11 @@ fn validate_weak_base_connectivity(
     let entry_component = components.root(entry_origin);
     let mut attached_count = 0_usize;
     let mut first_detached = None;
+    let mut component_count = 0_usize;
     for origin_id in 0..expected_points {
+        if components.root(origin_id) == origin_id {
+            component_count += 1;
+        }
         if components.root(origin_id) == entry_component {
             attached_count += 1;
         } else if first_detached.is_none() {
@@ -1829,10 +1853,14 @@ fn validate_weak_base_connectivity(
         }
     }
     if let Some(first_detached) = first_detached {
+        let first_isolated =
+            first_isolated.map_or_else(|| "none".to_owned(), |origin| format!("origin {origin}"));
         return Err(format!(
             "base layer splits into multiple weak components: entry origin {entry_origin}'s \
              component holds only {attached_count}/{expected_points} points ignoring edge \
-             direction; first detached origin is {first_detached}"
+             direction; first detached origin is {first_detached}; {component_count} weak \
+             components total; {isolated_count} points have zero base out-edges (first: \
+             {first_isolated})"
         ));
     }
     Ok(())
@@ -4495,6 +4523,11 @@ mod tests {
             .expect_err("edgeless multi-point graph must fail");
         assert!(detail.contains("weak components"), "{detail}");
         assert!(detail.contains("only 1/2"), "{detail}");
+        assert!(detail.contains("2 weak components total"), "{detail}");
+        assert!(
+            detail.contains("2 points have zero base out-edges (first: origin 0)"),
+            "{detail}"
+        );
     }
 
     /// #32: bounded neighbour pruning can strip every in-edge from a point,
@@ -4611,6 +4644,31 @@ mod tests {
             .expect_err("two locally valid components must fail weak connectivity");
         assert!(detail.contains("only 2/4"), "{detail}");
         assert!(detail.contains("first detached origin is 2"), "{detail}");
+        assert!(detail.contains("2 weak components total"), "{detail}");
+        assert!(
+            detail.contains("0 points have zero base out-edges (first: none)"),
+            "{detail}"
+        );
+    }
+
+    /// Pin the weak-component union-find at the exact cardinality of the
+    /// largest real corpus that has exercised this gate (CASS's published
+    /// quality tier). A forward-attached insertion chain — each non-seed point
+    /// holding one base edge to its predecessor, the invariant `insert_slice`
+    /// guarantees — must resolve to a single weak component with no overflow
+    /// or path-compression fault at this scale.
+    #[test]
+    fn weak_connectivity_attests_single_chain_at_production_cardinality() {
+        const PRODUCTION_POINT_COUNT: usize = 2_573_003;
+
+        validate_weak_base_connectivity(0, PRODUCTION_POINT_COUNT, |origin_id| {
+            Ok(if origin_id == 0 {
+                Vec::new()
+            } else {
+                vec![origin_id - 1]
+            })
+        })
+        .expect("a forward-attached insertion chain is one weak component");
     }
 
     #[test]
