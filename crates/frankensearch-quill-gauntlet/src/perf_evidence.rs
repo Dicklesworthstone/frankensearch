@@ -26,9 +26,9 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::perf::{
@@ -996,7 +996,11 @@ fn qg6_joint_tail_contrast(
 /// alpha=0.0025 quantile of a small chunk degenerates to its minimum); the
 /// density form converges as replicates grow and escalates only genuinely
 /// borderline decisions.
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn qg6_mc_standard_error(draw_order: &[f64], level: f64) -> f64 {
     let replicate_count = draw_order.len();
     if replicate_count < QG6_MC_BATCH_COUNT {
@@ -1035,8 +1039,8 @@ fn qg6_mc_standard_error(draw_order: &[f64], level: f64) -> f64 {
 /// errors for audit but can never stabilize against a zero margin they are
 /// expected to straddle.
 ///
-/// Endpoint vectors: [tantivy_p50, tantivy_p99, quill_p50, quill_p99,
-/// effect_p50, effect_p99]; the release decision consumes only the effect
+/// Endpoint vectors: `tantivy_p50`, `tantivy_p99`, `quill_p50`, `quill_p99`,
+/// `effect_p50`, `effect_p99`; the release decision consumes only the effect
 /// pair (index 4/5).
 fn qg6_worst_stability_ratio(bootstrap: &[Vec<f64>; 6]) -> f64 {
     let ratio = |vector: &[f64], boundary_log: f64, level: f64| {
@@ -1049,13 +1053,21 @@ fn qg6_worst_stability_ratio(bootstrap: &[Vec<f64>; 6]) -> f64 {
     let effect_p50 = &bootstrap[4];
     let effect_p99 = &bootstrap[5];
     let candidates = [
-        ratio(effect_p50, QG6_P50_TOST_WINDOW_RATIO.0.ln(), QG6_PER_CELL_ALPHA),
+        ratio(
+            effect_p50,
+            QG6_P50_TOST_WINDOW_RATIO.0.ln(),
+            QG6_PER_CELL_ALPHA,
+        ),
         ratio(
             effect_p50,
             QG6_P50_TOST_WINDOW_RATIO.1.ln(),
             1.0 - QG6_PER_CELL_ALPHA,
         ),
-        ratio(effect_p99, QG6_P99_UCB_LIMIT_RATIO.ln(), 1.0 - QG6_PER_CELL_ALPHA),
+        ratio(
+            effect_p99,
+            QG6_P99_UCB_LIMIT_RATIO.ln(),
+            1.0 - QG6_PER_CELL_ALPHA,
+        ),
     ];
     candidates.iter().copied().fold(f64::INFINITY, f64::min)
 }
@@ -1198,6 +1210,40 @@ fn estimate_qg6_joint_tail_from_validated_rows(
     quill_null_samples: &[PerfRawSample],
     external_authority: &Qg6ScheduleAuthority,
 ) -> Result<Qg6JointTailEstimate, EvidenceArtifactError> {
+    estimate_qg6_joint_tail_with_budget(
+        paired,
+        quill_null_samples,
+        external_authority,
+        QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES,
+        QG6_JOINT_TAIL_MAX_BOOTSTRAP_REPLICATES,
+    )
+}
+
+/// Test-only reduced-budget driver: identical mechanics, smaller replicate
+/// floor/ceiling so decision-layer unit tests do not pay normative Monte
+/// Carlo scale. Production paths always use the frozen constants.
+#[cfg(test)]
+pub(crate) fn estimate_qg6_joint_tail_fixture(
+    paired: &PairedExperimentResult,
+    quill_null_samples: &[PerfRawSample],
+    external_authority: &Qg6ScheduleAuthority,
+) -> Result<Qg6JointTailEstimate, EvidenceArtifactError> {
+    estimate_qg6_joint_tail_with_budget(
+        paired,
+        quill_null_samples,
+        external_authority,
+        2_000,
+        8_000,
+    )
+}
+
+fn estimate_qg6_joint_tail_with_budget(
+    paired: &PairedExperimentResult,
+    quill_null_samples: &[PerfRawSample],
+    external_authority: &Qg6ScheduleAuthority,
+    replicate_floor: usize,
+    replicate_ceiling: usize,
+) -> Result<Qg6JointTailEstimate, EvidenceArtifactError> {
     if paired.config.bootstrap_resamples == 0 {
         return Err(EvidenceArtifactError::InconsistentArtifact {
             reason: "QG-6 joint tail estimator requires positive bootstrap resamples".to_owned(),
@@ -1316,8 +1362,9 @@ fn estimate_qg6_joint_tail_from_validated_rows(
     // states are precomputed once so parallel workers can index them without
     // sharing mutable state, and draw order equals index order for batch
     // statistics.
-    let visits_per_replicate =
-        queries.len().saturating_mul(external_authority.rounds_per_query);
+    let visits_per_replicate = queries
+        .len()
+        .saturating_mul(external_authority.rounds_per_query);
     let mut replicate_seeds: Vec<u64> = Vec::new();
     let extend_seeds = |seeds: &mut Vec<u64>, chain: &mut u64, up_to: usize| {
         while seeds.len() < up_to {
@@ -1327,7 +1374,7 @@ fn estimate_qg6_joint_tail_from_validated_rows(
             }
         }
     };
-    extend_seeds(&mut replicate_seeds, &mut chain, QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES);
+    extend_seeds(&mut replicate_seeds, &mut chain, replicate_floor);
     // Normative driver (bd-quill-e8-perf-doctrine-x4e4.9.3): start at the
     // frozen replicate floor regardless of the generic paired config, then
     // double while the effect-arm decision boundaries keep moving away from
@@ -1342,13 +1389,12 @@ fn estimate_qg6_joint_tail_from_validated_rows(
     let mut monte_carlo_stable = false;
     let mut stalled_escalations = 0_u32;
     let mut last_stability_ratio = f64::INFINITY;
-    let mut bootstrap: [Vec<f64>; 6] =
-        std::array::from_fn(|_| Vec::with_capacity(QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES));
+    let mut bootstrap: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::with_capacity(replicate_floor));
     loop {
         let target = if drawn == 0 {
-            QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES
+            replicate_floor
         } else {
-            drawn.saturating_mul(2).min(QG6_JOINT_TAIL_MAX_BOOTSTRAP_REPLICATES)
+            drawn.saturating_mul(2).min(replicate_ceiling)
         };
         if target <= drawn {
             // Ceiling reached without boundary stability: fail closed by
@@ -1370,7 +1416,9 @@ fn estimate_qg6_joint_tail_from_validated_rows(
                         append_unit(&mut role_leaves, &queries[query_index][unit_index]);
                     },
                 )?;
-                Ok(qg6_tail_contrast_logs(&qg6_tail_arm_quantiles(&mut role_leaves)))
+                Ok(qg6_tail_contrast_logs(&qg6_tail_arm_quantiles(
+                    &mut role_leaves,
+                )))
             })
             .collect::<Result<Vec<_>, EvidenceArtifactError>>()?;
         for row in batch {
@@ -1379,7 +1427,7 @@ fn estimate_qg6_joint_tail_from_validated_rows(
             }
         }
         drawn = target;
-        if drawn > QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES {
+        if drawn > replicate_floor {
             escalations = escalations.saturating_add(1);
         }
         let stability_ratio = qg6_worst_stability_ratio(&bootstrap);
@@ -1387,9 +1435,7 @@ fn estimate_qg6_joint_tail_from_validated_rows(
             monte_carlo_stable = true;
             break;
         }
-        if drawn > QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES
-            && stability_ratio < 1.5 * last_stability_ratio.max(1.0)
-        {
+        if drawn > replicate_floor && stability_ratio < 1.5 * last_stability_ratio.max(1.0) {
             stalled_escalations = stalled_escalations.saturating_add(1);
             if stalled_escalations >= 2 {
                 break;
@@ -1687,6 +1733,33 @@ impl Qg6FormalProtocolEvidence {
             &quill_null_samples,
             external_authority,
         )?;
+        Ok(Self {
+            schedule_authority: external_authority.clone(),
+            quill_null_samples,
+            joint_tail,
+        })
+    }
+
+    /// Test-only twin of [`Self::new_against_authority`] using the reduced
+    /// fixture replicate budget; production code must use the normative
+    /// constructor.
+    #[cfg(test)]
+    pub(crate) fn new_against_authority_fixture(
+        paired: &PairedExperimentResult,
+        quill_null_samples: Vec<PerfRawSample>,
+        external_authority: &Qg6ScheduleAuthority,
+        identity: &PerfInputIdentity,
+        contract: &Qg6SemanticContract,
+    ) -> Result<Self, EvidenceArtifactError> {
+        validate_qg6_formal_protocol_rows(
+            paired,
+            &quill_null_samples,
+            external_authority,
+            identity,
+            contract,
+        )?;
+        let joint_tail =
+            estimate_qg6_joint_tail_fixture(paired, &quill_null_samples, external_authority)?;
         Ok(Self {
             schedule_authority: external_authority.clone(),
             quill_null_samples,
@@ -2149,6 +2222,23 @@ fn validate_qg6_formal_protocol(
         identity,
         contract,
     )?;
+    // Verification must reproduce the persisted estimate under ITS OWN
+    // replicate budget. Production artifacts always carry the normative
+    // floor/ceiling; test fixtures declare a reduced budget and the stored
+    // `replicates_used` is the exact deterministic draw count to replay.
+    #[cfg(test)]
+    let recomputed = {
+        let stored = &protocol.joint_tail;
+        let floor = stored.replicates_used.max(1);
+        estimate_qg6_joint_tail_with_budget(
+            paired,
+            &protocol.quill_null_samples,
+            external_authority,
+            floor,
+            floor,
+        )?
+    };
+    #[cfg(not(test))]
     let recomputed = estimate_qg6_joint_tail_from_validated_rows(
         paired,
         &protocol.quill_null_samples,
@@ -6658,7 +6748,7 @@ mod tests {
         );
         let paired =
             estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 paired estimate");
-        let protocol = Qg6FormalProtocolEvidence::new_against_authority(
+        let protocol = Qg6FormalProtocolEvidence::new_against_authority_fixture(
             &paired,
             quill_null,
             &authority,
@@ -7595,7 +7685,7 @@ mod tests {
             .expect("timing leaf");
         mutated_leaf.ended_ns = mutated_leaf.ended_ns.saturating_add(1);
         assert!(matches!(
-            Qg6FormalProtocolEvidence::new_against_authority(
+            Qg6FormalProtocolEvidence::new_against_authority_fixture(
                 &mutated_paired,
                 quill_null.clone(),
                 &authority,
@@ -7605,7 +7695,7 @@ mod tests {
             Err(EvidenceArtifactError::InconsistentArtifact { ref reason })
                 if reason.contains("failed authenticated replay")
         ));
-        let protocol = Qg6FormalProtocolEvidence::new_against_authority(
+        let protocol = Qg6FormalProtocolEvidence::new_against_authority_fixture(
             &paired, quill_null, &authority, identity, contract,
         )
         .expect("construct formal tail protocol");
@@ -7684,7 +7774,7 @@ mod tests {
         }
         let paired = estimate_paired_experiment(&effect, &tantivy_null, &estimator_config)
             .expect("paired six-role stream");
-        let protocol = Qg6FormalProtocolEvidence::new_against_authority(
+        let protocol = Qg6FormalProtocolEvidence::new_against_authority_fixture(
             &paired, quill_null, &authority, identity, contract,
         )
         .expect("formal six-role protocol");
@@ -8562,7 +8652,7 @@ mod tests {
         assert_eq!(paired.claim_state, PairedClaimState::EligibleForDecision);
         assert!(paired.reasons.is_empty());
 
-        let protocol = Qg6FormalProtocolEvidence::new_against_authority(
+        let protocol = Qg6FormalProtocolEvidence::new_against_authority_fixture(
             &paired, quill_null, &authority, identity, contract,
         )
         .expect("construct retained QG-6 formal protocol");
@@ -8598,11 +8688,11 @@ mod tests {
             no_claim
         );
         assert!(
-            no_claim.iter().any(
-                |reason| reason.code == "qg6.joint_tail_null_invalid"
+            no_claim
+                .iter()
+                .any(|reason| reason.code == "qg6.joint_tail_null_invalid"
                     && reason.message.contains("Tantivy/Tantivy")
-                    && reason.message.contains("p99")
-            ),
+                    && reason.message.contains("p99")),
             "the engineered Tantivy/Tantivy true-leaf p99 rejection must be present: {:?}",
             no_claim
         );
@@ -8720,7 +8810,7 @@ mod tests {
             paired.reasons
         );
 
-        let protocol = Qg6FormalProtocolEvidence::new_against_authority(
+        let protocol = Qg6FormalProtocolEvidence::new_against_authority_fixture(
             &paired, quill_null, &authority, identity, contract,
         )
         .expect("construct retained QG-6 formal protocol");

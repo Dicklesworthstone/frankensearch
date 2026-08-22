@@ -4844,7 +4844,7 @@ mod tests {
             .expect("QG-6 paired evidence");
         let quill_null_projection =
             projected_ratio_distribution(&quill_null_samples).expect("QG-6 Quill-null projection");
-        let protocol = crate::Qg6FormalProtocolEvidence::new_against_authority(
+        let protocol = crate::Qg6FormalProtocolEvidence::new_against_authority_fixture(
             &paired,
             quill_null_samples,
             authority,
