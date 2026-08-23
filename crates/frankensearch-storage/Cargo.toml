@@ -10,9 +10,9 @@ rust-version.workspace = true
 [dependencies]
 frankensearch-core = { workspace = true }
 asupersync = { workspace = true }
-fsqlite = { version = "0.3.7", default-features = false, features = ["native", "async-api", "fts5"] }
-fsqlite-types = { version = "0.3.7", features = ["native"] }
-fsqlite-ext-fts5 = { version = "0.3.7", optional = true }
+fsqlite = { version = "0.3.8", default-features = false, features = ["native", "async-api", "fts5"] }
+fsqlite-types = { version = "0.3.8", features = ["native"] }
+fsqlite-ext-fts5 = { version = "0.3.8", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
