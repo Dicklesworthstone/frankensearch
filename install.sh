@@ -18,7 +18,9 @@
 #   --offline          Never touch the network; requires --version and a local
 #                      --artifact-url plus --checksum
 #   --from-source      Build from source instead of downloading binary
-#   --lite             Force the model-free source profile (~15MB binary)
+#   --lite             Install the model-free profile (~15MB). Prefers the
+#                      prebuilt fsfs-lite-* artifact; source-builds only as a
+#                      fallback (or when combined with --from-source).
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
 #
@@ -318,6 +320,19 @@ install_route() {
   fi
 }
 
+# Archive basename for a release download. Prebuilt Linux artifacts have been
+# published under the "-lite-" name since v1.5.0 (the full/model-embedded
+# archive is Linux-absent), so a --lite install resolves the published lite
+# tarball instead of forcing a multi-minute source build. See GH#36.
+artifact_basename() {
+  local lite="$1" version_bare="$2" target="$3" ext="$4"
+  if [ "$lite" -eq 1 ]; then
+    printf '%s\n' "${BINARY_NAME}-lite-${version_bare}-${target}.${ext}"
+  else
+    printf '%s\n' "${BINARY_NAME}-${version_bare}-${target}.${ext}"
+  fi
+}
+
 fail_unsupported_semantic_platform() {
   local target="$1"
   err "unsupported_platform: the ordinary semantic fsfs profile is not available for ${target}"
@@ -526,8 +541,10 @@ Options:
   --offline          Never touch the network; requires --version plus a local
                      --artifact-url and --checksum
   --from-source      Build from source instead of downloading binary
-  --lite             Force the model-free source profile (~15MB).
-                     Implies --from-source; the Cargo default is loader-capable.
+  --lite             Install the model-free profile (~15MB). Prefers the
+                     prebuilt fsfs-lite-* release artifact and only builds from
+                     source as a fallback (or with --from-source). The Cargo
+                     default is loader-capable.
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
 EOFU
@@ -549,7 +566,11 @@ parse_args() {
       --force) FORCE=1; shift;;
       --offline) OFFLINE=1; shift;;
       --from-source) FROM_SOURCE=1; shift;;
-      --lite) LITE=1; FROM_SOURCE=1; shift;;
+      # --lite selects the model-free profile. It no longer implies --from-source:
+      # the prebuilt fsfs-lite-* artifact is published every release, so --lite
+      # downloads and verifies it (seconds) and only source-builds when that
+      # download is unavailable or --from-source is also given. See GH#36.
+      --lite) LITE=1; shift;;
       --quiet|-q) QUIET=1; shift;;
       --no-gum) NO_GUM=1; shift;;
       -h|--help) usage; return 10;;
@@ -595,6 +616,13 @@ run_installer_contract_test() {
         return 2
       }
       install_route "$2" "$3" "${4:-}"
+      ;;
+    artifact-name)
+      [ "$#" -eq 5 ] || {
+        err "contract artifact-name requires LITE VERSION_BARE TARGET EXT"
+        return 2
+      }
+      artifact_basename "$2" "$3" "$4" "$5"
       ;;
     unsupported)
       [ "$#" -eq 2 ] || { err "contract unsupported requires TARGET"; return 2; }
@@ -893,7 +921,7 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
     TAR=$(basename "$ARTIFACT_URL")
     URL="$ARTIFACT_URL"
   elif [ -n "$TARGET" ]; then
-    TAR="${BINARY_NAME}-${VERSION_BARE}-${TARGET}.${EXT}"
+    TAR="$(artifact_basename "$LITE" "$VERSION_BARE" "$TARGET" "$EXT")"
     URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
   else
     warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
@@ -1018,7 +1046,27 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
     ROUTE=$(install_route "$LITE" 0 "$TARGET")
     case "$ROUTE" in
       source-default)
-        warn "Full artifact download failed; building the loader-capable default from source"
+        # The full/model-embedded Linux artifact stopped being published after
+        # v1.4.3 (GH#36), so this path is now the common case on Linux, not a
+        # rare event. Make the ~15-20 min source build unmistakable instead of a
+        # single scrolling warning, and point at the fast alternative.
+        warn "======================================================================"
+        warn "Prebuilt ${BINARY_NAME} artifact ${TAR} is not available for ${VERSION}."
+        warn "Falling back to a FROM-SOURCE build: this clones the repo and"
+        warn "compiles the semantic-loader profile with Rust nightly, which can"
+        warn "take 15-20 minutes and needs git + a working toolchain."
+        warn "Faster: re-run with --lite to install the prebuilt model-free binary"
+        warn "in seconds, or pass --artifact-url to install a specific archive."
+        warn "======================================================================"
+        FROM_SOURCE=1
+        ;;
+      source-lite)
+        # --lite requested but the prebuilt lite artifact could not be fetched;
+        # fall back to the (shorter) model-free source build, loudly.
+        warn "======================================================================"
+        warn "Prebuilt lite artifact ${TAR} is not available for ${VERSION};"
+        warn "falling back to a FROM-SOURCE model-free build (needs git + Rust nightly)."
+        warn "======================================================================"
         FROM_SOURCE=1
         ;;
       unsupported-semantic)
@@ -1026,7 +1074,7 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
         exit $?
         ;;
       *)
-        err "Internal installer routing error: expected source-default or unsupported-semantic, got $ROUTE"
+        err "Internal installer routing error: expected source-default, source-lite, or unsupported-semantic, got $ROUTE"
         exit 1
         ;;
     esac
