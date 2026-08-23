@@ -1,6 +1,6 @@
 # Dependency Upgrade Log
 
-## 2026-08-21 — Registry refresh: FrankenSQLite 0.3.7, Asupersync 0.4.9, fastembed 6, jsonschema 0.50
+## 2026-08-21/23 — Registry refresh: FrankenSQLite 0.3.8, Asupersync 0.4.9, fastembed 6, jsonschema 0.50
 
 **Scope:** owner-directed refresh of every direct dependency to its crates.io
 latest (bd-r0ar1, bd-lnexf). Verified on remote workers: `cargo check
@@ -8,7 +8,7 @@ latest (bd-r0ar1, bd-lnexf). Verified on remote workers: `cargo check
 warnings`, the fastembed-gated clippy lane for embed + rerank, and the
 workspace test suite. No frankensearch call-site change was needed.
 
-- **FrankenSQLite 0.3.1 → 0.3.7** (storage / durability / fsfs / ops pins).
+- **FrankenSQLite 0.3.1 → 0.3.8** (storage / durability / fsfs / ops pins).
   Ships the fixes surfaced by the cass/frankensearch cross-repo triage:
   GH#366 `ReservedEmpty` reopen of a coherent populated file, GH#370
   orphaned FTS5 `%_content` reclaim, GH#371 bounded WITHOUT-ROWID / large

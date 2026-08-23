@@ -17,7 +17,7 @@ CENSUS_SCHEMA_VERSION="frankensearch-crates-registry-census-v1"
 # only; bump these literals deliberately, together with the lockfile, the
 # fresh-process contract pin in frankensearch-embed, and docs/planning/UPGRADE_LOG.md.
 AUDITED_ASUPERSYNC_VERSION="0.4.9"
-AUDITED_FSQLITE_FAMILY_VERSION="0.3.7"
+AUDITED_FSQLITE_FAMILY_VERSION="0.3.8"
 USER_AGENT="frankensearch-publish-contract/1.0 (https://github.com/Dicklesworthstone/frankensearch)"
 
 usage() {

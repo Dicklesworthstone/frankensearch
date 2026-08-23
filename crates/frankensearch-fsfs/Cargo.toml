@@ -96,8 +96,8 @@ ahash = { workspace = true }
 # lexical token text — the per-token to_ascii_lowercase heap alloc dominated
 # tokenize_lexical emission. Already resolved in the workspace lock (fusion dep).
 compact_str = "0.10"
-fsqlite = { version = "0.3.7", default-features = false, features = ["native", "async-api"] }
-fsqlite-types = { version = "0.3.7", features = ["native"] }
+fsqlite = { version = "0.3.8", default-features = false, features = ["native", "async-api"] }
+fsqlite-types = { version = "0.3.8", features = ["native"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toon-rust = { workspace = true }
