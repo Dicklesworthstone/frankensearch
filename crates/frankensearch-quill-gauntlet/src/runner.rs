@@ -15621,7 +15621,9 @@ mod tests {
             DivergenceRegistry::default(),
         )
         .expect("profile substitution runner")
-        .with_provenance(profile_provenance);
+        .with_provenance(profile_provenance)
+        .with_v4_source_build_snapshots(fixture_v4_source_build_snapshots())
+        .expect("attach fixture v4 Source-to-Build chain");
         let mut substituted_config = quill_config.clone();
         substituted_config.deterministic_ingest = !substituted_config.deterministic_ingest;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -15692,7 +15694,9 @@ mod tests {
             DivergenceRegistry::default(),
         )
         .expect("dependency substitution runner")
-        .with_provenance(dependency_provenance);
+        .with_provenance(dependency_provenance)
+        .with_v4_source_build_snapshots(fixture_v4_source_build_snapshots())
+        .expect("attach fixture v4 Source-to-Build chain");
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let error = dependency_campaign
                 .run_replay_internal(
@@ -15770,7 +15774,9 @@ mod tests {
             DivergenceRegistry::default(),
         )
         .expect("built-in all-infrastructure runner")
-        .with_provenance(provenance);
+        .with_provenance(provenance)
+        .with_v4_source_build_snapshots(fixture_v4_source_build_snapshots())
+        .expect("attach fixture v4 Source-to-Build chain");
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let report = campaign
@@ -16112,7 +16118,9 @@ mod tests {
             DivergenceRegistry::default(),
         )
         .expect("production rank-envelope policy")
-        .with_provenance(provenance);
+        .with_provenance(provenance)
+        .with_v4_source_build_snapshots(fixture_v4_source_build_snapshots())
+        .expect("attach fixture v4 Source-to-Build chain");
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let error = campaign
                 .run_replay_internal(
