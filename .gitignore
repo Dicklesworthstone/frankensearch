@@ -138,7 +138,7 @@ SESSION_REPORT.md
 SESSION_*.md
 verify_*.sh
 newfile.txt
-repro_*.rs
+/repro_*.rs
 
 # Claude local settings
 .claude/settings.local.json
