@@ -9,9 +9,9 @@ rust-version.workspace = true
 
 [dependencies]
 frankensearch-core = { workspace = true }
-fsqlite-core = { version = "0.3.8", default-features = false, features = ["native"] }
-fsqlite-error = "0.3.8"
-fsqlite-types = { version = "0.3.8", features = ["native"] }
+fsqlite-core = { version = "0.3.7", default-features = false, features = ["native"] }
+fsqlite-error = "0.3.7"
+fsqlite-types = { version = "0.3.7", features = ["native"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
