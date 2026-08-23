@@ -1268,8 +1268,13 @@ plain_start = installer.index("\nelse\n", gum_start)
 require_quickstart_order(source_quickstart, "source")
 require_quickstart_order(installer[gum_start:plain_start], "gum")
 require_quickstart_order(installer[plain_start:], "plain")
+# The default route's fallback must be a loud, from-source build of the
+# loader-capable profile (GH#36 wording), and the installer must never
+# compose the lite artifact name on that route.
 require(
-    "Full artifact download failed; building the loader-capable default from source" in installer
+    "Falling back to a FROM-SOURCE build" in installer
+    and "compiles the semantic-loader profile" in installer
+    and 'artifact_basename "$LITE"' in installer
     and "fsfs-lite-${VERSION_BARE}" not in installer,
     "ordinary installation must never silently substitute the explicit loader-free lite profile",
 )
