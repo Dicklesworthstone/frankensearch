@@ -1075,7 +1075,7 @@ fn qg6_worst_stability_ratio(bootstrap: &[Vec<f64>; 6]) -> f64 {
 /// deliberately NOT emitted here: a decisively failed equivalence is valid,
 /// claim-eligible evidence that the ratchet must consume into a Block (via
 /// the serialized `p50_equivalent` / `p99_noninferior` fields), not a
-/// NoDecision that would hide the measurement from the gate.
+/// `NoDecision` that would hide the measurement from the gate.
 fn qg6_joint_tail_decision_reasons(estimate: &Qg6JointTailEstimate) -> Vec<EvidenceReason> {
     let mut reasons = Vec::new();
     for (engine, null) in [
@@ -1201,7 +1201,7 @@ fn estimate_qg6_joint_tail_from_validated_rows(
 /// floor/ceiling so decision-layer unit tests do not pay normative Monte
 /// Carlo scale. Production paths always use the frozen constants.
 #[cfg(test)]
-pub(crate) fn estimate_qg6_joint_tail_fixture(
+fn estimate_qg6_joint_tail_fixture(
     paired: &PairedExperimentResult,
     quill_null_samples: &[PerfRawSample],
     external_authority: &Qg6ScheduleAuthority,
