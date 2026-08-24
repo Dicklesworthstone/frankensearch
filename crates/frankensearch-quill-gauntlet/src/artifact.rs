@@ -2519,7 +2519,15 @@ fn package_name_and_version_from_package_id(
         }
         return Ok((name.to_owned(), version.to_owned()));
     }
+    // Git sources append `?rev=…`/`?branch=…` to the URL; strip the query
+    // before taking the final path segment as the package name. Cargo only
+    // emits the bare-version fragment when that segment IS the package name,
+    // and a mismatch (renamed package) still fails closed downstream at lock
+    // membership rather than being silently mis-admitted.
     let name = base
+        .split('?')
+        .next()
+        .unwrap_or(base)
         .trim_end_matches('/')
         .rsplit('/')
         .next()
@@ -2567,8 +2575,9 @@ fn validate_dependency_records_lock_membership(
         locked.insert((name.to_owned(), version.to_owned()));
     }
     for record in records {
-        let (name, version) = package_name_and_version_from_package_id(&record.package_id)?;
-        if !locked.contains(&(name.clone(), version.clone())) {
+        let resolved = package_name_and_version_from_package_id(&record.package_id)?;
+        if !locked.contains(&resolved) {
+            let (name, version) = resolved;
             return Err(invalid(format!(
                 "dependency build-script record `{}` resolves to {name}@{version}, \
                  which the snapshot's Cargo.lock does not lock: the manifest is \
@@ -6594,6 +6603,13 @@ mod tests {
             )
             .expect("explicit name path form resolves"),
             ("renamed-package".to_owned(), "0.3.0".to_owned())
+        );
+        assert_eq!(
+            package_name_and_version_from_package_id(
+                "git+https://github.com/example/widget?rev=abc123#1.4.2"
+            )
+            .expect("bare-version git form strips the source query"),
+            ("widget".to_owned(), "1.4.2".to_owned())
         );
         for hostile in [
             "registry+https://github.com/rust-lang/crates.io-index",
