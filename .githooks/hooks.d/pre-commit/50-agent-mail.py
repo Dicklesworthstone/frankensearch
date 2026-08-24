@@ -10,7 +10,9 @@ import re
 import subprocess
 import sys
 
-PROJECT = "frankensearch"
+# The mail archive names projects by their slugified absolute path since
+# the 2026-08-24 archive rebuild (ensure_project human_key slugging).
+PROJECT = "data-projects-frankensearch"
 HOOK_NAME = "pre-commit"
 AGENT_NAME = os.environ.get("AGENT_NAME", "").strip()
 GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block")
