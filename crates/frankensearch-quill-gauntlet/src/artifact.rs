@@ -388,6 +388,29 @@ impl GauntletProducerBuildIdentity {
         validate_live_git_checkout(&expected_root, &expected_root, &self.source_git_revision)
     }
 
+    /// Live-checkout fence for COLLECTION, as opposed to sealed admission:
+    /// the checkout must still be exactly the producer's clean Git-verified
+    /// revision, but no sealed-executable demand is made. Collection is
+    /// legitimate wherever the executable identity is honestly typed — a
+    /// macOS path-snapshot chain from a clean checkout is exactly the
+    /// diagnostic F1 wants collected — and sealed admission enforces its own
+    /// bar (`validate_stored_sealed_v2`) at admission time. Without this
+    /// split, a CLEAN macOS checkout was less collectable than a dirty one,
+    /// because only the clean path ran the sealed-grade fence.
+    pub(crate) fn validate_live_source_checkout_for_collection(&self) -> Result<(), GauntletError> {
+        self.validate_stored_v2()?;
+        if self.source_verification != GauntletProducerSourceVerification::GitCheckoutVerified
+            || self.source_git_dirty
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "live-checkout collection fencing requires a clean Git-verified producer"
+                    .to_owned(),
+            });
+        }
+        let expected_root = producer_workspace_root();
+        validate_live_git_checkout(&expected_root, &expected_root, &self.source_git_revision)
+    }
+
     pub(crate) fn require_features(&self, required: &[&str]) -> Result<(), GauntletError> {
         self.validate_stored_v2()?;
         if let Some(missing) = required.iter().find(|feature| {
@@ -1681,7 +1704,7 @@ impl ArtifactStoreV4SourceBuildSnapshots {
                 == GauntletProducerSourceVerification::GitCheckoutVerified
                 && !producer.source_git_dirty;
             if has_live_git_provenance {
-                producer.validate_live_source_checkout()?;
+                producer.validate_live_source_checkout_for_collection()?;
             }
             let snapshots = Self::collect_workspace_snapshots(
                 &root,
@@ -1695,7 +1718,7 @@ impl ArtifactStoreV4SourceBuildSnapshots {
             // generation against the already-running executable. Git-less
             // producers remain explicitly unadmitted diagnostics instead.
             if has_live_git_provenance {
-                producer.validate_live_source_checkout()?;
+                producer.validate_live_source_checkout_for_collection()?;
             }
             Ok(snapshots)
         }
