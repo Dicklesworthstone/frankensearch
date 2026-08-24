@@ -1798,10 +1798,12 @@ pub fn v4_chain_shape_rejection(bytes: &[u8]) -> Option<String> {
 // ===== ArtifactStore v4 F4: typed consumer claims and promotion policy =====
 // (bd-artifactstore-v4-f4-consumer-wiring-396po)
 
-/// Consumer evidence modes. `FixturePublic` is the only CI and
-/// public-artifact mode; `PrivateLocal` policy is independently governed and
-/// can never block public fixture evidence — the evaluator consults private
-/// policy ONLY for `PrivateLocal` claims.
+/// Consumer evidence modes.
+///
+/// `FixturePublic` is the only CI and public-artifact mode; `PrivateLocal`
+/// policy is independently governed and can never block public fixture
+/// evidence — the evaluator consults private policy ONLY for
+/// `PrivateLocal` claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsumerMode {
@@ -1843,9 +1845,11 @@ pub enum DecisionState {
     Quarantine,
 }
 
-/// Coverage witnesses for one claim: every required label must be witnessed,
-/// and every witness must come from the SAME machine profile as the chain's
-/// execution (a cross-worker mix is not coverage, it is substitution).
+/// Coverage witnesses for one claim.
+///
+/// Every required label must be witnessed, and every witness must come from
+/// the SAME machine profile as the chain's execution (a cross-worker mix is
+/// not coverage, it is substitution).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverageWitnessSet {
     pub required: std::collections::BTreeSet<String>,
@@ -1853,16 +1857,20 @@ pub struct CoverageWitnessSet {
     pub witnessed: BTreeMap<String, (String, String)>,
 }
 
-/// Explicit release authority. Its existence is a deliberate, named act —
-/// release can never fall out of authentication or admission by default.
+/// Explicit release authority.
+///
+/// Its existence is a deliberate, named act — release can never fall out of
+/// authentication or admission by default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseAuthority {
     pub authority_label: String,
 }
 
-/// The admitted campaign identities a consumer expects the chain to bind
-/// (from the F1 source/build admission). A chain naming other identities is
-/// stale or substituted evidence regardless of its own authenticity.
+/// The admitted campaign identities a consumer expects the chain to bind.
+///
+/// These come from the F1 source/build admission. A chain naming other
+/// identities is stale or substituted evidence regardless of its own
+/// authenticity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmittedChainBinding {
     pub source_identity_sha256: String,
@@ -3224,7 +3232,7 @@ mod f4_consumer_policy_tests {
         }
     }
 
-    /// DiagnosticAttempt is always NoClaim — even for a fully authentic,
+    /// `DiagnosticAttempt` is always `NoClaim` — even for a fully authentic,
     /// admitted, passing, covered, released chain.
     #[test]
     fn f4_diagnostic_attempt_is_always_no_claim() {
@@ -3250,7 +3258,7 @@ mod f4_consumer_policy_tests {
         );
     }
 
-    /// AdmittedCampaignEvidence records Pass AND Miss exactly as evaluated;
+    /// `AdmittedCampaignEvidence` records Pass AND Miss exactly as evaluated;
     /// a Miss on an authentic chain stays a Miss, never relabeled.
     #[test]
     fn f4_admitted_evidence_records_pass_and_miss_without_relabeling() {
@@ -3274,7 +3282,7 @@ mod f4_consumer_policy_tests {
     }
 
     /// The full replacement ladder qualifies — and every single missing rung
-    /// drops it to a typed NoClaim.
+    /// drops it to a typed `NoClaim`.
     #[test]
     fn f4_replacement_qualification_ladder_and_rejection_matrix() {
         let fixture = verified_fixture(52, "exit 0");
@@ -3573,8 +3581,8 @@ mod f4_consumer_policy_tests {
         );
     }
 
-    /// PrivateLocal policy is independently governed: it gates PrivateLocal
-    /// claims and can never block FixturePublic evidence.
+    /// `PrivateLocal` policy is independently governed: it gates
+    /// `PrivateLocal` claims and can never block `FixturePublic` evidence.
     #[test]
     fn f4_private_local_policy_cannot_block_fixture_public() {
         let fixture = verified_fixture(55, "exit 0");
