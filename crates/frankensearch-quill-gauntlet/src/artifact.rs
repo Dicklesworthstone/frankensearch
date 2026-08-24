@@ -4254,6 +4254,13 @@ fn validate_stored_object_schema(schema_version: u32) -> Result<(), String> {
 pub fn classify_campaign_report_schema(
     bytes: &[u8],
 ) -> Result<SerializedSchemaDisposition, GauntletError> {
+    // F3 pre-policy canary: every v4 chain object also carries a bare
+    // `schema_version` integer, so without this check v4-shaped bytes would
+    // silently classify as UnauthenticatedLegacy and fall through to
+    // permissive legacy handling. Rejected BEFORE any version dispatch.
+    if let Some(reason) = crate::supervisor::v4_chain_shape_rejection(bytes) {
+        return Err(GauntletError::InvalidPreparedArtifact { reason });
+    }
     // A narrow derive-based probe ignores unrelated historical fields while
     // still rejecting a missing, non-integer, or duplicate schema key. This
     // routes every shipped generation before the current DTO is decoded.
@@ -4291,6 +4298,10 @@ pub fn classify_campaign_report_schema(
 pub fn classify_artifact_object_schema(
     bytes: &[u8],
 ) -> Result<SerializedSchemaDisposition, GauntletError> {
+    // F3 pre-policy canary — see `classify_campaign_report_schema`.
+    if let Some(reason) = crate::supervisor::v4_chain_shape_rejection(bytes) {
+        return Err(GauntletError::InvalidPreparedArtifact { reason });
+    }
     let probe: ArtifactObjectSchemaProbe =
         serde_json::from_slice(bytes).map_err(|error| GauntletError::InvalidPreparedArtifact {
             reason: format!("artifact object schema preflight failed closed: {error}"),

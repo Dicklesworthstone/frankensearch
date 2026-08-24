@@ -1409,6 +1409,384 @@ pub fn verify_execution_completion_chain(
     Ok((execution, completion))
 }
 
+// ===== ArtifactStore v4 F3: chain codec, store admission, and the =====
+// ===== pre-policy rejecting canary                                =====
+// (bd-artifactstore-v4-f3-codec-admission-xwtpw)
+
+/// Store-level chain-index identity domain. Not one of the four frozen F0
+/// object domains — the index is store metadata binding the four object
+/// identities; F1-F4 may add strictly stronger checks like this one.
+pub const ARTIFACTSTORE_V4_CHAIN_INDEX_DOMAIN: &str =
+    "frankensearch.artifactstore.v4.chain-index";
+
+/// Frozen F0 authentication axis (schema `authentication`). No value is ever
+/// inferred from another axis: a verified chain is not admission, decision,
+/// or release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthenticationClass {
+    VerifiedReceiptChain,
+    IntegrityOnly,
+    UnauthenticatedLegacy,
+}
+
+/// The store's chain index: one record binding the full object graph by
+/// complete identities (never paths or labels). Its publication is the
+/// chain's commit point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactStoreV4ChainIndex {
+    pub schema_version: u32,
+    pub source_identity_sha256: String,
+    pub build_identity_sha256: String,
+    pub execution_identity_sha256: String,
+    pub completion_identity_sha256: String,
+    /// Restated consumed nonce so index substitution is a one-field mismatch.
+    pub nonce_hex: String,
+    pub terminal_outcome: TerminalOutcome,
+}
+
+impl ArtifactStoreV4ChainIndex {
+    /// Canonical bytes + store-domain identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError`] when a field violates its structural
+    /// contract or the index cannot serialize canonically.
+    pub fn identity(&self) -> Result<(Vec<u8>, String), GauntletError> {
+        if self.schema_version != SUPERVISOR_AUTH_SCHEMA_VERSION {
+            return Err(invalid(format!(
+                "unknown chain-index schema version {} fails closed",
+                self.schema_version
+            )));
+        }
+        for (identity, what) in [
+            (&self.source_identity_sha256, "chain source identity"),
+            (&self.build_identity_sha256, "chain build identity"),
+            (&self.execution_identity_sha256, "chain execution identity"),
+            (&self.completion_identity_sha256, "chain completion identity"),
+        ] {
+            validate_identity_hex(identity, what)?;
+        }
+        decode_hex_exact(&self.nonce_hex, 16, "chain nonce")?;
+        let canonical = canonical_json_bytes(self)?;
+        let identity = domain_identity(ARTIFACTSTORE_V4_CHAIN_INDEX_DOMAIN, &canonical);
+        Ok((canonical, identity))
+    }
+}
+
+/// A fully verified, reloaded v4 chain. Construction happens ONLY through
+/// [`ArtifactStoreV4ChainStore::load_verified_chain`]; the classification is
+/// therefore earned, never asserted by the caller.
+#[derive(Debug)]
+pub struct VerifiedV4Chain {
+    pub authentication: AuthenticationClass,
+    pub index: ArtifactStoreV4ChainIndex,
+    pub execution: ArtifactStoreV4ExecutionObject,
+    pub completion: ArtifactStoreV4CompletionObject,
+}
+
+/// Result of one content-addressed publication step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishOutcome {
+    Written,
+    AlreadyPresentIdentical,
+}
+
+/// Content-addressed store for v4 execution/completion chains.
+///
+/// Layout under the root: `objects/<identity>` (raw canonical object bytes),
+/// `receipts/<object-identity>` (canonical receipt bytes),
+/// `absences/<execution-identity>` (canonical absence bytes), and
+/// `chains/<chain-identity>` (canonical index bytes; published LAST as the
+/// commit point). Every publication is create-new atomic: exclusive pending
+/// file, write, fsync, rename, parent-directory fsync. A leftover pending
+/// file from a crash fails closed rather than being silently overwritten.
+#[derive(Debug)]
+pub struct ArtifactStoreV4ChainStore {
+    root: PathBuf,
+}
+
+impl ArtifactStoreV4ChainStore {
+    /// Open (creating directories as needed) a chain store at `root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError`] when the directories cannot be created.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, GauntletError> {
+        let root = root.into();
+        for child in ["objects", "receipts", "absences", "chains"] {
+            std::fs::create_dir_all(root.join(child)).map_err(|error| {
+                invalid(format!("cannot create v4 chain store directory: {error}"))
+            })?;
+        }
+        Ok(Self { root })
+    }
+
+    fn child_dir(&self, kind: &str) -> PathBuf {
+        self.root.join(kind)
+    }
+
+    /// Create-new atomic publication of content-addressed bytes.
+    ///
+    /// An existing file with IDENTICAL bytes is idempotent success; an
+    /// existing file with different bytes at the same address is the
+    /// quarantine-class collision F0 assigns to identity conflicts.
+    fn publish_atomic(
+        &self,
+        kind: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<PublishOutcome, GauntletError> {
+        validate_identity_hex(name, "store entry name")?;
+        let dir = self.child_dir(kind);
+        let final_path = dir.join(name);
+        if final_path.exists() {
+            let existing = std::fs::read(&final_path)
+                .map_err(|error| invalid(format!("cannot read existing store entry: {error}")))?;
+            if existing == bytes {
+                return Ok(PublishOutcome::AlreadyPresentIdentical);
+            }
+            return Err(invalid(format!(
+                "content-address collision in {kind}: existing bytes differ; \
+                 this is a terminal quarantine, not an overwrite"
+            )));
+        }
+        let pending_path = dir.join(format!(".{name}.pending"));
+        let mut pending = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending_path)
+            .map_err(|error| {
+                invalid(format!(
+                    "cannot create pending store entry (a leftover pending file from a \
+                     crash fails closed and needs explicit operator recovery): {error}"
+                ))
+            })?;
+        use std::io::Write as _;
+        pending
+            .write_all(bytes)
+            .and_then(|()| pending.sync_all())
+            .map_err(|error| invalid(format!("cannot write pending store entry: {error}")))?;
+        drop(pending);
+        std::fs::rename(&pending_path, &final_path)
+            .map_err(|error| invalid(format!("cannot publish store entry: {error}")))?;
+        if let Ok(dir_handle) = std::fs::File::open(&dir) {
+            let _ = dir_handle.sync_all();
+        }
+        Ok(PublishOutcome::Written)
+    }
+
+    fn read_entry(&self, kind: &str, name: &str) -> Result<Vec<u8>, GauntletError> {
+        validate_identity_hex(name, "store entry name")?;
+        std::fs::read(self.child_dir(kind).join(name)).map_err(|error| {
+            invalid(format!(
+                "v4 chain store entry {kind}/{name} is absent or unreadable: {error}"
+            ))
+        })
+    }
+
+    /// Verify a chain FIRST, then publish it atomically; the chain index is
+    /// written last as the commit point. Nothing unverified is ever written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError`] when verification fails, when a
+    /// content-address collision is detected, or on a publication I/O
+    /// failure.
+    pub fn publish_verified_chain(
+        &self,
+        trust_roots: &SupervisorTrustRoots,
+        execution: &ArtifactStoreV4ExecutionObject,
+        execution_receipt: &SignedReceiptV4,
+        completion: &ArtifactStoreV4CompletionObject,
+        completion_receipt: &SignedReceiptV4,
+    ) -> Result<String, GauntletError> {
+        let (execution_bytes, execution_identity) = execution.identity()?;
+        let (completion_bytes, completion_identity) = completion.identity()?;
+        verify_execution_completion_chain(
+            trust_roots,
+            &execution_bytes,
+            execution_receipt,
+            &completion_bytes,
+            completion_receipt,
+        )?;
+        let index = ArtifactStoreV4ChainIndex {
+            schema_version: SUPERVISOR_AUTH_SCHEMA_VERSION,
+            source_identity_sha256: execution.source_identity_sha256.clone(),
+            build_identity_sha256: execution.predecessor_build_identity_sha256.clone(),
+            execution_identity_sha256: execution_identity.clone(),
+            completion_identity_sha256: completion_identity.clone(),
+            nonce_hex: execution.nonce_hex.clone(),
+            terminal_outcome: completion.terminal_outcome,
+        };
+        let (index_bytes, chain_identity) = index.identity()?;
+        self.publish_atomic("objects", &execution_identity, &execution_bytes)?;
+        self.publish_atomic("objects", &completion_identity, &completion_bytes)?;
+        self.publish_atomic(
+            "receipts",
+            &execution_identity,
+            &canonical_json_bytes(execution_receipt)?,
+        )?;
+        self.publish_atomic(
+            "receipts",
+            &completion_identity,
+            &canonical_json_bytes(completion_receipt)?,
+        )?;
+        self.publish_atomic("chains", &chain_identity, &index_bytes)?;
+        Ok(chain_identity)
+    }
+
+    /// Publish a typed completion absence for an execution (the execution
+    /// object and its receipt are stored alongside so the absence is
+    /// independently verifiable). Absences never receive a chain index —
+    /// there is no completion to commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError`] when the absence does not verify or on a
+    /// publication failure.
+    pub fn publish_verified_absence(
+        &self,
+        trust_roots: &SupervisorTrustRoots,
+        execution: &ArtifactStoreV4ExecutionObject,
+        execution_receipt: &SignedReceiptV4,
+        absence: &CompletionAbsenceV4,
+    ) -> Result<(), GauntletError> {
+        let (execution_bytes, execution_identity) = execution.identity()?;
+        execution_receipt.verify(
+            trust_roots,
+            "execution",
+            EXECUTION_SUPERVISOR_ROLE,
+            &execution_identity,
+        )?;
+        absence.verify(trust_roots)?;
+        if absence.execution_identity_sha256 != execution_identity {
+            return Err(invalid(
+                "absence does not bind the execution identity".to_owned(),
+            ));
+        }
+        self.publish_atomic("objects", &execution_identity, &execution_bytes)?;
+        self.publish_atomic(
+            "receipts",
+            &execution_identity,
+            &canonical_json_bytes(execution_receipt)?,
+        )?;
+        self.publish_atomic(
+            "absences",
+            &execution_identity,
+            &canonical_json_bytes(absence)?,
+        )?;
+        Ok(())
+    }
+
+    /// Verified reload: the ONLY constructor of [`VerifiedV4Chain`].
+    ///
+    /// Binds, fail-closed and in order: the chain index's content address,
+    /// both objects' content addresses recomputed from their exact stored
+    /// bytes, both receipts under the frozen roles and trust roots, the
+    /// nonce, and the full source/build/execution/completion graph — all
+    /// BEFORE any policy sees the data. The result is authentication only:
+    /// `VerifiedReceiptChain` never implies admission, decision, or release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError`] on any absent, truncated, extended,
+    /// tampered, non-canonical, digest-mismatched, signature-mismatched,
+    /// wrong-nonce, wrong-signer, or graph-inconsistent entry.
+    pub fn load_verified_chain(
+        &self,
+        trust_roots: &SupervisorTrustRoots,
+        chain_identity: &str,
+    ) -> Result<VerifiedV4Chain, GauntletError> {
+        let index_bytes = self.read_entry("chains", chain_identity)?;
+        let recomputed = domain_identity(ARTIFACTSTORE_V4_CHAIN_INDEX_DOMAIN, &index_bytes);
+        if recomputed != chain_identity {
+            return Err(invalid(
+                "chain index bytes do not match their content address".to_owned(),
+            ));
+        }
+        let index: ArtifactStoreV4ChainIndex = decode_canonical(&index_bytes)?;
+
+        let execution_bytes = self.read_entry("objects", &index.execution_identity_sha256)?;
+        let execution_recomputed =
+            domain_identity(ARTIFACTSTORE_V4_EXECUTION_DOMAIN, &execution_bytes);
+        if execution_recomputed != index.execution_identity_sha256 {
+            return Err(invalid(
+                "execution bytes do not match their content address".to_owned(),
+            ));
+        }
+        let completion_bytes = self.read_entry("objects", &index.completion_identity_sha256)?;
+        let completion_recomputed =
+            domain_identity(ARTIFACTSTORE_V4_COMPLETION_DOMAIN, &completion_bytes);
+        if completion_recomputed != index.completion_identity_sha256 {
+            return Err(invalid(
+                "completion bytes do not match their content address".to_owned(),
+            ));
+        }
+        let execution_receipt: SignedReceiptV4 =
+            decode_canonical(&self.read_entry("receipts", &index.execution_identity_sha256)?)?;
+        let completion_receipt: SignedReceiptV4 =
+            decode_canonical(&self.read_entry("receipts", &index.completion_identity_sha256)?)?;
+        let (execution, completion) = verify_execution_completion_chain(
+            trust_roots,
+            &execution_bytes,
+            &execution_receipt,
+            &completion_bytes,
+            &completion_receipt,
+        )?;
+        if execution.source_identity_sha256 != index.source_identity_sha256
+            || execution.predecessor_build_identity_sha256 != index.build_identity_sha256
+            || execution.nonce_hex != index.nonce_hex
+            || completion.terminal_outcome != index.terminal_outcome
+        {
+            return Err(invalid(
+                "chain index does not bind the verified object graph".to_owned(),
+            ));
+        }
+        Ok(VerifiedV4Chain {
+            authentication: AuthenticationClass::VerifiedReceiptChain,
+            index,
+            execution,
+            completion,
+        })
+    }
+}
+
+/// Pre-policy v4 rejecting canary (F3).
+///
+/// Legacy schema classifiers dispatch on a bare `schema_version` integer —
+/// and every v4 chain object also carries `schema_version`, so v4-shaped
+/// bytes fed to a legacy reader would silently classify as
+/// `UnauthenticatedLegacy` and fall through to permissive legacy handling.
+/// This probe runs BEFORE any legacy/default policy: bytes that carry v4
+/// chain field signatures are rejected with a typed reason instead of being
+/// classified at all.
+#[must_use]
+pub fn v4_chain_shape_rejection(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let object = value.as_object()?;
+    let has_nonce = object.contains_key("nonce_hex");
+    let chain_markers = [
+        "predecessor_build_identity_sha256",
+        "predecessor_execution_identity_sha256",
+        "execution_identity_sha256",
+        "completion_identity_sha256",
+    ];
+    let has_chain_marker = chain_markers.iter().any(|key| object.contains_key(key));
+    let is_receipt_shaped = object.contains_key("object_identity_sha256")
+        && object.contains_key("signature_hex")
+        && object.contains_key("role");
+    if (has_nonce && has_chain_marker) || is_receipt_shaped {
+        return Some(
+            "v4 chain-shaped bytes may not enter a legacy reader: route them \
+             through the ArtifactStore v4 verified-reload path"
+                .to_owned(),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
