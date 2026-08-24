@@ -167,6 +167,11 @@ chacha20poly1305 = "=0.11.0"
 getrandom = "=0.4.3"
 hmac = "=0.13.0"
 zeroize = "=1.9.0"
+# Ed25519 receipt signatures mandated by the frozen ArtifactStore v4 F0
+# contract (docs/artifactstore-v4-threat-model.md). Pinned to the version the
+# lock already resolves through asupersync, so no new dependency universe
+# entry is introduced.
+ed25519-dalek = "=2.2.0"
 
 # PDF text extraction (digital PDFs with selectable text)
 pdf-extract = "0.12.0"

@@ -40,6 +40,11 @@ mod qg2_contract;
 mod qg6_prepared;
 pub mod replacement_authorization;
 mod runner;
+/// ArtifactStore v4 F2: supervisor-issued execution/completion authentication.
+///
+/// External nonce authority, Ed25519 receipts, and typed completion absences
+/// per the frozen F0 trust contract.
+pub mod supervisor;
 mod version_contract;
 
 use std::path::PathBuf;
