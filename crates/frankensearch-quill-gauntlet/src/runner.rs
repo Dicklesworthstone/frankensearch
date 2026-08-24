@@ -5229,19 +5229,22 @@ impl DifferentialCampaignRunner {
         Ok(self)
     }
 
-    /// Collect and attach the current Linux producer's sealed v4 Source and
-    /// Build objects. This records the running `/proc/self/exe` digest in the
-    /// Build object before the campaign reservation is created.
+    /// Collect and attach the current producer's v4 Source and Build objects
+    /// before the campaign reservation is created. On Linux the Build object
+    /// records the kernel-held `/proc/self/exe` digest — the only executable
+    /// witness sealed admission accepts. On macOS it records an honestly
+    /// typed path-snapshot digest: authentic diagnostic provenance that
+    /// `validate_stored_sealed_v2` permanently rejects for sealed built-in
+    /// integrity.
     ///
     /// # Errors
     ///
     /// Returns an error when the checkout is not clean and Git-verified, a
-    /// compiler-visible input cannot be captured, or the running executable
-    /// cannot be bound through the Linux kernel-held image path.
+    /// compiler-visible input cannot be captured, the running executable
+    /// cannot be bound to the platform's witness, or the platform has no
+    /// collector.
     pub fn with_collected_v4_source_build_snapshots(self) -> Result<Self, GauntletError> {
-        self.with_v4_source_build_snapshots(
-            ArtifactStoreV4SourceBuildSnapshots::collect_current_linux()?,
-        )
+        self.with_v4_source_build_snapshots(ArtifactStoreV4SourceBuildSnapshots::collect_current()?)
     }
 
     /// [`Self::with_collected_v4_source_build_snapshots`] plus an external
@@ -5261,7 +5264,7 @@ impl DifferentialCampaignRunner {
         dependency_manifest: &str,
     ) -> Result<Self, GauntletError> {
         self.with_v4_source_build_snapshots(
-            ArtifactStoreV4SourceBuildSnapshots::collect_current_linux_with_dependency_manifest(
+            ArtifactStoreV4SourceBuildSnapshots::collect_current_with_dependency_manifest(
                 dependency_manifest,
             )?,
         )

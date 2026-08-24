@@ -1603,26 +1603,37 @@ impl ArtifactStoreV4SourceBuildSnapshots {
         Ok(Self { source, build })
     }
 
-    /// Collect the current Linux producer's source workspace and the build
-    /// facts bound into its running `/proc/self/exe` image.
+    /// Collect the current producer's source workspace and the build facts
+    /// bound into its running executable image.
     ///
     /// A clean Git checkout receives tracked-source selection plus live
     /// checkout fencing. A Git-less producer instead receives a complete
     /// observable-workspace selection and a typed source-provenance Build
     /// input. That records authentic but unadmitted diagnostic evidence; it
-    /// never satisfies the separate sealed-admission contract. The resulting
-    /// Build object carries the kernel-held executable digest, not a
-    /// replaceable path.
+    /// never satisfies the separate sealed-admission contract.
+    ///
+    /// Platform honesty boundary (F1,
+    /// bd-artifactstore-v4-f1-source-build-snapshot-ldqkt): on Linux the
+    /// Build object carries the KERNEL-HELD `/proc/self/exe` digest — the
+    /// only executable witness sealed admission accepts. On macOS there is
+    /// no kernel-held-image equivalent: the digest is a PATH SNAPSHOT
+    /// (hashed from the open descriptor with pre/post metadata stability,
+    /// which pins the inode during hashing but cannot prove the opened file
+    /// IS the mapped image). macOS snapshots are therefore collectable
+    /// diagnostics that `validate_stored_sealed_v2` permanently rejects for
+    /// sealed built-in integrity — the same standing Git-less producers
+    /// have. Other platforms fail closed.
     ///
     /// # Errors
     ///
     /// Returns [`GauntletError`] when source selection, descriptor capture,
-    /// compiled producer identity, or Linux running-image binding fails.
-    pub fn collect_current_linux() -> Result<Self, GauntletError> {
-        Self::collect_current_linux_inner(None)
+    /// compiled producer identity, or running-image binding fails, and on
+    /// every platform without a collector.
+    pub fn collect_current() -> Result<Self, GauntletError> {
+        Self::collect_current_inner(None)
     }
 
-    /// [`Self::collect_current_linux`] plus an external Cargo execution
+    /// [`Self::collect_current`] plus an external Cargo execution
     /// manifest for DEPENDENCY build scripts.
     ///
     /// `dependency_manifest` is the raw `cargo build --message-format=json`
@@ -1641,19 +1652,17 @@ impl ArtifactStoreV4SourceBuildSnapshots {
     ///
     /// # Errors
     ///
-    /// Everything [`Self::collect_current_linux`] returns, plus a malformed
+    /// Everything [`Self::collect_current`] returns, plus a malformed
     /// manifest line, a duplicate `(package_id, unit_dir)`, an unparseable
     /// package id, or a record whose package is not in `Cargo.lock`.
-    pub fn collect_current_linux_with_dependency_manifest(
+    pub fn collect_current_with_dependency_manifest(
         dependency_manifest: &str,
     ) -> Result<Self, GauntletError> {
-        Self::collect_current_linux_inner(Some(dependency_manifest))
+        Self::collect_current_inner(Some(dependency_manifest))
     }
 
-    fn collect_current_linux_inner(
-        dependency_manifest: Option<&str>,
-    ) -> Result<Self, GauntletError> {
-        #[cfg(target_os = "linux")]
+    fn collect_current_inner(dependency_manifest: Option<&str>) -> Result<Self, GauntletError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let producer = GauntletProducerBuildIdentity::compiled()?;
             producer.validate_creation_contract()?;
@@ -1674,7 +1683,7 @@ impl ArtifactStoreV4SourceBuildSnapshots {
             if has_live_git_provenance {
                 producer.validate_live_source_checkout()?;
             }
-            let snapshots = Self::collect_linux_workspace(
+            let snapshots = Self::collect_workspace_snapshots(
                 &root,
                 &producer,
                 has_live_git_provenance,
@@ -1690,17 +1699,20 @@ impl ArtifactStoreV4SourceBuildSnapshots {
             }
             Ok(snapshots)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = dependency_manifest;
             Err(GauntletError::InvalidPreparedArtifact {
-                reason: "ArtifactStore v4 current-process collection requires Linux /proc/self/exe"
+                reason: "ArtifactStore v4 current-process collection requires Linux \
+                         /proc/self/exe or a macOS path-snapshot identity; this platform \
+                         has no collector"
                     .to_owned(),
             })
         }
     }
 
-    fn collect_linux_workspace(
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn collect_workspace_snapshots(
         root: &Path,
         producer: &GauntletProducerBuildIdentity,
         has_live_git_provenance: bool,
@@ -1719,7 +1731,7 @@ impl ArtifactStoreV4SourceBuildSnapshots {
         )?;
         let build = ArtifactStoreV4BuildSnapshot::new(
             source.identity_sha256.clone(),
-            collect_current_linux_build_inputs(root, &source, producer, dependency_manifest)?,
+            collect_current_build_inputs(root, &source, producer, dependency_manifest)?,
         )?;
         Self::new(source, build)
     }
@@ -2662,7 +2674,7 @@ const PRODUCER_BUILD_SCRIPT_EMISSIONS: [(&str, &str); 15] = [
     ),
 ];
 
-fn collect_current_linux_build_inputs(
+fn collect_current_build_inputs(
     root: &Path,
     source: &ArtifactStoreV4SourceSnapshot,
     producer: &GauntletProducerBuildIdentity,
@@ -2803,7 +2815,7 @@ fn collect_current_linux_build_inputs(
     // executable: Cargo keeps no manifest of it in the binary, and OUT_DIR
     // paths for dependencies are not knowable at runtime. When the caller
     // supplies the external Cargo execution manifest this collector was
-    // waiting for (`collect_current_linux_with_dependency_manifest`), the
+    // waiting for (`collect_current_with_dependency_manifest`), the
     // records are collected canonically, lock-bound, and stored — and the
     // availability receipt says `external-manifest`, never `exact`, because
     // lock membership binds the dependency UNIVERSE, not the physical Cargo
@@ -2869,9 +2881,20 @@ fn collect_current_linux_build_inputs(
             producer.target_triple.as_bytes().to_vec(),
         ),
     );
+    // The executable witness is the one platform-specific Build input.
+    // Linux binds the kernel-held /proc/self/exe image (the only witness
+    // sealed admission accepts); macOS binds an inode-pinned PATH SNAPSHOT
+    // and says so — `validate_stored_sealed_v2` rejects it for sealed
+    // built-in integrity by construction.
+    #[cfg(target_os = "linux")]
     inputs.insert(
         "executable/linux-procfs-running-image".to_owned(),
         linux_running_image_build_input(producer)?,
+    );
+    #[cfg(target_os = "macos")]
+    inputs.insert(
+        "executable/macos-path-snapshot-image".to_owned(),
+        macos_path_snapshot_build_input(producer)?,
     );
     inputs.insert(
         "debug/producer-build-identity".to_owned(),
@@ -2958,6 +2981,15 @@ fn build_input(
     }
 }
 
+/// rustix `RawMode` is `u32` on Linux and `u16` on macOS; the snapshot
+/// schema stores `u32`. The allow covers the identity conversion on
+/// platforms where `RawMode` is already `u32`.
+#[allow(clippy::useless_conversion)]
+fn raw_mode_to_u32(mode: impl Into<u32>) -> u32 {
+    mode.into()
+}
+
+#[cfg(target_os = "linux")]
 fn linux_running_image_build_input(
     producer: &GauntletProducerBuildIdentity,
 ) -> Result<ArtifactStoreV4BuildInput, GauntletError> {
@@ -2982,6 +3014,50 @@ fn linux_running_image_build_input(
             "sha256": sha256,
             "byte_len": byte_len,
             "verification": verification,
+        }))?,
+    ))
+}
+
+/// macOS executable witness: an inode-pinned PATH SNAPSHOT, honestly typed.
+///
+/// macOS has no `/proc/self/exe` equivalent — `std::env::current_exe()`
+/// resolves a PATH via `_NSGetExecutablePath`, and no user-space API proves
+/// that the file opened at that path IS the kernel-mapped image. The capture
+/// hashes from the open descriptor with pre/post metadata stability (pinning
+/// one inode for the duration), which defeats a swap-under-the-path during
+/// hashing but not a swap before the open. The receipt therefore records
+/// `path_snapshot`, and `validate_stored_sealed_v2` rejects it for sealed
+/// built-in integrity permanently — this input exists so macOS producers get
+/// authentic, typed DIAGNOSTIC provenance instead of no collector at all
+/// (bd-artifactstore-v4-f1-source-build-snapshot-ldqkt).
+#[cfg(target_os = "macos")]
+fn macos_path_snapshot_build_input(
+    producer: &GauntletProducerBuildIdentity,
+) -> Result<ArtifactStoreV4BuildInput, GauntletError> {
+    let (sha256, byte_len, verification) = current_executable_identity()?;
+    if !producer
+        .target_triple
+        .split('-')
+        .any(|component| component == "darwin" || component == "apple")
+        || verification != GauntletExecutableVerification::PathSnapshot
+        || producer.executable_verification != GauntletExecutableVerification::PathSnapshot
+        || producer.executable_sha256 != sha256
+        || producer.executable_byte_len != byte_len
+    {
+        return Err(GauntletError::InvalidPreparedArtifact {
+            reason: "ArtifactStore v4 macOS executable receipt does not bind the running \
+                     producer's path-snapshot identity"
+                .to_owned(),
+        });
+    }
+    Ok(build_input(
+        ArtifactStoreV4BuildInputKind::Executable,
+        serde_json::to_vec(&serde_json::json!({
+            "path": "std::env::current_exe path snapshot",
+            "sha256": sha256,
+            "byte_len": byte_len,
+            "verification": verification,
+            "honesty": "inode-pinned during hashing via the open descriptor; NOT a kernel-held mapped-image witness; diagnostic-only and never sealed-admissible",
         }))?,
     ))
 }
@@ -5466,7 +5542,7 @@ impl PinnedDirectory {
                     relative_path: relative_path.to_owned(),
                     kind: ArtifactStoreV4SourceEntryKind::Symlink,
                     inclusion_reasons,
-                    mode: before.st_mode,
+                    mode: raw_mode_to_u32(before.st_mode),
                     byte_len: u64::try_from(target_bytes.len()).unwrap_or(u64::MAX),
                     sha256: lower_hex(&Sha256::digest(target_bytes)),
                     symlink_target: Some(target.to_owned()),
@@ -5541,7 +5617,11 @@ impl PinnedDirectory {
                     .to_owned(),
             });
         }
-        Ok((before.st_mode, byte_len, lower_hex(&Sha256::digest(bytes))))
+        Ok((
+            raw_mode_to_u32(before.st_mode),
+            byte_len,
+            lower_hex(&Sha256::digest(bytes)),
+        ))
     }
 
     fn publish_no_clobber(&self, name: &OsStr, bytes: &[u8]) -> Result<(), GauntletError> {
@@ -6169,8 +6249,20 @@ mod tests {
             .to_owned()
     }
 
+    /// A tempdir whose PATH has no symlinked ancestors. On macOS the
+    /// standard temp root lives under `/var -> /private/var`, and the
+    /// descriptor-safe capture rightly rejects symlinked path components —
+    /// exactly like production, which canonicalizes its workspace root
+    /// before collecting.
+    fn canonical_tempdir(purpose: &str) -> tempfile::TempDir {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonicalize the temp root");
+        tempfile::tempdir_in(base).unwrap_or_else(|error| panic!("{purpose}: {error}"))
+    }
+
     fn clean_fixture_repository() -> (tempfile::TempDir, String) {
-        let repository = tempfile::tempdir().expect("fixture Git repository");
+        let repository = canonical_tempdir("fixture Git repository");
         run_fixture_git(repository.path(), &["init", "--quiet"]);
         std::fs::write(repository.path().join("tracked.txt"), b"sealed source\n")
             .expect("write tracked fixture");
@@ -6726,7 +6818,7 @@ mod tests {
             inputs.iter().find(|input| input.key == key).cloned()
         };
 
-        let without = collect_current_linux_build_inputs(root.path(), &source, &producer, None)
+        let without = collect_current_build_inputs(root.path(), &source, &producer, None)
             .expect("collect without a dependency manifest");
         let receipt = find(&without, "build-script-output/dependency-availability")
             .expect("availability receipt is always present");
@@ -6738,7 +6830,7 @@ mod tests {
             "no records input may exist without a manifest"
         );
 
-        let with = collect_current_linux_build_inputs(
+        let with = collect_current_build_inputs(
             root.path(),
             &source,
             &producer,
@@ -6793,7 +6885,7 @@ mod tests {
         )
         .expect("capture narrowed source snapshot");
         assert!(
-            collect_current_linux_build_inputs(
+            collect_current_build_inputs(
                 root.path(),
                 &narrowed_source,
                 &producer,
@@ -6856,7 +6948,7 @@ mod tests {
         producer
             .validate_stored_v2()
             .expect("compiled producer must retain a well-formed typed source provenance");
-        let snapshots = ArtifactStoreV4SourceBuildSnapshots::collect_current_linux()
+        let snapshots = ArtifactStoreV4SourceBuildSnapshots::collect_current()
             .expect("collect a current Linux source/build chain");
         snapshots
             .source()
@@ -6971,6 +7063,53 @@ mod tests {
         );
     }
 
+    /// F1 macOS slice: the collector produces an honestly typed PATH-SNAPSHOT
+    /// executable witness, and sealed admission REJECTS it by construction —
+    /// macOS chains are diagnostics, never sealed built-in integrity.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn artifactstore_v4_current_macos_collector_binds_path_snapshot_and_stays_unsealed() {
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        assert_eq!(
+            producer.executable_verification,
+            GauntletExecutableVerification::PathSnapshot,
+            "macOS executable identity must be typed as a path snapshot"
+        );
+        let snapshots = ArtifactStoreV4SourceBuildSnapshots::collect_current()
+            .expect("collect a current macOS source/build chain");
+        snapshots
+            .source()
+            .validate()
+            .expect("validate source snapshot");
+        snapshots
+            .build()
+            .validate()
+            .expect("validate build snapshot");
+        let executable = snapshots
+            .build()
+            .inputs
+            .iter()
+            .find(|input| input.kind == ArtifactStoreV4BuildInputKind::Executable)
+            .expect("Build snapshot must retain a macOS executable receipt");
+        assert_eq!(executable.key, "executable/macos-path-snapshot-image");
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&executable.canonical_bytes).expect("decode executable receipt");
+        assert_eq!(receipt["verification"], "path_snapshot");
+        assert_eq!(receipt["sha256"], producer.executable_sha256);
+        assert!(
+            receipt["honesty"]
+                .as_str()
+                .is_some_and(|honesty| honesty.contains("never sealed-admissible")),
+            "the receipt must state its own honesty boundary"
+        );
+        // The load-bearing pin: no macOS producer — however clean its
+        // checkout — can pass sealed built-in validation.
+        assert!(
+            producer.validate_stored_sealed_v2().is_err(),
+            "sealed admission must reject a path-snapshot executable witness"
+        );
+    }
+
     #[test]
     fn artifactstore_v4_source_snapshot_rejects_ambiguous_paths_and_kinds() {
         let hash = "c".repeat(64);
@@ -7008,7 +7147,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().expect("temporary source root");
+        let root = canonical_tempdir("temporary source root");
         std::fs::write(root.path().join("Cargo.lock"), b"locked dependency graph\n")
             .expect("write source lockfile");
         std::fs::create_dir(root.path().join("crates")).expect("create source subdirectory");
@@ -7072,7 +7211,7 @@ mod tests {
     fn artifactstore_v4_source_snapshot_capture_rejects_incomplete_and_unsafe_inputs() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().expect("temporary source root");
+        let root = canonical_tempdir("temporary source root");
         std::fs::write(root.path().join("Cargo.lock"), b"locked dependency graph\n")
             .expect("write source lockfile");
         std::fs::create_dir(root.path().join("crates")).expect("create source subdirectory");
@@ -7207,7 +7346,7 @@ mod tests {
         .expect("construct build snapshot");
         let snapshots =
             ArtifactStoreV4SourceBuildSnapshots::new(source, build).expect("bind Source to Build");
-        let root = tempfile::tempdir().expect("temporary ArtifactStore root");
+        let root = canonical_tempdir("temporary ArtifactStore root");
         let store = ArtifactStore::new(root.path());
 
         let binding = store
