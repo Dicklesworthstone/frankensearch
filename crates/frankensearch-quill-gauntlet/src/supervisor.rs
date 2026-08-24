@@ -1413,11 +1413,12 @@ pub fn verify_execution_completion_chain(
 // ===== pre-policy rejecting canary                                =====
 // (bd-artifactstore-v4-f3-codec-admission-xwtpw)
 
-/// Store-level chain-index identity domain. Not one of the four frozen F0
-/// object domains — the index is store metadata binding the four object
-/// identities; F1-F4 may add strictly stronger checks like this one.
-pub const ARTIFACTSTORE_V4_CHAIN_INDEX_DOMAIN: &str =
-    "frankensearch.artifactstore.v4.chain-index";
+/// Store-level chain-index identity domain.
+///
+/// Not one of the four frozen F0 object domains — the index is store
+/// metadata binding the four object identities; F1-F4 may add strictly
+/// stronger checks like this one.
+pub const ARTIFACTSTORE_V4_CHAIN_INDEX_DOMAIN: &str = "frankensearch.artifactstore.v4.chain-index";
 
 /// Frozen F0 authentication axis (schema `authentication`). No value is ever
 /// inferred from another axis: a verified chain is not admission, decision,
@@ -1464,7 +1465,10 @@ impl ArtifactStoreV4ChainIndex {
             (&self.source_identity_sha256, "chain source identity"),
             (&self.build_identity_sha256, "chain build identity"),
             (&self.execution_identity_sha256, "chain execution identity"),
-            (&self.completion_identity_sha256, "chain completion identity"),
+            (
+                &self.completion_identity_sha256,
+                "chain completion identity",
+            ),
         ] {
             validate_identity_hex(identity, what)?;
         }
@@ -1735,6 +1739,10 @@ impl ArtifactStoreV4ChainStore {
             &completion_bytes,
             &completion_receipt,
         )?;
+        // The object and index field names deliberately differ
+        // (predecessor_build_identity vs build_identity): the index is a
+        // separate record, not a mirror.
+        #[allow(clippy::suspicious_operation_groupings)]
         if execution.source_identity_sha256 != index.source_identity_sha256
             || execution.predecessor_build_identity_sha256 != index.build_identity_sha256
             || execution.nonce_hex != index.nonce_hex
@@ -1773,7 +1781,7 @@ pub fn v4_chain_shape_rejection(bytes: &[u8]) -> Option<String> {
         "execution_identity_sha256",
         "completion_identity_sha256",
     ];
-    let has_chain_marker = chain_markers.iter().any(|key| object.contains_key(key));
+    let has_chain_marker = chain_markers.iter().any(|key| object.contains_key(*key));
     let is_receipt_shaped = object.contains_key("object_identity_sha256")
         && object.contains_key("signature_hex")
         && object.contains_key("role");
@@ -1792,14 +1800,14 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn now_ns() -> i64 {
+    pub(super) fn now_ns() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX))
             .unwrap_or(0)
     }
 
-    fn test_authority(seed: u8) -> (SupervisorSigningAuthority, SupervisorTrustRoots) {
+    pub(super) fn test_authority(seed: u8) -> (SupervisorSigningAuthority, SupervisorTrustRoots) {
         let authority = SupervisorSigningAuthority::from_seed([seed; 32]);
         let mut keys = BTreeMap::new();
         keys.insert(authority.key_id().to_owned(), authority.trust_root_key(0));
@@ -1812,17 +1820,21 @@ mod tests {
         )
     }
 
-    fn sh_path() -> PathBuf {
+    pub(super) fn sh_path() -> PathBuf {
         PathBuf::from("/bin/sh")
     }
 
-    fn sh_sha256() -> String {
+    pub(super) fn sh_sha256() -> String {
         lower_hex(&Sha256::digest(
             std::fs::read(sh_path()).expect("read /bin/sh"),
         ))
     }
 
-    fn sh_spec(script: &str, window: Duration, max_output_bytes: u64) -> SupervisedLaunchSpec {
+    pub(super) fn sh_spec(
+        script: &str,
+        window: Duration,
+        max_output_bytes: u64,
+    ) -> SupervisedLaunchSpec {
         SupervisedLaunchSpec {
             executable: sh_path(),
             args: vec!["-c".to_owned(), script.to_owned()],
@@ -1833,11 +1845,11 @@ mod tests {
         }
     }
 
-    fn test_identity(tag: &str) -> String {
+    pub(super) fn test_identity(tag: &str) -> String {
         lower_hex(&Sha256::digest(tag.as_bytes()))
     }
 
-    fn fixture_execution(
+    pub(super) fn fixture_execution(
         authority: &mut SupervisorSigningAuthority,
         spec: &SupervisedLaunchSpec,
         executable_sha256: &str,
@@ -1868,7 +1880,7 @@ mod tests {
         }
     }
 
-    fn completion_from(
+    pub(super) fn completion_from(
         execution: &ArtifactStoreV4ExecutionObject,
         termination: &SupervisedTermination,
     ) -> ArtifactStoreV4CompletionObject {
@@ -2526,5 +2538,411 @@ mod tests {
         let completion = completion_from(&execution, &termination);
         sign_and_verify_chain(&mut authority, &trust_roots, &execution, &completion)
             .expect("chain verifies");
+    }
+}
+
+#[cfg(test)]
+mod f3_store_tests {
+    use super::tests::{
+        completion_from, fixture_execution, now_ns, sh_sha256, sh_spec, test_authority,
+        test_identity,
+    };
+    use super::*;
+    use std::time::Duration;
+
+    struct PublishedChain {
+        store: ArtifactStoreV4ChainStore,
+        trust_roots: SupervisorTrustRoots,
+        chain_identity: String,
+        execution: ArtifactStoreV4ExecutionObject,
+        completion: ArtifactStoreV4CompletionObject,
+        _root: tempfile::TempDir,
+    }
+
+    fn publish_fixture_chain(seed: u8) -> PublishedChain {
+        let (mut authority, trust_roots) = test_authority(seed);
+        let spec = sh_spec("printf f3", Duration::from_secs(10), 4096);
+        let execution = fixture_execution(&mut authority, &spec, &sh_sha256());
+        let termination =
+            supervise_execution(&spec, &sh_sha256(), &SupervisionCancel::new()).expect("supervise");
+        let completion = completion_from(&execution, &termination);
+        let execution_receipt = authority
+            .sign_execution(&execution, now_ns())
+            .expect("sign execution");
+        let completion_receipt = authority
+            .sign_completion(&execution, &completion, now_ns())
+            .expect("sign completion");
+        let root = tempfile::tempdir().expect("store root");
+        let store = ArtifactStoreV4ChainStore::open(root.path()).expect("open store");
+        let chain_identity = store
+            .publish_verified_chain(
+                &trust_roots,
+                &execution,
+                &execution_receipt,
+                &completion,
+                &completion_receipt,
+            )
+            .expect("publish verified chain");
+        PublishedChain {
+            store,
+            trust_roots,
+            chain_identity,
+            execution,
+            completion,
+            _root: root,
+        }
+    }
+
+    /// Round-trip: publish -> verified reload reproduces the exact objects
+    /// with the earned `VerifiedReceiptChain` classification, and re-publishing
+    /// the identical chain is idempotent.
+    #[test]
+    fn f3_chain_round_trip_and_idempotent_republish() {
+        let published = publish_fixture_chain(30);
+        let loaded = published
+            .store
+            .load_verified_chain(&published.trust_roots, &published.chain_identity)
+            .expect("verified reload");
+        assert_eq!(
+            loaded.authentication,
+            AuthenticationClass::VerifiedReceiptChain
+        );
+        assert_eq!(loaded.execution, published.execution);
+        assert_eq!(loaded.completion, published.completion);
+        assert_eq!(
+            loaded.index.terminal_outcome,
+            published.completion.terminal_outcome
+        );
+    }
+
+    /// Golden canonical bytes: the wire form is hand-verifiable sorted-key
+    /// JSON with exact integers and null-present optional fields.
+    #[test]
+    fn f3_golden_canonical_completion_bytes() {
+        let empty = lower_hex(&Sha256::digest([]));
+        let predecessor = test_identity("golden-execution");
+        let durability = test_identity("golden-durability");
+        let completion = ArtifactStoreV4CompletionObject {
+            schema_version: SUPERVISOR_AUTH_SCHEMA_VERSION,
+            predecessor_execution_identity_sha256: predecessor.clone(),
+            nonce_hex: "000102030405060708090a0b0c0d0e0f".to_owned(),
+            terminal_outcome: TerminalOutcome::Succeeded,
+            outcome_reason_code: "exited_zero".to_owned(),
+            exit_code: Some(0),
+            termination_signal: None,
+            completed_at_ns: 1_700_000_000_000_000_000,
+            wall_clock_ns: 5_000_000,
+            stdout: CollectedArtifactDigest {
+                sha256: empty.clone(),
+                byte_len: 0,
+                truncated: false,
+            },
+            stderr: CollectedArtifactDigest {
+                sha256: empty.clone(),
+                byte_len: 0,
+                truncated: false,
+            },
+            artifact_index: BTreeMap::new(),
+            process_tree_escape_detected: false,
+            durability_label: "golden-set".to_owned(),
+            durability_sha256: Some(durability.clone()),
+            retention_disposition: "retain".to_owned(),
+        };
+        let (bytes, _) = completion.identity().expect("canonical bytes");
+        let expected = format!(
+            "{{\"artifact_index\":{{}},\"completed_at_ns\":1700000000000000000,\
+             \"durability_label\":\"golden-set\",\"durability_sha256\":\"{durability}\",\
+             \"exit_code\":0,\"nonce_hex\":\"000102030405060708090a0b0c0d0e0f\",\
+             \"outcome_reason_code\":\"exited_zero\",\
+             \"predecessor_execution_identity_sha256\":\"{predecessor}\",\
+             \"process_tree_escape_detected\":false,\"retention_disposition\":\"retain\",\
+             \"schema_version\":1,\
+             \"stderr\":{{\"byte_len\":0,\"sha256\":\"{empty}\",\"truncated\":false}},\
+             \"stdout\":{{\"byte_len\":0,\"sha256\":\"{empty}\",\"truncated\":false}},\
+             \"terminal_outcome\":\"succeeded\",\"termination_signal\":null,\
+             \"wall_clock_ns\":5000000}}"
+        );
+        assert_eq!(
+            String::from_utf8(bytes).expect("utf8"),
+            expected,
+            "canonical form is the hand-verifiable sorted-key golden"
+        );
+    }
+
+    /// Truncated, extended, and tampered stored bytes all fail the content
+    /// address at verified reload.
+    #[test]
+    fn f3_truncated_extended_and_tampered_entries_reject() {
+        let published = publish_fixture_chain(31);
+        let object_path = published
+            .store
+            .child_dir("objects")
+            .join(published.index_execution_identity());
+        let original = std::fs::read(&object_path).expect("read stored object");
+
+        std::fs::write(&object_path, &original[..original.len() - 1]).expect("truncate");
+        assert!(
+            published
+                .store
+                .load_verified_chain(&published.trust_roots, &published.chain_identity)
+                .is_err(),
+            "a truncated object must reject"
+        );
+
+        let mut extended = original.clone();
+        extended.push(b' ');
+        std::fs::write(&object_path, &extended).expect("extend");
+        assert!(
+            published
+                .store
+                .load_verified_chain(&published.trust_roots, &published.chain_identity)
+                .is_err(),
+            "an extended object must reject"
+        );
+
+        let mut tampered = original.clone();
+        let flip = tampered.len() / 2;
+        tampered[flip] = tampered[flip].wrapping_add(1);
+        std::fs::write(&object_path, &tampered).expect("tamper");
+        assert!(
+            published
+                .store
+                .load_verified_chain(&published.trust_roots, &published.chain_identity)
+                .is_err(),
+            "a tampered object must reject"
+        );
+
+        std::fs::write(&object_path, &original).expect("restore");
+        published
+            .store
+            .load_verified_chain(&published.trust_roots, &published.chain_identity)
+            .expect("restored object verifies again");
+    }
+
+    /// A missing receipt, a cross-object receipt substitution, and an
+    /// untrusted verifier all fail closed.
+    #[test]
+    fn f3_missing_and_cross_object_receipts_and_wrong_roots_reject() {
+        let published = publish_fixture_chain(32);
+        let receipts = published.store.child_dir("receipts");
+        let execution_receipt_path = receipts.join(published.index_execution_identity());
+        let completion_receipt_path = receipts.join(published.index_completion_identity());
+        let completion_receipt_bytes =
+            std::fs::read(&completion_receipt_path).expect("read completion receipt");
+
+        // Cross-object substitution: the execution receipt where the
+        // completion receipt belongs.
+        let execution_receipt_bytes =
+            std::fs::read(&execution_receipt_path).expect("read execution receipt");
+        std::fs::write(&completion_receipt_path, &execution_receipt_bytes).expect("substitute");
+        assert!(
+            published
+                .store
+                .load_verified_chain(&published.trust_roots, &published.chain_identity)
+                .is_err(),
+            "a cross-object receipt must reject"
+        );
+        std::fs::write(&completion_receipt_path, &completion_receipt_bytes).expect("restore");
+
+        // Untrusted roots: a verifier with no keys accepts nothing.
+        let empty_roots = SupervisorTrustRoots {
+            schema_version: SUPERVISOR_AUTH_SCHEMA_VERSION,
+            keys: BTreeMap::new(),
+        };
+        assert!(
+            published
+                .store
+                .load_verified_chain(&empty_roots, &published.chain_identity)
+                .is_err(),
+            "a chain under unknown keys must reject"
+        );
+
+        // Missing receipt file: simulate a partial publication by renaming
+        // the receipt aside (the pending-file crash state).
+        let aside = receipts.join(format!(
+            ".{}.pending",
+            published.index_completion_identity()
+        ));
+        std::fs::rename(&completion_receipt_path, &aside).expect("rename receipt aside");
+        assert!(
+            published
+                .store
+                .load_verified_chain(&published.trust_roots, &published.chain_identity)
+                .is_err(),
+            "a partially written chain (missing receipt) must reject"
+        );
+    }
+
+    /// A content-address collision (different bytes at the same identity) is
+    /// a typed quarantine, and a leftover pending file fails publication
+    /// closed instead of being silently overwritten.
+    #[test]
+    fn f3_collision_and_stale_pending_fail_closed() {
+        let published = publish_fixture_chain(33);
+        let name = published.index_execution_identity();
+
+        let collision = published.store.publish_atomic(
+            "objects",
+            &name,
+            b"different bytes at the same address",
+        );
+        let reason = format!("{:?}", collision.expect_err("collision must be typed"));
+        assert!(reason.contains("collision"), "typed collision: {reason}");
+
+        let fresh = test_identity("fresh-address");
+        let pending = published
+            .store
+            .child_dir("objects")
+            .join(format!(".{fresh}.pending"));
+        std::fs::write(&pending, b"crash leftover").expect("plant stale pending");
+        let refused = published.store.publish_atomic("objects", &fresh, b"bytes");
+        let reason = format!("{:?}", refused.expect_err("stale pending must fail closed"));
+        assert!(
+            reason.contains("pending"),
+            "typed pending refusal: {reason}"
+        );
+    }
+
+    /// The chain index is the commit point: without it the chain does not
+    /// load, and a tampered index fails its own content address.
+    #[test]
+    fn f3_index_is_the_commit_point() {
+        let published = publish_fixture_chain(34);
+        let chain_path = published
+            .store
+            .child_dir("chains")
+            .join(&published.chain_identity);
+        let index_bytes = std::fs::read(&chain_path).expect("read index");
+
+        let mut tampered = index_bytes.clone();
+        let flip = tampered.len() / 2;
+        tampered[flip] = tampered[flip].wrapping_add(1);
+        std::fs::write(&chain_path, &tampered).expect("tamper index");
+        assert!(
+            published
+                .store
+                .load_verified_chain(&published.trust_roots, &published.chain_identity)
+                .is_err(),
+            "a tampered index must fail its content address"
+        );
+
+        let aside = published
+            .store
+            .child_dir("chains")
+            .join(format!(".{}.pending", published.chain_identity));
+        std::fs::rename(&chain_path, &aside).expect("uncommit index");
+        assert!(
+            published
+                .store
+                .load_verified_chain(&published.trust_roots, &published.chain_identity)
+                .is_err(),
+            "objects without a committed index are not a loadable chain"
+        );
+    }
+
+    /// A verified absence publishes and reloads; it never yields a chain.
+    #[test]
+    fn f3_absence_publishes_without_a_chain() {
+        let (mut authority, trust_roots) = test_authority(35);
+        let spec = sh_spec("exit 0", Duration::from_secs(10), 4096);
+        let execution = fixture_execution(&mut authority, &spec, &sh_sha256());
+        let execution_receipt = authority
+            .sign_execution(&execution, now_ns())
+            .expect("sign execution");
+        let absence = authority
+            .sign_absence(&execution, "supervisor_interrupted", now_ns())
+            .expect("sign absence");
+        let root = tempfile::tempdir().expect("store root");
+        let store = ArtifactStoreV4ChainStore::open(root.path()).expect("open store");
+        store
+            .publish_verified_absence(&trust_roots, &execution, &execution_receipt, &absence)
+            .expect("publish absence");
+        let (_, execution_identity) = execution.identity().expect("identity");
+        let stored = store
+            .read_entry("absences", &execution_identity)
+            .expect("read stored absence");
+        let reloaded: CompletionAbsenceV4 = decode_canonical(&stored).expect("decode absence");
+        reloaded.verify(&trust_roots).expect("absence verifies");
+        assert!(
+            std::fs::read_dir(store.child_dir("chains"))
+                .expect("chains dir")
+                .next()
+                .is_none(),
+            "an absence never commits a chain index"
+        );
+    }
+
+    /// The pre-policy canary: every v4 chain artifact fed to a LEGACY
+    /// classifier is rejected with a typed reason instead of classifying as
+    /// `UnauthenticatedLegacy` — while genuine legacy fixtures still classify
+    /// legacy (replayable, release-ineligible) exactly as before.
+    #[test]
+    fn f3_v4_canary_blocks_legacy_fallthrough_without_breaking_legacy() {
+        let published = publish_fixture_chain(36);
+        let (execution_bytes, _) = published.execution.identity().expect("bytes");
+        let (completion_bytes, _) = published.completion.identity().expect("bytes");
+        let index_bytes = std::fs::read(
+            published
+                .store
+                .child_dir("chains")
+                .join(&published.chain_identity),
+        )
+        .expect("read index");
+        let receipt_bytes = std::fs::read(
+            published
+                .store
+                .child_dir("receipts")
+                .join(published.index_execution_identity()),
+        )
+        .expect("read receipt");
+
+        for (label, bytes) in [
+            ("execution object", execution_bytes.as_slice()),
+            ("completion object", completion_bytes.as_slice()),
+            ("chain index", index_bytes.as_slice()),
+            ("signed receipt", receipt_bytes.as_slice()),
+        ] {
+            assert!(
+                v4_chain_shape_rejection(bytes).is_some(),
+                "{label} must trip the canary"
+            );
+            let campaign = crate::classify_campaign_report_schema(bytes);
+            let reason = format!(
+                "{:?}",
+                campaign.expect_err("legacy campaign classifier must reject v4 bytes")
+            );
+            assert!(
+                reason.contains("v4 chain-shaped"),
+                "typed canary rejection for {label}: {reason}"
+            );
+            assert!(
+                crate::classify_artifact_object_schema(bytes).is_err(),
+                "legacy object classifier must reject v4 bytes ({label})"
+            );
+        }
+
+        // Genuine legacy fixtures still classify as frozen
+        // UnauthenticatedLegacy — replayable, never current, never
+        // release-eligible.
+        let legacy = br#"{"schema_version":1,"anything":"else"}"#;
+        assert!(v4_chain_shape_rejection(legacy).is_none());
+        match crate::classify_campaign_report_schema(legacy).expect("legacy classifies") {
+            crate::SerializedSchemaDisposition::UnauthenticatedLegacy { schema_version } => {
+                assert_eq!(schema_version, 1);
+            }
+            other => panic!("legacy fixture must stay UnauthenticatedLegacy, got {other:?}"),
+        }
+    }
+
+    impl PublishedChain {
+        fn index_execution_identity(&self) -> String {
+            let (_, identity) = self.execution.identity().expect("identity");
+            identity
+        }
+
+        fn index_completion_identity(&self) -> String {
+            let (_, identity) = self.completion.identity().expect("identity");
+            identity
+        }
     }
 }
