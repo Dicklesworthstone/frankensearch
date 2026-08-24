@@ -218,6 +218,29 @@ check_installer_behavior() {
     fi
   done
 
+  # GH#36 (bd-olu0i): Linux target-triple routing. The semantic (default)
+  # profile resolves the -gnu triple on glibc hosts because the published full
+  # artifact is glibc-linked (ort has no musl distribution); --lite stays on
+  # the statically-linked musl artifact regardless of host libc, and musl-only
+  # hosts keep musl for the semantic profile (loud source fallback downstream).
+  local actual_target expected_target target_case lite arch glibc
+  for target_case in \
+    "0 x86_64 1 x86_64-unknown-linux-gnu" \
+    "0 x86_64 0 x86_64-unknown-linux-musl" \
+    "1 x86_64 1 x86_64-unknown-linux-musl" \
+    "1 x86_64 0 x86_64-unknown-linux-musl" \
+    "0 aarch64 1 aarch64-unknown-linux-gnu" \
+    "1 aarch64 1 aarch64-unknown-linux-musl"; do
+    read -r lite arch glibc expected_target <<<"$target_case"
+    if actual_target=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" linux-target "$lite" "$arch" "$glibc") \
+      && [[ "$actual_target" == "$expected_target" ]]; then
+      echo "[installer][OK]   linux-target lite=$lite arch=$arch glibc=$glibc -> $actual_target"
+    else
+      echo "[installer][FAIL] linux-target lite=$lite arch=$arch glibc=$glibc expected=$expected_target actual=${actual_target:-<error>}"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
+
   local unsupported_output unsupported_status
   unsupported_status=0
   unsupported_output=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" unsupported x86_64-apple-darwin 2>&1) \
@@ -331,11 +354,16 @@ check_installer_preflight() {
     FAILURES=$((FAILURES + 1))
   fi
 
+  # Since f8e4ca47 (GH#36) --lite resolves the PREBUILT model-free artifact:
+  # lite=1 must be set and from_source must stay 0 at parse time (the source
+  # build is only the loud fallback when the lite artifact cannot be fetched).
+  # The previous form of this witness asserted the pre-f8e4ca47 semantics
+  # (from_source=1) and was red against the shipped installer.
   if parsed=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" args --lite 2>/dev/null) \
-    && [[ "$parsed" == *"lite=1"* ]] && [[ "$parsed" == *"from_source=1"* ]]; then
-    echo "[installer][OK]   --lite still implies the explicit model-free source route"
+    && [[ "$parsed" == *"lite=1"* ]] && [[ "$parsed" == *"from_source=0"* ]]; then
+    echo "[installer][OK]   --lite resolves the prebuilt model-free artifact route"
   else
-    echo "[installer][FAIL] --lite no longer implies from-source: ${parsed:-<error>}"
+    echo "[installer][FAIL] --lite must set lite=1 with from_source=0 (prebuilt artifact route): ${parsed:-<error>}"
     FAILURES=$((FAILURES + 1))
   fi
 

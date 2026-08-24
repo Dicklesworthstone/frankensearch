@@ -307,6 +307,34 @@ roll_back_incumbent() {
   return 1
 }
 
+# GH#36 (bd-olu0i): pick the Linux target triple for a download. The semantic
+# (default) profile has no musl artifact — the pinned ONNX Runtime ships no
+# musl binaries — but a full glibc artifact IS published (x86_64 since v1.7.0),
+# so the default route on a glibc host resolves the -gnu triple. --lite keeps
+# the statically-linked musl artifact everywhere, and musl-libc hosts keep the
+# loud from-source fallback for the semantic profile. Pure function: callers
+# pass GLIBC_PRESENT explicitly so the contract harness can pin the matrix.
+linux_target_for() {
+  local lite="$1" arch="$2" glibc_present="$3"
+  if [ "$lite" -eq 0 ] && [ "$glibc_present" -eq 1 ]; then
+    printf '%s\n' "${arch}-unknown-linux-gnu"
+  else
+    printf '%s\n' "${arch}-unknown-linux-musl"
+  fi
+}
+
+# True when the running Linux host has glibc. The dynamic-loader path is the
+# most reliable witness (present on every glibc distro, absent on musl-only
+# systems such as Alpine); getconf is the fallback for unusual layouts.
+linux_host_is_glibc() {
+  local arch="$1"
+  case "$arch" in
+    x86_64)  [ -e /lib64/ld-linux-x86-64.so.2 ] && return 0 ;;
+    aarch64) [ -e /lib/ld-linux-aarch64.so.1 ] && return 0 ;;
+  esac
+  getconf GNU_LIBC_VERSION >/dev/null 2>&1
+}
+
 install_route() {
   local explicit_lite="$1" full_artifact_available="$2" target="${3:-}"
   if [ "$explicit_lite" -eq 1 ]; then
@@ -624,6 +652,13 @@ run_installer_contract_test() {
       }
       artifact_basename "$2" "$3" "$4" "$5"
       ;;
+    linux-target)
+      [ "$#" -eq 4 ] || {
+        err "contract linux-target requires LITE ARCH GLIBC_PRESENT"
+        return 2
+      }
+      linux_target_for "$2" "$3" "$4"
+      ;;
     unsupported)
       [ "$#" -eq 2 ] || { err "contract unsupported requires TARGET"; return 2; }
       fail_unsupported_semantic_platform "$2"
@@ -832,8 +867,8 @@ esac
 TARGET=""
 EXT=""
 case "${OS}-${ARCH}" in
-  linux-x86_64)   TARGET="x86_64-unknown-linux-musl"; EXT="tar.xz" ;;
-  linux-aarch64)  TARGET="aarch64-unknown-linux-musl"; EXT="tar.xz" ;;
+  linux-x86_64)   TARGET=$(linux_target_for "$LITE" "x86_64" "$(linux_host_is_glibc x86_64 && echo 1 || echo 0)"); EXT="tar.xz" ;;
+  linux-aarch64)  TARGET=$(linux_target_for "$LITE" "aarch64" "$(linux_host_is_glibc aarch64 && echo 1 || echo 0)"); EXT="tar.xz" ;;
   darwin-x86_64)  TARGET="x86_64-apple-darwin"; EXT="tar.xz" ;;
   darwin-aarch64) TARGET="aarch64-apple-darwin"; EXT="tar.xz" ;;
   *) :;;
