@@ -5244,6 +5244,29 @@ impl DifferentialCampaignRunner {
         )
     }
 
+    /// [`Self::with_collected_v4_source_build_snapshots`] plus an external
+    /// Cargo execution manifest (`cargo build --message-format=json`) whose
+    /// `build-script-executed` records complete the DEPENDENCY build-script
+    /// slice of F1. Records are collected canonically and lock-bound; the
+    /// Build object's availability receipt records `external-manifest`, never
+    /// `exact` (bd-artifactstore-v4-f1-source-build-snapshot-ldqkt).
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::with_collected_v4_source_build_snapshots`] returns,
+    /// plus a malformed manifest or a record outside the snapshot's locked
+    /// dependency universe.
+    pub fn with_collected_v4_source_build_snapshots_and_dependency_manifest(
+        self,
+        dependency_manifest: &str,
+    ) -> Result<Self, GauntletError> {
+        self.with_v4_source_build_snapshots(
+            ArtifactStoreV4SourceBuildSnapshots::collect_current_linux_with_dependency_manifest(
+                dependency_manifest,
+            )?,
+        )
+    }
+
     /// Attach immutable production provenance (bd-quill-e6-gauntlet-scale-rm3q.9).
     /// Every production campaign run stamps it into the reservation and the
     /// report; regression fixtures deliberately leave it absent.

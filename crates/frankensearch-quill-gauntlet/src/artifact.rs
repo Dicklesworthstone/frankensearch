@@ -1619,6 +1619,40 @@ impl ArtifactStoreV4SourceBuildSnapshots {
     /// Returns [`GauntletError`] when source selection, descriptor capture,
     /// compiled producer identity, or Linux running-image binding fails.
     pub fn collect_current_linux() -> Result<Self, GauntletError> {
+        Self::collect_current_linux_inner(None)
+    }
+
+    /// [`Self::collect_current_linux`] plus an external Cargo execution
+    /// manifest for DEPENDENCY build scripts.
+    ///
+    /// `dependency_manifest` is the raw `cargo build --message-format=json`
+    /// stream for the build that produced this executable. Its
+    /// `build-script-executed` records are collected canonically
+    /// (fail-closed, unit-keyed) and each record's package must resolve to a
+    /// `(name, version)` present in the snapshot's `Cargo.lock` — a record
+    /// outside the locked dependency universe rejects the whole manifest.
+    ///
+    /// Honesty boundary: lock membership binds the manifest to the same
+    /// DEPENDENCY UNIVERSE as this build, not to the same physical Cargo
+    /// invocation — Cargo keeps no in-binary manifest of dependency
+    /// build-script output, so physical-run binding is not provable from the
+    /// running image. The availability receipt records exactly that: it
+    /// upgrades from `unavailable` to `external-manifest`, never to `exact`.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::collect_current_linux`] returns, plus a malformed
+    /// manifest line, a duplicate `(package_id, unit_dir)`, an unparseable
+    /// package id, or a record whose package is not in `Cargo.lock`.
+    pub fn collect_current_linux_with_dependency_manifest(
+        dependency_manifest: &str,
+    ) -> Result<Self, GauntletError> {
+        Self::collect_current_linux_inner(Some(dependency_manifest))
+    }
+
+    fn collect_current_linux_inner(
+        dependency_manifest: Option<&str>,
+    ) -> Result<Self, GauntletError> {
         #[cfg(target_os = "linux")]
         {
             let producer = GauntletProducerBuildIdentity::compiled()?;
@@ -1640,8 +1674,12 @@ impl ArtifactStoreV4SourceBuildSnapshots {
             if has_live_git_provenance {
                 producer.validate_live_source_checkout()?;
             }
-            let snapshots =
-                Self::collect_linux_workspace(&root, &producer, has_live_git_provenance)?;
+            let snapshots = Self::collect_linux_workspace(
+                &root,
+                &producer,
+                has_live_git_provenance,
+                dependency_manifest,
+            )?;
             // The first checkout check fences stale construction. Repeating it
             // after descriptor capture rejects a tracked file changed between
             // selection and publication rather than admitting a mixed source
@@ -1654,6 +1692,7 @@ impl ArtifactStoreV4SourceBuildSnapshots {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = dependency_manifest;
             Err(GauntletError::InvalidPreparedArtifact {
                 reason: "ArtifactStore v4 current-process collection requires Linux /proc/self/exe"
                     .to_owned(),
@@ -1665,6 +1704,7 @@ impl ArtifactStoreV4SourceBuildSnapshots {
         root: &Path,
         producer: &GauntletProducerBuildIdentity,
         has_live_git_provenance: bool,
+        dependency_manifest: Option<&str>,
     ) -> Result<Self, GauntletError> {
         producer.validate_stored_v2()?;
         let selected = if has_live_git_provenance {
@@ -1679,7 +1719,7 @@ impl ArtifactStoreV4SourceBuildSnapshots {
         )?;
         let build = ArtifactStoreV4BuildSnapshot::new(
             source.identity_sha256.clone(),
-            collect_current_linux_build_inputs(root, &source, producer)?,
+            collect_current_linux_build_inputs(root, &source, producer, dependency_manifest)?,
         )?;
         Self::new(source, build)
     }
@@ -2454,6 +2494,101 @@ pub fn dependency_build_script_build_input(
     })
 }
 
+/// Resolve a Cargo `PackageIdSpec` URL to its `(name, version)` pair.
+///
+/// Cargo emits `registry+https://…#name@version` for registry packages and
+/// either `path+file:///…/name#version` (directory name doubles as the
+/// package name) or `path+file:///…#name@version` (it does not) for path
+/// packages. Anything else fails closed — a package id this cannot name
+/// cannot be lock-bound, and guessing would silently admit an unbindable
+/// record.
+fn package_name_and_version_from_package_id(
+    package_id: &str,
+) -> Result<(String, String), GauntletError> {
+    let invalid = |reason: String| GauntletError::InvalidObservation { reason };
+    let (base, fragment) = package_id.split_once('#').ok_or_else(|| {
+        invalid(format!(
+            "package id `{package_id}` has no `#` name/version fragment"
+        ))
+    })?;
+    if let Some((name, version)) = fragment.split_once('@') {
+        if name.is_empty() || version.is_empty() {
+            return Err(invalid(format!(
+                "package id `{package_id}` has an empty name or version"
+            )));
+        }
+        return Ok((name.to_owned(), version.to_owned()));
+    }
+    // Git sources append `?rev=…`/`?branch=…` to the URL; strip the query
+    // before taking the final path segment as the package name. Cargo only
+    // emits the bare-version fragment when that segment IS the package name,
+    // and a mismatch (renamed package) still fails closed downstream at lock
+    // membership rather than being silently mis-admitted.
+    let name = base
+        .split('?')
+        .next()
+        .unwrap_or(base)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if name.is_empty() || fragment.is_empty() {
+        return Err(invalid(format!(
+            "package id `{package_id}` names no package directory or version"
+        )));
+    }
+    Ok((name.to_owned(), fragment.to_owned()))
+}
+
+/// Require every dependency build-script record to name a package that the
+/// snapshot's `Cargo.lock` actually locks.
+///
+/// This is the binding that makes a CALLER-SUPPLIED Cargo execution manifest
+/// admissible alongside the snapshot: a record whose `(name, version)` is not
+/// in the lock comes from some other dependency universe, and one foreign
+/// record rejects the whole manifest rather than being silently dropped.
+/// Deliberately NOT claimed: that the records came from the same physical
+/// Cargo invocation — the availability receipt states that boundary.
+fn validate_dependency_records_lock_membership(
+    cargo_lock_bytes: &[u8],
+    records: &[ArtifactStoreV4DependencyBuildScriptRecord],
+) -> Result<(), GauntletError> {
+    let invalid = |reason: String| GauntletError::InvalidObservation { reason };
+    let lock_text = std::str::from_utf8(cargo_lock_bytes)
+        .map_err(|error| invalid(format!("Cargo.lock is not UTF-8: {error}")))?;
+    let lock: toml::Value = toml::from_str(lock_text)
+        .map_err(|error| invalid(format!("Cargo.lock does not parse as TOML: {error}")))?;
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| invalid("Cargo.lock has no [[package]] array".to_owned()))?;
+    let mut locked: BTreeSet<(String, String)> = BTreeSet::new();
+    for package in packages {
+        let name = package
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| invalid("Cargo.lock package entry has no name".to_owned()))?;
+        let version = package
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| invalid(format!("Cargo.lock package `{name}` has no version")))?;
+        locked.insert((name.to_owned(), version.to_owned()));
+    }
+    for record in records {
+        let resolved = package_name_and_version_from_package_id(&record.package_id)?;
+        if !locked.contains(&resolved) {
+            let (name, version) = resolved;
+            return Err(invalid(format!(
+                "dependency build-script record `{}` resolves to {name}@{version}, \
+                 which the snapshot's Cargo.lock does not lock: the manifest is \
+                 from a different dependency universe",
+                record.package_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Every `cargo:rustc-env=` value this crate's build script emits, read back
 /// out of the executable Cargo compiled them into.
 ///
@@ -2531,16 +2666,18 @@ fn collect_current_linux_build_inputs(
     root: &Path,
     source: &ArtifactStoreV4SourceSnapshot,
     producer: &GauntletProducerBuildIdentity,
+    dependency_manifest: Option<&str>,
 ) -> Result<Vec<ArtifactStoreV4BuildInput>, GauntletError> {
     producer.validate_stored_v2()?;
     reject_unbound_runtime_build_overrides()?;
 
     let mut inputs = BTreeMap::new();
+    let cargo_lock_bytes = read_source_file_bound_to_snapshot(root, source, "Cargo.lock")?;
     inputs.insert(
         "cargo-lock".to_owned(),
         build_input(
             ArtifactStoreV4BuildInputKind::CargoLock,
-            read_source_file_bound_to_snapshot(root, source, "Cargo.lock")?,
+            cargo_lock_bytes.clone(),
         ),
     );
     for path in ["rust-toolchain.toml", "rust-toolchain"] {
@@ -2664,19 +2801,48 @@ fn collect_current_linux_build_inputs(
     // The narrowed residual, which the blanket receipt used to overstate.
     // A DEPENDENCY's build-script output is not recoverable from the running
     // executable: Cargo keeps no manifest of it in the binary, and OUT_DIR
-    // paths for dependencies are not knowable at runtime. That remains an
-    // external-manifest problem and is still fail-closed rather than omitted.
-    inputs.insert(
-        "build-script-output/dependency-availability".to_owned(),
-        build_input(
-            ArtifactStoreV4BuildInputKind::BuildScriptOutput,
-            serde_json::to_vec(&serde_json::json!({
-                "availability": "unavailable",
-                "scope": "dependency build scripts",
-                "reason": "the running producer carries no authoritative Cargo manifest of dependency build-script output; sealed admission needs an external Cargo execution manifest",
-            }))?,
-        ),
-    );
+    // paths for dependencies are not knowable at runtime. When the caller
+    // supplies the external Cargo execution manifest this collector was
+    // waiting for (`collect_current_linux_with_dependency_manifest`), the
+    // records are collected canonically, lock-bound, and stored — and the
+    // availability receipt says `external-manifest`, never `exact`, because
+    // lock membership binds the dependency UNIVERSE, not the physical Cargo
+    // invocation. Without one it remains fail-closed rather than omitted.
+    match dependency_manifest {
+        Some(cargo_json) => {
+            let records = collect_dependency_build_script_records(cargo_json)?;
+            validate_dependency_records_lock_membership(&cargo_lock_bytes, &records)?;
+            let record_count = records.len();
+            let records_input = dependency_build_script_build_input(&records)?;
+            inputs.insert(records_input.key.clone(), records_input);
+            inputs.insert(
+                "build-script-output/dependency-availability".to_owned(),
+                build_input(
+                    ArtifactStoreV4BuildInputKind::BuildScriptOutput,
+                    serde_json::to_vec(&serde_json::json!({
+                        "availability": "external-manifest",
+                        "scope": "dependency build scripts",
+                        "mechanism": "caller-supplied cargo --message-format=json build-script-executed records",
+                        "binding": "every record resolves to a (name, version) present in the snapshot's Cargo.lock; records outside the locked dependency universe fail closed. Lock membership does not prove the records came from the same physical Cargo invocation.",
+                        "record_count": record_count,
+                    }))?,
+                ),
+            );
+        }
+        None => {
+            inputs.insert(
+                "build-script-output/dependency-availability".to_owned(),
+                build_input(
+                    ArtifactStoreV4BuildInputKind::BuildScriptOutput,
+                    serde_json::to_vec(&serde_json::json!({
+                        "availability": "unavailable",
+                        "scope": "dependency build scripts",
+                        "reason": "the running producer carries no authoritative Cargo manifest of dependency build-script output; sealed admission needs an external Cargo execution manifest",
+                    }))?,
+                ),
+            );
+        }
+    }
     // GeneratedSource was named in F1's acceptance and had NO collector site at
     // all — the class was simply absent, which is the omission the acceptance
     // criteria call out as fail-closed. This crate's build script writes no
@@ -6410,6 +6576,231 @@ mod tests {
         assert_ne!(
             snapshot.identity_sha256, mutated_snapshot.identity_sha256,
             "a dependency build-script emission must change the Build snapshot identity"
+        );
+    }
+
+    /// Package-id resolution covers every spelling Cargo emits and refuses
+    /// the rest — an unnameable record cannot be lock-bound.
+    #[test]
+    fn artifactstore_v4_package_id_resolution_covers_registry_and_path_forms() {
+        assert_eq!(
+            package_name_and_version_from_package_id(
+                "registry+https://github.com/rust-lang/crates.io-index#serde_core@1.0.229"
+            )
+            .expect("registry form resolves"),
+            ("serde_core".to_owned(), "1.0.229".to_owned())
+        );
+        assert_eq!(
+            package_name_and_version_from_package_id(
+                "path+file:///data/projects/frankensearch/crates/frankensearch-quill#0.27.1"
+            )
+            .expect("bare-version path form resolves via the directory name"),
+            ("frankensearch-quill".to_owned(), "0.27.1".to_owned())
+        );
+        assert_eq!(
+            package_name_and_version_from_package_id(
+                "path+file:///data/projects/workspace#renamed-package@0.3.0"
+            )
+            .expect("explicit name path form resolves"),
+            ("renamed-package".to_owned(), "0.3.0".to_owned())
+        );
+        assert_eq!(
+            package_name_and_version_from_package_id(
+                "git+https://github.com/example/widget?rev=abc123#1.4.2"
+            )
+            .expect("bare-version git form strips the source query"),
+            ("widget".to_owned(), "1.4.2".to_owned())
+        );
+        for hostile in [
+            "registry+https://github.com/rust-lang/crates.io-index",
+            "path+file:///#",
+            "#@",
+            "registry+https://example#@1.0.0",
+            "registry+https://example#name@",
+        ] {
+            assert!(
+                package_name_and_version_from_package_id(hostile).is_err(),
+                "`{hostile}` must fail closed"
+            );
+        }
+    }
+
+    /// Compose a minimal-but-valid Cargo.lock that locks exactly the given
+    /// `(name, version)` pairs.
+    fn cargo_lock_text_for(packages: &[(String, String)]) -> String {
+        use std::fmt::Write as _;
+        let mut text = String::from("version = 4\n");
+        for (name, version) in packages {
+            let _ = write!(
+                text,
+                "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n"
+            );
+        }
+        text
+    }
+
+    /// A caller-supplied Cargo execution manifest is admitted only when every
+    /// record's package is in the snapshot's Cargo.lock, and one foreign
+    /// record rejects the whole manifest.
+    #[test]
+    fn artifactstore_v4_dependency_manifest_lock_membership_is_fail_closed() {
+        let records = collect_dependency_build_script_records(DEPENDENCY_BUILD_SCRIPT_CAPTURE)
+            .expect("the real capture must collect");
+        let named = records
+            .iter()
+            .map(|record| {
+                package_name_and_version_from_package_id(&record.package_id)
+                    .expect("every real capture record resolves")
+            })
+            .collect::<Vec<_>>();
+
+        let covering_lock = cargo_lock_text_for(&named);
+        validate_dependency_records_lock_membership(covering_lock.as_bytes(), &records)
+            .expect("a lock covering every record admits the manifest");
+
+        // Drop ONE package from the lock: the whole manifest must refuse,
+        // naming the foreign package rather than silently skipping it.
+        let (dropped_name, dropped_version) = named.first().expect("capture is non-empty");
+        let narrowed = named
+            .iter()
+            .filter(|(name, version)| !(name == dropped_name && version == dropped_version))
+            .cloned()
+            .collect::<Vec<_>>();
+        let narrowed_lock = cargo_lock_text_for(&narrowed);
+        let error = validate_dependency_records_lock_membership(narrowed_lock.as_bytes(), &records)
+            .expect_err("a record outside the locked universe must reject the manifest");
+        let reason = error.to_string();
+        assert!(
+            reason.contains(dropped_name.as_str())
+                && reason.contains("different dependency universe"),
+            "rejection must name the foreign package: {reason}"
+        );
+
+        // Unparseable lock bytes fail closed rather than admitting anything.
+        assert!(
+            validate_dependency_records_lock_membership(b"\xff\xfe not toml", &records).is_err(),
+            "non-UTF-8 lock bytes must refuse"
+        );
+        assert!(
+            validate_dependency_records_lock_membership(b"version = 4\n", &records).is_err(),
+            "a lock with no [[package] ] array must refuse"
+        );
+    }
+
+    /// The full collector path: WITHOUT a manifest the dependency receipt
+    /// stays `unavailable` and no records input exists; WITH one, the records
+    /// input appears and the receipt upgrades to `external-manifest` — never
+    /// `exact`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn artifactstore_v4_dependency_manifest_swaps_the_availability_receipt() {
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let records = collect_dependency_build_script_records(DEPENDENCY_BUILD_SCRIPT_CAPTURE)
+            .expect("the real capture must collect");
+        let named = records
+            .iter()
+            .map(|record| {
+                package_name_and_version_from_package_id(&record.package_id)
+                    .expect("every real capture record resolves")
+            })
+            .collect::<Vec<_>>();
+
+        let root = tempfile::TempDir::new().expect("create source root");
+        std::fs::write(root.path().join("Cargo.lock"), cargo_lock_text_for(&named))
+            .expect("write covering lock");
+        let selected = BTreeMap::from([(
+            "Cargo.lock".to_owned(),
+            vec![
+                ArtifactStoreV4SourceInclusionReason::Tracked,
+                ArtifactStoreV4SourceInclusionReason::CargoLock,
+            ],
+        )]);
+        let source = ArtifactStoreV4SourceSnapshot::capture_selected(
+            root.path(),
+            selected,
+            MAX_ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_BYTES,
+        )
+        .expect("capture lock-only source snapshot");
+
+        let find = |inputs: &[ArtifactStoreV4BuildInput], key: &str| {
+            inputs.iter().find(|input| input.key == key).cloned()
+        };
+
+        let without = collect_current_linux_build_inputs(root.path(), &source, &producer, None)
+            .expect("collect without a dependency manifest");
+        let receipt = find(&without, "build-script-output/dependency-availability")
+            .expect("availability receipt is always present");
+        let receipt_json: serde_json::Value =
+            serde_json::from_slice(&receipt.canonical_bytes).expect("receipt is JSON");
+        assert_eq!(receipt_json["availability"], "unavailable");
+        assert!(
+            find(&without, "build-script-output/dependency-execution-records").is_none(),
+            "no records input may exist without a manifest"
+        );
+
+        let with = collect_current_linux_build_inputs(
+            root.path(),
+            &source,
+            &producer,
+            Some(DEPENDENCY_BUILD_SCRIPT_CAPTURE),
+        )
+        .expect("collect with the real dependency manifest");
+        let receipt = find(&with, "build-script-output/dependency-availability")
+            .expect("availability receipt is always present");
+        let receipt_json: serde_json::Value =
+            serde_json::from_slice(&receipt.canonical_bytes).expect("receipt is JSON");
+        assert_eq!(
+            receipt_json["availability"], "external-manifest",
+            "a supplied manifest upgrades availability to external-manifest, not exact"
+        );
+        assert_eq!(receipt_json["record_count"], records.len());
+        let stored = find(&with, "build-script-output/dependency-execution-records")
+            .expect("the records input must be stored");
+        assert_eq!(
+            stored.canonical_bytes,
+            dependency_build_script_build_input(&records)
+                .expect("build input")
+                .canonical_bytes,
+            "the stored records must be the canonical collection"
+        );
+
+        // A manifest from a FOREIGN dependency universe rejects the whole
+        // collection instead of degrading the receipt. Filter by pair rather
+        // than slicing: a package with two units repeats its (name, version),
+        // and slicing one occurrence off would leave the pair locked.
+        let (dropped_name, dropped_version) = named.first().expect("capture is non-empty").clone();
+        let narrowed = named
+            .iter()
+            .filter(|(name, version)| !(*name == dropped_name && *version == dropped_version))
+            .cloned()
+            .collect::<Vec<_>>();
+        std::fs::write(
+            root.path().join("Cargo.lock"),
+            cargo_lock_text_for(&narrowed),
+        )
+        .expect("write narrowed lock");
+        let narrowed_selected = BTreeMap::from([(
+            "Cargo.lock".to_owned(),
+            vec![
+                ArtifactStoreV4SourceInclusionReason::Tracked,
+                ArtifactStoreV4SourceInclusionReason::CargoLock,
+            ],
+        )]);
+        let narrowed_source = ArtifactStoreV4SourceSnapshot::capture_selected(
+            root.path(),
+            narrowed_selected,
+            MAX_ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_BYTES,
+        )
+        .expect("capture narrowed source snapshot");
+        assert!(
+            collect_current_linux_build_inputs(
+                root.path(),
+                &narrowed_source,
+                &producer,
+                Some(DEPENDENCY_BUILD_SCRIPT_CAPTURE),
+            )
+            .is_err(),
+            "a manifest outside the locked universe must fail the collection"
         );
     }
 
