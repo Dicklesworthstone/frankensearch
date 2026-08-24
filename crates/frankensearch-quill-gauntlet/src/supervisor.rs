@@ -1795,6 +1795,200 @@ pub fn v4_chain_shape_rejection(bytes: &[u8]) -> Option<String> {
     None
 }
 
+// ===== ArtifactStore v4 F4: typed consumer claims and promotion policy =====
+// (bd-artifactstore-v4-f4-consumer-wiring-396po)
+
+/// Consumer evidence modes. `FixturePublic` is the only CI and
+/// public-artifact mode; `PrivateLocal` policy is independently governed and
+/// can never block public fixture evidence — the evaluator consults private
+/// policy ONLY for `PrivateLocal` claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerMode {
+    FixturePublic,
+    PrivateLocal,
+}
+
+/// The claim a consumer is making about a verified chain. The ladder is
+/// strictly ordered in required authority; nothing here is inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerClaim {
+    /// Always `NoClaim`, even when the chain is fully authentic.
+    DiagnosticAttempt,
+    /// May record `Pass` or `Miss` exactly as evaluated, never relabeled.
+    AdmittedCampaignEvidence,
+    /// Requires a verified chain, admitted `Pass`, complete required
+    /// coverage, a successful terminal completion, durable evidence, and an
+    /// explicit release authority.
+    ReplacementQualified,
+}
+
+/// Frozen F0 admission axis (schema `admission`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionState {
+    Admitted,
+    Unadmitted,
+    NoDecision,
+}
+
+/// Frozen F0 decision axis (schema `decision`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionState {
+    Pass,
+    Miss,
+    NoDecision,
+    Quarantine,
+}
+
+/// Coverage witnesses for one claim: every required label must be witnessed,
+/// and every witness must come from the SAME machine profile as the chain's
+/// execution (a cross-worker mix is not coverage, it is substitution).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageWitnessSet {
+    pub required: std::collections::BTreeSet<String>,
+    /// Witness label -> (machine profile, witness digest).
+    pub witnessed: BTreeMap<String, (String, String)>,
+}
+
+/// Explicit release authority. Its existence is a deliberate, named act —
+/// release can never fall out of authentication or admission by default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseAuthority {
+    pub authority_label: String,
+}
+
+/// The admitted campaign identities a consumer expects the chain to bind
+/// (from the F1 source/build admission). A chain naming other identities is
+/// stale or substituted evidence regardless of its own authenticity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedChainBinding {
+    pub source_identity_sha256: String,
+    pub build_identity_sha256: String,
+    pub executable_sha256: String,
+}
+
+/// Typed policy output. `NoClaim` carries a bounded reason code;
+/// `RecordedEvidence` preserves the evaluated decision without relabeling;
+/// `Qualified` exists only for the full replacement ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromotionOutput {
+    NoClaim { reason_code: String },
+    RecordedEvidence { decision: DecisionState },
+    Qualified,
+}
+
+fn no_claim(reason_code: &str) -> PromotionOutput {
+    PromotionOutput::NoClaim {
+        reason_code: reason_code.to_owned(),
+    }
+}
+
+/// Evaluate one consumer claim over a VERIFIED chain.
+///
+/// The chain parameter is [`VerifiedV4Chain`], whose only constructor is
+/// [`ArtifactStoreV4ChainStore::load_verified_chain`] — a consumer cannot
+/// reach this evaluator with a path, a boolean, or a caller-supplied hash,
+/// and authenticity is therefore never inferred from content hashes alone.
+/// Authentication also never implies a win: every claim still walks the
+/// admission, decision, coverage, terminal, durability, and authority
+/// checks below.
+///
+/// # Errors
+///
+/// Returns [`GauntletError`] only for structurally malformed inputs (an
+/// empty required-coverage set on a qualification claim, malformed
+/// identities). POLICY failures are typed `NoClaim` outputs, not errors, so
+/// callers cannot confuse a rejection with an infrastructure fault.
+pub fn evaluate_consumer_claim(
+    mode: ConsumerMode,
+    claim: ConsumerClaim,
+    chain: &VerifiedV4Chain,
+    admitted_binding: &AdmittedChainBinding,
+    admission: AdmissionState,
+    decision: DecisionState,
+    coverage: &CoverageWitnessSet,
+    release_authority: Option<&ReleaseAuthority>,
+    private_local_policy_satisfied: Option<bool>,
+) -> Result<PromotionOutput, GauntletError> {
+    if chain.authentication != AuthenticationClass::VerifiedReceiptChain {
+        // IntegrityOnly / UnauthenticatedLegacy data may be preserved and
+        // replayed, but no claim ladder starts below a verified chain.
+        return Ok(no_claim("authentication_below_verified_receipt_chain"));
+    }
+    // Stale or substituted evidence: the chain must bind the admitted
+    // source, build, and executable identities exactly.
+    if chain.execution.source_identity_sha256 != admitted_binding.source_identity_sha256
+        || chain.execution.predecessor_build_identity_sha256
+            != admitted_binding.build_identity_sha256
+        || chain.execution.executable_sha256 != admitted_binding.executable_sha256
+    {
+        return Ok(no_claim("chain_does_not_bind_admitted_identities"));
+    }
+    // PrivateLocal policy is consulted ONLY for PrivateLocal claims;
+    // FixturePublic evidence can never be blocked by it.
+    if mode == ConsumerMode::PrivateLocal && private_local_policy_satisfied != Some(true) {
+        return Ok(no_claim("private_local_policy_not_satisfied"));
+    }
+
+    match claim {
+        ConsumerClaim::DiagnosticAttempt => Ok(no_claim("diagnostic_attempt_is_never_a_claim")),
+        ConsumerClaim::AdmittedCampaignEvidence => {
+            if admission != AdmissionState::Admitted {
+                return Ok(no_claim("evidence_not_admitted"));
+            }
+            if decision == DecisionState::Pass
+                && chain.completion.terminal_outcome != TerminalOutcome::Succeeded
+            {
+                // A failed terminal completion cannot carry a Pass; the
+                // authentic failure stays recordable as what it is.
+                return Ok(no_claim("pass_requires_successful_terminal_completion"));
+            }
+            Ok(PromotionOutput::RecordedEvidence { decision })
+        }
+        ConsumerClaim::ReplacementQualified => {
+            if coverage.required.is_empty() {
+                return Err(invalid(
+                    "a qualification claim must name its required coverage".to_owned(),
+                ));
+            }
+            if admission != AdmissionState::Admitted {
+                return Ok(no_claim("qualification_requires_admitted_evidence"));
+            }
+            if decision != DecisionState::Pass {
+                return Ok(no_claim("qualification_requires_a_pass_decision"));
+            }
+            if chain.completion.terminal_outcome != TerminalOutcome::Succeeded {
+                return Ok(no_claim("qualification_requires_successful_completion"));
+            }
+            if chain.completion.durability_sha256.is_none() {
+                return Ok(no_claim("qualification_requires_durable_evidence"));
+            }
+            for label in &coverage.required {
+                match coverage.witnessed.get(label) {
+                    None => {
+                        return Ok(no_claim("qualification_coverage_incomplete"));
+                    }
+                    Some((machine_profile, digest)) => {
+                        if machine_profile != &chain.execution.machine_profile {
+                            return Ok(no_claim("qualification_coverage_cross_worker_mix"));
+                        }
+                        validate_identity_hex(digest, "coverage witness digest")?;
+                    }
+                }
+            }
+            if release_authority.is_none() {
+                return Ok(no_claim(
+                    "qualification_requires_explicit_release_authority",
+                ));
+            }
+            Ok(PromotionOutput::Qualified)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2944,5 +3138,484 @@ mod f3_store_tests {
             let (_, identity) = self.completion.identity().expect("identity");
             identity
         }
+    }
+}
+
+#[cfg(test)]
+mod f4_consumer_policy_tests {
+    use super::tests::{
+        completion_from, fixture_execution, now_ns, sh_sha256, sh_spec, test_authority,
+        test_identity,
+    };
+    use super::*;
+    use std::time::Duration;
+
+    struct VerifiedFixture {
+        chain: VerifiedV4Chain,
+        binding: AdmittedChainBinding,
+        _root: tempfile::TempDir,
+    }
+
+    /// Mock-free E2E prelude: REAL supervised child -> signed chain ->
+    /// atomic store publication -> verified reload. Everything downstream
+    /// consumes the reloaded chain, exactly as a real consumer would.
+    fn verified_fixture(seed: u8, script: &str) -> VerifiedFixture {
+        let (mut authority, trust_roots) = test_authority(seed);
+        let spec = sh_spec(script, Duration::from_secs(10), 4096);
+        let execution = fixture_execution(&mut authority, &spec, &sh_sha256());
+        let termination =
+            supervise_execution(&spec, &sh_sha256(), &SupervisionCancel::new()).expect("supervise");
+        let completion = completion_from(&execution, &termination);
+        let execution_receipt = authority
+            .sign_execution(&execution, now_ns())
+            .expect("sign execution");
+        let completion_receipt = authority
+            .sign_completion(&execution, &completion, now_ns())
+            .expect("sign completion");
+        let root = tempfile::tempdir().expect("store root");
+        let store = ArtifactStoreV4ChainStore::open(root.path()).expect("open store");
+        let chain_identity = store
+            .publish_verified_chain(
+                &trust_roots,
+                &execution,
+                &execution_receipt,
+                &completion,
+                &completion_receipt,
+            )
+            .expect("publish");
+        let chain = store
+            .load_verified_chain(&trust_roots, &chain_identity)
+            .expect("verified reload");
+        let binding = AdmittedChainBinding {
+            source_identity_sha256: chain.execution.source_identity_sha256.clone(),
+            build_identity_sha256: chain.execution.predecessor_build_identity_sha256.clone(),
+            executable_sha256: chain.execution.executable_sha256.clone(),
+        };
+        VerifiedFixture {
+            chain,
+            binding,
+            _root: root,
+        }
+    }
+
+    fn complete_coverage(chain: &VerifiedV4Chain) -> CoverageWitnessSet {
+        let mut required = std::collections::BTreeSet::new();
+        required.insert("latency".to_owned());
+        required.insert("quality".to_owned());
+        let mut witnessed = BTreeMap::new();
+        for label in &required {
+            witnessed.insert(
+                label.clone(),
+                (
+                    chain.execution.machine_profile.clone(),
+                    test_identity(label),
+                ),
+            );
+        }
+        CoverageWitnessSet {
+            required,
+            witnessed,
+        }
+    }
+
+    fn release() -> ReleaseAuthority {
+        ReleaseAuthority {
+            authority_label: "release-policy-v1".to_owned(),
+        }
+    }
+
+    /// DiagnosticAttempt is always NoClaim — even for a fully authentic,
+    /// admitted, passing, covered, released chain.
+    #[test]
+    fn f4_diagnostic_attempt_is_always_no_claim() {
+        let fixture = verified_fixture(50, "exit 0");
+        let coverage = complete_coverage(&fixture.chain);
+        let output = evaluate_consumer_claim(
+            ConsumerMode::FixturePublic,
+            ConsumerClaim::DiagnosticAttempt,
+            &fixture.chain,
+            &fixture.binding,
+            AdmissionState::Admitted,
+            DecisionState::Pass,
+            &coverage,
+            Some(&release()),
+            None,
+        )
+        .expect("evaluate");
+        assert_eq!(
+            output,
+            PromotionOutput::NoClaim {
+                reason_code: "diagnostic_attempt_is_never_a_claim".to_owned()
+            }
+        );
+    }
+
+    /// AdmittedCampaignEvidence records Pass AND Miss exactly as evaluated;
+    /// a Miss on an authentic chain stays a Miss, never relabeled.
+    #[test]
+    fn f4_admitted_evidence_records_pass_and_miss_without_relabeling() {
+        let fixture = verified_fixture(51, "exit 0");
+        let coverage = complete_coverage(&fixture.chain);
+        for decision in [DecisionState::Pass, DecisionState::Miss] {
+            let output = evaluate_consumer_claim(
+                ConsumerMode::FixturePublic,
+                ConsumerClaim::AdmittedCampaignEvidence,
+                &fixture.chain,
+                &fixture.binding,
+                AdmissionState::Admitted,
+                decision,
+                &coverage,
+                None,
+                None,
+            )
+            .expect("evaluate");
+            assert_eq!(output, PromotionOutput::RecordedEvidence { decision });
+        }
+    }
+
+    /// The full replacement ladder qualifies — and every single missing rung
+    /// drops it to a typed NoClaim.
+    #[test]
+    fn f4_replacement_qualification_ladder_and_rejection_matrix() {
+        let fixture = verified_fixture(52, "exit 0");
+        let coverage = complete_coverage(&fixture.chain);
+        let qualify = |admission: AdmissionState,
+                       decision: DecisionState,
+                       coverage: &CoverageWitnessSet,
+                       authority: Option<&ReleaseAuthority>,
+                       binding: &AdmittedChainBinding| {
+            evaluate_consumer_claim(
+                ConsumerMode::FixturePublic,
+                ConsumerClaim::ReplacementQualified,
+                &fixture.chain,
+                binding,
+                admission,
+                decision,
+                coverage,
+                authority,
+                None,
+            )
+            .expect("evaluate")
+        };
+
+        assert_eq!(
+            qualify(
+                AdmissionState::Admitted,
+                DecisionState::Pass,
+                &coverage,
+                Some(&release()),
+                &fixture.binding,
+            ),
+            PromotionOutput::Qualified
+        );
+
+        for admission in [AdmissionState::Unadmitted, AdmissionState::NoDecision] {
+            assert_eq!(
+                qualify(
+                    admission,
+                    DecisionState::Pass,
+                    &coverage,
+                    Some(&release()),
+                    &fixture.binding,
+                ),
+                PromotionOutput::NoClaim {
+                    reason_code: "qualification_requires_admitted_evidence".to_owned()
+                }
+            );
+        }
+        for decision in [
+            DecisionState::Miss,
+            DecisionState::NoDecision,
+            DecisionState::Quarantine,
+        ] {
+            assert_eq!(
+                qualify(
+                    AdmissionState::Admitted,
+                    decision,
+                    &coverage,
+                    Some(&release()),
+                    &fixture.binding,
+                ),
+                PromotionOutput::NoClaim {
+                    reason_code: "qualification_requires_a_pass_decision".to_owned()
+                }
+            );
+        }
+
+        // Missing coverage witness.
+        let mut incomplete = coverage.clone();
+        incomplete.witnessed.remove("latency");
+        assert_eq!(
+            qualify(
+                AdmissionState::Admitted,
+                DecisionState::Pass,
+                &incomplete,
+                Some(&release()),
+                &fixture.binding,
+            ),
+            PromotionOutput::NoClaim {
+                reason_code: "qualification_coverage_incomplete".to_owned()
+            }
+        );
+
+        // Cross-worker mix: one witness from a different machine profile.
+        let mut mixed = coverage.clone();
+        mixed.witnessed.insert(
+            "latency".to_owned(),
+            ("some-other-host".to_owned(), test_identity("latency")),
+        );
+        assert_eq!(
+            qualify(
+                AdmissionState::Admitted,
+                DecisionState::Pass,
+                &mixed,
+                Some(&release()),
+                &fixture.binding,
+            ),
+            PromotionOutput::NoClaim {
+                reason_code: "qualification_coverage_cross_worker_mix".to_owned()
+            }
+        );
+
+        // Missing release authority.
+        assert_eq!(
+            qualify(
+                AdmissionState::Admitted,
+                DecisionState::Pass,
+                &coverage,
+                None,
+                &fixture.binding,
+            ),
+            PromotionOutput::NoClaim {
+                reason_code: "qualification_requires_explicit_release_authority".to_owned()
+            }
+        );
+
+        // Stale source/ELF: the chain does not bind the admitted identities.
+        let stale = AdmittedChainBinding {
+            executable_sha256: test_identity("some-other-executable"),
+            ..fixture.binding.clone()
+        };
+        assert_eq!(
+            qualify(
+                AdmissionState::Admitted,
+                DecisionState::Pass,
+                &coverage,
+                Some(&release()),
+                &stale,
+            ),
+            PromotionOutput::NoClaim {
+                reason_code: "chain_does_not_bind_admitted_identities".to_owned()
+            }
+        );
+
+        // An empty required set is a malformed claim, not a passing one.
+        let empty = CoverageWitnessSet {
+            required: std::collections::BTreeSet::new(),
+            witnessed: BTreeMap::new(),
+        };
+        assert!(
+            evaluate_consumer_claim(
+                ConsumerMode::FixturePublic,
+                ConsumerClaim::ReplacementQualified,
+                &fixture.chain,
+                &fixture.binding,
+                AdmissionState::Admitted,
+                DecisionState::Pass,
+                &empty,
+                Some(&release()),
+                None,
+            )
+            .is_err(),
+            "an empty required-coverage set is structurally malformed"
+        );
+    }
+
+    /// A failed terminal completion can never carry a Pass — but the
+    /// authentic failure remains recordable as a Miss, and can never
+    /// qualify.
+    #[test]
+    fn f4_failed_terminal_completion_rejects_pass_and_qualification() {
+        let fixture = verified_fixture(53, "exit 7");
+        let coverage = complete_coverage(&fixture.chain);
+        assert_eq!(
+            fixture.chain.completion.terminal_outcome,
+            TerminalOutcome::Failed
+        );
+        let pass_attempt = evaluate_consumer_claim(
+            ConsumerMode::FixturePublic,
+            ConsumerClaim::AdmittedCampaignEvidence,
+            &fixture.chain,
+            &fixture.binding,
+            AdmissionState::Admitted,
+            DecisionState::Pass,
+            &coverage,
+            None,
+            None,
+        )
+        .expect("evaluate");
+        assert_eq!(
+            pass_attempt,
+            PromotionOutput::NoClaim {
+                reason_code: "pass_requires_successful_terminal_completion".to_owned()
+            }
+        );
+        let miss = evaluate_consumer_claim(
+            ConsumerMode::FixturePublic,
+            ConsumerClaim::AdmittedCampaignEvidence,
+            &fixture.chain,
+            &fixture.binding,
+            AdmissionState::Admitted,
+            DecisionState::Miss,
+            &coverage,
+            None,
+            None,
+        )
+        .expect("evaluate");
+        assert_eq!(
+            miss,
+            PromotionOutput::RecordedEvidence {
+                decision: DecisionState::Miss
+            }
+        );
+        let qualification = evaluate_consumer_claim(
+            ConsumerMode::FixturePublic,
+            ConsumerClaim::ReplacementQualified,
+            &fixture.chain,
+            &fixture.binding,
+            AdmissionState::Admitted,
+            DecisionState::Pass,
+            &coverage,
+            Some(&release()),
+            None,
+        )
+        .expect("evaluate");
+        assert_eq!(
+            qualification,
+            PromotionOutput::NoClaim {
+                reason_code: "qualification_requires_successful_completion".to_owned()
+            }
+        );
+    }
+
+    /// Partial durability (typed null) rejects qualification while the
+    /// evidence itself stays recordable.
+    #[test]
+    fn f4_partial_durability_rejects_qualification_only() {
+        let (mut authority, trust_roots) = test_authority(54);
+        let spec = sh_spec("exit 0", Duration::from_secs(10), 4096);
+        let execution = fixture_execution(&mut authority, &spec, &sh_sha256());
+        let termination =
+            supervise_execution(&spec, &sh_sha256(), &SupervisionCancel::new()).expect("supervise");
+        let mut completion = completion_from(&execution, &termination);
+        completion.durability_sha256 = None;
+        let execution_receipt = authority
+            .sign_execution(&execution, now_ns())
+            .expect("sign execution");
+        let completion_receipt = authority
+            .sign_completion(&execution, &completion, now_ns())
+            .expect("sign completion");
+        let root = tempfile::tempdir().expect("store root");
+        let store = ArtifactStoreV4ChainStore::open(root.path()).expect("open store");
+        let chain_identity = store
+            .publish_verified_chain(
+                &trust_roots,
+                &execution,
+                &execution_receipt,
+                &completion,
+                &completion_receipt,
+            )
+            .expect("publish");
+        let chain = store
+            .load_verified_chain(&trust_roots, &chain_identity)
+            .expect("reload");
+        let binding = AdmittedChainBinding {
+            source_identity_sha256: chain.execution.source_identity_sha256.clone(),
+            build_identity_sha256: chain.execution.predecessor_build_identity_sha256.clone(),
+            executable_sha256: chain.execution.executable_sha256.clone(),
+        };
+        let coverage = complete_coverage(&chain);
+        let qualification = evaluate_consumer_claim(
+            ConsumerMode::FixturePublic,
+            ConsumerClaim::ReplacementQualified,
+            &chain,
+            &binding,
+            AdmissionState::Admitted,
+            DecisionState::Pass,
+            &coverage,
+            Some(&release()),
+            None,
+        )
+        .expect("evaluate");
+        assert_eq!(
+            qualification,
+            PromotionOutput::NoClaim {
+                reason_code: "qualification_requires_durable_evidence".to_owned()
+            }
+        );
+        let recorded = evaluate_consumer_claim(
+            ConsumerMode::FixturePublic,
+            ConsumerClaim::AdmittedCampaignEvidence,
+            &chain,
+            &binding,
+            AdmissionState::Admitted,
+            DecisionState::Pass,
+            &coverage,
+            None,
+            None,
+        )
+        .expect("evaluate");
+        assert_eq!(
+            recorded,
+            PromotionOutput::RecordedEvidence {
+                decision: DecisionState::Pass
+            }
+        );
+    }
+
+    /// PrivateLocal policy is independently governed: it gates PrivateLocal
+    /// claims and can never block FixturePublic evidence.
+    #[test]
+    fn f4_private_local_policy_cannot_block_fixture_public() {
+        let fixture = verified_fixture(55, "exit 0");
+        let coverage = complete_coverage(&fixture.chain);
+        // The private policy is UNSATISFIED — FixturePublic is unaffected.
+        let public = evaluate_consumer_claim(
+            ConsumerMode::FixturePublic,
+            ConsumerClaim::AdmittedCampaignEvidence,
+            &fixture.chain,
+            &fixture.binding,
+            AdmissionState::Admitted,
+            DecisionState::Pass,
+            &coverage,
+            None,
+            Some(false),
+        )
+        .expect("evaluate");
+        assert_eq!(
+            public,
+            PromotionOutput::RecordedEvidence {
+                decision: DecisionState::Pass
+            }
+        );
+        // The same claim in PrivateLocal mode is gated by that policy.
+        let private = evaluate_consumer_claim(
+            ConsumerMode::PrivateLocal,
+            ConsumerClaim::AdmittedCampaignEvidence,
+            &fixture.chain,
+            &fixture.binding,
+            AdmissionState::Admitted,
+            DecisionState::Pass,
+            &coverage,
+            None,
+            Some(false),
+        )
+        .expect("evaluate");
+        assert_eq!(
+            private,
+            PromotionOutput::NoClaim {
+                reason_code: "private_local_policy_not_satisfied".to_owned()
+            }
+        );
     }
 }
