@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-rerank"
-version = "0.2.2"
+version = "0.2.3"
 description = "Cross-encoder reranking for frankensearch (pure-Rust frankentorch + FastEmbed)"
 edition.workspace = true
 license-file.workspace = true

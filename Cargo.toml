@@ -41,14 +41,14 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 # Internal crates
-frankensearch-core = { version = "0.2.1", path = "crates/frankensearch-core" }
-frankensearch-embed = { version = "0.2.1", path = "crates/frankensearch-embed", default-features = false }
-frankensearch-index = { version = "0.2.1", path = "crates/frankensearch-index" }
-frankensearch-lexical = { version = "0.2.1", path = "crates/frankensearch-lexical" }
-frankensearch-fusion = { version = "0.2.1", path = "crates/frankensearch-fusion" }
-frankensearch-rerank = { version = "0.2.2", path = "crates/frankensearch-rerank" }
-frankensearch-storage = { version = "0.2.0", path = "crates/frankensearch-storage" }
-frankensearch-durability = { version = "0.2.0", path = "crates/frankensearch-durability", default-features = false }
+frankensearch-core = { version = "0.2.2", path = "crates/frankensearch-core" }
+frankensearch-embed = { version = "0.2.2", path = "crates/frankensearch-embed", default-features = false }
+frankensearch-index = { version = "0.2.2", path = "crates/frankensearch-index" }
+frankensearch-lexical = { version = "0.2.2", path = "crates/frankensearch-lexical" }
+frankensearch-fusion = { version = "0.2.2", path = "crates/frankensearch-fusion" }
+frankensearch-rerank = { version = "0.2.3", path = "crates/frankensearch-rerank" }
+frankensearch-storage = { version = "0.2.1", path = "crates/frankensearch-storage" }
+frankensearch-durability = { version = "0.2.1", path = "crates/frankensearch-durability", default-features = false }
 frankensearch-fsfs = { version = "1.4.3", path = "crates/frankensearch-fsfs" }
 frankensearch-tui = { version = "0.2.0", path = "crates/frankensearch-tui" }
 frankensearch-ops = { version = "0.2.0", path = "crates/frankensearch-ops" }
@@ -119,28 +119,32 @@ fastembed = { version = "=6.0.0", default-features = false, features = [
 safetensors = "0.8.0"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 # frankentorch (pure-Rust tensor lib) backing the frankensearch-rerank `native`
-# feature (cross-encoder reranker + MiniLM embedder). Pinned by GIT REV so downstream
-# consumers (e.g. cass) can pull frankensearch's `native` feature from a git rev
-# without a local frankentorch checkout: a relative `../frankentorch` path dep escapes
-# a git checkout and fails to resolve (`no matching package named ft-api`). frankentorch
-# is unpublishable on crates.io under these names (`ft-api` is taken by an unrelated
-# crate), so a git rev is the consumable pin. For local frankentorch development, add a
-# `[patch."https://github.com/Dicklesworthstone/frankentorch"]` block pointing ft-api /
-# ft-autograd / ft-core at ../frankentorch/crates/* locally (do NOT commit it).
-ft-api = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c5d2ede1b1644ed439a00b9e814bfcf205bbe1c0" }
-ft-autograd = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c5d2ede1b1644ed439a00b9e814bfcf205bbe1c0" }
-ft-core = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c5d2ede1b1644ed439a00b9e814bfcf205bbe1c0" }
+# feature (cross-encoder reranker + MiniLM embedder). The family is published
+# on crates.io under `frankentorch-*` names (`ft-api` on crates.io belongs to
+# an unrelated crate, so the git-era `ft-*` names stay as workspace dep keys
+# via `package =` renames). For local frankentorch development, add a
+# `[patch.crates-io]` block pointing frankentorch-api / frankentorch-autograd /
+# frankentorch-core at ../frankentorch/crates/* locally (do NOT commit it).
+ft-api = { package = "frankentorch-api", version = "0.1.0" }
+ft-autograd = { package = "frankentorch-autograd", version = "0.1.0" }
+ft-core = { package = "frankentorch-core", version = "0.1.0" }
 
 # Full-text search
-# Tantivy 0.26.1 (the latest crates.io release as of 2026-08-11) still pins
-# unsound lru 0.16.x (RUSTSEC-2026-0253). Pin the exact upstream 0.27 commit
-# that has moved to patched lru 0.18.2 until the next stable release lands.
-tantivy = { git = "https://github.com/quickwit-oss/tantivy", rev = "1f32c1a8af0eb9d68bd3f5576caf20941364b657" }
+# Registry 0.26.1 pins lru ^0.16.3, which RUSTSEC-2026-0253 marks unsound
+# (patched only in lru >= 0.18.2, unreachable from ^0.16.3). The advisory is
+# informational: the use-after-free needs `catch_unwind` around a panicking
+# `Drop` on a cache KEY type, and tantivy's lru caches are keyed by integers
+# and other trivially-droppable types, so the pattern cannot occur in this
+# graph. A registry pin is required for crates.io publication (a git dep is
+# unpublishable); move to tantivy 0.27 when it ships with patched lru.
+tantivy = "=0.26.1"
 
 ndarray = "0.17"
 
-# HNSW approximate nearest neighbors
-hnsw_rs = { git = "https://github.com/Dicklesworthstone/hnswlib-rs", rev = "fe44c6b717628997812da671848b046668451216", default-features = false }
+# HNSW approximate nearest neighbors. Published fork of upstream hnsw_rs 0.3.4
+# (crates.io `hnsw_rs` belongs to upstream): carries layer-invariant and
+# hnswio-hardening fixes; the upstream import path is kept via `package =`.
+hnsw_rs = { package = "frankenhnsw", version = "=0.3.5", default-features = false }
 
 # CRC32 checksums for FSVI index integrity
 crc32fast = "1"

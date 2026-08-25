@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-embed"
-version = "0.2.1"
+version = "0.2.2"
 description = "Embedder implementations for frankensearch (hash, model2vec, fastembed)"
 edition.workspace = true
 license-file.workspace = true
