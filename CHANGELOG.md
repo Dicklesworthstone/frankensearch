@@ -25,7 +25,14 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.7.0...main>
 
-No post-1.7.0 changes yet.
+### crates.io publication of the library line (2026-08-24, gh#416)
+
+The whole current library line is on crates.io for the first time, published bottom-up with every crate at a fresh, never-used version (registry 0.3.2 / 0.2.x entries from the earlier attempt were stale same-version twins of older trees and are superseded, never overwritten):
+
+- `frankensearch 0.4.0` (facade; 0.3.x is skipped so resolution can never land on the stale 0.3.2 twin), `frankensearch-core 0.2.2`, `frankensearch-embed 0.2.2`, `frankensearch-index 0.2.2`, `frankensearch-lexical 0.2.2`, `frankensearch-fusion 0.2.2`, `frankensearch-rerank 0.2.3`, `frankensearch-storage 0.2.1`, `frankensearch-durability 0.2.1`, `frankensearch-quill 0.2.1` (first release under this name).
+- Every git dependency was retargeted to the registry to make this possible: the frankentorch family is consumed as `frankentorch-{core,kernel-cpu,dispatch,autograd,runtime,api}` (published under those names; crates.io `ft-api` belongs to an unrelated crate), the HNSW fork is `frankenhnsw 0.3.5` (fork of upstream `hnsw_rs` 0.3.4 with layer-invariant and hnswio-hardening fixes; upstream import path kept via `package =`), and tantivy is registry `=0.26.1` — its `lru ^0.16.3` carries informational RUSTSEC-2026-0253, unreachable in this graph because the advisory needs a panicking `Drop` on a cache key under `catch_unwind` and tantivy's cache keys are trivially droppable. Move to tantivy 0.27 when it ships with patched lru.
+- The version bump moves `frankensearch-embed`'s frozen model-manifest fingerprints (they embed `CARGO_PKG_VERSION` in `implementation_revision`); the fixture test tracks the new values.
+- The `four_engine_generation_receipts` facade gates, red from birth, were repaired: a sealed FSVI v2 image stores records sorted by `(doc_id_hash, doc_id)`, so the ordered docset every role attests is the image's stored order, not the writer's insertion order — the tests now derive `generation_order()` from the admitted image and feed the same sequence to every role, including Quill's indexing order.
 
 ---
 
