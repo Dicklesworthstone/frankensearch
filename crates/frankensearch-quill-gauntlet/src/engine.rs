@@ -85,6 +85,13 @@ const BUILT_IN_PROFILE_V2_CASS_SCHEMA_HASH: &str =
     "11057d81013ddadc6499674acb23a8b6842d589f4344fa88b3e70fa744fc4ee9";
 const BUILT_IN_PROFILE_V2_SCALAR_ORACLE_CONFIG_HASH: &str = "shipping-schema-and-parser-v1";
 const BUILT_IN_PROFILE_V2_CASS_ORACLE_CONFIG_HASH: &str = "cass-schema-and-parser-v1";
+// v3 (gh#416): the semantic contract is IDENTICAL to v2; only the lexical
+// wrapper version moved (0.2.1 -> 0.2.2) when the oracle switched from the
+// git tantivy 0.27-dev pin to the registry 0.26.1 dependency universe
+// (oracle dependency contract v4). Historical v2 receipts stay archive-valid
+// and can no longer create runs, exactly like v1 before them.
+const BUILT_IN_PROFILE_V3_QUILL_CRATE_VERSION: &str = "0.2.1";
+const BUILT_IN_PROFILE_V3_LEXICAL_CRATE_VERSION: &str = "0.2.2";
 
 /// Closed engine family used by the cross-engine false-green guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +404,7 @@ pub struct BuiltInEngineProfileReceipt {
 impl BuiltInEngineProfileReceipt {
     const V1_SCHEMA_VERSION: u32 = 1;
     const V2_SCHEMA_VERSION: u32 = 2;
+    const V3_SCHEMA_VERSION: u32 = 3;
     #[cfg_attr(
         not(any(test, feature = "tantivy-oracle")),
         expect(
@@ -404,7 +412,7 @@ impl BuiltInEngineProfileReceipt {
             reason = "typed built-in receipts are constructed only by oracle-backed or test lanes"
         )
     )]
-    const CURRENT_SCHEMA_VERSION: u32 = Self::V2_SCHEMA_VERSION;
+    const CURRENT_SCHEMA_VERSION: u32 = Self::V3_SCHEMA_VERSION;
 
     #[cfg_attr(
         not(any(test, feature = "tantivy-oracle")),
@@ -435,6 +443,7 @@ impl BuiltInEngineProfileReceipt {
         match self.schema_version {
             1 => self.validate_stored_v1(engines),
             2 => self.validate_stored_v2(engines),
+            3 => self.validate_stored_v3(engines),
             _ => Err(GauntletError::InvalidContract {
                 reason: "built-in engine profile receipt schema is unsupported".to_owned(),
             }),
@@ -560,6 +569,50 @@ impl BuiltInEngineProfileReceipt {
         {
             return Err(GauntletError::InvalidContract {
                 reason: "built-in engine profile receipt v2 does not match its stored adapter identities and semantic contract"
+                    .to_owned(),
+            });
+        }
+        validate_recorded_producer_source(
+            &engines.subject.source_revision,
+            engines.subject.source_dirty,
+        )?;
+        Ok(())
+    }
+
+    /// v3 differs from v2 only in the pinned lexical wrapper version
+    /// (0.2.2, the registry-oracle line of gh#416); the analyzer/schema
+    /// semantic contract is byte-identical, so v2's is reused.
+    fn validate_stored_v3(&self, engines: &EnginePairIdentity) -> Result<(), GauntletError> {
+        self.subject_config.validate_stored_v1()?;
+        let (subject_implementation, subject_hash, oracle_hash) = match self.profile {
+            BuiltInEngineProfile::ScalarShipping | BuiltInEngineProfile::ScalarG1a => (
+                "frankensearch-quill/scalar-index",
+                self.subject_config.descriptor_hash_v1(),
+                BUILT_IN_PROFILE_V2_SCALAR_ORACLE_CONFIG_HASH,
+            ),
+            BuiltInEngineProfile::Cass => (
+                "frankensearch-quill/cass-index",
+                format!(
+                    "cass-semantic-v1:{}",
+                    self.subject_config.descriptor_hash_v1()
+                ),
+                BUILT_IN_PROFILE_V2_CASS_ORACLE_CONFIG_HASH,
+            ),
+        };
+        if self.schema_version != Self::V3_SCHEMA_VERSION
+            || engines.comparison_mode != ComparisonMode::CrossEngine
+            || engines.subject.implementation != subject_implementation
+            || engines.subject.crate_version != BUILT_IN_PROFILE_V3_QUILL_CRATE_VERSION
+            || engines.subject.config_hash != subject_hash
+            || engines.oracle.implementation != "frankensearch-lexical/tantivy-index"
+            || engines.oracle.crate_version != BUILT_IN_PROFILE_V3_LEXICAL_CRATE_VERSION
+            || engines.oracle.config_hash != oracle_hash
+            || engines.semantic_contract.as_ref() != Some(&self.stored_semantic_contract_v2())
+            || engines.subject.source_revision != engines.oracle.source_revision
+            || engines.subject.source_dirty != engines.oracle.source_dirty
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "built-in engine profile receipt v3 does not match its stored adapter identities and semantic contract"
                     .to_owned(),
             });
         }
@@ -4237,20 +4290,31 @@ mod tests {
         schema_version: u32,
     ) -> EnginePairIdentity {
         let receipt = match schema_version {
-            BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION => BuiltInEngineProfileReceipt {
+            BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION
+            | BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION => BuiltInEngineProfileReceipt {
                 schema_version,
                 profile,
                 subject_config: QuillConfigReceipt::from_config(config),
             },
-            BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION => {
+            BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION => {
                 BuiltInEngineProfileReceipt::new(profile, config)
             }
             _ => panic!("unsupported test profile schema {schema_version}"),
         };
         let semantic_contract = match schema_version {
             BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION => receipt.stored_semantic_contract_v1(),
-            BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION => receipt.stored_semantic_contract_v2(),
+            // v3 kept v2's semantic contract byte-identical.
+            BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION
+            | BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION => {
+                receipt.stored_semantic_contract_v2()
+            }
             _ => unreachable!("validated above"),
+        };
+        let lexical_crate_version = match schema_version {
+            BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION => {
+                BUILT_IN_PROFILE_V3_LEXICAL_CRATE_VERSION
+            }
+            _ => BUILT_IN_PROFILE_V1_LEXICAL_CRATE_VERSION,
         };
         let (subject_implementation, subject_config_hash, oracle_config_hash) = match profile {
             BuiltInEngineProfile::ScalarShipping | BuiltInEngineProfile::ScalarG1a => (
@@ -4281,7 +4345,7 @@ mod tests {
             EngineDescriptor {
                 family: EngineFamily::Tantivy,
                 implementation: "frankensearch-lexical/tantivy-index".to_owned(),
-                crate_version: BUILT_IN_PROFILE_V1_LEXICAL_CRATE_VERSION.to_owned(),
+                crate_version: lexical_crate_version.to_owned(),
                 source_revision: producer_revision,
                 source_dirty: false,
                 config_hash: oracle_config_hash.to_owned(),
@@ -6560,36 +6624,39 @@ mod tests {
     }
 
     #[test]
-    fn built_in_profile_v2_is_current_while_v1_remains_archive_only() {
+    fn built_in_profile_v3_is_current_while_v1_and_v2_remain_archive_only() {
         for profile in [
             BuiltInEngineProfile::ScalarShipping,
             BuiltInEngineProfile::ScalarG1a,
             BuiltInEngineProfile::Cass,
         ] {
-            let archived = stored_profile_pair(
-                profile,
-                &QuillConfig::default(),
+            for archived_schema in [
                 BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION,
-            );
-            archived
-                .validate_stored_contract()
-                .expect("frozen v1 receipt remains archive-valid");
-            assert!(
-                archived.validate_builtin_contract().is_err(),
-                "v1 cannot create a run under the Tantivy 0.27 semantic contract"
-            );
+                BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION,
+            ] {
+                let archived =
+                    stored_profile_pair(profile, &QuillConfig::default(), archived_schema);
+                archived
+                    .validate_stored_contract()
+                    .expect("frozen receipt remains archive-valid");
+                assert!(
+                    archived.validate_builtin_contract().is_err(),
+                    "schema v{archived_schema} cannot create a run under the registry-oracle \
+                     dependency contract (lexical 0.2.2)"
+                );
+            }
 
             let current = stored_profile_pair(
                 profile,
                 &QuillConfig::default(),
-                BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION,
+                BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION,
             );
             current
                 .validate_stored_contract()
-                .expect("v2 receipt remains independently replay-valid");
+                .expect("v3 receipt remains independently replay-valid");
             current
                 .validate_builtin_contract()
-                .expect("v2 receipt must match the current adapters");
+                .expect("v3 receipt must match the current adapters");
         }
     }
 

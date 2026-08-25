@@ -368,8 +368,12 @@ impl PerfCellSpec {
 pub const QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION: &str =
     crate::version_contract::CURRENT_ORACLE_TANTIVY_VERSION;
 /// Wire schema for the provisional QG-1 Tantivy incumbent screen.
+///
+/// v5 (gh#416): the oracle moved from the git tantivy 0.27-dev pin to
+/// registry 0.26.1, and per the protocol-pin rule above that retires every
+/// v4 screen record — a new screen must be taken under the 0.26.1 writer.
 pub const QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION: &str =
-    "quill-qg1-tantivy-incumbent-screen-v4-tantivy-0.27.0";
+    "quill-qg1-tantivy-incumbent-screen-v5-tantivy-0.26.1";
 
 /// Tantivy writer construction admitted to the QG-1 incumbent screen.
 ///
@@ -8933,7 +8937,7 @@ mod tests {
     }
 
     #[test]
-    fn qg1_incumbent_protocol_uses_the_current_oracle_and_rejects_retained_v2() {
+    fn qg1_incumbent_protocol_uses_the_current_oracle_and_rejects_retired_versions() {
         let oracle = crate::oracle_version_contract().expect("current oracle contract");
         assert_eq!(
             QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION,
@@ -8941,13 +8945,15 @@ mod tests {
         );
         assert_eq!(
             QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION,
-            "quill-qg1-tantivy-incumbent-screen-v4-tantivy-0.27.0"
+            "quill-qg1-tantivy-incumbent-screen-v5-tantivy-0.26.1"
         );
 
-        let mut retained_v2 = qg1_semantic_contract();
-        retained_v2.tantivy_version = "0.26.1".to_owned();
+        // The retired v4 screens ran under the git tantivy 0.27-dev pin; a
+        // contract still claiming that writer must not admit into v5 records.
+        let mut retired_v4 = qg1_semantic_contract();
+        retired_v4.tantivy_version = "0.27.0".to_owned();
         assert!(matches!(
-            retained_v2.contract_sha256(),
+            retired_v4.contract_sha256(),
             Err(Qg1TantivyIncumbentError::InvalidSemanticContract)
         ));
     }
