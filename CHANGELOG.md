@@ -10,7 +10,7 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.7.0...main) | HEAD | 2026-08-21 | (no post-1.7.0 changes yet) |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.7.0...main) | HEAD | 2026-08-24 | crates.io publication of the library line (frankensearch 0.4.0 + sub-crates; gh#416) |
 | [v1.7.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.7.0) | Release | 2026-08-23 | Registry refresh (FrankenSQLite 0.3.8, Asupersync 0.4.9, fastembed 6), hash-control fuse follow-through, Quill CASS ingest |
 | [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) | Release | 2026-08-14 | Hash control no longer presented as semantic search |
 | [v1.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.5.0) | Release | 2026-08-05 | Multi-platform assets; remedy for #31 |

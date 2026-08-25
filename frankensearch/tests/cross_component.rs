@@ -1371,6 +1371,15 @@ mod four_engine_generation_receipts {
     /// order, so indexing in this same order is what makes all four roles
     /// agree on one canonical docset.
     fn generation_order(owner: &ValidatedFsviBytes) -> Vec<String> {
+        // Every physical row is a live document in these fixtures. The witness
+        // digest covers LIVE rows only, so a fixture that gains tombstones must
+        // filter them here instead of silently shifting the attested order.
+        assert_eq!(
+            owner.tombstone_count(),
+            0,
+            "generation_order() enumerates all physical rows; teach it to skip \
+             tombstones before adding tombstoned fixtures"
+        );
         let rows = usize::try_from(owner.witness().record_count).expect("record count fits");
         (0..rows)
             .map(|row| owner.doc_id_at(row).expect("validated row id").to_owned())
