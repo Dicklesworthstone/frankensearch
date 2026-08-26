@@ -3876,11 +3876,11 @@ mod tests {
         let expected = [
             (
                 "model2vec-native".to_owned(),
-                "63cb492548ea4a45fd03fb029b9087266b3ff5d1e08b4789e8c4c8155cadce0c".to_owned(),
+                "38469302ca53aa9e82e1a1f1e4d6576e5d6aff492f441de273eafcf6e437216e".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "fbc9b3c13af685018b899b650ddb50ccd1018e088053cca6777c4f140432fcd3".to_owned(),
+                "7bee34ce869e288067c20775f80b72fce87d95f4d28eebf25529ae227b7cdd8b".to_owned(),
             ),
             (
                 "frankentorch-native-minilm".to_owned(),
@@ -3888,11 +3888,11 @@ mod tests {
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "df2bbc6da09542e42d82a015ba9c3ea3b42e5b23d9d949b975612c9f1df2296a".to_owned(),
+                "773b04ae1120f4787d650b866ff67c54f91132201be4cf845061d58d484d5a1e".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "70a93c856145560d23b94f859589726fd81a37080d2aa36503f64d6c4b78dddc".to_owned(),
+                "a8272beabe876d07d68e82f9ba50c26bc55958220f3b4cc9701db299ffebb04f".to_owned(),
             ),
         ];
         assert_eq!(observed, expected);
