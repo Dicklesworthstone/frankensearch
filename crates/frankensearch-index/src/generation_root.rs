@@ -10368,6 +10368,25 @@ if not close_only_contended or not explicit_unlock_released:
         #[test]
         fn linux_atime_only_drift_is_excluded_without_restoring_metadata() {
             let root_path = fixture_root("atime-drift");
+            // The fixture below proves that an ambient (non-O_NOATIME) read advances atime and
+            // that admission neither trips on it nor rewinds it. On a `noatime` mount the kernel
+            // never advances atime for anyone, so the precondition cannot be staged and the
+            // drift under test does not exist; report the host as not applicable rather than
+            // asserting a property of the developer's mount options. Everything else about the
+            // filesystem is left to the assertions below.
+            let mount =
+                rustix::fs::statvfs(&root_path).expect("fixture mount flags should be readable");
+            if mount
+                .f_flag
+                .contains(rustix::fs::StatVfsMountFlags::NOATIME)
+            {
+                eprintln!(
+                    "skipping linux_atime_only_drift_is_excluded_without_restoring_metadata: \
+                     the fixture root is on a noatime mount, so an ambient read cannot \
+                     advance atime and atime-only drift cannot be staged here"
+                );
+                return;
+            }
             let artifact = private_file(&root_path, "artifact", b"atime");
             let timestamp_owner = File::open(&artifact).expect("fixture should open for timestamp");
             let modified = timestamp_owner
@@ -10818,12 +10837,26 @@ if not close_only_contended or not explicit_unlock_released:
         #[test]
         fn root_filesystem_profile_exposes_only_qualified_local_type() {
             let root_path = fixture_root("filesystem-profile");
-            let root =
-                QualifiedGenerationRoot::admit(&root_path).expect("ext4 root should qualify");
-            assert_eq!(
-                root.witness().filesystem(),
+            // Derive the expected profile from the kernel's own statfs magic rather than
+            // hard-coding one filesystem: the witness must report the qualified local type the
+            // fixture root actually lives on, whichever of the qualified Linux filesystems that
+            // is. Anything else is not a qualified root and the test cannot run there.
+            let filesystem =
+                rustix::fs::statfs(&root_path).expect("fixture root should be statable");
+            let raw_type = i128::from(filesystem.f_type);
+            let expected = if raw_type == i128::from(libc::EXT4_SUPER_MAGIC) {
                 super::super::QualifiedFilesystem::LinuxExt4
-            );
+            } else if raw_type == i128::from(libc::BTRFS_SUPER_MAGIC) {
+                super::super::QualifiedFilesystem::LinuxBtrfs
+            } else {
+                panic!(
+                    "fixture root must live on ext4 or Btrfs (the qualified Linux filesystems); \
+                     statfs reported f_type {raw_type:#x}"
+                );
+            };
+            let root = QualifiedGenerationRoot::admit(&root_path)
+                .expect("qualified local root should qualify");
+            assert_eq!(root.witness().filesystem(), expected);
             assert_ne!(root.witness().mount_identity(), [0; 32]);
         }
 
