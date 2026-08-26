@@ -1321,13 +1321,11 @@ mod four_engine_generation_receipts {
         MANIFEST_SCHEMA_VERSION, QuantizationFormat, SourceCheckpointV1, compute_manifest_hash,
     };
 
-    /// One document corpus, shared by every role.
+    /// One ordered document set, shared by every role.
     ///
-    /// This is the WRITER's insertion order only. The canonical ordered docset
-    /// every role attests is [`generation_order`] — the sealed image's stored
-    /// order — and the docset digest is order-sensitive, so an engine that
-    /// reordered live documents must not agree with the anchor by accident
-    /// (pinned by the reversed-order rejection below).
+    /// The identifiers sort in insertion order on purpose: the docset digest is
+    /// order-sensitive, so an engine that reordered live documents must not be
+    /// able to agree with the anchor by accident.
     const DOCUMENTS: [&str; 3] = ["doc-alpha", "doc-beta", "doc-gamma"];
 
     const VECTORS: [[f32; 4]; 3] = [
@@ -1361,22 +1359,6 @@ mod four_engine_generation_receipts {
         Arc::new(ValidatedFsviBytes::open_published(&path, &bound).expect("admit the sealed image"))
     }
 
-    /// The owner's live document ids in exact generation order.
-    ///
-    /// A sealed FSVI v2 image stores its records sorted by
-    /// `(doc_id_hash, doc_id)` — generation order is NOT insertion order —
-    /// and the witness digest is taken over that stored order. Every role is
-    /// fed this sequence: the vector/ANN adapters authenticate against it,
-    /// and Quill's snapshot receipt materializes its docset in indexing
-    /// order, so indexing in this same order is what makes all four roles
-    /// agree on one canonical docset.
-    fn generation_order(owner: &ValidatedFsviBytes) -> Vec<String> {
-        let rows = usize::try_from(owner.witness().record_count).expect("record count fits");
-        (0..rows)
-            .map(|row| owner.doc_id_at(row).expect("validated row id").to_owned())
-            .collect()
-    }
-
     /// A real `GenerationManifest` over the shared document set.
     ///
     /// `for_metadata_manifest` requires `total_documents` to equal the docset
@@ -1408,10 +1390,9 @@ mod four_engine_generation_receipts {
     fn the_vector_and_ann_roles_agree_because_they_witness_one_image() {
         let directory = tempfile::tempdir().expect("7hvtf publication directory");
         let owner = fsvi_owner(directory.path());
-        let order = generation_order(&owner);
         let checkpoint = SourceCheckpointV1::derive(&CommitRange { low: 1, high: 9 });
 
-        let vector = vector_component_receipt(owner.witness(), order.clone(), checkpoint)
+        let vector = vector_component_receipt(owner.witness(), DOCUMENTS, checkpoint)
             .expect("vector receipt from the real FSVI witness");
 
         let graph =
@@ -1420,7 +1401,7 @@ mod four_engine_generation_receipts {
         let graph_receipt = graph
             .save(&directory.path().join("current.fshnsw"))
             .expect("save the graph and mint its receipt");
-        let ann = ann_component_receipt(&graph_receipt, order.clone(), checkpoint)
+        let ann = ann_component_receipt(&graph_receipt, DOCUMENTS, checkpoint)
             .expect("ANN receipt from the real graph receipt");
 
         assert_eq!(
@@ -1438,7 +1419,7 @@ mod four_engine_generation_receipts {
         // canonical preimage. Reversing the IDs must fail against the
         // engine-local digest authenticated by the persisted graph receipt,
         // before a contradictory component reaches the composite join.
-        let mut reordered = order.clone();
+        let mut reordered = DOCUMENTS;
         reordered.reverse();
         assert!(
             ann_component_receipt(&graph_receipt, reordered, checkpoint).is_err(),
@@ -1472,11 +1453,10 @@ mod four_engine_generation_receipts {
 
         let directory = tempfile::tempdir().expect("7hvtf publication directory");
         let owner = fsvi_owner(directory.path());
-        let order = generation_order(&owner);
         let range = CommitRange { low: 1, high: 9 };
         let checkpoint = SourceCheckpointV1::derive(&range);
 
-        let vector = vector_component_receipt(owner.witness(), order.clone(), checkpoint)
+        let vector = vector_component_receipt(owner.witness(), DOCUMENTS, checkpoint)
             .expect("vector receipt from the real FSVI witness");
         let graph =
             ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
@@ -1484,10 +1464,10 @@ mod four_engine_generation_receipts {
         let graph_receipt = graph
             .save(&directory.path().join("current.fshnsw"))
             .expect("save the graph and mint its receipt");
-        let ann = ann_component_receipt(&graph_receipt, order.clone(), checkpoint)
+        let ann = ann_component_receipt(&graph_receipt, DOCUMENTS, checkpoint)
             .expect("ANN receipt from the real graph receipt");
 
-        let docset = CanonicalDocsetV1::from_ordered_live_documents(order.clone())
+        let docset = CanonicalDocsetV1::from_ordered_live_documents(DOCUMENTS)
             .expect("canonical docset over the shared ordered ids");
         let manifest = manifest_over(range);
         let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize the manifest image");
@@ -1500,7 +1480,7 @@ mod four_engine_generation_receipts {
             let index = QuillIndex::create(&cx, &quill_directory, QuillConfig::default())
                 .await
                 .expect("create the Quill index");
-            let documents = order
+            let documents = DOCUMENTS
                 .iter()
                 .map(|id| IndexableDocument {
                     id: (*id).to_owned(),
@@ -1568,7 +1548,6 @@ mod four_engine_generation_receipts {
 
         let directory = tempfile::tempdir().expect("7hvtf drift directory");
         let owner = fsvi_owner(directory.path());
-        let order = generation_order(&owner);
         let range = CommitRange { low: 1, high: 9 };
         let other_range = CommitRange { low: 2, high: 11 };
         let checkpoint = SourceCheckpointV1::derive(&range);
@@ -1579,7 +1558,7 @@ mod four_engine_generation_receipts {
             "the two commit ranges must derive different checkpoints or nothing below is a drift"
         );
 
-        let vector = vector_component_receipt(owner.witness(), order.clone(), checkpoint)
+        let vector = vector_component_receipt(owner.witness(), DOCUMENTS, checkpoint)
             .expect("anchor receipt");
         let graph =
             ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
@@ -1588,11 +1567,11 @@ mod four_engine_generation_receipts {
             .save(&directory.path().join("current.fshnsw"))
             .expect("save the graph and mint its receipt");
         let ann =
-            ann_component_receipt(&graph_receipt, order.clone(), checkpoint).expect("ANN receipt");
-        let drifted_ann = ann_component_receipt(&graph_receipt, order.clone(), drifted)
+            ann_component_receipt(&graph_receipt, DOCUMENTS, checkpoint).expect("ANN receipt");
+        let drifted_ann = ann_component_receipt(&graph_receipt, DOCUMENTS, drifted)
             .expect("ANN receipt on another checkpoint");
 
-        let docset = CanonicalDocsetV1::from_ordered_live_documents(order.clone())
+        let docset = CanonicalDocsetV1::from_ordered_live_documents(DOCUMENTS)
             .expect("canonical docset over the shared ordered ids");
         let manifest = manifest_over(range);
         let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize the manifest image");
@@ -1614,7 +1593,7 @@ mod four_engine_generation_receipts {
             let index = QuillIndex::create(&cx, &quill_directory, QuillConfig::default())
                 .await
                 .expect("create the Quill index");
-            let documents = order
+            let documents = DOCUMENTS
                 .iter()
                 .map(|id| IndexableDocument {
                     id: (*id).to_owned(),
@@ -1721,14 +1700,13 @@ mod four_engine_generation_receipts {
 
         let directory = tempfile::tempdir().expect("7hvtf anchor directory");
         let owner = fsvi_owner(directory.path());
-        let order = generation_order(&owner);
         let range = CommitRange { low: 1, high: 9 };
         let checkpoint = SourceCheckpointV1::derive(&range);
         let moved_anchor = SourceCheckpointV1::derive(&CommitRange { low: 5, high: 6 });
 
         let vector =
-            vector_component_receipt(owner.witness(), order.clone(), checkpoint).expect("anchor");
-        let drifted_vector = vector_component_receipt(owner.witness(), order.clone(), moved_anchor)
+            vector_component_receipt(owner.witness(), DOCUMENTS, checkpoint).expect("anchor");
+        let drifted_vector = vector_component_receipt(owner.witness(), DOCUMENTS, moved_anchor)
             .expect("anchor receipt on a different checkpoint");
         let graph =
             ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
@@ -1737,8 +1715,8 @@ mod four_engine_generation_receipts {
             .save(&directory.path().join("current.fshnsw"))
             .expect("save the graph and mint its receipt");
         let ann =
-            ann_component_receipt(&graph_receipt, order.clone(), checkpoint).expect("ANN receipt");
-        let docset = CanonicalDocsetV1::from_ordered_live_documents(order.clone())
+            ann_component_receipt(&graph_receipt, DOCUMENTS, checkpoint).expect("ANN receipt");
+        let docset = CanonicalDocsetV1::from_ordered_live_documents(DOCUMENTS)
             .expect("canonical docset over the shared ordered ids");
         let manifest = manifest_over(range);
         let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize the manifest image");
@@ -1751,7 +1729,7 @@ mod four_engine_generation_receipts {
             let index = QuillIndex::create(&cx, &quill_directory, QuillConfig::default())
                 .await
                 .expect("create the Quill index");
-            let documents = order
+            let documents = DOCUMENTS
                 .iter()
                 .map(|id| IndexableDocument {
                     id: (*id).to_owned(),
