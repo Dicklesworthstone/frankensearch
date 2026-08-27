@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-storage"
-version = "0.2.1"
+version = "0.2.2"
 description = "FrankenSQLite-backed metadata and embedding job storage for frankensearch"
 edition.workspace = true
 license-file.workspace = true

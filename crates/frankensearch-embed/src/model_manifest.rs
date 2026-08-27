@@ -3876,11 +3876,11 @@ mod tests {
         let expected = [
             (
                 "model2vec-native".to_owned(),
-                "63cb492548ea4a45fd03fb029b9087266b3ff5d1e08b4789e8c4c8155cadce0c".to_owned(),
+                "aad9f3e3817ebe5bf66b11ac6fcc060821943336100b252900af766ada40c51c".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "fbc9b3c13af685018b899b650ddb50ccd1018e088053cca6777c4f140432fcd3".to_owned(),
+                "6f243d51c65dd78577b99f275909e605c00dc2cf49f0f00526c48627d60ef042".to_owned(),
             ),
             (
                 "frankentorch-native-minilm".to_owned(),
@@ -3888,11 +3888,11 @@ mod tests {
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "df2bbc6da09542e42d82a015ba9c3ea3b42e5b23d9d949b975612c9f1df2296a".to_owned(),
+                "f11b638ba16e5426efb6bc0ec81bc1a3979ee574bdb5297390cc5777690adab1".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "70a93c856145560d23b94f859589726fd81a37080d2aa36503f64d6c4b78dddc".to_owned(),
+                "25faf1b6ef58aa5217782bfb5e690a5e219382d834f355f43ac3c229c0a291ad".to_owned(),
             ),
         ];
         assert_eq!(observed, expected);

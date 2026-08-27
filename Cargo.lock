@@ -1733,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-durability"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crc32fast",
  "criterion",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1819,7 +1819,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-fusion"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "ahash",
  "asupersync",
@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-index"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "ahash",
  "asupersync",
@@ -1870,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-lexical"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-rerank"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-storage"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "asupersync",
  "criterion",
