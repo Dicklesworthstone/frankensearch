@@ -1030,7 +1030,10 @@ fn test_index_freshness_audit_report_conformance() {
 
     assert_eq!(report.kind, KIND_INDEX_FRESHNESS_AUDIT_REPORT);
     assert_eq!(report.summary.verdict, IndexFreshnessAuditVerdict::Clean);
-    assert!(report.findings.is_empty());
+    assert_eq!(
+        report.findings,
+        [] as [frankensearch_fsfs::incremental_change::IndexFreshnessAuditFinding; 0]
+    );
     assert!(report.repair_plan.dry_run);
     assert!(!report.repair_plan.fail_closed);
 
@@ -1053,7 +1056,7 @@ fn test_progressive_release_quality_gate_pack_conformance() {
     assert_eq!(report.summary.lane_count, 4);
     assert_eq!(report.summary.phase_contract_count, 12);
     assert_eq!(report.summary.quality_envelope_count, 12);
-    assert!(report.findings.is_empty());
+    assert_eq!(report.findings, [] as [frankensearch_fsfs::GateFinding; 0]);
     assert!(
         report
             .human_summary

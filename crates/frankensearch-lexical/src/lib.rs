@@ -5631,8 +5631,8 @@ mod tests {
             assert_eq!(counted.hits, [] as [LexicalDocHit; 0]);
             assert_eq!(counted.total_count, 1);
             assert_eq!(
-                execute_top_k(&searcher, &*parsed, 0, 0)
-                    .expect("count-free zero-limit search"), [] as [LexicalDocHit; 0]
+                execute_top_k(&searcher, &*parsed, 0, 0).expect("count-free zero-limit search"),
+                [] as [LexicalDocHit; 0]
             );
 
             assert!(
@@ -5642,8 +5642,8 @@ mod tests {
                     .is_empty()
             );
             assert_eq!(
-                idx.search_doc_ids(&cx, "searchable", 0)
-                    .expect("id search"), [] as [LexicalIdHit; 0]
+                idx.search_doc_ids(&cx, "searchable", 0).expect("id search"),
+                [] as [LexicalIdHit; 0]
             );
             assert!(
                 idx.search_with_snippets(&cx, "searchable", 0, &SnippetConfig::default())

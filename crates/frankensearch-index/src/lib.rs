@@ -1,3 +1,7 @@
+// Raised for the trait solver: proving Send for the nested async blocks here
+// overflows the default limit on newer rustc. Not a defect in the code.
+#![recursion_limit = "512"]
+
 //! Vector index storage and loading for frankensearch.
 //!
 //! This crate implements the FSVI binary format reader/writer plus exact

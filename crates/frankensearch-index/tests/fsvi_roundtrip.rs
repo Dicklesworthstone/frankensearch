@@ -422,7 +422,7 @@ fn search_returns_closest_vector() {
     // Query close to "north" — north should rank highest.
     let query = normalize(&[0.9, 0.1, 0.0, 0.0]);
     let results = index.search_top_k(&query, 3, None).unwrap();
-    assert!(!results.is_empty());
+    assert_ne!(results, [] as [frankensearch_core::types::VectorHit; 0]);
     assert_eq!(
         results[0].doc_id, "north",
         "north should be closest to [0.9, 0.1, 0, 0]"
@@ -480,7 +480,7 @@ fn search_on_empty_index_returns_empty() {
 
     let index = VectorIndex::open(&path).unwrap();
     let results = index.search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None).unwrap();
-    assert!(results.is_empty());
+    assert_eq!(results, [] as [frankensearch_core::types::VectorHit; 0]);
 
     cleanup(&path);
 }
@@ -528,7 +528,7 @@ fn wal_entries_are_searchable_before_compaction() {
     // Search for something close to the WAL entry.
     let query = normalize(&[0.1, 0.9, 0.0, 0.0]);
     let results = index.search_top_k(&query, 2, None).unwrap();
-    assert!(!results.is_empty());
+    assert_ne!(results, [] as [frankensearch_core::types::VectorHit; 0]);
     assert_eq!(
         results[0].doc_id, "wal-doc",
         "WAL entry should be searchable and rank highest"

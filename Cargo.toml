@@ -215,6 +215,16 @@ ftui-extras = "0.5.0"
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
+# Fires on index-arithmetic loops that walk several parallel slices by one counter;
+# an iterator rewrite would obscure the arithmetic without changing behaviour.
+needless_range_loop = "allow"
+# Redundant #[must_use] on types already must_use; purely cosmetic.
+double_must_use = "allow"
+# New in recent nightlies. It only asks for `assert_eq!(x, "")` instead of
+# `assert!(x.is_empty())` to improve the failure message; it fires on dozens of test
+# assertions here with no defect behind any, and the rewrite is type-specific so
+# `clippy --fix` cannot apply it.
+assert_is_empty = "allow"
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 # ── Nightly-unstable pedantic/nursery lints that churn CI ──

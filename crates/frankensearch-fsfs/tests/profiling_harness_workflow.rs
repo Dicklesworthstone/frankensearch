@@ -96,7 +96,7 @@ fn crawl_ingest_track_is_ranked_and_guarded() {
 
     for proof in &track.proof_checklist {
         assert!(hotspot_ids.contains(proof.lever_id.as_str()));
-        assert!(!proof.required_invariants.is_empty());
+        assert_ne!(proof.required_invariants, [] as [std::string::String; 0]);
         assert!(
             proof.replay_command.contains("benchmark_baseline_matrix"),
             "replay must name the deterministic baseline matrix, not a fictional subcommand"
@@ -120,7 +120,7 @@ fn crawl_ingest_track_is_ranked_and_guarded() {
             !guardrail.rollback_command.contains("fsfs profile"),
             "fsfs has no profile subcommand (bd-rh0t)"
         );
-        assert!(!guardrail.abort_reason_codes.is_empty());
+        assert_ne!(guardrail.abort_reason_codes, [] as [std::string::String; 0]);
     }
 }
 

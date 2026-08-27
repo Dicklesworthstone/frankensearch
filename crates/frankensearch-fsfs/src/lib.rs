@@ -3,6 +3,10 @@
 //! This crate establishes the standalone fsfs binary surface with explicit
 //! separation between reusable runtime/config logic and UX adapters.
 
+// Raised for the trait solver: proving Send for the nested async blocks in
+// runtime.rs overflows the default limit on newer rustc.
+#![recursion_limit = "512"]
+
 #![deny(unsafe_code)] // deny (not forbid) so concurrency/lifecycle can #[allow] for kill(2)
 
 pub mod adapters;

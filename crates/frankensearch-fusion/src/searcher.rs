@@ -2937,7 +2937,6 @@ impl TwoTierSearcher {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     /// Apply the configured score calibrator to a single score (identity if no
     /// calibrator is set). Non-finite calibrated values collapse to `0.0`, matching
     /// [`Self::apply_score_calibration_to_hits`].

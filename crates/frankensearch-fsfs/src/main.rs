@@ -1,3 +1,8 @@
+// Raised for the trait solver: proving Send for the nested async blocks here
+// overflows the default limit on newer rustc. The binary is a separate crate
+// root, so lib.rs's limit does not apply.
+#![recursion_limit = "512"]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -1239,7 +1244,7 @@ mod tests {
         );
 
         assert_eq!(code, 78);
-        assert!(stderr.is_empty());
+        assert_eq!(stderr, [] as [u8; 0]);
         let value: serde_json::Value =
             serde_json::from_slice(&stdout).expect("parse process error envelope");
         assert_eq!(value["ok"], false);
@@ -1281,7 +1286,7 @@ mod tests {
         );
 
         assert_eq!(code, 78);
-        assert!(stdout.is_empty());
+        assert_eq!(stdout, [] as [u8; 0]);
         let rendered = String::from_utf8(stderr).expect("human error is utf-8");
         assert!(rendered.contains("error: [embedder_unavailable]"));
         assert!(rendered.contains("Fix:"));

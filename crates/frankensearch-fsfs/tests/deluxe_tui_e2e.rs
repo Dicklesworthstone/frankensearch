@@ -775,7 +775,7 @@ fn scenario_tui_degraded_modes_capture_budgeted_snapshots() {
             8,
             mode,
         );
-        assert!(!artifact.snapshots.is_empty());
+        assert_ne!(artifact.snapshots, [] as [SnapshotArtifact; 0]);
         for snapshot in &artifact.snapshots {
             assert_ne!(snapshot.latency_bucket, "over_budget");
             assert!(snapshot.snapshot_ref.starts_with("snapshot-"));

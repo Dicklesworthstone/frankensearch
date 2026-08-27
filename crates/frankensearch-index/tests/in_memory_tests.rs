@@ -165,7 +165,7 @@ fn empty_and_single_vector_behave_safely() {
     let empty_hits = empty
         .search_top_k(&[0.0; 8], 5, None)
         .expect("empty search");
-    assert!(empty_hits.is_empty());
+    assert_eq!(empty_hits, [] as [frankensearch_core::VectorHit; 0]);
 
     let single = InMemoryVectorIndex::from_vectors(
         vec!["solo".to_owned()],

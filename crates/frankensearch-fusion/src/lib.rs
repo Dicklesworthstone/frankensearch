@@ -1,3 +1,7 @@
+// Raised for the trait solver: proving Send for the nested async blocks here
+// overflows the default limit on newer rustc. Not a defect in the code.
+#![recursion_limit = "512"]
+
 //! RRF fusion, score blending, and two-tier progressive search for frankensearch.
 //!
 //! This crate provides:

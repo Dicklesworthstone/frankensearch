@@ -222,7 +222,7 @@ fn repeated_empty_searches_log_one_transition_not_a_storm() {
             let classified = index
                 .search_fast_classified(&E1, 3)
                 .expect("classified search");
-            assert!(classified.hits.is_empty());
+            assert_eq!(classified.hits, [] as [frankensearch_core::VectorHit; 0]);
             assert_eq!(
                 classified.zero_signal,
                 Some(ZeroSignalReason::AllTombstoned)
