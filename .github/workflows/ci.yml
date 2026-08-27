@@ -51,7 +51,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
           components: rustfmt, clippy
 
       - name: Prepare path dependencies
@@ -216,7 +216,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
           components: rustfmt, clippy
 
       - name: Prepare path dependencies
@@ -1135,7 +1135,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
           components: rustfmt, clippy
 
       - name: Prepare path dependencies
@@ -1256,7 +1256,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
 
       - name: Prepare path dependencies
         shell: bash
@@ -1324,7 +1324,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
 
       - name: Prepare path dependencies
         shell: bash
@@ -1379,7 +1379,7 @@ jobs:
       - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
 
       - name: Bootstrap the pinned RCH worker dependencies
         shell: bash
@@ -1431,7 +1431,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
 
       - name: Prepare path dependencies
         shell: bash
@@ -1488,7 +1488,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
 
       - name: Prepare path dependencies
         shell: bash
@@ -1679,7 +1679,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
           components: rustfmt, clippy
 
       - name: Prepare path dependencies
@@ -1879,7 +1879,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
           components: rustfmt, clippy
 
       - name: Prepare path dependencies
@@ -2155,7 +2155,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-25
           components: rustfmt, clippy
 
       - name: Prepare path dependencies

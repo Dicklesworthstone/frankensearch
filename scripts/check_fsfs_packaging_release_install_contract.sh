@@ -1034,7 +1034,7 @@ require(
     "native Linux aarch64 installer proof must use the GitHub-hosted ARM runner",
 )
 require(
-    "toolchain: nightly-2026-07-20" in installer_platform
+    "toolchain: nightly-2026-08-25" in installer_platform
     and "components: rustfmt, clippy" in installer_platform,
     "installer proof must install every component pinned by rust-toolchain.toml",
 )
