@@ -52,7 +52,7 @@ frankensearch-durability = { version = "0.2.1", path = "crates/frankensearch-dur
 frankensearch-fsfs = { version = "1.7.0", path = "crates/frankensearch-fsfs" }
 frankensearch-tui = { version = "0.2.0", path = "crates/frankensearch-tui" }
 frankensearch-ops = { version = "0.2.0", path = "crates/frankensearch-ops" }
-frankensearch-quill = { version = "0.2.1", path = "crates/frankensearch-quill" }
+frankensearch-quill = { version = "0.2.2", path = "crates/frankensearch-quill" }
 
 # Async runtime (structured concurrency, NO tokio)
 # `default-features = false` keeps asupersync's `test-internals` feature out

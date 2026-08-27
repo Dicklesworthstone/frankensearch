@@ -97,7 +97,7 @@ pub const WRITER_LOCK_RECORD_BYTES: usize = 36;
 ///
 /// The build-time assertion in this module's tests intentionally forces this
 /// value to change when `Cargo.toml` changes.
-pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 2, 1);
+pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 2, 2);
 
 const MANIFEST_MIN_BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 /// v2 images carry the additional `last_publish_unix_s` word after `flags`.
@@ -4899,19 +4899,27 @@ impl KeeperWriter {
             Err(error) => return Err(error),
         }
 
-        let gc_admission = Arc::clone(&admission);
-        let gc_directory = directory.clone();
-        spawn_blocking(move || {
-            gc_admission.ensure_directory_identity()?;
-            // Witness before sweeping, and only here: this writer has
-            // published nothing of its own yet, so nothing on disk is a
-            // staged-but-unpublished segment that a sighting would misread
-            // as an orphan. The sweep itself never mints provenance.
-            witness_orphaned_segments_under_lock(&gc_directory, schema)?;
-            gc_admission.ensure_directory_identity()?;
-            collect_writer_garbage_under_lock(&gc_directory, schema, garbage_options)
-        })
-        .await?;
+        #[cfg(unix)]
+        {
+            let gc_admission = Arc::clone(&admission);
+            let gc_directory = directory.clone();
+            spawn_blocking(move || {
+                gc_admission.ensure_directory_identity()?;
+                // Witness before sweeping, and only here: this writer has
+                // published nothing of its own yet, so nothing on disk is a
+                // staged-but-unpublished segment that a sighting would misread
+                // as an orphan. The sweep itself never mints provenance.
+                witness_orphaned_segments_under_lock(&gc_directory, schema)?;
+                gc_admission.ensure_directory_identity()?;
+                collect_writer_garbage_under_lock(&gc_directory, schema, garbage_options)
+            })
+            .await?;
+        }
+        #[cfg(windows)]
+        tracing::debug!(
+            path = %directory.display(),
+            "Windows writer admission is active; descriptor-relative garbage collection remains unavailable"
+        );
         // GC cannot remove reachable bytes, but reopen once so the writer's
         // snapshot is proven from the post-recovery directory state.
         let snapshot = open_snapshot_blocking(directory, schema).await?;
@@ -7680,7 +7688,13 @@ impl WriterLockRecord {
             ));
         }
         let pid = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-        if pid == 0 || i32::try_from(pid).is_err() {
+        if pid == 0 {
+            return Err(format!(
+                "writer-lock pid {pid} is not a valid process identifier"
+            ));
+        }
+        #[cfg(unix)]
+        if i32::try_from(pid).is_err() {
             return Err(format!(
                 "writer-lock pid {pid} is outside the POSIX pid range"
             ));
@@ -7736,12 +7750,16 @@ fn linux_process_start_time(pid: u32) -> Option<u64> {
 struct WriterAdmissionInner {
     directory: PathBuf,
     directory_file: File,
+    #[cfg(windows)]
+    directory_identity: same_file::Handle,
     lock_path: PathBuf,
     lock_file: File,
     #[cfg(unix)]
     lock_device: u64,
     #[cfg(unix)]
     lock_inode: u64,
+    #[cfg(windows)]
+    lock_identity: same_file::Handle,
     record: WriterLockRecord,
 }
 
@@ -7752,7 +7770,13 @@ impl WriterAdmissionInner {
         ensure_writer_lock_identity(self)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn ensure_directory_identity(&self) -> Result<(), KeeperError> {
+        ensure_windows_directory_identity(self)?;
+        ensure_windows_writer_lock_identity(self)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn ensure_directory_identity(&self) -> Result<(), KeeperError> {
         Err(KeeperError::Io {
             operation: "verify writer-lock directory identity",
@@ -7763,6 +7787,217 @@ impl WriterAdmissionInner {
             ),
         })
     }
+}
+
+#[cfg(windows)]
+fn windows_path_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn open_windows_admission_directory(
+    directory: &Path,
+) -> Result<(File, same_file::Handle), KeeperError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        // Deliberately omit FILE_SHARE_DELETE. Keeping this handle alive makes
+        // directory rename/replacement fail while admission is retained.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(directory)
+        .map_err(|source| KeeperError::Io {
+            operation: "open no-follow writer directory",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    let metadata = file.metadata().map_err(|source| KeeperError::Io {
+        operation: "inspect writer directory",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_dir() || windows_path_is_reparse_point(&metadata) {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: directory.to_path_buf(),
+            detail: "writer directory must be a no-follow, non-reparse directory".to_owned(),
+        });
+    }
+    let identity =
+        same_file::Handle::from_file(file.try_clone().map_err(|source| KeeperError::Io {
+            operation: "clone writer-directory handle",
+            path: directory.to_path_buf(),
+            source,
+        })?)
+        .map_err(|source| KeeperError::Io {
+            operation: "identify writer directory",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    Ok((file, identity))
+}
+
+#[cfg(windows)]
+fn open_windows_writer_lock(
+    path: &Path,
+    create: bool,
+) -> Result<(File, same_file::Handle), KeeperError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if !metadata.file_type().is_file() || windows_path_is_reparse_point(&metadata) =>
+        {
+            return Err(KeeperError::WriterLockCorrupted {
+                path: path.to_path_buf(),
+                detail: "LOCK must be a no-follow, non-reparse regular file".to_owned(),
+            });
+        }
+        Ok(_) => {}
+        Err(source) if create && source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(KeeperError::Io {
+                operation: "inspect writer-lock pathname",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        // The lock record remains readable by a contender, but omitting
+        // FILE_SHARE_DELETE prevents pathname replacement while this handle
+        // carries the authoritative byte-range lock.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+        .open(path)
+        .map_err(|source| KeeperError::Io {
+            operation: "open no-follow writer lock",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = file.metadata().map_err(|source| KeeperError::Io {
+        operation: "inspect writer lock",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() || windows_path_is_reparse_point(&metadata) {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: path.to_path_buf(),
+            detail: "LOCK must be a no-follow, non-reparse regular file".to_owned(),
+        });
+    }
+    let identity =
+        same_file::Handle::from_file(file.try_clone().map_err(|source| KeeperError::Io {
+            operation: "clone writer-lock handle",
+            path: path.to_path_buf(),
+            source,
+        })?)
+        .map_err(|source| KeeperError::Io {
+            operation: "identify writer lock",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok((file, identity))
+}
+
+#[cfg(windows)]
+fn open_windows_generation_claim(
+    path: &Path,
+    create_new: bool,
+) -> io::Result<(File, same_file::Handle)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(create_new)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || windows_path_is_reparse_point(&metadata)
+        || metadata.len() != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "generation claim must be a no-follow, non-reparse, zero-length regular file",
+        ));
+    }
+    let identity = same_file::Handle::from_file(file.try_clone()?)?;
+    Ok((file, identity))
+}
+
+#[cfg(windows)]
+fn open_windows_regular_file_no_reparse(
+    path: &Path,
+    write: bool,
+    create_new: bool,
+) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(write)
+        .create_new(create_new)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || windows_path_is_reparse_point(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "path must be a no-follow, non-reparse regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn ensure_windows_directory_identity(admission: &WriterAdmissionInner) -> Result<(), KeeperError> {
+    let (_, observed) = open_windows_admission_directory(&admission.directory)?;
+    if observed != admission.directory_identity {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: admission.directory.clone(),
+            detail: "writer directory pathname no longer resolves to the admitted handle"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_windows_writer_lock_identity(
+    admission: &WriterAdmissionInner,
+) -> Result<(), KeeperError> {
+    let (_, observed) = open_windows_writer_lock(&admission.lock_path, false)?;
+    if observed != admission.lock_identity {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: admission.lock_path.clone(),
+            detail: "LOCK pathname no longer resolves to the locked handle".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 impl Drop for WriterAdmissionInner {
@@ -7889,15 +8124,88 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
     Ok(admission)
 }
 
-#[cfg(not(all(
-    unix,
-    not(any(
-        target_os = "espidf",
-        target_os = "horizon",
-        target_os = "solaris",
-        target_os = "vita",
-        target_os = "wasi"
-    ))
+#[cfg(windows)]
+fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner>, KeeperError> {
+    use std::fs::TryLockError;
+
+    let (directory_file, directory_identity) = open_windows_admission_directory(directory)?;
+    let lock_path = directory.join("LOCK");
+    let (mut lock_file, lock_identity) = open_windows_writer_lock(&lock_path, true)?;
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            let owner_pid = read_writer_lock_record(&lock_path, &mut lock_file)
+                .ok()
+                .flatten()
+                .map(|record| record.pid);
+            return Err(KeeperError::WriterBusy {
+                path: lock_path,
+                owner_pid,
+            });
+        }
+        Err(TryLockError::Error(source)) => {
+            return Err(KeeperError::Io {
+                operation: "acquire Windows writer lock",
+                path: lock_path,
+                source,
+            });
+        }
+    }
+
+    let record = WriterLockRecord::current(&lock_path)?;
+    let bytes = record.to_bytes();
+    lock_file
+        .set_len(0)
+        .and_then(|()| lock_file.seek(SeekFrom::Start(0)).map(|_| ()))
+        .and_then(|()| lock_file.write_all(&bytes))
+        .and_then(|()| lock_file.sync_all())
+        .map_err(|source| KeeperError::Io {
+            operation: "persist Windows writer-lock record",
+            path: lock_path.clone(),
+            source,
+        })?;
+    let admission = Arc::new(WriterAdmissionInner {
+        directory: directory.to_path_buf(),
+        directory_file,
+        directory_identity,
+        lock_path,
+        lock_file,
+        lock_identity,
+        record,
+    });
+    admission.ensure_directory_identity()?;
+    if read_writer_lock_record(
+        &admission.lock_path,
+        &mut admission
+            .lock_file
+            .try_clone()
+            .map_err(|source| KeeperError::Io {
+                operation: "clone Windows writer-lock record handle",
+                path: admission.lock_path.clone(),
+                source,
+            })?,
+    )? != Some(record)
+    {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: admission.lock_path.clone(),
+            detail: "persisted Windows writer-lock record did not round-trip".to_owned(),
+        });
+    }
+    Ok(admission)
+}
+
+#[cfg(not(any(
+    windows,
+    all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    )
 )))]
 fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner>, KeeperError> {
     Err(KeeperError::Io {
@@ -7905,7 +8213,7 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
         path: directory.to_path_buf(),
         source: io::Error::new(
             io::ErrorKind::Unsupported,
-            "cross-process Quill writer admission requires flock semantics",
+            "cross-process Quill writer admission is unsupported on this target",
         ),
     })
 }
@@ -8164,15 +8472,30 @@ fn release_writer_admission(admission: &mut WriterAdmissionInner) {
     let _ = flock(&admission.lock_file, FlockOperation::Unlock);
 }
 
-#[cfg(not(all(
-    unix,
-    not(any(
-        target_os = "espidf",
-        target_os = "horizon",
-        target_os = "solaris",
-        target_os = "vita",
-        target_os = "wasi"
-    ))
+#[cfg(windows)]
+fn release_writer_admission(admission: &mut WriterAdmissionInner) {
+    if admission.ensure_directory_identity().is_ok()
+        && read_writer_lock_record(&admission.lock_path, &mut admission.lock_file)
+            .is_ok_and(|record| record == Some(admission.record))
+    {
+        let _ = admission.lock_file.set_len(0);
+        let _ = admission.lock_file.sync_all();
+    }
+    let _ = admission.lock_file.unlock();
+}
+
+#[cfg(not(any(
+    windows,
+    all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    )
 )))]
 fn release_writer_admission(_: &mut WriterAdmissionInner) {}
 
@@ -9752,7 +10075,7 @@ fn install_recovered_bytes_portable(
                 path: quarantine.clone(),
                 source,
             })?;
-        std::fs::rename(destination, &quarantine).map_err(|source| KeeperError::Io {
+        replace_file_atomically(destination, &quarantine).map_err(|source| KeeperError::Io {
             operation: "retire corrupt recovered-byte destination",
             path: quarantine.clone(),
             source,
@@ -9791,7 +10114,7 @@ fn install_recovered_bytes_portable(
                 })
                 .find(|candidate| candidate.exists());
             if let Some(quarantine) = quarantine {
-                let _ = std::fs::rename(&quarantine, destination);
+                let _ = replace_file_atomically(&quarantine, destination);
                 observe(RecoveredByteInstallCheckpoint::AfterRollback, destination).ok();
             }
         }
@@ -10081,7 +10404,7 @@ fn retire_regular_artifact_portable(
         .into_owned();
     let (probe, probe_file) = create_probed_file(admission, &base)?;
     drop(probe_file);
-    std::fs::rename(source, &probe).map_err(|source_error| KeeperError::Io {
+    replace_file_atomically(source, &probe).map_err(|source_error| KeeperError::Io {
         operation: "retire writer artifact over claimed probe",
         path: probe,
         source: source_error,
@@ -10160,7 +10483,39 @@ fn remove_stale_generation_claim(
         })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn remove_stale_generation_claim(
+    admission: &WriterAdmissionInner,
+    path: &Path,
+) -> Result<(), KeeperError> {
+    admission.ensure_directory_identity()?;
+    let (_, observed) = open_windows_generation_claim(path, false).map_err(|source| {
+        KeeperError::InvalidClaimArtifact {
+            path: path.to_path_buf(),
+            detail: source.to_string(),
+        }
+    })?;
+    let (_, revalidated) = open_windows_generation_claim(path, false).map_err(|source| {
+        KeeperError::InvalidClaimArtifact {
+            path: path.to_path_buf(),
+            detail: source.to_string(),
+        }
+    })?;
+    if observed != revalidated {
+        return Err(KeeperError::InvalidClaimArtifact {
+            path: path.to_path_buf(),
+            detail: "claim pathname changed during stale recovery".to_owned(),
+        });
+    }
+    std::fs::remove_file(path).map_err(|source| KeeperError::Io {
+        operation: "remove stale Windows generation claim",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    admission.ensure_directory_identity()
+}
+
+#[cfg(not(any(unix, windows)))]
 fn remove_stale_generation_claim(
     admission: &WriterAdmissionInner,
     path: &Path,
@@ -11693,6 +12048,13 @@ fn retirement_receipt_name(segment_id: u64) -> String {
 /// different preconditions, and an operator reading a directory by hand must
 /// be able to tell a retirement from a crash-orphan sighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "descriptor-relative Windows garbage collection remains explicitly unsupported"
+    )
+)]
 enum UnreachabilityWitness {
     /// A publication rotated the segment out of the durable slot pair.
     RetiredByPublication,
@@ -11701,6 +12063,13 @@ enum UnreachabilityWitness {
     FirstSightedByWriter,
 }
 
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "descriptor-relative Windows garbage collection remains explicitly unsupported"
+    )
+)]
 impl UnreachabilityWitness {
     const RETIRED_BY_PUBLICATION: u8 = 1;
     const FIRST_SIGHTED_BY_WRITER: u8 = 2;
@@ -11751,6 +12120,13 @@ struct SegmentRetirementReceipt {
     witness: UnreachabilityWitness,
 }
 
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "descriptor-relative Windows garbage collection remains explicitly unsupported"
+    )
+)]
 impl SegmentRetirementReceipt {
     fn encode(&self) -> [u8; RETIREMENT_RECEIPT_BYTES] {
         let mut bytes = [0_u8; RETIREMENT_RECEIPT_BYTES];
@@ -11859,7 +12235,7 @@ fn write_unreachability_receipt(
             source,
         })?;
     drop(temp);
-    std::fs::rename(&temp_path, &receipt_path).map_err(|source| KeeperError::Io {
+    replace_file_atomically(&temp_path, &receipt_path).map_err(|source| KeeperError::Io {
         operation: "rename unreachability receipt into place",
         path: receipt_path,
         source,
@@ -12019,7 +12395,7 @@ where
     }
 
     before_rename(&pending, &published)?;
-    std::fs::rename(&pending_path, &published).map_err(|source| KeeperError::Io {
+    move_file_atomically(&pending_path, &published).map_err(|source| KeeperError::Io {
         operation: "rename segment temp to published",
         path: pending_path,
         source,
@@ -12177,8 +12553,12 @@ struct GenerationClaimGuard {
     admission: Arc<WriterAdmissionInner>,
     name: OsString,
     claim_file: File,
+    #[cfg(unix)]
     device: u64,
+    #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    identity: same_file::Handle,
 }
 
 impl GenerationClaimGuard {
@@ -12271,15 +12651,60 @@ impl GenerationClaimGuard {
         })
     }
 
-    #[cfg(not(all(
-        unix,
-        not(any(
-            target_os = "espidf",
-            target_os = "horizon",
-            target_os = "solaris",
-            target_os = "vita",
-            target_os = "wasi"
-        ))
+    #[cfg(windows)]
+    fn acquire(admission: Arc<WriterAdmissionInner>, generation: u64) -> Result<Self, KeeperError> {
+        admission.ensure_directory_identity()?;
+        let name = OsString::from(format!("gen-{generation}.claim"));
+        let path = admission.directory.join(&name);
+        let (claim_file, identity) = match open_windows_generation_claim(&path, true) {
+            Ok(claim) => claim,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                match open_windows_generation_claim(&path, false) {
+                    Ok(_) => {
+                        return Err(KeeperError::GenerationClaimConflict { path, generation });
+                    }
+                    Err(source) => {
+                        return Err(KeeperError::InvalidClaimArtifact {
+                            path,
+                            detail: source.to_string(),
+                        });
+                    }
+                }
+            }
+            Err(source) => {
+                return Err(KeeperError::Io {
+                    operation: "create exclusive Windows generation claim",
+                    path,
+                    source,
+                });
+            }
+        };
+        claim_file.sync_all().map_err(|source| KeeperError::Io {
+            operation: "persist Windows generation claim",
+            path: path.clone(),
+            source,
+        })?;
+        admission.ensure_directory_identity()?;
+        Ok(Self {
+            admission,
+            name,
+            claim_file,
+            identity,
+        })
+    }
+
+    #[cfg(not(any(
+        windows,
+        all(
+            unix,
+            not(any(
+                target_os = "espidf",
+                target_os = "horizon",
+                target_os = "solaris",
+                target_os = "vita",
+                target_os = "wasi"
+            ))
+        )
     )))]
     fn acquire(admission: Arc<WriterAdmissionInner>, _: u64) -> Result<Self, KeeperError> {
         Err(KeeperError::Io {
@@ -12327,7 +12752,22 @@ fn release_generation_claim(claim: &GenerationClaimGuard) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn release_generation_claim(claim: &GenerationClaimGuard) {
+    let _ = claim.claim_file.metadata();
+    if claim.admission.ensure_directory_identity().is_err() {
+        return;
+    }
+    let path = claim.admission.directory.join(&claim.name);
+    let Ok((_, observed)) = open_windows_generation_claim(&path, false) else {
+        return;
+    };
+    if observed == claim.identity {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn release_generation_claim(_: &GenerationClaimGuard) {}
 
 /// In-process serializer for the two-slot MANIFEST publication protocol.
@@ -12395,7 +12835,7 @@ impl ManifestPublisher {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_publish_lock_for_test(
         directory: impl Into<PathBuf>,
         publish_lock: Arc<Mutex<()>>,
@@ -12617,7 +13057,7 @@ impl ManifestPublisher {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn publish_lock_for_test(&self) -> Arc<Mutex<()>> {
         if let Some(publish_lock) = &self.publish_lock_override {
             return Arc::clone(publish_lock);
@@ -12634,7 +13074,7 @@ impl ManifestPublisher {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn publish_lock_for_directory(directory: &Path) -> Arc<Mutex<()>> {
     let directory = normalize_publish_directory(directory.to_path_buf());
     publish_lock_for_normalized_directory(directory)
@@ -13257,7 +13697,7 @@ where
     A: FnMut(&Path, &Path) -> Result<(), KeeperError>,
     O: FnMut(PublishCheckpoint, &Path) -> Result<(), KeeperError>,
 {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     ensure_atomic_publish_supported(&directory)?;
     let proposed =
         Manifest::from_bytes(bytes).map_err(|source| KeeperError::InvalidManifest { source })?;
@@ -13343,10 +13783,12 @@ where
     }
     before_slot_renames(&directory, rename_current, proposed.generation)?;
     if rename_current {
-        std::fs::rename(&current_path, &previous_path).map_err(|source| KeeperError::Io {
-            operation: "rename current to previous",
-            path: current_path.clone(),
-            source,
+        replace_file_atomically(&current_path, &previous_path).map_err(|source| {
+            KeeperError::Io {
+                operation: "rename current to previous",
+                path: current_path.clone(),
+                source,
+            }
         })?;
         after_current_move(
             &directory,
@@ -13356,7 +13798,7 @@ where
         )?;
         observe(PublishCheckpoint::CurrentMovedToPrevious, &previous_path)?;
     }
-    std::fs::rename(&temp_path, &current_path).map_err(|source| KeeperError::Io {
+    replace_file_atomically(&temp_path, &current_path).map_err(|source| KeeperError::Io {
         operation: "rename temp to current",
         path: temp_path,
         source,
@@ -13440,10 +13882,12 @@ fn complete_manifest_sidecar_rotation(
     }
     let previous_sidecar = FileProtector::sidecar_path(previous_path);
     ensure_sidecar_absent(&previous_sidecar)?;
-    std::fs::rename(&current_sidecar, &previous_sidecar).map_err(|source| KeeperError::Io {
-        operation: "move current MANIFEST sidecar to previous",
-        path: current_sidecar,
-        source,
+    move_file_atomically(&current_sidecar, &previous_sidecar).map_err(|source| {
+        KeeperError::Io {
+            operation: "move current MANIFEST sidecar to previous",
+            path: current_sidecar,
+            source,
+        }
     })?;
     sync_directory(directory)
 }
@@ -13458,7 +13902,7 @@ fn install_manifest_sidecar(
     let temp_sidecar = FileProtector::sidecar_path(&temp_path);
     let current_sidecar = FileProtector::sidecar_path(current_path);
     ensure_sidecar_absent(&current_sidecar)?;
-    std::fs::rename(&temp_sidecar, &current_sidecar).map_err(|source| KeeperError::Io {
+    move_file_atomically(&temp_sidecar, &current_sidecar).map_err(|source| KeeperError::Io {
         operation: "install current MANIFEST sidecar",
         path: temp_sidecar,
         source,
@@ -13711,7 +14155,12 @@ fn open_existing_manifest_temp(path: &Path) -> io::Result<File> {
     Ok(File::from(temp_file))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_existing_manifest_temp(path: &Path) -> io::Result<File> {
+    open_windows_regular_file_no_reparse(path, true, false)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_existing_manifest_temp(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
 }
@@ -14387,12 +14836,49 @@ fn open_manifest_slot(path: &Path) -> io::Result<File> {
     Ok(File::from(slot))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_manifest_slot(path: &Path) -> io::Result<File> {
+    open_windows_regular_file_no_reparse(path, false, false)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_manifest_slot(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    atomicwrites::replace_atomic(source, destination)
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn move_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    atomicwrites::move_atomic(source, destination)
+}
+
+#[cfg(not(windows))]
+fn move_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn ensure_atomic_publish_supported(directory: &Path) -> Result<(), KeeperError> {
+    Err(KeeperError::Io {
+        operation: "verify descriptor-relative writer maintenance support",
+        path: directory.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            "descriptor-relative Quill garbage collection is not yet available on Windows",
+        ),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn ensure_atomic_publish_supported(directory: &Path) -> Result<(), KeeperError> {
     Err(KeeperError::Io {
         operation: "verify atomic publish support",
@@ -14415,7 +14901,14 @@ fn sync_directory(directory: &Path) -> Result<(), KeeperError> {
         })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_directory(_: &Path) -> Result<(), KeeperError> {
+    // Every Windows rename in the publication choreography goes through
+    // `atomicwrites`, whose MoveFileExW call includes MOVEFILE_WRITE_THROUGH.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn sync_directory(directory: &Path) -> Result<(), KeeperError> {
     ensure_atomic_publish_supported(directory)
 }
@@ -15191,8 +15684,8 @@ impl From<CurrentPointerError> for QuillError {
 /// # Errors
 ///
 /// Returns [`CurrentPointerError::Io`] for temp creation, write, fsync,
-/// rename, or directory-fsync failures. On non-Unix targets the directory
-/// fsync gate fails closed, matching MANIFEST publication.
+/// rename, or directory-fsync failures. Windows uses a write-through atomic
+/// replacement; unsupported targets retain the fail-closed directory gate.
 pub fn publish_current(
     lexical_root: &Path,
     pointer: &CurrentPointer,
@@ -15240,10 +15733,12 @@ pub fn publish_current(
                 source,
             })?;
         drop(temp_file);
-        std::fs::rename(&temp_path, &current_path).map_err(|source| CurrentPointerError::Io {
-            operation: "rename CURRENT into place",
-            path: current_path.clone(),
-            source,
+        replace_file_atomically(&temp_path, &current_path).map_err(|source| {
+            CurrentPointerError::Io {
+                operation: "rename CURRENT into place",
+                path: current_path.clone(),
+                source,
+            }
         })?;
         sync_directory(lexical_root).map_err(|source| CurrentPointerError::Io {
             operation: "fsync CURRENT directory",
@@ -15896,10 +16391,15 @@ impl<'a> ByteCursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[cfg(unix)]
     use asupersync::runtime::yield_now;
+    #[cfg(unix)]
     use asupersync::types::Budget;
+    #[cfg(unix)]
     use asupersync::{LabConfig, LabRuntime};
     use frankensearch_core::generation::CommitRange;
     #[cfg(feature = "durability")]
@@ -16671,6 +17171,7 @@ mod tests {
     /// Stamp the first-unreachable receipt a retiring publication would have
     /// written for `segment_id`, so hand-built fixtures can model a directory
     /// that really did retire a segment.
+    #[cfg(unix)]
     fn write_test_retirement_receipt(
         directory: &Path,
         segment_id: u64,
@@ -22168,12 +22669,12 @@ mod tests {
         runtime.block_on(operation(cx));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct WriterChild {
         child: Option<std::process::Child>,
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl WriterChild {
         fn child_mut(&mut self) -> &mut std::process::Child {
             self.child.as_mut().expect("child is still owned")
@@ -22187,6 +22688,7 @@ mod tests {
             Ok(())
         }
 
+        #[cfg(unix)]
         fn kill_and_reap(mut self) -> TestResult {
             let mut child = self.child.take().expect("child is still owned");
             let kill_result = child.kill();
@@ -22200,7 +22702,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl Drop for WriterChild {
         fn drop(&mut self) {
             if let Some(child) = &mut self.child {
@@ -22210,7 +22712,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn spawn_writer_child(
         role: &str,
         directory: &Path,
@@ -22230,7 +22732,7 @@ mod tests {
         Ok(WriterChild { child: Some(child) })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn wait_for_child_marker(child: &mut WriterChild, marker: &Path, label: &str) -> TestResult {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -22247,7 +22749,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn create_test_index(directory: &Path) -> Result<(), String> {
         let directory = directory.to_path_buf();
         run_with_test_cx(move |cx| async move {
@@ -22258,7 +22760,7 @@ mod tests {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn writer_lock_child_dispatch() {
         let Ok(role) = std::env::var("QUILL_WRITER_LOCK_ROLE") else {
@@ -22353,6 +22855,109 @@ mod tests {
         let mut bad_crc = golden;
         bad_crc[20] ^= 1;
         assert!(WriterLockRecord::from_bytes(&bad_crc).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_writer_admission_is_cross_process_exclusive_and_reusable() -> TestResult {
+        let index = tempdir()?;
+        create_test_index(index.path()).map_err(io::Error::other)?;
+
+        let holder_control = tempdir()?;
+        let mut holder = spawn_writer_child("hold", index.path(), holder_control.path(), "first")?;
+        wait_for_child_marker(
+            &mut holder,
+            &holder_control.path().join("ready-first"),
+            "first Windows writer",
+        )?;
+
+        let contender_control = tempdir()?;
+        let mut contender =
+            spawn_writer_child("contend", index.path(), contender_control.path(), "blocked")?;
+        std::fs::write(contender_control.path().join("START"), [])?;
+        wait_for_child_marker(
+            &mut contender,
+            &contender_control.path().join("busy-blocked"),
+            "blocked Windows writer",
+        )?;
+        contender.wait_success()?;
+
+        std::fs::write(holder_control.path().join("RELEASE"), [])?;
+        holder.wait_success()?;
+
+        let successor_control = tempdir()?;
+        let mut successor =
+            spawn_writer_child("hold", index.path(), successor_control.path(), "second")?;
+        wait_for_child_marker(
+            &mut successor,
+            &successor_control.path().join("ready-second"),
+            "successor Windows writer",
+        )?;
+        std::fs::write(successor_control.path().join("RELEASE"), [])?;
+        successor.wait_success()?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_writer_admission_prevents_replacement_and_rejects_non_file_lock() -> TestResult {
+        let directory = tempdir()?;
+        let admission = acquire_writer_admission(directory.path())?;
+        let lock_path = directory.path().join("LOCK");
+        let displaced = directory.path().join("LOCK.displaced");
+        assert!(
+            std::fs::rename(&lock_path, &displaced).is_err(),
+            "the retained Windows handle must deny LOCK replacement"
+        );
+        assert!(matches!(
+            acquire_writer_admission(directory.path()),
+            Err(KeeperError::WriterBusy { .. })
+        ));
+        drop(admission);
+
+        std::fs::rename(&lock_path, &displaced)?;
+        std::fs::create_dir(&lock_path)?;
+        assert!(matches!(
+            acquire_writer_admission(directory.path()),
+            Err(KeeperError::WriterLockCorrupted { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_writer_create_publish_and_reopen_committed_generation() -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let published: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let schema_id = DEFAULT_SCHEMA
+                .schema_id()
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &Manifest::empty(2, schema_id, 0))
+                .await
+                .map_err(|error| error.to_string())?;
+            assert!(!directory.join("gen-2.claim").exists());
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
+            drop(writer);
+
+            let reopened = KeeperSnapshot::open(&directory, DEFAULT_SCHEMA)
+                .map_err(|error| error.to_string())?;
+            assert_eq!(reopened.loaded_manifest().manifest.generation, 2);
+            Ok(())
+        });
+        published.map_err(io::Error::other)?;
+        Ok(())
     }
 
     #[cfg(unix)]

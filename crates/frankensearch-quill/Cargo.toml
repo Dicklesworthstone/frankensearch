@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-quill"
-version = "0.2.1"
+version = "0.2.2"
 description = "Quill native lexical search engine for frankensearch"
 edition.workspace = true
 license-file.workspace = true
@@ -61,6 +61,14 @@ sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+# `File::try_lock` supplies the OS-backed LockFileEx admission primitive. These
+# dependencies bind the retained handles to stable Windows file identities and
+# make MANIFEST replacement write-through without introducing unsafe code here.
+atomicwrites = "0.4.4"
+same-file = "1.0.6"
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # Deterministic LabRuntime helpers remain test-only.

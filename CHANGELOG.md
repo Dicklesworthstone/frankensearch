@@ -25,6 +25,12 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.7.0...main>
 
+### Windows Quill writer admission and crates.io patch release (2026-08-27, gh#39)
+
+- `frankensearch-quill 0.2.2` and the `frankensearch 0.4.1` facade add native Windows writer admission using the standard library's OS-backed exclusive file lock. Retained no-delete, no-follow handles bind the admitted directory and `LOCK` path to stable Windows file identities; contention remains a typed busy result, while unsafe lock artifacts and identity drift fail as corruption.
+- Windows generation claims use exclusive creation, and segment, MANIFEST, durability-sidecar, recovery, and `CURRENT` publication use write-through atomic moves. Native tests exercise cross-process acquire/busy/release/reuse, lock replacement/non-file refusal, and the real writer create -> publish -> reopen path.
+- Descriptor-relative garbage collection remains explicitly unavailable on Windows. Writer open logs that typed non-claim instead of manufacturing an empty successful sweep; the Unix GC implementation is unchanged.
+
 ### crates.io publication of the library line (2026-08-24, gh#416)
 
 The whole current library line is on crates.io for the first time, published bottom-up with every crate at a fresh, never-used version (registry 0.3.2 / 0.2.x entries from the earlier attempt were stale same-version twins of older trees and are superseded, never overwritten):
