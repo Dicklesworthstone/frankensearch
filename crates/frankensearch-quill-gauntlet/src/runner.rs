@@ -365,14 +365,14 @@ pub enum CampaignSelection {
 }
 
 impl<'de> Deserialize<'de> for CampaignSelection {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -3213,14 +3213,14 @@ pub enum CampaignCaseReason {
 }
 
 impl<'de> Deserialize<'de> for CampaignCaseReason {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -3365,14 +3365,14 @@ pub enum CampaignLexicalCaseSummary {
 }
 
 impl<'de> Deserialize<'de> for CampaignLexicalCaseSummary {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -3538,14 +3538,14 @@ pub enum CampaignLexicalCoverageSummary {
 }
 
 impl<'de> Deserialize<'de> for CampaignLexicalCoverageSummary {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {

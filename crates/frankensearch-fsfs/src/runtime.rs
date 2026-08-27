@@ -19999,6 +19999,52 @@ mod tests {
         );
     }
 
+    fn wait_for_publication_lease_runtime_marker(
+        mut child: std::process::Child,
+        marker: &Path,
+        timeout: Duration,
+        label: &str,
+    ) -> std::process::Child {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if marker.is_file() {
+                return child;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let output = child
+                        .wait_with_output()
+                        .expect("collect exited publication-lease helper output");
+                    panic!(
+                        "{label} exited before publishing {}: status={status:?}, stdout={}, stderr={}",
+                        marker.display(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => panic!(
+                    "inspect {label} while awaiting {}: {error}",
+                    marker.display()
+                ),
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .expect("collect timed-out publication-lease helper output");
+                panic!(
+                    "timed out after {timeout:?} waiting for {label} to publish {}: status={:?}, stdout={}, stderr={}",
+                    marker.display(),
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn publication_lease_test_checkpoint(
         index_root: &Path,
         generation: &str,
@@ -23761,14 +23807,15 @@ mod tests {
             let publisher = publisher_command
                 .spawn()
                 .expect("spawn generation B publisher");
-            for _ in 0..400 {
-                if index_root.join("generation-b-midpoint-ready").is_file() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
+            let midpoint_ready = index_root.join("generation-b-midpoint-ready");
+            let publisher = wait_for_publication_lease_runtime_marker(
+                publisher,
+                &midpoint_ready,
+                Duration::from_secs(30),
+                "generation B publisher",
+            );
             assert!(
-                index_root.join("generation-b-midpoint-ready").is_file(),
+                midpoint_ready.is_file(),
                 "publisher must pause after lexical B and before vector/sentinel B"
             );
 
@@ -27740,11 +27787,21 @@ mod tests {
                 scheduler.block_on(runtime.request_live_flush(&request_cx, &requester_path))
             });
             let request_path = lexical_root.join(super::FSFS_FLUSH_REQUEST_FILE);
-            for _ in 0..200 {
-                if request_path.exists() {
-                    break;
+            let request_deadline = Instant::now() + Duration::from_secs(30);
+            while !request_path.exists() {
+                if requester.is_finished() {
+                    let early_result = requester
+                        .join()
+                        .expect("requester thread exits without panicking");
+                    panic!(
+                        "flush requester exited before publishing its durable request: {early_result:?}"
+                    );
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                assert!(
+                    Instant::now() < request_deadline,
+                    "flush requester did not publish its durable request within 30 seconds"
+                );
+                std::thread::sleep(Duration::from_millis(25));
             }
             let request =
                 read_durable_json::<FsfsFlushRequest>(&request_path, "fsfs.flush.test.request")

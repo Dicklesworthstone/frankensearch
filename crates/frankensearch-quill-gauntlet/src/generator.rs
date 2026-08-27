@@ -1499,14 +1499,14 @@ pub enum GeneratedQueryKind {
 }
 
 impl<'de> Deserialize<'de> for GeneratedQueryKind {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -1558,14 +1558,14 @@ pub enum GeneratedSourceFilter {
 }
 
 impl<'de> Deserialize<'de> for GeneratedSourceFilter {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {

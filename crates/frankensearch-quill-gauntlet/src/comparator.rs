@@ -179,14 +179,14 @@ pub enum LexicalNormalizedQuery {
 }
 
 impl<'de> Deserialize<'de> for LexicalNormalizedQuery {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -450,14 +450,14 @@ pub enum SensitiveValueObservation {
 }
 
 impl<'de> Deserialize<'de> for SensitiveValueObservation {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -704,14 +704,14 @@ pub enum LexicalHydrationSelection {
 }
 
 impl<'de> Deserialize<'de> for LexicalHydrationSelection {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -783,14 +783,14 @@ pub enum LexicalHydrationResult {
 }
 
 impl<'de> Deserialize<'de> for LexicalHydrationResult {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -2118,14 +2118,14 @@ pub enum LexicalProbeCoverage {
 }
 
 impl<'de> Deserialize<'de> for LexicalProbeCoverage {
+    #[allow(
+        clippy::empty_enums,
+        reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(
-            clippy::empty_enums,
-            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
-        )]
         #[derive(Deserialize)]
         #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
