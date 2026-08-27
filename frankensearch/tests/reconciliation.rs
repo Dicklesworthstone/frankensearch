@@ -220,7 +220,7 @@ fn canonicalizer_query_is_simpler() {
         output.contains("Rust") || output.contains("rust"),
         "query should preserve key terms: {output}"
     );
-    assert!(!output.is_empty());
+    assert_ne!(output, "");
 }
 
 #[test]

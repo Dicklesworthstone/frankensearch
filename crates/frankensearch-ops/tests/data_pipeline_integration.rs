@@ -558,7 +558,7 @@ fn pipeline_embedding_wave_surfaces_backlog_and_resource_pressure() {
                 256,
             )
             .expect("resource trend query should succeed");
-        assert!(!trend.is_empty());
+        assert_ne!(trend, [] as [frankensearch_ops::storage::ResourceTrendPoint; 0]);
 
         let max_queue_depth = trend
             .iter()

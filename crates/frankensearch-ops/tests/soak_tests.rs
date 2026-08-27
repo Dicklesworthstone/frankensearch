@@ -789,7 +789,7 @@ fn drift_report_empty_checkpoints_defaults_to_zero_metrics() {
     assert_eq!(report.max_open_anomalies, 0);
     assert!(!report.monotonic_pending_growth);
     assert!(!report.monotonic_anomaly_growth);
-    assert!(report.throughput_deltas.is_empty());
+    assert_eq!(report.throughput_deltas, [] as [u64; 0]);
 }
 
 #[test]
