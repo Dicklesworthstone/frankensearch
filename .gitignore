@@ -148,6 +148,7 @@ newfile.txt
 .beads/*.backup_*
 .beads/*.rebuild_*
 .beads/.beads.db.schema-migration-*.vacuum-*
+.beads/.beads.db.schema-migration-*.vacuum.fsqlite-migration-state
 .beads/recovery*/
 .beads_recovery/
 
@@ -164,4 +165,3 @@ newfile.txt
 # Skill-loop / repo-janitor scratch
 .skill-loop-progress.md
 .skill-loop-progress-*.md
-

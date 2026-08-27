@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "asupersync",
  "compact_str 0.10.0",
