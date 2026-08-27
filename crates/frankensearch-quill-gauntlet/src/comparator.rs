@@ -183,6 +183,10 @@ impl<'de> Deserialize<'de> for LexicalNormalizedQuery {
     where
         D: serde::Deserializer<'de>,
     {
+        #[allow(
+            clippy::empty_enums,
+            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+        )]
         #[derive(Deserialize)]
         #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -450,6 +454,10 @@ impl<'de> Deserialize<'de> for SensitiveValueObservation {
     where
         D: serde::Deserializer<'de>,
     {
+        #[allow(
+            clippy::empty_enums,
+            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+        )]
         #[derive(Deserialize)]
         #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -700,6 +708,10 @@ impl<'de> Deserialize<'de> for LexicalHydrationSelection {
     where
         D: serde::Deserializer<'de>,
     {
+        #[allow(
+            clippy::empty_enums,
+            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+        )]
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -775,6 +787,10 @@ impl<'de> Deserialize<'de> for LexicalHydrationResult {
     where
         D: serde::Deserializer<'de>,
     {
+        #[allow(
+            clippy::empty_enums,
+            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+        )]
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -2106,6 +2122,10 @@ impl<'de> Deserialize<'de> for LexicalProbeCoverage {
     where
         D: serde::Deserializer<'de>,
     {
+        #[allow(
+            clippy::empty_enums,
+            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+        )]
         #[derive(Deserialize)]
         #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {

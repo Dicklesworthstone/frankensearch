@@ -704,6 +704,10 @@ impl<'de> Deserialize<'de> for ArtifactLexicalContractEvidence {
     where
         D: serde::Deserializer<'de>,
     {
+        #[allow(
+            clippy::empty_enums,
+            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+        )]
         #[derive(Deserialize)]
         #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
@@ -745,6 +749,10 @@ impl<'de> Deserialize<'de> for ArtifactOracleDependency {
     where
         D: serde::Deserializer<'de>,
     {
+        #[allow(
+            clippy::empty_enums,
+            reason = "Serde generates an empty field-name enum for strict zero-field tagged variants"
+        )]
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum StrictWire {
