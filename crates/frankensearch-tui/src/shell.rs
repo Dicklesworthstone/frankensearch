@@ -832,9 +832,9 @@ mod tests {
     #[test]
     fn status_line_default_is_empty() {
         let sl = StatusLine::default();
-        assert!(sl.left.is_empty());
-        assert!(sl.center.is_empty());
-        assert!(sl.right.is_empty());
+        assert_eq!(sl.left, "");
+        assert_eq!(sl.center, "");
+        assert_eq!(sl.right, "");
     }
 
     #[test]
@@ -850,15 +850,15 @@ mod tests {
     fn status_line_partial_builder_only_left() {
         let sl = StatusLine::new().with_left("L");
         assert_eq!(sl.left, "L");
-        assert!(sl.center.is_empty());
-        assert!(sl.right.is_empty());
+        assert_eq!(sl.center, "");
+        assert_eq!(sl.right, "");
     }
 
     #[test]
     fn status_line_partial_builder_only_right() {
         let sl = StatusLine::new().with_right("R");
-        assert!(sl.left.is_empty());
-        assert!(sl.center.is_empty());
+        assert_eq!(sl.left, "");
+        assert_eq!(sl.center, "");
         assert_eq!(sl.right, "R");
     }
 

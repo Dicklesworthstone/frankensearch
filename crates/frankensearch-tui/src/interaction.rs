@@ -812,7 +812,7 @@ mod tests {
     #[test]
     fn surface_kind_ids_are_nonempty() {
         for kind in InteractionSurfaceKind::all() {
-            assert!(!kind.id().is_empty());
+            assert_ne!(kind.id(), "");
         }
     }
 

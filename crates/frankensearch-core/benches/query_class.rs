@@ -52,10 +52,7 @@ fn looks_like_identifier_old(s: &str) -> bool {
             return true;
         }
     }
-    if s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ") {
-        return true;
-    }
-    false
+    s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ")
 }
 
 /// Prior `classify`, using the old identifier check.
@@ -114,10 +111,7 @@ fn looks_like_identifier_current(s: &str) -> bool {
             return true;
         }
     }
-    if s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ") {
-        return true;
-    }
-    false
+    s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ")
 }
 
 fn classify_current(query: &str) -> u8 {

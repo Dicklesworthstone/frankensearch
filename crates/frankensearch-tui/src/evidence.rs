@@ -433,7 +433,7 @@ mod tests {
         let envelope = wrap_envelope(event);
 
         assert_eq!(envelope.v, 1);
-        assert!(!envelope.ts.is_empty());
+        assert_ne!(envelope.ts, "");
 
         let json = serde_json::to_string(&envelope).unwrap();
         let decoded: EvidenceEnvelope = serde_json::from_str(&json).unwrap();

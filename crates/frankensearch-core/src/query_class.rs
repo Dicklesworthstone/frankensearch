@@ -119,11 +119,7 @@ impl QueryClass {
             }
         }
 
-        if s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ") {
-            return true;
-        }
-
-        false
+        s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ")
     }
 
     fn looks_like_identifier_unicode(s: &str) -> bool {
@@ -182,11 +178,7 @@ impl QueryClass {
         }
 
         // Starts with common code prefixes (these contain a space).
-        if s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ") {
-            return true;
-        }
-
-        false
+        s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ")
     }
 
     /// Suggested candidate multiplier for lexical search.

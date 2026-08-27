@@ -5628,12 +5628,11 @@ mod tests {
             let searcher = idx.reader.searcher();
             let counted = execute_query_with_offset(&searcher, &*parsed, 0, 0)
                 .expect("counted zero-limit search");
-            assert!(counted.hits.is_empty());
+            assert_eq!(counted.hits, [] as [LexicalDocHit; 0]);
             assert_eq!(counted.total_count, 1);
-            assert!(
+            assert_eq!(
                 execute_top_k(&searcher, &*parsed, 0, 0)
-                    .expect("count-free zero-limit search")
-                    .is_empty()
+                    .expect("count-free zero-limit search"), [] as [LexicalDocHit; 0]
             );
 
             assert!(
@@ -5642,10 +5641,9 @@ mod tests {
                     .expect("search")
                     .is_empty()
             );
-            assert!(
+            assert_eq!(
                 idx.search_doc_ids(&cx, "searchable", 0)
-                    .expect("id search")
-                    .is_empty()
+                    .expect("id search"), [] as [LexicalIdHit; 0]
             );
             assert!(
                 idx.search_with_snippets(&cx, "searchable", 0, &SnippetConfig::default())
@@ -6114,7 +6112,7 @@ mod tests {
             idx.commit(&cx).await.expect("commit");
 
             let results = idx.search_doc_ids(&cx, "Rust", 10).expect("search");
-            assert!(!results.is_empty());
+            assert_ne!(results, [] as [LexicalIdHit; 0]);
             for (expected_rank, hit) in results.iter().enumerate() {
                 assert_eq!(hit.rank, expected_rank, "rank should be sequential");
                 assert!(!hit.doc_id.is_empty());
