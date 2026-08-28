@@ -413,8 +413,34 @@ impl RepairOrchestrator {
                 continue;
             };
 
-            // Delegate repair to provider.
-            let attempt = provider.attempt_repair(path, descriptor, now_millis);
+            // Delegate repair to the provider, but do not let its success enum
+            // become state-transition authority on its own. Bind the returned
+            // attempt to the requested artifact and verify repaired bytes
+            // against the generation manifest before recording success.
+            let mut attempt = provider.attempt_repair(path, descriptor, now_millis);
+            if attempt.artifact_path != *path {
+                attempt.artifact_path.clone_from(path);
+                attempt.outcome = RepairOutcome::Failed {
+                    reason: "repair provider returned an attempt for a different artifact"
+                        .to_owned(),
+                };
+            } else if attempt.outcome.is_success() {
+                attempt.outcome = match artifact_checksum(manifest, path) {
+                    Some(expected_checksum)
+                        if !expected_checksum.is_empty()
+                            && provider.verify_after_repair(path, expected_checksum) =>
+                    {
+                        attempt.outcome
+                    }
+                    Some(_) => RepairOutcome::Failed {
+                        reason: "repaired artifact failed its manifest checksum".to_owned(),
+                    },
+                    None => RepairOutcome::Failed {
+                        reason: "repair descriptor has no matching manifest artifact checksum"
+                            .to_owned(),
+                    },
+                };
+            }
             cycle_attempts.push(attempt.clone());
             self.record_attempt(attempt);
         }
@@ -620,6 +646,21 @@ impl RepairOrchestrator {
     }
 }
 
+fn artifact_checksum<'a>(manifest: &'a GenerationManifest, artifact_path: &str) -> Option<&'a str> {
+    manifest
+        .vector_artifacts
+        .iter()
+        .find(|artifact| artifact.path == artifact_path)
+        .map(|artifact| artifact.checksum.as_str())
+        .or_else(|| {
+            manifest
+                .lexical_artifacts
+                .iter()
+                .find(|artifact| artifact.path == artifact_path)
+                .map(|artifact| artifact.checksum.as_str())
+        })
+}
+
 fn unrepaired_artifacts(
     corruption_log: &[CorruptionEvent],
     repair_history: &[RepairAttempt],
@@ -786,6 +827,52 @@ mod tests {
         }
     }
 
+    /// Mock provider whose decoder claims success but whose output does not
+    /// match the manifest checksum.
+    struct UnverifiedSuccessProvider;
+
+    impl RepairProvider for UnverifiedSuccessProvider {
+        fn attempt_repair(
+            &self,
+            artifact_path: &str,
+            _descriptor: &RepairDescriptor,
+            now_millis: u64,
+        ) -> RepairAttempt {
+            RepairAttempt {
+                artifact_path: artifact_path.into(),
+                started_at: now_millis,
+                completed_at: now_millis + 10,
+                outcome: RepairOutcome::Success { symbols_used: 5 },
+            }
+        }
+
+        fn verify_after_repair(&self, _artifact_path: &str, _expected_checksum: &str) -> bool {
+            false
+        }
+    }
+
+    struct WrongArtifactSuccessProvider;
+
+    impl RepairProvider for WrongArtifactSuccessProvider {
+        fn attempt_repair(
+            &self,
+            _artifact_path: &str,
+            _descriptor: &RepairDescriptor,
+            now_millis: u64,
+        ) -> RepairAttempt {
+            RepairAttempt {
+                artifact_path: "vectors/shard_1.fsvi".into(),
+                started_at: now_millis,
+                completed_at: now_millis + 10,
+                outcome: RepairOutcome::Success { symbols_used: 5 },
+            }
+        }
+
+        fn verify_after_repair(&self, _artifact_path: &str, _expected_checksum: &str) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn starts_healthy() {
         let orch = RepairOrchestrator::default();
@@ -888,6 +975,86 @@ mod tests {
         orch.run_repair_cycle(&manifest, &provider, 2000);
 
         assert!(orch.state().is_healthy());
+    }
+
+    #[test]
+    fn unverified_provider_success_does_not_clear_corruption() {
+        let policy = CorruptionPolicy {
+            max_corrupted_artifacts: 1,
+            suspension_threshold: 5,
+            ..Default::default()
+        };
+        let orch = RepairOrchestrator::new(policy);
+        let manifest = sample_manifest();
+        orch.report_corruption(corruption_event("vectors/shard_0.fsvi", 1000));
+
+        let attempts = orch.run_repair_cycle(&manifest, &UnverifiedSuccessProvider, 2000);
+
+        assert!(matches!(
+            attempts.as_slice(),
+            [RepairAttempt {
+                outcome: RepairOutcome::Failed { .. },
+                ..
+            }]
+        ));
+        assert_eq!(orch.unrepaired_artifact_count(), 1);
+        assert!(matches!(orch.state(), ServiceState::Degraded { .. }));
+    }
+
+    #[test]
+    fn provider_cannot_report_success_for_a_different_artifact() {
+        let orch = RepairOrchestrator::default();
+        let manifest = sample_manifest();
+        let requested = "vectors/shard_0.fsvi";
+        orch.report_corruption(corruption_event(requested, 1000));
+
+        let attempts = orch.run_repair_cycle(&manifest, &WrongArtifactSuccessProvider, 2000);
+
+        assert!(matches!(
+            attempts.as_slice(),
+            [RepairAttempt {
+                artifact_path,
+                outcome: RepairOutcome::Failed { .. },
+                ..
+            }] if artifact_path == requested
+        ));
+        assert_eq!(orch.unrepaired_artifact_count(), 1);
+    }
+
+    #[test]
+    fn provider_success_without_a_manifest_checksum_fails_closed() {
+        let orch = RepairOrchestrator::default();
+        let mut manifest = sample_manifest();
+        let requested = "vectors/shard_0.fsvi";
+        manifest
+            .vector_artifacts
+            .retain(|artifact| artifact.path != requested);
+        orch.report_corruption(corruption_event(requested, 1000));
+
+        let attempts = orch.run_repair_cycle(&manifest, &AlwaysSucceedProvider, 2000);
+
+        assert!(matches!(
+            attempts.as_slice(),
+            [RepairAttempt {
+                outcome: RepairOutcome::Failed { .. },
+                ..
+            }]
+        ));
+        assert_eq!(orch.unrepaired_artifact_count(), 1);
+    }
+
+    #[test]
+    fn artifact_checksum_resolves_vector_and_lexical_entries() {
+        let manifest = sample_manifest();
+        assert_eq!(
+            artifact_checksum(&manifest, "vectors/shard_0.fsvi"),
+            Some("deadbeef")
+        );
+        assert_eq!(
+            artifact_checksum(&manifest, "lexical/segment_0"),
+            Some("cafebabe")
+        );
+        assert_eq!(artifact_checksum(&manifest, "missing"), None);
     }
 
     #[test]

@@ -214,6 +214,8 @@ pub struct RepairData {
     pub repair_symbols: Vec<(u32, Vec<u8>)>,
     pub k_source: u32,
     pub symbol_size: u32,
+    /// Exact byte length of the original source before symbol padding.
+    pub source_len: u64,
     /// `xxh3_64` hash bytes of the original source payload.
     pub source_hash: [u8; 8],
 }
@@ -480,6 +482,7 @@ impl CodecFacade {
             repair_symbols: encoded.repair_symbols,
             k_source: encoded.k_source,
             symbol_size: encoded.symbol_size,
+            source_len: encoded.source_len,
             source_hash: xxh3_64(source_data).to_le_bytes(),
         })
     }
@@ -493,9 +496,11 @@ impl CodecFacade {
         source_data: &[u8],
         repair_data: &RepairData,
     ) -> SearchResult<VerifyResult> {
-        Self::validate_repair_data(repair_data)?;
+        let source_len = Self::validate_repair_data(repair_data)?;
 
-        if xxh3_64(source_data).to_le_bytes() == repair_data.source_hash {
+        if source_data.len() == source_len
+            && xxh3_64(source_data).to_le_bytes() == repair_data.source_hash
+        {
             return Ok(VerifyResult::Intact);
         }
 
@@ -503,14 +508,10 @@ impl CodecFacade {
         let corrupted_symbols =
             count_corrupted_symbols(&regenerated.repair_symbols, &repair_data.repair_symbols);
 
-        let mut symbols =
-            source_symbols_from_bytes(source_data, repair_data.symbol_size, repair_data.k_source)?;
-        symbols.extend(repair_data.repair_symbols.clone());
-
-        let repairable = matches!(
-            self.decode_for_symbol_size(&symbols, repair_data.k_source, repair_data.symbol_size)?,
-            DecodedPayload::Success { .. }
-        );
+        // A codec-level success is not sufficient proof of repairability: a
+        // decoder can legally produce bytes from corrupt source symbols. The
+        // stored whole-payload witness is the acceptance boundary.
+        let repairable = self.repair(source_data, repair_data).is_ok();
 
         debug!(
             corrupted_symbols,
@@ -528,7 +529,28 @@ impl CodecFacade {
 
     /// Attempt to reconstruct original payload bytes from corrupted data + repair symbols.
     pub fn repair(&self, corrupted_data: &[u8], repair_data: &RepairData) -> SearchResult<Vec<u8>> {
-        Self::validate_repair_data(repair_data)?;
+        let source_len = Self::validate_repair_data(repair_data)?;
+
+        if corrupted_data.len() == source_len
+            && xxh3_64(corrupted_data).to_le_bytes() == repair_data.source_hash
+        {
+            return Ok(corrupted_data.to_vec());
+        }
+
+        // Try the stored repair symbols alone first. Source symbols have no
+        // per-symbol checksums, so feeding same-length corrupt input into an
+        // erasure decoder can poison an otherwise recoverable solve. The
+        // default durability configuration retains at least one complete set
+        // of repair symbols for this reason.
+        if let DecodedPayload::Success { data, .. } = self.decode_for_symbol_size(
+            &repair_data.repair_symbols,
+            repair_data.k_source,
+            repair_data.symbol_size,
+        )? && let Some(verified) =
+            Self::normalize_and_verify_repair(data, source_len, repair_data.source_hash)
+        {
+            return Ok(verified);
+        }
 
         let mut symbols = source_symbols_from_bytes(
             corrupted_data,
@@ -542,7 +564,16 @@ impl CodecFacade {
             repair_data.k_source,
             repair_data.symbol_size,
         )? {
-            DecodedPayload::Success { data, .. } => Ok(data),
+            DecodedPayload::Success { data, .. } => {
+                Self::normalize_and_verify_repair(data, source_len, repair_data.source_hash)
+                    .ok_or_else(|| SearchError::SubsystemError {
+                        subsystem: "durability",
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "decoded repair payload failed the stored length/hash witness",
+                        )),
+                    })
+            }
             DecodedPayload::Failure {
                 class,
                 reason,
@@ -563,6 +594,18 @@ impl CodecFacade {
 
     pub fn metrics(&self) -> &Arc<DurabilityMetrics> {
         &self.metrics
+    }
+
+    fn normalize_and_verify_repair(
+        mut data: Vec<u8>,
+        source_len: usize,
+        source_hash: [u8; 8],
+    ) -> Option<Vec<u8>> {
+        if data.len() < source_len {
+            return None;
+        }
+        data.truncate(source_len);
+        (xxh3_64(&data).to_le_bytes() == source_hash).then_some(data)
     }
 
     fn decode_failure(
@@ -601,7 +644,7 @@ impl CodecFacade {
         }
     }
 
-    fn validate_repair_data(repair_data: &RepairData) -> SearchResult<()> {
+    fn validate_repair_data(repair_data: &RepairData) -> SearchResult<usize> {
         if repair_data.symbol_size == 0 {
             return Err(SearchError::InvalidConfig {
                 field: "repair_data.symbol_size".to_owned(),
@@ -618,7 +661,43 @@ impl CodecFacade {
             });
         }
 
-        Ok(())
+        let source_len =
+            usize::try_from(repair_data.source_len).map_err(|_| SearchError::InvalidConfig {
+                field: "repair_data.source_len".to_owned(),
+                value: repair_data.source_len.to_string(),
+                reason: "cannot convert source_len to usize".to_owned(),
+            })?;
+        let k_source =
+            usize::try_from(repair_data.k_source).map_err(|_| SearchError::InvalidConfig {
+                field: "repair_data.k_source".to_owned(),
+                value: repair_data.k_source.to_string(),
+                reason: "cannot convert k_source to usize".to_owned(),
+            })?;
+        let symbol_size =
+            usize::try_from(repair_data.symbol_size).map_err(|_| SearchError::InvalidConfig {
+                field: "repair_data.symbol_size".to_owned(),
+                value: repair_data.symbol_size.to_string(),
+                reason: "cannot convert symbol_size to usize".to_owned(),
+            })?;
+        let symbol_capacity =
+            k_source
+                .checked_mul(symbol_size)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "repair_data.source_len".to_owned(),
+                    value: repair_data.source_len.to_string(),
+                    reason: "source symbol capacity overflows usize".to_owned(),
+                })?;
+        if source_len > symbol_capacity {
+            return Err(SearchError::InvalidConfig {
+                field: "repair_data.source_len".to_owned(),
+                value: repair_data.source_len.to_string(),
+                reason: format!(
+                    "exceeds k_source * symbol_size capacity ({symbol_capacity} bytes)"
+                ),
+            });
+        }
+
+        Ok(source_len)
     }
 }
 
@@ -764,8 +843,8 @@ mod tests {
     use fsqlite_error::FrankenError;
 
     use super::{
-        CodecFacade, Cx, DecodeFailureClass, DecodedPayload, RepairData, VerifyResult,
-        classify_decode_failure,
+        CodecFacade, Cx, DecodeFailureClass, DecodedPayload, DefaultSymbolCodec, RepairData,
+        VerifyResult, classify_decode_failure,
     };
     use crate::config::DurabilityConfig;
     use crate::metrics::DurabilityMetrics;
@@ -1088,6 +1167,97 @@ mod tests {
     }
 
     #[test]
+    fn default_codec_repairs_same_length_corruption_exactly() {
+        let facade = CodecFacade::new(
+            Arc::new(DefaultSymbolCodec),
+            DurabilityConfig {
+                symbol_size: 256,
+                ..DurabilityConfig::default()
+            },
+            Arc::new(DurabilityMetrics::default()),
+        )
+        .expect("facade");
+        let source = (0_u16..700)
+            .map(|value| value.to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        let repair_data = facade
+            .compute_repair_symbols(&source)
+            .expect("compute repair data");
+        let mut corrupted = source.clone();
+        corrupted[0] ^= 0xFF;
+        corrupted[300] ^= 0xFF;
+        corrupted[699] ^= 0xFF;
+
+        let repaired = facade
+            .repair(&corrupted, &repair_data)
+            .expect("repair from the stored symbols");
+
+        assert_eq!(repaired, source);
+    }
+
+    #[test]
+    fn default_codec_rejects_output_when_repair_symbols_are_poisoned() {
+        let facade = CodecFacade::new(
+            Arc::new(DefaultSymbolCodec),
+            DurabilityConfig {
+                symbol_size: 256,
+                ..DurabilityConfig::default()
+            },
+            Arc::new(DurabilityMetrics::default()),
+        )
+        .expect("facade");
+        let source = (0_u16..600)
+            .map(|value| value.to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        let mut repair_data = facade
+            .compute_repair_symbols(&source)
+            .expect("compute repair data");
+        for (_, symbol) in &mut repair_data.repair_symbols {
+            symbol[0] ^= 0xFF;
+        }
+        let mut corrupted = source.clone();
+        corrupted[137] ^= 0xFF;
+
+        assert!(matches!(
+            facade.verify(&corrupted, &repair_data).expect("verify"),
+            VerifyResult::Corrupted {
+                repairable: false,
+                ..
+            }
+        ));
+        assert!(
+            facade.repair(&corrupted, &repair_data).is_err(),
+            "a codec success with the wrong bytes must fail the stored witness"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_matching_hash_with_wrong_source_length() {
+        let facade = CodecFacade::new(
+            Arc::new(DefaultSymbolCodec),
+            DurabilityConfig {
+                symbol_size: 256,
+                ..DurabilityConfig::default()
+            },
+            Arc::new(DurabilityMetrics::default()),
+        )
+        .expect("facade");
+        let source = vec![0xA5; 600];
+        let mut repair_data = facade
+            .compute_repair_symbols(&source)
+            .expect("compute repair data");
+        repair_data.source_len += 1;
+
+        assert!(matches!(
+            facade.verify(&source, &repair_data).expect("verify"),
+            VerifyResult::Corrupted {
+                repairable: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn verify_flags_corruption_and_reports_repairability() {
         let facade = CodecFacade::new(
             Arc::new(MockCodec {
@@ -1138,6 +1308,7 @@ mod tests {
             repair_symbols: vec![(10, vec![7_u8; 4096])],
             k_source: 1,
             symbol_size: 4096,
+            source_len: 3,
             source_hash: [0_u8; 8],
         };
 
@@ -1336,6 +1507,7 @@ mod tests {
             repair_symbols: vec![(10, vec![7_u8; 4096])],
             k_source: 0,
             symbol_size: 4096,
+            source_len: 0,
             source_hash: [0_u8; 8],
         };
 
@@ -1363,6 +1535,7 @@ mod tests {
             repair_symbols: vec![(10, vec![7_u8; 4096])],
             k_source: 1,
             symbol_size: 0,
+            source_len: 0,
             source_hash: [0_u8; 8],
         };
 

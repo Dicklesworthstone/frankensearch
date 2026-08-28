@@ -2180,7 +2180,13 @@ impl TwoTierSearcher {
         if self.prf_config.should_expand(&query_class) {
             let mut feedback_embeddings = Vec::new();
             for result in initial_results.iter().take(self.prf_config.top_k_feedback) {
-                let feedback = self.index.semantic_vector_for_doc_id(&result.doc_id);
+                // PRF interpolates these document vectors with `quality_vec`, so
+                // every feedback value must come from that exact embedding space.
+                // `semantic_vector_for_doc_id` is intentionally unsuitable here:
+                // it silently falls back to the fast tier for a document missing
+                // quality coverage, which would make a same-dimension foreign
+                // vector look valid and poison the expanded query.
+                let feedback = self.index.quality_vector_for_doc_id(&result.doc_id);
                 cancellation_checkpoint(cx, "prf_vector_lookup")?;
                 match feedback {
                     Ok(Some(embedding)) => {
@@ -2663,6 +2669,44 @@ impl TwoTierSearcher {
         Ok(results)
     }
 
+    /// Load one complete MMR candidate pool from a single embedding space.
+    ///
+    /// Prefer quality when every candidate has quality coverage. Otherwise
+    /// retry the entire pool in the fast space. A pool spanning quality-only
+    /// and fast-only documents has no valid comparison space, so MMR is
+    /// skipped instead of comparing unrelated coordinates.
+    #[cfg(feature = "rerank")]
+    fn mmr_embeddings_in_one_space(
+        &self,
+        cx: &Cx,
+        results: &[ScoredResult],
+    ) -> SearchResult<Option<Vec<Vec<f32>>>> {
+        let mut quality = Vec::with_capacity(results.len());
+        for result in results {
+            let embedding = self.index.quality_vector_for_doc_id(&result.doc_id)?;
+            cancellation_checkpoint(cx, "mmr_quality_vector_lookup")?;
+            let Some(embedding) = embedding else {
+                quality.clear();
+                break;
+            };
+            quality.push(embedding);
+        }
+        if quality.len() == results.len() {
+            return Ok(Some(quality));
+        }
+
+        let mut fast = Vec::with_capacity(results.len());
+        for result in results {
+            let embedding = self.index.fast_vector_for_doc_id(&result.doc_id)?;
+            cancellation_checkpoint(cx, "mmr_fast_vector_lookup")?;
+            let Some(embedding) = embedding else {
+                return Ok(None);
+            };
+            fast.push(embedding);
+        }
+        Ok(Some(fast))
+    }
+
     /// Run Phase 3: cross-encoder reranking and MMR diversity.
     #[cfg(feature = "rerank")]
     async fn run_phase3(
@@ -2698,24 +2742,13 @@ impl TwoTierSearcher {
         if self.mmr_config.enabled && results.len() > 1 {
             let pool = results.len().min(self.mmr_config.candidate_pool.max(1));
             if pool > 1 {
-                let mut embeddings = Vec::with_capacity(pool);
-                let mut scores = Vec::with_capacity(pool);
-                let mut complete_pool = true;
-
-                for result in results.iter().take(pool) {
-                    let embedding = self.index.semantic_vector_for_doc_id(&result.doc_id)?;
-                    cancellation_checkpoint(cx, "mmr_vector_lookup")?;
-                    if let Some(embedding) = embedding {
-                        embeddings.push(embedding);
-                        scores.push(f64::from(result.score));
-                    } else {
-                        complete_pool = false;
-                        break;
-                    }
-                }
-
-                if complete_pool {
+                if let Some(embeddings) = self.mmr_embeddings_in_one_space(cx, &results[..pool])? {
                     cancellation_checkpoint(cx, "mmr_lookup_to_rerank")?;
+                    let scores = results
+                        .iter()
+                        .take(pool)
+                        .map(|result| f64::from(result.score))
+                        .collect::<Vec<_>>();
                     let refs = embeddings
                         .iter()
                         .map(std::vec::Vec::as_slice)
@@ -4789,8 +4822,6 @@ mod tests {
                 0,
                 "the refusal must precede the embedder, not follow it"
             );
-
-            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 
@@ -4845,8 +4876,6 @@ mod tests {
                 "got {error:?}"
             );
             assert_eq!(embedder.embed_count(), 0, "refused before any inference");
-
-            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 
@@ -4925,6 +4954,206 @@ mod tests {
             )
             .expect("admit both tiers"),
         )
+    }
+
+    /// An owner-backed partial-quality fixture whose shared document has
+    /// deliberately different coordinates in the two embedding spaces.
+    fn owner_backed_partial_quality_index(
+        dir: &std::path::Path,
+        fast_binding: &FsviV2IdentityBinding,
+        quality_binding: &FsviV2IdentityBinding,
+    ) -> Arc<TwoTierIndex> {
+        let fast_path = dir.join("vector.fast.idx");
+        let quality_path = dir.join("vector.quality.idx");
+        write_v2_tier(
+            &fast_path,
+            fast_binding,
+            &[
+                ("doc-shared", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-fast-only", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        write_v2_tier(
+            &quality_path,
+            quality_binding,
+            &[
+                ("doc-shared", &[0.0, 1.0, 0.0, 0.0]),
+                ("doc-quality-query", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-quality-wrong", &[0.6, 0.8, 0.0, 0.0]),
+            ],
+        );
+        Arc::new(
+            TwoTierIndex::open_admitted_v2_with_paths(
+                &frankensearch_index::TwoTierIndexPaths::new(&fast_path)
+                    .with_quality_index(&quality_path),
+                TwoTierConfig::default(),
+                fast_binding,
+                Some(quality_binding),
+            )
+            .expect("admit partial-quality tiers"),
+        )
+    }
+
+    #[cfg(feature = "rerank")]
+    fn test_scored_result(doc_id: &str, score: f32) -> ScoredResult {
+        ScoredResult {
+            doc_id: doc_id.to_owned().into(),
+            score,
+            source: ScoreSource::SemanticFast,
+            index: None,
+            fast_score: Some(score),
+            quality_score: None,
+            lexical_score: None,
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn mmr_partial_quality_pool_falls_back_entirely_to_fast_space() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("mmr-partial-quality");
+            let fast_binding = artifact_binding("mmr-fast", 4, 41);
+            let quality_binding = artifact_binding("mmr-quality", 4, 41);
+            let index = owner_backed_partial_quality_index(&dir, &fast_binding, &quality_binding);
+            let fast = Arc::new(IdentityCountingEmbedder::new(
+                "fast",
+                in_memory_identity("mmr-fast", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let searcher =
+                TwoTierSearcher::new(index, fast as Arc<dyn Embedder>, TwoTierConfig::default());
+            let results = [
+                test_scored_result("doc-shared", 1.0),
+                test_scored_result("doc-fast-only", 0.5),
+            ];
+
+            let embeddings = searcher
+                .mmr_embeddings_in_one_space(&cx, &results)
+                .expect("load one-space MMR pool")
+                .expect("the complete fast tier covers this pool");
+
+            assert_eq!(embeddings[0], vec![1.0, 0.0, 0.0, 0.0]);
+            assert_eq!(embeddings[1], vec![0.0, 1.0, 0.0, 0.0]);
+            assert_ne!(
+                embeddings[0],
+                vec![0.0, 1.0, 0.0, 0.0],
+                "the shared document's quality vector must not be mixed with a fast fallback"
+            );
+        });
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn mmr_skips_pool_with_no_tier_covering_every_candidate() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("mmr-no-common-space");
+            let fast_binding = artifact_binding("mmr-fast", 4, 43);
+            let quality_binding = artifact_binding("mmr-quality", 4, 43);
+            let index = owner_backed_partial_quality_index(&dir, &fast_binding, &quality_binding);
+            let fast = Arc::new(IdentityCountingEmbedder::new(
+                "fast",
+                in_memory_identity("mmr-fast", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let searcher =
+                TwoTierSearcher::new(index, fast as Arc<dyn Embedder>, TwoTierConfig::default());
+            let results = [
+                test_scored_result("doc-fast-only", 1.0),
+                test_scored_result("doc-quality-query", 0.5),
+            ];
+
+            assert!(
+                searcher
+                    .mmr_embeddings_in_one_space(&cx, &results)
+                    .expect("lookups remain valid")
+                    .is_none(),
+                "MMR must skip when no one vector space covers the whole pool"
+            );
+        });
+    }
+
+    #[test]
+    fn prf_never_falls_back_to_fast_vectors_for_quality_query_expansion() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("prf-quality-only-feedback");
+            let fast_binding = artifact_binding("prf-fast", 4, 47);
+            let quality_binding = artifact_binding("prf-quality", 4, 47);
+            let index = owner_backed_partial_quality_index(&dir, &fast_binding, &quality_binding);
+            let fast = Arc::new(IdentityCountingEmbedder::new(
+                "fast",
+                in_memory_identity("prf-fast", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let quality = Arc::new(IdentityCountingEmbedder::new(
+                "quality",
+                in_memory_identity("prf-quality", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let searcher =
+                TwoTierSearcher::new(index, fast as Arc<dyn Embedder>, TwoTierConfig::default())
+                    .with_quality_embedder(quality as Arc<dyn Embedder>)
+                    .with_prf_config(PrfConfig {
+                        enabled: true,
+                        alpha: 0.5,
+                        top_k_feedback: 2,
+                        min_feedback_docs: 2,
+                        score_weighted: false,
+                    });
+
+            let mut initial = Vec::new();
+            let mut refined = Vec::new();
+            let mut refinement_error = None;
+            searcher
+                .search(
+                    &cx,
+                    "natural language query with enough words",
+                    4,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. } => {
+                            initial = results
+                                .iter()
+                                .map(|result| result.doc_id.to_string())
+                                .collect();
+                        }
+                        SearchPhase::Refined { results, .. }
+                        | SearchPhase::Reranked { results, .. } => {
+                            refined = results
+                                .iter()
+                                .map(|result| result.doc_id.to_string())
+                                .collect();
+                        }
+                        SearchPhase::RefinementFailed { error, .. } => {
+                            refinement_error = Some(error.to_string());
+                        }
+                    },
+                )
+                .await
+                .expect("run partial-quality PRF search");
+
+            assert_eq!(refinement_error, None, "refinement must not fail");
+            assert_eq!(
+                initial.len(),
+                2,
+                "both fast documents feed the PRF candidate loop"
+            );
+            assert!(initial.contains(&"doc-fast-only".to_owned()));
+            let query_rank = refined
+                .iter()
+                .position(|doc_id| doc_id == "doc-quality-query")
+                .expect("quality-query document remains in refined pool");
+            let wrong_rank = refined
+                .iter()
+                .position(|doc_id| doc_id == "doc-quality-wrong")
+                .expect("quality-wrong document remains in refined pool");
+            assert!(
+                query_rank < wrong_rank,
+                "a fast-tier fallback would rotate the quality query toward doc-quality-wrong: {refined:?}"
+            );
+        });
     }
 
     /// bd-ctzo C2, on the REAL async orchestration: the refined phase must
