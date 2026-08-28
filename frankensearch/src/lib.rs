@@ -386,7 +386,7 @@ pub use frankensearch_rerank::rerank_step;
 pub use frankensearch_rerank::NativeReranker;
 
 #[cfg(feature = "native")]
-pub use frankensearch_rerank::NativeEmbedder;
+pub use frankensearch_rerank::{NativeEmbedder, NativeEmbeddingModel};
 
 #[cfg(feature = "fastembed-reranker")]
 pub use frankensearch_rerank::FastEmbedReranker;

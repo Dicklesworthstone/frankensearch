@@ -26,10 +26,11 @@ const TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
 const FRANKENSEARCH_MODEL_DIR_ENV: &str = "FRANKENSEARCH_MODEL_DIR";
 const FRANKENSEARCH_DATA_DIR_ENV: &str = "FRANKENSEARCH_DATA_DIR";
 const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
-const KNOWN_MODEL_LAYOUT_DIRS: [&str; 4] = [
+const KNOWN_MODEL_LAYOUT_DIRS: [&str; 5] = [
     "potion-base-128M",
     "potion-multilingual-128M",
     "all-MiniLM-L6-v2",
+    "paraphrase-multilingual-MiniLM-L12-v2",
     "ms-marco-MiniLM-L-6-v2",
 ];
 
@@ -79,7 +80,7 @@ pub struct RegisteredReranker {
     pub is_baseline: bool,
 }
 
-const REGISTERED_EMBEDDERS: [RegisteredEmbedder; 6] = [
+const REGISTERED_EMBEDDERS: [RegisteredEmbedder; 7] = [
     RegisteredEmbedder {
         name: "minilm",
         id: "minilm-384",
@@ -91,6 +92,18 @@ const REGISTERED_EMBEDDERS: [RegisteredEmbedder; 6] = [
         huggingface_id: "sentence-transformers/all-MiniLM-L6-v2",
         size_bytes: 90_000_000,
         is_baseline: true,
+    },
+    RegisteredEmbedder {
+        name: "multilingual-minilm",
+        id: "paraphrase-multilingual-minilm-l12-v2-384",
+        dimension: 384,
+        is_semantic: true,
+        description: "Opt-in multilingual MiniLM-L12-v2 sentence embedder",
+        requires_model_files: true,
+        release_date: "2020-11-01",
+        huggingface_id: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        size_bytes: 479_724_528,
+        is_baseline: false,
     },
     RegisteredEmbedder {
         name: "snowflake-arctic-s",
@@ -267,7 +280,8 @@ impl EmbedderRegistry {
 
     /// Return the most preferred available embedder.
     ///
-    /// Preference is quality-first, with deterministic fallback to hash.
+    /// Preference is quality-first among automatically selectable models, with
+    /// deterministic fallback to hash. Opt-in models have rank zero.
     #[must_use]
     pub fn best_available(&self) -> &'static RegisteredEmbedder {
         const HASH_ENTRY_INDEX: usize = REGISTERED_EMBEDDERS.len() - 1;
@@ -379,6 +393,7 @@ fn embedder_preference_rank(id: &str) -> u8 {
         "potion-retrieval-32m-512" => 80,
         "potion-multilingual-128m-256" => 70,
         "fnv1a-384" => 1,
+        "paraphrase-multilingual-minilm-l12-v2-384" => 0,
         _ => 0,
     }
 }
@@ -410,6 +425,7 @@ fn reranker_is_available(entry: &RegisteredReranker, data_dir: &Path) -> bool {
 fn embedder_dir_name(entry: &RegisteredEmbedder) -> &'static str {
     match entry.id {
         "minilm-384" => "all-MiniLM-L6-v2",
+        "paraphrase-multilingual-minilm-l12-v2-384" => "paraphrase-multilingual-MiniLM-L12-v2",
         "snowflake-arctic-s-384" => "snowflake-arctic-embed-s",
         "nomic-embed-768" => "nomic-embed-text-v1.5",
         "potion-multilingual-128m-256" => "potion-multilingual-128M",
@@ -443,6 +459,16 @@ fn has_embedder_files(id: &str, dir: &Path) -> bool {
                 ],
             ) && has_onnx_file(dir)
         }
+        "paraphrase-multilingual-minilm-l12-v2-384" => has_all_files(
+            dir,
+            &[
+                MODEL_SAFETENSORS,
+                TOKENIZER_JSON,
+                CONFIG_JSON,
+                SPECIAL_TOKENS_JSON,
+                TOKENIZER_CONFIG_JSON,
+            ],
+        ),
         "snowflake-arctic-s-384" | "nomic-embed-768" => {
             has_all_files(dir, &[TOKENIZER_JSON]) && has_onnx_file(dir)
         }
@@ -596,6 +622,35 @@ mod tests {
         assert!(available_ids.contains(&"minilm-384"));
         assert!(available_ids.contains(&"potion-multilingual-128m-256"));
         assert!(available_ids.contains(&"fnv1a-384"));
+    }
+
+    #[test]
+    fn multilingual_minilm_is_visible_but_never_automatically_selected() {
+        let temp = tempfile::tempdir().unwrap();
+        touch_model_files(
+            temp.path(),
+            "paraphrase-multilingual-MiniLM-L12-v2",
+            &[
+                MODEL_SAFETENSORS,
+                TOKENIZER_JSON,
+                CONFIG_JSON,
+                SPECIAL_TOKENS_JSON,
+                TOKENIZER_CONFIG_JSON,
+            ],
+        );
+
+        let registry = EmbedderRegistry::new(temp.path());
+        assert!(
+            registry
+                .available()
+                .iter()
+                .any(|entry| entry.id == "paraphrase-multilingual-minilm-l12-v2-384")
+        );
+        assert_eq!(
+            registry.best_available().id,
+            "fnv1a-384",
+            "opt-in multilingual model must not replace the default lane implicitly"
+        );
     }
 
     #[test]
@@ -775,6 +830,10 @@ mod tests {
         assert!(
             embedder_preference_rank("potion-multilingual-128m-256")
                 > embedder_preference_rank("fnv1a-384")
+        );
+        assert!(
+            embedder_preference_rank("fnv1a-384")
+                > embedder_preference_rank("paraphrase-multilingual-minilm-l12-v2-384")
         );
     }
 
@@ -1105,6 +1164,16 @@ mod tests {
                         ],
                     )
             }
+            "paraphrase-multilingual-minilm-l12-v2-384" => has_all_files(
+                dir,
+                &[
+                    MODEL_SAFETENSORS,
+                    TOKENIZER_JSON,
+                    CONFIG_JSON,
+                    SPECIAL_TOKENS_JSON,
+                    TOKENIZER_CONFIG_JSON,
+                ],
+            ),
             "snowflake-arctic-s-384" | "nomic-embed-768" => {
                 has_any_file(dir, &[MODEL_ONNX_SUBDIR]) && has_all_files(dir, &[TOKENIZER_JSON])
             }
@@ -1132,6 +1201,7 @@ mod tests {
         ];
         let embedder_ids = [
             "minilm-384",
+            "paraphrase-multilingual-minilm-l12-v2-384",
             "snowflake-arctic-s-384",
             "nomic-embed-768",
             "potion-multilingual-128m-256",
@@ -1228,7 +1298,7 @@ mod tests {
 
     #[test]
     fn registered_embedder_count() {
-        assert_eq!(registered_embedders().len(), 6);
+        assert_eq!(registered_embedders().len(), 7);
     }
 
     #[test]

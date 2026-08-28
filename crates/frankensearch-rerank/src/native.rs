@@ -19,7 +19,7 @@
 //! The only reranker backend (ort/ONNX was removed in bd-1nl13.6); feature-gated
 //! behind `native`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -34,7 +34,7 @@ use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{RerankDocument, RerankScore, SyncRerank};
 
 const H: usize = 384;
-const L: usize = 6;
+const RERANKER_LAYERS: usize = 6;
 const NH: usize = 12;
 const HD: usize = H / NH; // 32
 const INTER: usize = 4 * H; // 1536 — FFN intermediate width
@@ -513,6 +513,8 @@ pub(crate) struct Model {
     /// `w` leaves, shared via `Arc`), so the tape-free fused-layer path can call the
     /// `add_layer_norm` kernel directly without round-tripping through the session.
     raw_params: HashMap<String, Arc<Vec<f32>>>,
+    /// Contiguous encoder-layer count attested by the loaded weight set.
+    encoder_layers: usize,
     /// Autograd tape node count captured right after the persistent weights are
     /// loaded. Each forward pass truncates the tape back to this boundary to free
     /// that pass's intermediate activations, so the session does not grow
@@ -523,6 +525,10 @@ pub(crate) struct Model {
 }
 
 impl Model {
+    pub(crate) const fn encoder_layers(&self) -> usize {
+        self.encoder_layers
+    }
+
     fn g(&self, name: &str) -> SearchResult<TensorNodeId> {
         self.w
             .get(name)
@@ -897,7 +903,7 @@ impl Model {
         let mut emb = self.add_ln(emb_wp, e_typ, "bert.embeddings.LayerNorm")?;
 
         let scale = ATTN_SCALE_F32;
-        for i in 0..L {
+        for i in 0..self.encoder_layers {
             let p = format!("bert.encoder.layer.{i}");
             // self-attention (fused-QKV + fused kernel, or separate-QKV + bmm by len)
             let ctx = self.attention(emb, &p, s_len, scale)?;
@@ -1026,7 +1032,7 @@ impl Model {
                 .s
                 .tensor_values_f32(emb)
                 .map_err(|e| rerank_err("batch.emb_extract", e))?;
-            for i in 0..L - 1 {
+            for i in 0..self.encoder_layers - 1 {
                 let p = format!("bert.encoder.layer.{i}");
                 emb_vals = self.encoder_layer_raw(
                     &emb_vals,
@@ -1038,7 +1044,7 @@ impl Model {
                     &mut scratch,
                 )?;
             }
-            let p_last = format!("bert.encoder.layer.{}", L - 1);
+            let p_last = format!("bert.encoder.layer.{}", self.encoder_layers - 1);
             let cls_vals = self.encoder_layer_cls(
                 &emb_vals,
                 &offsets,
@@ -1056,7 +1062,7 @@ impl Model {
         } else {
             // Long-document path: separate-QKV + cache-blocking bmm attention through
             // the tape (a long doc in the chunk; rare).
-            for i in 0..L {
+            for i in 0..self.encoder_layers {
                 let p = format!("bert.encoder.layer.{i}");
                 let q = self.linear(emb, &format!("{p}.attention.self.query"))?;
                 let k = self.linear(emb, &format!("{p}.attention.self.key"))?;
@@ -1191,7 +1197,7 @@ impl Model {
             .map_err(|e| rerank_err("embed.add", e))?;
         let emb = self.add_ln(emb_wp, e_typ, "bert.embeddings.LayerNorm")?;
 
-        // Encoder: ALL L layers on raw f32 buffers (mean-pooling needs every token's
+        // Encoder: every attested layer on raw f32 buffers (mean-pooling needs every token's
         // final hidden state, so no CLS-only last layer). Same kernels as the reranker.
         let scale = ATTN_SCALE_F32;
         let mut scratch = AttnScratch::default();
@@ -1199,7 +1205,7 @@ impl Model {
             .s
             .tensor_values_f32(emb)
             .map_err(|e| rerank_err("embed.extract", e))?;
-        for i in 0..L {
+        for i in 0..self.encoder_layers {
             let p = format!("bert.encoder.layer.{i}");
             emb_vals =
                 self.encoder_layer_raw(&emb_vals, total, &offsets, &lens, &p, scale, &mut scratch)?;
@@ -1318,12 +1324,24 @@ impl NativeReranker {
         // cores. No pool is needed (and one session keeps the f32 embedding table
         // resident only once, ~47 MB instead of per-slot copies).
         let shared = parse_weights(&weights_path)?;
-        let model = build_model(&shared)?;
+        if shared.encoder_layers != RERANKER_LAYERS {
+            return Err(SearchError::ModelLoadFailed {
+                path: weights_path,
+                source: format!(
+                    "reranker weights contain {} encoder layers, expected {RERANKER_LAYERS}",
+                    shared.encoder_layers
+                )
+                .into(),
+            });
+        }
+        let linear_int8 = shared.qw.len();
+        let f32_params = shared.f32_params.len();
+        let model = build_model(shared)?;
 
         tracing::info!(
             model = MODEL_NAME,
-            linear_int8 = shared.qw.len(),
-            f32_params = shared.f32_params.len(),
+            linear_int8,
+            f32_params,
             max_length = DEFAULT_MAX_LENGTH,
             model_dir = %dir.display(),
             "native frankentorch reranker loaded (int8 linear, parallel forward)"
@@ -1345,12 +1363,14 @@ fn is_linear_weight(name: &str) -> bool {
     name.ends_with(".weight") && !name.contains("LayerNorm") && !name.contains("embeddings")
 }
 
-/// Parsed, immutable weight data: int8 Linear weights keyed by layer prefix, plus
-/// the f32 `embedding/LayerNorm` parameter values. Parsed and quantized once, then
-/// cloned (cheaply, via `Arc`) into each session by [`build_model`].
+/// Parsed weight data: int8 Linear weights keyed by layer prefix, plus the f32
+/// `embedding/LayerNorm` parameter values. [`build_model`] consumes this staging
+/// representation so large embedding tables move into the session without a
+/// second resident copy.
 pub(crate) struct SharedWeights {
     qw: HashMap<String, QLinear>,
     f32_params: HashMap<String, (Arc<Vec<f32>>, Vec<usize>)>,
+    encoder_layers: usize,
 }
 
 /// Parse a safetensors file: int8-quantize the Linear weights (per output channel)
@@ -1483,80 +1503,53 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
         });
     }
 
-    // Second pass: classify. Linear `.weight`s are int8-quantized (folding in their
-    // `.bias`, which is then skipped); everything else (embeddings + LayerNorm
-    // weight/bias) stays f32.
-    let mut qw: HashMap<String, QLinear> = HashMap::new();
-    let mut f32_params: HashMap<String, (Arc<Vec<f32>>, Vec<usize>)> = HashMap::new();
-    for (name, (vals, shape)) in &raw {
-        if is_linear_weight(name) {
-            let prefix = name.strip_suffix(".weight").expect("ends_with .weight");
-            let out = *shape.first().unwrap_or(&0);
-            let in_ = *shape.get(1).unwrap_or(&0);
-            if out == 0 || in_ == 0 || vals.len() != out * in_ {
-                return Err(SearchError::ModelLoadFailed {
-                    path: path.to_path_buf(),
-                    source: format!(
-                        "linear weight {name} bad shape {shape:?} for {} values",
-                        vals.len()
-                    )
-                    .into(),
-                });
-            }
-            let (w_i8, w_scales) = quantize_per_output_channel_i8(vals, out, in_);
-            // Pre-pack the static weights into the NR=4 SDOT tile layout once at
-            // load (the zero-per-forward weight-packing win) on aarch64, where the
-            // packed micro-kernel runs and `out % 4 == 0 && in % 16 == 0` holds for
-            // every linear except the 1-row classifier. Other targets / the
-            // classifier keep row-major + the portable kernel.
-            let packed = cfg!(target_arch = "aarch64") && out % 4 == 0 && in_ % 16 == 0;
-            let w_i8 = if packed {
-                ft_api::pack_int8_weights_nr4(&w_i8, out, in_)
-            } else {
-                w_i8
-            };
-            let bias = raw
-                .get(&format!("{prefix}.bias"))
-                .map(|(b, _)| b.clone())
-                .unwrap_or_else(|| vec![0.0f32; out]);
-            qw.insert(
-                prefix.to_string(),
-                QLinear {
-                    w_i8: Arc::new(w_i8),
-                    w_scales: Arc::new(w_scales),
-                    bias: Arc::new(bias),
-                    out,
-                    in_,
-                    packed,
-                },
-            );
-        } else if name.strip_suffix(".bias").is_some() && !name.contains("LayerNorm") {
-            // Linear bias — already folded into its QLinear above; do not keep as f32.
-        } else {
-            // f32 parameter: embeddings and LayerNorm weight/bias.
-            f32_params.insert(name.clone(), (Arc::new(vals.clone()), shape.clone()));
-        }
-    }
-    if qw.is_empty() {
+    // Every retained tensor is now owned by `raw`; release the original 449 MiB
+    // safetensors byte buffer before quantization creates another set of weights.
+    drop(bytes);
+
+    let encoder_layer_indices = raw
+        .keys()
+        .filter_map(|name| {
+            name.strip_prefix("bert.encoder.layer.")?
+                .split_once('.')?
+                .0
+                .parse::<usize>()
+                .ok()
+        })
+        .collect::<BTreeSet<_>>();
+    let encoder_layers = encoder_layer_indices
+        .last()
+        .copied()
+        .and_then(|last| last.checked_add(1))
+        .ok_or_else(|| SearchError::ModelLoadFailed {
+            path: path.to_path_buf(),
+            source: "safetensors has no numbered BERT encoder layers".into(),
+        })?;
+    if encoder_layer_indices.len() != encoder_layers
+        || !(0..encoder_layers).all(|index| encoder_layer_indices.contains(&index))
+    {
         return Err(SearchError::ModelLoadFailed {
             path: path.to_path_buf(),
-            source: "no Linear weights found to quantize".into(),
+            source: "safetensors BERT encoder layers are not contiguous from zero".into(),
         });
     }
 
-    // Third pass: fuse each layer's Q/K/V projections into one `[3H, H]` linear
+    // Second pass, part one: fuse each layer's Q/K/V projections while the raw
+    // tensors are still present. Missing or malformed projections are a hard
+    // topology failure: every attested BERT encoder layer must be executable.
+    let mut qw: HashMap<String, QLinear> = HashMap::new();
+    // Fuse each layer's Q/K/V projections into one `[3H, H]` linear
     // (key `…attention.self.qkv`). The forward then quantizes `emb` once and runs a
     // single int8 GEMM instead of three — cutting the per-call quant / rayon-launch
     // / dequant / tape-node overhead that is a real fraction of the short-sequence
     // forward (the SDOT math itself is at its M4 throughput ceiling). The stacked
     // weight re-quantizes per output channel, so each of the 3H rows keeps its own
     // scale and the fused output is byte-identical to the three separate linears.
-    for i in 0..L {
+    for i in 0..encoder_layers {
         let p = format!("bert.encoder.layer.{i}");
         let parts = ["query", "key", "value"];
         let mut stacked: Vec<f32> = Vec::with_capacity(3 * H * H);
         let mut bias: Vec<f32> = Vec::with_capacity(3 * H);
-        let mut ok = true;
         for part in parts {
             let wn = format!("{p}.attention.self.{part}.weight");
             match raw.get(&wn) {
@@ -1569,13 +1562,15 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
                     bias.extend_from_slice(&b);
                 }
                 _ => {
-                    ok = false;
-                    break;
+                    return Err(SearchError::ModelLoadFailed {
+                        path: path.to_path_buf(),
+                        source: format!(
+                            "encoder layer {i} has missing or malformed {part} projection"
+                        )
+                        .into(),
+                    });
                 }
             }
-        }
-        if !ok {
-            continue;
         }
         let (out, in_) = (3 * H, H);
         let (w_i8, w_scales) = quantize_per_output_channel_i8(&stacked, out, in_);
@@ -1598,22 +1593,104 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
         );
     }
 
-    Ok(SharedWeights { qw, f32_params })
+    // Second pass, part two: remove and quantize each Linear weight together
+    // with its bias. Removing entries lets the large f32 vectors move into their
+    // final owners instead of being cloned from the staging map.
+    let linear_weight_names = raw
+        .keys()
+        .filter(|name| is_linear_weight(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in linear_weight_names {
+        let (vals, shape) = raw
+            .remove(&name)
+            .expect("linear weight name was collected from raw");
+        let prefix = name.strip_suffix(".weight").expect("ends_with .weight");
+        let out = *shape.first().unwrap_or(&0);
+        let in_ = *shape.get(1).unwrap_or(&0);
+        if out == 0 || in_ == 0 || vals.len() != out * in_ {
+            return Err(SearchError::ModelLoadFailed {
+                path: path.to_path_buf(),
+                source: format!(
+                    "linear weight {name} bad shape {shape:?} for {} values",
+                    vals.len()
+                )
+                .into(),
+            });
+        }
+        let bias = raw
+            .remove(&format!("{prefix}.bias"))
+            .map_or_else(|| vec![0.0f32; out], |(bias, _)| bias);
+        let (w_i8, w_scales) = quantize_per_output_channel_i8(&vals, out, in_);
+        // Pre-pack the static weights into the NR=4 SDOT tile layout once at
+        // load (the zero-per-forward weight-packing win) on aarch64, where the
+        // packed micro-kernel runs and `out % 4 == 0 && in % 16 == 0` holds for
+        // every linear except the 1-row classifier. Other targets / the
+        // classifier keep row-major + the portable kernel.
+        let packed = cfg!(target_arch = "aarch64") && out % 4 == 0 && in_ % 16 == 0;
+        let w_i8 = if packed {
+            ft_api::pack_int8_weights_nr4(&w_i8, out, in_)
+        } else {
+            w_i8
+        };
+        qw.insert(
+            prefix.to_string(),
+            QLinear {
+                w_i8: Arc::new(w_i8),
+                w_scales: Arc::new(w_scales),
+                bias: Arc::new(bias),
+                out,
+                in_,
+                packed,
+            },
+        );
+    }
+    if qw.is_empty() {
+        return Err(SearchError::ModelLoadFailed {
+            path: path.to_path_buf(),
+            source: "no Linear weights found to quantize".into(),
+        });
+    }
+
+    let mut f32_params: HashMap<String, (Arc<Vec<f32>>, Vec<usize>)> = HashMap::new();
+    for (name, (vals, shape)) in raw {
+        if name.strip_suffix(".bias").is_some() && !name.contains("LayerNorm") {
+            // Bias for a non-Linear auxiliary tensor; it is not a model leaf.
+            continue;
+        }
+        f32_params.insert(name, (Arc::new(vals), shape));
+    }
+
+    Ok(SharedWeights {
+        qw,
+        f32_params,
+        encoder_layers,
+    })
 }
 
-/// Build a fresh session from shared weights: create an f32 leaf for every
-/// embedding/LayerNorm parameter and clone the (Arc-shared) int8 Linear weights.
-pub(crate) fn build_model(shared: &SharedWeights) -> SearchResult<Model> {
+/// Build a session by consuming parsed weights. Large embedding tables transfer
+/// directly into the session; only the small `LayerNorm` values are duplicated
+/// because the tape-free path also needs their raw buffers.
+pub(crate) fn build_model(shared: SharedWeights) -> SearchResult<Model> {
+    let SharedWeights {
+        qw,
+        f32_params,
+        encoder_layers,
+    } = shared;
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     session.no_grad_enter();
-    let mut w = HashMap::with_capacity(shared.f32_params.len());
-    let mut raw_params = HashMap::with_capacity(shared.f32_params.len());
-    for (name, (vals, shape)) in &shared.f32_params {
+    let mut w = HashMap::with_capacity(f32_params.len());
+    let mut raw_params = HashMap::with_capacity(f32_params.len());
+    for (name, (vals, shape)) in f32_params {
+        let raw_layer_norm = name.contains("LayerNorm").then(|| Arc::clone(&vals));
+        let vals = Arc::try_unwrap(vals).unwrap_or_else(|vals| vals.as_ref().clone());
         let node = session
-            .tensor_variable_f32(vals.as_ref().clone(), shape.clone(), false)
+            .tensor_variable_f32(vals, shape, false)
             .map_err(|e| rerank_err("build_model", format!("create f32 tensor {name}: {e}")))?;
-        w.insert(name.clone(), node);
-        raw_params.insert(name.clone(), Arc::clone(vals));
+        if let Some(raw) = raw_layer_norm {
+            raw_params.insert(name.clone(), raw);
+        }
+        w.insert(name, node);
     }
     // Tape boundary AFTER the persistent f32 leaves are created; each forward
     // truncates back to here to free intermediates while keeping parameters.
@@ -1621,8 +1698,9 @@ pub(crate) fn build_model(shared: &SharedWeights) -> SearchResult<Model> {
     Ok(Model {
         s: session,
         w,
-        qw: shared.qw.clone(),
+        qw,
         raw_params,
+        encoder_layers,
         weights_boundary,
     })
 }

@@ -3,11 +3,12 @@
 //! ONNX / no `ort`).
 //!
 //! It reuses the reranker's validated, SIMD/int8-optimized BERT encoder verbatim
-//! (same 6-layer `MiniLM` forward, same kernels via [`crate::native::Model::embed_forward`]);
-//! it differs only at the head — **mean-pool over every token + L2-normalize** instead
-//! of the `[CLS]` pooler + classifier — and in tokenization (one text, token-type ids
-//! all 0). Because there is no ONNX Runtime, there is no AVX-static-init hazard: the
-//! int8 GEMM dispatches NEON (aarch64 SDOT / NR=4 packing) or x86 SIMD at runtime.
+//! (the registered 6- or 12-layer topology, with the same kernels via
+//! [`crate::native::Model::embed_forward`]); it differs only at the head —
+//! **mean-pool over every token + L2-normalize** instead of the `[CLS]` pooler +
+//! classifier — and in tokenization (one text, token-type ids all 0). Because there
+//! is no ONNX Runtime, there is no AVX-static-init hazard: the int8 GEMM dispatches
+//! NEON (aarch64 SDOT / NR=4 packing) or x86 SIMD at runtime.
 //!
 //! Feature-gated behind `native`.
 
@@ -25,8 +26,10 @@ use crate::native::{
     DEFAULT_MAX_LENGTH, Model, SAFETENSORS_FALLBACK, TOKENIZER_JSON, build_model, parse_weights,
 };
 
-const MODEL_NAME: &str = "all-minilm-l6-v2";
-const EMBEDDER_ID: &str = "minilm-384-native";
+const DEFAULT_MODEL_NAME: &str = "all-minilm-l6-v2";
+const DEFAULT_EMBEDDER_ID: &str = "minilm-384-native";
+const MULTILINGUAL_MODEL_NAME: &str = "paraphrase-multilingual-minilm-l12-v2";
+const MULTILINGUAL_EMBEDDER_ID: &str = "paraphrase-multilingual-minilm-l12-v2-384-native";
 const DIM: usize = 384;
 const IDENTITY_DIMENSION: u32 = 384;
 const IDENTITY_SEQUENCE_POLICY: &str = "max-length=512;longest-first;no-padding";
@@ -35,6 +38,47 @@ const IDENTITY_OUTPUT_NORMALIZATION: &str = "l2-f32-if-norm-gt-zero-else-unchang
 /// Token budget per batched forward (mirrors the reranker's chunking) so each
 /// forward's attention intermediates stay memory-bounded.
 const MAX_BATCH_TOKENS: usize = 2048;
+
+/// Manifest-registered pure-Rust sentence-embedding models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeEmbeddingModel {
+    /// English-centric `all-MiniLM-L6-v2` baseline.
+    AllMiniLmL6V2,
+    /// Opt-in XLM-R/SentencePiece multilingual `MiniLM` L12 model.
+    ParaphraseMultilingualMiniLmL12V2,
+}
+
+impl NativeEmbeddingModel {
+    const fn model_name(self) -> &'static str {
+        match self {
+            Self::AllMiniLmL6V2 => DEFAULT_MODEL_NAME,
+            Self::ParaphraseMultilingualMiniLmL12V2 => MULTILINGUAL_MODEL_NAME,
+        }
+    }
+
+    const fn embedder_id(self) -> &'static str {
+        match self {
+            Self::AllMiniLmL6V2 => DEFAULT_EMBEDDER_ID,
+            Self::ParaphraseMultilingualMiniLmL12V2 => MULTILINGUAL_EMBEDDER_ID,
+        }
+    }
+
+    const fn encoder_layers(self) -> usize {
+        match self {
+            Self::AllMiniLmL6V2 => 6,
+            Self::ParaphraseMultilingualMiniLmL12V2 => 12,
+        }
+    }
+
+    fn manifest(self) -> SearchResult<ModelArtifactManifestV1> {
+        match self {
+            Self::AllMiniLmL6V2 => ModelArtifactManifestV1::minilm_native_frankentorch(),
+            Self::ParaphraseMultilingualMiniLmL12V2 => {
+                ModelArtifactManifestV1::multilingual_minilm_native_frankentorch()
+            }
+        }
+    }
+}
 
 /// Pure-Rust frankentorch `MiniLM` sentence-embedder.
 pub struct NativeEmbedder {
@@ -59,18 +103,42 @@ impl std::fmt::Debug for NativeEmbedder {
 }
 
 impl NativeEmbedder {
-    /// Load from a model directory containing `tokenizer.json` and a safetensors weight
-    /// file (`model.safetensors`) — the standard immutable
-    /// `sentence-transformers/all-MiniLM-L6-v2` layout (bare
-    /// `embeddings.*`/`encoder.*` keys are normalized to the shared
-    /// `bert.`-prefixed scheme during parse).
+    /// Load the default `all-MiniLM-L6-v2` model from a verified directory.
     ///
     /// # Errors
     /// [`SearchError::ModelNotFound`] when required files are missing;
     /// [`SearchError::ModelLoadFailed`] when the tokenizer or weights fail to load.
     pub fn load(model_dir: impl AsRef<Path>) -> SearchResult<Self> {
+        Self::load_model(model_dir, NativeEmbeddingModel::AllMiniLmL6V2)
+    }
+
+    /// Load the opt-in multilingual `MiniLM` L12 model from a verified directory.
+    ///
+    /// This constructor is intentionally explicit: the multilingual model is never
+    /// substituted for the default model merely because both output 384 values.
+    ///
+    /// # Errors
+    /// [`SearchError::ModelNotFound`] when required files are missing;
+    /// [`SearchError::ModelLoadFailed`] when the tokenizer, topology, or weights fail.
+    pub fn load_multilingual(model_dir: impl AsRef<Path>) -> SearchResult<Self> {
+        Self::load_model(
+            model_dir,
+            NativeEmbeddingModel::ParaphraseMultilingualMiniLmL12V2,
+        )
+    }
+
+    /// Load one explicit manifest-registered native embedding model.
+    ///
+    /// # Errors
+    /// [`SearchError::ModelNotFound`] when required files are missing;
+    /// [`SearchError::ModelLoadFailed`] when the tokenizer, topology, or weights fail.
+    pub fn load_model(
+        model_dir: impl AsRef<Path>,
+        profile: NativeEmbeddingModel,
+    ) -> SearchResult<Self> {
         let dir = model_dir.as_ref();
-        let verified = ModelArtifactManifestV1::minilm_native_frankentorch()?.verify_dir(dir)?;
+        let model_name = profile.model_name();
+        let verified = profile.manifest()?.verify_dir(dir)?;
         let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
         if identity.space.dimension != IDENTITY_DIMENSION {
             return Err(SearchError::ModelLoadFailed {
@@ -110,7 +178,7 @@ impl NativeEmbedder {
         if !tok_path.is_file() {
             return Err(SearchError::ModelNotFound {
                 name: format!(
-                    "{MODEL_NAME} (missing {TOKENIZER_JSON} in {})",
+                    "{model_name} (missing {TOKENIZER_JSON} in {})",
                     dir.display()
                 ),
             });
@@ -141,18 +209,30 @@ impl NativeEmbedder {
         if !weights_path.is_file() {
             return Err(SearchError::ModelNotFound {
                 name: format!(
-                    "{MODEL_NAME} (missing verified {SAFETENSORS_FALLBACK} in {})",
+                    "{model_name} (missing verified {SAFETENSORS_FALLBACK} in {})",
                     dir.display()
                 ),
             });
         }
 
         let shared = parse_weights(&weights_path)?;
-        let model = build_model(&shared)?;
+        let model = build_model(shared)?;
+        if model.encoder_layers() != profile.encoder_layers() {
+            return Err(SearchError::ModelLoadFailed {
+                path: weights_path,
+                source: format!(
+                    "registered model requires {} encoder layers, weights contain {}",
+                    profile.encoder_layers(),
+                    model.encoder_layers()
+                )
+                .into(),
+            });
+        }
 
         tracing::info!(
-            model = MODEL_NAME,
+            model = model_name,
             dimension = DIM,
+            encoder_layers = model.encoder_layers(),
             max_length = DEFAULT_MAX_LENGTH,
             manifest = %verified.frozen().fingerprint,
             identity = %identity.fingerprint(),
@@ -163,8 +243,8 @@ impl NativeEmbedder {
             inner: Mutex::new(model),
             tokenizer,
             max_length: DEFAULT_MAX_LENGTH,
-            name: MODEL_NAME.to_owned(),
-            id: EMBEDDER_ID.to_owned(),
+            name: model_name.to_owned(),
+            id: profile.embedder_id().to_owned(),
             identity,
         })
     }
@@ -175,7 +255,7 @@ impl NativeEmbedder {
             self.tokenizer
                 .encode(text, true)
                 .map_err(|e| SearchError::EmbeddingFailed {
-                    model: MODEL_NAME.to_owned(),
+                    model: self.name.clone(),
                     source: format!("tokenize failed: {e}").into(),
                 })?;
         Ok(crate::ids_to_truncated_i64(
@@ -186,7 +266,7 @@ impl NativeEmbedder {
 
     fn lock_model(&self) -> SearchResult<std::sync::MutexGuard<'_, Model>> {
         self.inner.lock().map_err(|e| SearchError::EmbeddingFailed {
-            model: MODEL_NAME.to_owned(),
+            model: self.name.clone(),
             source: format!("embedder mutex poisoned: {e}").into(),
         })
     }
@@ -199,12 +279,12 @@ impl SyncEmbed for NativeEmbedder {
         let mut out = model.embed_forward(&[ids])?;
         drop(model);
         let vector = out.pop().ok_or_else(|| SearchError::EmbeddingFailed {
-            model: MODEL_NAME.to_owned(),
+            model: self.name.clone(),
             source: "native backend returned no embedding".into(),
         })?;
         if vector.len() != DIM {
             return Err(SearchError::EmbeddingFailed {
-                model: MODEL_NAME.to_owned(),
+                model: self.name.clone(),
                 source: format!(
                     "native backend returned dimension {}, expected {DIM}",
                     vector.len()
@@ -245,7 +325,7 @@ impl SyncEmbed for NativeEmbedder {
         drop(model);
         if out.len() != texts.len() || out.iter().any(|vector| vector.len() != DIM) {
             return Err(SearchError::EmbeddingFailed {
-                model: MODEL_NAME.to_owned(),
+                model: self.name.clone(),
                 source:
                     "native backend returned a batch shape inconsistent with its attested identity"
                         .into(),
@@ -299,6 +379,28 @@ mod tests {
         assert_eq!(
             identity.space.output_normalization,
             IDENTITY_OUTPUT_NORMALIZATION
+        );
+    }
+
+    #[test]
+    fn multilingual_identity_is_distinct_from_same_dimension_minilm() {
+        let baseline = ModelArtifactManifestV1::minilm_native_frankentorch()
+            .expect("registered native MiniLM manifest")
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .expect("derive native MiniLM identity");
+        let multilingual = ModelArtifactManifestV1::multilingual_minilm_native_frankentorch()
+            .expect("registered multilingual MiniLM manifest")
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .expect("derive multilingual MiniLM identity");
+
+        assert_eq!(baseline.space.dimension, multilingual.space.dimension);
+        assert_ne!(
+            baseline.space.fingerprint(),
+            multilingual.space.fingerprint()
+        );
+        assert!(
+            baseline.verify_exact_producer_with(&multilingual).is_err(),
+            "same dimensionality must not admit vectors from a different model space"
         );
     }
 
@@ -359,6 +461,100 @@ mod tests {
         assert_eq!(
             observed, expected,
             "native MiniLM output bits drifted from the registered producer certificate"
+        );
+    }
+
+    fn cosine(left: &[f32], right: &[f32]) -> f32 {
+        left.iter().zip(right).map(|(a, b)| a * b).sum()
+    }
+
+    /// Real multilingual proof against the immutable 12-layer fixture. The test
+    /// covers native XLM-R/SentencePiece tokenization, exact topology admission,
+    /// Chinese-to-English and English-to-Chinese retrieval, mixed code/text, and
+    /// bit-exact repeatability.
+    #[test]
+    #[ignore = "requires a verified multilingual MiniLM model dir via MULTILINGUAL_MINILM_FIXTURE_DIR"]
+    fn multilingual_fixture_proves_cross_language_retrieval_and_determinism() {
+        let dir = std::env::var("MULTILINGUAL_MINILM_FIXTURE_DIR")
+            .expect("set MULTILINGUAL_MINILM_FIXTURE_DIR to paraphrase-multilingual-MiniLM-L12-v2");
+        let load_started = std::time::Instant::now();
+        let embedder = NativeEmbedder::load_multilingual(&dir)
+            .expect("load verified multilingual MiniLM embedder");
+        let load_elapsed = load_started.elapsed();
+        assert_eq!(embedder.dimension(), DIM);
+        assert_eq!(embedder.id(), MULTILINGUAL_EMBEDDER_ID);
+        assert_eq!(
+            embedder.lock_model().expect("lock model").encoder_layers(),
+            12
+        );
+
+        let chinese_ids = embedder
+            .tokenize("如何修复数据库事务死锁？")
+            .expect("tokenize Chinese query");
+        assert!(
+            chinese_ids.len() > 4,
+            "native multilingual tokenizer collapsed Chinese input"
+        );
+
+        let texts = [
+            "如何在 Rust 中处理任务取消和结构化并发？",
+            "In Rust, structured concurrency keeps child tasks scoped and propagates cancellation safely.",
+            "A sourdough starter needs flour, water, and a warm kitchen.",
+            "How should a database transaction deadlock be resolved?",
+            "数据库事务发生死锁时，应回滚其中一个事务，并按固定顺序重试锁操作。",
+            "这份食谱介绍如何烤制苹果派和准备奶油馅料。",
+            "修复 Rust async cancellation bug in worker_queue.rs",
+            "worker_queue.rs 必须在 async 任务取消时归还 reservation，避免消息丢失。",
+            "The watercolor landscape uses blue pigment and cold-press paper.",
+        ];
+        let first_started = std::time::Instant::now();
+        let first = embedder
+            .embed_batch_sync(&texts)
+            .expect("embed multilingual retrieval fixture");
+        let first_elapsed = first_started.elapsed();
+        let repeat_started = std::time::Instant::now();
+        let second = embedder
+            .embed_batch_sync(&texts)
+            .expect("repeat multilingual retrieval fixture");
+        let repeat_elapsed = repeat_started.elapsed();
+        assert_eq!(
+            first, second,
+            "native multilingual output must be bit-exact"
+        );
+
+        for (query, relevant, distractor, label) in [
+            (0, 1, 2, "Chinese query to English discussion"),
+            (3, 4, 5, "English query to Chinese discussion"),
+            (6, 7, 8, "mixed Chinese/code query"),
+        ] {
+            let relevant_score = cosine(&first[query], &first[relevant]);
+            let distractor_score = cosine(&first[query], &first[distractor]);
+            assert!(
+                relevant_score > distractor_score + 0.05,
+                "{label} failed: relevant={relevant_score}, distractor={distractor_score}"
+            );
+        }
+
+        let manifest = ModelArtifactManifestV1::multilingual_minilm_native_frankentorch()
+            .expect("registered multilingual MiniLM manifest");
+        let conformance_texts = &frankensearch_embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        let conformance_started = std::time::Instant::now();
+        let vectors = embedder
+            .embed_batch_sync(conformance_texts)
+            .expect("embed bounded conformance corpus");
+        let conformance_elapsed = conformance_started.elapsed();
+        let observed = frankensearch_core::generation::GoldenVectorCertificateV1::from_exact_f32(
+            conformance_texts,
+            &vectors,
+        )
+        .expect("compute exact multilingual conformance certificate");
+        assert_eq!(observed, manifest.execution.golden_vectors);
+        eprintln!(
+            "multilingual_native_metrics load_ms={} first_9_ms={} repeat_9_ms={} conformance_4_ms={}",
+            load_elapsed.as_millis(),
+            first_elapsed.as_millis(),
+            repeat_elapsed.as_millis(),
+            conformance_elapsed.as_millis()
         );
     }
 }

@@ -25,6 +25,13 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.7.0...main>
 
+### Opt-in multilingual native embeddings and crates.io patch release (2026-08-28, gh#40)
+
+- `frankensearch 0.4.2` adds the distinct `paraphrase-multilingual-minilm-l12-v2` embedding space, backed by its real XLM-R Unigram tokenizer and all 12 Frankentorch encoder layers. The immutable manifest pins the upstream revision and exact checksums for weights, tokenizer, configuration, and tokenizer metadata; acquisition remains explicit and the model is never auto-selected.
+- The multilingual model deliberately does not reuse the existing `minilm-384` identity despite sharing its 384-dimensional geometry. Loaders and persisted identity checks fail closed across the two spaces, and operators must fully backfill then atomically publish a new semantic generation when switching.
+- Frozen-model proof covers Chinese-to-English and English-to-Chinese retrieval, mixed source-code/text input, bit-exact repeat inference, topology/tokenizer attestation, latency, and bounded peak memory. The native weight loader now discovers contiguous encoder depth and transfers large tensors into inference sessions without retaining avoidable duplicate buffers.
+- The changed crates advance to `frankensearch-embed 0.2.4`, `frankensearch-rerank 0.2.5`, and the `frankensearch 0.4.2` facade. Unchanged members retain their existing published versions, avoiding unrelated semver and durable-format churn.
+
 ### Windows Quill writer admission and crates.io patch release (2026-08-27, gh#39)
 
 - `frankensearch-quill 0.2.2` and the `frankensearch 0.4.1` facade add native Windows writer admission using the standard library's OS-backed exclusive file lock. Retained no-delete, no-follow handles bind the admitted directory and `LOCK` path to stable Windows file identities; contention remains a typed busy result, while unsafe lock artifacts and identity drift fail as corruption.

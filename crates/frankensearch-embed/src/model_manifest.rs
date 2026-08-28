@@ -381,6 +381,45 @@ impl ModelArtifactManifestV1 {
         )
     }
 
+    /// Frozen pure-Rust Frankentorch contract for the opt-in multilingual
+    /// `paraphrase-multilingual-MiniLM-L12-v2` embedding space.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the immutable upstream artifact metadata or
+    /// native execution contract is incomplete.
+    pub fn multilingual_minilm_native_frankentorch() -> SearchResult<Self> {
+        let execution = ModelExecutionContractV1 {
+            backend: "frankentorch-native-multilingual-minilm".to_owned(),
+            implementation_revision: "frankensearch-rerank-native-embedder-v2+frankentorch-0.1.0"
+                .to_owned(),
+            protocol_revision: "tokenizers-0.23.1-xlmr-unigram+frankentorch-bert-dynamic-layers-v2"
+                .to_owned(),
+            numeric_profile: "f32-weights-int8-linear-f32-accumulate-v2".to_owned(),
+            weights_format: "safetensors-f32-runtime-int8-linear-v1".to_owned(),
+            tokenizer_family: "huggingface-tokenizers-json-xlmr-unigram-v1".to_owned(),
+            model_preprocessing: "xlmr-special-tokens=true;token-type-ids=zero".to_owned(),
+            sequence_policy: "max-length=512;longest-first;no-padding".to_owned(),
+            pooling: "mean-all-returned-tokens-including-specials-no-padding-v1".to_owned(),
+            output_normalization: "l2-f32-if-norm-gt-zero-else-unchanged-v1".to_owned(),
+            query_instruction: String::new(),
+            document_instruction: String::new(),
+            input_contract: default_plain_text_input_contract(),
+            golden_vectors: GoldenVectorCertificateV1 {
+                corpus_sha256: conformance_corpus_fingerprint()?,
+                vectors_sha256: "c7dcf38c4aff04846e5457e658da704dd3d8ac177182ec2104411c064be7ec7d"
+                    .to_owned(),
+                vector_count: 4,
+                dimension: 384,
+            },
+        };
+        Self::from_download_manifest(
+            &ModelManifest::multilingual_minilm_l12_v2(),
+            "sentence-transformers-huggingface",
+            execution,
+        )
+    }
+
     /// Frozen `FastEmbed` contract for Snowflake Arctic Embed S.
     ///
     /// # Errors
@@ -1381,6 +1420,69 @@ impl ModelManifest {
         }
     }
 
+    /// Opt-in manifest for multilingual `MiniLM` L12 sentence embeddings.
+    ///
+    /// This model is deliberately absent from [`Self::builtin_catalog`]: its
+    /// 384-dimensional output is a distinct vector space from `all-MiniLM-L6-v2`,
+    /// and its larger artifact must never be acquired or selected implicitly.
+    #[must_use]
+    pub fn multilingual_minilm_l12_v2() -> Self {
+        const REVISION: &str = "e8f8c211226b894fcb81acc59f3b34ba3efd5f42";
+        const REPO: &str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
+        Self {
+            id: "paraphrase-multilingual-minilm-l12-v2".to_owned(),
+            version: "v1".to_owned(),
+            display_name: Some("Paraphrase Multilingual MiniLM L12 v2 (opt-in)".to_owned()),
+            description: Some(
+                "Opt-in 384-dimensional multilingual sentence embedder for CJK and mixed-language retrieval"
+                    .to_owned(),
+            ),
+            repo: REPO.to_owned(),
+            revision: REVISION.to_owned(),
+            files: vec![
+                ModelFile {
+                    name: "model.safetensors".to_owned(),
+                    sha256: "eaa086f0ffee582aeb45b36e34cdd1fe2d6de2bef61f8a559a1bbc9bd955917b"
+                        .to_owned(),
+                    size: 470_641_600,
+                    url: None,
+                },
+                ModelFile {
+                    name: "tokenizer.json".to_owned(),
+                    sha256: "2c3387be76557bd40970cec13153b3bbf80407865484b209e655e5e4729076b8"
+                        .to_owned(),
+                    size: 9_081_518,
+                    url: None,
+                },
+                ModelFile {
+                    name: "config.json".to_owned(),
+                    sha256: "6300193cb75e01cf80c96decef7187dfb33094d97cc1490b7ead6ff134476e4e"
+                        .to_owned(),
+                    size: 645,
+                    url: None,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".to_owned(),
+                    sha256: "378eb3bf733eb16e65792d7e3fda5b8a4631387ca04d2015199c4d4f22ae554d"
+                        .to_owned(),
+                    size: 239,
+                    url: None,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".to_owned(),
+                    sha256: "5036ea374ffedd706e3bef33e2e0d6953cb868ef8a490e76e32ba0faa37a6b9b"
+                        .to_owned(),
+                    size: 526,
+                    url: None,
+                },
+            ],
+            license: "Apache-2.0".to_owned(),
+            dimension: Some(384),
+            tier: Some(ModelTier::Quality),
+            download_size_bytes: 479_724_528,
+        }
+    }
+
     /// Built-in manifest for potion-128M style `Model2Vec` assets (fast tier).
     #[must_use]
     pub fn potion_128m() -> Self {
@@ -1720,6 +1822,9 @@ impl ModelManifest {
     pub fn for_embedder(name: &str) -> Option<Self> {
         match name {
             "minilm" => Some(Self::minilm_v2()),
+            "multilingual-minilm" | "paraphrase-multilingual-minilm-l12-v2" => {
+                Some(Self::multilingual_minilm_l12_v2())
+            }
             "snowflake-arctic-s" => Some(Self::snowflake_arctic_s()),
             "nomic-embed" => Some(Self::nomic_embed()),
             "potion-128m" => Some(Self::potion_128m()),
@@ -1774,6 +1879,16 @@ impl ModelManifest {
                 Self::jina_reranker_turbo(),
                 Self::flashrank_nano(),
             ],
+        }
+    }
+
+    /// Models that are discoverable and downloadable only after an explicit
+    /// model selection. They are excluded from default bulk acquisition.
+    #[must_use]
+    pub fn opt_in_catalog() -> ModelManifestCatalog {
+        ModelManifestCatalog {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            models: vec![Self::multilingual_minilm_l12_v2()],
         }
     }
 
@@ -3830,6 +3945,7 @@ mod tests {
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
             ModelArtifactManifestV1::minilm_native_frankentorch().unwrap(),
+            ModelArtifactManifestV1::multilingual_minilm_native_frankentorch().unwrap(),
             ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
             ModelArtifactManifestV1::nomic_fastembed().unwrap(),
         ] {
@@ -3866,6 +3982,7 @@ mod tests {
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
             ModelArtifactManifestV1::minilm_native_frankentorch().unwrap(),
+            ModelArtifactManifestV1::multilingual_minilm_native_frankentorch().unwrap(),
             ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
             ModelArtifactManifestV1::nomic_fastembed().unwrap(),
         ]
@@ -3876,23 +3993,27 @@ mod tests {
         let expected = [
             (
                 "model2vec-native".to_owned(),
-                "aad9f3e3817ebe5bf66b11ac6fcc060821943336100b252900af766ada40c51c".to_owned(),
+                "860061ab2a8de3ad3a36a235ebf856eec6bb3d952840be655b0670595882d3cb".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "6f243d51c65dd78577b99f275909e605c00dc2cf49f0f00526c48627d60ef042".to_owned(),
+                "bad3145f51094f257ed565fa02a6c4c2de9e9294b2e154d6c6086693ac42cfd2".to_owned(),
             ),
             (
                 "frankentorch-native-minilm".to_owned(),
                 "726d6dde1d25946d1c7287a26f92518c158ee6d009b8a76f52748275f063e72c".to_owned(),
             ),
             (
-                "fastembed-onnx".to_owned(),
-                "f11b638ba16e5426efb6bc0ec81bc1a3979ee574bdb5297390cc5777690adab1".to_owned(),
+                "frankentorch-native-multilingual-minilm".to_owned(),
+                "59160d9e43d396d05b4139c99f9feb7922da14868587fca7e33d379821a41405".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "25faf1b6ef58aa5217782bfb5e690a5e219382d834f355f43ac3c229c0a291ad".to_owned(),
+                "ea886582d1908a21790748d3ef9cabfa4992a30889b1736f21dae7b79b3d0463".to_owned(),
+            ),
+            (
+                "fastembed-onnx".to_owned(),
+                "b08612d52b1dea243aa4c9abcd65e156fc411813220a2280d1bf4ac45ef7027e".to_owned(),
             ),
         ];
         assert_eq!(observed, expected);
@@ -5070,6 +5191,25 @@ mod tests {
         assert_eq!(m.tier, Some(ModelTier::Quality));
         assert!(m.display_name.is_some());
         assert!(m.display_name.as_deref().unwrap().contains("quality"));
+    }
+
+    #[test]
+    fn multilingual_minilm_is_production_ready_but_not_in_default_catalog() {
+        let manifest = ModelManifest::multilingual_minilm_l12_v2();
+        manifest.validate().unwrap();
+        assert!(manifest.is_production_ready());
+        assert_eq!(manifest.dimension, Some(384));
+        assert_eq!(manifest.tier, Some(ModelTier::Quality));
+        assert_eq!(manifest.total_size_bytes(), 479_724_528);
+        assert!(
+            !ModelManifest::builtin_catalog()
+                .models
+                .iter()
+                .any(|candidate| candidate.id == manifest.id)
+        );
+        let opt_in = ModelManifest::opt_in_catalog();
+        assert_eq!(opt_in.models, vec![manifest]);
+        opt_in.validate().unwrap();
     }
 
     #[test]

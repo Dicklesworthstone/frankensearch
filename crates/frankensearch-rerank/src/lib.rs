@@ -33,7 +33,7 @@ pub mod native_embedder;
 pub use native::NativeReranker;
 
 #[cfg(feature = "native")]
-pub use native_embedder::NativeEmbedder;
+pub use native_embedder::{NativeEmbedder, NativeEmbeddingModel};
 
 /// Default model directory name for the cross-encoder reranker.
 pub const DEFAULT_MODEL_NAME: &str = "rerank-default-v1";

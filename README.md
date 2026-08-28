@@ -81,6 +81,27 @@ substitutes hash control embeddings for semantic results. Use
 `--no-default-features` only when you intentionally want the model-free lite
 binary.
 
+### Opt-in multilingual native embeddings
+
+The pure-Rust `native` feature also supports the 384-dimensional
+`paraphrase-multilingual-MiniLM-L12-v2` model for CJK and mixed-language
+corpora. Acquisition and activation are both explicit; it is not part of the
+default download set and is never selected merely because it is installed:
+
+```bash
+fsfs download-models paraphrase-multilingual-minilm-l12-v2
+fsfs download-models paraphrase-multilingual-minilm-l12-v2 --verify
+```
+
+Library callers compiled with `--features native` load the verified model
+directory with `NativeEmbedder::load_multilingual(...)` (or the corresponding
+`NativeEmbeddingModel` variant). This producer has a distinct frozen identity
+from `all-MiniLM-L6-v2`, despite sharing its 384-value output dimension. An
+existing semantic index therefore cannot be reused or mixed: switch the model,
+re-embed the complete corpus, and atomically publish that backfilled generation
+before serving queries from it. Identity checks fail closed if vectors from the
+two spaces are combined.
+
 To build the full binary profile with Potion and MiniLM embedded, provision the
 revision-pinned inputs and select the feature explicitly:
 

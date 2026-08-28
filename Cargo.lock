@@ -1689,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-rerank"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "asupersync",
  "criterion",

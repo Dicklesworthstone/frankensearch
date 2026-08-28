@@ -10218,7 +10218,10 @@ impl FsfsRuntime {
     }
 
     fn resolve_download_manifests(&self) -> SearchResult<Vec<ModelManifest>> {
-        let manifests = ModelManifest::builtin_catalog().models;
+        let mut manifests = ModelManifest::builtin_catalog().models;
+        if self.cli_input.download_list || self.cli_input.model_name.is_some() {
+            manifests.extend(ModelManifest::opt_in_catalog().models);
+        }
         let Some(requested) = self.cli_input.model_name.as_deref() else {
             return Ok(manifests);
         };
@@ -10325,6 +10328,9 @@ impl FsfsRuntime {
         match manifest.id.as_str() {
             "potion-multilingual-128m" => "potion-multilingual-128M".to_owned(),
             "all-minilm-l6-v2" => "all-MiniLM-L6-v2".to_owned(),
+            "paraphrase-multilingual-minilm-l12-v2" => {
+                "paraphrase-multilingual-MiniLM-L12-v2".to_owned()
+            }
             "ms-marco-minilm-l-6-v2" => "ms-marco-MiniLM-L-6-v2".to_owned(),
             "flashrank-nano" => "flashrank".to_owned(),
             _ => manifest.id.clone(),
@@ -10929,6 +10935,7 @@ impl FsfsRuntime {
         for manifest in ModelManifest::builtin_catalog()
             .models
             .into_iter()
+            .chain(ModelManifest::opt_in_catalog().models)
             // ubs:ignore -- public model-tier enum, not secret material.
             .filter(|manifest| manifest.tier == Some(expected_tier))
         {
@@ -27887,7 +27894,7 @@ mod tests {
                 .await
                 .expect("list payload");
             assert_eq!(payload.operation, "list");
-            assert_eq!(payload.models.len(), 7);
+            assert_eq!(payload.models.len(), 8);
             let flashrank = payload
                 .models
                 .iter()
@@ -27909,6 +27916,31 @@ mod tests {
                     .all(|entry| matches!(entry.state.as_str(), "missing"))
             );
         });
+    }
+
+    #[test]
+    fn multilingual_model_requires_explicit_download_selection() {
+        let default_download = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Download,
+            ..CliInput::default()
+        });
+        assert!(
+            default_download
+                .resolve_download_manifests()
+                .expect("resolve default download set")
+                .iter()
+                .all(|manifest| manifest.id != "paraphrase-multilingual-minilm-l12-v2")
+        );
+
+        let explicit = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Download,
+            model_name: Some("multilingual-minilm".to_owned()),
+            ..CliInput::default()
+        });
+        let manifests = explicit
+            .resolve_download_manifests()
+            .expect("resolve explicit multilingual download");
+        assert_eq!(manifests, vec![ModelManifest::multilingual_minilm_l12_v2()]);
     }
 
     #[test]
