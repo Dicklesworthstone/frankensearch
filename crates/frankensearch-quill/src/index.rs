@@ -25731,6 +25731,16 @@ mod tests {
                 .commit(&cx)
                 .await
                 .expect("the repaired retry publishes the retained segment");
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("retried publisher snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                generation + 1,
+                "the retried publication must advance exactly one generation"
+            );
             assert!(
                 index.writer_mut().pending_owned_segments.is_empty(),
                 "a successful publication must consume the pending inventory"
