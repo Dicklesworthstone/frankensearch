@@ -17289,9 +17289,11 @@ mod tests {
     fn empty_manifest_has_stable_wire_golden() -> TestResult {
         let manifest = Manifest::empty(1, 0x1122_3344_5566_7788, 0);
         let bytes = manifest.to_bytes()?;
+        // Bytes 36..40 are `CURRENT_ENGINE_VERSION` (0.2.2 => `02 00 02 00`);
+        // the trailing CRC32 covers everything before it.
         let expected = hex_bytes(
             "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
-             01000200000000000000000000000000000000000000000087ee6320",
+             020002000000000000000000000000000000000000000000af477d78",
         );
         assert_eq!(bytes, expected);
         assert_eq!(Manifest::from_bytes(&bytes)?, manifest);
