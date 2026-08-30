@@ -6215,6 +6215,189 @@ pub mod generation_reader {
             assert_eq!(snapshot.head(), slot);
             assert!(Arc::ptr_eq(&cell.load().expect("installed"), &snapshot));
         }
+
+        #[test]
+        fn readers_see_old_or_complete_new_at_every_publisher_crash_point() {
+            use platform::TestBoundary as B;
+            // (crash point, the successor slot is durable afterwards, the torn
+            // slot needs repair rather than reconciliation).
+            let matrix: [(B, bool, bool); 9] = [
+                (B::BeforePublishAttemptFrame, false, false),
+                (B::AfterPublishAttemptFrame, false, false),
+                (B::BeforePublishSlotWrite, false, false),
+                (B::DuringPublishSlotWrite { written: 1024 }, false, true),
+                (B::AfterPublishSlotWrite, true, false),
+                (B::BeforePublishSlotReread, true, false),
+                (B::BeforePublishFloorAdvance, true, false),
+                (B::AfterPublishFloorAdvance, true, false),
+                (B::BeforePublishOwnerFrame, true, false),
+            ];
+            for (index, (crash_at, slot_written, torn)) in matrix.into_iter().enumerate() {
+                let root_path = fixture_root(&format!("reader-crash-{index}"));
+                let root = admit(&root_path);
+                let floor = InMemoryAntiRollbackFloorStoreV1::new();
+                let publisher = publisher(&root);
+                let (genesis, genesis_manifest, genesis_slot) = publish_with_manifest(
+                    &root_path,
+                    &publisher,
+                    1,
+                    None,
+                    ExpectedAuthorityPairV1::default(),
+                    Some(&floor),
+                );
+                let old = opened(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::RequiredExternal,
+                    Some(&floor),
+                ));
+                let old_vector = old.closure().bytes(GenerationComponentRole::Vector);
+
+                // Successor objects are sealed first (outside the lock), then
+                // the publication crashes at the boundary under test.
+                let successor_manifest = manifest(2, Some(genesis));
+                let (len, sha256) = successor_manifest.object_receipt();
+                write_component_objects(&root_path, 2);
+                write_manifest_object(
+                    &root_path,
+                    object_id(2),
+                    &successor_manifest.canonical_bytes(),
+                );
+                let successor =
+                    AuthorityRefV1::new(2, object_id(2), len, sha256, Some(genesis.fingerprint()))
+                        .expect("authority");
+                let expected = ExpectedAuthorityPairV1 {
+                    first: None,
+                    second: Some(genesis_slot),
+                };
+                let outcome = {
+                    let _hook = platform::install_test_hook(move |boundary| {
+                        if boundary == crash_at {
+                            Err(GenerationRootError::new(
+                                GenerationRootErrorKind::Io,
+                                GenerationRootStage::SyncRegularFile,
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    publisher
+                        .publish(successor, expected, Some(&floor), [0x71; 16])
+                        .expect("publication runs")
+                };
+                let PublicationOutcomeV1::CommitOutcomeUnknown(permit) = outcome else {
+                    panic!("crash at {crash_at:?} must be unknown, got {outcome:?}");
+                };
+
+                // Fresh reader between crash and reconcile: either the old
+                // head, complete, or a typed fail-closed refusal — never the
+                // successor and never a mix.
+                let fresh = open(
+                    &root,
+                    GenerationRootSecurityProfileV1::RequiredExternal,
+                    Some(&floor),
+                );
+                if crash_at == B::BeforePublishAttemptFrame {
+                    let snapshot = opened(fresh);
+                    assert_eq!(snapshot.head(), genesis_slot, "{crash_at:?}");
+                    assert_eq!(
+                        snapshot.health(),
+                        SnapshotHealthV1::ExternallyAnchored { cas_version: 1 }
+                    );
+                } else {
+                    match fresh {
+                        SnapshotOpenOutcomeV1::Refused(refusal) => assert_eq!(
+                            refusal,
+                            SnapshotRefusalV1::PendingReconciliation,
+                            "{crash_at:?}"
+                        ),
+                        SnapshotOpenOutcomeV1::Opened(snapshot) => panic!(
+                            "{crash_at:?}: served head {} ({:?}) while an attempt was unresolved (permit stage {:?})",
+                            snapshot.head().authority.sequence,
+                            snapshot.health(),
+                            permit.stage
+                        ),
+                    }
+                }
+                // The retained reader is untouched by any of it.
+                assert_eq!(old.head(), genesis_slot);
+                assert_eq!(old.manifest(), &genesis_manifest);
+                assert_eq!(
+                    &*old.closure().bytes(GenerationComponentRole::Vector),
+                    &*old_vector
+                );
+
+                // Reconcile, then the reader converges to exactly one verdict.
+                let verdict = publisher
+                    .reconcile(&permit, Some(&floor))
+                    .expect("reconcile runs");
+                if torn {
+                    assert!(
+                        matches!(verdict, ReconcileOutcomeV1::RepairRequired(_)),
+                        "{crash_at:?}: {verdict:?}"
+                    );
+                    // Blocked until repair: still fail-closed, still typed.
+                    assert_eq!(
+                        refused(open(
+                            &root,
+                            GenerationRootSecurityProfileV1::RequiredExternal,
+                            Some(&floor)
+                        )),
+                        SnapshotRefusalV1::PendingReconciliation,
+                        "{crash_at:?}"
+                    );
+                    assert_eq!(old.head(), genesis_slot);
+                    continue;
+                }
+                if slot_written {
+                    assert!(
+                        matches!(verdict, ReconcileOutcomeV1::Committed { .. }),
+                        "{crash_at:?}: {verdict:?}"
+                    );
+                } else {
+                    assert_eq!(verdict, ReconcileOutcomeV1::NotCommitted, "{crash_at:?}");
+                    let after_reconcile = open(
+                        &root,
+                        GenerationRootSecurityProfileV1::RequiredExternal,
+                        Some(&floor),
+                    );
+                    if crash_at == B::BeforePublishAttemptFrame {
+                        // Nothing ever reached the LOCK: the old head serves.
+                        assert_eq!(opened(after_reconcile).head(), genesis_slot);
+                    } else {
+                        // The attempt frame still has no completing owner frame.
+                        assert_eq!(
+                            refused(after_reconcile),
+                            SnapshotRefusalV1::PendingReconciliation,
+                            "{crash_at:?}"
+                        );
+                    }
+                    let retry = publisher
+                        .publish(successor, expected, Some(&floor), [0x72; 16])
+                        .expect("retry runs");
+                    assert!(
+                        matches!(retry, PublicationOutcomeV1::Committed { .. }),
+                        "{crash_at:?}: {retry:?}"
+                    );
+                }
+                let converged = opened(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::RequiredExternal,
+                    Some(&floor),
+                ));
+                assert_eq!(converged.head().authority, successor, "{crash_at:?}");
+                assert_eq!(converged.manifest(), &successor_manifest);
+                assert_eq!(
+                    converged.health(),
+                    SnapshotHealthV1::ExternallyAnchored { cas_version: 2 },
+                    "{crash_at:?}"
+                );
+                assert_eq!(
+                    &*converged.closure().bytes(GenerationComponentRole::Vector),
+                    component_bytes(GenerationComponentRole::Vector, 2).as_slice()
+                );
+                assert_eq!(old.head(), genesis_slot, "{crash_at:?}");
+            }
+        }
     }
 }
 
