@@ -1054,4 +1054,138 @@ mod tests {
         assert_eq!(c.expanded_start, 7);
         assert!(c.is_exhausted());
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// A non-increasing ordering over a small score alphabet so ties are
+        /// frequent at both page edges.
+        fn ordering() -> impl Strategy<Value = Vec<f32>> {
+            proptest::collection::vec(
+                prop_oneof![Just(7.0_f32), Just(5.0), Just(3.0), Just(2.0), Just(1.0)],
+                0..=12,
+            )
+            .prop_map(|mut scores| {
+                scores.sort_by(|left, right| right.total_cmp(left));
+                scores
+            })
+        }
+
+        /// Brute-force oracle for what `from_native_prefix` must decide.
+        fn expected(
+            scores: &[f32],
+            offset: u64,
+            limit: u64,
+            prefix_len: usize,
+        ) -> Result<(u64, u64, bool), ()> {
+            let m = u64::try_from(scores.len()).expect("small");
+            let n = u64::try_from(prefix_len).expect("small");
+            let start = offset.min(m);
+            let end = offset.saturating_add(limit).min(m);
+            if limit == 0 {
+                // No evidence and no boundary, but exhaustion is still the
+                // closed `b == M` fact: true exactly when the page sits at M.
+                return Ok((start, start, start == m));
+            }
+            if start >= end {
+                return Ok((m, m, true));
+            }
+            if end > n {
+                return Err(());
+            }
+            let at = |rank: u64| scores[usize::try_from(rank).expect("small")];
+            let mut a = start;
+            while a > 0 && at(a - 1).to_bits() == at(start).to_bits() {
+                a -= 1;
+            }
+            let mut b = end;
+            while b < n && at(b).to_bits() == at(end - 1).to_bits() {
+                b += 1;
+            }
+            if b == n && n < m {
+                return Err(());
+            }
+            Ok((a, b, b == m))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            #[test]
+            fn derivation_agrees_with_the_brute_force_oracle_and_is_closed(
+                scores in ordering(),
+                offset in 0_u64..=14,
+                limit in 0_u64..=6,
+                prefix_fraction in 0_u8..=12,
+            ) {
+                let prefix_len = usize::from(prefix_fraction).min(scores.len());
+                let bits = scores[..prefix_len].iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+                let m = u64::try_from(scores.len()).expect("small");
+                let derived = CutoffCertificateV1::from_native_prefix(m, offset, limit, &bits, provenance());
+                match expected(&scores, offset, limit, prefix_len) {
+                    Err(()) => prop_assert!(
+                        matches!(derived, Err(CutoffDerivationError::TrailingGroupTruncated { .. })),
+                        "expected insufficiency, got {derived:?}"
+                    ),
+                    Ok((a, b, exhausted)) => {
+                        let certificate = derived.expect("brute force says certifiable");
+                        prop_assert_eq!(certificate.validate(), Ok(()));
+                        prop_assert_eq!(certificate.expanded_start, a);
+                        prop_assert_eq!(certificate.expanded_end(), b);
+                        prop_assert_eq!(certificate.is_exhausted(), exhausted);
+                        prop_assert_eq!(certificate.page.start, offset.min(m));
+                        prop_assert_eq!(certificate.page.end, offset.saturating_add(limit).min(m));
+                        // P ⊆ E for a non-empty page.
+                        if certificate.page.start < certificate.page.end {
+                            prop_assert!(a <= certificate.page.start && certificate.page.end <= b);
+                            // Whole groups at both edges, witnessed by strict neighbours.
+                            let at = |rank: u64| scores[usize::try_from(rank).expect("small")];
+                            if a > 0 {
+                                prop_assert!(at(a - 1) > at(a));
+                            }
+                            if b < m {
+                                prop_assert!(at(b) < at(b - 1));
+                            }
+                        }
+                        // Content addressing is deterministic and round-trips.
+                        let bytes = certificate.canonical_bytes().expect("bytes");
+                        let decoded = CutoffCertificateV1::from_canonical_bytes(&bytes).expect("decode");
+                        prop_assert_eq!(&decoded, &certificate);
+                        prop_assert_eq!(decoded.digest_sha256(), certificate.digest_sha256());
+                    }
+                }
+            }
+
+            #[test]
+            fn the_trailing_witness_is_essential_capacity_never_substitutes(
+                scores in ordering(),
+                offset in 0_u64..=14,
+                limit in 1_u64..=6,
+            ) {
+                let m = u64::try_from(scores.len()).expect("small");
+                let bits = scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+                let Ok(certificate) = CutoffCertificateV1::from_native_prefix(m, offset, limit, &bits, provenance()) else {
+                    return Ok(());
+                };
+                if certificate.is_exhausted() || certificate.page_is_empty() {
+                    return Ok(());
+                }
+                // Drop everything from the witness rank `b` onward: the same
+                // page with the same requested capacity is no longer certifiable.
+                let b = usize::try_from(certificate.expanded_end()).expect("small");
+                let without_witness = &bits[..b];
+                let truncated = matches!(
+                    CutoffCertificateV1::from_native_prefix(m, offset, limit, without_witness, provenance()),
+                    Err(CutoffDerivationError::TrailingGroupTruncated { .. })
+                );
+                prop_assert!(truncated);
+                // And a certificate that CLAIMS exhaustion over that shorter
+                // prefix is refused by the validator.
+                let mut forged = certificate.clone();
+                forged.trailing_boundary = exhausted();
+                prop_assert!(forged.validate().is_err());
+            }
+        }
+    }
 }

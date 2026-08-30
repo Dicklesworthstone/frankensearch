@@ -70,6 +70,7 @@ criterion = { workspace = true }
 frankensearch-quill = { workspace = true, features = ["bench-internals"] }
 jsonschema = { version = "0.50", default-features = false }
 rayon = { workspace = true }
+proptest = { workspace = true }
 tempfile = "3.27"
 tracing-subscriber = { workspace = true }
 
