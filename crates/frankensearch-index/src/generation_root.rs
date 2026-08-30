@@ -149,6 +149,8 @@ pub enum GenerationRootStage {
     /// Positional write of one authenticated slot into the AUTHORITY anchor;
     /// phases as for [`Self::WriteLockFrame`].
     WriteAuthoritySlot,
+    /// Bounded no-follow enumeration of the retained root directory.
+    InventoryDirectory,
 }
 
 impl GenerationRootStage {
@@ -156,6 +158,7 @@ impl GenerationRootStage {
         match self {
             Self::WriteLockFrame => "write_lock_frame",
             Self::WriteAuthoritySlot => "write_authority_slot",
+            Self::InventoryDirectory => "inventory_directory",
             Self::PlatformGate => "platform_gate",
             Self::ParseRootRoute => "parse_root_route",
             Self::ParseRelativeRoute => "parse_relative_route",
@@ -788,6 +791,137 @@ impl fmt::Debug for ConfinedGenerationPath {
     }
 }
 
+/// Object type of one retained-root directory entry, as reported by a
+/// no-follow `statat` on the retained root descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationRootEntryKind {
+    /// Regular file.
+    RegularFile,
+    /// Directory.
+    Directory,
+    /// Symbolic link (never followed).
+    Symlink,
+    /// Any other object (device, socket, FIFO…).
+    Other,
+}
+
+/// One entry directly inside the retained root, identified without
+/// following links and without adopting its pathname.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GenerationRootEntry {
+    name: std::ffi::OsString,
+    kind: GenerationRootEntryKind,
+    device: u64,
+    inode: u64,
+    hard_links: u64,
+    byte_len: u64,
+    mode: u32,
+}
+
+impl GenerationRootEntry {
+    /// Entry name (one component, never `.` or `..`).
+    #[must_use]
+    pub fn name(&self) -> &std::ffi::OsStr {
+        &self.name
+    }
+
+    /// Object type.
+    #[must_use]
+    pub const fn kind(&self) -> GenerationRootEntryKind {
+        self.kind
+    }
+
+    /// Device the object lives on.
+    #[must_use]
+    pub const fn device(&self) -> u64 {
+        self.device
+    }
+
+    /// Inode number.
+    #[must_use]
+    pub const fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    /// Hard-link count.
+    #[must_use]
+    pub const fn hard_links(&self) -> u64 {
+        self.hard_links
+    }
+
+    /// Byte length (for a symlink, the target length).
+    #[must_use]
+    pub const fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    /// Full `st_mode` (type bits included).
+    #[must_use]
+    pub const fn mode(&self) -> u32 {
+        self.mode
+    }
+}
+
+/// Bounded, name-sorted inventory of a retained root directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationRootInventory {
+    entries: Vec<GenerationRootEntry>,
+}
+
+impl GenerationRootInventory {
+    /// Entries sorted by name.
+    #[must_use]
+    pub fn entries(&self) -> &[GenerationRootEntry] {
+        &self.entries
+    }
+
+    /// Look one entry up by exact name.
+    #[must_use]
+    pub fn entry(&self, name: &std::ffi::OsStr) -> Option<&GenerationRootEntry> {
+        self.entries
+            .binary_search_by(|entry| entry.name.as_os_str().cmp(name))
+            .ok()
+            .map(|index| &self.entries[index])
+    }
+
+    /// Entries whose names are not in `declared`: the undeclared residue a
+    /// declared-role closure must refuse, named rather than generic.
+    #[must_use]
+    pub fn undeclared<'a>(&'a self, declared: &[&std::ffi::OsStr]) -> Vec<&'a GenerationRootEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| !declared.contains(&entry.name.as_os_str()))
+            .collect()
+    }
+
+    /// Groups of two or more names that resolve to one `(device, inode)`:
+    /// aliases inside the root. Empty when every name is its own object.
+    #[must_use]
+    pub fn aliases(&self) -> Vec<Vec<&GenerationRootEntry>> {
+        let mut by_identity: Vec<((u64, u64), Vec<&GenerationRootEntry>)> = Vec::new();
+        for entry in &self.entries {
+            let identity = (entry.device, entry.inode);
+            match by_identity.iter_mut().find(|(key, _)| *key == identity) {
+                Some((_, group)) => group.push(entry),
+                None => by_identity.push((identity, vec![entry])),
+            }
+        }
+        by_identity
+            .into_iter()
+            .filter_map(|(_, group)| (group.len() > 1).then_some(group))
+            .collect()
+    }
+
+    /// Entries whose device differs from `device` (the root's device):
+    /// cross-device objects a closure must refuse.
+    #[must_use]
+    pub fn foreign_device(&self, device: u64) -> Vec<&GenerationRootEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.device != device)
+            .collect()
+    }
+}
 /// Internal qualified directory capability used while atomically binding the
 /// named LOCK and AUTHORITY anchors.
 struct QualifiedGenerationDirectory {
@@ -930,6 +1064,10 @@ impl QualifiedGenerationDirectory {
     /// required primitive fails.
     fn sync_directory_durable(&self) -> GenerationRootResult<()> {
         platform::sync_root_directory(&self.inner)
+    }
+
+    fn inventory(&self) -> GenerationRootResult<GenerationRootInventory> {
+        platform::inventory(&self.inner).map(|entries| GenerationRootInventory { entries })
     }
 
     /// Admit an existing fixed-size private control anchor as a persistent
@@ -1194,6 +1332,27 @@ impl QualifiedGenerationRoot {
         self.directory.sync_directory_durable()
     }
 
+    /// Enumerate every entry directly inside the retained root directory.
+    ///
+    /// The scan runs on the retained root descriptor (never a pathname
+    /// re-walk), identifies each entry with a no-follow `statat`, and is
+    /// bounded by [`GENERATION_ROOT_MAX_DIRECTORY_ENTRIES`] and
+    /// [`GENERATION_ROOT_MAX_DIRECTORY_NAME_BYTES`]. The root is revalidated
+    /// before and after the scan. Entries are returned sorted by name so two
+    /// inventories of one unchanged directory are equal.
+    ///
+    /// This is the closure primitive: a consumer that knows the declared
+    /// component set of a generation can now prove that nothing undeclared,
+    /// no alias, and no foreign-device object sits beside it (bd-v3hgo),
+    /// without adopting any pathname.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed route, identity, resource-limit, or platform error.
+    pub fn inventory(&self) -> GenerationRootResult<GenerationRootInventory> {
+        self.directory.inventory()
+    }
+
     /// Acquire a non-blocking shared guard on the exact named LOCK anchor and
     /// capture fresh stable LOCK and AUTHORITY images.
     ///
@@ -1363,6 +1522,16 @@ impl GenerationRootReadGuard<'_> {
             self.lock_image.witness,
             self.authority_image.witness,
         )
+    }
+
+    /// Bounded no-follow inventory of the retained root, taken while the
+    /// shared anchor lock is held.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`QualifiedGenerationRoot::inventory`].
+    pub fn inventory(&self) -> GenerationRootResult<GenerationRootInventory> {
+        self.root.inventory()
     }
 
     /// Borrow the exact named LOCK image.
@@ -4971,6 +5140,151 @@ pub mod generation_reader {
                 SnapshotRefusalV1::Authority(_)
             ));
         }
+
+        #[test]
+        fn inventory_lists_exact_entries_sorted_with_identity_and_no_pathname_adoption() {
+            use crate::generation_root::GenerationRootEntryKind;
+            use std::ffi::OsStr;
+
+            let root_path = fixture_root("inventory-exact");
+            let root = admit(&root_path);
+            let manifest = manifest(1, None);
+            let bytes = manifest.canonical_bytes();
+            let manifest_path = write_manifest_object(&root_path, object_id(1), &bytes);
+            let manifest_name = manifest_path
+                .file_name()
+                .expect("manifest name")
+                .to_os_string();
+
+            let inventory = root.inventory().expect("inventory scans");
+            let names: Vec<&OsStr> = inventory.entries().iter().map(|e| e.name()).collect();
+            let mut expected = vec![
+                OsStr::new("AUTHORITY"),
+                OsStr::new("LOCK"),
+                manifest_name.as_os_str(),
+            ];
+            expected.sort();
+            assert_eq!(names, expected, "sorted, exact, nothing else");
+            for entry in inventory.entries() {
+                assert_eq!(entry.kind(), GenerationRootEntryKind::RegularFile);
+                assert_eq!(entry.hard_links(), 1);
+                assert_eq!(entry.device(), root.witness().device());
+            }
+            let authority = inventory
+                .entry(OsStr::new("AUTHORITY"))
+                .expect("AUTHORITY listed");
+            assert_eq!(authority.byte_len(), GENERATION_ROOT_AUTHORITY_FILE_BYTES);
+            assert_eq!(
+                authority.inode(),
+                root.anchor_witnesses().authority().inode()
+            );
+            assert_eq!(
+                inventory
+                    .entry(OsStr::new("LOCK"))
+                    .expect("LOCK listed")
+                    .inode(),
+                root.anchor_witnesses().lock().inode()
+            );
+            assert_eq!(
+                inventory
+                    .entry(&manifest_name)
+                    .expect("manifest listed")
+                    .byte_len(),
+                u64::try_from(bytes.len()).expect("len")
+            );
+            assert!(inventory.entry(OsStr::new("missing")).is_none());
+
+            // Closure helpers: the manifest is the only undeclared residue
+            // relative to the anchors; no aliases; nothing off-device.
+            let undeclared = inventory.undeclared(&[OsStr::new("LOCK"), OsStr::new("AUTHORITY")]);
+            assert_eq!(undeclared.len(), 1);
+            assert_eq!(undeclared[0].name(), manifest_name.as_os_str());
+            assert!(inventory.aliases().is_empty());
+            assert!(inventory.foreign_device(root.witness().device()).is_empty());
+
+            // Stable across repeats and identical under the shared lock.
+            assert_eq!(root.inventory().expect("second scan"), inventory);
+            let guard = root.read_guard().expect("shared guard");
+            assert_eq!(guard.inventory().expect("locked scan"), inventory);
+            guard.release().expect("release");
+        }
+
+        #[test]
+        fn inventory_reports_aliases_symlinks_and_subdirectories_without_following() {
+            use crate::generation_root::GenerationRootEntryKind;
+            use std::ffi::OsStr;
+
+            let root_path = fixture_root("inventory-planted");
+            let root = admit(&root_path);
+            let manifest = manifest(1, None);
+            let manifest_path =
+                write_manifest_object(&root_path, object_id(1), &manifest.canonical_bytes());
+            let manifest_name = manifest_path
+                .file_name()
+                .expect("manifest name")
+                .to_os_string();
+            let clean = root.inventory().expect("control scan");
+            assert!(clean.aliases().is_empty());
+
+            // Planted alone, each with the clean control above.
+            fs::hard_link(&manifest_path, root_path.join("alias")).expect("hard link");
+            std::os::unix::fs::symlink("LOCK", root_path.join("link")).expect("symlink");
+            DirBuilder::new()
+                .mode(0o700)
+                .create(root_path.join("nested"))
+                .expect("subdirectory");
+
+            let planted = root.inventory().expect("planted scan");
+            assert_eq!(planted.entries().len(), clean.entries().len() + 3);
+
+            let aliases = planted.aliases();
+            assert_eq!(aliases.len(), 1, "exactly one alias group");
+            let mut alias_names: Vec<&OsStr> = aliases[0].iter().map(|e| e.name()).collect();
+            alias_names.sort();
+            assert_eq!(
+                alias_names,
+                vec![manifest_name.as_os_str(), OsStr::new("alias")]
+            );
+            assert_eq!(
+                planted
+                    .entry(&manifest_name)
+                    .expect("manifest")
+                    .hard_links(),
+                2
+            );
+
+            let link = planted.entry(OsStr::new("link")).expect("symlink listed");
+            assert_eq!(link.kind(), GenerationRootEntryKind::Symlink);
+            assert_ne!(
+                link.inode(),
+                planted.entry(OsStr::new("LOCK")).expect("LOCK").inode(),
+                "the link is identified, never followed"
+            );
+            assert_eq!(
+                planted.entry(OsStr::new("nested")).expect("dir").kind(),
+                GenerationRootEntryKind::Directory
+            );
+
+            // The undeclared residue names every planted entry.
+            let mut undeclared: Vec<&OsStr> = planted
+                .undeclared(&[
+                    OsStr::new("LOCK"),
+                    OsStr::new("AUTHORITY"),
+                    manifest_name.as_os_str(),
+                ])
+                .into_iter()
+                .map(|e| e.name())
+                .collect();
+            undeclared.sort();
+            assert_eq!(
+                undeclared,
+                vec![
+                    OsStr::new("alias"),
+                    OsStr::new("link"),
+                    OsStr::new("nested")
+                ]
+            );
+        }
     }
 }
 
@@ -5238,6 +5552,7 @@ mod platform {
         GenerationRootLockMode, GenerationRootObjectWitness, GenerationRootResult,
         GenerationRootStage, QualifiedFilesystem,
     };
+    use super::{GenerationRootEntry, GenerationRootEntryKind};
     use rustix::fd::{AsFd, OwnedFd};
     use rustix::fs::{FileType, Mode, OFlags, fstat, fstatfs, fstatvfs};
     use rustix::io::{Errno, pread};
@@ -9729,6 +10044,52 @@ mod platform {
         Ok(())
     }
 
+    /// Bounded no-follow inventory of the retained root directory.
+    pub(super) fn inventory(root: &RootHandle) -> GenerationRootResult<Vec<GenerationRootEntry>> {
+        use rustix::fs::{AtFlags, Dir, FileType, statat};
+
+        let stage = GenerationRootStage::InventoryDirectory;
+        revalidate_root(root)?;
+        let mut directory =
+            Dir::read_from(&root.state.descriptor).map_err(|error| os_error(stage, error))?;
+        let mut entries = Vec::new();
+        let mut entry_count = 0_usize;
+        let mut name_bytes = 0_usize;
+        while let Some(entry) = directory.read() {
+            let entry = entry.map_err(|error| os_error(stage, error))?;
+            let name = entry.file_name();
+            let raw = name.to_bytes();
+            if raw == b"." || raw == b".." {
+                continue;
+            }
+            entry_count = entry_count.saturating_add(1);
+            name_bytes = name_bytes.saturating_add(raw.len());
+            validate_directory_scan_counts(entry_count, name_bytes, stage, 0)?;
+            let stat = statat(&root.state.descriptor, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| os_error(stage, error))?;
+            let kind = match FileType::from_raw_mode(stat.st_mode) {
+                FileType::RegularFile => GenerationRootEntryKind::RegularFile,
+                FileType::Directory => GenerationRootEntryKind::Directory,
+                FileType::Symlink => GenerationRootEntryKind::Symlink,
+                _ => GenerationRootEntryKind::Other,
+            };
+            let byte_len = u64::try_from(stat.st_size).map_err(|_| {
+                GenerationRootError::new(GenerationRootErrorKind::ObjectChanged, stage)
+            })?;
+            entries.push(GenerationRootEntry {
+                name: OsStr::from_bytes(raw).to_os_string(),
+                kind,
+                device: stat_device_as_u64(stat.st_dev),
+                inode: stat_inode_as_u64(stat.st_ino),
+                hard_links: stat_link_count_as_u64(stat.st_nlink),
+                byte_len,
+                mode: stat_mode_as_u32(stat.st_mode),
+            });
+        }
+        revalidate_root(root)?;
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(entries)
+    }
     fn validate_directory_scan_counts(
         entry_count: usize,
         name_bytes: usize,
@@ -9939,6 +10300,10 @@ mod platform {
     }
 
     pub(super) fn sync_root_directory(root: &RootHandle) -> GenerationRootResult<()> {
+        match *root {}
+    }
+
+    pub(super) fn inventory(root: &RootHandle) -> GenerationRootResult<Vec<GenerationRootEntry>> {
         match *root {}
     }
 
