@@ -8740,6 +8740,110 @@ impl FsfsRuntime {
         })
     }
 
+    /// Offer one interactive consent prompt for missing registered semantic
+    /// models before an indexing run resolves its embedder.
+    ///
+    /// Library APIs never prompt; this is a CLI-only convenience that shows the
+    /// exact model id, revision, license, byte budget and destination, then
+    /// downloads through the same verified lifecycle as `fsfs download-models`
+    /// with [`ConsentSource::Interactive`]. Declining, offline mode, a
+    /// non-interactive terminal, or a machine output format leaves the
+    /// existing typed readiness error in charge.
+    async fn maybe_offer_interactive_model_provisioning(&self, cx: &Cx) -> SearchResult<()> {
+        let model_root = self.resolve_download_model_root()?;
+        let mut missing = Vec::new();
+        for manifest in ModelManifest::builtin_catalog().models {
+            let install_dir = Self::manifest_install_dir_name(&manifest);
+            let destination = model_root.join(&install_dir);
+            let (_, verified, _) = Self::inspect_manifest_installation(&manifest, &destination);
+            if verified != Some(true) {
+                missing.push((manifest, destination));
+            }
+        }
+
+        let interactive_terminal =
+            std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+        let decision = interactive_model_provisioning_decision(
+            self.config.indexing.offline,
+            interactive_terminal,
+            self.cli_input.format == OutputFormat::Table,
+            missing.len(),
+        );
+        if decision != InteractiveModelProvisioning::Offer {
+            debug!(
+                ?decision,
+                missing = missing.len(),
+                "no interactive model provisioning offer"
+            );
+            return Ok(());
+        }
+
+        let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
+        let total_bytes: u64 = missing
+            .iter()
+            .map(|(manifest, _)| manifest.total_size_bytes())
+            .fold(0, u64::saturating_add);
+        println!(
+            "{}",
+            paint(
+                "Semantic search needs registered models that are not verified in the model cache.",
+                "38;5;220",
+                no_color,
+            )
+        );
+        for (manifest, destination) in &missing {
+            println!(
+                "  {}  revision {}  license {}  {}  -> {}",
+                manifest.id,
+                manifest.revision,
+                manifest.license,
+                humanize_bytes(manifest.total_size_bytes()),
+                destination.display()
+            );
+        }
+        println!(
+            "Download {} ({} total) now? This is the same verified flow as `fsfs download-models`. [y/N]",
+            missing.len(),
+            humanize_bytes(total_bytes)
+        );
+        let mut stdout = std::io::stdout();
+        write!(stdout, "{} ", paint("consent>", "1;38;5;45", no_color)).map_err(tui_io_error)?;
+        stdout.flush().map_err(tui_io_error)?;
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(SearchError::Io)?;
+        if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes" | "YES") {
+            println!(
+                "Not downloading. Run `fsfs download-models` when ready; semantic results never use the hash control embedder."
+            );
+            return Ok(());
+        }
+
+        fs::create_dir_all(&model_root)?;
+        let downloader = ModelDownloader::with_defaults();
+        for (manifest, destination) in missing {
+            cx.checkpoint().map_err(|error| SearchError::Cancelled {
+                phase: "interactive_model_provisioning".to_owned(),
+                reason: cx
+                    .cancel_reason()
+                    .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+            })?;
+            let mut lifecycle = ModelLifecycle::new(
+                manifest.clone(),
+                DownloadConsent::granted(ConsentSource::Interactive),
+            );
+            let staged = downloader
+                .download_model(cx, &manifest, &model_root, &mut lifecycle, |progress| {
+                    eprintln!("{progress}");
+                })
+                .await?;
+            manifest.promote_verified_installation(&staged, &destination)?;
+            println!("  verified {} -> {}", manifest.id, destination.display());
+        }
+        Ok(())
+    }
+
     fn run_doctor_command(&self) -> SearchResult<()> {
         let payload = self.collect_doctor_payload()?;
         let failed = matches!(payload.overall, DoctorVerdict::Fail);
@@ -11137,6 +11241,12 @@ impl FsfsRuntime {
         // 1. Resolve and prove the real semantic embedder before creating any
         // vector/cache artifacts. Test builds may retain their explicit hash
         // control fixture, but no production indexing path admits it.
+        //
+        // An interactive terminal may first be offered exactly one consent
+        // prompt to provision missing registered models; every other lane
+        // (offline, non-TTY, machine formats, declined) falls through to the
+        // existing typed readiness error with its `fsfs download-models` argv.
+        self.maybe_offer_interactive_model_provisioning(cx).await?;
         let embedder = self.resolve_fast_embedder()?;
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
         Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
@@ -19825,6 +19935,49 @@ const fn model_free_semantic_recovery_guidance() -> &'static str {
     "Search mode: lexical-only. This explicit lite binary has download support but no Model2Vec/FastEmbed loaders, so downloaded model files alone cannot activate semantic retrieval. Install a standard fsfs build, or rebuild with `cargo build --release -p frankensearch-fsfs`; then provision verified models with `fsfs download-models`. Hash control embeddings are never admitted as semantic results."
 }
 
+/// Outcome of the interactive model-provisioning policy for one indexing run.
+///
+/// Only [`Self::Offer`] prompts. Every other variant is a deliberate
+/// non-prompt so library semantics, offline runs and machine consumers never
+/// see a question on stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveModelProvisioning {
+    /// Every registered model is present and verified; nothing to offer.
+    NothingMissing,
+    /// Offline mode forbids acquisition; fail with the local plan instead.
+    SkipOffline,
+    /// stdout/stdin is not an interactive terminal.
+    SkipNonInteractive,
+    /// A machine-readable output format is in use; emit the typed error only.
+    SkipMachineFormat,
+    /// Show the one-shot consent prompt.
+    Offer,
+}
+
+/// Pure decision behind [`FsfsRuntime::maybe_offer_interactive_model_provisioning`].
+///
+/// Offline wins over everything so an offline run never even reaches the
+/// terminal check; the terminal check wins over the format check because a
+/// machine format on a TTY is still a script.
+const fn interactive_model_provisioning_decision(
+    offline: bool,
+    interactive_terminal: bool,
+    table_format: bool,
+    missing_models: usize,
+) -> InteractiveModelProvisioning {
+    if missing_models == 0 {
+        InteractiveModelProvisioning::NothingMissing
+    } else if offline {
+        InteractiveModelProvisioning::SkipOffline
+    } else if !interactive_terminal {
+        InteractiveModelProvisioning::SkipNonInteractive
+    } else if !table_format {
+        InteractiveModelProvisioning::SkipMachineFormat
+    } else {
+        InteractiveModelProvisioning::Offer
+    }
+}
+
 #[cfg(feature = "semantic-loaders")]
 const fn semantic_model_doctor_recovery_guidance() -> &'static str {
     "provision the configured model with `fsfs download-models`, verify it with `fsfs download-models --verify`, or point FRANKENSEARCH_MODEL_DIR at a verified cache"
@@ -19861,6 +20014,51 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::future::{Future, poll_fn};
+
+    #[test]
+    fn interactive_model_provisioning_offers_only_on_a_table_tty_with_missing_models() {
+        use super::{InteractiveModelProvisioning as P, interactive_model_provisioning_decision};
+
+        // Nothing missing never prompts, regardless of every other input.
+        assert_eq!(
+            interactive_model_provisioning_decision(false, true, true, 0),
+            P::NothingMissing
+        );
+        assert_eq!(
+            interactive_model_provisioning_decision(true, false, false, 0),
+            P::NothingMissing
+        );
+        // Offline wins before the terminal is even consulted.
+        assert_eq!(
+            interactive_model_provisioning_decision(true, true, true, 2),
+            P::SkipOffline
+        );
+        // A script (non-TTY) never sees a question, even in table format.
+        assert_eq!(
+            interactive_model_provisioning_decision(false, false, true, 1),
+            P::SkipNonInteractive
+        );
+        // A machine format on a TTY is still machine output.
+        assert_eq!(
+            interactive_model_provisioning_decision(false, true, false, 1),
+            P::SkipMachineFormat
+        );
+        // The one lane that prompts.
+        assert_eq!(
+            interactive_model_provisioning_decision(false, true, true, 1),
+            P::Offer
+        );
+    }
+
+    #[test]
+    fn interactive_model_provisioning_is_never_offered_under_test_stdio() {
+        // Test binaries run without an interactive stdin/stdout, so the index
+        // scaffold's pre-resolution hook must be a silent no-op here; this pins
+        // that the hook cannot block a headless run on a prompt.
+        let interactive_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && std::io::IsTerminal::is_terminal(&std::io::stdin());
+        assert!(!interactive_terminal || std::env::var_os("FSFS_ALLOW_TTY_TEST").is_some());
+    }
     use std::io::{ErrorKind, Write as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
