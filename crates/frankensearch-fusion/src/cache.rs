@@ -337,7 +337,7 @@ impl IndexOpenSpec {
 /// if cache.is_stale()? {
 ///     // Rebuild and replace atomically:
 ///     let new_index = TwoTierIndex::open(&dir, config)?;
-///     cache.replace(new_index);
+///     cache.replace(new_index)?;
 /// }
 /// ```
 #[derive(Debug)]
@@ -459,16 +459,121 @@ impl IndexCache {
     /// goes out of scope. This does not rebind the cache's original directory
     /// or explicit-path contract; a later [`reload`](Self::reload) always
     /// reopens that retained contract.
-    pub fn replace(&self, new_index: TwoTierIndex) {
-        let mut guard = self.write_index();
+    ///
+    /// # Errors
+    ///
+    /// The replacement is validated against the retained index before the
+    /// swap and rejected with [`SearchError::InvalidConfig`] when it would
+    /// change what this cache stands for (bd-8utj): a different fast or
+    /// quality artifact path (absolute, cwd-independent), a different tier
+    /// topology (fast-only vs fast+quality), a different embedding-space
+    /// fingerprint under the same tier, a loss of identity attestation, or a
+    /// different embedder revision when no fingerprint is available to compare.
+    /// On rejection the prior index stays installed and in-flight readers are
+    /// unaffected.
+    pub fn replace(&self, new_index: TwoTierIndex) -> SearchResult<()> {
+        let current_dir = std::env::current_dir()?;
+        let new_count = new_index.doc_count();
+        let old_count = {
+            let mut guard = self.write_index();
+            Self::validate_replacement(&guard, &new_index, &current_dir)?;
+            let old_count = guard.doc_count();
+            *guard = Arc::new(new_index);
+            old_count
+        };
         debug!(
             target: "frankensearch.cache",
             state_dir = %self.state_dir.display(),
-            old_count = guard.doc_count(),
-            new_count = new_index.doc_count(),
-            "replacing cached index"
+            old_count,
+            new_count,
+            "replaced cached index"
         );
-        *guard = Arc::new(new_index);
+        Ok(())
+    }
+
+    fn validate_replacement(
+        current: &TwoTierIndex,
+        candidate: &TwoTierIndex,
+        current_dir: &Path,
+    ) -> SearchResult<()> {
+        let reject = |value: String, reason: &str| SearchError::InvalidConfig {
+            field: "index_cache.replace".to_owned(),
+            value,
+            reason: reason.to_owned(),
+        };
+
+        let current_fast = absolute_from(current.fast_index_path(), current_dir);
+        let candidate_fast = absolute_from(candidate.fast_index_path(), current_dir);
+        if current_fast != candidate_fast {
+            return Err(reject(
+                candidate_fast.display().to_string(),
+                "replacement fast index path differs from the retained cache path",
+            ));
+        }
+        let current_quality = current
+            .quality_index_path()
+            .map(|path| absolute_from(path, current_dir));
+        let candidate_quality = candidate
+            .quality_index_path()
+            .map(|path| absolute_from(path, current_dir));
+        if current_quality != candidate_quality {
+            return Err(reject(
+                candidate_quality.map_or_else(|| "<none>".to_owned(), |p| p.display().to_string()),
+                "replacement quality tier topology or path differs from the retained cache",
+            ));
+        }
+
+        for (
+            tier,
+            current_fingerprint,
+            candidate_fingerprint,
+            current_attested,
+            candidate_attested,
+        ) in [
+            (
+                "fast",
+                current.fast_space_fingerprint_hex(),
+                candidate.fast_space_fingerprint_hex(),
+                current.fast_identity_is_attested(),
+                candidate.fast_identity_is_attested(),
+            ),
+            (
+                "quality",
+                current.quality_space_fingerprint_hex(),
+                candidate.quality_space_fingerprint_hex(),
+                current.quality_identity_is_attested(),
+                candidate.quality_identity_is_attested(),
+            ),
+        ] {
+            if let Some(expected) = current_fingerprint {
+                if candidate_fingerprint != Some(expected) {
+                    return Err(reject(
+                        candidate_fingerprint.unwrap_or("<none>").to_owned(),
+                        if tier == "fast" {
+                            "replacement fast tier lives in a different embedding space than the retained index"
+                        } else {
+                            "replacement quality tier lives in a different embedding space than the retained index"
+                        },
+                    ));
+                }
+            }
+            if current_attested && !candidate_attested {
+                return Err(reject(
+                    tier.to_owned(),
+                    "replacement drops the identity attestation the retained index carries",
+                ));
+            }
+        }
+        if current.fast_space_fingerprint_hex().is_none()
+            && candidate.fast_space_fingerprint_hex().is_none()
+            && current.fast_embedder_revision() != candidate.fast_embedder_revision()
+        {
+            return Err(reject(
+                candidate.fast_embedder_revision().to_owned(),
+                "replacement fast embedder revision differs from the retained index and no space fingerprint is available to prove compatibility",
+            ));
+        }
+        Ok(())
     }
 
     /// Reload the index from disk and atomically replace the cached version.
@@ -476,11 +581,12 @@ impl IndexCache {
     /// # Errors
     ///
     /// Returns errors from the constructor represented by this cache's original
-    /// directory or explicit-path contract.
+    /// directory or explicit-path contract, or the validation errors of
+    /// [`replace`](Self::replace) when the on-disk index no longer matches the
+    /// retained contract.
     pub fn reload(&self) -> SearchResult<()> {
         let new_index = self.open_spec.open(self.config.clone())?;
-        self.replace(new_index);
-        Ok(())
+        self.replace(new_index)
     }
 
     /// Check whether the current index is stale.
@@ -527,7 +633,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use frankensearch_index::{
-        Quantization, TwoTierIndex, TwoTierIndexPaths, VECTOR_INDEX_FAST_FILENAME, VectorIndex,
+        Quantization, TwoTierIndex, TwoTierIndexPaths, VECTOR_INDEX_FAST_FILENAME,
+        VECTOR_INDEX_QUALITY_FILENAME, VectorIndex,
     };
 
     use super::*;
@@ -809,7 +916,9 @@ mod tests {
 
         // Replace with reloaded index
         let new_index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
-        cache.replace(new_index);
+        cache
+            .replace(new_index)
+            .expect("same-path replacement is admitted");
 
         // Old reference still works with old count
         assert_eq!(old.doc_count(), 3);
@@ -853,8 +962,114 @@ mod tests {
             ],
         );
         let replacement = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
-        cache.replace(replacement);
+        cache
+            .replace(replacement)
+            .expect("same-path replacement is admitted");
         assert_eq!(cache.current().doc_count(), 2);
+    }
+
+    fn is_replace_rejection(error: &SearchError) -> bool {
+        matches!(error, SearchError::InvalidConfig { field, .. } if field == "index_cache.replace")
+    }
+
+    #[test]
+    fn replace_rejects_an_index_from_another_directory_and_keeps_the_old_one() {
+        let dir = temp_dir("cache-replace-foreign");
+        write_fast_index(&dir, &sample_records());
+        let cache = IndexCache::open(
+            &dir,
+            TwoTierConfig::default(),
+            Box::new(SentinelFileDetector::new()),
+        )
+        .expect("open cache");
+        let retained = cache.current();
+
+        let other = temp_dir("cache-replace-foreign-other");
+        write_fast_index(
+            &other,
+            &[
+                ("x", vec![1.0, 0.0, 0.0, 0.0]),
+                ("y", vec![0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        let foreign = TwoTierIndex::open(&other, TwoTierConfig::default()).expect("open other");
+        let error = cache
+            .replace(foreign)
+            .expect_err("an index at another path must be rejected");
+        assert!(is_replace_rejection(&error), "{error:?}");
+        // Prior snapshot retained; readers unaffected.
+        assert!(std::sync::Arc::ptr_eq(&retained, &cache.current()));
+        assert_eq!(cache.current().doc_count(), 3);
+    }
+
+    #[test]
+    fn replace_rejects_same_name_new_embedder_revision() {
+        let dir = temp_dir("cache-replace-revision");
+        write_fast_index(&dir, &sample_records());
+        let cache = IndexCache::open(
+            &dir,
+            TwoTierConfig::default(),
+            Box::new(SentinelFileDetector::new()),
+        )
+        .expect("open cache");
+
+        // Same embedder name and path, new weights/revision: the classic
+        // silent-poisoning case. Rewrite the artifact in place with "v2".
+        let path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        std::fs::remove_file(&path).expect("retire the v1 fixture artifact");
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "potion-128M", "v2", 4, Quantization::F16)
+                .expect("writer");
+        for (doc_id, vec) in sample_records() {
+            writer.write_record(doc_id, &vec).expect("write");
+        }
+        writer.finish().expect("finish");
+
+        let rebuilt = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen v2");
+        assert_eq!(rebuilt.fast_embedder_revision(), "v2");
+        let error = cache
+            .replace(rebuilt)
+            .expect_err("a changed revision under the same name must be rejected");
+        assert!(is_replace_rejection(&error), "{error:?}");
+        assert_eq!(cache.current().fast_embedder_revision(), "v1");
+        // reload() goes through the same gate.
+        let error = cache
+            .reload()
+            .expect_err("reload of a revision-changed artifact is rejected too");
+        assert!(is_replace_rejection(&error), "{error:?}");
+        assert_eq!(cache.current().fast_embedder_revision(), "v1");
+    }
+
+    #[test]
+    fn replace_rejects_a_tier_topology_change() {
+        let dir = temp_dir("cache-replace-topology");
+        write_fast_index(&dir, &sample_records());
+        let cache = IndexCache::open(
+            &dir,
+            TwoTierConfig::default(),
+            Box::new(SentinelFileDetector::new()),
+        )
+        .expect("open cache");
+        assert!(cache.current().quality_index_path().is_none());
+
+        // A quality tier appears next to the fast tier: a different topology
+        // than the cache was opened with. The cache must be reopened for that,
+        // never silently widened by a replacement.
+        write_index(
+            &dir.join(VECTOR_INDEX_QUALITY_FILENAME),
+            &[
+                ("doc-a", vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                ("doc-b", vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                ("doc-c", vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+            ],
+        );
+        let widened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
+        assert!(widened.quality_index_path().is_some());
+        let error = cache
+            .replace(widened)
+            .expect_err("a topology change must be rejected");
+        assert!(is_replace_rejection(&error), "{error:?}");
+        assert!(cache.current().quality_index_path().is_none());
     }
 
     #[test]

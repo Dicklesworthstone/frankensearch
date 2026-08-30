@@ -1019,8 +1019,10 @@ impl RefreshWorker {
                         .record_embedded(&record.doc_id, &record.content_hash);
                 }
 
-                // Atomically swap the cached index.
-                self.cache.replace(new_index);
+                // Atomically swap the cached index; a replacement that would
+                // change the cache's path/topology/identity contract is a
+                // typed rejection that keeps the prior index installed.
+                self.cache.replace(new_index)?;
 
                 info!(
                     target: "frankensearch.refresh",
