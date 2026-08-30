@@ -1845,6 +1845,7 @@ name = "frankensearch-index"
 version = "0.2.3"
 dependencies = [
  "ahash",
+ "arc-swap",
  "asupersync",
  "bytemuck",
  "crc32fast",
@@ -1877,6 +1878,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tantivy",
  "tempfile",
  "tracing",
@@ -1951,6 +1953,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "jsonschema",
+ "proptest",
  "rayon",
  "rustix 1.1.4",
  "serde",
