@@ -1188,4 +1188,219 @@ mod tests {
             }
         }
     }
+
+    /// Two-fresh-process deterministic derivation (bd-pjvl1 evidence lane).
+    ///
+    /// Each child re-derives every certificate of a fixed matrix from raw
+    /// inputs, binds the derivation digest to the strict environment identity
+    /// (source revision/dirty state, Cargo.lock SHA-256, test-ELF SHA-256),
+    /// and prints one bounded receipt line. The driver requires byte-identical
+    /// receipts from two independent processes, bounded output, no redaction
+    /// canary, and retains child output as a failure artifact on violation.
+    mod fresh_process {
+        use super::*;
+
+        const RECEIPT_SCHEMA: &str =
+            "frankensearch.quill-gauntlet-cutoff-certificate-replay-receipt.v1";
+        const CHILD_ENV: &str = "QUILL_GAUNTLET_CUTOFF_CERTIFICATE_REPLAY_CHILD";
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        const MAX_LOG_LINES: usize = 10_000;
+        const MAX_LOG_BYTES: usize = 8 * 1024 * 1024;
+        /// Raw query text that feeds the arm digest of every derived
+        /// certificate; it must survive only as a digest.
+        const REDACTION_CANARY: &str = "cutoff replay raw canary query text";
+
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ReplayReceipt {
+            schema: String,
+            certificate_count: usize,
+            insufficient_count: usize,
+            derivation_digest: String,
+            source_git_revision: String,
+            source_git_dirty: bool,
+            cargo_lock_sha256: String,
+            test_elf_sha256: String,
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().fold(String::new(), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+        }
+
+        /// The full derivation both processes run: every (M, O, L, prefix)
+        /// over the tie-heavy ordering, certificates hashed in order, the
+        /// insufficient cells counted rather than guessed.
+        fn derive_matrix() -> Result<(usize, usize, [u8; 32]), CutoffDerivationError> {
+            let scores = scores();
+            let bits = scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+            let m = u64::try_from(scores.len()).expect("small");
+            let arm_sha256: [u8; 32] = Sha256::digest(REDACTION_CANARY.as_bytes()).into();
+            let mut hasher = Sha256::new();
+            hasher.update(b"frankensearch/quill-gauntlet/cutoff-certificate-replay/v1\0");
+            let mut certified = 0_usize;
+            let mut insufficient = 0_usize;
+            for offset in 0..=m + 1 {
+                for limit in 0..=4_u64 {
+                    for prefix_len in 0..=scores.len() {
+                        let provenance = CertificateProvenanceV1 {
+                            arm_sha256,
+                            ..provenance()
+                        };
+                        match CutoffCertificateV1::from_native_prefix(
+                            m,
+                            offset,
+                            limit,
+                            &bits[..prefix_len],
+                            provenance,
+                        ) {
+                            Ok(certificate) => {
+                                certified += 1;
+                                hasher.update(certificate.digest_sha256()?);
+                            }
+                            Err(CutoffDerivationError::TrailingGroupTruncated { prefix_len }) => {
+                                insufficient += 1;
+                                hasher.update(b"insufficient");
+                                hasher.update(prefix_len.to_be_bytes());
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+            }
+            Ok((certified, insufficient, hasher.finalize().into()))
+        }
+
+        fn replay_receipt() -> Result<String, String> {
+            let (certificate_count, insufficient_count, digest) =
+                derive_matrix().map_err(|error| format!("derivation: {error}"))?;
+            let producer = crate::artifact::GauntletProducerBuildIdentity::compiled()
+                .map_err(|error| format!("producer identity: {error}"))?;
+            let receipt = ReplayReceipt {
+                schema: RECEIPT_SCHEMA.to_owned(),
+                certificate_count,
+                insufficient_count,
+                derivation_digest: hex(&digest),
+                source_git_revision: producer.source_git_revision,
+                source_git_dirty: producer.source_git_dirty,
+                cargo_lock_sha256: producer.cargo_lock_sha256,
+                test_elf_sha256: producer.executable_sha256,
+            };
+            serde_json::to_string(&receipt).map_err(|error| format!("receipt serialize: {error}"))
+        }
+
+        /// Fresh-process helper: derives the matrix and prints the receipt on
+        /// one bounded line. No-op in the parent test process.
+        #[test]
+        fn cutoff_certificate_replay_process_helper() {
+            if std::env::var_os(CHILD_ENV).is_none() {
+                return;
+            }
+            println!(
+                "{}",
+                replay_receipt().expect("fresh process must emit a receipt")
+            );
+        }
+
+        #[test]
+        fn the_matrix_is_nonempty_on_both_sides_in_process() {
+            let (certified, insufficient, _) = derive_matrix().expect("matrix derives");
+            assert!(
+                certified > 0 && insufficient > 0,
+                "{certified} / {insufficient}"
+            );
+            assert_eq!(
+                derive_matrix().expect("again").2,
+                derive_matrix().expect("again").2,
+                "derivation is deterministic within one process"
+            );
+        }
+
+        #[test]
+        fn certificates_derive_identically_in_two_fresh_processes() {
+            let current_test = std::env::current_exe().expect("current test executable");
+            let helper_name = "cutoff_certificate::tests::fresh_process::cutoff_certificate_replay_process_helper";
+            let mut receipts = Vec::new();
+            for round in 0..2 {
+                let mut child = std::process::Command::new(&current_test)
+                    .args(["--exact", helper_name, "--nocapture"])
+                    .env(CHILD_ENV, "1")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("spawn fresh replay process");
+                let deadline = std::time::Instant::now() + TIMEOUT;
+                let status = loop {
+                    if let Some(status) = child.try_wait().expect("poll fresh replay process") {
+                        break status;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let output = child.wait_with_output().expect("collect killed child");
+                        let retained = std::env::temp_dir().join(format!(
+                            "cutoff-certificate-replay-timeout-round{round}-{}.log",
+                            std::process::id()
+                        ));
+                        let mut bytes = output.stdout.clone();
+                        bytes.extend_from_slice(&output.stderr);
+                        std::fs::write(&retained, &bytes).expect("retain timeout failure artifact");
+                        panic!(
+                            "fresh replay process exceeded {TIMEOUT:?}; failure artifact retained at {}",
+                            retained.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                };
+                let output = child
+                    .wait_with_output()
+                    .expect("collect fresh replay output");
+                let stdout = output.stdout;
+                let stderr = output.stderr;
+                let retain_failure = |reason: &str| -> ! {
+                    let retained = std::env::temp_dir().join(format!(
+                        "cutoff-certificate-replay-failure-round{round}-{}.log",
+                        std::process::id()
+                    ));
+                    let mut bytes = stdout.clone();
+                    bytes.extend_from_slice(b"\n--- stderr ---\n");
+                    bytes.extend_from_slice(&stderr);
+                    std::fs::write(&retained, &bytes).expect("retain replay failure artifact");
+                    panic!(
+                        "{reason}; failure artifact retained at {}",
+                        retained.display()
+                    );
+                };
+                if !status.success() {
+                    retain_failure("fresh replay process exited nonzero");
+                }
+                let stdout_text = String::from_utf8(stdout.clone())
+                    .unwrap_or_else(|_| retain_failure("fresh replay stdout was not UTF-8"));
+                if stdout.len() > MAX_LOG_BYTES || stdout_text.lines().count() > MAX_LOG_LINES {
+                    retain_failure("fresh replay output exceeded its bounded budget");
+                }
+                if stdout_text.contains(REDACTION_CANARY)
+                    || String::from_utf8_lossy(&stderr).contains(REDACTION_CANARY)
+                {
+                    retain_failure("fresh replay output leaked the redaction canary");
+                }
+                let receipt = stdout_text
+                    .lines()
+                    .find(|line| line.contains(RECEIPT_SCHEMA))
+                    .unwrap_or_else(|| retain_failure("fresh replay process emitted no receipt"))
+                    .to_owned();
+                let decoded: ReplayReceipt = serde_json::from_str(&receipt)
+                    .unwrap_or_else(|_| retain_failure("receipt did not decode under its schema"));
+                assert!(decoded.certificate_count > 0 && decoded.insufficient_count > 0);
+                receipts.push(receipt);
+            }
+            assert_eq!(
+                receipts[0], receipts[1],
+                "two fresh processes must derive byte-identical replay receipts"
+            );
+        }
+    }
 }
