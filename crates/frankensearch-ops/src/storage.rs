@@ -1448,8 +1448,11 @@ impl OpsStorage {
     }
 
     /// Underlying database connection.
+    ///
+    /// Crate-private on purpose: every write goes through `with_transaction`,
+    /// and a public raw handle would let callers bypass that bracket.
     #[must_use]
-    pub const fn connection(&self) -> &AsyncConnection {
+    pub(crate) const fn connection(&self) -> &AsyncConnection {
         &self.conn
     }
 
@@ -1634,13 +1637,13 @@ impl OpsStorage {
 
             let mut db_inserted = 0_usize;
             let mut ensured_project_keys = BTreeSet::new();
-            let mut ensured_instance_ids = BTreeSet::new();
+            let mut ensured_instances = BTreeSet::new();
             for event in &to_insert {
                 db_inserted = db_inserted.saturating_add(insert_search_event_row(
                     conn,
                     event,
                     &mut ensured_project_keys,
-                    &mut ensured_instance_ids,
+                    &mut ensured_instances,
                 )?);
             }
 
@@ -2808,7 +2811,7 @@ fn insert_search_event_row<'a>(
     conn: &AsyncConnection,
     event: &'a SearchEventRecord,
     ensured_project_keys: &mut BTreeSet<&'a str>,
-    ensured_instance_ids: &mut BTreeSet<&'a str>,
+    ensured_instances: &mut BTreeSet<(&'a str, &'a str)>,
 ) -> SearchResult<usize> {
     // Manual dedup: FrankenSQLite does not support INSERT OR IGNORE reliably.
     let existing = conn
@@ -2828,9 +2831,13 @@ fn insert_search_event_row<'a>(
         ensure_project_exists(conn, &event.project_key, event.ts_ms)?;
         ensured_project_keys.insert(event.project_key.as_str());
     }
-    if !ensured_instance_ids.contains(event.instance_id.as_str()) {
+    // The cache is keyed by the (project, instance) pair, not the instance
+    // alone: the same instance id under a second project in one batch must
+    // reach `ensure_instance_exists` so its ownership mismatch is rejected.
+    let instance_key = (event.project_key.as_str(), event.instance_id.as_str());
+    if !ensured_instances.contains(&instance_key) {
         ensure_instance_exists(conn, &event.instance_id, &event.project_key, event.ts_ms)?;
-        ensured_instance_ids.insert(event.instance_id.as_str());
+        ensured_instances.insert(instance_key);
     }
 
     let params = [
@@ -2894,11 +2901,33 @@ fn ensure_instance_exists(
 ) -> SearchResult<()> {
     let existing = conn
         .query_with_params_sync(
-            "SELECT 1 FROM instances WHERE instance_id = ?1;",
+            "SELECT project_key FROM instances WHERE instance_id = ?1;",
             &[SqliteValue::Text(instance_id.to_owned().into())],
         )
         .map_err(ops_error)?;
-    if existing.is_empty() {
+    if let Some(row) = existing.first() {
+        // `instances.instance_id` is the primary key, so an existing row
+        // already binds this instance to one project. Silently accepting a
+        // different project here would attach the caller's rows to a parent
+        // it never named; reject instead of adopting either side.
+        let owner = row
+            .get(0)
+            .and_then(|value| match value {
+                SqliteValue::Text(text) => Some(text.as_ref()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if owner != project_key {
+            return Err(SearchError::InvalidConfig {
+                field: "instance_id".to_owned(),
+                value: instance_id.to_owned(),
+                reason: format!(
+                    "instance is already registered under project {owner:?}; refusing to \
+                     attach it to project {project_key:?}"
+                ),
+            });
+        }
+    } else {
         conn.execute_with_params_sync(
             "INSERT INTO instances(\
              instance_id, project_key, host_name, pid, version, \
@@ -4689,6 +4718,45 @@ mod tests {
             ),
             Some(10)
         );
+    }
+
+    #[test]
+    fn ingest_search_events_batch_rejects_instance_owned_by_another_project() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        storage
+            .ingest_search_events_batch(&[sample_search_event("event-owner", 10)], 64)
+            .expect("owning project should ingest");
+
+        // Same instance id, different project, inside one batch that also
+        // carries a legitimate event. The whole batch must be rejected and
+        // rolled back: no partial rows, no adopted parent.
+        let legitimate = sample_search_event("event-owner-later", 20);
+        let mut hijack = sample_search_event("event-hijack", 30);
+        hijack.project_key = "project-b".to_owned();
+        let error = storage
+            .ingest_search_events_batch(&[legitimate, hijack], 64)
+            .expect_err("instance registered under another project must be rejected");
+        assert!(
+            matches!(
+                &error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == "instance_id" && value == "instance-a"
+            ),
+            "unexpected error: {error}"
+        );
+
+        assert_eq!(search_event_count(storage.connection()), 1);
+        assert_eq!(table_row_count(storage.connection(), "projects"), 1);
+        assert_eq!(table_row_count(storage.connection(), "instances"), 1);
+        assert_eq!(
+            storage
+                .connection()
+                .query_sync("SELECT project_key FROM instances WHERE instance_id = 'instance-a';")
+                .expect("instance lookup should succeed")
+                .len(),
+            1
+        );
+        assert_eq!(storage.ingestion_metrics().pending_events, 0);
     }
 
     #[test]
