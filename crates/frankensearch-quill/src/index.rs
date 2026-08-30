@@ -10940,6 +10940,54 @@ impl PreparsedQuillIndex {
             .search_preparsed_paginated(cx, query, limit, offset, exact_count)
     }
 
+    /// Ranked page, expanded prefix, and exact count for one already-built
+    /// query tree, all on ONE loaded publication with its physical digest.
+    ///
+    /// See [`QuillSearchIndex::search_paginated_pinned`]; this is the same
+    /// contract for the compiled-schema (CASS) read path.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, lowering, scoring, or collection failures.
+    #[cfg(feature = "conformance-internals")]
+    pub fn search_preparsed_paginated_pinned(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        expanded_limit: usize,
+    ) -> Result<PinnedSearchBundle, QuillIndexError> {
+        let published = self.reader.published_snapshot.load();
+        let observed = self.reader.search_preparsed_paginated_on(
+            cx,
+            query,
+            limit,
+            offset,
+            false,
+            published.as_ref(),
+        )?;
+        let expanded = self.reader.search_preparsed_paginated_on(
+            cx,
+            query,
+            expanded_limit,
+            0,
+            false,
+            published.as_ref(),
+        )?;
+        let count =
+            self.reader
+                .search_preparsed_paginated_on(cx, query, 0, 0, true, published.as_ref())?;
+        Ok(PinnedSearchBundle {
+            observed,
+            expanded,
+            count,
+            snapshot_sha256: pinned_snapshot_sha256(published.as_ref()),
+            snapshot_epoch: published.snapshot_epoch(),
+            keeper_generation: published.keeper_generation(),
+        })
+    }
+
     /// Number of live documents in the pinned snapshot.
     #[must_use]
     pub fn doc_count(&self) -> u64 {

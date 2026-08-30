@@ -1727,7 +1727,7 @@ fn quill_native_observation_from_results(
     )
 }
 
-#[cfg(any(feature = "tantivy-oracle", test))]
+#[cfg(test)]
 fn quill_observation_from_results(
     observed: &QuillSearchResult,
     evidence: &QuillSearchResult,
@@ -2470,27 +2470,26 @@ impl CassQuillSubject {
                     reason: "expanded Quill CASS observation window does not fit usize".to_owned(),
                 })?;
         let parsed = self.parser.parse(&case.query, filters);
-        let mut observed = self.index()?.search_preparsed_paginated(
+        // Page, expanded prefix, and count on ONE checked publication
+        // (bd-pjvl1), so the CASS path certifies exactly like the native one.
+        let mut bundle = self.index()?.search_preparsed_paginated_pinned(
             cx,
             &parsed.query,
             limit,
             offset,
-            case.count_requested,
+            fetch_limit,
         )?;
-        let mut evidence =
-            self.index()?
-                .search_preparsed_paginated(cx, &parsed.query, fetch_limit, 0, true)?;
-        observed.diagnostics.clone_from(&parsed.diagnostics);
-        evidence.diagnostics = parsed.diagnostics;
-        // The preparsed CASS path issues two separate searches; without a
-        // pinned bundle it makes no same-snapshot completeness claim.
-        quill_observation_from_results(
-            &observed,
-            &evidence,
+        bundle.observed.diagnostics.clone_from(&parsed.diagnostics);
+        bundle.expanded.diagnostics.clone_from(&parsed.diagnostics);
+        bundle.count.diagnostics = parsed.diagnostics;
+        quill_native_observation_from_results(
+            &bundle.observed,
+            &bundle.expanded,
+            &bundle.count,
             limit,
             offset,
             case.count_requested,
-            None,
+            Some(bundle.snapshot_sha256),
         )
     }
 
