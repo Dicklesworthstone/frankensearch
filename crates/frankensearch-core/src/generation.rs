@@ -5983,6 +5983,200 @@ mod tests {
         );
     }
 
+    /// One request in the floor property model.
+    #[derive(Debug, Clone, Copy)]
+    enum FloorOp {
+        /// Valid successor on the current head with a fresh key.
+        Advance,
+        /// Same-base race loser: an exact receipt that is no longer the head.
+        StaleBase,
+        /// Byte-exact replay of an earlier successful request.
+        Replay,
+        /// Reuse an earlier key with a different next authority.
+        Rebind,
+        /// Valid base, but a next authority whose sequence does not exceed the head.
+        Regress,
+    }
+
+    /// Drive `load`/`compare_and_advance` through a random request stream and
+    /// check, after every request, that the floor never decreases, that CAS
+    /// versions are dense and monotone, that replays return the original
+    /// receipt, and that every refusal leaves the head byte-identical.
+    fn check_floor_never_decreases<L, C>(ops: &[FloorOp], load: L, cas: C)
+    where
+        L: Fn([u8; 16]) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1>,
+        C: Fn(
+            Option<AntiRollbackFloorRecordV1>,
+            AuthorityFloorV1,
+            [u8; 16],
+        ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1>,
+    {
+        let root_id = [0x5a; 16];
+        let mut head: Option<AntiRollbackFloorRecordV1> = None;
+        // (key, expected, next, receipt) of every successful request.
+        let mut successes: Vec<(
+            [u8; 16],
+            Option<AntiRollbackFloorRecordV1>,
+            AuthorityFloorV1,
+            AntiRollbackFloorRecordV1,
+        )> = Vec::new();
+        let mut next_key = 0x40_u8;
+        let mut fresh_key = || {
+            next_key = next_key.wrapping_add(1).max(1);
+            [next_key; 16]
+        };
+        let successor_of = |head: Option<AntiRollbackFloorRecordV1>| {
+            head.map_or_else(
+                || authority_reference(1, None),
+                |record| {
+                    authority_reference(
+                        record.authority.sequence + 1,
+                        Some(record.authority.fingerprint()),
+                    )
+                },
+            )
+        };
+
+        for (step, op) in ops.iter().enumerate() {
+            let before = head;
+            match op {
+                FloorOp::Advance => {
+                    let next = AuthorityFloorV1::new(root_id, successor_of(head)).expect("floor");
+                    let key = fresh_key();
+                    let receipt = cas(head, next, key).unwrap_or_else(|error| {
+                        panic!("step {step}: valid advance refused: {error:?}")
+                    });
+                    assert_eq!(
+                        receipt.cas_version,
+                        head.map_or(0, |record| record.cas_version) + 1,
+                        "step {step}: CAS versions are dense"
+                    );
+                    assert_eq!(receipt.authority, next.authority);
+                    successes.push((key, head, next, receipt));
+                    head = Some(receipt);
+                }
+                FloorOp::StaleBase => {
+                    // The most recent superseded receipt, or None while a head exists.
+                    let stale = if successes.len() >= 2 {
+                        Some(successes[successes.len() - 2].3)
+                    } else if head.is_some() {
+                        None
+                    } else {
+                        continue;
+                    };
+                    let next = AuthorityFloorV1::new(root_id, successor_of(stale)).expect("floor");
+                    assert_eq!(
+                        cas(stale, next, fresh_key()),
+                        Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict),
+                        "step {step}: a stale base cannot advance"
+                    );
+                }
+                FloorOp::Replay => {
+                    let Some((key, expected, next, receipt)) = successes.last().copied() else {
+                        continue;
+                    };
+                    assert_eq!(
+                        cas(expected, next, key),
+                        Ok(receipt),
+                        "step {step}: replay returns the original receipt"
+                    );
+                }
+                FloorOp::Rebind => {
+                    let Some((key, expected, _, _)) = successes.last().copied() else {
+                        continue;
+                    };
+                    let other = AuthorityFloorV1::new(
+                        root_id,
+                        AuthorityRefV1::new(
+                            head.map_or(1, |record| record.authority.sequence + 1),
+                            [0xee; 16],
+                            9_000,
+                            [0xdd; 32],
+                            head.map(|record| record.authority.fingerprint()),
+                        )
+                        .expect("valid rebind authority"),
+                    )
+                    .expect("floor");
+                    assert_eq!(
+                        cas(expected, other, key),
+                        Err(GenerationAuthorityErrorV1::FloorIdempotencyConflict),
+                        "step {step}: a completed key cannot be rebound"
+                    );
+                }
+                FloorOp::Regress => {
+                    let Some(record) = head else {
+                        continue;
+                    };
+                    let regress = AuthorityFloorV1::new(root_id, record.authority).expect("floor");
+                    assert_eq!(
+                        cas(head, regress, fresh_key()),
+                        Err(GenerationAuthorityErrorV1::FloorSequenceRegression),
+                        "step {step}: the floor never moves backward"
+                    );
+                }
+            }
+            let observed = load(root_id).expect("load");
+            assert_eq!(observed, head, "step {step}: store head matches the model");
+            if let (Some(before), Some(after)) = (before, head) {
+                assert!(
+                    after.authority.sequence >= before.authority.sequence
+                        && after.cas_version >= before.cas_version,
+                    "step {step}: monotone"
+                );
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn in_memory_anti_rollback_floor_never_decreases_under_random_requests(
+            raw in proptest::collection::vec(0_u8..5, 1..40)
+        ) {
+            let ops: Vec<FloorOp> = raw
+                .into_iter()
+                .map(|byte| match byte {
+                    0 => FloorOp::Advance,
+                    1 => FloorOp::StaleBase,
+                    2 => FloorOp::Replay,
+                    3 => FloorOp::Rebind,
+                    _ => FloorOp::Regress,
+                })
+                .collect();
+            let store = InMemoryAntiRollbackFloorStoreV1::new();
+            check_floor_never_decreases(
+                &ops,
+                |root| store.load(root),
+                |expected, next, key| store.compare_and_advance(expected, next, key),
+            );
+        }
+
+        #[test]
+        fn local_anti_rollback_floor_never_decreases_under_random_requests(
+            raw in proptest::collection::vec(0_u8..5, 1..24)
+        ) {
+            let ops: Vec<FloorOp> = raw
+                .into_iter()
+                .map(|byte| match byte {
+                    0 => FloorOp::Advance,
+                    1 => FloorOp::StaleBase,
+                    2 => FloorOp::Replay,
+                    3 => FloorOp::Rebind,
+                    _ => FloorOp::Regress,
+                })
+                .collect();
+            let directory = tempfile::tempdir().expect("temp floor directory");
+            let store =
+                LocalAntiRollbackFloorStoreV1::open(directory.path()).expect("open store");
+            check_floor_never_decreases(
+                &ops,
+                |root| store.load(root),
+                |expected, next, key| store.compare_and_advance(expected, next, key),
+            );
+        }
+    }
+
     #[test]
     fn local_anti_rollback_floor_allows_exactly_one_same_base_publisher() {
         let directory = tempfile::tempdir().expect("temp floor directory");
