@@ -1073,6 +1073,37 @@ impl DifferentialCase {
             });
         }
 
+        // bd-pjvl1: a present certificate must be a valid closed proof for
+        // exactly this case's page, and its exact total must be the count
+        // this observation reports (when it reports one). Absence is no
+        // claim; presence is authority and is checked here.
+        if let Some(certificate) = &observation.cutoff_certificate {
+            certificate
+                .validate()
+                .map_err(|error| GauntletError::InvalidObservation {
+                    reason: format!("{label} cutoff certificate is invalid: {error}"),
+                })?;
+            let page_len = certificate.page.end.saturating_sub(certificate.page.start);
+            if certificate.offset != self.offset
+                || certificate.limit != self.limit
+                || page_len != hit_count
+            {
+                return Err(GauntletError::InvalidObservation {
+                    reason: format!(
+                        "{label} cutoff certificate does not describe the requested page"
+                    ),
+                });
+            }
+            if let CountState::Value(match_count) = observation.match_count
+                && certificate.exact_total != match_count
+            {
+                return Err(GauntletError::InvalidObservation {
+                    reason: format!(
+                        "{label} cutoff certificate exact total disagrees with the exact count"
+                    ),
+                });
+            }
+        }
         let Some(cutoff) = observation.hits.last() else {
             if observation.cutoff_tie_group.is_empty() && observation.offset_tie_group.is_empty() {
                 return Ok(());
@@ -7763,6 +7794,75 @@ mod tests {
             case.validate_observations(&engines, &underfilled, &underfilled)
                 .is_err()
         );
+
+        // bd-pjvl1: a present certificate must describe exactly this case.
+        {
+            use crate::cutoff_certificate::{CertificateProvenanceV1, CutoffCertificateV1};
+            let provenance = CertificateProvenanceV1 {
+                snapshot_sha256: [0x11; 32],
+                arm_sha256: [0x22; 32],
+                ranked_observation_sha256: [0x33; 32],
+                expanded_observation_sha256: [0x44; 32],
+                same_snapshot_authority: [0x55; 16],
+            };
+            let prefix = [4.0_f32.to_bits(), 3.0_f32.to_bits(), 1.0_f32.to_bits()];
+            let certificate = CutoffCertificateV1::from_native_prefix(3, 0, 2, &prefix, provenance)
+                .expect("certifiable");
+            let hit = |doc_id: &str, score: f32, doc| RankedHit {
+                doc_id: doc_id.to_owned(),
+                score_bits: score.to_bits(),
+                native_tie_key: NativeTieKey::QuillDocId { doc_id: doc },
+            };
+            let mut certified_case = DifferentialCase::new("certified", "query", 2);
+            certified_case.count_requested = false;
+            let certified = EngineObservation {
+                cutoff_certificate: Some(certificate.clone()),
+                hits: vec![hit("a", 4.0, 1), hit("b", 3.0, 2)],
+                cutoff_tie_group: Vec::new(),
+                cutoff_tie_complete: true,
+                offset_tie_group: Vec::new(),
+                offset_tie_complete: false,
+                snippets: BTreeMap::new(),
+                match_count: CountState::NotRequested,
+                doc_count: 3,
+                ast_differences: Vec::new(),
+            };
+            certified_case
+                .validate_observation_shape("subject", &certified)
+                .expect("a certificate for exactly this page is admissible");
+
+            // Requested page differs from the certified one.
+            let mut other_case = certified_case.clone();
+            other_case.limit = 3;
+            assert!(matches!(
+                other_case.validate_observation_shape("subject", &certified),
+                Err(GauntletError::InvalidObservation { reason })
+                    if reason.contains("does not describe the requested page")
+            ));
+            // A tampered certificate is refused by its own validator.
+            let mut tampered = certified.clone();
+            tampered
+                .cutoff_certificate
+                .as_mut()
+                .expect("certificate")
+                .expanded_start = 1;
+            assert!(matches!(
+                certified_case.validate_observation_shape("subject", &tampered),
+                Err(GauntletError::InvalidObservation { reason })
+                    if reason.contains("cutoff certificate is invalid")
+            ));
+            // The reported exact count must be the certified exact total.
+            let mut miscounted = certified;
+            miscounted.match_count = CountState::Value(4);
+            let mut counted_case = certified_case;
+            counted_case.count_requested = true;
+            assert!(matches!(
+                counted_case.validate_observation_shape("subject", &miscounted),
+                Err(GauntletError::InvalidObservation { reason })
+                    if reason.contains("disagrees with the exact count")
+                        || reason.contains("inconsistent with its exact count")
+            ));
+        }
 
         let quill_hit = RankedHit {
             doc_id: "one".to_owned(),

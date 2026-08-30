@@ -7823,6 +7823,7 @@ fn compare_observations_validated_v7(
             subject: subject.doc_count.to_string(),
         });
     }
+    compare_cutoff_certificates(&subject, &oracle, &mut divergences);
 
     let status = if divergences.is_empty() {
         ComparisonStatus::Exact
@@ -8549,6 +8550,69 @@ fn rank_divergence(
 
 fn describe_hit(hit: &RankedHit) -> String {
     format!("{}@{:08x}", hit.doc_id, hit.score_bits)
+}
+
+/// Compare the same-snapshot cutoff certificates when BOTH sides carry one.
+///
+/// A one-sided certificate is not a divergence: absence is no claim, and V7
+/// replays never carry one. When both exist they must agree on the exact
+/// total (reported under the count class) and on the page interval, the
+/// expanded rank window, and exhaustion (reported under the rank class) —
+/// the facts that decide whether the two engines saw the same complete
+/// cutoff. Scores and identities are engine-native and compared elsewhere.
+fn compare_cutoff_certificates(
+    subject: &EngineObservation,
+    oracle: &EngineObservation,
+    divergences: &mut Vec<Divergence>,
+) {
+    let (Some(subject_certificate), Some(oracle_certificate)) =
+        (&subject.cutoff_certificate, &oracle.cutoff_certificate)
+    else {
+        return;
+    };
+    if subject_certificate.exact_total != oracle_certificate.exact_total {
+        divergences.push(Divergence {
+            class: DivergenceClass::CountMismatch,
+            pointer: "/comparison/subject/cutoff_certificate/exact_total".to_owned(),
+            oracle: oracle_certificate.exact_total.to_string(),
+            subject: subject_certificate.exact_total.to_string(),
+        });
+    }
+    let facts = |certificate: &crate::cutoff_certificate::CutoffCertificateV1| {
+        (
+            (certificate.page.start, certificate.page.end),
+            (certificate.expanded_start, certificate.expanded_end()),
+            certificate.is_exhausted(),
+        )
+    };
+    let (subject_page, subject_window, subject_exhausted) = facts(subject_certificate);
+    let (oracle_page, oracle_window, oracle_exhausted) = facts(oracle_certificate);
+    for (pointer, oracle_fact, subject_fact) in [
+        (
+            "/comparison/subject/cutoff_certificate/page",
+            format!("[{}, {})", oracle_page.0, oracle_page.1),
+            format!("[{}, {})", subject_page.0, subject_page.1),
+        ),
+        (
+            "/comparison/subject/cutoff_certificate/expanded",
+            format!("[{}, {})", oracle_window.0, oracle_window.1),
+            format!("[{}, {})", subject_window.0, subject_window.1),
+        ),
+        (
+            "/comparison/subject/cutoff_certificate/exhausted",
+            oracle_exhausted.to_string(),
+            subject_exhausted.to_string(),
+        ),
+    ] {
+        if oracle_fact != subject_fact {
+            divergences.push(Divergence {
+                class: DivergenceClass::RankMismatch,
+                pointer: pointer.to_owned(),
+                oracle: oracle_fact,
+                subject: subject_fact,
+            });
+        }
+    }
 }
 
 fn describe_count(count: CountState) -> String {
@@ -9545,6 +9609,87 @@ mod tests {
                 doc_id: doc_id_in_segment,
             },
         }
+    }
+
+    fn certified(
+        hits: Vec<RankedHit>,
+        exact_total: u64,
+        limit: u64,
+        prefix: &[f32],
+    ) -> EngineObservation {
+        use crate::cutoff_certificate::{CertificateProvenanceV1, CutoffCertificateV1};
+        let bits = prefix
+            .iter()
+            .map(|score| score.to_bits())
+            .collect::<Vec<_>>();
+        let provenance = CertificateProvenanceV1 {
+            snapshot_sha256: [0x11; 32],
+            arm_sha256: [0x22; 32],
+            ranked_observation_sha256: [0x33; 32],
+            expanded_observation_sha256: [0x44; 32],
+            same_snapshot_authority: [0x55; 16],
+        };
+        let mut observation = observation(hits);
+        observation.match_count = CountState::Value(exact_total);
+        observation.cutoff_certificate = Some(
+            CutoffCertificateV1::from_native_prefix(exact_total, 0, limit, &bits, provenance)
+                .expect("certifiable prefix"),
+        );
+        observation
+    }
+
+    #[test]
+    fn cutoff_certificates_diverge_only_when_both_sides_disagree() {
+        let hits = || vec![quill_hit("a", 4.0, 1), quill_hit("b", 3.0, 2)];
+        let oracle_hits = || vec![tantivy_hit("a", 4.0, 8), tantivy_hit("b", 3.0, 9)];
+        // Both exhausted over the same three-rank ordering: no divergence.
+        let subject = certified(hits(), 3, 2, &[4.0, 3.0, 1.0]);
+        let oracle = certified(oracle_hits(), 3, 2, &[4.0, 3.0, 1.0]);
+        let report =
+            compare_observations(subject.clone(), oracle.clone(), ComparatorConfig::default())
+                .expect("certified comparison");
+        assert!(
+            !report
+                .divergences
+                .iter()
+                .any(|item| item.pointer.contains("cutoff_certificate")),
+            "{:?}",
+            report.divergences
+        );
+
+        // One side certifies, the other makes no claim: still no divergence.
+        let mut silent = oracle.clone();
+        silent.cutoff_certificate = None;
+        let report = compare_observations(subject.clone(), silent, ComparatorConfig::default())
+            .expect("one-sided comparison");
+        assert!(
+            !report
+                .divergences
+                .iter()
+                .any(|item| item.pointer.contains("cutoff_certificate"))
+        );
+
+        // The oracle saw a fourth match tied at the cutoff: exact totals and
+        // the expanded window diverge under the count and rank classes with
+        // typed pointers.
+        let mut wider_oracle = certified(oracle_hits(), 4, 2, &[4.0, 3.0, 3.0, 0.5]);
+        wider_oracle.match_count = CountState::Value(3);
+        let report = compare_observations(subject, wider_oracle, ComparatorConfig::default())
+            .expect("diverging comparison");
+        let pointers = report
+            .divergences
+            .iter()
+            .map(|item| (item.class, item.pointer.as_str()))
+            .collect::<Vec<_>>();
+        assert!(pointers.contains(&(
+            DivergenceClass::CountMismatch,
+            "/comparison/subject/cutoff_certificate/exact_total"
+        )));
+        assert!(pointers.contains(&(
+            DivergenceClass::RankMismatch,
+            "/comparison/subject/cutoff_certificate/expanded"
+        )));
+        assert_eq!(report.status, ComparisonStatus::Failed);
     }
 
     fn observation(hits: Vec<RankedHit>) -> EngineObservation {
