@@ -9466,26 +9466,6 @@ impl QuillReader {
     }
 
     #[cfg(feature = "pruning-conformance")]
-    fn search_paginated_with_conformance_pruning_trace(
-        &self,
-        cx: &Cx,
-        query: &str,
-        limit: usize,
-        offset: usize,
-        exact_count: bool,
-    ) -> Result<(QuillSearchResult, ConformancePruningTraceReceipt), QuillIndexError> {
-        let published = self.published_snapshot.load();
-        self.search_paginated_with_conformance_pruning_trace_on(
-            cx,
-            query,
-            limit,
-            offset,
-            exact_count,
-            published.as_ref(),
-        )
-    }
-
-    #[cfg(feature = "pruning-conformance")]
     fn search_paginated_with_conformance_pruning_trace_on(
         &self,
         cx: &Cx,

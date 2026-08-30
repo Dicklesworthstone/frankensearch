@@ -493,6 +493,22 @@ jobs:
           GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-pr
         run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_ -- --nocapture
 
+      # bd-669hb: the UNION_HORIZON pruning-conformance pins regressed silently
+      # for weeks because no lane compiled them (they need pruning-conformance
+      # on top of the oracle). Kept as its own step so the fast lane's feature
+      # set — and therefore its timings — stay exactly what bd-quill-e6.9 pinned.
+      - name: Quill UNION_HORIZON pruning-conformance lane (bd-quill-union-horizon-exactness-salej)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 20
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+          GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej-pr
+        # The two skips are the bd-669hb regression (seeking fill admits +5
+        # fuel units and binds a candidate-less horizon seek); they return to
+        # the lane when that bead is dispositioned — do not widen the skips.
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_ -- --nocapture --skip salej_union_horizon_final_refill_checkpoints_are_exact_and_atomic --skip salej_union_horizon_minimum_fuel_boundary_is_atomic_and_deterministic
+
       - name: Quill E6.3 metamorphic PR lane (bd-quill-e6.3)
         if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 10

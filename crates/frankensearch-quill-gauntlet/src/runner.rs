@@ -12446,6 +12446,37 @@ mod tests {
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonProof {
+        /// The proof with every same-snapshot certificate's PHYSICAL
+        /// provenance blanked (snapshot digest and the authority derived from
+        /// it). Two fresh rebuilds of one fixture are different physical
+        /// publications by design (segment ids, seal sequences), so
+        /// cross-rebuild determinism is a statement about the logical
+        /// evidence — page, expanded ranks, boundaries, exact total — never
+        /// about which physical snapshot certified it (bd-pjvl1).
+        fn physically_normalized(&self) -> Self {
+            let mut normalized = self.clone();
+            for run in &mut normalized.comparisons {
+                run.comparison.subject = physically_normalized_observation(&run.comparison.subject);
+                run.comparison.oracle = physically_normalized_observation(&run.comparison.oracle);
+            }
+            normalized
+        }
+    }
+
+    /// One observation with its certificate's physical provenance blanked;
+    /// see [`UnionHorizonProof::physically_normalized`].
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn physically_normalized_observation(observation: &EngineObservation) -> EngineObservation {
+        let mut normalized = observation.clone();
+        if let Some(certificate) = normalized.cutoff_certificate.as_mut() {
+            certificate.provenance.snapshot_sha256 = [0; 32];
+            certificate.provenance.same_snapshot_authority = [0; 16];
+        }
+        normalized
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     enum UnionHorizonProofKind {
@@ -15217,8 +15248,8 @@ mod tests {
             let first = run_union_horizon_proof(cx, fixture, layout, proof_kind).await;
             let second = run_union_horizon_proof(cx, fixture, layout, proof_kind).await;
             assert_eq!(
-                first,
-                second,
+                first.physically_normalized(),
+                second.physically_normalized(),
                 "UNION_HORIZON proof kind={} layout={} changed across fresh rebuilds",
                 proof_kind.label(),
                 layout.label(),
@@ -15262,8 +15293,12 @@ mod tests {
             "UNION_HORIZON serial and Rayon query matrices must have equal cardinality",
         );
         for (serial_run, rayon_run) in serial.comparisons.iter().zip(&rayon.comparisons) {
+            // Serial and Rayon proofs are separate physical publications, so
+            // the certificate's physical provenance is blanked for this
+            // logical-invariance check.
             assert_eq!(
-                serial_run.comparison.subject, rayon_run.comparison.subject,
+                physically_normalized_observation(&serial_run.comparison.subject),
+                physically_normalized_observation(&rayon_run.comparison.subject),
                 "UNION_HORIZON subject observation must be invariant across serial and Rayon execution",
             );
         }
