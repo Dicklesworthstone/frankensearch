@@ -1773,6 +1773,105 @@ pub mod authority_publisher {
         Ok((record, floor))
     }
 
+    /// Writer identity for owner/attempt frames: diagnostics and a mutation
+    /// fence, never a liveness proof or a timeout-stealable lease.
+    ///
+    /// `writer_id` is the first 16 bytes of a SHA-256 over the host
+    /// fingerprint, boot identity, PID, process start ticks and a fresh random
+    /// nonce, so it is unique per process incarnation and cannot be replayed
+    /// by a PID reuse on the same host or by the same PID on a foreign host.
+    /// The components are retained in clear so a stale owner frame can be
+    /// explained (same host? same boot? which process?) without ever being
+    /// trusted as proof that the writer is alive.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct WriterIdentityV1 {
+        /// Derived 16-byte identity used in LOCK frames.
+        pub writer_id: [u8; 16],
+        /// SHA-256 of the host identity source (`/etc/machine-id` or hostname).
+        pub host_fingerprint: [u8; 32],
+        /// Kernel boot identity (`/proc/sys/kernel/random/boot_id`), if readable.
+        pub boot_id: Option<[u8; 16]>,
+        /// Process id at derivation time.
+        pub pid: u32,
+        /// Process start time in clock ticks since boot (`/proc/self/stat`
+        /// field 22), if readable.
+        pub process_start_ticks: Option<u64>,
+        /// Fresh random nonce bound into the identity.
+        pub nonce: [u8; 16],
+    }
+
+    impl WriterIdentityV1 {
+        /// Derive the identity of the current process incarnation.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`GenerationRootError`] only when no random nonce can be
+        /// obtained; every other component degrades to `None`/hostname.
+        pub fn for_current_process() -> GenerationRootResult<Self> {
+            use sha2::{Digest as _, Sha256};
+            let nonce = random_identity()?;
+            let host_source = std::fs::read("/etc/machine-id")
+                .ok()
+                .filter(|bytes| !bytes.iter().all(u8::is_ascii_whitespace))
+                .or_else(|| std::fs::read("/proc/sys/kernel/hostname").ok())
+                .unwrap_or_default();
+            let host_fingerprint: [u8; 32] = Sha256::digest(&host_source).into();
+            let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .ok()
+                .and_then(|text| parse_uuid_bytes(text.trim()));
+            let pid = std::process::id();
+            let process_start_ticks =
+                std::fs::read_to_string("/proc/self/stat")
+                    .ok()
+                    .and_then(|stat| {
+                        // Field 2 (comm) may contain spaces; fields after the
+                        // closing parenthesis are stable, so index from there:
+                        // state is field 3, start time is field 22.
+                        let tail = &stat[stat.rfind(')')? + 1..];
+                        tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+                    });
+            let mut hasher = Sha256::new();
+            hasher.update(b"frankensearch.generation-root.writer-identity.v1");
+            hasher.update(host_fingerprint);
+            hasher.update(boot_id.unwrap_or([0; 16]));
+            hasher.update(pid.to_be_bytes());
+            hasher.update(process_start_ticks.unwrap_or(0).to_be_bytes());
+            hasher.update(nonce);
+            let digest: [u8; 32] = hasher.finalize().into();
+            let mut writer_id = [0_u8; 16];
+            writer_id.copy_from_slice(&digest[..16]);
+            if writer_id == [0; 16] {
+                writer_id = nonce;
+            }
+            Ok(Self {
+                writer_id,
+                host_fingerprint,
+                boot_id,
+                pid,
+                process_start_ticks,
+                nonce,
+            })
+        }
+
+        /// Whether `other` was derived on this host during this boot.
+        #[must_use]
+        pub fn same_host_and_boot(&self, other: &Self) -> bool {
+            self.host_fingerprint == other.host_fingerprint && self.boot_id == other.boot_id
+        }
+    }
+
+    fn parse_uuid_bytes(text: &str) -> Option<[u8; 16]> {
+        let hex: String = text.chars().filter(|c| *c != '-').collect();
+        if hex.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0_u8; 16];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        Some(bytes)
+    }
+
     fn random_identity() -> GenerationRootResult<[u8; 16]> {
         use std::io::Read as _;
         let mut bytes = [0_u8; 16];
@@ -2982,6 +3081,56 @@ pub mod authority_publisher {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn writer_identity_is_bound_to_host_boot_process_and_nonce() {
+            let first = WriterIdentityV1::for_current_process().expect("identity derives");
+            let second = WriterIdentityV1::for_current_process().expect("identity derives");
+            assert_ne!(first.writer_id, [0; 16]);
+            assert_ne!(
+                first.nonce, second.nonce,
+                "every derivation carries a fresh nonce"
+            );
+            assert_ne!(
+                first.writer_id, second.writer_id,
+                "the nonce is bound into the id"
+            );
+            assert_eq!(first.pid, std::process::id());
+            assert!(first.same_host_and_boot(&second));
+            assert_eq!(first.host_fingerprint, second.host_fingerprint);
+            assert_eq!(first.process_start_ticks, second.process_start_ticks);
+            assert!(first.boot_id.is_some(), "Linux exposes boot_id");
+            assert!(
+                first.process_start_ticks.is_some(),
+                "Linux exposes /proc/self/stat"
+            );
+
+            // The derived id is accepted by the publisher and lands in the
+            // owner frame verbatim, so a frame can be attributed to exactly
+            // this process incarnation.
+            let root_path = fixture_root("writer-identity");
+            let root = admit(&root_path);
+            let publisher = root
+                .authority_publisher(
+                    ROOT_ID,
+                    first.writer_id,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher binds");
+            let outcome = publisher
+                .publish(
+                    authority(1, None),
+                    ExpectedAuthorityPairV1::default(),
+                    None,
+                    [0x41; 16],
+                )
+                .expect("genesis runs");
+            assert!(matches!(outcome, PublicationOutcomeV1::Committed { .. }));
+            assert_eq!(
+                publisher.owner_frame().expect("frame").map(|f| f.writer_id),
+                Some(first.writer_id)
+            );
         }
 
         #[test]
