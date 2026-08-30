@@ -783,6 +783,381 @@ impl InMemoryAntiRollbackFloorStoreV1 {
     }
 }
 
+/// Magic prefix of one durable anti-rollback floor version file.
+const LOCAL_FLOOR_FILE_MAGIC_V1: [u8; 8] = *b"FSARFLR1";
+/// Exact byte length of one durable floor version file (bd-ynwdi).
+///
+/// `magic` 8 | `schema` 2 | `root_id` 16 | `authority` 108 | `cas_version` 8 |
+/// `record_sha256` 32 | `idempotency_key` 16 | `expected_present` 1 |
+/// `expected_record_sha256` 32 | `file_sha256` 32.
+const LOCAL_FLOOR_FILE_BYTES_V1: usize =
+    8 + 2 + 16 + AUTHORITY_REF_BYTES_V1 + 8 + 32 + 16 + 1 + 32 + 32;
+const LOCAL_FLOOR_FILE_SUFFIX_V1: &str = ".floor";
+
+/// Crash-durable local reference anti-rollback floor provider (bd-ynwdi).
+///
+/// This is the `CooperativeLocal` profile's owner-controlled floor. It lives
+/// in a directory the caller chooses **outside** any replaceable generation
+/// root, so replaying an older root cannot replay the floor with it. It
+/// detects crashes and ordinary stale roots; it does not defend against a
+/// hostile whole-store rollback that also rewinds this directory, which is
+/// exactly why the profile is named cooperative rather than external.
+///
+/// Semantics are identical to [`InMemoryAntiRollbackFloorStoreV1`]:
+/// linearizable per root, monotone sequence, exact predecessor linkage,
+/// idempotent replay, and exactly one same-base winner. Durability and
+/// linearizability come from the filesystem rather than a mutex:
+///
+/// * every CAS version is its own immutable file `<root_hex>/v<cas>.floor`,
+///   created with `create_new` — the kernel's `O_EXCL` election is what makes
+///   two same-base publishers resolve to exactly one winner, with no lock file
+///   that could go stale;
+/// * each file ends in a SHA-256 of its own bytes, so a torn or partial write
+///   never reads as a floor: a highest-numbered file that fails to verify is
+///   reported as [`GenerationAuthorityErrorV1::UnresolvedAttempt`], which
+///   fails every further advance closed until an operator reconciles it —
+///   files are never deleted or rewritten by this store;
+/// * the file is `fsync`ed and then its directory is `fsync`ed before the
+///   receipt is returned, so an acknowledged advance survives power loss.
+///
+/// The idempotency journal is the record file itself: the request's key and
+/// expected receipt digest are stored beside the result, so a replay finds
+/// its original receipt after a restart and a rebinding attempt conflicts.
+#[derive(Debug, Clone)]
+pub struct LocalAntiRollbackFloorStoreV1 {
+    directory: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalFloorFileV1 {
+    record: AntiRollbackFloorRecordV1,
+    idempotency_key: [u8; 16],
+    expected_record_sha256: Option<[u8; 32]>,
+}
+
+impl LocalFloorFileV1 {
+    fn encode(&self) -> [u8; LOCAL_FLOOR_FILE_BYTES_V1] {
+        let mut bytes = [0_u8; LOCAL_FLOOR_FILE_BYTES_V1];
+        let mut at = 0;
+        let mut put = |chunk: &[u8]| {
+            bytes[at..at + chunk.len()].copy_from_slice(chunk);
+            at += chunk.len();
+        };
+        put(&LOCAL_FLOOR_FILE_MAGIC_V1);
+        put(&self.record.schema_version.to_be_bytes());
+        put(&self.record.root_id);
+        put(&self.record.authority.canonical_bytes());
+        put(&self.record.cas_version.to_be_bytes());
+        put(&self.record.record_sha256);
+        put(&self.idempotency_key);
+        put(&[u8::from(self.expected_record_sha256.is_some())]);
+        put(&self.expected_record_sha256.unwrap_or([0; 32]));
+        let body_len = LOCAL_FLOOR_FILE_BYTES_V1 - 32;
+        let digest: [u8; 32] = Sha256::digest(&bytes[..body_len]).into();
+        bytes[body_len..].copy_from_slice(&digest);
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() != LOCAL_FLOOR_FILE_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "local_floor_file.len",
+            });
+        }
+        let body_len = LOCAL_FLOOR_FILE_BYTES_V1 - 32;
+        let digest: [u8; 32] = Sha256::digest(&bytes[..body_len]).into();
+        let stored: [u8; 32] =
+            bytes[body_len..]
+                .try_into()
+                .map_err(|_| GenerationAuthorityErrorV1::InvalidField {
+                    field: "local_floor_file.sha256",
+                })?;
+        if !constant_time_fingerprint_eq(&digest, &stored) {
+            return Err(GenerationAuthorityErrorV1::ChecksumMismatch);
+        }
+        if bytes[..8] != LOCAL_FLOOR_FILE_MAGIC_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "local_floor_file.magic",
+            });
+        }
+        let mut decoder = CanonicalDecoder::new(&bytes[8..body_len]);
+        let schema_version = decoder.u16("local_floor_file.schema_version")?;
+        let root_id: [u8; 16] = decoder
+            .take(16, "local_floor_file.root_id")?
+            .try_into()
+            .map_err(|_| GenerationAuthorityErrorV1::InvalidField {
+                field: "local_floor_file.root_id",
+            })?;
+        let authority = AuthorityRefV1::from_canonical_bytes(
+            decoder.take(AUTHORITY_REF_BYTES_V1, "local_floor_file.authority")?,
+        )?;
+        let cas_version = decoder.u64("local_floor_file.cas_version")?;
+        let record_sha256: [u8; 32] = decoder
+            .take(32, "local_floor_file.record_sha256")?
+            .try_into()
+            .map_err(|_| GenerationAuthorityErrorV1::InvalidField {
+                field: "local_floor_file.record_sha256",
+            })?;
+        let idempotency_key: [u8; 16] = decoder
+            .take(16, "local_floor_file.idempotency_key")?
+            .try_into()
+            .map_err(|_| GenerationAuthorityErrorV1::InvalidField {
+                field: "local_floor_file.idempotency_key",
+            })?;
+        let expected_present = decoder.take(1, "local_floor_file.expected_present")?[0];
+        let expected_bytes: [u8; 32] = decoder
+            .take(32, "local_floor_file.expected_record_sha256")?
+            .try_into()
+            .map_err(|_| GenerationAuthorityErrorV1::InvalidField {
+                field: "local_floor_file.expected_record_sha256",
+            })?;
+        decoder.finish()?;
+        let expected_record_sha256 = match expected_present {
+            0 if expected_bytes == [0; 32] => None,
+            0 => return Err(GenerationAuthorityErrorV1::NonCanonicalPadding),
+            1 => Some(expected_bytes),
+            _ => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "local_floor_file.expected_present",
+                });
+            }
+        };
+        let record = AntiRollbackFloorRecordV1 {
+            schema_version,
+            root_id,
+            authority,
+            cas_version,
+            record_sha256,
+        };
+        record.validate()?;
+        Ok(Self {
+            record,
+            idempotency_key,
+            expected_record_sha256,
+        })
+    }
+}
+
+fn floor_io_unavailable(_: std::io::Error) -> GenerationAuthorityErrorV1 {
+    GenerationAuthorityErrorV1::FloorStoreUnavailable
+}
+
+impl LocalAntiRollbackFloorStoreV1 {
+    /// Bind a store to `directory`, creating it if absent.
+    ///
+    /// The directory must not live inside a generation root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationAuthorityErrorV1::FloorStoreUnavailable`] when the
+    /// directory cannot be created.
+    pub fn open(
+        directory: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let directory = directory.into();
+        std::fs::create_dir_all(&directory).map_err(floor_io_unavailable)?;
+        Ok(Self { directory })
+    }
+
+    /// Directory this store persists into.
+    #[must_use]
+    pub fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
+    fn root_directory(&self, root_id: [u8; 16]) -> std::path::PathBuf {
+        let mut name = String::with_capacity(32);
+        for byte in root_id {
+            let _ = write!(name, "{byte:02x}");
+        }
+        self.directory.join(name)
+    }
+
+    fn version_path(root_directory: &std::path::Path, cas_version: u64) -> std::path::PathBuf {
+        root_directory.join(format!("v{cas_version:020}{LOCAL_FLOOR_FILE_SUFFIX_V1}"))
+    }
+
+    /// Every version file for `root_id`, keyed by the CAS version in its name,
+    /// with the decode outcome of its bytes. A missing directory is no floor.
+    #[allow(clippy::type_complexity)]
+    fn scan(
+        &self,
+        root_id: [u8; 16],
+    ) -> Result<
+        BTreeMap<u64, Result<LocalFloorFileV1, GenerationAuthorityErrorV1>>,
+        GenerationAuthorityErrorV1,
+    > {
+        let root_directory = self.root_directory(root_id);
+        let entries = match std::fs::read_dir(&root_directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(error) => return Err(floor_io_unavailable(error)),
+        };
+        let mut files = BTreeMap::new();
+        for entry in entries {
+            let entry = entry.map_err(floor_io_unavailable)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(digits) = name
+                .strip_prefix('v')
+                .and_then(|rest| rest.strip_suffix(LOCAL_FLOOR_FILE_SUFFIX_V1))
+            else {
+                continue;
+            };
+            let Ok(cas_version) = digits.parse::<u64>() else {
+                continue;
+            };
+            let bytes = std::fs::read(entry.path()).map_err(floor_io_unavailable)?;
+            let decoded = LocalFloorFileV1::decode(&bytes).and_then(|file| {
+                if file.record.root_id == root_id && file.record.cas_version == cas_version {
+                    Ok(file)
+                } else {
+                    Err(GenerationAuthorityErrorV1::RootMismatch)
+                }
+            });
+            files.insert(cas_version, decoded);
+        }
+        Ok(files)
+    }
+
+    /// Current floor for `root_id`, or `None` before any advance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationAuthorityErrorV1::UnresolvedAttempt`] when the
+    /// highest-numbered version file does not verify (torn, tampered, or
+    /// foreign): the store then refuses every advance until it is reconciled
+    /// out of band, because that file may be an acknowledged publication.
+    pub fn load(
+        &self,
+        root_id: [u8; 16],
+    ) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1> {
+        if root_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.root_id",
+            });
+        }
+        let files = self.scan(root_id)?;
+        match files.into_iter().next_back() {
+            None => Ok(None),
+            Some((_, Ok(file))) => Ok(Some(file.record)),
+            Some((_, Err(_))) => Err(GenerationAuthorityErrorV1::UnresolvedAttempt),
+        }
+    }
+
+    /// Durable compare-and-advance with the same contract as
+    /// [`InMemoryAntiRollbackFloorStoreV1::compare_and_advance`].
+    ///
+    /// # Errors
+    ///
+    /// Mirrors the in-memory provider's typed states, plus
+    /// [`GenerationAuthorityErrorV1::UnresolvedAttempt`] for an unverifiable
+    /// highest version file and
+    /// [`GenerationAuthorityErrorV1::FloorStoreUnavailable`] for I/O failure.
+    /// A lost `create_new` race is reported as
+    /// [`GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict`]. A write
+    /// that fails after the file was created is left in place as a torn file:
+    /// it reads back as an unresolved attempt, never as a floor.
+    pub fn compare_and_advance(
+        &self,
+        expected: Option<AntiRollbackFloorRecordV1>,
+        next: AuthorityFloorV1,
+        idempotency_key: [u8; 16],
+    ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1> {
+        next.validate()?;
+        if idempotency_key == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.idempotency_key",
+            });
+        }
+        if let Some(expected) = expected {
+            expected.validate()?;
+            if expected.root_id != next.root_id {
+                return Err(GenerationAuthorityErrorV1::RootMismatch);
+            }
+        }
+        let expected_record_sha256 = expected.map(|record| record.record_sha256);
+
+        let files = self.scan(next.root_id)?;
+        for file in files.values().flatten() {
+            if file.idempotency_key == idempotency_key {
+                if file.expected_record_sha256 == expected_record_sha256
+                    && file.record.authority == next.authority
+                {
+                    return Ok(file.record);
+                }
+                return Err(GenerationAuthorityErrorV1::FloorIdempotencyConflict);
+            }
+        }
+        let current = match files.into_iter().next_back() {
+            None => None,
+            Some((_, Ok(file))) => Some(file.record),
+            Some((_, Err(_))) => return Err(GenerationAuthorityErrorV1::UnresolvedAttempt),
+        };
+        if current != expected {
+            return Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict);
+        }
+        match current {
+            Some(record) => {
+                let expected_sequence = record.authority.next_sequence()?;
+                if next.authority.sequence <= record.authority.sequence {
+                    return Err(GenerationAuthorityErrorV1::FloorSequenceRegression);
+                }
+                if next.authority.sequence != expected_sequence
+                    || !predecessor_matches_authority(next.authority.predecessor, record.authority)
+                {
+                    return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+                }
+            }
+            None if next.authority.sequence != 1 || next.authority.predecessor.is_some() => {
+                return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+            }
+            None => {}
+        }
+        let cas_version = current
+            .map(|record| record.cas_version)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(GenerationAuthorityErrorV1::FloorVersionExhausted)?;
+        let record = AntiRollbackFloorRecordV1::new(next, cas_version)?;
+        let file = LocalFloorFileV1 {
+            record,
+            idempotency_key,
+            expected_record_sha256,
+        };
+
+        let root_directory = self.root_directory(next.root_id);
+        std::fs::create_dir_all(&root_directory).map_err(floor_io_unavailable)?;
+        let path = Self::version_path(&root_directory, cas_version);
+        // `create_new` is the election: whichever same-base publisher opens
+        // this name first owns this CAS version; every other one loses with a
+        // typed conflict and must reload.
+        let mut handle = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict);
+            }
+            Err(error) => return Err(floor_io_unavailable(error)),
+        };
+        std::io::Write::write_all(&mut handle, &file.encode())
+            .and_then(|()| handle.sync_all())
+            .map_err(floor_io_unavailable)?;
+        drop(handle);
+        std::fs::File::open(&root_directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(floor_io_unavailable)?;
+        Ok(record)
+    }
+}
+
 /// Kind of fixed `LOCK` frame. Owner and attempt remain distinct on disk so an
 /// interrupted attempt cannot be silently mistaken for authority ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -5467,6 +5842,197 @@ mod tests {
             GenerationRootSecurityProfileV1::ReadOnlyUnanchored.require_mutation_authorized(),
             Err(GenerationAuthorityErrorV1::ReadOnlyProfile),
             "inspection-only admission cannot be reused for mutation"
+        );
+    }
+
+    #[test]
+    fn local_anti_rollback_floor_is_durable_monotone_and_idempotent_across_reopen() {
+        let directory = tempfile::tempdir().expect("temp floor directory");
+        let store = LocalAntiRollbackFloorStoreV1::open(directory.path()).expect("open store");
+        let root_id = [0x5a; 16];
+        assert_eq!(store.load(root_id), Ok(None));
+
+        let genesis = authority_reference(1, None);
+        let genesis_floor = AuthorityFloorV1::new(root_id, genesis).expect("valid genesis floor");
+        let first = store
+            .compare_and_advance(None, genesis_floor, [0x41; 16])
+            .expect("first durable advance");
+        assert_eq!(first.cas_version, 1);
+        assert_eq!(store.load(root_id), Ok(Some(first)));
+        assert_eq!(
+            store.compare_and_advance(None, genesis_floor, [0x41; 16]),
+            Ok(first),
+            "replaying the exact request returns its original receipt"
+        );
+
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let successor_floor =
+            AuthorityFloorV1::new(root_id, successor).expect("valid successor floor");
+        let second = store
+            .compare_and_advance(Some(first), successor_floor, [0x42; 16])
+            .expect("monotone successor advance");
+        assert_eq!(second.cas_version, 2);
+
+        // A fresh store instance over the same directory (a restart) sees the
+        // same floor and honours the same idempotency journal.
+        let reopened = LocalAntiRollbackFloorStoreV1::open(directory.path()).expect("reopen store");
+        assert_eq!(reopened.load(root_id), Ok(Some(second)));
+        assert_eq!(
+            reopened.compare_and_advance(None, genesis_floor, [0x41; 16]),
+            Ok(first),
+            "idempotent replay survives restart"
+        );
+        assert_eq!(
+            reopened.compare_and_advance(Some(first), successor_floor, [0x43; 16]),
+            Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict),
+            "a stale exact CAS receipt cannot overwrite a newer floor"
+        );
+        assert_eq!(
+            reopened.compare_and_advance(Some(second), genesis_floor, [0x44; 16]),
+            Err(GenerationAuthorityErrorV1::FloorSequenceRegression),
+            "a valid older authority cannot roll the durable floor backward"
+        );
+        assert_eq!(
+            reopened.compare_and_advance(Some(second), successor_floor, [0x41; 16]),
+            Err(GenerationAuthorityErrorV1::FloorIdempotencyConflict),
+            "a completed idempotency key cannot be rebound to another CAS"
+        );
+        assert_eq!(
+            reopened.compare_and_advance(
+                Some(second),
+                AuthorityFloorV1::new(
+                    root_id,
+                    authority_reference(4, Some(successor.fingerprint()))
+                )
+                .expect("valid floor"),
+                [0x45; 16]
+            ),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "the durable floor requires the exact next sequence"
+        );
+        assert_eq!(reopened.load(root_id), Ok(Some(second)));
+        assert_eq!(reopened.load([0x5b; 16]), Ok(None), "roots are isolated");
+        assert_eq!(
+            reopened.load([0; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.root_id"
+            })
+        );
+    }
+
+    #[test]
+    fn local_anti_rollback_floor_torn_or_tampered_head_is_an_unresolved_attempt() {
+        let directory = tempfile::tempdir().expect("temp floor directory");
+        let store = LocalAntiRollbackFloorStoreV1::open(directory.path()).expect("open store");
+        let root_id = [0x5a; 16];
+        let genesis = authority_reference(1, None);
+        let genesis_floor = AuthorityFloorV1::new(root_id, genesis).expect("valid genesis floor");
+        let first = store
+            .compare_and_advance(None, genesis_floor, [0x41; 16])
+            .expect("first durable advance");
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let successor_floor =
+            AuthorityFloorV1::new(root_id, successor).expect("valid successor floor");
+        let second = store
+            .compare_and_advance(Some(first), successor_floor, [0x42; 16])
+            .expect("second durable advance");
+
+        let head = store.root_directory(root_id).join(format!(
+            "v{:020}{LOCAL_FLOOR_FILE_SUFFIX_V1}",
+            second.cas_version
+        ));
+        let original = std::fs::read(&head).expect("read head file");
+        assert_eq!(original.len(), LOCAL_FLOOR_FILE_BYTES_V1);
+
+        // Torn tail: a crash mid-write. Neither the floor nor an advance may
+        // silently fall back to the previous version.
+        std::fs::write(&head, &original[..original.len() / 2]).expect("truncate head");
+        assert_eq!(
+            store.load(root_id),
+            Err(GenerationAuthorityErrorV1::UnresolvedAttempt)
+        );
+        let third = authority_reference(3, Some(successor.fingerprint()));
+        let third_floor = AuthorityFloorV1::new(root_id, third).expect("valid floor");
+        assert_eq!(
+            store.compare_and_advance(Some(second), third_floor, [0x46; 16]),
+            Err(GenerationAuthorityErrorV1::UnresolvedAttempt)
+        );
+        assert_eq!(
+            store.compare_and_advance(Some(first), successor_floor, [0x47; 16]),
+            Err(GenerationAuthorityErrorV1::UnresolvedAttempt),
+            "a lower valid base cannot bypass the unresolved head"
+        );
+
+        // Single-bit tamper of a full-length file fails the trailing digest.
+        let mut tampered = original.clone();
+        tampered[40] ^= 0x01;
+        std::fs::write(&head, &tampered).expect("tamper head");
+        assert_eq!(
+            store.load(root_id),
+            Err(GenerationAuthorityErrorV1::UnresolvedAttempt)
+        );
+
+        // Restoring the exact bytes reconciles it.
+        std::fs::write(&head, &original).expect("restore head");
+        assert_eq!(store.load(root_id), Ok(Some(second)));
+        assert_eq!(
+            store
+                .compare_and_advance(Some(second), third_floor, [0x46; 16])
+                .map(|record| record.cas_version),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn local_anti_rollback_floor_allows_exactly_one_same_base_publisher() {
+        let directory = tempfile::tempdir().expect("temp floor directory");
+        let store = LocalAntiRollbackFloorStoreV1::open(directory.path()).expect("open store");
+        let root_id = [0x5a; 16];
+        let genesis = authority_reference(1, None);
+        let genesis_floor = AuthorityFloorV1::new(root_id, genesis).expect("valid genesis floor");
+        let base = store
+            .compare_and_advance(None, genesis_floor, [0x41; 16])
+            .expect("genesis advance");
+        let successor_floor =
+            AuthorityFloorV1::new(root_id, authority_reference(2, Some(genesis.fingerprint())))
+                .expect("valid successor floor");
+
+        const PUBLISHERS: usize = 8;
+        let barrier = std::sync::Barrier::new(PUBLISHERS);
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..PUBLISHERS)
+                .map(|index| {
+                    let store = &store;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let key = [u8::try_from(0x60 + index).expect("small index"); 16];
+                        store.compare_and_advance(Some(base), successor_floor, key)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("publisher thread"))
+                .collect::<Vec<_>>()
+        });
+        let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(winners, 1, "create_new elects exactly one same-base winner");
+        assert!(
+            outcomes.iter().all(|outcome| matches!(
+                outcome,
+                Ok(_) | Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict)
+            )),
+            "every loser sees a typed conflict, never an I/O error: {outcomes:?}"
+        );
+        let head = store.load(root_id).expect("load head").expect("advanced");
+        assert_eq!(head.cas_version, 2);
+        assert_eq!(
+            std::fs::read_dir(store.root_directory(root_id))
+                .expect("root directory")
+                .count(),
+            2,
+            "losers never leave version files behind"
         );
     }
 
