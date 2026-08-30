@@ -4178,6 +4178,14 @@ pub mod generation_reader {
         /// Every declared object admitted, but the root also holds something
         /// a sealed generation root must never hold.
         ClosureViolation(ClosureViolationV1),
+        /// The fresh head is older than the snapshot already installed in a
+        /// cell for the same root identity (stale replica or replayed root).
+        RegressedHead {
+            /// Sequence of the installed snapshot's head.
+            installed: u64,
+            /// Sequence the fresh open observed.
+            observed: u64,
+        },
     }
 
     /// Outcome of one fresh open.
@@ -4663,6 +4671,98 @@ pub mod generation_reader {
         }
     }
 
+    /// Lock-free owned cell the query hot path reads a prebuilt snapshot from.
+    ///
+    /// The cell never builds anything itself: [`Self::refresh`] opens a fresh
+    /// snapshot through [`QualifiedGenerationRoot::open_generation_snapshot`]
+    /// and installs the already-built `Arc` only when the open succeeded and
+    /// the head did not regress. A refusal or infrastructure error leaves
+    /// whatever was installed exactly as it was, so readers keep serving the
+    /// last admitted generation. Old `Arc`s handed out by [`Self::load`] stay
+    /// valid and byte-exact after any later install.
+    pub struct GenerationSnapshotCellV1 {
+        inner: arc_swap::ArcSwapOption<OpenedGenerationSnapshotV1>,
+    }
+
+    impl Default for GenerationSnapshotCellV1 {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl GenerationSnapshotCellV1 {
+        /// An empty cell: nothing admitted yet.
+        #[must_use]
+        pub const fn new() -> Self {
+            Self {
+                inner: arc_swap::ArcSwapOption::const_empty(),
+            }
+        }
+
+        /// The currently installed snapshot, if any (one atomic load).
+        #[must_use]
+        pub fn load(&self) -> Option<Arc<OpenedGenerationSnapshotV1>> {
+            self.inner.load_full()
+        }
+
+        /// Install an already-admitted snapshot; returns the previous one.
+        pub fn install(
+            &self,
+            snapshot: Arc<OpenedGenerationSnapshotV1>,
+        ) -> Option<Arc<OpenedGenerationSnapshotV1>> {
+            self.inner.swap(Some(snapshot))
+        }
+
+        /// Open a fresh snapshot of `root` and install it on success.
+        ///
+        /// The new head must not be older than the installed one for the same
+        /// root identity: a stale replica or replayed root is refused typed
+        /// ([`SnapshotRefusalV1::RegressedHead`]) and the installed snapshot is
+        /// kept. On any refusal or error nothing is installed.
+        ///
+        /// # Errors
+        ///
+        /// Same as [`QualifiedGenerationRoot::open_generation_snapshot`].
+        pub fn refresh(
+            &self,
+            root: &QualifiedGenerationRoot,
+            root_id: [u8; 16],
+            profile: GenerationRootSecurityProfileV1,
+            floor: Option<&dyn AntiRollbackFloorProviderV1>,
+        ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
+            let outcome = root.open_generation_snapshot(root_id, profile, floor)?;
+            let SnapshotOpenOutcomeV1::Opened(fresh) = &outcome else {
+                return Ok(outcome);
+            };
+            if let Some(installed) = self.load()
+                && installed.root_id() == fresh.root_id()
+                && installed.head().authority.sequence > fresh.head().authority.sequence
+            {
+                return Ok(SnapshotOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::RegressedHead {
+                        installed: installed.head().authority.sequence,
+                        observed: fresh.head().authority.sequence,
+                    },
+                ));
+            }
+            self.inner.store(Some(Arc::clone(fresh)));
+            Ok(outcome)
+        }
+    }
+
+    impl fmt::Debug for GenerationSnapshotCellV1 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("GenerationSnapshotCellV1")
+                .field(
+                    "installed_head_sequence",
+                    &self
+                        .load()
+                        .map(|snapshot| snapshot.head().authority.sequence),
+                )
+                .finish()
+        }
+    }
     #[cfg(all(test, target_os = "linux"))]
     mod tests {
         use super::super::authority_publisher::{
@@ -5837,6 +5937,283 @@ pub mod generation_reader {
                 2 + 2 + 8 + 1,
                 "anchors + two manifests + eight components + orphan"
             );
+        }
+
+        #[test]
+        fn cell_installs_only_on_success_and_keeps_the_old_arc_on_any_refusal() {
+            let (root_path, root, slot) = genesis_root("cell-install");
+            let cell = GenerationSnapshotCellV1::new();
+            assert!(cell.load().is_none());
+
+            let outcome = cell
+                .refresh(
+                    &root,
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                )
+                .expect("refresh runs");
+            let installed = opened(outcome);
+            let loaded = cell.load().expect("installed");
+            assert!(Arc::ptr_eq(&installed, &loaded));
+            assert_eq!(loaded.head(), slot);
+            let bytes_before = loaded.closure().bytes(GenerationComponentRole::Vector);
+
+            // Plant a violation: the refresh is refused and the cell is untouched.
+            write_sealed_object(&root_path, "stray.wal", b"journal");
+            let refusal = refused(
+                cell.refresh(
+                    &root,
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                )
+                .expect("refresh runs"),
+            );
+            assert_eq!(
+                refusal,
+                SnapshotRefusalV1::ClosureViolation(ClosureViolationV1::WriteAheadLog)
+            );
+            let still = cell.load().expect("still installed");
+            assert!(Arc::ptr_eq(&still, &loaded));
+            assert_eq!(
+                &*still.closure().bytes(GenerationComponentRole::Vector),
+                &*bytes_before
+            );
+            assert!(format!("{cell:?}").contains("installed_head_sequence: Some(1)"));
+        }
+
+        #[test]
+        fn cell_refuses_a_regressed_head_from_a_stale_root() {
+            // Root A advances to sequence 2; root B (same root id, e.g. a
+            // replica restored from an older copy) only has genesis.
+            let root_path = fixture_root("cell-regress-a");
+            let root_a = admit(&root_path);
+            let publisher = publisher(&root_a);
+            let (genesis, _, genesis_slot) = publish_with_manifest(
+                &root_path,
+                &publisher,
+                1,
+                None,
+                ExpectedAuthorityPairV1::default(),
+                None,
+            );
+            publish_with_manifest(
+                &root_path,
+                &publisher,
+                2,
+                Some(genesis),
+                ExpectedAuthorityPairV1 {
+                    first: None,
+                    second: Some(genesis_slot),
+                },
+                None,
+            );
+            let (_, root_b, _) = genesis_root("cell-regress-b");
+
+            let cell = GenerationSnapshotCellV1::new();
+            let current = opened(
+                cell.refresh(
+                    &root_a,
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                )
+                .expect("refresh runs"),
+            );
+            assert_eq!(current.head().authority.sequence, 2);
+            assert_eq!(
+                refused(
+                    cell.refresh(
+                        &root_b,
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                    )
+                    .expect("refresh runs")
+                ),
+                SnapshotRefusalV1::RegressedHead {
+                    installed: 2,
+                    observed: 1
+                }
+            );
+            assert!(Arc::ptr_eq(&cell.load().expect("kept"), &current));
+            // Explicit install is the caller's decision and is not gated.
+            let stale = opened(open(
+                &root_b,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            let previous = cell.install(Arc::clone(&stale)).expect("previous");
+            assert!(Arc::ptr_eq(&previous, &current));
+            assert!(Arc::ptr_eq(&cell.load().expect("stale"), &stale));
+        }
+
+        #[test]
+        fn long_lived_reader_stays_byte_exact_across_many_publications() {
+            const PUBLICATIONS: u64 = 12;
+            let root_path = fixture_root("cell-long-lived");
+            let root = admit(&root_path);
+            let floor = InMemoryAntiRollbackFloorStoreV1::new();
+            let publisher = publisher(&root);
+            let (mut previous, genesis_manifest, mut previous_slot) = publish_with_manifest(
+                &root_path,
+                &publisher,
+                1,
+                None,
+                ExpectedAuthorityPairV1::default(),
+                Some(&floor),
+            );
+            let cell = GenerationSnapshotCellV1::new();
+            let old = opened(
+                cell.refresh(
+                    &root,
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::RequiredExternal,
+                    Some(&floor),
+                )
+                .expect("refresh runs"),
+            );
+            let old_closure: Vec<Arc<[u8]>> = ROLES
+                .iter()
+                .map(|role| old.closure().bytes(*role))
+                .collect();
+            let mut pair = ExpectedAuthorityPairV1 {
+                first: None,
+                second: Some(previous_slot),
+            };
+
+            for sequence in 2..=PUBLICATIONS {
+                let (authority, _, slot) = publish_with_manifest(
+                    &root_path,
+                    &publisher,
+                    sequence,
+                    Some(previous),
+                    pair,
+                    Some(&floor),
+                );
+                if slot.slot_index == 0 {
+                    pair.first = Some(slot);
+                } else {
+                    pair.second = Some(slot);
+                }
+                previous = authority;
+                previous_slot = slot;
+                // Refresh every other publication; the cell must follow.
+                if sequence % 2 == 0 {
+                    let fresh = opened(
+                        cell.refresh(
+                            &root,
+                            ROOT_ID,
+                            GenerationRootSecurityProfileV1::RequiredExternal,
+                            Some(&floor),
+                        )
+                        .expect("refresh runs"),
+                    );
+                    assert_eq!(fresh.head(), slot);
+                    assert_eq!(
+                        fresh.health(),
+                        SnapshotHealthV1::ExternallyAnchored {
+                            cas_version: sequence
+                        }
+                    );
+                }
+            }
+
+            // The first reader never noticed: same authority, manifest, and
+            // component bytes; its descriptors still open.
+            assert_eq!(old.head().authority.sequence, 1);
+            assert_eq!(old.manifest(), &genesis_manifest);
+            for (role, bytes) in ROLES.iter().zip(&old_closure) {
+                assert_eq!(&*old.closure().bytes(*role), &**bytes);
+                assert_eq!(old.closure().file(*role).witness().hard_links(), 1);
+            }
+            assert_eq!(
+                &*old.manifest_bytes(),
+                genesis_manifest.canonical_bytes().as_slice()
+            );
+            let latest = cell.load().expect("installed");
+            assert_eq!(latest.head(), previous_slot);
+            assert!(!Arc::ptr_eq(&latest, &old));
+            // Every generation's objects are still retained beside each other.
+            let inventory = root.inventory().expect("inventory");
+            let manifests = inventory
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(ACTIVATION_MANIFEST_SUFFIX_V1))
+                })
+                .count();
+            assert_eq!(u64::try_from(manifests).expect("count"), PUBLICATIONS);
+        }
+
+        #[test]
+        fn a_live_exclusive_holder_yields_a_typed_lock_contended_refusal() {
+            use std::io::BufRead as _;
+            use std::process::{Command, Stdio};
+
+            let (root_path, root, slot) = genesis_root("cell-contended");
+            let mut child = Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "generation_root::authority_publisher::tests::lock_holder_child",
+                    "--nocapture",
+                ])
+                .env("FRANKENSEARCH_PUBLISHER_LOCK_HOLDER_ROOT", &root_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn lock-holder child");
+            let stdout = child.stdout.take().expect("child stdout");
+            let mut lines = std::io::BufReader::new(stdout).lines();
+            let locked = std::iter::from_fn(|| lines.next().and_then(Result::ok))
+                .take(50)
+                .any(|line| line.trim() == "LOCKED");
+            assert!(locked, "child never reported holding the lock");
+
+            let cell = GenerationSnapshotCellV1::new();
+            assert_eq!(
+                refused(
+                    cell.refresh(
+                        &root,
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                    )
+                    .expect("contended refresh runs")
+                ),
+                SnapshotRefusalV1::LockContended
+            );
+            assert!(cell.load().is_none(), "nothing installed while contended");
+
+            child.kill().expect("kill the holder");
+            child.wait().expect("reap the holder");
+            let mut admitted = None;
+            for _ in 0..200 {
+                match cell
+                    .refresh(
+                        &root,
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                    )
+                    .expect("post-kill refresh runs")
+                {
+                    SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::LockContended) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    other => {
+                        admitted = Some(other);
+                        break;
+                    }
+                }
+            }
+            let snapshot = opened(admitted.expect("the lock frees after the holder dies"));
+            assert_eq!(snapshot.head(), slot);
+            assert!(Arc::ptr_eq(&cell.load().expect("installed"), &snapshot));
         }
     }
 }
