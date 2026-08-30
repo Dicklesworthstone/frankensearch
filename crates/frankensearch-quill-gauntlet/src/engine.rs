@@ -7954,6 +7954,75 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
+    fn oracle_certificates_track_a_mutation_between_calls() {
+        let revision = oracle_version_contract()
+            .expect("version contract")
+            .lexical_contract_audit_revision;
+        let mut oracle = TantivyOracle::in_memory_with_source(&revision, false).expect("oracle");
+        let documents = vec![
+            frankensearch_core::IndexableDocument::new("a", "shared token"),
+            frankensearch_core::IndexableDocument::new("b", "shared token"),
+            frankensearch_core::IndexableDocument::new("c", "shared token"),
+        ];
+        let mut case = DifferentialCase::new("oracle-mutation", "shared", 2);
+        case.tie_expansion_limit = 8;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            oracle
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index oracle corpus");
+            let before = oracle.observe(&cx, &case).await.expect("observe before");
+            let before_certificate = before
+                .cutoff_certificate
+                .clone()
+                .expect("certifiable before the mutation");
+            assert_eq!(before_certificate.exact_total, 3);
+
+            // A commit between two observations: each certificate describes
+            // its own pinned searcher, never a blend of the two.
+            oracle
+                .index_documents(
+                    &cx,
+                    &[frankensearch_core::IndexableDocument::new(
+                        "d",
+                        "shared token",
+                    )],
+                )
+                .await
+                .expect("commit a fourth document");
+            let after = oracle.observe(&cx, &case).await.expect("observe after");
+            let after_certificate = after
+                .cutoff_certificate
+                .clone()
+                .expect("certifiable after the mutation");
+            assert_eq!(after_certificate.exact_total, 4);
+            assert_eq!(after_certificate.expanded.len(), 4, "the tie group grew");
+            assert!(after_certificate.is_exhausted());
+            assert_ne!(
+                after_certificate.provenance.snapshot_sha256,
+                before_certificate.provenance.snapshot_sha256,
+                "a different physical searcher"
+            );
+            assert_ne!(
+                after_certificate.provenance.same_snapshot_authority,
+                before_certificate.provenance.same_snapshot_authority
+            );
+            assert_ne!(
+                after_certificate.digest_sha256().expect("digest"),
+                before_certificate.digest_sha256().expect("digest")
+            );
+            // The earlier certificate is an immutable value: it still
+            // validates as the proof it was, over the snapshot it names.
+            assert_eq!(before_certificate.validate(), Ok(()));
+            assert_eq!(before_certificate.exact_total, 3);
+            assert_eq!(before.match_count, CountState::Value(3));
+            assert_eq!(after.match_count, CountState::Value(4));
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
     fn oracle_observation_retains_full_tie_evidence_and_exact_count() {
         let revision = oracle_version_contract()
             .expect("version contract")
