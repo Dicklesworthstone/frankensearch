@@ -11,7 +11,7 @@ repository.workspace = true
 bench-internals = ["frankensearch-core/bench-internals"]
 # Dev-only observation surface for the Quill conformance oracle. This keeps
 # full Tantivy DocAddress/count evidence out of shipping APIs and default builds.
-tantivy-oracle = []
+tantivy-oracle = ["dep:sha2"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
@@ -21,7 +21,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 rayon = { workspace = true }
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)

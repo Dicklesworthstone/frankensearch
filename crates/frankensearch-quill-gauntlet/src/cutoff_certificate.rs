@@ -391,11 +391,12 @@ impl CutoffCertificateV1 {
     ///
     /// # Errors
     ///
-    /// Returns the first violated invariant; serialization of a valid
-    /// certificate cannot fail.
+    /// Returns the first violated invariant, or [`CutoffCertificateError::Schema`]
+    /// if the certificate cannot be serialized — never an empty byte string
+    /// that would hash to a plausible-looking digest.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, CutoffCertificateError> {
         self.validate()?;
-        Ok(serde_json::to_vec(self).unwrap_or_default())
+        serde_json::to_vec(self).map_err(|_| CutoffCertificateError::Schema)
     }
 
     /// Domain-separated content address of a validated certificate.
