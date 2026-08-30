@@ -3423,6 +3423,83 @@ pub mod authority_publisher {
         }
 
         #[test]
+        fn short_slot_write_leaves_a_torn_slot_that_requires_repair() {
+            let root_path = fixture_root("short-write");
+            let root = admit(&root_path);
+            let publisher = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher binds");
+            let genesis = authority(1, None);
+            let before = authority_bytes(&root_path);
+
+            // Fault after the first 1024-byte chunk of the 4096-byte slot.
+            let outcome = {
+                let _hook = platform::install_test_hook(|boundary| match boundary {
+                    platform::TestBoundary::DuringPublishSlotWrite { written: 1024 } => {
+                        Err(GenerationRootError::new(
+                            GenerationRootErrorKind::Io,
+                            GenerationRootStage::SyncRegularFile,
+                        ))
+                    }
+                    _ => Ok(()),
+                });
+                publisher
+                    .publish(
+                        genesis,
+                        ExpectedAuthorityPairV1::default(),
+                        None,
+                        [0x41; 16],
+                    )
+                    .expect("publication runs")
+            };
+            let PublicationOutcomeV1::CommitOutcomeUnknown(permit) = outcome else {
+                panic!("a short write must be unknown: {outcome:?}");
+            };
+            assert_eq!(permit.stage, AttemptStageV1::SlotWrite);
+
+            // Exactly the first chunk of slot 1 changed; the tail is still zero.
+            let after = authority_bytes(&root_path);
+            let range = slot_range(1);
+            assert_ne!(
+                &after[range.start..range.start + 1024],
+                &before[range.start..range.start + 1024]
+            );
+            assert_eq!(
+                &after[range.start + 1024..range.end],
+                &before[range.start + 1024..range.end]
+            );
+            assert_eq!(
+                &after[..range.start],
+                &before[..range.start],
+                "slot 0 untouched"
+            );
+
+            // The torn slot authenticates as nothing: reconcile demands repair,
+            // and a fresh publication is blocked until it happens.
+            assert!(matches!(
+                publisher.reconcile(&permit, None).expect("reconcile runs"),
+                ReconcileOutcomeV1::RepairRequired(GenerationAuthorityErrorV1::ChecksumMismatch)
+            ));
+            assert!(matches!(
+                publisher
+                    .publish(
+                        genesis,
+                        ExpectedAuthorityPairV1::default(),
+                        None,
+                        [0x42; 16]
+                    )
+                    .expect("publication runs"),
+                PublicationOutcomeV1::NotCommitted(NotCommittedV1::UnreadableSlot(
+                    GenerationAuthorityErrorV1::ChecksumMismatch
+                ))
+            ));
+        }
+
+        #[test]
         fn rollback_is_a_higher_sequence_record_and_an_exhausted_head_is_read_only() {
             let root_path = fixture_root("rollback");
             let root = admit(&root_path);
@@ -4088,6 +4165,11 @@ mod platform {
         BeforePublishAttemptFrame,
         AfterPublishAttemptFrame,
         BeforePublishSlotWrite,
+        /// After each bounded chunk of the slot write; `written` bytes are on
+        /// disk, the rest are not: a fault here is a genuine short write.
+        DuringPublishSlotWrite {
+            written: usize,
+        },
         AfterPublishSlotWrite,
         BeforePublishSlotReread,
         BeforePublishFloorAdvance,
@@ -5358,12 +5440,16 @@ mod platform {
         debug_assert!(end <= control.expectation.byte_len);
         let mut written = 0_usize;
         while written < bytes.len() {
-            let count = rustix::io::pwrite(
-                &control.descriptor,
-                &bytes[written..],
-                offset + usize_as_u64(written),
-            )
-            .map_err(|error| os_error(GenerationRootStage::SyncRegularFile, error))?;
+            // Test builds write in bounded chunks so a fault between two
+            // chunks models a genuine short write (a torn slot produced by
+            // the real write path, not by a test poking the file).
+            #[cfg(test)]
+            let chunk = &bytes[written..bytes.len().min(written + 1024)];
+            #[cfg(not(test))]
+            let chunk = &bytes[written..];
+            let count =
+                rustix::io::pwrite(&control.descriptor, chunk, offset + usize_as_u64(written))
+                    .map_err(|error| os_error(GenerationRootStage::SyncRegularFile, error))?;
             if count == 0 {
                 return Err(GenerationRootError::new(
                     GenerationRootErrorKind::Io,
@@ -5371,6 +5457,8 @@ mod platform {
                 ));
             }
             written += count;
+            #[cfg(test)]
+            test_boundary(TestBoundary::DuringPublishSlotWrite { written })?;
         }
         sync_file_descriptor(&control.descriptor)?;
         revalidate_anchor_route(control)
