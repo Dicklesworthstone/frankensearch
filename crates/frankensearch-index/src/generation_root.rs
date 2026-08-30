@@ -2431,11 +2431,18 @@ pub mod authority_publisher {
         }
 
         fn authority(sequence: u64, predecessor: Option<[u8; 32]>) -> AuthorityRefV1 {
+            // Sequence-wide (not u8-bound) so long publication runs stay valid;
+            // every field is nonzero for any sequence >= 1.
+            let word = sequence.to_be_bytes();
+            let mut object_id = [0x01_u8; 16];
+            object_id[8..].copy_from_slice(&word);
+            let mut manifest_sha256 = [0x10_u8; 32];
+            manifest_sha256[24..].copy_from_slice(&word);
             AuthorityRefV1::new(
                 sequence,
-                [u8::try_from(sequence).expect("small sequence"); 16],
+                object_id,
                 4_096 + sequence,
-                [u8::try_from(sequence + 16).expect("small digest"); 32],
+                manifest_sha256,
                 predecessor,
             )
             .expect("valid authority reference")
@@ -3131,6 +3138,184 @@ pub mod authority_publisher {
                 publisher.owner_frame().expect("frame").map(|f| f.writer_id),
                 Some(first.writer_id)
             );
+        }
+
+        const LOCK_HOLDER_CHILD_ENV: &str = "FRANKENSEARCH_PUBLISHER_LOCK_HOLDER_ROOT";
+
+        /// Child-process body for the SIGKILL test: holds the exclusive anchor
+        /// lock until killed. Selected only through the env var, so it is a
+        /// no-op when the test filter runs it directly.
+        #[test]
+        fn lock_holder_child() {
+            let Some(root) = std::env::var_os(LOCK_HOLDER_CHILD_ENV) else {
+                return;
+            };
+            let root = admit(Path::new(&root));
+            let guard = root
+                .try_exclusive_anchor_guard()
+                .expect("child takes the exclusive lock");
+            println!("LOCKED");
+            std::io::Write::flush(&mut std::io::stdout()).expect("flush");
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            drop(guard);
+        }
+
+        #[test]
+        fn sigkill_of_the_live_owner_releases_the_lock_without_any_frame_write() {
+            use std::io::BufRead as _;
+            use std::process::{Command, Stdio};
+
+            let root_path = fixture_root("sigkill");
+            let mut child = Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "generation_root::authority_publisher::tests::lock_holder_child",
+                    "--nocapture",
+                ])
+                .env(LOCK_HOLDER_CHILD_ENV, &root_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn lock-holder child");
+            let stdout = child.stdout.take().expect("child stdout");
+            let mut lines = std::io::BufReader::new(stdout).lines();
+            let locked = std::iter::from_fn(|| lines.next().and_then(Result::ok))
+                .take(50)
+                .any(|line| line.trim() == "LOCKED");
+            assert!(locked, "child never reported holding the lock");
+
+            // While the child lives, the lock is contended: a typed refusal,
+            // no frame, no slot.
+            let root = admit(&root_path);
+            let publisher = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher binds");
+            let before = authority_bytes(&root_path);
+            assert_eq!(
+                publisher
+                    .publish(
+                        authority(1, None),
+                        ExpectedAuthorityPairV1::default(),
+                        None,
+                        [0x41; 16]
+                    )
+                    .expect("contended publication runs"),
+                PublicationOutcomeV1::NotCommitted(NotCommittedV1::LockContended)
+            );
+
+            // SIGKILL: no unlock code runs in the child. The kernel releases
+            // the flock at descriptor close; nothing else is needed and no
+            // owner frame is consulted for liveness.
+            child.kill().expect("kill -9 the holder");
+            child.wait().expect("reap the holder");
+            let mut outcome = None;
+            for _ in 0..200 {
+                let attempt = publisher
+                    .publish(
+                        authority(1, None),
+                        ExpectedAuthorityPairV1::default(),
+                        None,
+                        [0x42; 16],
+                    )
+                    .expect("post-kill publication runs");
+                if matches!(
+                    attempt,
+                    PublicationOutcomeV1::NotCommitted(NotCommittedV1::LockContended)
+                ) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                outcome = Some(attempt);
+                break;
+            }
+            assert!(
+                matches!(outcome, Some(PublicationOutcomeV1::Committed { .. })),
+                "the lock must be free after SIGKILL: {outcome:?}"
+            );
+            assert_ne!(authority_bytes(&root_path), before);
+            assert_eq!(
+                publisher.owner_frame().expect("frame").map(|f| f.fence),
+                Some(1)
+            );
+        }
+
+        #[test]
+        fn many_publications_never_change_directory_entries_or_anchor_inodes() {
+            use std::os::unix::fs::MetadataExt as _;
+
+            // Each publication re-qualifies the full route and runs several
+            // durability barriers (~2 s on the reference filesystem), so the
+            // unit lane proves the invariant over 64 publications; the
+            // thousands-scale soak the bead asks for belongs in a release-mode
+            // lane, not here.
+            const PUBLICATIONS: u64 = 64;
+            let root_path = fixture_root("inodes");
+            let root = admit(&root_path);
+            let floor = InMemoryAntiRollbackFloorStoreV1::new();
+            let publisher = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher binds");
+            let listing = |path: &Path| -> Vec<(String, u64)> {
+                let mut entries: Vec<(String, u64)> = fs::read_dir(path)
+                    .expect("root readable")
+                    .map(|entry| {
+                        let entry = entry.expect("entry");
+                        (
+                            entry.file_name().to_string_lossy().into_owned(),
+                            entry.metadata().expect("metadata").ino(),
+                        )
+                    })
+                    .collect();
+                entries.sort();
+                entries
+            };
+            let before = listing(&root_path);
+            assert_eq!(before.len(), 2, "exactly LOCK and AUTHORITY");
+
+            let mut pair = ExpectedAuthorityPairV1::default();
+            let mut previous: Option<AuthorityRefV1> = None;
+            for sequence in 1..=PUBLICATIONS {
+                let candidate = authority(sequence, previous.map(|p| p.fingerprint()));
+                let outcome = publisher
+                    .publish(
+                        candidate,
+                        pair,
+                        Some(&floor),
+                        [u8::try_from(sequence % 251 + 1).expect("byte"); 16],
+                    )
+                    .expect("publication runs");
+                let PublicationOutcomeV1::Committed { slot, .. } = outcome else {
+                    panic!("publication {sequence} must commit: {outcome:?}");
+                };
+                if slot.slot_index == 0 {
+                    pair.first = Some(slot);
+                } else {
+                    pair.second = Some(slot);
+                }
+                previous = Some(candidate);
+            }
+            assert_eq!(listing(&root_path), before, "no dirent or inode changed");
+            let head = floor.load(ROOT_ID).expect("floor").expect("advanced");
+            assert_eq!(head.authority.sequence, PUBLICATIONS);
+            assert_eq!(head.cas_version, PUBLICATIONS);
+            // Both incumbents are retained: the pair holds the last two sequences.
+            let bytes = authority_bytes(&root_path);
+            let observed = decode_pair(&bytes, ROOT_ID).expect("pair decodes");
+            let sequences: Vec<u64> = [observed.first, observed.second]
+                .into_iter()
+                .flatten()
+                .map(|s| s.authority.sequence)
+                .collect();
+            assert_eq!(sequences.iter().max(), Some(&PUBLICATIONS));
+            assert_eq!(sequences.iter().min(), Some(&(PUBLICATIONS - 1)));
         }
 
         #[test]
