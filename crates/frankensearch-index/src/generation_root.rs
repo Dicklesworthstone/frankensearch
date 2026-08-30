@@ -141,11 +141,21 @@ pub enum GenerationRootStage {
     AcquireLock,
     /// Explicitly release a kernel file lock.
     ReleaseLock,
+    /// Positional write of an owner/attempt frame into the LOCK anchor by the
+    /// exclusive lock holder; `expected` carries the failing phase (1 = pre-write
+    /// revalidation, 2 = write, 3 = barrier, 4 = witness re-stat, 5 = identity,
+    /// 6 = exact reread, 7 = post-write revalidation) and `observed` the offset.
+    WriteLockFrame,
+    /// Positional write of one authenticated slot into the AUTHORITY anchor;
+    /// phases as for [`Self::WriteLockFrame`].
+    WriteAuthoritySlot,
 }
 
 impl GenerationRootStage {
     const fn code(self) -> &'static str {
         match self {
+            Self::WriteLockFrame => "write_lock_frame",
+            Self::WriteAuthoritySlot => "write_authority_slot",
             Self::PlatformGate => "platform_gate",
             Self::ParseRootRoute => "parse_root_route",
             Self::ParseRelativeRoute => "parse_relative_route",
@@ -1568,6 +1578,9 @@ pub mod authority_publisher {
         ReadOnlyProfile,
         /// Another live owner holds the exclusive flock.
         LockContended,
+        /// The anchors mutated between this publisher's open and its lock
+        /// (another publication landed); reload the pair and retry.
+        AnchorsChanged,
         /// The LOCK anchor is not exactly two 4096-byte frames.
         LockLayout {
             /// Observed physical LOCK length.
@@ -1865,6 +1878,14 @@ pub mod authority_publisher {
                         NotCommittedV1::LockContended,
                     ));
                 }
+                // The lock path witnesses LOCK at open time and revalidates it
+                // mutation-stably after the flock lands: a publication that
+                // completed in that window is a fence, not a fault.
+                Err(error) if error.kind() == GenerationRootErrorKind::ObjectChanged => {
+                    return Ok(PublicationOutcomeV1::NotCommitted(
+                        NotCommittedV1::AnchorsChanged,
+                    ));
+                }
                 Err(error) => return Err(error),
             };
 
@@ -2084,7 +2105,20 @@ pub mod authority_publisher {
                     GenerationAuthorityErrorV1::RootMismatch,
                 ));
             }
-            let mut guard = self.root.try_exclusive_anchor_guard()?;
+            let mut guard = match self.root.try_exclusive_anchor_guard() {
+                Ok(guard) => guard,
+                // Same fence as in `publish`: the permit stays valid; retry.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        GenerationRootErrorKind::LockContended
+                            | GenerationRootErrorKind::ObjectChanged
+                    ) =>
+                {
+                    return Ok(ReconcileOutcomeV1::StillUnknown(*permit));
+                }
+                Err(error) => return Err(error),
+            };
             let observed_target = match decode_slot(
                 &guard.authority_image.bytes,
                 permit.target_slot,
@@ -2607,7 +2641,8 @@ pub mod authority_publisher {
                                     .expect("publication runs")
                                 {
                                     PublicationOutcomeV1::NotCommitted(
-                                        NotCommittedV1::LockContended,
+                                        NotCommittedV1::LockContended
+                                        | NotCommittedV1::AnchorsChanged,
                                     ) => {
                                         std::thread::yield_now();
                                     }
@@ -2947,6 +2982,163 @@ pub mod authority_publisher {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn rollback_is_a_higher_sequence_record_and_an_exhausted_head_is_read_only() {
+            let root_path = fixture_root("rollback");
+            let root = admit(&root_path);
+            let floor = InMemoryAntiRollbackFloorStoreV1::new();
+            let publisher = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher binds");
+            let genesis = authority(1, None);
+            let PublicationOutcomeV1::Committed { slot: g_slot, .. } = publisher
+                .publish(
+                    genesis,
+                    ExpectedAuthorityPairV1::default(),
+                    Some(&floor),
+                    [0x41; 16],
+                )
+                .expect("genesis runs")
+            else {
+                panic!("genesis must commit");
+            };
+            let successor = authority(2, Some(genesis.fingerprint()));
+            let PublicationOutcomeV1::Committed { slot: s_slot, .. } = publisher
+                .publish(
+                    successor,
+                    ExpectedAuthorityPairV1 {
+                        first: None,
+                        second: Some(g_slot),
+                    },
+                    Some(&floor),
+                    [0x42; 16],
+                )
+                .expect("successor runs")
+            else {
+                panic!("successor must commit");
+            };
+
+            // A rollback to the retained genesis is a NEW sequence-3 record
+            // whose manifest is the genesis object; the sequence never moves
+            // backward and the incumbent slot pair is what it fences against.
+            let rollback = AuthorityRefV1::new(
+                3,
+                genesis.object_id,
+                genesis.manifest_len,
+                genesis.manifest_sha256,
+                Some(successor.fingerprint()),
+            )
+            .expect("valid rollback reference");
+            let outcome = publisher
+                .publish(
+                    rollback,
+                    ExpectedAuthorityPairV1 {
+                        first: Some(s_slot),
+                        second: Some(g_slot),
+                    },
+                    Some(&floor),
+                    [0x43; 16],
+                )
+                .expect("rollback runs");
+            let PublicationOutcomeV1::Committed {
+                slot: r_slot,
+                floor: receipt,
+            } = outcome
+            else {
+                panic!("rollback must commit as sequence 3: {outcome:?}");
+            };
+            assert_eq!(r_slot.authority.sequence, 3);
+            assert_eq!(
+                r_slot.slot_index, 1,
+                "sequence 3 overwrites the genesis slot"
+            );
+            assert_eq!(r_slot.authority.object_id, genesis.object_id);
+            assert_eq!(receipt.map(|r| r.cas_version), Some(3));
+            // Publishing the old sequence-2 successor again is a regression
+            // and is refused before any write.
+            let regress = publisher
+                .publish(
+                    successor,
+                    ExpectedAuthorityPairV1 {
+                        first: Some(s_slot),
+                        second: Some(r_slot),
+                    },
+                    Some(&floor),
+                    [0x44; 16],
+                )
+                .expect("regression runs");
+            assert!(
+                matches!(
+                    regress,
+                    PublicationOutcomeV1::NotCommitted(NotCommittedV1::InvalidCandidate(_))
+                ),
+                "{regress:?}"
+            );
+
+            // A head at u64::MAX freezes the root read-only: the candidate
+            // cannot be derived, nothing is written, the pair is unchanged.
+            let exhausted_root = fixture_root("exhausted");
+            let exhausted_head =
+                AuthorityRefV1::new(u64::MAX, [0x7e; 16], 4_096, [0x7f; 32], Some([0x11; 32]))
+                    .expect("valid exhausted reference");
+            let exhausted_slot = AuthoritySlotV1::new(1, ROOT_ID, exhausted_head)
+                .expect("slot")
+                .encode()
+                .expect("slot encodes");
+            {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(exhausted_root.join("AUTHORITY"))
+                    .expect("authority writable");
+                std::os::unix::fs::FileExt::write_all_at(&file, &exhausted_slot, slot_offset(1))
+                    .expect("head written");
+                file.sync_all().expect("head durable");
+            }
+            let exhausted = admit(&exhausted_root);
+            let publisher = exhausted
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher binds");
+            let head = AuthoritySlotV1::new(1, ROOT_ID, exhausted_head).expect("slot");
+            let before = authority_bytes(&exhausted_root);
+            let attempt = publisher
+                .publish(
+                    AuthorityRefV1::new(
+                        u64::MAX,
+                        [0x7e; 16],
+                        4_096,
+                        [0x7f; 32],
+                        Some(exhausted_head.fingerprint()),
+                    )
+                    .expect("valid reference"),
+                    ExpectedAuthorityPairV1 {
+                        first: None,
+                        second: Some(head),
+                    },
+                    None,
+                    [0x45; 16],
+                )
+                .expect("exhausted publication runs");
+            assert_eq!(
+                attempt,
+                PublicationOutcomeV1::NotCommitted(NotCommittedV1::InvalidCandidate(
+                    GenerationAuthorityErrorV1::SequenceExhausted
+                ))
+            );
+            assert_eq!(
+                authority_bytes(&exhausted_root),
+                before,
+                "read-only: zero mutation"
+            );
         }
 
         #[test]
@@ -4754,17 +4946,20 @@ mod platform {
         offset: u64,
         bytes: &[u8],
     ) -> GenerationRootResult<()> {
-        validate_lock_process(lock, GenerationRootStage::SyncRegularFile)?;
-        revalidate_lock_route(lock)?;
+        const STAGE: GenerationRootStage = GenerationRootStage::WriteLockFrame;
+        let at = |phase: u64| {
+            move |error: GenerationRootError| {
+                GenerationRootError::new(error.kind(), STAGE).with_counts(phase, offset)
+            }
+        };
+        validate_lock_process(lock, STAGE)?;
+        revalidate_lock_route(lock).map_err(at(1))?;
         let end = offset
             .checked_add(usize_as_u64(bytes.len()))
             .filter(|end| *end <= lock.expectation.byte_len)
             .ok_or_else(|| {
-                GenerationRootError::new(
-                    GenerationRootErrorKind::ResourceLimit,
-                    GenerationRootStage::SyncRegularFile,
-                )
-                .with_counts(lock.expectation.byte_len, offset)
+                GenerationRootError::new(GenerationRootErrorKind::ResourceLimit, STAGE)
+                    .with_counts(lock.expectation.byte_len, offset)
             })?;
         debug_assert!(end <= lock.expectation.byte_len);
         let mut written = 0_usize;
@@ -4774,16 +4969,14 @@ mod platform {
                 &bytes[written..],
                 offset + usize_as_u64(written),
             )
-            .map_err(|error| os_error(GenerationRootStage::SyncRegularFile, error))?;
+            .map_err(|error| os_error(STAGE, error).with_counts(2, offset))?;
             if count == 0 {
-                return Err(GenerationRootError::new(
-                    GenerationRootErrorKind::Io,
-                    GenerationRootStage::SyncRegularFile,
-                ));
+                return Err(GenerationRootError::new(GenerationRootErrorKind::Io, STAGE)
+                    .with_counts(2, offset));
             }
             written += count;
         }
-        sync_file_descriptor(&lock.descriptor)?;
+        sync_file_descriptor(&lock.descriptor).map_err(at(3))?;
         // The retained witness is mutation-stable (mtime/ctime); the lock
         // holder is the one legitimate mutator, so it advances its own witness
         // to the exact post-write state before revalidating the route.
@@ -4791,17 +4984,19 @@ mod platform {
             &lock.descriptor,
             lock.witness.filesystem,
             lock.witness.mount_identity,
-            GenerationRootStage::SyncRegularFile,
-        )?;
+            STAGE,
+        )
+        .map_err(at(4))?;
         if !after.same_file_security_identity(lock.witness)
             || after.byte_len != lock.witness.byte_len
         {
-            return Err(GenerationRootError::new(
-                GenerationRootErrorKind::ObjectChanged,
-                GenerationRootStage::SyncRegularFile,
-            ));
+            return Err(
+                GenerationRootError::new(GenerationRootErrorKind::ObjectChanged, STAGE)
+                    .with_counts(5, offset),
+            );
         }
-        let (content, after) = read_exact_owned(&lock.descriptor, after, lock.expectation)?;
+        let (content, after) =
+            read_exact_owned(&lock.descriptor, after, lock.expectation).map_err(at(6))?;
         lock.content_witness = ExactContentWitness {
             sha256: Sha256::digest(&content).into(),
         };
@@ -4810,7 +5005,7 @@ mod platform {
         {
             lock.bytes = Arc::from(content);
         }
-        revalidate_lock_route(lock)
+        revalidate_lock_route(lock).map_err(at(7))
     }
 
     /// Exact current bytes of the LOCK anchor through the held lock descriptor.
