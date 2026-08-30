@@ -12,6 +12,7 @@
 mod artifact;
 mod campaign_contract;
 mod comparator;
+pub mod cutoff_certificate;
 mod engine;
 mod generator;
 mod local_perf_runner;
