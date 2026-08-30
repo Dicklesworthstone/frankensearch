@@ -872,6 +872,54 @@ enum FsviPublicationState {
 ///     owner.append("forbidden", &[1.0, 0.0]);
 /// }
 /// ```
+///
+/// An owner is reachable only through admission against a validated
+/// [`FsviV2IdentityBinding`]. None of the following shortcuts compile, and
+/// each block below is a regression guard: if a later change adds the
+/// corresponding public constructor, the block starts compiling and the
+/// doctest fails.
+///
+/// Raw bytes alone cannot become an owner:
+///
+/// ```compile_fail
+/// use frankensearch_index::ValidatedFsviBytes;
+///
+/// fn from_raw(bytes: &[u8]) -> ValidatedFsviBytes {
+///     ValidatedFsviBytes::from_raw_bytes(bytes)
+/// }
+/// ```
+///
+/// The private fields cannot be assembled by hand:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use frankensearch_index::ValidatedFsviBytes;
+///
+/// fn assemble(bytes: Arc<[u8]>) -> ValidatedFsviBytes {
+///     ValidatedFsviBytes { bytes, ..unreachable!() }
+/// }
+/// ```
+///
+/// A bare fingerprint string is not an identity binding:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use frankensearch_index::ValidatedFsviBytes;
+///
+/// fn from_fingerprint(bytes: Arc<[u8]>, fingerprint: &str) {
+///     let _ = ValidatedFsviBytes::from_arc(bytes, fingerprint);
+/// }
+/// ```
+///
+/// Dimension-only metadata is not an identity binding either:
+///
+/// ```compile_fail
+/// use frankensearch_index::FsviV2IdentityBinding;
+///
+/// fn dimension_only(dimension: usize) -> FsviV2IdentityBinding {
+///     FsviV2IdentityBinding::new(dimension).expect("must not type-check")
+/// }
+/// ```
 pub struct ValidatedFsviBytes {
     bytes: Arc<[u8]>,
     index: VectorIndex,
