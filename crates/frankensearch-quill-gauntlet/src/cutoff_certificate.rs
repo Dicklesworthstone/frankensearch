@@ -425,6 +425,158 @@ impl CutoffCertificateV1 {
     }
 }
 
+/// Why a certificate cannot be derived from a native ranked prefix.
+///
+/// None of these is a completeness verdict: an insufficient prefix means
+/// the engine must expand further on the same snapshot, never that the
+/// page is (or is not) complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CutoffDerivationError {
+    #[error("native prefix is longer than the exact total")]
+    PrefixLongerThanTotal,
+    #[error("native prefix scores are not non-increasing in rank order")]
+    PrefixNotRankOrdered,
+    #[error("a native prefix score is not canonical and finite")]
+    NonCanonicalScore,
+    #[error(
+        "the trailing score group is cut by the fetch at rank {prefix_len}; expand on the same snapshot"
+    )]
+    TrailingGroupTruncated { prefix_len: u64 },
+    #[error("derived certificate is invalid: {0}")]
+    Certificate(#[from] CutoffCertificateError),
+}
+
+impl CutoffCertificateV1 {
+    /// Derive the certificate from one engine-native ranked prefix.
+    ///
+    /// `prefix` holds the score bits of absolute ranks `0..n` of the full
+    /// same-snapshot ordering (the engine's expanded `TopDocs` fetch);
+    /// `exact_total` comes from the separate count on that snapshot. The
+    /// expanded evidence is the smallest `[a, b)` that covers the page and
+    /// whole score groups at both edges, with the neighbours at `a - 1` and
+    /// `b` taken from the same prefix. If the trailing group runs off the end
+    /// of the prefix while ranks remain (`n < M`), no certificate exists:
+    /// the fetch capacity is not evidence, and the caller must expand.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed derivation error; never infers completeness.
+    pub fn from_native_prefix(
+        exact_total: u64,
+        offset: u64,
+        limit: u64,
+        prefix: &[u32],
+        provenance: CertificateProvenanceV1,
+    ) -> Result<Self, CutoffDerivationError> {
+        let n = u64::try_from(prefix.len())
+            .map_err(|_| CutoffDerivationError::PrefixLongerThanTotal)?;
+        if n > exact_total {
+            return Err(CutoffDerivationError::PrefixLongerThanTotal);
+        }
+        if prefix.iter().any(|bits| !is_canonical_finite(*bits)) {
+            return Err(CutoffDerivationError::NonCanonicalScore);
+        }
+        if prefix
+            .windows(2)
+            .any(|pair| f32::from_bits(pair[1]) > f32::from_bits(pair[0]))
+        {
+            return Err(CutoffDerivationError::PrefixNotRankOrdered);
+        }
+        let page = checked_page(exact_total, offset, limit)?;
+
+        if limit == 0 {
+            let zero = BoundaryWitnessV1::NotApplicable {
+                reason: BoundaryNotApplicableV1::ZeroLimit,
+            };
+            return Ok(Self::new(
+                exact_total,
+                offset,
+                limit,
+                page.start,
+                Vec::new(),
+                zero,
+                zero,
+                provenance,
+            )?);
+        }
+        if page.start >= page.end {
+            let beyond = BoundaryWitnessV1::NotApplicable {
+                reason: BoundaryNotApplicableV1::BeyondEnd,
+            };
+            return Ok(Self::new(
+                exact_total,
+                offset,
+                limit,
+                exact_total,
+                Vec::new(),
+                beyond,
+                beyond,
+                provenance,
+            )?);
+        }
+
+        // The page is non-empty, so every page rank must be in the prefix.
+        if page.end > n {
+            return Err(CutoffDerivationError::TrailingGroupTruncated { prefix_len: n });
+        }
+        let at = |rank: u64| prefix[usize::try_from(rank).unwrap_or(usize::MAX)];
+        let same = |x: u32, y: u32| f32::from_bits(x).to_bits() == f32::from_bits(y).to_bits();
+
+        // Leading edge: walk back to the start of the score group at P.start.
+        let leading_bits = at(page.start);
+        let mut a = page.start;
+        while a > 0 && same(at(a - 1), leading_bits) {
+            a -= 1;
+        }
+        // Trailing edge: walk forward to the end of the score group at P.end - 1.
+        let trailing_bits = at(page.end - 1);
+        let mut b = page.end;
+        while b < n && same(at(b), trailing_bits) {
+            b += 1;
+        }
+        if b == n && n < exact_total {
+            // The group may continue beyond the fetch: no witness, no proof.
+            return Err(CutoffDerivationError::TrailingGroupTruncated { prefix_len: n });
+        }
+
+        let expanded = (a..b)
+            .map(|rank| ExpandedRankV1 {
+                absolute_rank: rank,
+                score_bits: at(rank),
+            })
+            .collect();
+        let leading = if a == 0 {
+            BoundaryWitnessV1::NotApplicable {
+                reason: BoundaryNotApplicableV1::AtStart,
+            }
+        } else {
+            BoundaryWitnessV1::Neighbour {
+                absolute_rank: a - 1,
+                score_bits: at(a - 1),
+            }
+        };
+        let trailing = if b == exact_total {
+            BoundaryWitnessV1::NotApplicable {
+                reason: BoundaryNotApplicableV1::Exhausted,
+            }
+        } else {
+            BoundaryWitnessV1::Neighbour {
+                absolute_rank: b,
+                score_bits: at(b),
+            }
+        };
+        Ok(Self::new(
+            exact_total,
+            offset,
+            limit,
+            a,
+            expanded,
+            leading,
+            trailing,
+            provenance,
+        )?)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,5 +932,126 @@ mod tests {
             certificate(10, 4, 2, 4, 6).unwrap_err(),
             CutoffCertificateError::LeadingBoundary
         );
+    }
+
+    fn prefix(len: usize) -> Vec<u32> {
+        scores()[..len].iter().map(|s| s.to_bits()).collect()
+    }
+
+    #[test]
+    fn derivation_expands_to_whole_groups_and_witnesses_neighbours_from_the_prefix() {
+        // Page [3, 8) touches the 5.0 group (3..6) and the 2.0 group (7..9);
+        // a nine-rank prefix carries the witness at rank 9 (1.0).
+        let c = CutoffCertificateV1::from_native_prefix(10, 3, 5, &prefix(10), provenance())
+            .expect("full prefix");
+        assert_eq!(c.expanded_start, 3);
+        assert_eq!(c.expanded_end(), 9);
+        assert_eq!(c.leading_boundary, neighbour(2, 7.0));
+        assert_eq!(c.trailing_boundary, neighbour(9, 1.0));
+        assert!(!c.is_exhausted());
+        assert_eq!(
+            c,
+            CutoffCertificateV1::from_native_prefix(10, 3, 5, &prefix(10), provenance())
+                .expect("deterministic")
+        );
+        // Exactly enough prefix (rank 9 present) derives the same certificate.
+        assert_eq!(
+            CutoffCertificateV1::from_native_prefix(10, 3, 5, &prefix(10), provenance())
+                .expect("ten")
+                .digest_sha256(),
+            c.digest_sha256()
+        );
+    }
+
+    #[test]
+    fn a_fetch_that_cuts_the_trailing_group_is_insufficient_not_incomplete() {
+        // Prefix of 8 ends inside the 2.0 group: the engine must expand.
+        assert_eq!(
+            CutoffCertificateV1::from_native_prefix(10, 3, 5, &prefix(8), provenance()),
+            Err(CutoffDerivationError::TrailingGroupTruncated { prefix_len: 8 })
+        );
+        // Prefix of 9 ends exactly at the group end but rank 9 is unseen:
+        // the group MAY continue, so still insufficient.
+        assert_eq!(
+            CutoffCertificateV1::from_native_prefix(10, 3, 5, &prefix(9), provenance()),
+            Err(CutoffDerivationError::TrailingGroupTruncated { prefix_len: 9 })
+        );
+        // A page shorter than the prefix can be covered.
+        assert_eq!(
+            CutoffCertificateV1::from_native_prefix(10, 0, 9, &prefix(9), provenance()),
+            Err(CutoffDerivationError::TrailingGroupTruncated { prefix_len: 9 })
+        );
+        // Requested capacity larger than the total proves nothing by itself:
+        // with M = 10 and a prefix of 10, exhaustion comes from b == M.
+        let c = CutoffCertificateV1::from_native_prefix(10, 0, 50, &prefix(10), provenance())
+            .expect("exhausted");
+        assert!(c.is_exhausted());
+        assert_eq!(c.trailing_boundary, exhausted());
+    }
+
+    #[test]
+    fn derivation_handles_zero_limit_empty_totals_and_beyond_end() {
+        let zero = CutoffCertificateV1::from_native_prefix(10, 4, 0, &prefix(10), provenance())
+            .expect("zero limit");
+        assert!(zero.page_is_empty());
+        assert_eq!(
+            zero.leading_boundary,
+            BoundaryWitnessV1::NotApplicable {
+                reason: BoundaryNotApplicableV1::ZeroLimit
+            }
+        );
+        for (total, offset, prefix_len) in [(0, 0, 0), (0, 4, 0), (10, 10, 10), (10, 12, 3)] {
+            let c = CutoffCertificateV1::from_native_prefix(
+                total,
+                offset,
+                3,
+                &prefix(prefix_len),
+                provenance(),
+            )
+            .expect("empty page beyond end");
+            assert!(c.page_is_empty());
+            assert_eq!(c.expanded_start, total);
+            assert_eq!(
+                c.trailing_boundary,
+                BoundaryWitnessV1::NotApplicable {
+                    reason: BoundaryNotApplicableV1::BeyondEnd
+                }
+            );
+        }
+        // A prefix longer than the exact total is a contradiction.
+        assert_eq!(
+            CutoffCertificateV1::from_native_prefix(5, 0, 3, &prefix(6), provenance()),
+            Err(CutoffDerivationError::PrefixLongerThanTotal)
+        );
+        // Non-ranked or non-canonical prefixes are refused before derivation.
+        let mut unordered = prefix(10);
+        unordered.swap(1, 2);
+        assert_eq!(
+            CutoffCertificateV1::from_native_prefix(10, 0, 3, &unordered, provenance()),
+            Err(CutoffDerivationError::PrefixNotRankOrdered)
+        );
+        let mut nan = prefix(10);
+        nan[4] = f32::NAN.to_bits();
+        assert_eq!(
+            CutoffCertificateV1::from_native_prefix(10, 0, 3, &nan, provenance()),
+            Err(CutoffDerivationError::NonCanonicalScore)
+        );
+    }
+
+    #[test]
+    fn derivation_at_the_offset_edge_expands_the_leading_group() {
+        // Page starts at rank 4, inside the 5.0 group: a walks back to 3 and
+        // the predecessor witness is rank 2 (7.0).
+        let c = CutoffCertificateV1::from_native_prefix(10, 4, 2, &prefix(10), provenance())
+            .expect("leading expansion");
+        assert_eq!(c.expanded_start, 3);
+        assert_eq!(c.expanded_end(), 6);
+        assert_eq!(c.leading_boundary, neighbour(2, 7.0));
+        assert_eq!(c.trailing_boundary, neighbour(6, 3.0));
+        // Last page: b reaches M and is exhausted without any witness.
+        let c = CutoffCertificateV1::from_native_prefix(10, 8, 5, &prefix(10), provenance())
+            .expect("last page");
+        assert_eq!(c.expanded_start, 7);
+        assert!(c.is_exhausted());
     }
 }
