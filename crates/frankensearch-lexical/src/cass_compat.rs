@@ -1310,6 +1310,7 @@ impl CassTantivyIndex {
                         .is_eq()
                 })
         });
+        let expanded_hits = materialized.clone();
         materialized.truncate(top_len);
 
         let doc_count =
@@ -1324,6 +1325,8 @@ impl CassTantivyIndex {
             cutoff_tie_complete,
             total_count: search_result.total_count,
             doc_count,
+            expanded_hits,
+            searcher_sha256: crate::oracle_searcher_sha256(&searcher),
         })
     }
 

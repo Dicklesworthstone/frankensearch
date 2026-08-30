@@ -9684,6 +9684,7 @@ mod tests {
                 CountState::NotRequested
             };
             EngineObservation {
+                cutoff_certificate: None,
                 hits,
                 cutoff_tie_group: Vec::new(),
                 cutoff_tie_complete: true,
@@ -19906,6 +19907,7 @@ mod tests {
                 let count = u64::try_from(hits.len()).unwrap_or(u64::MAX);
                 let doc_count = u64::try_from(self.documents.len()).unwrap_or(u64::MAX);
                 Ok(EngineObservation {
+                    cutoff_certificate: None,
                     hits,
                     cutoff_tie_group: Vec::new(),
                     cutoff_tie_complete: false,
@@ -20187,6 +20189,7 @@ mod tests {
     #[test]
     fn auto_triage_maps_comparator_evidence_to_layers() {
         let base_observation = |ids: &[&str]| EngineObservation {
+            cutoff_certificate: None,
             hits: ids
                 .iter()
                 .enumerate()
@@ -22139,6 +22142,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             EngineObservation {
+                cutoff_certificate: None,
                 match_count: CountState::Value(u64::try_from(hits.len()).unwrap_or(u64::MAX)),
                 doc_count: 2,
                 hits,
@@ -25567,6 +25571,7 @@ mod tests {
 
         fn v7c_observation(hits: Vec<RankedHit>) -> EngineObservation {
             EngineObservation {
+                cutoff_certificate: None,
                 match_count: CountState::Value(u64::try_from(hits.len()).unwrap_or(u64::MAX)),
                 doc_count: 9,
                 hits,

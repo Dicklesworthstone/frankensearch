@@ -7704,6 +7704,7 @@ mod tests {
         snippets: BTreeMap<String, String>,
     ) -> EngineObservation {
         EngineObservation {
+            cutoff_certificate: None,
             hits,
             cutoff_tie_group: Vec::new(),
             cutoff_tie_complete: true,

@@ -5015,6 +5015,94 @@ impl Drop for BenchmarkQuillDirectorySyncArm {
     }
 }
 
+/// Three same-snapshot observations plus the snapshot's physical digest.
+///
+/// See [`QuillSearchIndex::search_paginated_pinned`].
+#[cfg(feature = "conformance-internals")]
+#[derive(Debug, Clone)]
+pub struct PinnedSearchBundle {
+    /// The requested page (`limit` at `offset`), count-free.
+    pub observed: QuillSearchResult,
+    /// The expanded prefix from rank 0 (`expanded_limit` rows), count-free.
+    pub expanded: QuillSearchResult,
+    /// The count-only invocation (`limit = 0`, exact count on).
+    pub count: QuillSearchResult,
+    /// Domain-separated SHA-256 over the pinned publication's physical
+    /// identity: epoch, Keeper generation, every sealed segment's manifest
+    /// identity (id, seal sequence, length, xxh3, docid range, doc count),
+    /// and the Delta segment count.
+    pub snapshot_sha256: [u8; 32],
+    /// Publication epoch the bundle was taken on.
+    pub snapshot_epoch: u64,
+    /// Keeper generation the bundle was taken on.
+    pub keeper_generation: u64,
+}
+
+#[cfg(feature = "conformance-internals")]
+fn pinned_snapshot_sha256(snapshot: &QuillSearchSnapshot) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch/quill/pinned-search-snapshot/v1\0");
+    hasher.update(snapshot.snapshot_epoch().to_be_bytes());
+    hasher.update(snapshot.keeper_generation().to_be_bytes());
+    let keeper = snapshot.keeper_snapshot();
+    hasher.update(keeper.doc_count().to_be_bytes());
+    let segments = keeper.segments();
+    hasher.update(
+        u64::try_from(segments.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for segment in segments {
+        let manifest = segment.manifest();
+        for word in [
+            manifest.segment_id,
+            manifest.seal_seq,
+            manifest.file_len,
+            manifest.file_xxh3,
+            manifest.docid_lo,
+            manifest.docid_hi,
+            u64::from(manifest.doc_count),
+        ] {
+            hasher.update(word.to_be_bytes());
+        }
+    }
+    hasher.update(
+        u64::try_from(snapshot.delta_count())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.finalize().into()
+}
+
+#[cfg(feature = "conformance-internals")]
+impl QuillReader {
+    /// Ranked page, expanded prefix, and exact count on ONE loaded
+    /// publication. See [`QuillSearchIndex::search_paginated_pinned`].
+    fn search_paginated_pinned(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        expanded_limit: usize,
+    ) -> Result<PinnedSearchBundle, QuillIndexError> {
+        let published = self.checked_published_snapshot()?;
+        let observed =
+            self.search_paginated_on(cx, query, limit, offset, false, published.as_ref())?;
+        let expanded =
+            self.search_paginated_on(cx, query, expanded_limit, 0, false, published.as_ref())?;
+        let count = self.search_paginated_on(cx, query, 0, 0, true, published.as_ref())?;
+        Ok(PinnedSearchBundle {
+            observed,
+            expanded,
+            count,
+            snapshot_sha256: pinned_snapshot_sha256(published.as_ref()),
+            snapshot_epoch: published.snapshot_epoch(),
+            keeper_generation: published.keeper_generation(),
+        })
+    }
+}
+
 /// Read-only Quill handle for consumers that must coexist with another
 /// process holding the durable writer lease.
 ///
@@ -11068,6 +11156,29 @@ impl QuillSearchIndex {
             .search_paginated(cx, query, limit, offset, exact_count)
     }
 
+    /// Ranked page, expanded prefix, and exact count taken on ONE pinned
+    /// publication, with that publication's physical digest.
+    ///
+    /// See [`QuillSearchIndex::search_paginated_pinned`]; this is the same
+    /// operation on the writer-side handle's reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, parsing, lowering, scoring, collection, or
+    /// reconciliation-required failures.
+    #[cfg(feature = "conformance-internals")]
+    pub fn search_paginated_pinned(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        expanded_limit: usize,
+    ) -> Result<PinnedSearchBundle, QuillIndexError> {
+        self.reader
+            .search_paginated_pinned(cx, query, limit, offset, expanded_limit)
+    }
+
     /// Execute one already-built query tree against the pinned publication.
     ///
     /// This is the read entry point for a compiled schema that carries its own
@@ -11472,6 +11583,33 @@ impl QuillIndex {
     /// have advanced durable authority beyond this process-local view.
     pub fn snapshot(&self) -> Result<Arc<KeeperSnapshot>, QuillIndexError> {
         Ok(self.checked_published_snapshot()?.keeper_snapshot_arc())
+    }
+
+    /// Ranked page, expanded prefix, and exact count taken on ONE pinned
+    /// publication, with that publication's physical digest.
+    ///
+    /// Conformance witnesses need the three observations to describe the
+    /// same snapshot: three separate `search_paginated` calls may each load
+    /// a different publication if a refresh lands between them. This runs all
+    /// three against one loaded `QuillSearchSnapshot`. The count is a separate
+    /// invocation on that snapshot and cannot affect hit selection, tie
+    /// expansion, or ordering (bd-pjvl1).
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, parsing, lowering, scoring, collection, or
+    /// reconciliation-required failures.
+    #[cfg(feature = "conformance-internals")]
+    pub fn search_paginated_pinned(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        expanded_limit: usize,
+    ) -> Result<PinnedSearchBundle, QuillIndexError> {
+        self.reader
+            .search_paginated_pinned(cx, query, limit, offset, expanded_limit)
     }
 
     /// Current authoritative process-local Keeper plus Delta snapshot.
@@ -18095,6 +18233,65 @@ mod tests {
                 "the real invocation Cx must be cancelled there"
             );
             controller.disarm();
+        });
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn pinned_bundle_describes_exactly_one_publication() {
+        run_with_cx(|cx| async move {
+            let index =
+                QuillIndex::in_memory(deterministic_config()).expect("create pinned-bundle index");
+            for id in ["a", "b", "c"] {
+                index
+                    .index_document(&cx, &IndexableDocument::new(id, "shared token"))
+                    .await
+                    .expect("index tie fixture");
+            }
+            index.commit(&cx).await.expect("publish tie fixture");
+
+            let bundle = index
+                .search_paginated_pinned(&cx, "shared", 2, 0, 10)
+                .expect("pinned bundle");
+            assert_eq!(bundle.observed.hits.len(), 2);
+            assert_eq!(bundle.expanded.hits.len(), 3, "expanded prefix from rank 0");
+            assert!(
+                bundle.count.hits.is_empty(),
+                "count is a separate invocation"
+            );
+            assert_eq!(bundle.count.total_count, Some(3));
+            assert_eq!(
+                bundle.observed.total_count, None,
+                "ranked page is count-free"
+            );
+            assert_eq!(bundle.expanded.total_count, None);
+            assert_eq!(
+                &bundle.observed.hits[..],
+                &bundle.expanded.hits[..2],
+                "the page is exactly the head of the expanded prefix on the same snapshot"
+            );
+            assert_ne!(bundle.snapshot_sha256, [0; 32]);
+
+            // Same publication: same digest, same epoch/generation.
+            let again = index
+                .search_paginated_pinned(&cx, "shared", 2, 0, 10)
+                .expect("pinned bundle again");
+            assert_eq!(again.snapshot_sha256, bundle.snapshot_sha256);
+            assert_eq!(again.snapshot_epoch, bundle.snapshot_epoch);
+            assert_eq!(again.keeper_generation, bundle.keeper_generation);
+
+            // A new publication is a different physical snapshot.
+            index
+                .index_document(&cx, &IndexableDocument::new("d", "shared token"))
+                .await
+                .expect("index fourth document");
+            index.commit(&cx).await.expect("publish successor");
+            let successor = index
+                .search_paginated_pinned(&cx, "shared", 2, 0, 10)
+                .expect("pinned bundle on successor");
+            assert_ne!(successor.snapshot_sha256, bundle.snapshot_sha256);
+            assert_eq!(successor.count.total_count, Some(4));
+            assert_eq!(successor.expanded.hits.len(), 4);
         });
     }
 

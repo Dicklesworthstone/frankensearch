@@ -1624,16 +1624,18 @@ fn quill_observe(
     // page and its expanded tie evidence. Exact count is an independent
     // observation: enabling it must never switch the collector that supplies
     // ranked score bits or native tie keys.
-    let observed = index.search_paginated(cx, &case.query, limit, offset, false)?;
-    let evidence = index.search_paginated(cx, &case.query, fetch_limit, 0, false)?;
-    let count_evidence = index.search_paginated(cx, &case.query, 0, 0, true)?;
+    // All three run against ONE loaded publication (bd-pjvl1): a refresh
+    // between separate calls could otherwise make the page, its expanded
+    // evidence, and the exact count describe different snapshots.
+    let bundle = index.search_paginated_pinned(cx, &case.query, limit, offset, fetch_limit)?;
     quill_native_observation_from_results(
-        &observed,
-        &evidence,
-        &count_evidence,
+        &bundle.observed,
+        &bundle.expanded,
+        &bundle.count,
         limit,
         offset,
         case.count_requested,
+        Some(bundle.snapshot_sha256),
     )
 }
 
@@ -1644,6 +1646,7 @@ fn quill_native_observation_from_results(
     limit: usize,
     offset: usize,
     count_requested: bool,
+    snapshot_sha256: Option<[u8; 32]>,
 ) -> Result<EngineObservation, GauntletError> {
     if observed.total_count.is_some() || evidence.total_count.is_some() {
         return Err(GauntletError::InvalidObservation {
@@ -1689,6 +1692,7 @@ fn quill_native_observation_from_results(
         match_count,
         limit,
         offset,
+        snapshot_sha256,
     )
 }
 
@@ -1699,6 +1703,7 @@ fn quill_observation_from_results(
     limit: usize,
     offset: usize,
     count_requested: bool,
+    snapshot_sha256: Option<[u8; 32]>,
 ) -> Result<EngineObservation, GauntletError> {
     if observed.doc_count != evidence.doc_count {
         return Err(GauntletError::InvalidObservation {
@@ -1743,6 +1748,7 @@ fn quill_observation_from_results(
         match_count,
         limit,
         offset,
+        snapshot_sha256,
     )
 }
 
@@ -1753,6 +1759,7 @@ fn quill_observation_from_validated_results(
     match_count: CountState,
     limit: usize,
     offset: usize,
+    snapshot_sha256: Option<[u8; 32]>,
 ) -> Result<EngineObservation, GauntletError> {
     let page_end = offset
         .checked_add(limit)
@@ -1814,6 +1821,42 @@ fn quill_observation_from_validated_results(
             },
         })
         .collect();
+    // The certificate exists only when the three observations were taken on
+    // one pinned publication (the native adapter); the CASS preparsed path
+    // passes no snapshot digest and therefore makes no claim.
+    let cutoff_certificate = match snapshot_sha256 {
+        None => None,
+        Some(snapshot_sha256) => {
+            let rows = |hits: &[frankensearch_quill::QuillHit]| {
+                observation_digest(hits.iter().map(|hit| {
+                    (
+                        hit.document_id.as_str(),
+                        hit.score.to_bits(),
+                        [hit.global_docid, 0],
+                    )
+                }))
+            };
+            let provenance = certificate_provenance(
+                snapshot_sha256,
+                "frankensearch-quill/scalar-index",
+                rows(&observed.hits),
+                rows(&evidence.hits),
+                total_count,
+            );
+            let expanded_bits = evidence
+                .hits
+                .iter()
+                .map(|hit| hit.score.to_bits())
+                .collect::<Vec<_>>();
+            derive_cutoff_certificate(
+                total_count,
+                u64::try_from(offset).unwrap_or(u64::MAX),
+                u64::try_from(limit).unwrap_or(u64::MAX),
+                &expanded_bits,
+                provenance,
+            )?
+        }
+    };
     Ok(EngineObservation {
         hits,
         cutoff_tie_group,
@@ -1823,6 +1866,7 @@ fn quill_observation_from_validated_results(
         snippets: BTreeMap::new(),
         match_count,
         doc_count: observed.doc_count,
+        cutoff_certificate,
         // Subject-side only. The oracle builders below keep an empty vector
         // because the pinned Tantivy parser emits no structured diagnostics to
         // project; that asymmetry is stated verbatim inside each emitted
@@ -1833,6 +1877,128 @@ fn quill_observation_from_validated_results(
             &observed.diagnostics,
         ),
     })
+}
+
+/// Digest of one native observation: document identity, score bits, and the
+/// native tie key of every row, in order. Ties the certificate to exactly the
+/// rows it was derived from.
+fn observation_digest<'a>(rows: impl Iterator<Item = (&'a str, u32, [u32; 2])>) -> [u8; 32] {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"frankensearch/quill-gauntlet/native-observation/v1\0");
+    for (doc_id, score_bits, tie) in rows {
+        hasher.update(
+            u64::try_from(doc_id.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        hasher.update(doc_id.as_bytes());
+        hasher.update(score_bits.to_be_bytes());
+        hasher.update(tie[0].to_be_bytes());
+        hasher.update(tie[1].to_be_bytes());
+    }
+    hasher.finalize().into()
+}
+
+/// Bind a certificate's provenance: physical snapshot, arm, both native
+/// observations, and the one-shot same-snapshot authority — the latter is a
+/// digest over the snapshot, both observations, and the exact count, so the
+/// three facts can only be certified together.
+fn certificate_provenance(
+    snapshot_sha256: [u8; 32],
+    arm: &str,
+    ranked_observation_sha256: [u8; 32],
+    expanded_observation_sha256: [u8; 32],
+    exact_total: u64,
+) -> crate::cutoff_certificate::CertificateProvenanceV1 {
+    use sha2::Digest as _;
+
+    let mut arm_hasher = sha2::Sha256::new();
+    arm_hasher.update(b"frankensearch/quill-gauntlet/certificate-arm/v1\0");
+    arm_hasher.update(arm.as_bytes());
+    let arm_sha256: [u8; 32] = arm_hasher.finalize().into();
+
+    let mut authority = sha2::Sha256::new();
+    authority.update(b"frankensearch/quill-gauntlet/same-snapshot-authority/v1\0");
+    authority.update(snapshot_sha256);
+    authority.update(ranked_observation_sha256);
+    authority.update(expanded_observation_sha256);
+    authority.update(exact_total.to_be_bytes());
+    let authority: [u8; 32] = authority.finalize().into();
+    let mut same_snapshot_authority = [0_u8; 16];
+    same_snapshot_authority.copy_from_slice(&authority[..16]);
+
+    crate::cutoff_certificate::CertificateProvenanceV1 {
+        snapshot_sha256,
+        arm_sha256,
+        ranked_observation_sha256,
+        expanded_observation_sha256,
+        same_snapshot_authority,
+    }
+}
+
+/// Derive the same-snapshot certificate, or `None` when the native prefix
+/// does not reach past the trailing score group (no claim is made). Any
+/// other derivation failure means the observation itself is malformed.
+fn derive_cutoff_certificate(
+    exact_total: u64,
+    offset: u64,
+    limit: u64,
+    expanded_score_bits: &[u32],
+    provenance: crate::cutoff_certificate::CertificateProvenanceV1,
+) -> Result<Option<crate::cutoff_certificate::CutoffCertificateV1>, GauntletError> {
+    use crate::cutoff_certificate::{CutoffCertificateV1, CutoffDerivationError};
+
+    match CutoffCertificateV1::from_native_prefix(
+        exact_total,
+        offset,
+        limit,
+        expanded_score_bits,
+        provenance,
+    ) {
+        Ok(certificate) => Ok(Some(certificate)),
+        Err(CutoffDerivationError::TrailingGroupTruncated { .. }) => Ok(None),
+        Err(error) => Err(GauntletError::InvalidObservation {
+            reason: format!("native evidence cannot certify the cutoff: {error}"),
+        }),
+    }
+}
+
+/// Certificate for one Tantivy oracle observation taken on one pinned searcher.
+#[cfg(feature = "tantivy-oracle")]
+fn oracle_cutoff_certificate(
+    observation: &frankensearch_lexical::OracleQueryObservation,
+    case: &DifferentialCase,
+) -> Result<Option<crate::cutoff_certificate::CutoffCertificateV1>, GauntletError> {
+    let rows = |hits: &[frankensearch_lexical::OracleRankedHit]| {
+        observation_digest(hits.iter().map(|hit| {
+            (
+                hit.doc_id.as_str(),
+                hit.score_bits,
+                [hit.segment_ord, hit.segment_doc_id],
+            )
+        }))
+    };
+    let provenance = certificate_provenance(
+        observation.searcher_sha256,
+        "frankensearch-lexical/tantivy-index",
+        rows(&observation.hits),
+        rows(&observation.expanded_hits),
+        u64::try_from(observation.total_count).unwrap_or(u64::MAX),
+    );
+    let expanded_bits = observation
+        .expanded_hits
+        .iter()
+        .map(|hit| hit.score_bits)
+        .collect::<Vec<_>>();
+    derive_cutoff_certificate(
+        u64::try_from(observation.total_count).unwrap_or(u64::MAX),
+        case.offset,
+        case.limit,
+        &expanded_bits,
+        provenance,
+    )
 }
 
 fn cutoff_tie_group(
@@ -2285,7 +2451,16 @@ impl CassQuillSubject {
                 .search_preparsed_paginated(cx, &parsed.query, fetch_limit, 0, true)?;
         observed.diagnostics.clone_from(&parsed.diagnostics);
         evidence.diagnostics = parsed.diagnostics;
-        quill_observation_from_results(&observed, &evidence, limit, offset, case.count_requested)
+        // The preparsed CASS path issues two separate searches; without a
+        // pinned bundle it makes no same-snapshot completeness claim.
+        quill_observation_from_results(
+            &observed,
+            &evidence,
+            limit,
+            offset,
+            case.count_requested,
+            None,
+        )
     }
 
     pub(crate) fn descriptor(&self) -> EngineDescriptor {
@@ -3764,6 +3939,7 @@ impl GauntletEngine for TantivyOracle {
                 tie_expansion_limit,
                 &snippet_config,
             )?;
+            let cutoff_certificate = oracle_cutoff_certificate(&observation, case)?;
             let (offset_tie_group, offset_tie_complete) = if offset > 0
                 && offset < observation.hits.len()
                 && observation
@@ -3858,6 +4034,7 @@ impl GauntletEngine for TantivyOracle {
                 })
                 .collect();
             Ok(EngineObservation {
+                cutoff_certificate,
                 hits,
                 cutoff_tie_group,
                 cutoff_tie_complete: observation.cutoff_tie_complete,
@@ -3881,6 +4058,7 @@ fn oracle_observation_from_results(
     observation: frankensearch_lexical::OracleQueryObservation,
     case: &DifferentialCase,
 ) -> Result<EngineObservation, GauntletError> {
+    let cutoff_certificate = oracle_cutoff_certificate(&observation, case)?;
     let limit = usize::try_from(case.limit).map_err(|_| GauntletError::InvalidCase {
         reason: "limit does not fit usize".to_owned(),
     })?;
@@ -3994,6 +4172,7 @@ fn oracle_observation_from_results(
         },
         doc_count: u64::try_from(observation.doc_count).unwrap_or(u64::MAX),
         ast_differences: Vec::new(),
+        cutoff_certificate,
     })
 }
 
@@ -4848,6 +5027,7 @@ mod tests {
             Box::pin(async move {
                 self.observe_calls.fetch_add(1, Ordering::Relaxed);
                 Ok(EngineObservation {
+                    cutoff_certificate: None,
                     hits: Vec::new(),
                     cutoff_tie_group: Vec::new(),
                     cutoff_tie_complete: true,
@@ -5384,6 +5564,7 @@ mod tests {
             limit,
             offset,
             case.count_requested,
+            None,
         )
         .expect("assemble E5.5 ranked observation");
         match mode {
@@ -5463,6 +5644,7 @@ mod tests {
         E55CaseEvidence {
             diagnostics,
             observation: EngineObservation {
+                cutoff_certificate: None,
                 cutoff_tie_group: hits.clone(),
                 cutoff_tie_complete: true,
                 hits,
@@ -6554,6 +6736,95 @@ mod tests {
     }
 
     #[test]
+    fn quill_native_observation_carries_a_same_snapshot_certificate() {
+        use crate::cutoff_certificate::{BoundaryNotApplicableV1, BoundaryWitnessV1};
+
+        let mut subject =
+            QuillSubject::in_memory_with_source(QuillConfig::default(), "a".repeat(40), false)
+                .expect("live Quill subject");
+        let documents = vec![
+            frankensearch_core::IndexableDocument::new("a", "shared token"),
+            frankensearch_core::IndexableDocument::new("b", "shared token"),
+            frankensearch_core::IndexableDocument::new("c", "shared token"),
+        ];
+        let mut case = DifferentialCase::new("quill-certificate", "shared", 2);
+        case.tie_expansion_limit = 8;
+        case.snippet_max_chars = None;
+        case.count_requested = false;
+        let mut cut_case = case.clone();
+        cut_case.fixture_id = "quill-certificate-cut".to_owned();
+        cut_case.tie_expansion_limit = 0;
+        let mut counted_case = case.clone();
+        counted_case.fixture_id = "quill-certificate-counted".to_owned();
+        counted_case.count_requested = true;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            subject
+                .claim_fresh_campaign()
+                .expect("claim certificate campaign");
+            subject
+                .index_mut()
+                .expect("open certificate campaign")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index subject corpus");
+            subject
+                .index_mut()
+                .expect("open certificate campaign")
+                .commit(&cx)
+                .await
+                .expect("commit subject corpus");
+            subject
+                .mark_committed()
+                .expect("publish certificate campaign");
+
+            let observation = subject.observe(&cx, &case).await.expect("observe");
+            let certificate = observation
+                .cutoff_certificate
+                .as_ref()
+                .expect("pinned bundle prefix reaches the exact total");
+            assert_eq!(certificate.exact_total, 3);
+            assert_eq!((certificate.page.start, certificate.page.end), (0, 2));
+            assert_eq!(certificate.expanded.len(), 3);
+            assert!(certificate.is_exhausted());
+            assert_eq!(
+                certificate.leading_boundary,
+                BoundaryWitnessV1::NotApplicable {
+                    reason: BoundaryNotApplicableV1::AtStart
+                }
+            );
+            assert_ne!(certificate.provenance.snapshot_sha256, [0; 32]);
+            assert_ne!(certificate.provenance.same_snapshot_authority, [0; 16]);
+            // The count-free case still certifies: exact_total comes from
+            // the separate count invocation on the same snapshot, never from
+            // the ranked page.
+            assert_eq!(observation.match_count, CountState::NotRequested);
+
+            // A fetch that cuts the trailing group: no claim.
+            let cut = subject.observe(&cx, &cut_case).await.expect("observe cut");
+            assert!(cut.cutoff_certificate.is_none());
+            assert!(!cut.cutoff_tie_complete);
+
+            // Requesting the count changes nothing about the certificate.
+            let counted = subject
+                .observe(&cx, &counted_case)
+                .await
+                .expect("observe counted");
+            assert_eq!(counted.match_count, CountState::Value(3));
+            let counted_certificate = counted
+                .cutoff_certificate
+                .as_ref()
+                .expect("counted case certifiable");
+            assert_eq!(counted_certificate.expanded, certificate.expanded);
+            assert_eq!(
+                counted_certificate.provenance.snapshot_sha256,
+                certificate.provenance.snapshot_sha256,
+                "same publication, same physical digest"
+            );
+        });
+    }
+
+    #[test]
     fn live_subject_is_a_trait_object_with_quill_identity() {
         let subject: Box<dyn GauntletEngine> = Box::new(
             QuillSubject::in_memory_with_source(QuillConfig::default(), "test-revision", false)
@@ -7289,7 +7560,7 @@ mod tests {
 
         for mismatch in [wrong_external_id, wrong_native_tie_key, wrong_score_bits] {
             assert!(matches!(
-                quill_observation_from_results(&mismatch, &evidence, 1, 0, false),
+                quill_observation_from_results(&mismatch, &evidence, 1, 0, false, None),
                 Err(GauntletError::InvalidObservation { reason }) if reason == expected_reason
             ));
         }
@@ -7316,15 +7587,29 @@ mod tests {
             diagnostics: Vec::new(),
         };
 
-        let counted =
-            quill_native_observation_from_results(&ranked, &ranked, &count_evidence, 1, 0, true)
-                .expect("native ranking plus independent count evidence");
+        let counted = quill_native_observation_from_results(
+            &ranked,
+            &ranked,
+            &count_evidence,
+            1,
+            0,
+            true,
+            None,
+        )
+        .expect("native ranking plus independent count evidence");
         assert_eq!(counted.hits[0].score_bits, native_score.to_bits());
         assert_eq!(counted.match_count, CountState::Value(110));
 
-        let count_free =
-            quill_native_observation_from_results(&ranked, &ranked, &count_evidence, 1, 0, false)
-                .expect("internal count evidence stays hidden for a count-free case");
+        let count_free = quill_native_observation_from_results(
+            &ranked,
+            &ranked,
+            &count_evidence,
+            1,
+            0,
+            false,
+            None,
+        )
+        .expect("internal count evidence stays hidden for a count-free case");
         assert_eq!(count_free.hits[0].score_bits, native_score.to_bits());
         assert_eq!(count_free.match_count, CountState::NotRequested);
     }
@@ -7359,6 +7644,7 @@ mod tests {
                 1,
                 0,
                 true,
+                None,
             ),
             Err(GauntletError::InvalidObservation { reason })
                 if reason == "Quill native ranked observations unexpectedly executed exact-count work"
@@ -7374,6 +7660,7 @@ mod tests {
                 1,
                 0,
                 true,
+                None,
             ),
             Err(GauntletError::InvalidObservation { reason })
                 if reason == "Quill count-only evidence unexpectedly returned ranked hits"
@@ -7389,6 +7676,7 @@ mod tests {
                 1,
                 0,
                 true,
+                None,
             ),
             Err(GauntletError::InvalidObservation { reason })
                 if reason == "Quill native ranked and count-only observations disagreed on the committed document count"
@@ -7411,6 +7699,7 @@ mod tests {
                 1,
                 0,
                 true,
+                None,
             ),
             Err(GauntletError::InvalidObservation { reason })
                 if reason == "Quill native ranked and count-only observations disagreed on parser diagnostics"
@@ -7426,6 +7715,7 @@ mod tests {
                 1,
                 0,
                 true,
+                None,
             ),
             Err(GauntletError::InvalidObservation { reason })
                 if reason == "Quill count-only evidence omitted its exact count"
@@ -7457,6 +7747,7 @@ mod tests {
         )
         .expect("distinct engines");
         let underfilled = EngineObservation {
+            cutoff_certificate: None,
             hits: Vec::new(),
             cutoff_tie_group: Vec::new(),
             cutoff_tie_complete: true,
@@ -7479,6 +7770,7 @@ mod tests {
             native_tie_key: NativeTieKey::QuillDocId { doc_id: 1 },
         };
         let subject_overfilled = EngineObservation {
+            cutoff_certificate: None,
             hits: vec![quill_hit.clone()],
             cutoff_tie_group: vec![quill_hit],
             cutoff_tie_complete: true,
@@ -7490,6 +7782,7 @@ mod tests {
             ast_differences: Vec::new(),
         };
         let oracle_empty = EngineObservation {
+            cutoff_certificate: None,
             hits: Vec::new(),
             cutoff_tie_group: Vec::new(),
             cutoff_tie_complete: true,
@@ -7508,6 +7801,7 @@ mod tests {
         );
 
         let malformed_offset = EngineObservation {
+            cutoff_certificate: None,
             hits: vec![RankedHit {
                 doc_id: "page".to_owned(),
                 score_bits: 1.0_f32.to_bits(),
@@ -7627,6 +7921,53 @@ mod tests {
             assert_eq!(paginated.offset_tie_group.len(), 3);
             assert!(paginated.offset_tie_complete);
             assert_eq!(paginated.match_count, CountState::Value(3));
+
+            // bd-pjvl1: the same observations now carry a same-searcher
+            // certificate derived from the native expanded prefix.
+            use crate::cutoff_certificate::{BoundaryNotApplicableV1, BoundaryWitnessV1};
+            let certificate = observation
+                .cutoff_certificate
+                .as_ref()
+                .expect("prefix reaches the exact total: certifiable");
+            assert_eq!(certificate.exact_total, 3);
+            assert_eq!((certificate.page.start, certificate.page.end), (0, 2));
+            assert_eq!(certificate.expanded_start, 0);
+            assert_eq!(certificate.expanded.len(), 3, "the whole tie group");
+            assert!(certificate.is_exhausted());
+            assert_eq!(
+                certificate.trailing_boundary,
+                BoundaryWitnessV1::NotApplicable {
+                    reason: BoundaryNotApplicableV1::Exhausted
+                }
+            );
+            assert_ne!(certificate.provenance.snapshot_sha256, [0; 32]);
+            assert_ne!(certificate.provenance.same_snapshot_authority, [0; 16]);
+            // A fetch that cuts the group makes NO claim — not "incomplete".
+            assert!(exhausted.cutoff_certificate.is_none());
+            // Zero limit: certified with no score boundary.
+            let zero = zero_limit
+                .cutoff_certificate
+                .as_ref()
+                .expect("zero limit is certifiable");
+            assert!(zero.page_is_empty());
+            assert_eq!(
+                zero.leading_boundary,
+                BoundaryWitnessV1::NotApplicable {
+                    reason: BoundaryNotApplicableV1::ZeroLimit
+                }
+            );
+            // Offset inside the tie: the leading group is expanded back to 0.
+            let inside = paginated
+                .cutoff_certificate
+                .as_ref()
+                .expect("offset page inside the tie is certifiable");
+            assert_eq!((inside.page.start, inside.page.end), (1, 2));
+            assert_eq!(inside.expanded_start, 0);
+            assert!(inside.is_exhausted());
+            assert_ne!(
+                inside.digest_sha256().expect("digest"),
+                certificate.digest_sha256().expect("digest")
+            );
         });
     }
 

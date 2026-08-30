@@ -799,6 +799,37 @@ pub struct OracleQueryObservation {
     pub total_count: usize,
     /// Exact live-document count.
     pub doc_count: usize,
+    /// Every row of the expanded fetch in native rank order: a prefix
+    /// `[0, n)` of the full ordering on the SAME pinned searcher, a superset
+    /// of `hits`. Conformance certificates derive whole-group expansion and
+    /// boundary witnesses from it instead of inferring completeness from the
+    /// fetch capacity (bd-pjvl1).
+    pub expanded_hits: Vec<OracleRankedHit>,
+    /// Domain-separated SHA-256 of the pinned searcher's physical identity
+    /// (every segment id, max doc, deleted count, and the live count).
+    pub searcher_sha256: [u8; 32],
+}
+
+/// Physical identity of one pinned Tantivy searcher.
+#[cfg(feature = "tantivy-oracle")]
+pub(crate) fn oracle_searcher_sha256(searcher: &tantivy::Searcher) -> [u8; 32] {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"frankensearch/lexical/oracle-searcher/v1\0");
+    hasher.update(searcher.num_docs().to_be_bytes());
+    let readers = searcher.segment_readers();
+    hasher.update(
+        u64::try_from(readers.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for reader in readers {
+        hasher.update(reader.segment_id().uuid_string().as_bytes());
+        hasher.update(reader.max_doc().to_be_bytes());
+        hasher.update(reader.num_deleted_docs().to_be_bytes());
+    }
+    hasher.finalize().into()
 }
 
 /// Dev-only exact counted page used by the Quill replacement witness.
@@ -3302,6 +3333,8 @@ impl TantivyIndex {
                 cutoff_tie_complete: true,
                 total_count: 0,
                 doc_count,
+                expanded_hits: Vec::new(),
+                searcher_sha256: oracle_searcher_sha256(&searcher),
             });
         }
 
@@ -3383,6 +3416,8 @@ impl TantivyIndex {
             cutoff_tie_complete,
             total_count,
             doc_count,
+            expanded_hits,
+            searcher_sha256: oracle_searcher_sha256(&searcher),
         })
     }
 

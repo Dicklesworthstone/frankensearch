@@ -5469,6 +5469,12 @@ pub struct EngineObservation {
     /// queries with no recorded lowering difference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ast_differences: Vec<AstDifference>,
+    /// Same-snapshot cutoff/offset completeness certificate (bd-pjvl1) when
+    /// the producer could derive one from native evidence on one pinned
+    /// snapshot/searcher. `None` means no claim — never "incomplete". Omitted
+    /// from canonical bytes when absent, so V7 artifacts are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutoff_certificate: Option<crate::cutoff_certificate::CutoffCertificateV1>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if protocol
@@ -6571,6 +6577,7 @@ fn cass_success_to_engine(
     success: &CassLexicalProfileSuccess,
 ) -> Result<EngineObservation, GauntletError> {
     Ok(EngineObservation {
+        cutoff_certificate: None,
         hits: success
             .hits
             .iter()
@@ -8732,6 +8739,7 @@ mod tests {
             native_tie_key: NativeTieKey::QuillDocId { doc_id: 1 },
         };
         EngineObservation {
+            cutoff_certificate: None,
             hits: vec![first, second.clone()],
             cutoff_tie_group: vec![second],
             cutoff_tie_complete: true,
@@ -9541,6 +9549,7 @@ mod tests {
 
     fn observation(hits: Vec<RankedHit>) -> EngineObservation {
         EngineObservation {
+            cutoff_certificate: None,
             match_count: CountState::Value(u64::try_from(hits.len()).unwrap_or(u64::MAX)),
             doc_count: 9,
             hits,
@@ -10648,6 +10657,7 @@ mod tests {
 
         let classified = compare_observations(
             EngineObservation {
+                cutoff_certificate: None,
                 match_count: CountState::Value(3),
                 ..subject.clone()
             },
