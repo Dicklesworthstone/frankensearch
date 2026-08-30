@@ -49,38 +49,6 @@ use std::collections::BTreeSet;
 #[cfg(feature = "native")]
 use std::path::PathBuf;
 
-/// Claim `tracing`'s global default subscriber before anything else can.
-///
-/// `asupersync::test_utils::run_test_with_cx` installs a TRACE-level subscriber
-/// and ignores `RUST_LOG`. `tracing`'s global default is first-wins and applies
-/// process-wide, so once any test in this binary calls it, every later test
-/// inherits TRACE — including the ones that tokenize. The `HuggingFace` tokenizer
-/// inside `NativeEmbedder` logs *five lines per character*: one measured run
-/// produced 1,976,875 lines and burned over ten CPU-hours across 66 threads
-/// without finishing, while the same tests in a process that never reaches
-/// `run_test_with_cx` produce four lines and complete normally.
-///
-/// So every test here calls this first. It is a workaround, not the fix —
-/// `bd-irb1` tracks making `run_test_with_cx` honour `RUST_LOG` — but without it
-/// the hybrid lane (the only one needing both `Cx` and the embedder) is
-/// unrunnable.
-///
-/// Honours `RUST_LOG` when set, so deliberate debugging still works.
-fn quiet_logging() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-        // Failure means someone else already claimed the global default; that
-        // is exactly the race this guards against, and losing it is not fatal.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_test_writer()
-            .try_init();
-    });
-}
-
 // ─── Fixture loading and chunking ────────────────────────────────────────────
 
 /// One indexed passage of the book.
@@ -351,7 +319,6 @@ fn resolve_model_dir(lane: &str) -> Option<PathBuf> {
 
 #[test]
 fn fixture_chunks_into_all_thirty_four_chapters() {
-    quiet_logging();
     let passages = corpus();
     let chapters: BTreeSet<u32> = passages.iter().map(|p| p.chapter).collect();
 
@@ -388,7 +355,6 @@ fn fixture_chunks_into_all_thirty_four_chapters() {
 
 #[test]
 fn semantic_queries_do_not_leak_the_answer_vocabulary() {
-    quiet_logging();
     // A future maintainer facing a red semantic test could "fix" it by sneaking
     // the target passage's distinctive words into the query. That would turn a
     // meaning test into a keyword test and re-open the exact hole this file
@@ -425,9 +391,9 @@ mod lexical {
     use frankensearch::lexical_tantivy::{
         IndexRecordOption, Query, TantivyDocument, Term, TermQuery, TopDocs, Value,
     };
-    use frankensearch::{IndexableDocument, LexicalRead, LexicalWrite, QuillConfig, QuillIndex};
+    use frankensearch::{IndexableDocument, LexicalWrite, QuillConfig, QuillIndex};
     #[cfg(feature = "lexical-tantivy")]
-    use frankensearch::{ScoredResult, TantivyIndex};
+    use frankensearch::{LexicalRead, ScoredResult, TantivyIndex};
 
     const BOOK_SHA256: &str =
         "sha256:be2e285d9b0fa633eac35b350490af1693e29c7bf19c54b9260ce6389fab5190";
@@ -850,7 +816,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_phrase_prefix_matches_tantivy_oracle() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let docs = vec![
                 IndexableDocument::new("phrase-prefix-hit", "compass companion route"),
@@ -881,7 +846,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_phrase_prefix_score_bits_match_tantivy_oracle() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let docs = vec![IndexableDocument::new("hit", "anchor prefix")];
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -900,7 +864,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_phrase_prefix_ranking_uses_fixed_frequency_not_suffix_idf() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let docs = vec![
                 IndexableDocument::new(
@@ -949,7 +912,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_phrase_prefix_caps_expansions_per_leaf_like_tantivy() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let first_content = format!(
                 "{} anchor p050",
@@ -1025,7 +987,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_zero_limit_range_matches_tantivy_without_spending_query_fuel() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             const FUEL_BUDGET: u64 = 6;
             let documents = ["atlas", "boreal", "cinder", "dynamo"]
@@ -1078,7 +1039,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_redundant_deep_groups_match_tantivy_oracle() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let docs = vec![
                 IndexableDocument::new("nested-hit", "depthneedle"),
@@ -1122,7 +1082,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_deep_field_scoped_groups_match_tantivy_oracle() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let docs = vec![
                 IndexableDocument::new("nested-hit", "depthneedle"),
@@ -1166,7 +1125,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_deep_mixed_scope_groups_match_tantivy_oracle() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let docs = vec![
                 IndexableDocument::new("nested-hit", "depthneedle"),
@@ -1203,7 +1161,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_deep_field_scope_with_nested_boolean_body_matches_tantivy_oracle() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let docs = vec![
                 IndexableDocument::new("content-hit", "depthneedle").with_title("neutral"),
@@ -1245,7 +1202,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_depth_72_alternating_boolean_arena_matches_tantivy_oracle() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             const PAIRS: usize = 36;
             const EXPECTED_GROUPS: usize = 72;
@@ -1318,7 +1274,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_unfielded_three_term_or_matches_tantivy_score_bits_and_order() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             const QUERY: &str = "(release OR require) OR return";
             const LIMIT: usize = 5;
@@ -1345,7 +1300,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_single_batch_upsert_is_last_write_wins_by_identity() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let documents = vec![
                 IndexableDocument::new("duplicate", "stalealpha").with_metadata("revision", "old"),
@@ -1412,7 +1366,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_replacement_after_pending_batch_matches_tantivy_oracle() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let seed = vec![
                 IndexableDocument::new("seeded", "stalealpha"),
@@ -1518,7 +1471,6 @@ mod lexical {
 
     #[test]
     fn fixture_source_qrels_and_chunk_manifest_are_frozen() {
-        super::quiet_logging();
         let passages = corpus();
         assert_eq!(
             frankensearch::core::sha256_checksum(super::BOOK.as_bytes()),
@@ -1539,7 +1491,6 @@ mod lexical {
 
     #[test]
     fn exact_terms_retrieve_the_right_chapters_and_nothing_else() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let passages = corpus();
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -1634,7 +1585,6 @@ mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn quill_and_tantivy_pass_real_prose_qrels_across_reopen() {
-        super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let passages = corpus();
             let docs = indexable_documents(&passages);
@@ -1807,7 +1757,6 @@ mod semantic {
 
     #[test]
     fn concept_queries_find_the_right_chapters_and_hashing_cannot() {
-        super::quiet_logging();
         let Some(model_dir) = resolve_model_dir("semantic concept-retrieval lane") else {
             return;
         };
@@ -1925,7 +1874,6 @@ mod semantic {
 
     #[test]
     fn a_hash_embedder_is_never_mistaken_for_a_semantic_one() {
-        super::quiet_logging();
         // The degradation is only detectable if these two disagree about
         // themselves. Guard the property directly — it is load-bearing for the
         // skip logic, for `TwoTierAvailability`, and for the fusion searcher's
@@ -1945,7 +1893,6 @@ mod semantic {
 
     #[test]
     fn semantically_close_passages_score_higher_than_unrelated_ones() {
-        super::quiet_logging();
         // A direct, corpus-independent check that the vectors carry meaning:
         // two descriptions of the same idea must be closer than two
         // descriptions of different ideas.
@@ -1995,7 +1942,6 @@ mod hybrid {
 
     #[test]
     fn rrf_fuses_both_arms_over_real_prose() {
-        super::quiet_logging();
         let Some(model_dir) = resolve_model_dir("hybrid fusion lane") else {
             return;
         };

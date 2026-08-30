@@ -81,11 +81,6 @@ toml = { workspace = true }
 ndarray = { workspace = true }
 rayon = { workspace = true }
 sha2 = { workspace = true }
-# Lets a test claim `tracing`'s global default subscriber before
-# `asupersync::test_utils::run_test_with_cx` installs its own TRACE-level one.
-# Without this the HuggingFace tokenizer logs five lines per character and a
-# single embedding lane burns >10 CPU-hours. See bd-irb1.
-tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "search_bench"
