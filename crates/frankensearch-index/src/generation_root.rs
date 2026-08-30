@@ -9222,51 +9222,62 @@ mod platform {
         stage: GenerationRootStage,
         index: Option<usize>,
     ) -> GenerationRootResult<BasicObjectIdentity> {
+        // The ACL read is bracketed by two ctime witnesses so an owner, mode,
+        // or ACL change racing the read cannot slip through. A directory's
+        // ctime also moves when any entry is created or removed beside the
+        // route, which is ordinary neighbour churn rather than a security
+        // change — so a moved witness re-qualifies the ancestor from scratch
+        // (owner, mode, and ACL are all re-read against the fresh witness)
+        // instead of refusing, up to a small bound. Only an ancestor whose
+        // ctime never settles across every attempt is reported as changed.
+        const ANCESTOR_QUALIFICATION_ATTEMPTS: usize = 4;
         let result = (|| {
-            let before = absolute_ancestor_security_witness(descriptor, stage)?;
-            #[cfg(target_os = "linux")]
-            let raw_mode = before.identity.mode;
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let raw_mode = u16::try_from(before.identity.mode).map_err(|_| {
-                GenerationRootError::new(GenerationRootErrorKind::ObjectChanged, stage)
-            })?;
-            if FileType::from_raw_mode(raw_mode) != FileType::Directory {
-                return Err(GenerationRootError::new(
-                    GenerationRootErrorKind::NotDirectory,
-                    stage,
-                ));
-            }
-            validate_absolute_ancestor_owner_mode(
-                before.identity.uid,
-                before.identity.mode,
-                stage,
-            )?;
-            #[cfg(test)]
-            test_boundary(TestBoundary::BeforeAbsoluteAncestorAclRead { index })?;
-            let acl_presence =
-                crate::fd_acl::extended_acl_presence(descriptor.as_fd()).map_err(|error| {
-                    GenerationRootError::new(GenerationRootErrorKind::AclRejected, stage)
-                        .with_raw_os_error(error.raw_os_error().unwrap_or(libc::EIO))
+            for _ in 0..ANCESTOR_QUALIFICATION_ATTEMPTS {
+                let before = absolute_ancestor_security_witness(descriptor, stage)?;
+                #[cfg(target_os = "linux")]
+                let raw_mode = before.identity.mode;
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let raw_mode = u16::try_from(before.identity.mode).map_err(|_| {
+                    GenerationRootError::new(GenerationRootErrorKind::ObjectChanged, stage)
                 })?;
-            #[cfg(test)]
-            test_boundary(TestBoundary::AfterAbsoluteAncestorAclRead { index })?;
-            match acl_presence {
-                crate::fd_acl::ExtendedAclPresence::Absent => {}
-                crate::fd_acl::ExtendedAclPresence::Present => {
+                if FileType::from_raw_mode(raw_mode) != FileType::Directory {
                     return Err(GenerationRootError::new(
-                        GenerationRootErrorKind::AclRejected,
+                        GenerationRootErrorKind::NotDirectory,
                         stage,
                     ));
                 }
-            }
-            let after = absolute_ancestor_security_witness(descriptor, stage)?;
-            if before != after {
-                return Err(GenerationRootError::new(
-                    GenerationRootErrorKind::ObjectChanged,
+                validate_absolute_ancestor_owner_mode(
+                    before.identity.uid,
+                    before.identity.mode,
                     stage,
-                ));
+                )?;
+                #[cfg(test)]
+                test_boundary(TestBoundary::BeforeAbsoluteAncestorAclRead { index })?;
+                let acl_presence = crate::fd_acl::extended_acl_presence(descriptor.as_fd())
+                    .map_err(|error| {
+                        GenerationRootError::new(GenerationRootErrorKind::AclRejected, stage)
+                            .with_raw_os_error(error.raw_os_error().unwrap_or(libc::EIO))
+                    })?;
+                #[cfg(test)]
+                test_boundary(TestBoundary::AfterAbsoluteAncestorAclRead { index })?;
+                match acl_presence {
+                    crate::fd_acl::ExtendedAclPresence::Absent => {}
+                    crate::fd_acl::ExtendedAclPresence::Present => {
+                        return Err(GenerationRootError::new(
+                            GenerationRootErrorKind::AclRejected,
+                            stage,
+                        ));
+                    }
+                }
+                let after = absolute_ancestor_security_witness(descriptor, stage)?;
+                if before == after {
+                    return Ok(after.identity);
+                }
             }
-            Ok(after.identity)
+            Err(GenerationRootError::new(
+                GenerationRootErrorKind::ObjectChanged,
+                stage,
+            ))
         })();
         result.map_err(|error| at_absolute_component(error, index))
     }
@@ -16554,6 +16565,9 @@ if not close_only_contended or not explicit_unlock_released:
 
         #[test]
         fn ancestor_mutation_inside_the_acl_sandwich_is_rejected() {
+            // A real security mutation (group/other-writable) slipped in
+            // between the owner/mode check and the ACL read moves the ctime
+            // witness; the re-qualification re-reads the mode and names it.
             let ancestor = fixture_root("ancestor-acl-sandwich");
             let root_path = private_dir(&ancestor, "root");
             let ancestor_index = ancestor.components().count().saturating_sub(2);
@@ -16566,14 +16580,70 @@ if not close_only_contended or not explicit_unlock_released:
                             index: Some(ancestor_index),
                         })
                 {
-                    fs::set_permissions(&hook_ancestor, fs::Permissions::from_mode(0o710))
+                    fs::set_permissions(&hook_ancestor, fs::Permissions::from_mode(0o722))
                         .expect("the ancestor security mutation should be injectable");
                     mutated = true;
                 }
                 Ok(())
             });
             let error = QualifiedGenerationRoot::admit(&root_path)
-                .expect_err("ctime drift inside the ACL sandwich must fail");
+                .expect_err("a security mutation inside the ACL sandwich must fail");
+            assert_eq!(error.kind(), GenerationRootErrorKind::WrongMode);
+            assert_eq!(
+                error.component_index(),
+                Some(u16::try_from(ancestor_index).expect("fixture depth fits u16"))
+            );
+        }
+
+        #[test]
+        fn sibling_churn_inside_the_acl_sandwich_is_requalified_not_rejected() {
+            // A neighbour created beside the route moves the ancestor's ctime
+            // exactly like a security change would; the ancestor is
+            // re-qualified against the fresh witness and admitted.
+            let ancestor = fixture_root("ancestor-acl-sandwich-churn");
+            let root_path = private_dir(&ancestor, "root");
+            let ancestor_index = ancestor.components().count().saturating_sub(2);
+            let mut churned = 0_u32;
+            let hook_ancestor = ancestor.clone();
+            let _guard = install_test_hook(move |boundary| {
+                if churned < 2
+                    && boundary
+                        == (TestBoundary::BeforeAbsoluteAncestorAclRead {
+                            index: Some(ancestor_index),
+                        })
+                {
+                    private_dir(&hook_ancestor, &format!("neighbour-{churned}"));
+                    churned += 1;
+                }
+                Ok(())
+            });
+            let root = QualifiedGenerationRoot::admit(&root_path)
+                .expect("sibling churn inside the sandwich is not a security change");
+            assert_eq!(root.witness().mode() & 0o022, 0);
+        }
+
+        #[test]
+        fn an_ancestor_whose_ctime_never_settles_is_rejected() {
+            let ancestor = fixture_root("ancestor-acl-sandwich-unsettled");
+            let root_path = private_dir(&ancestor, "root");
+            let ancestor_index = ancestor.components().count().saturating_sub(2);
+            let mut churned = 0_u32;
+            let hook_ancestor = ancestor.clone();
+            let _guard = install_test_hook(move |boundary| {
+                if boundary
+                    == (TestBoundary::BeforeAbsoluteAncestorAclRead {
+                        index: Some(ancestor_index),
+                    })
+                {
+                    // Every attempt sees a fresh neighbour: the witness never
+                    // settles within the bound, so the ancestor is refused.
+                    private_dir(&hook_ancestor, &format!("neighbour-{churned}"));
+                    churned += 1;
+                }
+                Ok(())
+            });
+            let error = QualifiedGenerationRoot::admit(&root_path)
+                .expect_err("an ancestor that never settles must fail closed");
             assert_eq!(error.kind(), GenerationRootErrorKind::ObjectChanged);
             assert_eq!(
                 error.component_index(),
@@ -17483,9 +17553,12 @@ if not close_only_contended or not explicit_unlock_released:
                 }
                 Ok(())
             });
+            // The moved ctime witness re-qualifies the ancestor, and the
+            // re-read now sees the inserted ACL: the verdict names the ACL
+            // itself rather than the fence that caught it.
             let error = QualifiedGenerationRoot::admit(&root_path)
-                .expect_err("an ACL inserted after the Darwin probe must trip the ctime fence");
-            assert_eq!(error.kind(), GenerationRootErrorKind::ObjectChanged);
+                .expect_err("an ACL inserted after the Darwin probe must be caught on re-read");
+            assert_eq!(error.kind(), GenerationRootErrorKind::AclRejected);
             assert_eq!(
                 error.component_index(),
                 Some(u16::try_from(ancestor_index).expect("fixture depth fits u16"))
