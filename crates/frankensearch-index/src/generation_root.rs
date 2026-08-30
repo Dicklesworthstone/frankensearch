@@ -1980,7 +1980,13 @@ pub mod authority_publisher {
                 // The lock path witnesses LOCK at open time and revalidates it
                 // mutation-stably after the flock lands: a publication that
                 // completed in that window is a fence, not a fault.
-                Err(error) if error.kind() == GenerationRootErrorKind::ObjectChanged => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        GenerationRootErrorKind::ObjectChanged
+                            | GenerationRootErrorKind::HardLinked
+                    ) =>
+                {
                     return Ok(PublicationOutcomeV1::NotCommitted(
                         NotCommittedV1::AnchorsChanged,
                     ));
@@ -2212,6 +2218,7 @@ pub mod authority_publisher {
                         error.kind(),
                         GenerationRootErrorKind::LockContended
                             | GenerationRootErrorKind::ObjectChanged
+                            | GenerationRootErrorKind::HardLinked
                     ) =>
                 {
                     return Ok(ReconcileOutcomeV1::StillUnknown(*permit));
@@ -3316,6 +3323,103 @@ pub mod authority_publisher {
                 .collect();
             assert_eq!(sequences.iter().max(), Some(&PUBLICATIONS));
             assert_eq!(sequences.iter().min(), Some(&(PUBLICATIONS - 1)));
+        }
+
+        #[test]
+        fn swapped_anchor_inodes_are_a_typed_refusal_with_zero_mutation() {
+            use std::os::unix::fs::MetadataExt as _;
+
+            for swapped in ["AUTHORITY", "LOCK"] {
+                let root_path = fixture_root(&format!("swap-{}", swapped.to_lowercase()));
+                let root = admit(&root_path);
+                let publisher = root
+                    .authority_publisher(
+                        ROOT_ID,
+                        WRITER_A,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                    )
+                    .expect("publisher binds");
+
+                // A same-length, same-mode replacement inode renamed over the
+                // anchor: the classic path-substitution attack against a
+                // retained descriptor set.
+                let original_ino = fs::metadata(root_path.join(swapped)).expect("meta").ino();
+                let replacement = root_path.join(format!("{swapped}.replacement"));
+                {
+                    let len = fs::metadata(root_path.join(swapped)).expect("meta").len();
+                    let mut file = OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .mode(0o600)
+                        .open(&replacement)
+                        .expect("replacement creatable");
+                    file.write_all(&vec![0_u8; usize::try_from(len).expect("len")])
+                        .expect("replacement bytes");
+                    file.sync_all().expect("replacement durable");
+                }
+                fs::rename(&replacement, root_path.join(swapped)).expect("swap renamed");
+                let swapped_ino = fs::metadata(root_path.join(swapped)).expect("meta").ino();
+                assert_ne!(original_ino, swapped_ino);
+                let before = fs::read(root_path.join(swapped)).expect("swapped readable");
+
+                let outcome = publisher
+                    .publish(
+                        authority(1, None),
+                        ExpectedAuthorityPairV1::default(),
+                        None,
+                        [0x41; 16],
+                    )
+                    .expect("publication runs");
+                assert_eq!(
+                    outcome,
+                    PublicationOutcomeV1::NotCommitted(NotCommittedV1::AnchorsChanged),
+                    "swapped {swapped}"
+                );
+                assert_eq!(
+                    fs::read(root_path.join(swapped)).expect("swapped readable"),
+                    before,
+                    "no byte reached the substituted {swapped}"
+                );
+                // The original inode (now unlinked from the tree) is untouched
+                // too: the retained descriptor set refuses to write once the
+                // route no longer resolves to it.
+                let permit = AttemptPermitV1 {
+                    root_id: ROOT_ID,
+                    writer_id: WRITER_A,
+                    attempt_id: [0x70; 16],
+                    target_slot: 1,
+                    candidate: authority(1, None),
+                    expected: ExpectedAuthorityPairV1::default(),
+                    stage: AttemptStageV1::SlotWrite,
+                    idempotency_key: [0x41; 16],
+                };
+                assert_eq!(
+                    publisher.reconcile(&permit, None).expect("reconcile runs"),
+                    ReconcileOutcomeV1::StillUnknown(permit),
+                    "swapped {swapped}: reconcile cannot adjudicate on a substituted anchor"
+                );
+                // A freshly admitted root over the substituted anchors is a
+                // different root set and publishes normally on its own inodes.
+                let fresh = admit(&root_path);
+                let fresh_publisher = fresh
+                    .authority_publisher(
+                        ROOT_ID,
+                        WRITER_B,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                    )
+                    .expect("publisher binds");
+                assert!(matches!(
+                    fresh_publisher
+                        .publish(
+                            authority(1, None),
+                            ExpectedAuthorityPairV1::default(),
+                            None,
+                            [0x42; 16]
+                        )
+                        .expect("fresh publication runs"),
+                    PublicationOutcomeV1::Committed { .. }
+                ));
+            }
         }
 
         #[test]
