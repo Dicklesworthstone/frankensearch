@@ -1964,13 +1964,25 @@ pub mod authority_publisher {
 
             // From here on, every failure is CommitOutcomeUnknown: the attempt
             // frame is the durable witness that a slot byte may follow.
+            #[cfg(test)]
+            if platform::crash_point(platform::TestBoundary::BeforePublishAttemptFrame).is_err() {
+                return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
+            }
             if platform::write_lock_range(&mut guard.flock, ATTEMPT_FRAME_OFFSET, &attempt_frame)
                 .is_err()
             {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
+            #[cfg(test)]
+            if platform::crash_point(platform::TestBoundary::AfterPublishAttemptFrame).is_err() {
+                return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
+            }
 
             permit.stage = AttemptStageV1::SlotWrite;
+            #[cfg(test)]
+            if platform::crash_point(platform::TestBoundary::BeforePublishSlotWrite).is_err() {
+                return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
+            }
             if platform::write_control_range(
                 &self.root.authority.inner,
                 slot_offset(target_slot),
@@ -1980,8 +1992,16 @@ pub mod authority_publisher {
             {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
+            #[cfg(test)]
+            if platform::crash_point(platform::TestBoundary::AfterPublishSlotWrite).is_err() {
+                return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
+            }
 
             permit.stage = AttemptStageV1::SlotReread;
+            #[cfg(test)]
+            if platform::crash_point(platform::TestBoundary::BeforePublishSlotReread).is_err() {
+                return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
+            }
             let reread_matches = platform::capture_anchor_image(&self.root.authority.inner)
                 .ok()
                 .and_then(|image| {
@@ -1996,6 +2016,10 @@ pub mod authority_publisher {
             }
 
             permit.stage = AttemptStageV1::FloorAdvance;
+            #[cfg(test)]
+            if platform::crash_point(platform::TestBoundary::BeforePublishFloorAdvance).is_err() {
+                return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
+            }
             let floor_receipt = match floor {
                 None => None,
                 Some(provider) => {
@@ -2008,8 +2032,16 @@ pub mod authority_publisher {
                     }
                 }
             };
+            #[cfg(test)]
+            if platform::crash_point(platform::TestBoundary::AfterPublishFloorAdvance).is_err() {
+                return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
+            }
 
             permit.stage = AttemptStageV1::OwnerFrame;
+            #[cfg(test)]
+            if platform::crash_point(platform::TestBoundary::BeforePublishOwnerFrame).is_err() {
+                return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
+            }
             let Ok(owner_frame) = GenerationLockFrameV1::new(
                 GenerationLockFrameKindV1::Owner,
                 self.root_id,
@@ -2757,6 +2789,167 @@ pub mod authority_publisher {
         }
 
         #[test]
+        fn every_publish_crash_point_reconciles_to_its_exact_verdict() {
+            use platform::TestBoundary as B;
+            // (crash point, stage the permit must report, verdict a fresh
+            // reconcile must reach, whether the floor is expected to hold the
+            // candidate afterwards).
+            let matrix: [(B, AttemptStageV1, bool); 8] = [
+                (
+                    B::BeforePublishAttemptFrame,
+                    AttemptStageV1::AttemptFrame,
+                    false,
+                ),
+                (
+                    B::AfterPublishAttemptFrame,
+                    AttemptStageV1::AttemptFrame,
+                    false,
+                ),
+                (B::BeforePublishSlotWrite, AttemptStageV1::SlotWrite, false),
+                (B::AfterPublishSlotWrite, AttemptStageV1::SlotWrite, true),
+                (B::BeforePublishSlotReread, AttemptStageV1::SlotReread, true),
+                (
+                    B::BeforePublishFloorAdvance,
+                    AttemptStageV1::FloorAdvance,
+                    true,
+                ),
+                (
+                    B::AfterPublishFloorAdvance,
+                    AttemptStageV1::FloorAdvance,
+                    true,
+                ),
+                (B::BeforePublishOwnerFrame, AttemptStageV1::OwnerFrame, true),
+            ];
+            for (index, (crash_at, stage, slot_written)) in matrix.into_iter().enumerate() {
+                let root_path = fixture_root(&format!("crash-{index}"));
+                let root = admit(&root_path);
+                let floor = InMemoryAntiRollbackFloorStoreV1::new();
+                let publisher = root
+                    .authority_publisher(
+                        ROOT_ID,
+                        WRITER_A,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                    )
+                    .expect("publisher binds");
+                let genesis = authority(1, None);
+                let before = authority_bytes(&root_path);
+
+                let outcome = {
+                    let _hook = platform::install_test_hook(move |boundary| {
+                        if boundary == crash_at {
+                            Err(GenerationRootError::new(
+                                GenerationRootErrorKind::Io,
+                                GenerationRootStage::SyncRegularFile,
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    publisher
+                        .publish(
+                            genesis,
+                            ExpectedAuthorityPairV1::default(),
+                            Some(&floor),
+                            [0x41; 16],
+                        )
+                        .expect("publication runs")
+                };
+                let PublicationOutcomeV1::CommitOutcomeUnknown(permit) = outcome else {
+                    panic!("crash at {crash_at:?} must be unknown, got {outcome:?}");
+                };
+                assert_eq!(permit.stage, stage, "crash at {crash_at:?}");
+
+                // Local slot state is exactly what the crash point implies.
+                let after = authority_bytes(&root_path);
+                if slot_written {
+                    assert_ne!(after, before, "crash at {crash_at:?} left the slot durable");
+                    assert_eq!(
+                        decode_slot(&after, 1, ROOT_ID)
+                            .expect("slot decodes")
+                            .map(|s| s.authority),
+                        Some(genesis)
+                    );
+                } else {
+                    assert_eq!(
+                        after, before,
+                        "crash at {crash_at:?} must not touch AUTHORITY"
+                    );
+                }
+                let floor_advanced_before_reconcile = matches!(
+                    crash_at,
+                    B::AfterPublishFloorAdvance | B::BeforePublishOwnerFrame
+                );
+                assert_eq!(
+                    floor.load(ROOT_ID).expect("floor loads").is_some(),
+                    floor_advanced_before_reconcile,
+                    "crash at {crash_at:?}"
+                );
+
+                // A fresh reconcile (hook gone) reaches the exact verdict.
+                let verdict = publisher
+                    .reconcile(&permit, Some(&floor))
+                    .expect("reconcile runs");
+                if slot_written {
+                    let ReconcileOutcomeV1::Committed {
+                        slot,
+                        floor: receipt,
+                    } = verdict
+                    else {
+                        panic!("crash at {crash_at:?} must reconcile committed: {verdict:?}");
+                    };
+                    assert_eq!(slot.authority, genesis);
+                    assert_eq!(receipt.map(|r| r.cas_version), Some(1));
+                    assert_eq!(
+                        floor.load(ROOT_ID).expect("floor").map(|r| r.authority),
+                        Some(genesis),
+                        "reconcile advanced the floor exactly once for {crash_at:?}"
+                    );
+                    assert_eq!(
+                        publisher.owner_frame().expect("frame").map(|f| f.fence),
+                        Some(1),
+                        "reconcile completed the owner frame for {crash_at:?}"
+                    );
+                    // The next publication extends the reconciled head normally.
+                    let next = publisher
+                        .publish(
+                            authority(2, Some(genesis.fingerprint())),
+                            ExpectedAuthorityPairV1 {
+                                first: None,
+                                second: Some(slot),
+                            },
+                            Some(&floor),
+                            [0x42; 16],
+                        )
+                        .expect("successor runs");
+                    assert!(
+                        matches!(next, PublicationOutcomeV1::Committed { .. }),
+                        "{next:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        verdict,
+                        ReconcileOutcomeV1::NotCommitted,
+                        "crash at {crash_at:?}"
+                    );
+                    assert_eq!(floor.load(ROOT_ID), Ok(None));
+                    // Nothing was published: a fresh genesis publication succeeds.
+                    let retry = publisher
+                        .publish(
+                            genesis,
+                            ExpectedAuthorityPairV1::default(),
+                            Some(&floor),
+                            [0x43; 16],
+                        )
+                        .expect("retry runs");
+                    assert!(
+                        matches!(retry, PublicationOutcomeV1::Committed { .. }),
+                        "{retry:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
         fn reconcile_reports_fork_and_not_committed_from_exact_slot_state() {
             let root_path = fixture_root("fork");
             let root = admit(&root_path);
@@ -3260,6 +3453,22 @@ mod platform {
         BeforeFinalRouteStat,
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         AfterFinalRouteStat,
+        // Publisher crash points (bd-ycng6): a hook error here models a crash
+        // or fault exactly between two durable steps of one publication.
+        BeforePublishAttemptFrame,
+        AfterPublishAttemptFrame,
+        BeforePublishSlotWrite,
+        AfterPublishSlotWrite,
+        BeforePublishSlotReread,
+        BeforePublishFloorAdvance,
+        AfterPublishFloorAdvance,
+        BeforePublishOwnerFrame,
+    }
+
+    /// Publisher-visible crash point (test builds only).
+    #[cfg(test)]
+    pub(super) fn crash_point(boundary: TestBoundary) -> GenerationRootResult<()> {
+        test_boundary(boundary)
     }
 
     #[cfg(test)]
