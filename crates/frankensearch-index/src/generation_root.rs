@@ -3895,10 +3895,13 @@ impl fmt::Debug for QualifiedGenerationDirectory {
 /// the manifest descriptor and bytes, so a later publication, rollback, or
 /// root pathname replacement never changes what an admitted snapshot serves.
 ///
-/// Slice 1 opens the activation manifest object; the vector/lexical/ANN/
-/// metadata component closure named by the manifest's receipts is admitted
-/// by the composite adapter that owns the role→file convention. Publication,
-/// reconciliation, and deletion are out of scope (see `authority_publisher`).
+/// The activation manifest is opened first, then every vector/lexical/ANN/
+/// metadata component object it declares — content-addressed as
+/// `<sha256 hex>.<role>` — at the exact length and digest of its receipt
+/// (`GenerationClosureV1`), and finally the root inventory taken under the
+/// second shared lock must be a clean closure (`ClosureViolationV1`).
+/// Publication, reconciliation, and deletion are out of scope (see
+/// `authority_publisher`).
 pub mod generation_reader {
     use std::fmt;
     use std::path::Path;

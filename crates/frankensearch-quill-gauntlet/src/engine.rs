@@ -1666,7 +1666,10 @@ fn quill_observe(
         limit,
         offset,
         case.count_requested,
-        Some(bundle.snapshot_sha256),
+        Some(PinnedArm {
+            snapshot_sha256: bundle.snapshot_sha256,
+            arm: "frankensearch-quill/scalar-index",
+        }),
     )
 }
 
@@ -1677,7 +1680,7 @@ fn quill_native_observation_from_results(
     limit: usize,
     offset: usize,
     count_requested: bool,
-    snapshot_sha256: Option<[u8; 32]>,
+    pinned: Option<PinnedArm>,
 ) -> Result<EngineObservation, GauntletError> {
     if observed.total_count.is_some() || evidence.total_count.is_some() {
         return Err(GauntletError::InvalidObservation {
@@ -1723,7 +1726,7 @@ fn quill_native_observation_from_results(
         match_count,
         limit,
         offset,
-        snapshot_sha256,
+        pinned,
     )
 }
 
@@ -1734,7 +1737,7 @@ fn quill_observation_from_results(
     limit: usize,
     offset: usize,
     count_requested: bool,
-    snapshot_sha256: Option<[u8; 32]>,
+    pinned: Option<PinnedArm>,
 ) -> Result<EngineObservation, GauntletError> {
     if observed.doc_count != evidence.doc_count {
         return Err(GauntletError::InvalidObservation {
@@ -1779,7 +1782,7 @@ fn quill_observation_from_results(
         match_count,
         limit,
         offset,
-        snapshot_sha256,
+        pinned,
     )
 }
 
@@ -1790,7 +1793,7 @@ fn quill_observation_from_validated_results(
     match_count: CountState,
     limit: usize,
     offset: usize,
-    snapshot_sha256: Option<[u8; 32]>,
+    pinned: Option<PinnedArm>,
 ) -> Result<EngineObservation, GauntletError> {
     let page_end = offset
         .checked_add(limit)
@@ -1855,9 +1858,9 @@ fn quill_observation_from_validated_results(
     // The certificate exists only when the three observations were taken on
     // one pinned publication (the native adapter); the CASS preparsed path
     // passes no snapshot digest and therefore makes no claim.
-    let cutoff_certificate = match snapshot_sha256 {
+    let cutoff_certificate = match pinned {
         None => None,
-        Some(snapshot_sha256) => {
+        Some(pinned) => {
             let rows = |hits: &[frankensearch_quill::QuillHit]| {
                 observation_digest(hits.iter().map(|hit| {
                     (
@@ -1868,8 +1871,8 @@ fn quill_observation_from_validated_results(
                 }))
             };
             let provenance = certificate_provenance(
-                snapshot_sha256,
-                "frankensearch-quill/scalar-index",
+                pinned.snapshot_sha256,
+                pinned.arm,
                 rows(&observed.hits),
                 rows(&evidence.hits),
                 total_count,
@@ -1908,6 +1911,16 @@ fn quill_observation_from_validated_results(
             &observed.diagnostics,
         ),
     })
+}
+
+/// What a pinned bundle contributes to a certificate's provenance: the
+/// physical snapshot digest and the arm (engine implementation) that produced
+/// the observations on it. Absent when the observations were not taken on
+/// one pinned publication — then no certificate is derived.
+#[derive(Debug, Clone, Copy)]
+struct PinnedArm {
+    snapshot_sha256: [u8; 32],
+    arm: &'static str,
 }
 
 /// Digest of one native observation: document identity, score bits, and the
@@ -2489,7 +2502,10 @@ impl CassQuillSubject {
             limit,
             offset,
             case.count_requested,
-            Some(bundle.snapshot_sha256),
+            Some(PinnedArm {
+                snapshot_sha256: bundle.snapshot_sha256,
+                arm: "frankensearch-quill/cass-index",
+            }),
         )
     }
 
