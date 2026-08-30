@@ -3909,15 +3909,18 @@ pub mod generation_reader {
         ExpectedAuthorityPairV1, OWNER_FRAME_OFFSET, decode_pair, floor_head,
     };
     use super::{
-        ConfinedGenerationPath, GenerationFileExpectation, GenerationRootAnchorWitness,
-        GenerationRootErrorKind, GenerationRootObjectWitness, GenerationRootReadGuard,
-        GenerationRootResult, QualifiedGenerationFile, QualifiedGenerationRoot,
+        ConfinedGenerationPath, GENERATION_ROOT_AUTHORITY_FILE_NAME,
+        GENERATION_ROOT_LOCK_FILE_NAME, GenerationFileExpectation, GenerationRootAnchorWitness,
+        GenerationRootEntryKind, GenerationRootErrorKind, GenerationRootInventory,
+        GenerationRootObjectWitness, GenerationRootReadGuard, GenerationRootResult,
+        QualifiedGenerationFile, QualifiedGenerationRoot,
     };
     use frankensearch_core::generation::{
         ActivationManifestV1, AntiRollbackFloorRecordV1, AuthorityRefV1, AuthoritySlotV1,
-        GENERATION_LOCK_FRAME_BYTES_V1, GenerationAuthorityErrorV1, GenerationLockFrameKindV1,
-        GenerationLockFrameV1, GenerationRootSecurityProfileV1,
-        resolve_authority_slots_with_profile_v1, verify_authority_manifest_reference_v1,
+        GENERATION_LOCK_FRAME_BYTES_V1, GenerationAuthorityErrorV1, GenerationComponentReceiptV1,
+        GenerationComponentRole, GenerationLockFrameKindV1, GenerationLockFrameV1,
+        GenerationRootSecurityProfileV1, resolve_authority_slots_with_profile_v1,
+        verify_authority_manifest_reference_v1,
     };
 
     /// Bounded number of resolve→open→reresolve rounds before a fresh open
@@ -3940,14 +3943,177 @@ pub mod generation_reader {
     pub fn activation_manifest_path_v1(
         object_id: [u8; 16],
     ) -> GenerationRootResult<ConfinedGenerationPath> {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut name = String::with_capacity(32 + ACTIVATION_MANIFEST_SUFFIX_V1.len());
-        for byte in object_id {
-            name.push(char::from(HEX[usize::from(byte >> 4)]));
-            name.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
+        ConfinedGenerationPath::parse(Path::new(&activation_manifest_name_v1(object_id)))
+    }
+
+    /// Bare name of the activation manifest object for `object_id`.
+    #[must_use]
+    pub fn activation_manifest_name_v1(object_id: [u8; 16]) -> String {
+        let mut name = lower_hex(&object_id);
         name.push_str(ACTIVATION_MANIFEST_SUFFIX_V1);
-        ConfinedGenerationPath::parse(Path::new(&name))
+        name
+    }
+
+    /// Suffix (after the dot) of each content-addressed component object.
+    const COMPONENT_OBJECT_SUFFIXES_V1: [&str; 4] = ["vector", "lexical", "ann", "metadata"];
+
+    /// Suffix a write-ahead log carries beside the artifact it shadows; a WAL
+    /// inside a sealed generation root is never admissible.
+    pub const WRITE_AHEAD_LOG_SUFFIX_V1: &str = ".wal";
+
+    /// Bare name of one immutable component object.
+    ///
+    /// The name is the 64 lowercase hex digits
+    /// of its exact SHA-256 plus `.<role>` (`vector`, `lexical`, `ann`,
+    /// `metadata`). Content addressing makes the manifest's receipt the only
+    /// locator a reader needs, and two generations that share identical
+    /// bytes for a role share one retained object.
+    #[must_use]
+    pub fn component_object_name_v1(role: GenerationComponentRole, sha256: [u8; 32]) -> String {
+        let mut name = lower_hex(&sha256);
+        name.push('.');
+        name.push_str(role.as_str());
+        name
+    }
+
+    /// Confined relative path of one component object.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's route error when relative names are unsupported.
+    pub fn component_object_path_v1(
+        role: GenerationComponentRole,
+        sha256: [u8; 32],
+    ) -> GenerationRootResult<ConfinedGenerationPath> {
+        ConfinedGenerationPath::parse(Path::new(&component_object_name_v1(role, sha256)))
+    }
+
+    fn lower_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            hex.push(char::from(HEX[usize::from(byte >> 4)]));
+            hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        hex
+    }
+
+    fn is_lower_hex(bytes: &[u8], len: usize) -> bool {
+        bytes.len() == len
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    }
+
+    /// Whether `name` has the shape of a retained immutable object: an
+    /// activation manifest (`<32 hex>.activation`) or a component object
+    /// (`<64 hex>.<role>`). Shape only — identity is proven by admission.
+    #[must_use]
+    pub fn is_retained_object_name_v1(name: &[u8]) -> bool {
+        if let Some(stem) = name.strip_suffix(ACTIVATION_MANIFEST_SUFFIX_V1.as_bytes()) {
+            return is_lower_hex(stem, 32);
+        }
+        COMPONENT_OBJECT_SUFFIXES_V1.iter().any(|role| {
+            name.strip_suffix(role.as_bytes())
+                .and_then(|stem| stem.strip_suffix(b"."))
+                .is_some_and(|stem| is_lower_hex(stem, 64))
+        })
+    }
+
+    /// Why the retained root's contents are not a clean closure over
+    /// immutable objects. Bounded facts only — never a name or path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum ClosureViolationV1 {
+        /// A write-ahead log sits beside a sealed object.
+        WriteAheadLog,
+        /// An entry that is neither an anchor nor a retained-object shape.
+        UndeclaredEntry {
+            /// Object type of the offending entry.
+            kind: GenerationRootEntryKind,
+        },
+        /// Two or more names resolve to one inode, or an object carries a
+        /// second link from outside the root.
+        Alias,
+        /// An object lives on a different device than the root.
+        ForeignDevice,
+    }
+
+    /// The four retained component objects of one generation, each admitted
+    /// descriptor-relatively at the exact length and digest its manifest
+    /// receipt names.
+    pub struct GenerationClosureV1 {
+        vector: QualifiedGenerationFile,
+        lexical: QualifiedGenerationFile,
+        ann: QualifiedGenerationFile,
+        metadata: QualifiedGenerationFile,
+    }
+
+    impl GenerationClosureV1 {
+        /// Retained object for `role`.
+        #[must_use]
+        pub const fn file(&self, role: GenerationComponentRole) -> &QualifiedGenerationFile {
+            match role {
+                GenerationComponentRole::Vector => &self.vector,
+                GenerationComponentRole::Lexical => &self.lexical,
+                GenerationComponentRole::Ann => &self.ann,
+                GenerationComponentRole::Metadata => &self.metadata,
+            }
+        }
+
+        /// Exact bytes of the object for `role` (shared, immutable).
+        #[must_use]
+        pub fn bytes(&self, role: GenerationComponentRole) -> Arc<[u8]> {
+            self.file(role).bytes()
+        }
+    }
+
+    impl fmt::Debug for GenerationClosureV1 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("GenerationClosureV1")
+                .field("vector", &self.vector.witness())
+                .field("lexical", &self.lexical.witness())
+                .field("ann", &self.ann.witness())
+                .field("metadata", &self.metadata.witness())
+                .finish()
+        }
+    }
+
+    /// Prove the root is a clean closure: every entry is an anchor, one of
+    /// this generation's declared objects, or a retained object of another
+    /// generation with the immutable-object shape, single-linked, on the
+    /// root's device; no WAL and no alias anywhere.
+    fn check_closure(
+        inventory: &GenerationRootInventory,
+        root_device: u64,
+        declared: &[&str],
+    ) -> Result<(), ClosureViolationV1> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        for entry in inventory.entries() {
+            let name = entry.name().as_bytes();
+            if name.ends_with(WRITE_AHEAD_LOG_SUFFIX_V1.as_bytes()) {
+                return Err(ClosureViolationV1::WriteAheadLog);
+            }
+            if declared.iter().any(|declared| declared.as_bytes() == name) {
+                continue;
+            }
+            if entry.kind() != GenerationRootEntryKind::RegularFile
+                || !is_retained_object_name_v1(name)
+            {
+                return Err(ClosureViolationV1::UndeclaredEntry { kind: entry.kind() });
+            }
+            if entry.hard_links() != 1 {
+                return Err(ClosureViolationV1::Alias);
+            }
+            if entry.device() != root_device {
+                return Err(ClosureViolationV1::ForeignDevice);
+            }
+        }
+        if !inventory.aliases().is_empty() {
+            return Err(ClosureViolationV1::Alias);
+        }
+        Ok(())
     }
 
     /// Bounded health of an admitted snapshot relative to the external floor.
@@ -4006,9 +4172,12 @@ pub mod generation_reader {
         /// The manifest object opened, but it is not the exact object the
         /// resolved authority addresses.
         Manifest(GenerationAuthorityErrorV1),
-        /// The immutable manifest object could not be admitted exactly
+        /// The manifest or a component object could not be admitted exactly
         /// (missing, wrong length or digest, wrong owner/mode/link identity…).
         Closure(GenerationRootErrorKind),
+        /// Every declared object admitted, but the root also holds something
+        /// a sealed generation root must never hold.
+        ClosureViolation(ClosureViolationV1),
     }
 
     /// Outcome of one fresh open.
@@ -4035,10 +4204,17 @@ pub mod generation_reader {
         floor: Option<AntiRollbackFloorRecordV1>,
         manifest_file: QualifiedGenerationFile,
         manifest: ActivationManifestV1,
+        closure: GenerationClosureV1,
         health: SnapshotHealthV1,
     }
 
     impl OpenedGenerationSnapshotV1 {
+        /// The four retained component objects this generation declares.
+        #[must_use]
+        pub const fn closure(&self) -> &GenerationClosureV1 {
+            &self.closure
+        }
+
         /// Root object witness at admission.
         #[must_use]
         pub const fn root_witness(&self) -> GenerationRootObjectWitness {
@@ -4263,9 +4439,27 @@ pub mod generation_reader {
     }
 
     enum Round {
-        Resolved(Box<(Resolution, GenerationRootAnchorWitness)>),
+        Resolved(
+            Box<(
+                Resolution,
+                GenerationRootAnchorWitness,
+                GenerationRootInventory,
+            )>,
+        ),
         Retry,
         Refused(SnapshotRefusalV1),
+    }
+
+    fn admit_component(
+        root: &QualifiedGenerationRoot,
+        role: GenerationComponentRole,
+        receipt: GenerationComponentReceiptV1,
+    ) -> GenerationRootResult<Result<QualifiedGenerationFile, SnapshotRefusalV1>> {
+        let path = component_object_path_v1(role, receipt.sha256)?;
+        let expectation = GenerationFileExpectation::immutable(receipt.byte_len, receipt.sha256)?;
+        Ok(root
+            .admit_file(&path, expectation)
+            .map_err(|error| SnapshotRefusalV1::Closure(error.kind())))
     }
 
     impl QualifiedGenerationRoot {
@@ -4291,8 +4485,21 @@ pub mod generation_reader {
                 }
             };
             let anchors = guard.witnesses();
+            // The closure inventory is taken while the shared lock is held so
+            // it describes the same instant as the resolution.
+            let inventory = match guard.inventory() {
+                Ok(inventory) => inventory,
+                Err(error) if is_transient(error.kind()) => {
+                    let _ = guard.release();
+                    return Ok(Round::Retry);
+                }
+                Err(error) => {
+                    let _ = guard.release();
+                    return Err(error);
+                }
+            };
             match guard.release() {
-                Ok(()) => Ok(Round::Resolved(Box::new((resolution, anchors)))),
+                Ok(()) => Ok(Round::Resolved(Box::new((resolution, anchors, inventory)))),
                 Err(error) if is_transient(error.kind()) => Ok(Round::Retry),
                 Err(error) => Err(error),
             }
@@ -4326,7 +4533,7 @@ pub mod generation_reader {
                 ));
             }
             for _ in 0..SNAPSHOT_OPEN_MAX_ATTEMPTS_V1 {
-                let (first, _) = match self.resolution_round(root_id, profile, floor)? {
+                let (first, _, _) = match self.resolution_round(root_id, profile, floor)? {
                     Round::Resolved(resolved) => *resolved,
                     Round::Retry => continue,
                     Round::Refused(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
@@ -4362,15 +4569,76 @@ pub mod generation_reader {
                         }
                     };
 
-                // Reread under a fresh shared lock: identical or start over.
-                let (second, anchors) = match self.resolution_round(root_id, profile, floor)? {
-                    Round::Resolved(resolved) => *resolved,
-                    Round::Retry => continue,
-                    Round::Refused(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
+                // Every declared component object, exact length and digest
+                // from the manifest receipts, descriptor-relative.
+                let receipts = manifest.components;
+                let mut files = Vec::with_capacity(4);
+                for (role, receipt) in [
+                    (GenerationComponentRole::Vector, receipts.vector),
+                    (GenerationComponentRole::Lexical, receipts.lexical),
+                    (GenerationComponentRole::Ann, receipts.ann),
+                    (GenerationComponentRole::Metadata, receipts.metadata),
+                ] {
+                    match admit_component(self, role, receipt)? {
+                        Ok(file) => files.push(file),
+                        Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
+                    }
+                }
+                let mut files = files.into_iter();
+                let closure = GenerationClosureV1 {
+                    vector: files.next().expect("four components admitted"),
+                    lexical: files.next().expect("four components admitted"),
+                    ann: files.next().expect("four components admitted"),
+                    metadata: files.next().expect("four components admitted"),
                 };
+
+                // Reread under a fresh shared lock: identical or start over.
+                let (second, anchors, inventory) =
+                    match self.resolution_round(root_id, profile, floor)? {
+                        Round::Resolved(resolved) => *resolved,
+                        Round::Retry => continue,
+                        Round::Refused(refusal) => {
+                            return Ok(SnapshotOpenOutcomeV1::Refused(refusal));
+                        }
+                    };
                 if second != first {
                     continue;
                 }
+
+                // Closure over the retained root as it was under that lock.
+                let manifest_name = activation_manifest_name_v1(authority.object_id);
+                let component_names = [
+                    component_object_name_v1(
+                        GenerationComponentRole::Vector,
+                        receipts.vector.sha256,
+                    ),
+                    component_object_name_v1(
+                        GenerationComponentRole::Lexical,
+                        receipts.lexical.sha256,
+                    ),
+                    component_object_name_v1(GenerationComponentRole::Ann, receipts.ann.sha256),
+                    component_object_name_v1(
+                        GenerationComponentRole::Metadata,
+                        receipts.metadata.sha256,
+                    ),
+                ];
+                let declared = [
+                    GENERATION_ROOT_LOCK_FILE_NAME,
+                    GENERATION_ROOT_AUTHORITY_FILE_NAME,
+                    manifest_name.as_str(),
+                    component_names[0].as_str(),
+                    component_names[1].as_str(),
+                    component_names[2].as_str(),
+                    component_names[3].as_str(),
+                ];
+                if let Err(violation) =
+                    check_closure(&inventory, self.witness().device(), &declared)
+                {
+                    return Ok(SnapshotOpenOutcomeV1::Refused(
+                        SnapshotRefusalV1::ClosureViolation(violation),
+                    ));
+                }
+
                 return Ok(SnapshotOpenOutcomeV1::Opened(Arc::new(
                     OpenedGenerationSnapshotV1 {
                         root: self.witness(),
@@ -4382,6 +4650,7 @@ pub mod generation_reader {
                         floor: second.floor,
                         manifest_file,
                         manifest,
+                        closure,
                         health: second.health,
                     },
                 )));
@@ -4410,6 +4679,7 @@ pub mod generation_reader {
             GenerationComponentReceiptV1, GenerationComponentReceiptsV1,
             InMemoryAntiRollbackFloorStoreV1,
         };
+        use sha2::{Digest as _, Sha256};
         use std::fs::{self, DirBuilder, OpenOptions};
         use std::io::Write as _;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -4493,24 +4763,44 @@ pub mod generation_reader {
             .expect("publisher binds")
         }
 
-        fn component_receipts() -> GenerationComponentReceiptsV1 {
+        const ROLES: [GenerationComponentRole; 4] = [
+            GenerationComponentRole::Vector,
+            GenerationComponentRole::Lexical,
+            GenerationComponentRole::Ann,
+            GenerationComponentRole::Metadata,
+        ];
+
+        /// Deterministic per-role, per-generation component bytes.
+        fn component_bytes(role: GenerationComponentRole, sequence: u64) -> Vec<u8> {
+            let tag = match role {
+                GenerationComponentRole::Vector => 0x11,
+                GenerationComponentRole::Lexical => 0x12,
+                GenerationComponentRole::Ann => 0x13,
+                GenerationComponentRole::Metadata => 0x14,
+            };
+            let len = 100 + usize::try_from(sequence).expect("small sequence");
+            let mut bytes = vec![tag; len];
+            bytes[..8].copy_from_slice(&sequence.to_be_bytes());
+            bytes
+        }
+
+        fn component_receipt(
+            role: GenerationComponentRole,
+            sequence: u64,
+        ) -> GenerationComponentReceiptV1 {
+            let bytes = component_bytes(role, sequence);
+            GenerationComponentReceiptV1 {
+                byte_len: u64::try_from(bytes.len()).expect("len"),
+                sha256: Sha256::digest(&bytes).into(),
+            }
+        }
+
+        fn component_receipts(sequence: u64) -> GenerationComponentReceiptsV1 {
             GenerationComponentReceiptsV1 {
-                vector: GenerationComponentReceiptV1 {
-                    byte_len: 101,
-                    sha256: [0x11; 32],
-                },
-                lexical: GenerationComponentReceiptV1 {
-                    byte_len: 102,
-                    sha256: [0x12; 32],
-                },
-                ann: GenerationComponentReceiptV1 {
-                    byte_len: 103,
-                    sha256: [0x13; 32],
-                },
-                metadata: GenerationComponentReceiptV1 {
-                    byte_len: 104,
-                    sha256: [0x14; 32],
-                },
+                vector: component_receipt(GenerationComponentRole::Vector, sequence),
+                lexical: component_receipt(GenerationComponentRole::Lexical, sequence),
+                ann: component_receipt(GenerationComponentRole::Ann, sequence),
+                metadata: component_receipt(GenerationComponentRole::Metadata, sequence),
             }
         }
 
@@ -4523,9 +4813,38 @@ pub mod generation_reader {
                 [0x31; 32],
                 [0x32; 32],
                 [0x33; 32],
-                component_receipts(),
+                component_receipts(sequence),
             )
             .expect("valid activation manifest")
+        }
+
+        /// Write one sealed immutable object (`create_new`, owner read-only,
+        /// synced) under `name`; returns its path.
+        fn write_sealed_object(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = root.join(name);
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .expect("object is create_new");
+            file.write_all(bytes).expect("object bytes");
+            file.sync_all().expect("object durable");
+            drop(file);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("seal mode");
+            path
+        }
+
+        /// Write the four content-addressed component objects of `sequence`
+        /// (skipping any that an earlier generation already retained).
+        fn write_component_objects(root: &Path, sequence: u64) {
+            for role in ROLES {
+                let bytes = component_bytes(role, sequence);
+                let name = component_object_name_v1(role, Sha256::digest(&bytes).into());
+                if !root.join(&name).exists() {
+                    write_sealed_object(root, &name, &bytes);
+                }
+            }
         }
 
         fn object_id(sequence: u64) -> [u8; 16] {
@@ -4537,25 +4856,9 @@ pub mod generation_reader {
         /// Write the immutable manifest object exactly as a publisher lane
         /// would: `create_new`, sealed read-only for its owner, fully synced.
         fn write_manifest_object(root: &Path, object_id: [u8; 16], bytes: &[u8]) -> PathBuf {
-            let name = activation_manifest_path_v1(object_id).expect("confined manifest name");
-            let hex = object_id.iter().fold(String::new(), |mut hex, byte| {
-                use std::fmt::Write as _;
-                let _ = write!(hex, "{byte:02x}");
-                hex
-            });
-            assert_eq!(name.component_count(), 1);
-            let path = root.join(format!("{hex}{ACTIVATION_MANIFEST_SUFFIX_V1}"));
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&path)
-                .expect("manifest object is create_new");
-            file.write_all(bytes).expect("manifest bytes");
-            file.sync_all().expect("manifest durable");
-            drop(file);
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("seal mode");
-            path
+            let confined = activation_manifest_path_v1(object_id).expect("confined manifest name");
+            assert_eq!(confined.component_count(), 1);
+            write_sealed_object(root, &activation_manifest_name_v1(object_id), bytes)
         }
 
         /// Publish `sequence` with a real manifest object; returns the
@@ -4572,6 +4875,7 @@ pub mod generation_reader {
             let bytes = manifest.canonical_bytes();
             let (len, sha256) = manifest.object_receipt();
             let id = object_id(sequence);
+            write_component_objects(root_path, sequence);
             write_manifest_object(root_path, id, &bytes);
             let authority = AuthorityRefV1::new(
                 sequence,
@@ -4938,6 +5242,7 @@ pub mod generation_reader {
             // A publisher dies right after persisting its attempt frame.
             let successor_manifest = manifest(2, Some(genesis));
             let (len, sha256) = successor_manifest.object_receipt();
+            write_component_objects(&root_path, 2);
             write_manifest_object(
                 &root_path,
                 object_id(2),
@@ -5283,6 +5588,254 @@ pub mod generation_reader {
                     OsStr::new("link"),
                     OsStr::new("nested")
                 ]
+            );
+        }
+
+        /// A committed genesis with every object written, ready for one
+        /// planted negative.
+        fn genesis_root(label: &str) -> (PathBuf, QualifiedGenerationRoot, AuthoritySlotV1) {
+            let root_path = fixture_root(label);
+            let root = admit(&root_path);
+            let slot = {
+                let publisher = publisher(&root);
+                let (_, _, slot) = publish_with_manifest(
+                    &root_path,
+                    &publisher,
+                    1,
+                    None,
+                    ExpectedAuthorityPairV1::default(),
+                    None,
+                );
+                slot
+            };
+            (root_path, root, slot)
+        }
+
+        #[test]
+        fn closure_admits_every_declared_component_at_its_exact_receipt() {
+            let (_, root, slot) = genesis_root("closure-clean");
+            let snapshot = opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            assert_eq!(snapshot.head(), slot);
+            let receipts = snapshot.manifest().components;
+            for (role, receipt) in [
+                (GenerationComponentRole::Vector, receipts.vector),
+                (GenerationComponentRole::Lexical, receipts.lexical),
+                (GenerationComponentRole::Ann, receipts.ann),
+                (GenerationComponentRole::Metadata, receipts.metadata),
+            ] {
+                let file = snapshot.closure().file(role);
+                assert_eq!(file.sha256(), receipt.sha256, "{role:?} digest");
+                assert_eq!(
+                    u64::try_from(file.as_bytes().len()).expect("len"),
+                    receipt.byte_len,
+                    "{role:?} length"
+                );
+                assert_eq!(&*snapshot.closure().bytes(role), &*component_bytes(role, 1));
+                assert_eq!(file.witness().hard_links(), 1);
+            }
+            assert!(is_retained_object_name_v1(
+                component_object_name_v1(GenerationComponentRole::Ann, receipts.ann.sha256)
+                    .as_bytes()
+            ));
+            assert!(is_retained_object_name_v1(
+                activation_manifest_name_v1(object_id(1)).as_bytes()
+            ));
+            for bad in [
+                "vector",
+                ".vector",
+                "abc.vector",
+                "0123456789abcdef0123456789abcdef.vector",
+                "0123456789ABCDEF0123456789ABCDEF.activation",
+                "LOCK",
+            ] {
+                assert!(!is_retained_object_name_v1(bad.as_bytes()), "{bad}");
+            }
+        }
+
+        #[test]
+        fn tampered_component_object_is_refused_by_role_before_any_use() {
+            let root_path = fixture_root("closure-tamper");
+            let root = admit(&root_path);
+            let publisher = publisher(&root);
+            // Write a lexical object with the right name but one flipped byte
+            // BEFORE the generation writes its real objects, so the
+            // content-addressed name is taken by the wrong bytes.
+            let mut wrong = component_bytes(GenerationComponentRole::Lexical, 1);
+            let name = component_object_name_v1(
+                GenerationComponentRole::Lexical,
+                Sha256::digest(&wrong).into(),
+            );
+            wrong[50] ^= 1;
+            write_sealed_object(&root_path, &name, &wrong);
+            publish_with_manifest(
+                &root_path,
+                &publisher,
+                1,
+                None,
+                ExpectedAuthorityPairV1::default(),
+                None,
+            );
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::Closure(GenerationRootErrorKind::HashMismatch)
+            );
+        }
+
+        #[test]
+        fn a_write_ahead_log_beside_a_sealed_object_is_refused() {
+            let (root_path, root, _) = genesis_root("closure-wal");
+            opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            let vector = component_object_name_v1(
+                GenerationComponentRole::Vector,
+                Sha256::digest(component_bytes(GenerationComponentRole::Vector, 1)).into(),
+            );
+            write_sealed_object(&root_path, &format!("{vector}.wal"), b"journal");
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::ClosureViolation(ClosureViolationV1::WriteAheadLog)
+            );
+        }
+
+        #[test]
+        fn an_undeclared_entry_is_refused_and_named_by_kind() {
+            let (root_path, root, _) = genesis_root("closure-undeclared-file");
+            opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            write_sealed_object(&root_path, "notes.txt", b"not an object");
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::ClosureViolation(ClosureViolationV1::UndeclaredEntry {
+                    kind: GenerationRootEntryKind::RegularFile
+                })
+            );
+
+            let (root_path, root, _) = genesis_root("closure-undeclared-symlink");
+            std::os::unix::fs::symlink("LOCK", root_path.join("link")).expect("symlink");
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::ClosureViolation(ClosureViolationV1::UndeclaredEntry {
+                    kind: GenerationRootEntryKind::Symlink
+                })
+            );
+
+            let (root_path, root, _) = genesis_root("closure-undeclared-dir");
+            DirBuilder::new()
+                .mode(0o700)
+                .create(root_path.join("nested"))
+                .expect("subdirectory");
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::ClosureViolation(ClosureViolationV1::UndeclaredEntry {
+                    kind: GenerationRootEntryKind::Directory
+                })
+            );
+        }
+
+        #[test]
+        fn aliases_are_refused_whether_declared_or_retained() {
+            // A second name for a declared component: admission sees the
+            // extra link before the closure does.
+            let (root_path, root, _) = genesis_root("closure-alias-declared");
+            let vector = component_object_name_v1(
+                GenerationComponentRole::Vector,
+                Sha256::digest(component_bytes(GenerationComponentRole::Vector, 1)).into(),
+            );
+            let alias = component_object_name_v1(GenerationComponentRole::Vector, [0xee; 32]);
+            fs::hard_link(root_path.join(&vector), root_path.join(&alias)).expect("hard link");
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::Closure(GenerationRootErrorKind::HardLinked)
+            );
+
+            // Two retained-shaped names for one undeclared inode.
+            let (root_path, root, _) = genesis_root("closure-alias-retained");
+            let first = component_object_name_v1(GenerationComponentRole::Ann, [0xe1; 32]);
+            let second = component_object_name_v1(GenerationComponentRole::Ann, [0xe2; 32]);
+            write_sealed_object(&root_path, &first, b"retained");
+            fs::hard_link(root_path.join(&first), root_path.join(&second)).expect("hard link");
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::ClosureViolation(ClosureViolationV1::Alias)
+            );
+        }
+
+        #[test]
+        fn retained_objects_of_other_generations_are_not_violations() {
+            let root_path = fixture_root("closure-retained-history");
+            let root = admit(&root_path);
+            let publisher = publisher(&root);
+            let (genesis, _, genesis_slot) = publish_with_manifest(
+                &root_path,
+                &publisher,
+                1,
+                None,
+                ExpectedAuthorityPairV1::default(),
+                None,
+            );
+            publish_with_manifest(
+                &root_path,
+                &publisher,
+                2,
+                Some(genesis),
+                ExpectedAuthorityPairV1 {
+                    first: None,
+                    second: Some(genesis_slot),
+                },
+                None,
+            );
+            // Genesis objects stay beside the successor's; a well-formed
+            // retained object nobody references any more is fine too.
+            let orphan = component_object_name_v1(GenerationComponentRole::Metadata, [0xd1; 32]);
+            write_sealed_object(&root_path, &orphan, b"orphaned but sealed");
+            let snapshot = opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            assert_eq!(snapshot.head().authority.sequence, 2);
+            assert_eq!(
+                root.inventory().expect("inventory").entries().len(),
+                2 + 2 + 8 + 1,
+                "anchors + two manifests + eight components + orphan"
             );
         }
     }
