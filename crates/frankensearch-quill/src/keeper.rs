@@ -21850,8 +21850,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gc_retires_a_receipt_whose_segment_is_live_again_or_already_gone() -> TestResult {
+        // The margin over the grace period only has to make receipts stamped
+        // DURING this test look expired at `now`; at +1s the stamps landed
+        // after `now - grace` when the parallel suite delayed the writes
+        // below by more than a second (bd-zam2i).
         let now = SystemTime::now()
-            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(60))
             .ok_or_else(|| io::Error::other("test clock remains representable"))?;
 
         // An aborted publication can stamp a receipt and never perform the
@@ -23375,8 +23379,10 @@ mod tests {
     /// The production publisher reaches `DirectorySynced` in its dedicated
     /// blocking lane. The test waits for that lane's checkpoint event rather
     /// than assuming a fixed number of async scheduler yields is enough for
-    /// an OS directory fsync.
-    const DURABLE_PUBLISH_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(2);
+    /// an OS directory fsync. The bound only has to catch a hang, never to
+    /// race the scheduler: at 2s it flaked under the full parallel suite when
+    /// the blocking pool was saturated by ~660 neighbours (bd-zam2i).
+    const DURABLE_PUBLISH_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[test]
     fn dropped_publish_future_after_durable_install_advances_the_next_publication() -> TestResult {

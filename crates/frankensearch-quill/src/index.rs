@@ -16802,6 +16802,11 @@ fn owned_fieldnorm_bridge_calls() -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// Test-rendezvous bound: catches a hang, never races the scheduler.
+    /// 2s flaked when the full parallel suite saturated the blocking pool
+    /// (bd-zam2i).
+    const PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(30);
     use std::collections::BTreeMap;
     use std::future::Future;
     // Unconditional: the shipping-driver ingest-span capture below needs both
@@ -26215,7 +26220,7 @@ mod tests {
             crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
                 &mut seal,
                 &pause,
-                Duration::from_secs(2),
+                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
             )
             .await
             .expect("reach the bounded durable Delta-seal rendezvous");
@@ -26334,7 +26339,7 @@ mod tests {
             crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
                 &mut commit,
                 &pause,
-                Duration::from_secs(2),
+                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
             )
             .await
             .expect("reach bounded live-writer rendezvous");
@@ -26432,7 +26437,7 @@ mod tests {
             crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
                 &mut commit,
                 &pause,
-                Duration::from_secs(2),
+                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
             )
             .await
             .expect("reach pre-slot claimed-publication rendezvous");
@@ -26693,7 +26698,7 @@ mod tests {
                     .expect("return reader authority result");
             });
             pause
-                .wait_until_reached(Duration::from_secs(2))
+                .wait_until_reached(PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT)
                 .expect("reader reaches the authority double-read rendezvous");
             index
                 .commit(&cx)
@@ -26701,7 +26706,7 @@ mod tests {
                 .expect("publish while reader holds its first authority observation");
             pause.release();
             let observed = receiver
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT)
                 .expect("reader completes after publication")
                 .expect("reader must retry to one authoritative Arc");
             reader.join().expect("reader thread does not panic");
@@ -26739,7 +26744,7 @@ mod tests {
             crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
                 &mut commit,
                 &pause,
-                Duration::from_secs(2),
+                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
             )
             .await
             .expect("reach bounded dropped-commit rendezvous");
@@ -26831,7 +26836,7 @@ mod tests {
             crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
                 &mut commit,
                 &pause,
-                Duration::from_secs(2),
+                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
             )
             .await
             .expect("reach bounded dropped durable-commit rendezvous");
@@ -26924,7 +26929,7 @@ mod tests {
             crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
                 &mut delete,
                 &pause,
-                Duration::from_secs(2),
+                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
             )
             .await
             .expect("reach bounded dropped-delete rendezvous");
@@ -27014,7 +27019,7 @@ mod tests {
             crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
                 &mut compact,
                 &pause,
-                Duration::from_secs(2),
+                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
             )
             .await
             .expect("reach bounded dropped-compaction rendezvous");
@@ -29432,7 +29437,7 @@ mod tests {
             crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
                 &mut compact,
                 &pause,
-                Duration::from_secs(2),
+                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
             )
             .await
             .expect("reach bounded durable compaction crash rendezvous");
