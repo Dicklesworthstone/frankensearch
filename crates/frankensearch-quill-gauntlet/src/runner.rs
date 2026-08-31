@@ -24326,7 +24326,17 @@ mod tests {
                 *result = LexicalHydrationResult::Error(query_error_observation());
             }),
             ("derived", |object| {
-                core_comparison(object).status = LexicalComparisonStatus::Mismatch;
+                // TOGGLE rather than set: the post-9wu3p default lane
+                // legitimately retains Mismatch-status cases (bd-pttxk), and
+                // setting a constant on a target that already carries it is a
+                // no-op that hashes to the ORIGINAL object -- the store then
+                // rightly loads it, and the matrix reads that as a missed
+                // rejection. A toggle is a genuine mutation for every target.
+                let comparison = core_comparison(object);
+                comparison.status = match comparison.status {
+                    LexicalComparisonStatus::Equivalent => LexicalComparisonStatus::Mismatch,
+                    LexicalComparisonStatus::Mismatch => LexicalComparisonStatus::Equivalent,
+                };
             }),
         ];
         assert_eq!(
