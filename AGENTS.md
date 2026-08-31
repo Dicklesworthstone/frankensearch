@@ -285,7 +285,9 @@ frankensearch/
 │   ├── frankensearch-durability/      # Repair/protection layer for index artifacts
 │   ├── frankensearch-fsfs/            # Standalone CLI product
 │   ├── frankensearch-tui/             # Shared TUI framework primitives
-│   └── frankensearch-ops/             # Fleet observability/control-plane TUI
+│   ├── frankensearch-ops/             # Fleet observability/control-plane TUI
+│   ├── frankensearch-quill/           # Native pure-Rust BM25 lexical engine
+│   └── frankensearch-quill-gauntlet/  # Differential conformance/perf gauntlet certifying Quill
 ├── frankensearch/                     # Facade crate (re-exports everything)
 ├── tools/optimize_params/             # Parameter search/optimization helper tool
 ├── tests/                             # Cross-component integration tests
@@ -302,7 +304,7 @@ frankensearch/
 | `frankensearch-embed` | `src/model2vec_embedder.rs` | potion-128M static embedder (fast tier, ~0.57ms) |
 | `frankensearch-embed` | `src/fastembed_embedder.rs` | MiniLM-L6-v2 ONNX embedder (quality tier, ~128ms) |
 | `frankensearch-embed` | `src/auto_detect.rs` | `EmbedderStack` auto-detection and fallback chain |
-| `frankensearch-index` | `src/format.rs` | FSVI binary format I/O (f16 quantized, memory-mapped) |
+| `frankensearch-index` | `src/lib.rs` | FSVI binary format I/O (f16 quantized, memory-mapped) |
 | `frankensearch-index` | `src/simd.rs` | `wide::f32x8` dot product (f16→f32 + SIMD multiply-accumulate) |
 | `frankensearch-index` | `src/search.rs` | Brute-force top-k with BinaryHeap guard pattern, Rayon parallel |
 | `frankensearch-lexical` | `src/lib.rs` | Tantivy schema, document indexing, BM25 query parsing |
@@ -315,6 +317,10 @@ frankensearch/
 | `frankensearch-tui` | `src/shell.rs` | Shared app-shell frame loop, navigation, overlays, and status plumbing |
 | `frankensearch-ops` | `src/storage.rs` | Ops telemetry storage/materialization and control-plane persistence |
 | `frankensearch-rerank` | `src/lib.rs` | FlashRank cross-encoder with sigmoid activation |
+| `frankensearch-quill` | `src/index.rs` | Native pure-Rust BM25 index, postings, queries, and segment lifecycle |
+| `frankensearch-quill` | `src/argus.rs` | BM25 query execution and scoring |
+| `frankensearch-quill` | `src/quiver.rs` | Postings and positions store |
+| `frankensearch-quill-gauntlet` | `src/engine.rs` / `src/runner.rs` | Differential conformance/perf witness vs. Tantivy oracle |
 
 ### Feature Flags
 
