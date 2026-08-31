@@ -10,7 +10,10 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -48,6 +51,16 @@ struct ReceiptIdentity {
     executable_sha256: String,
     active_features: String,
     active_features_sha256: String,
+    asupersync: RegistryPackageIdentity,
+    tokenizers: RegistryPackageIdentity,
+}
+
+#[derive(Debug)]
+struct RegistryPackageIdentity {
+    name: String,
+    version: String,
+    source: String,
+    checksum: String,
 }
 
 #[derive(Debug)]
@@ -85,10 +98,67 @@ enum ChildFailure {
         output_tail: String,
     },
     Timeout {
+        bytes: usize,
+        lines: usize,
         status: ExitStatus,
         output_sha256: String,
         output_tail: String,
     },
+}
+
+#[derive(Clone, Default)]
+struct MarkerCollector {
+    messages: Arc<Mutex<Vec<String>>>,
+}
+
+impl MarkerCollector {
+    fn text(&self) -> String {
+        self.messages
+            .lock()
+            .expect("marker collector lock must remain usable")
+            .join("\n")
+    }
+}
+
+struct MessageExtractor {
+    message: Option<String>,
+}
+
+impl tracing::field::Visit for MessageExtractor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl tracing::Subscriber for MarkerCollector {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut extractor = MessageExtractor { message: None };
+        event.record(&mut extractor);
+        if let Some(message) = extractor.message {
+            self.messages
+                .lock()
+                .expect("marker collector lock must remain usable")
+                .push(message);
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 fn output_sha256(bytes: &[u8], trailing: &[u8]) -> String {
@@ -200,28 +270,96 @@ fn witness_worker_dispatch_contract() {
     });
 }
 
+fn witness_caller_dispatch_and_success_restoration() {
+    let collector = MarkerCollector::default();
+    let dispatch = tracing::Dispatch::new(collector.clone());
+    assert!(tracing::dispatcher::get_default(|current| {
+        current.is::<tracing::subscriber::NoSubscriber>()
+    }));
+
+    tracing::dispatcher::with_default(&dispatch, || {
+        assert!(tracing::dispatcher::get_default(|current| {
+            current.is::<MarkerCollector>()
+        }));
+        tracing::info!(target: "frankensearch::logging_contract", "caller-before");
+        run_test_with_cx(|_cx| async {
+            assert!(tracing::dispatcher::get_default(|current| {
+                current.is::<MarkerCollector>()
+            }));
+            tracing::info!(target: "frankensearch::logging_contract", "caller-during");
+            exercise_real_tokenizer_body();
+        });
+        assert!(tracing::dispatcher::get_default(|current| {
+            current.is::<MarkerCollector>()
+        }));
+        tracing::info!(target: "frankensearch::logging_contract", "caller-after");
+    });
+
+    assert!(tracing::dispatcher::get_default(|current| {
+        current.is::<tracing::subscriber::NoSubscriber>()
+    }));
+    let text = collector.text();
+    for marker in ["caller-before", "caller-during", "caller-after"] {
+        assert!(
+            text.contains(marker),
+            "caller dispatcher did not retain {marker:?}:\n{text}"
+        );
+    }
+}
+
+fn witness_success_restoration() {
+    assert!(tracing::dispatcher::get_default(|current| {
+        current.is::<tracing::subscriber::NoSubscriber>()
+    }));
+    run_test_with_cx(|_cx| async {
+        assert!(tracing::dispatcher::get_default(|current| {
+            !current.is::<tracing::subscriber::NoSubscriber>()
+        }));
+        exercise_real_tokenizer_body();
+    });
+    assert!(tracing::dispatcher::get_default(|current| {
+        current.is::<tracing::subscriber::NoSubscriber>()
+    }));
+}
+
 fn witness_overlapping_runtimes() {
+    let collector_a = MarkerCollector::default();
+    let collector_b = MarkerCollector::default();
+    let dispatch_a = tracing::Dispatch::new(collector_a.clone());
+    let dispatch_b = tracing::Dispatch::new(collector_b.clone());
     let (ready_tx, ready_rx) = mpsc::channel();
     let (go_a_tx, go_a_rx) = mpsc::channel();
     let (go_b_tx, go_b_rx) = mpsc::channel();
 
     let ready_a = ready_tx.clone();
     let worker_a = thread::spawn(move || {
-        run_test_with_cx(|_cx| async move {
-            ready_a.send(()).expect("runtime A must report readiness");
-            go_a_rx
-                .recv_timeout(CHILD_TIMEOUT)
-                .expect("runtime A must be released");
-            exercise_real_tokenizer_body();
+        tracing::dispatcher::with_default(&dispatch_a, || {
+            run_test_with_cx(|_cx| async move {
+                ready_a.send(()).expect("runtime A must report readiness");
+                go_a_rx
+                    .recv_timeout(CHILD_TIMEOUT)
+                    .expect("runtime A must be released");
+                tracing::info!(
+                    target: "frankensearch::logging_contract",
+                    "runtime-a-only"
+                );
+                exercise_real_tokenizer_body();
+            });
         });
     });
     let worker_b = thread::spawn(move || {
-        run_test_with_cx(|_cx| async move {
-            ready_tx.send(()).expect("runtime B must report readiness");
-            go_b_rx
-                .recv_timeout(CHILD_TIMEOUT)
-                .expect("runtime B must be released");
-            exercise_real_tokenizer_body();
+        tracing::dispatcher::with_default(&dispatch_b, || {
+            run_test_with_cx(|_cx| async move {
+                ready_tx.send(()).expect("runtime B must report readiness");
+                go_b_rx
+                    .recv_timeout(CHILD_TIMEOUT)
+                    .expect("runtime B must be released");
+                tracing::info!(
+                    target: "frankensearch::logging_contract",
+                    "runtime-b-only"
+                );
+                exercise_real_tokenizer_body();
+            });
         });
     });
 
@@ -239,6 +377,25 @@ fn witness_overlapping_runtimes() {
         .expect("runtime B release must be delivered");
     worker_a.join().expect("runtime A must complete");
     worker_b.join().expect("runtime B must complete");
+
+    let text_a = collector_a.text();
+    let text_b = collector_b.text();
+    assert!(
+        text_a.contains("runtime-a-only"),
+        "runtime A sink:\n{text_a}"
+    );
+    assert!(
+        !text_a.contains("runtime-b-only"),
+        "runtime B leaked into runtime A sink:\n{text_a}"
+    );
+    assert!(
+        text_b.contains("runtime-b-only"),
+        "runtime B sink:\n{text_b}"
+    );
+    assert!(
+        !text_b.contains("runtime-a-only"),
+        "runtime A leaked into runtime B sink:\n{text_b}"
+    );
 }
 
 fn spawn_drain<R>(mut reader: R, stream_is_stderr: bool, tx: mpsc::Sender<(bool, Vec<u8>)>)
@@ -299,6 +456,8 @@ fn read_bounded_child(mut child: Child, timeout: Duration) -> Result<ChildOutput
     loop {
         if started.elapsed() > timeout {
             return Err(ChildFailure::Timeout {
+                bytes: bytes.len(),
+                lines,
                 status: terminate_and_reap(&mut child),
                 output_sha256: output_sha256(&bytes, &[]),
                 output_tail: output_tail(&bytes, &[]),
@@ -345,7 +504,7 @@ fn read_bounded_child(mut child: Child, timeout: Duration) -> Result<ChildOutput
     })
 }
 
-fn spawn_child(case: &str, rust_log: Option<OsString>) -> Child {
+fn spawn_child(case: &str, rust_log: Option<&std::ffi::OsStr>) -> Child {
     let mut command = Command::new(std::env::current_exe().expect("test binary must exist"));
     command
         .arg(CHILD_TEST)
@@ -375,7 +534,23 @@ fn run_child_with_rust_log(
     case: &str,
     rust_log: Option<OsString>,
 ) -> Result<ChildOutput, ChildFailure> {
-    read_bounded_child(spawn_child(case, rust_log), CHILD_TIMEOUT)
+    run_child_with_rust_log_and_timeout(case, rust_log, CHILD_TIMEOUT)
+}
+
+fn run_child_with_rust_log_and_timeout(
+    case: &str,
+    rust_log: Option<OsString>,
+    timeout: Duration,
+) -> Result<ChildOutput, ChildFailure> {
+    let result = read_bounded_child(spawn_child(case, rust_log.as_deref()), timeout);
+    let receipt = match &result {
+        Ok(output) => SealedChildReceipt::from_output(case, rust_log.as_deref(), timeout, output),
+        Err(failure) => {
+            SealedChildReceipt::from_failure(case, rust_log.as_deref(), timeout, failure)
+        }
+    };
+    assert_sealed_receipt(&receipt, case, timeout);
+    result
 }
 
 fn run_child(case: &str, rust_log: Option<&str>) -> Result<ChildOutput, ChildFailure> {
@@ -387,7 +562,7 @@ fn run_child_with_timeout(
     rust_log: Option<&str>,
     timeout: Duration,
 ) -> Result<ChildOutput, ChildFailure> {
-    read_bounded_child(spawn_child(case, rust_log.map(OsString::from)), timeout)
+    run_child_with_rust_log_and_timeout(case, rust_log.map(OsString::from), timeout)
 }
 
 fn run_passing_child(case: &str, rust_log: Option<&str>) -> ChildOutput {
@@ -440,6 +615,8 @@ fn workspace_root() -> PathBuf {
 impl ReceiptIdentity {
     fn capture() -> Self {
         let root = workspace_root();
+        let lock = std::fs::read_to_string(root.join("Cargo.lock"))
+            .expect("receipt identity must read the workspace Cargo.lock");
         let active_features = active_embed_features();
         Self {
             cargo_lock_sha256: sha256_file(&root.join("Cargo.lock")),
@@ -452,6 +629,8 @@ impl ReceiptIdentity {
             ),
             active_features_sha256: output_sha256(active_features.as_bytes(), &[]),
             active_features,
+            asupersync: registry_package_identity(&lock, "asupersync", "0.4.9"),
+            tokenizers: registry_package_identity(&lock, "tokenizers", "0.23.1"),
         }
     }
 }
@@ -517,7 +696,12 @@ fn termination_signal(status: ExitStatus) -> Option<i32> {
 }
 
 impl SealedChildReceipt {
-    fn from_output(case: &str, rust_log: Option<&std::ffi::OsStr>, output: &ChildOutput) -> Self {
+    fn from_output(
+        case: &str,
+        rust_log: Option<&std::ffi::OsStr>,
+        timeout: Duration,
+        output: &ChildOutput,
+    ) -> Self {
         let tail = output_tail(&output.bytes, &[]);
         Self {
             case: case.to_owned(),
@@ -532,7 +716,7 @@ impl SealedChildReceipt {
             observed_lines: output.lines,
             max_output_bytes: MAX_OUTPUT_BYTES,
             max_output_lines: MAX_OUTPUT_LINES,
-            timeout_millis: CHILD_TIMEOUT.as_millis(),
+            timeout_millis: timeout.as_millis(),
             identity: ReceiptIdentity::capture(),
         }
     }
@@ -540,6 +724,7 @@ impl SealedChildReceipt {
     fn from_failure(
         case: &str,
         rust_log: Option<&std::ffi::OsStr>,
+        timeout: Duration,
         failure: &ChildFailure,
     ) -> Self {
         let (terminal_cause, status, output_digest, output_tail, observed_bytes, observed_lines) =
@@ -559,6 +744,8 @@ impl SealedChildReceipt {
                     *lines,
                 ),
                 ChildFailure::Timeout {
+                    bytes,
+                    lines,
                     status,
                     output_sha256,
                     output_tail,
@@ -567,8 +754,8 @@ impl SealedChildReceipt {
                     status,
                     output_sha256,
                     output_tail,
-                    0,
-                    0,
+                    *bytes,
+                    *lines,
                 ),
             };
         Self {
@@ -584,13 +771,17 @@ impl SealedChildReceipt {
             observed_lines,
             max_output_bytes: MAX_OUTPUT_BYTES,
             max_output_lines: MAX_OUTPUT_LINES,
-            timeout_millis: CHILD_TIMEOUT.as_millis(),
+            timeout_millis: timeout.as_millis(),
             identity: ReceiptIdentity::capture(),
         }
     }
 }
 
-fn assert_sealed_receipt(receipt: &SealedChildReceipt, expected_case: &str) {
+fn assert_sealed_receipt(
+    receipt: &SealedChildReceipt,
+    expected_case: &str,
+    expected_timeout: Duration,
+) {
     assert_eq!(receipt.case, expected_case, "receipt case must be exact");
     assert_sha256_digest(&receipt.filter_sha256);
     assert_sha256_digest(&receipt.output_sha256);
@@ -601,7 +792,7 @@ fn assert_sealed_receipt(receipt: &SealedChildReceipt, expected_case: &str) {
     );
     assert_eq!(receipt.max_output_bytes, MAX_OUTPUT_BYTES);
     assert_eq!(receipt.max_output_lines, MAX_OUTPUT_LINES);
-    assert_eq!(receipt.timeout_millis, CHILD_TIMEOUT.as_millis());
+    assert_eq!(receipt.timeout_millis, expected_timeout.as_millis());
     assert!(
         receipt.exit_code.is_some() || receipt.termination_signal.is_some(),
         "receipt must bind an exit code or terminating signal"
@@ -619,14 +810,8 @@ fn assert_sealed_receipt(receipt: &SealedChildReceipt, expected_case: &str) {
             );
         }
         TerminalCause::Timeout => {
-            assert_eq!(
-                receipt.observed_bytes, 0,
-                "timeout receipts retain no payload"
-            );
-            assert_eq!(
-                receipt.observed_lines, 0,
-                "timeout receipts retain no payload"
-            );
+            assert!(receipt.observed_bytes <= MAX_OUTPUT_BYTES);
+            assert!(receipt.observed_lines <= MAX_OUTPUT_LINES);
         }
     }
     for digest in [
@@ -642,6 +827,8 @@ fn assert_sealed_receipt(receipt: &SealedChildReceipt, expected_case: &str) {
         !receipt.identity.active_features.is_empty(),
         "receipt must retain the exact active feature set"
     );
+    assert_registry_package_identity(&receipt.identity.asupersync, "asupersync", "0.4.9");
+    assert_registry_package_identity(&receipt.identity.tokenizers, "tokenizers", "0.23.1");
 }
 
 fn lock_package_block<'a>(lock: &'a str, name: &str, version: &str) -> &'a str {
@@ -651,6 +838,37 @@ fn lock_package_block<'a>(lock: &'a str, name: &str, version: &str) -> &'a str {
                 && block.contains(&format!("version = \"{version}\""))
         })
         .unwrap_or_else(|| panic!("Cargo.lock must contain {name} {version}"))
+}
+
+fn registry_package_identity(lock: &str, name: &str, version: &str) -> RegistryPackageIdentity {
+    let block = lock_package_block(lock, name, version);
+    let field = |prefix: &str| {
+        block
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix)?.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("Cargo.lock package {name} {version} must contain {prefix}"))
+            .to_owned()
+    };
+    RegistryPackageIdentity {
+        name: name.to_owned(),
+        version: version.to_owned(),
+        source: field("source = \""),
+        checksum: field("checksum = \""),
+    }
+}
+
+fn assert_registry_package_identity(
+    identity: &RegistryPackageIdentity,
+    expected_name: &str,
+    expected_version: &str,
+) {
+    assert_eq!(identity.name, expected_name);
+    assert_eq!(identity.version, expected_version);
+    assert_eq!(
+        identity.source,
+        "registry+https://github.com/rust-lang/crates.io-index"
+    );
+    assert_sha256_digest(&identity.checksum);
 }
 
 #[test]
@@ -691,13 +909,14 @@ fn fresh_process_contract_binds_pinned_dependency_and_source_identities() {
 #[test]
 fn fresh_process_receipts_are_bounded_identity_bound_and_filter_redacted() {
     let output = run_passing_child("default", None);
-    let successful = SealedChildReceipt::from_output("default", None, &output);
-    assert_sealed_receipt(&successful, "default");
+    let successful = SealedChildReceipt::from_output("default", None, CHILD_TIMEOUT, &output);
+    assert_sealed_receipt(&successful, "default", CHILD_TIMEOUT);
 
     let secret_bearing_filter = OsString::from("api_token=do-not-persist");
     let redacted = SealedChildReceipt::from_output(
         "default",
         Some(secret_bearing_filter.as_os_str()),
+        CHILD_TIMEOUT,
         &output,
     );
     let rendered = format!("{redacted:?}");
@@ -708,8 +927,8 @@ fn fresh_process_receipts_are_bounded_identity_bound_and_filter_redacted() {
 
     let failure = run_child("line-overflow", None)
         .expect_err("infinite line output must produce a bounded failure receipt");
-    let limited = SealedChildReceipt::from_failure("line-overflow", None, &failure);
-    assert_sealed_receipt(&limited, "line-overflow");
+    let limited = SealedChildReceipt::from_failure("line-overflow", None, CHILD_TIMEOUT, &failure);
+    assert_sealed_receipt(&limited, "line-overflow", CHILD_TIMEOUT);
     assert!(
         matches!(limited.terminal_cause, TerminalCause::OutputLimit),
         "line-overflow must seal an output-limit terminal cause"
@@ -752,6 +971,12 @@ fn real_tokenizers_log_output_requires_explicit_bridge_and_trace() {
 
     let worker_dispatch_child = run_passing_child("worker-dispatch", Some("trace"));
     assert_marker_is_suppressed("worker-dispatch", &worker_dispatch_child);
+
+    let caller_dispatch_child = run_passing_child("caller-dispatch-success", Some("trace"));
+    assert_marker_is_suppressed("caller-dispatch-success", &caller_dispatch_child);
+
+    let success_restoration_child = run_passing_child("success-restoration", Some("trace"));
+    assert_marker_is_suppressed("success-restoration", &success_restoration_child);
 
     let overlapping_runtimes_child = run_passing_child("overlapping-runtimes", Some("trace"));
     assert_marker_is_suppressed("overlapping-runtimes", &overlapping_runtimes_child);
@@ -878,6 +1103,7 @@ fn fresh_process_timeout_reaps_stalled_child_tree() {
             status,
             output_sha256,
             output_tail,
+            ..
         }) => {
             assert_sha256_digest(&output_sha256);
             assert!(!status.success(), "tree parent must be terminated");
@@ -962,6 +1188,8 @@ fn fresh_process_child() {
             exercise_real_tokenizer();
         }
         "worker-dispatch" => witness_worker_dispatch_contract(),
+        "caller-dispatch-success" => witness_caller_dispatch_and_success_restoration(),
+        "success-restoration" => witness_success_restoration(),
         "overlapping-runtimes" => witness_overlapping_runtimes(),
         "line-overflow" => loop {
             println!("bounded-child-output-overflow");
