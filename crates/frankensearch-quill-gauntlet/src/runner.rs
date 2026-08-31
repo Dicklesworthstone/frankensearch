@@ -8991,7 +8991,7 @@ mod tests {
         LexicalHydrationSelection, LexicalNonLexicalControlKind, LexicalNormalizedQuery,
         LexicalObservation, LexicalObservationContext, LexicalObservationOutcome, LexicalObserved,
         LexicalQueryClass, LexicalScoreSource, LexicalWinnerOrigin, LexicalWinnerProjection,
-        ScoreEpsilonReason, SensitiveValueObservation,
+        ScoreEpsilonReason, SensitiveValueObservation, lexical_mismatch_is_reviewed_score_epsilon,
     };
     use crate::engine::{EngineFamily, TANTIVY_ORACLE_CONFIG_HASH};
     use crate::generator::{
@@ -21282,139 +21282,32 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     const E68_WITNESS_CONTROL_QUERY: &str = "release OR require";
 
-    /// Split the comparator's `doc-id@score-bits` rendering.
-    #[cfg(feature = "tantivy-oracle")]
-    fn split_scored_hit(value: &str) -> (&str, u32) {
-        let (doc_id, bits) = value
-            .rsplit_once('@')
-            .unwrap_or_else(|| panic!("scored hit must render as id@bits: {value:?}"));
-        (
-            doc_id,
-            u32::from_str_radix(bits, 16)
-                .unwrap_or_else(|error| panic!("hit score bits {bits:?} are not hex: {error}")),
-        )
-    }
-
-    /// TEMPORARY bd-pttxk measurement probe: prints, never asserts. Captures
-    /// the raw and enveloped comparator outcomes for the DIV-008 witness pair
-    /// and control at HEAD so the tripwire re-pin is written from receipts.
-    #[cfg(feature = "tantivy-oracle")]
-    #[test]
-    #[ignore = "bd-pttxk measurement probe; run explicitly"]
-    fn pttxk_probe_div007_witness_outcomes_at_head() {
-        asupersync::test_utils::run_test_with_cx(|cx| async move {
-            use frankensearch_core::LexicalWrite;
-
-            let fixture = make_scalar_g1a_regression_fixture();
-            let (mut subject, mut oracle) = live_campaign_engines();
-            subject.claim_fresh_campaign().expect("claim probe subject");
-            oracle.claim_fresh_campaign().expect("claim probe oracle");
-            let documents = fixture
-                .documents
-                .iter()
-                .cloned()
-                .map(frankensearch_core::IndexableDocument::from)
-                .collect::<Vec<_>>();
-            subject
-                .index_mut()
-                .expect("probe quill index")
-                .index_documents(&cx, &documents)
-                .await
-                .expect("index probe quill corpus");
-            subject
-                .index_mut()
-                .expect("probe quill index")
-                .commit(&cx)
-                .await
-                .expect("commit probe quill corpus");
-            oracle
-                .index()
-                .index_documents(&cx, &documents)
-                .await
-                .expect("index probe oracle corpus");
-            oracle
-                .index()
-                .commit(&cx)
-                .await
-                .expect("commit probe oracle corpus");
-            subject.mark_committed().expect("publish probe quill");
-            oracle.mark_committed().expect("publish probe oracle");
-
-            let zero_tolerance = crate::engine::DifferentialHarness::new(
-                ComparisonMode::CrossEngine,
-                ComparatorConfig::default(),
-            );
-            let enveloped = crate::engine::DifferentialHarness::new(
-                ComparisonMode::CrossEngine,
-                ComparatorConfig::default()
-                    .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
-            );
-            for (fixture_id, query) in [
-                ("e68-div007-witness", E68_WITNESS_QUERY),
-                ("e68-div007-witness-sibling", E68_WITNESS_SIBLING_QUERY),
-                ("e68-div007-control", E68_WITNESS_CONTROL_QUERY),
-            ] {
-                let case = DifferentialCase {
-                    fixture_id: fixture_id.to_owned(),
-                    query: query.to_owned(),
-                    limit: 20,
-                    offset: 0,
-                    tie_expansion_limit: 256,
-                    count_requested: false,
-                    snippet_max_chars: None,
-                    metadata: DifferentialCaseMetadata {
-                        generator_id: Some("e68-div007-witness-v1".to_owned()),
-                        generator_seed: Some(0x6538_0007),
-                        corpus_hash: Some(fixture.corpus_hash.clone()),
-                    },
-                };
-                for (label, harness) in [("raw", &zero_tolerance), ("enveloped", &enveloped)] {
-                    let outcome = harness
-                        .run(&cx, &subject, &oracle, &case)
-                        .await
-                        .unwrap_or_else(|error| panic!("{fixture_id} {label} run: {error}"));
-                    let rendered = outcome
-                        .comparison
-                        .divergences
-                        .iter()
-                        .map(|divergence| {
-                            format!(
-                                "{:?} oracle={} subject={}",
-                                divergence.class, divergence.oracle, divergence.subject
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    println!(
-                        "PROBE {fixture_id} {label}: status={:?} rank_class={:?} divergences={rendered:?}",
-                        outcome.comparison.status, outcome.comparison.rank_class,
-                    );
-                }
-            }
-        });
-    }
-
-    /// bd-quill-e6-gauntlet-scale-rm3q.8: pin the exact live divergence the
-    /// E6.8 register witness is ingested from, in BOTH comparator
-    /// configurations, so the ingested record can never drift from the
-    /// behaviour it claims to witness.
+    /// bd-quill-e6-gauntlet-scale-rm3q.8 / bd-pttxk: the DIV-008 witness
+    /// pair, re-pinned to its CONVERGED behaviour.
     ///
-    /// This is the mechanism DIV-007 documents — Quill fuses each unfielded
-    /// term's `[content, 2.0x title]` expansion into one summed contribution
-    /// while the pinned oracle accumulates 2N interleaved clause outputs — but
-    /// observed here WITHOUT any of DIV-007's original qualifiers: a plain
-    /// three-clause OR, three leaves rather than eight, no boost, no nesting
-    /// beyond one level of grouping. The bd-55mvg owner ruling states that the
-    /// comparator's default config REMAINS zero-tolerance and that campaign
-    /// lanes opt in with the typed reason; this test pins both halves of that
-    /// ruling as executable behaviour:
+    /// HISTORY, because the test's name still says `diverges`: when DIV-008
+    /// was witnessed (2026-08-04) these two three-clause disjunctions each
+    /// scored one document exactly one ULP away from the pinned oracle, in
+    /// opposite directions, and this test pinned that behaviour so the
+    /// ingested register record could never drift from what it claimed to
+    /// witness. The post-9wu3p scoring chain (abfbc246, 4929402a, 0677a3ec)
+    /// then changed Quill's summation association and the witness CONVERGED:
+    /// the tripwire fired with `left: Exact` (bd-pttxk, 2026-08-31), which is
+    /// the exact drift-detection duty the register handed it. The ledger's
+    /// sequence-3 `fixed` disposition for DIV-008 is now literally true at
+    /// the scoring level, not merely at the classification level.
     ///
-    ///   default `ComparatorConfig`  -> raw `RankMismatch`, `ComparisonStatus::Failed`
-    ///   `with_score_epsilon_reason` -> `ScoreEpsilon`/`SummationAssociation`, Classified
+    /// The name is left alone because the committed register fixtures
+    /// (`fixtures/divergence-register-v2-live.json`) and the mint procedure
+    /// reference it; what it means now is "the pair that USED to diverge".
     ///
-    /// The two queries move the ULP in OPPOSITE directions on the same
-    /// document, which is what makes this summation association rather than a
-    /// systematic scoring bias in either engine, and the two-clause control
-    /// stays bit-exact, which bounds it to three-or-more leaves.
+    /// What this test pins today, measured on 2026-08-31 (probe receipts on
+    /// bd-pttxk): witness, sibling, and control are all BIT-EXACT under the
+    /// default zero-tolerance comparator, and the reviewed
+    /// `SummationAssociation` envelope manufactures nothing — the same
+    /// queries stay `Exact` with it enabled. If this test fires again, the
+    /// DIV-007 mechanism has REGRESSED at three-leaf shapes and needs a NEW
+    /// register observation, not a revival of DIV-008.
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn three_clause_or_diverges_at_one_ulp_without_the_div007_envelope() {
@@ -21489,92 +21382,33 @@ mod tests {
                 },
             };
 
-            let mut signed_ulp_deltas = Vec::new();
             for (fixture_id, query) in [
                 ("e68-div007-witness", E68_WITNESS_QUERY),
                 ("e68-div007-witness-sibling", E68_WITNESS_SIBLING_QUERY),
+                ("e68-div007-control", E68_WITNESS_CONTROL_QUERY),
             ] {
                 let case = witness_case(fixture_id, query);
-                let raw = zero_tolerance
-                    .run(&cx, &subject, &oracle, &case)
-                    .await
-                    .unwrap_or_else(|error| panic!("{fixture_id} zero-tolerance run: {error}"));
-                assert_eq!(
-                    raw.comparison.status,
-                    ComparisonStatus::Failed,
-                    "{fixture_id} must stay a RAW failure under the default comparator: {:?}",
-                    raw.comparison.divergences
-                );
-                assert_eq!(raw.comparison.rank_class, RankClass::RankMismatch);
-                assert_eq!(
-                    raw.comparison.divergences.len(),
-                    1,
-                    "{fixture_id} must remain a single minimized divergence: {:?}",
-                    raw.comparison.divergences
-                );
-                let divergence = &raw.comparison.divergences[0];
-                assert_eq!(divergence.class, DivergenceClass::RankMismatch);
-                let (oracle_doc, oracle_bits) = split_scored_hit(&divergence.oracle);
-                let (subject_doc, subject_bits) = split_scored_hit(&divergence.subject);
-                assert_eq!(
-                    oracle_doc, subject_doc,
-                    "{fixture_id} must diverge in SCORE on one document, not in membership"
-                );
-                let delta = i64::from(subject_bits) - i64::from(oracle_bits);
-                assert_eq!(
-                    delta.abs(),
-                    1,
-                    "{fixture_id} must diverge by exactly one ULP: oracle={oracle_bits:#010x} subject={subject_bits:#010x}"
-                );
-                signed_ulp_deltas.push(delta);
-
-                let classified = enveloped
-                    .run(&cx, &subject, &oracle, &case)
-                    .await
-                    .unwrap_or_else(|error| panic!("{fixture_id} enveloped run: {error}"));
-                assert_eq!(
-                    classified.comparison.status,
-                    ComparisonStatus::Classified,
-                    "{fixture_id} must classify once the lane opts into the typed reason: {:?}",
-                    classified.comparison.divergences
-                );
-                assert_eq!(
-                    classified.comparison.score_epsilon_reason,
-                    Some(ScoreEpsilonReason::SummationAssociation)
-                );
-                assert!(
-                    classified
-                        .comparison
-                        .divergences
-                        .iter()
-                        .all(|divergence| divergence.class == DivergenceClass::ScoreEpsilon),
-                    "{fixture_id} must not widen another class under the envelope: {:?}",
-                    classified.comparison.divergences
-                );
+                for (label, harness) in [("raw", &zero_tolerance), ("enveloped", &enveloped)] {
+                    let outcome = harness
+                        .run(&cx, &subject, &oracle, &case)
+                        .await
+                        .unwrap_or_else(|error| panic!("{fixture_id} {label} run: {error}"));
+                    assert_eq!(
+                        outcome.comparison.status,
+                        ComparisonStatus::Exact,
+                        "{fixture_id} must stay bit-exact under the {label} comparator since \
+                         the post-9wu3p convergence; a failure here is a REGRESSION of the \
+                         DIV-007 summation-association mechanism and needs a new register \
+                         observation: {:?}",
+                        outcome.comparison.divergences
+                    );
+                    assert!(
+                        outcome.comparison.divergences.is_empty(),
+                        "an Exact comparison must carry no divergences: {:?}",
+                        outcome.comparison.divergences
+                    );
+                }
             }
-
-            assert!(
-                signed_ulp_deltas.contains(&1) && signed_ulp_deltas.contains(&-1),
-                "the witness pair must move the ULP in both directions, or this is a scoring bias \
-                 rather than summation association: {signed_ulp_deltas:?}"
-            );
-
-            let control = zero_tolerance
-                .run(
-                    &cx,
-                    &subject,
-                    &oracle,
-                    &witness_case("e68-div007-control", E68_WITNESS_CONTROL_QUERY),
-                )
-                .await
-                .expect("two-clause control run");
-            assert_eq!(
-                control.comparison.status,
-                ComparisonStatus::Exact,
-                "the two-clause control must stay bit-exact under the SAME zero-tolerance \
-                 comparator: {:?}",
-                control.comparison.divergences
-            );
         });
     }
 
@@ -22742,50 +22576,57 @@ mod tests {
                 .iter()
                 .find(|case| case.case_id == E68_WITNESS_CASE_ID)
                 .expect("witness case is selected by the campaign");
-            // bd-gx7n4 CHANGED WHAT THIS CASE PROVES, and the change is stated
-            // rather than absorbed. Before the fix this witness landed
-            // Unclassified/LexicalContractMismatch — the lane did not opt into
-            // the reviewed reason, so the rank axis raised a raw RankMismatch
-            // and the lexical axis refused first. The lane now opts in and the
-            // register records three-clause disjunctions as DIV-007 members, so
-            // the SAME production evidence must now come out CLASSIFIED.
+            // THIS CASE HAS NOW CHANGED WHAT IT PROVES TWICE, and both
+            // changes are stated rather than absorbed.
             //
-            // What this case no longer proves is fail-closed-on-an-unregistered
-            // mismatch, because its mismatch is now registered. That property
-            // did not evaporate: it is pinned at the gate by
-            // `comparator::tests::the_reviewed_score_envelope_refuses_everything_it_should`
-            // and `the_lexical_axis_defers_only_to_a_rank_axis_that_actually_classified`,
-            // including the case that matters most — one unreviewed mismatch
-            // travelling beside a reviewed one still fails the whole case. That
-            // is a unit-level proof where this was a production-evidence proof,
-            // and restoring production evidence needs a second live case
-            // carrying a genuinely non-DIV-007 divergence, which cannot be
-            // minted from a dirty checkout.
-            assert_ne!(
+            // 1. Originally it proved fail-closed-on-unregistered: the lane
+            //    did not opt into the reviewed reason, the rank axis raised a
+            //    raw RankMismatch, and the witness landed Unclassified. That
+            //    property lives on at the gate in
+            //    `comparator::tests::the_reviewed_score_envelope_refuses_everything_it_should`
+            //    and `the_lexical_axis_defers_only_to_a_rank_axis_that_actually_classified`.
+            // 2. bd-gx7n4 opted the lane into the typed reason and the SAME
+            //    evidence came out CLASSIFIED (ScoreEpsilon rank class beside
+            //    a still-reported lexical mismatch).
+            // 3. The post-9wu3p scoring chain (abfbc246, 4929402a, 0677a3ec)
+            //    then converged Quill's summation association at this shape,
+            //    and the witness is now BIT-EXACT on the same Core100 corpus
+            //    (bd-pttxk probe receipts, 2026-08-31: witness, sibling, and
+            //    control all Exact/RankExact under both comparator configs).
+            //    The ledger's sequence-3 `fixed` disposition for DIV-008 is
+            //    now true at the scoring level. DIV-008's register join below
+            //    is UNAFFECTED: its observation names the committed retained
+            //    witness bytes, never a live re-derivation.
+            //
+            // If the witness stops being Exact, the DIV-007 mechanism has
+            // regressed at three-leaf shapes and needs a NEW register
+            // observation, not a revival of DIV-008.
+            assert_eq!(
                 witness.disposition,
-                CampaignDisposition::Unclassified,
-                "the reviewed DIV-007 mechanism must no longer fail closed in this lane: {:?}",
+                CampaignDisposition::Exact,
+                "the converged DIV-008 witness must be bit-exact in this lane: {:?}",
                 witness.reason
             );
             assert_eq!(
                 witness.reason, None,
-                "a classified case must not also carry a refusal reason"
+                "an exact case must not carry a refusal reason"
             );
-            // NOTHING WAS HIDDEN. The total lexical contract still reports the
-            // mismatch and still names where; only the campaign disposition
-            // changed. If a future edit made the contract go quiet instead,
-            // this is the assertion that catches it.
-            match witness.lexical_contract {
+            match &witness.lexical_contract {
                 CampaignLexicalCaseSummary::CoreLexicalV3 {
                     status,
-                    ref first_mismatch,
+                    first_mismatch,
                     mismatch_count,
                     ..
                 } => {
-                    assert_eq!(status, LexicalComparisonStatus::Mismatch);
+                    assert_eq!(
+                        *status,
+                        LexicalComparisonStatus::Equivalent,
+                        "the converged witness's total lexical contract must be \
+                         equivalent: {first_mismatch:?}"
+                    );
                     assert!(
-                        mismatch_count > 0 && first_mismatch.is_some(),
-                        "a lexical mismatch verdict must name where it mismatched"
+                        *mismatch_count == 0 && first_mismatch.is_none(),
+                        "an equivalent lexical verdict must carry no mismatches"
                     );
                 }
                 CampaignLexicalCaseSummary::LegacyMissing
@@ -22796,13 +22637,12 @@ mod tests {
             }
             assert_eq!(
                 witness.rank_class,
-                Some(RankClass::ScoreEpsilon),
-                "the lane's typed reason must classify the rank axis"
+                Some(RankClass::RankExact),
+                "the converged witness's rank axis must be exact"
             );
             assert!(
                 witness.registered_divergence.is_none(),
-                "an AUTO-class needs no register entry; a register-classified divergence here \
-                 would mean the auto-class path stopped working"
+                "an exact case needs no register entry"
             );
 
             let control = report
@@ -24989,17 +24829,71 @@ mod tests {
                 "default profile must be admissible: rank_mismatches={:?} lexical_mismatches={:?} coverage={:?} cases={:?}",
                 report.mismatches, report.lexical_mismatches, report.lexical_coverage, report.cases,
             );
-            assert!(report.lexical_mismatches.is_empty());
-            assert!(report.cases.iter().all(|case| {
-                matches!(
-                    &case.lexical_contract,
+            // bd-pttxk: the post-9wu3p scoring chain moved the reviewed
+            // DIV-007 summation-association mechanism onto query shapes whose
+            // ranks do NOT flip, so the rank axis auto-classifies them as
+            // `ScoreEpsilon` and the total lexical contract still reports the
+            // same one-ULP score difference. bd-gx7n4/bd-73ok3 admit exactly
+            // that shape at case level; these assertions state the SAME law at
+            // report level instead of demanding zero lexical evidence. What
+            // this still refuses: any mismatch that is not the `Score` class
+            // on a score-bits path, any bit distance outside the reviewed
+            // SummationAssociation envelope, any mismatching case whose rank
+            // axis did not auto-classify, and any non-passing disposition.
+            for group in &report.lexical_mismatches {
+                assert!(
+                    lexical_mismatch_is_reviewed_score_epsilon(
+                        &group.mismatch,
+                        ScoreEpsilonReason::SummationAssociation,
+                    ),
+                    "a default-lane lexical mismatch group must be inside the \
+                     reviewed summation-association score envelope: {group:?}"
+                );
+            }
+            for case in &report.cases {
+                match &case.lexical_contract {
                     CampaignLexicalCaseSummary::CoreLexicalV3 {
                         status: LexicalComparisonStatus::Equivalent,
                         mismatch_count: 0,
                         ..
+                    } => {}
+                    CampaignLexicalCaseSummary::CoreLexicalV3 {
+                        status: LexicalComparisonStatus::Mismatch,
+                        first_mismatch: Some(first_mismatch),
+                        mismatch_count,
+                        ..
+                    } => {
+                        assert!(
+                            *mismatch_count > 0,
+                            "a mismatch verdict must count at least one mismatch: {case:?}"
+                        );
+                        assert_eq!(
+                            case.disposition,
+                            CampaignDisposition::AutoClassified,
+                            "a lexically mismatching default-lane case must be the \
+                             auto-classified rank divergence, nothing looser: {case:?}"
+                        );
+                        assert_eq!(
+                            case.rank_class,
+                            Some(RankClass::ScoreEpsilon),
+                            "the lexical mismatch must BE the classified rank \
+                             divergence: {case:?}"
+                        );
+                        assert!(
+                            lexical_mismatch_is_reviewed_score_epsilon(
+                                first_mismatch,
+                                ScoreEpsilonReason::SummationAssociation,
+                            ),
+                            "the retained first mismatch must be inside the reviewed \
+                             summation-association score envelope: {first_mismatch:?}"
+                        );
                     }
-                )
-            }));
+                    other => panic!(
+                        "default-lane lexical contract must be Equivalent or the \
+                         reviewed score mismatch: {other:?}"
+                    ),
+                }
+            }
             let CampaignLexicalCoverageSummary::CoreLexicalV3 {
                 subject,
                 oracle,
