@@ -21318,10 +21318,13 @@ mod tests {
     /// scored one document exactly one ULP away from the pinned oracle, in
     /// opposite directions, and this test pinned that behaviour so the
     /// ingested register record could never drift from what it claimed to
-    /// witness. The post-9wu3p scoring chain (abfbc246, 4929402a, 0677a3ec)
-    /// then changed Quill's summation association and the witness CONVERGED:
-    /// the tripwire fired with `left: Exact` (bd-pttxk, 2026-08-31), which is
-    /// the exact drift-detection duty the register handed it. The ledger's
+    /// witness. At current HEAD, after the post-9wu3p scoring commits
+    /// (abfbc246, 4929402a, 0677a3ec) had landed, the witness was observed to
+    /// have CONVERGED: the tripwire fired with `left: Exact` (bd-pttxk,
+    /// 2026-08-31). Historical bisection was unavailable, so this records the
+    /// measured boundary without attributing causality to that commit set. The
+    /// tripwire performed the exact drift-detection duty the register handed
+    /// it. The ledger's
     /// sequence-3 `fixed` disposition for DIV-008 is now literally true at
     /// the scoring level, not merely at the classification level.
     ///
@@ -22678,15 +22681,17 @@ mod tests {
             // 2. bd-gx7n4 opted the lane into the typed reason and the SAME
             //    evidence came out CLASSIFIED (ScoreEpsilon rank class beside
             //    a still-reported lexical mismatch).
-            // 3. The post-9wu3p scoring chain (abfbc246, 4929402a, 0677a3ec)
-            //    then converged Quill's summation association at this shape,
-            //    and the witness is now BIT-EXACT on the same Core100 corpus
+            // 3. At current HEAD, after the post-9wu3p scoring commits
+            //    (abfbc246, 4929402a, 0677a3ec) had landed, this witness was
+            //    observed to be BIT-EXACT on the same Core100 corpus
             //    (bd-pttxk probe receipts, 2026-08-31: witness, sibling, and
             //    control all Exact/RankExact under both comparator configs).
-            //    The ledger's sequence-3 `fixed` disposition for DIV-008 is
-            //    now true at the scoring level. DIV-008's register join below
-            //    is UNAFFECTED: its observation names the committed retained
-            //    witness bytes, never a live re-derivation.
+            //    Historical bisection was unavailable, so the commit set is a
+            //    temporal boundary rather than a causal claim. The ledger's
+            //    sequence-3 `fixed` disposition for DIV-008 is now true at the
+            //    scoring level. DIV-008's register join below is UNAFFECTED:
+            //    its observation names the committed retained witness bytes,
+            //    never a live re-derivation.
             //
             // If the witness stops being Exact, the DIV-007 mechanism has
             // regressed at three-leaf shapes and needs a NEW register
@@ -24956,15 +24961,18 @@ mod tests {
                 "default profile must be admissible: rank_mismatches={:?} lexical_mismatches={:?} coverage={:?} cases={:?}",
                 report.mismatches, report.lexical_mismatches, report.lexical_coverage, report.cases,
             );
-            // bd-pttxk: the post-9wu3p scoring chain moved the reviewed
-            // DIV-007 summation-association mechanism onto query shapes whose
-            // ranks do NOT flip, so the rank axis auto-classifies them as
-            // `ScoreEpsilon` and the total lexical contract still reports the
-            // same one-ULP score difference. bd-gx7n4/bd-73ok3 admit exactly
-            // that shape at case level; these assertions state the SAME law at
-            // report level instead of demanding zero lexical evidence. What
-            // this still refuses: any mismatch that is not the `Score` class
-            // on a score-bits path, any bit distance outside the reviewed
+            // bd-pttxk: at current HEAD, after the post-9wu3p scoring changes,
+            // the reviewed DIV-007 summation-association mechanism is observed
+            // on query shapes whose ranks do NOT flip. Historical bisection
+            // was unavailable, so this is an observed current state rather
+            // than attribution to specific commits. The rank axis
+            // auto-classifies these cases as `ScoreEpsilon`, while the total
+            // lexical contract still reports the same one-ULP score
+            // difference. bd-gx7n4/bd-73ok3 admit exactly that shape at case
+            // level; these assertions state the SAME law at report level
+            // instead of demanding zero lexical evidence. What this still
+            // refuses: any mismatch that is not the `Score` class on a
+            // score-bits path, any bit distance outside the reviewed
             // SummationAssociation envelope, any mismatching case whose rank
             // axis did not auto-classify, and any non-passing disposition.
             assert!(
@@ -25004,6 +25012,7 @@ mod tests {
                 match &case.lexical_contract {
                     CampaignLexicalCaseSummary::CoreLexicalV3 {
                         status: LexicalComparisonStatus::Equivalent,
+                        first_mismatch: None,
                         mismatch_count: 0,
                         ..
                     } => {}
