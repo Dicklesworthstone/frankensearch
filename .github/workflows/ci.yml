@@ -504,10 +504,7 @@ jobs:
           GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
           GAUNTLET_SUBJECT_DIRTY: "false"
           GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej-pr
-        # The two skips are the bd-669hb regression (seeking fill admits +5
-        # fuel units and binds a candidate-less horizon seek); they return to
-        # the lane when that bead is dispositioned — do not widen the skips.
-        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_ -- --nocapture --skip salej_union_horizon_final_refill_checkpoints_are_exact_and_atomic --skip salej_union_horizon_minimum_fuel_boundary_is_atomic_and_deterministic
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_ -- --nocapture
 
       - name: Quill E6.3 metamorphic PR lane (bd-quill-e6.3)
         if: matrix.os == 'ubuntu-latest'

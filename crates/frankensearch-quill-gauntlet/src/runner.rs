@@ -13746,6 +13746,7 @@ mod tests {
     fn assert_union_horizon_interruption_location(
         location: frankensearch_quill::index::ConformanceQueryInterruptionLocation,
         phase: frankensearch_quill::argus::ConformanceQueryWorkPhase,
+        candidate_doc: Option<u32>,
         candidate_scored: bool,
         units: u64,
         consumed_before: u64,
@@ -13753,7 +13754,7 @@ mod tests {
         assert_eq!(location.refill_ordinal(), 3);
         assert_eq!(location.window_start(), 8_192);
         assert_eq!(location.phase(), phase);
-        assert_eq!(location.candidate_doc(), Some(9_000));
+        assert_eq!(location.candidate_doc(), candidate_doc);
         assert_eq!(location.candidate_scored(), candidate_scored);
         assert_eq!(
             location.work_kind(),
@@ -18024,6 +18025,7 @@ mod tests {
                 assert_union_horizon_interruption_location(
                     location,
                     frankensearch_quill::argus::ConformanceQueryWorkPhase::Drain,
+                    Some(9_000),
                     true,
                     0,
                     0,
@@ -18107,6 +18109,7 @@ mod tests {
     /// and the move that exhausts a cursor charges none at all. Such a build
     /// reports the seek as the query's last checkpoint and answers a
     /// cancelled query with a complete result set.
+
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     #[test]
     fn salej_union_horizon_final_refill_checkpoints_are_exact_and_atomic() {
@@ -18228,6 +18231,7 @@ mod tests {
             assert_union_horizon_interruption_location(
                 final_location,
                 ConformanceQueryWorkPhase::Drain,
+                Some(9_000),
                 true,
                 0,
                 0,
@@ -18238,7 +18242,8 @@ mod tests {
                     .filter(|location| location.phase() == ConformanceQueryWorkPhase::Seek)
                     .count(),
                 1,
-                "the final refill seeks its single candidate exactly once",
+                "one trailing horizon seek closes the final refill (bd-669hb: the \
+                 seeking fill's candidate seek precedes this checkpoint window)",
             );
             assert_eq!(
                 locations
@@ -18250,19 +18255,22 @@ mod tests {
             );
             for location in &locations {
                 match location.phase() {
-                    // The seek charges the one posting block it enters and has
-                    // not scored its candidate yet; a drain has scored it and
-                    // enters no new block.
+                    // bd-669hb: under the seeking fill (abfbc246) the trailing
+                    // checkpoint window's seek is the horizon advance — it
+                    // names no candidate and, at this checkpoint, has entered
+                    // no new block; both drains have scored the late winner.
                     ConformanceQueryWorkPhase::Seek => assert_union_horizon_interruption_location(
                         *location,
                         ConformanceQueryWorkPhase::Seek,
+                        None,
                         false,
-                        1,
+                        0,
                         0,
                     ),
                     ConformanceQueryWorkPhase::Drain => assert_union_horizon_interruption_location(
                         *location,
                         ConformanceQueryWorkPhase::Drain,
+                        Some(9_000),
                         true,
                         0,
                         0,
@@ -18414,18 +18422,24 @@ mod tests {
                 )
                 .expect_err("N-1 UNION_HORIZON fuel must fail without a receipt");
             let first_diagnostics = union_horizon_fuel_diagnostics(&first_error);
-            assert_eq!(minimum_successful_budget, 75);
-            assert_eq!(failing_budget, 74);
-            assert_eq!(first_diagnostics, (74, 74, 1, 6, 67, 0));
+            // bd-669hb re-mint: the seeking fill (abfbc246) admits five more
+            // posting blocks on this shape than the stepping fill the prior
+            // pins (75 / 67 blocks) were minted against — its own docs claim
+            // no skip-cost advantage, and the arrival probes are deliberately
+            // admitted work. The pins stay exact at the measured values.
+            assert_eq!(minimum_successful_budget, 80);
+            assert_eq!(failing_budget, 79);
+            assert_eq!(first_diagnostics, (79, 79, 1, 6, 72, 0));
             let first_location = failing_controller
                 .query_interruption_location()
                 .expect("N-1 UNION_HORIZON fuel binds its exact scorer location");
             assert_union_horizon_interruption_location(
                 first_location,
                 frankensearch_quill::argus::ConformanceQueryWorkPhase::Seek,
+                None,
                 false,
                 1,
-                74,
+                79,
             );
             assert!(Arc::ptr_eq(
                 &failing_snapshot_before,
@@ -18459,9 +18473,10 @@ mod tests {
             assert_union_horizon_interruption_location(
                 second_location,
                 frankensearch_quill::argus::ConformanceQueryWorkPhase::Seek,
+                None,
                 false,
                 1,
-                74,
+                79,
             );
             assert!(Arc::ptr_eq(
                 &failing_snapshot_before,
