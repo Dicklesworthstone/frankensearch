@@ -21281,6 +21281,15 @@ mod tests {
     const E68_WITNESS_SIBLING_QUERY: &str = "(relationships OR release) OR require";
     #[cfg(feature = "tantivy-oracle")]
     const E68_WITNESS_CONTROL_QUERY: &str = "release OR require";
+    /// Current recurrence of the historical DIV-007/008 summation-association
+    /// mechanism. These are deliberately separate from the immutable E6.8
+    /// witness constants above: the retained artifact records what happened at
+    /// mint time, while this pair proves the reviewed mechanism still occurs at
+    /// the current scoring order.
+    #[cfg(feature = "tantivy-oracle")]
+    const PTTXK_CURRENT_RECURRENCE_QUERY: &str = "rust ownership borrowing";
+    #[cfg(feature = "tantivy-oracle")]
+    const PTTXK_CURRENT_CONTROL_QUERY: &str = "rust ownership";
 
     /// Split the comparator's `doc-id@score-bits` rendering.
     #[cfg(feature = "tantivy-oracle")]
@@ -21353,6 +21362,8 @@ mod tests {
                 ("e68-div007-witness", E68_WITNESS_QUERY),
                 ("e68-div007-witness-sibling", E68_WITNESS_SIBLING_QUERY),
                 ("e68-div007-control", E68_WITNESS_CONTROL_QUERY),
+                ("pttxk-current-recurrence", PTTXK_CURRENT_RECURRENCE_QUERY),
+                ("pttxk-current-control", PTTXK_CURRENT_CONTROL_QUERY),
             ] {
                 let case = DifferentialCase {
                     fixture_id: fixture_id.to_owned(),
@@ -21393,28 +21404,24 @@ mod tests {
         });
     }
 
-    /// bd-quill-e6-gauntlet-scale-rm3q.8: pin the exact live divergence the
-    /// E6.8 register witness is ingested from, in BOTH comparator
-    /// configurations, so the ingested record can never drift from the
-    /// behaviour it claims to witness.
+    /// Pin a current recurrence of the mechanism retained by the immutable
+    /// E6.8 register witness, in BOTH comparator configurations.
     ///
     /// This is the mechanism DIV-007 documents — Quill fuses each unfielded
     /// term's `[content, 2.0x title]` expansion into one summed contribution
-    /// while the pinned oracle accumulates 2N interleaved clause outputs — but
-    /// observed here WITHOUT any of DIV-007's original qualifiers: a plain
-    /// three-clause OR, three leaves rather than eight, no boost, no nesting
-    /// beyond one level of grouping. The bd-55mvg owner ruling states that the
-    /// comparator's default config REMAINS zero-tolerance and that campaign
-    /// lanes opt in with the typed reason; this test pins both halves of that
-    /// ruling as executable behaviour:
+    /// while the pinned oracle accumulates 2N interleaved clause outputs. The
+    /// historical query is retained in the committed artifact even though it
+    /// is now bit-exact; this test uses a separate three-term query that still
+    /// exhibits the same reviewed one-ULP shape. The bd-55mvg owner ruling
+    /// states that the comparator's default config REMAINS zero-tolerance and
+    /// that campaign lanes opt in with the typed reason; this test pins both
+    /// halves of that ruling as executable behaviour:
     ///
     ///   default `ComparatorConfig`  -> raw `RankMismatch`, `ComparisonStatus::Failed`
     ///   `with_score_epsilon_reason` -> `ScoreEpsilon`/`SummationAssociation`, Classified
     ///
-    /// The two queries move the ULP in OPPOSITE directions on the same
-    /// document, which is what makes this summation association rather than a
-    /// systematic scoring bias in either engine, and the two-clause control
-    /// stays bit-exact, which bounds it to three-or-more leaves.
+    /// The two-term control stays bit-exact on the same corpus and comparator,
+    /// which keeps the current recurrence bounded to the extra summed leaf.
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn three_clause_or_diverges_at_one_ulp_without_the_div007_envelope() {
@@ -21489,74 +21496,62 @@ mod tests {
                 },
             };
 
-            let mut signed_ulp_deltas = Vec::new();
-            for (fixture_id, query) in [
-                ("e68-div007-witness", E68_WITNESS_QUERY),
-                ("e68-div007-witness-sibling", E68_WITNESS_SIBLING_QUERY),
-            ] {
-                let case = witness_case(fixture_id, query);
-                let raw = zero_tolerance
-                    .run(&cx, &subject, &oracle, &case)
-                    .await
-                    .unwrap_or_else(|error| panic!("{fixture_id} zero-tolerance run: {error}"));
-                assert_eq!(
-                    raw.comparison.status,
-                    ComparisonStatus::Failed,
-                    "{fixture_id} must stay a RAW failure under the default comparator: {:?}",
-                    raw.comparison.divergences
-                );
-                assert_eq!(raw.comparison.rank_class, RankClass::RankMismatch);
-                assert_eq!(
-                    raw.comparison.divergences.len(),
-                    1,
-                    "{fixture_id} must remain a single minimized divergence: {:?}",
-                    raw.comparison.divergences
-                );
-                let divergence = &raw.comparison.divergences[0];
-                assert_eq!(divergence.class, DivergenceClass::RankMismatch);
-                let (oracle_doc, oracle_bits) = split_scored_hit(&divergence.oracle);
-                let (subject_doc, subject_bits) = split_scored_hit(&divergence.subject);
-                assert_eq!(
-                    oracle_doc, subject_doc,
-                    "{fixture_id} must diverge in SCORE on one document, not in membership"
-                );
-                let delta = i64::from(subject_bits) - i64::from(oracle_bits);
-                assert_eq!(
-                    delta.abs(),
-                    1,
-                    "{fixture_id} must diverge by exactly one ULP: oracle={oracle_bits:#010x} subject={subject_bits:#010x}"
-                );
-                signed_ulp_deltas.push(delta);
+            let fixture_id = "pttxk-current-recurrence";
+            let case = witness_case(fixture_id, PTTXK_CURRENT_RECURRENCE_QUERY);
+            let raw = zero_tolerance
+                .run(&cx, &subject, &oracle, &case)
+                .await
+                .unwrap_or_else(|error| panic!("{fixture_id} zero-tolerance run: {error}"));
+            assert_eq!(
+                raw.comparison.status,
+                ComparisonStatus::Failed,
+                "{fixture_id} must stay a RAW failure under the default comparator: {:?}",
+                raw.comparison.divergences
+            );
+            assert_eq!(raw.comparison.rank_class, RankClass::RankMismatch);
+            assert_eq!(
+                raw.comparison.divergences.len(),
+                1,
+                "{fixture_id} must remain a single minimized divergence: {:?}",
+                raw.comparison.divergences
+            );
+            let divergence = &raw.comparison.divergences[0];
+            assert_eq!(divergence.class, DivergenceClass::RankMismatch);
+            let (oracle_doc, oracle_bits) = split_scored_hit(&divergence.oracle);
+            let (subject_doc, subject_bits) = split_scored_hit(&divergence.subject);
+            assert_eq!(
+                oracle_doc, subject_doc,
+                "{fixture_id} must diverge in SCORE on one document, not in membership"
+            );
+            assert_eq!(
+                subject_bits.abs_diff(oracle_bits),
+                1,
+                "{fixture_id} must diverge by exactly one ULP: oracle={oracle_bits:#010x} subject={subject_bits:#010x}"
+            );
 
-                let classified = enveloped
-                    .run(&cx, &subject, &oracle, &case)
-                    .await
-                    .unwrap_or_else(|error| panic!("{fixture_id} enveloped run: {error}"));
-                assert_eq!(
-                    classified.comparison.status,
-                    ComparisonStatus::Classified,
-                    "{fixture_id} must classify once the lane opts into the typed reason: {:?}",
-                    classified.comparison.divergences
-                );
-                assert_eq!(
-                    classified.comparison.score_epsilon_reason,
-                    Some(ScoreEpsilonReason::SummationAssociation)
-                );
-                assert!(
-                    classified
-                        .comparison
-                        .divergences
-                        .iter()
-                        .all(|divergence| divergence.class == DivergenceClass::ScoreEpsilon),
-                    "{fixture_id} must not widen another class under the envelope: {:?}",
-                    classified.comparison.divergences
-                );
-            }
-
+            let classified = enveloped
+                .run(&cx, &subject, &oracle, &case)
+                .await
+                .unwrap_or_else(|error| panic!("{fixture_id} enveloped run: {error}"));
+            assert_eq!(
+                classified.comparison.status,
+                ComparisonStatus::Classified,
+                "{fixture_id} must classify once the lane opts into the typed reason: {:?}",
+                classified.comparison.divergences
+            );
+            assert_eq!(classified.comparison.rank_class, RankClass::ScoreEpsilon);
+            assert_eq!(
+                classified.comparison.score_epsilon_reason,
+                Some(ScoreEpsilonReason::SummationAssociation)
+            );
             assert!(
-                signed_ulp_deltas.contains(&1) && signed_ulp_deltas.contains(&-1),
-                "the witness pair must move the ULP in both directions, or this is a scoring bias \
-                 rather than summation association: {signed_ulp_deltas:?}"
+                classified
+                    .comparison
+                    .divergences
+                    .iter()
+                    .all(|divergence| divergence.class == DivergenceClass::ScoreEpsilon),
+                "{fixture_id} must not widen another class under the envelope: {:?}",
+                classified.comparison.divergences
             );
 
             let control = zero_tolerance
@@ -21564,7 +21559,7 @@ mod tests {
                     &cx,
                     &subject,
                     &oracle,
-                    &witness_case("e68-div007-control", E68_WITNESS_CONTROL_QUERY),
+                    &witness_case("pttxk-current-control", PTTXK_CURRENT_CONTROL_QUERY),
                 )
                 .await
                 .expect("two-clause control run");
@@ -24989,17 +24984,81 @@ mod tests {
                 "default profile must be admissible: rank_mismatches={:?} lexical_mismatches={:?} coverage={:?} cases={:?}",
                 report.mismatches, report.lexical_mismatches, report.lexical_coverage, report.cases,
             );
-            assert!(report.lexical_mismatches.is_empty());
-            assert!(report.cases.iter().all(|case| {
-                matches!(
-                    &case.lexical_contract,
-                    CampaignLexicalCaseSummary::CoreLexicalV3 {
-                        status: LexicalComparisonStatus::Equivalent,
-                        mismatch_count: 0,
-                        ..
-                    }
-                )
-            }));
+            assert!(
+                report
+                    .cases
+                    .iter()
+                    .filter(|case| case.disposition == CampaignDisposition::Exact)
+                    .all(|case| matches!(
+                        &case.lexical_contract,
+                        CampaignLexicalCaseSummary::CoreLexicalV3 {
+                            status: LexicalComparisonStatus::Equivalent,
+                            first_mismatch: None,
+                            mismatch_count: 0,
+                            ..
+                        }
+                    )),
+                "rank-exact cases must remain exact on the total lexical contract"
+            );
+            let mismatching_cases = report
+                .cases
+                .iter()
+                .filter(|case| {
+                    matches!(
+                        &case.lexical_contract,
+                        CampaignLexicalCaseSummary::CoreLexicalV3 {
+                            status: LexicalComparisonStatus::Mismatch,
+                            ..
+                        }
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !mismatching_cases.is_empty(),
+                "the live lane must retain a current summation-association recurrence"
+            );
+            for case in &mismatching_cases {
+                assert_eq!(case.disposition, CampaignDisposition::AutoClassified);
+                assert_eq!(case.comparison_status, Some(ComparisonStatus::Classified));
+                assert_eq!(case.rank_class, Some(RankClass::ScoreEpsilon));
+                let CampaignLexicalCaseSummary::CoreLexicalV3 {
+                    first_mismatch: Some(first_mismatch),
+                    mismatch_count,
+                    ..
+                } = &case.lexical_contract
+                else {
+                    panic!("mismatching case must retain its first mismatch: {case:?}");
+                };
+                assert!(*mismatch_count > 0);
+                assert!(
+                    crate::comparator::lexical_mismatch_is_reviewed_score_epsilon(
+                        first_mismatch,
+                        ScoreEpsilonReason::SummationAssociation,
+                    )
+                );
+            }
+            assert!(
+                report.lexical_mismatches.iter().all(|group| {
+                    crate::comparator::lexical_mismatch_is_reviewed_score_epsilon(
+                        &group.mismatch,
+                        ScoreEpsilonReason::SummationAssociation,
+                    ) && group.case_ids.iter().all(|case_id| {
+                        mismatching_cases
+                            .iter()
+                            .any(|case| case.case_id == *case_id)
+                    })
+                }),
+                "every retained lexical mismatch group must be the typed rank-axis divergence: {:?}",
+                report.lexical_mismatches,
+            );
+            assert!(
+                report.lexical_mismatches.iter().any(|group| {
+                    group.mismatch.path.contains("_hydration/")
+                        && group.mismatch.path.ends_with("/raw_lexical_score_bits")
+                }),
+                "the live lane must retain hydration-axis raw score evidence: {:?}",
+                report.lexical_mismatches,
+            );
             let CampaignLexicalCoverageSummary::CoreLexicalV3 {
                 subject,
                 oracle,

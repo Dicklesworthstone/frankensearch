@@ -10902,7 +10902,7 @@ mod tests {
         assert!(lexical_mismatch_is_reviewed_score_epsilon(
             &mismatch(
                 LexicalMismatchClass::Score,
-                "/full_search/outcome/hits/0/raw_lexical_score_bits",
+                "/all_lexical_winners_hydration/post_state/outcome/hits/2/raw_lexical_score_bits",
                 "Some(\"0x4113fe32\")",
                 "Some(\"0x4113fe33\")",
             ),
