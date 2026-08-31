@@ -506,6 +506,15 @@ jobs:
           GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej-pr
         run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_ -- --nocapture
 
+      - name: Upload Quill UNION_HORIZON PR artifacts
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quill-gauntlet-salej-pr-${{ github.run_id }}
+          path: target/coverage/quill-gauntlet-salej-pr/**
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Quill E6.3 metamorphic PR lane (bd-quill-e6.3)
         if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 10

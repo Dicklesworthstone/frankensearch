@@ -2146,8 +2146,38 @@ mod tests {
         TwoTierIndex::open(dir, TwoTierConfig::default()).unwrap()
     }
 
+    /// Seed a fast+quality index pair so tests can exercise quality-tier
+    /// refresh without tripping the post-bd-8utj topology-change refusal.
+    fn seed_two_tier_index(
+        dir: &Path,
+        fast_dimension: usize,
+        quality_dimension: usize,
+    ) -> TwoTierIndex {
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        VectorIndex::create(&fast_path, "stub-fast", fast_dimension)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        VectorIndex::create(&quality_path, "stub-quality", quality_dimension)
+            .unwrap()
+            .finish()
+            .unwrap();
+        TwoTierIndex::open(dir, TwoTierConfig::default()).unwrap()
+    }
+
     fn make_cache(dir: &Path, dimension: usize) -> Arc<IndexCache> {
         seed_index(dir, dimension);
+        let detector = Box::new(SentinelFileDetector::new());
+        Arc::new(IndexCache::open(dir, TwoTierConfig::default(), detector).unwrap())
+    }
+
+    fn make_cache_with_quality(
+        dir: &Path,
+        fast_dimension: usize,
+        quality_dimension: usize,
+    ) -> Arc<IndexCache> {
+        seed_two_tier_index(dir, fast_dimension, quality_dimension);
         let detector = Box::new(SentinelFileDetector::new());
         Arc::new(IndexCache::open(dir, TwoTierConfig::default(), detector).unwrap())
     }
@@ -2449,7 +2479,7 @@ mod tests {
             let queue = make_queue(100);
             submit(&queue, "doc-1", "Test document");
 
-            let cache = make_cache(&dir, 256);
+            let cache = make_cache_with_quality(&dir, 256, 384);
             let config =
                 RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10));
             let fast = Arc::new(StubEmbedder::new("stub-fast", 256));
@@ -2645,7 +2675,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("unchanged-tier-ids");
             let queue = make_queue(100);
-            let cache = make_cache(&dir, 256);
+            let cache = make_cache_with_quality(&dir, 256, 384);
             let fast_spy = Arc::new(StubEmbedder::new("stub-fast", 256));
             let quality_spy = Arc::new(StubEmbedder::new("stub-quality", 384));
             let worker = RefreshWorker::new(
@@ -3144,8 +3174,10 @@ mod tests {
             let dir = temp_index_dir("quality-preserve");
             let queue = make_queue(100);
 
-            // First cycle with quality embedder.
-            let cache = make_cache(&dir, 256);
+            // First cycle with quality embedder.  Seed a quality-capable
+            // generation so the initial replacement is a same-topology refresh
+            // rather than an attempted topology upgrade.
+            let cache = make_cache_with_quality(&dir, 256, 384);
             let config =
                 RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10));
             let fast = Arc::new(StubEmbedder::new("stub-fast", 256));
