@@ -6460,7 +6460,14 @@ fn oracle_blamed_lowering_defect(query: &str, comparison: &ComparisonReport) -> 
     }
     let mut saw_membership_divergence = false;
     for divergence in &comparison.divergences {
-        if is_auto_class(divergence.class) {
+        // Certificate rows restate the membership disagreement at the
+        // certificate layer (bd-pttxk); the blame symptom is judged on the
+        // divergences that state it directly.
+        if is_auto_class(divergence.class)
+            || divergence
+                .pointer
+                .starts_with("/comparison/subject/cutoff_certificate/")
+        {
             continue;
         }
         if divergence.class != DivergenceClass::RankMismatch {
@@ -23900,6 +23907,29 @@ mod tests {
             )
             .expect("copy immutable object");
         }
+        // bd-pttxk: the v4 verified-publication boundary (a8c33db7) made
+        // `open_pinned_campaign` require the store's `v4/` chain, so the
+        // copied campaign must carry the same Source-to-Build snapshots the
+        // report's binding names — an isolated store without them is not an
+        // equivalent store, it is a truncated one.
+        if let Some(binding) = &report.v4_source_build_binding {
+            let scratch_sources = scratch_root.join("v4").join("sources");
+            let scratch_builds = scratch_root.join("v4").join("builds");
+            std::fs::create_dir_all(&scratch_sources).expect("create scratch v4 sources");
+            std::fs::create_dir_all(&scratch_builds).expect("create scratch v4 builds");
+            let source_name = format!("{}.json", binding.source_identity_sha256);
+            let build_name = format!("{}.json", binding.build_identity_sha256);
+            std::fs::copy(
+                source_root.join("v4").join("sources").join(&source_name),
+                scratch_sources.join(&source_name),
+            )
+            .expect("copy v4 source snapshot");
+            std::fs::copy(
+                source_root.join("v4").join("builds").join(&build_name),
+                scratch_builds.join(&build_name),
+            )
+            .expect("copy v4 build snapshot");
+        }
         let store = ArtifactStore::new(scratch_root);
         assert_eq!(
             store
@@ -24379,7 +24409,17 @@ mod tests {
                 *result = LexicalHydrationResult::Error(query_error_observation());
             }),
             ("derived", |object| {
-                core_comparison(object).status = LexicalComparisonStatus::Mismatch;
+                // TOGGLE rather than set: the post-9wu3p default lane
+                // legitimately retains Mismatch-status cases (bd-pttxk), and
+                // setting a constant on a target that already carries it is a
+                // no-op that hashes to the ORIGINAL object -- the store then
+                // rightly loads it, and the matrix reads that as a missed
+                // rejection. A toggle is a genuine mutation for every target.
+                let comparison = core_comparison(object);
+                comparison.status = match comparison.status {
+                    LexicalComparisonStatus::Equivalent => LexicalComparisonStatus::Mismatch,
+                    LexicalComparisonStatus::Mismatch => LexicalComparisonStatus::Equivalent,
+                };
             }),
         ];
         assert_eq!(
@@ -24425,9 +24465,13 @@ mod tests {
                 &mutated_report,
             );
 
-            let error = store
-                .load_integrity_checked_campaign(&report.run_id)
-                .expect_err("semantic replay must reject canonical typed mutation");
+            let error = match store.load_integrity_checked_campaign(&report.run_id) {
+                Err(error) => error,
+                Ok(_) => panic!(
+                    "semantic replay must reject the canonical typed mutation {label:?}, \
+                     but the mutated campaign loaded integrity-checked"
+                ),
+            };
             assert_reached_past_completion(label, &error);
             std::fs::write(&target_case_path, &original_case_bytes)
                 .expect("restore target run manifest");
