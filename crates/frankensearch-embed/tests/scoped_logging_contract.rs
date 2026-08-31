@@ -6,7 +6,7 @@
 //! processes, with bounded concurrent stdout/stderr drains.
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::{Read, Write},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
@@ -532,29 +532,27 @@ fn spawn_child(case: &str, rust_log: Option<&std::ffi::OsStr>) -> Child {
 
 fn run_child_with_rust_log(
     case: &str,
-    rust_log: Option<OsString>,
+    rust_log: Option<&OsStr>,
 ) -> Result<ChildOutput, ChildFailure> {
     run_child_with_rust_log_and_timeout(case, rust_log, CHILD_TIMEOUT)
 }
 
 fn run_child_with_rust_log_and_timeout(
     case: &str,
-    rust_log: Option<OsString>,
+    rust_log: Option<&OsStr>,
     timeout: Duration,
 ) -> Result<ChildOutput, ChildFailure> {
-    let result = read_bounded_child(spawn_child(case, rust_log.as_deref()), timeout);
+    let result = read_bounded_child(spawn_child(case, rust_log), timeout);
     let receipt = match &result {
-        Ok(output) => SealedChildReceipt::from_output(case, rust_log.as_deref(), timeout, output),
-        Err(failure) => {
-            SealedChildReceipt::from_failure(case, rust_log.as_deref(), timeout, failure)
-        }
+        Ok(output) => SealedChildReceipt::from_output(case, rust_log, timeout, output),
+        Err(failure) => SealedChildReceipt::from_failure(case, rust_log, timeout, failure),
     };
     assert_sealed_receipt(&receipt, case, timeout);
     result
 }
 
 fn run_child(case: &str, rust_log: Option<&str>) -> Result<ChildOutput, ChildFailure> {
-    run_child_with_rust_log(case, rust_log.map(OsString::from))
+    run_child_with_rust_log(case, rust_log.map(OsStr::new))
 }
 
 fn run_child_with_timeout(
@@ -562,7 +560,7 @@ fn run_child_with_timeout(
     rust_log: Option<&str>,
     timeout: Duration,
 ) -> Result<ChildOutput, ChildFailure> {
-    run_child_with_rust_log_and_timeout(case, rust_log.map(OsString::from), timeout)
+    run_child_with_rust_log_and_timeout(case, rust_log.map(OsStr::new), timeout)
 }
 
 fn run_passing_child(case: &str, rust_log: Option<&str>) -> ChildOutput {
@@ -575,7 +573,8 @@ fn run_passing_child(case: &str, rust_log: Option<&str>) -> ChildOutput {
 fn run_child_with_non_unicode_rust_log(case: &str) -> Result<ChildOutput, ChildFailure> {
     use std::os::unix::ffi::OsStringExt;
 
-    run_child_with_rust_log(case, Some(OsString::from_vec(vec![b't', 0x80])))
+    let rust_log = OsString::from_vec(vec![b't', 0x80]);
+    run_child_with_rust_log(case, Some(rust_log.as_os_str()))
 }
 
 #[cfg(unix)]
