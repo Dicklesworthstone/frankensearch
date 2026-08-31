@@ -21295,6 +21295,104 @@ mod tests {
         )
     }
 
+    /// TEMPORARY bd-pttxk measurement probe: prints, never asserts. Captures
+    /// the raw and enveloped comparator outcomes for the DIV-008 witness pair
+    /// and control at HEAD so the tripwire re-pin is written from receipts.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    #[ignore = "bd-pttxk measurement probe; run explicitly"]
+    fn pttxk_probe_div007_witness_outcomes_at_head() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            use frankensearch_core::LexicalWrite;
+
+            let fixture = make_scalar_g1a_regression_fixture();
+            let (mut subject, mut oracle) = live_campaign_engines();
+            subject.claim_fresh_campaign().expect("claim probe subject");
+            oracle.claim_fresh_campaign().expect("claim probe oracle");
+            let documents = fixture
+                .documents
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            subject
+                .index_mut()
+                .expect("probe quill index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index probe quill corpus");
+            subject
+                .index_mut()
+                .expect("probe quill index")
+                .commit(&cx)
+                .await
+                .expect("commit probe quill corpus");
+            oracle
+                .index()
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index probe oracle corpus");
+            oracle
+                .index()
+                .commit(&cx)
+                .await
+                .expect("commit probe oracle corpus");
+            subject.mark_committed().expect("publish probe quill");
+            oracle.mark_committed().expect("publish probe oracle");
+
+            let zero_tolerance = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default(),
+            );
+            let enveloped = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default()
+                    .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
+            );
+            for (fixture_id, query) in [
+                ("e68-div007-witness", E68_WITNESS_QUERY),
+                ("e68-div007-witness-sibling", E68_WITNESS_SIBLING_QUERY),
+                ("e68-div007-control", E68_WITNESS_CONTROL_QUERY),
+            ] {
+                let case = DifferentialCase {
+                    fixture_id: fixture_id.to_owned(),
+                    query: query.to_owned(),
+                    limit: 20,
+                    offset: 0,
+                    tie_expansion_limit: 256,
+                    count_requested: false,
+                    snippet_max_chars: None,
+                    metadata: DifferentialCaseMetadata {
+                        generator_id: Some("e68-div007-witness-v1".to_owned()),
+                        generator_seed: Some(0x6538_0007),
+                        corpus_hash: Some(fixture.corpus_hash.clone()),
+                    },
+                };
+                for (label, harness) in [("raw", &zero_tolerance), ("enveloped", &enveloped)] {
+                    let outcome = harness
+                        .run(&cx, &subject, &oracle, &case)
+                        .await
+                        .unwrap_or_else(|error| panic!("{fixture_id} {label} run: {error}"));
+                    let rendered = outcome
+                        .comparison
+                        .divergences
+                        .iter()
+                        .map(|divergence| {
+                            format!(
+                                "{:?} oracle={} subject={}",
+                                divergence.class, divergence.oracle, divergence.subject
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "PROBE {fixture_id} {label}: status={:?} rank_class={:?} divergences={rendered:?}",
+                        outcome.comparison.status, outcome.comparison.rank_class,
+                    );
+                }
+            }
+        });
+    }
+
     /// bd-quill-e6-gauntlet-scale-rm3q.8: pin the exact live divergence the
     /// E6.8 register witness is ingested from, in BOTH comparator
     /// configurations, so the ingested record can never drift from the
