@@ -7715,9 +7715,10 @@ fn relabel_membership_divergence_as_oracle_bug(
     oracle: &str,
     subject: &str,
 ) {
-    report
-        .divergences
-        .retain(|divergence| divergence.class != DivergenceClass::RankMismatch);
+    report.divergences.retain(|divergence| {
+        divergence.class != DivergenceClass::RankMismatch
+            && !is_cutoff_certificate_divergence(divergence)
+    });
     report.divergences.push(Divergence {
         class: DivergenceClass::OracleBug,
         pointer: pointer.to_owned(),
@@ -7741,10 +7742,27 @@ fn relabel_membership_divergence_as_oracle_bug(
         .map(|divergence| divergence.pointer.clone());
 }
 
+/// Whether a divergence is the cutoff-certificate RESTATEMENT of an engine
+/// disagreement the comparison already reports directly (bd-pttxk).
+///
+/// `compare_cutoff_certificates` re-observes membership and count
+/// disagreement at the same-snapshot certificate layer, under pointers rooted
+/// at `/comparison/subject/cutoff_certificate/`. Blame gates and the
+/// membership relabel must treat those rows WITH the divergence they restate:
+/// a membership divergence blamed on the oracle is the same fact whether it
+/// is read from the hit lists or from the certificates describing them, and
+/// leaving the certificate rows behind would make every reviewed oracle-blame
+/// attribution unreachable the moment both engines emit certificates.
+fn is_cutoff_certificate_divergence(divergence: &Divergence) -> bool {
+    divergence
+        .pointer
+        .starts_with("/comparison/subject/cutoff_certificate/")
+}
+
 fn membership_only_divergence(report: &ComparisonReport) -> bool {
     let mut saw_membership_divergence = false;
     for divergence in &report.divergences {
-        if divergence.class.is_auto() {
+        if divergence.class.is_auto() || is_cutoff_certificate_divergence(divergence) {
             continue;
         }
         if divergence.class != DivergenceClass::RankMismatch {
@@ -7760,7 +7778,7 @@ fn membership_only_divergence(report: &ComparisonReport) -> bool {
 fn oracle_over_returned_on_a_membership_divergence(report: &ComparisonReport) -> bool {
     let mut saw_membership_divergence = false;
     for divergence in &report.divergences {
-        if divergence.class.is_auto() {
+        if divergence.class.is_auto() || is_cutoff_certificate_divergence(divergence) {
             continue;
         }
         if divergence.class != DivergenceClass::RankMismatch {
