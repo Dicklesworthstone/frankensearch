@@ -18328,6 +18328,95 @@ mod tests {
         });
     }
 
+    /// bd-pjvl1's concurrent-refresh law for the pinned bundle, proven with
+    /// the real publish-pause seam rather than a sleep: while a publication
+    /// is stopped mid-install (`TempMovedToCurrent`), the pinned read path
+    /// FAILS CLOSED with the typed reconciliation error — it never blends
+    /// the old and new publications into one bundle — and after
+    /// reconciliation a fresh bundle describes exactly the successor under a
+    /// new physical digest, while a bundle taken before the mutation keeps
+    /// describing its own publication.
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn pinned_bundle_fails_closed_mid_publication_and_reconciles_to_the_successor() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("pinned-refresh Keeper directory");
+            let index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create pinned-refresh index");
+            for id in ["a", "b", "c"] {
+                index
+                    .index_document(&cx, &IndexableDocument::new(id, "shared token"))
+                    .await
+                    .expect("index pinned-refresh fixture");
+            }
+            index
+                .commit(&cx)
+                .await
+                .expect("publish pinned-refresh fixture");
+
+            let before = index
+                .search_paginated_pinned(&cx, "shared", 2, 0, 10)
+                .expect("pinned bundle before the mutation");
+            assert_eq!(before.count.total_count, Some(3));
+            assert_eq!(before.expanded.hits.len(), 3);
+
+            index
+                .index_document(&cx, &IndexableDocument::new("d", "shared token"))
+                .await
+                .expect("stage the successor document");
+            let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
+                directory.path(),
+                crate::keeper::PublishCheckpoint::TempMovedToCurrent,
+            );
+            let mut commit = Box::pin(index.commit(&cx));
+            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                &mut commit,
+                &pause,
+                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
+            )
+            .await
+            .expect("reach the pinned-refresh mid-install rendezvous");
+
+            // Mid-install: the pinned path refuses typed. No partial bundle,
+            // no blend of generations, no silent old-snapshot answer.
+            let refused = index
+                .search_paginated_pinned(&cx, "shared", 2, 0, 10)
+                .expect_err("a pinned bundle mid-publication must fail closed");
+            assert!(
+                matches!(
+                    refused,
+                    QuillIndexError::PublicationReconciliationRequired { .. }
+                ),
+                "unexpected mid-publication refusal: {refused:?}"
+            );
+            // The earlier bundle is an immutable value describing its own
+            // publication, untouched by the paused successor.
+            assert_eq!(before.count.total_count, Some(3));
+            assert_eq!(before.expanded.hits.len(), 3);
+            assert_ne!(before.snapshot_sha256, [0; 32]);
+
+            drop(commit);
+            pause.release();
+            index
+                .reconcile_publication(&cx)
+                .await
+                .expect("reconcile the dropped mid-install publication");
+
+            let after = index
+                .search_paginated_pinned(&cx, "shared", 2, 0, 10)
+                .expect("pinned bundle after reconciliation");
+            assert_eq!(after.count.total_count, Some(4));
+            assert_eq!(after.expanded.hits.len(), 4);
+            assert_ne!(
+                after.snapshot_sha256, before.snapshot_sha256,
+                "the successor is a different physical publication"
+            );
+            assert!(after.keeper_generation > before.keeper_generation);
+        });
+    }
+
     #[test]
     fn public_snippet_search_low_fuel_exact_term_refuses_before_tail_dictionary_work() {
         run_with_cx(|cx| async move {
