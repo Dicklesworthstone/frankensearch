@@ -24,7 +24,7 @@ use crate::{
 };
 
 /// Version of the machine-readable ratchet decision artifact.
-pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v4";
+pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v5";
 /// Strict schema for the immutable pointer to an admitted history artifact pair.
 pub const PERF_HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v3";
 /// Maximum directional pass-over-pass regression admitted for a cell.
@@ -76,6 +76,42 @@ impl fmt::Display for PerfGateDecision {
     }
 }
 
+/// Whether the presented evidence was admitted as a valid decision input.
+///
+/// A target loss is still admitted evidence. Structural failures, invalid
+/// controls, incomplete coverage, and inconclusive measurements are rejected
+/// before they can be mistaken for a target decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfEvidenceAdmission {
+    /// The evidence is valid enough to support a target decision.
+    Admitted,
+    /// The evidence is invalid, incomplete, or inconclusive.
+    Rejected,
+}
+
+/// Target result derived only after evidence admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfTargetDecision {
+    /// Every required target passed under the promotion contract.
+    Win,
+    /// Admitted evidence decisively missed a required target.
+    Loss,
+    /// No target decision exists for the presented evidence or mode.
+    NoDecision,
+}
+
+/// Whether one gate result can participate in terminal release aggregation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfReleaseEligibility {
+    /// An admitted, active-gate promotion produced a target WIN.
+    Eligible,
+    /// The result cannot participate in terminal release authorization.
+    Ineligible,
+}
+
 /// One content-addressed input or output named by the evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerfEvidenceFile {
@@ -118,7 +154,7 @@ pub struct PerfCellComparison {
 }
 
 /// Complete machine-readable ratchet decision.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PerfRatchetEvaluation {
     /// Schema identifier.
     pub schema_version: String,
@@ -130,6 +166,18 @@ pub struct PerfRatchetEvaluation {
     pub gate_activated: bool,
     /// Final decision.
     pub decision: PerfGateDecision,
+    /// Independent evidence-admission result.
+    pub evidence_admission: PerfEvidenceAdmission,
+    /// Independent target result. Regression alarms never produce a target
+    /// decision, even when their operator decision is `Allow`.
+    pub target_decision: PerfTargetDecision,
+    /// Whether this gate result may feed terminal release aggregation.
+    pub release_eligibility: PerfReleaseEligibility,
+    /// Terminal lexical replacement authorization.
+    ///
+    /// The ratchet can never grant this authority. It remains `false` until
+    /// bd-3beo consumes an exact-revision all-required-target WIN set.
+    pub flip_authorized: bool,
     /// Stable structured reasons.
     pub reasons: Vec<PerfRatchetReason>,
     /// Median+MAD comparisons against the committed baseline.
@@ -139,6 +187,137 @@ pub struct PerfRatchetEvaluation {
     /// Content-addressed history objects planned before the decision record is
     /// written. Publication occurs only after that record is durable.
     pub history_updates: Vec<PerfEvidenceFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PerfRatchetEvaluationWire {
+    schema_version: String,
+    gate: PerfGate,
+    mode: PerfRatchetMode,
+    gate_activated: bool,
+    decision: PerfGateDecision,
+    evidence_admission: PerfEvidenceAdmission,
+    target_decision: PerfTargetDecision,
+    release_eligibility: PerfReleaseEligibility,
+    flip_authorized: bool,
+    reasons: Vec<PerfRatchetReason>,
+    comparisons: Vec<PerfCellComparison>,
+    evidence: Vec<PerfEvidenceFile>,
+    history_updates: Vec<PerfEvidenceFile>,
+}
+
+impl PerfRatchetEvaluation {
+    fn validate_release_state(&self) -> Result<(), &'static str> {
+        if self.schema_version != PERF_RATCHET_SCHEMA_VERSION {
+            return Err("ratchet evaluation schema version is not current");
+        }
+        if self.flip_authorized {
+            return Err("a ratchet evaluation can never authorize the lexical replacement");
+        }
+        let expected_release_eligibility = if self.mode == PerfRatchetMode::Promotion
+            && self.gate_activated
+            && self.evidence_admission == PerfEvidenceAdmission::Admitted
+            && self.target_decision == PerfTargetDecision::Win
+        {
+            PerfReleaseEligibility::Eligible
+        } else {
+            PerfReleaseEligibility::Ineligible
+        };
+        if self.release_eligibility != expected_release_eligibility {
+            return Err("release eligibility is inconsistent with admission and target decision");
+        }
+        if self.evidence_admission == PerfEvidenceAdmission::Rejected
+            && self.target_decision != PerfTargetDecision::NoDecision
+        {
+            return Err("rejected evidence cannot carry a target decision");
+        }
+        if (self.mode != PerfRatchetMode::Promotion || !self.gate_activated)
+            && self.target_decision != PerfTargetDecision::NoDecision
+        {
+            return Err("only an active-gate promotion can carry a target decision");
+        }
+        match self.target_decision {
+            PerfTargetDecision::Win if self.decision != PerfGateDecision::Allow => {
+                Err("a target WIN requires an Allow operator decision")
+            }
+            PerfTargetDecision::Loss if self.decision != PerfGateDecision::Block => {
+                Err("a target loss requires a Block operator decision")
+            }
+            PerfTargetDecision::NoDecision
+                if self.mode == PerfRatchetMode::Promotion
+                    && self.gate_activated
+                    && self.decision == PerfGateDecision::Allow =>
+            {
+                Err("an active promotion cannot Allow without a target WIN")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl From<&PerfRatchetEvaluation> for PerfRatchetEvaluationWire {
+    fn from(value: &PerfRatchetEvaluation) -> Self {
+        Self {
+            schema_version: value.schema_version.clone(),
+            gate: value.gate,
+            mode: value.mode,
+            gate_activated: value.gate_activated,
+            decision: value.decision,
+            evidence_admission: value.evidence_admission,
+            target_decision: value.target_decision,
+            release_eligibility: value.release_eligibility,
+            flip_authorized: value.flip_authorized,
+            reasons: value.reasons.clone(),
+            comparisons: value.comparisons.clone(),
+            evidence: value.evidence.clone(),
+            history_updates: value.history_updates.clone(),
+        }
+    }
+}
+
+impl From<PerfRatchetEvaluationWire> for PerfRatchetEvaluation {
+    fn from(value: PerfRatchetEvaluationWire) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            gate: value.gate,
+            mode: value.mode,
+            gate_activated: value.gate_activated,
+            decision: value.decision,
+            evidence_admission: value.evidence_admission,
+            target_decision: value.target_decision,
+            release_eligibility: value.release_eligibility,
+            flip_authorized: value.flip_authorized,
+            reasons: value.reasons,
+            comparisons: value.comparisons,
+            evidence: value.evidence,
+            history_updates: value.history_updates,
+        }
+    }
+}
+
+impl Serialize for PerfRatchetEvaluation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate_release_state()
+            .map_err(serde::ser::Error::custom)?;
+        PerfRatchetEvaluationWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PerfRatchetEvaluation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let evaluation = Self::from(PerfRatchetEvaluationWire::deserialize(deserializer)?);
+        evaluation
+            .validate_release_state()
+            .map_err(serde::de::Error::custom)?;
+        Ok(evaluation)
+    }
 }
 
 /// Inputs to one ratchet evaluation.
@@ -353,6 +532,27 @@ impl DecisionState {
             PerfGateDecision::Allow
         }
     }
+
+    const fn evidence_admission(&self) -> PerfEvidenceAdmission {
+        if self.fatal || self.quarantined {
+            PerfEvidenceAdmission::Rejected
+        } else {
+            PerfEvidenceAdmission::Admitted
+        }
+    }
+
+    fn target_decision(&self, mode: PerfRatchetMode, gate_activated: bool) -> PerfTargetDecision {
+        if mode != PerfRatchetMode::Promotion
+            || !gate_activated
+            || self.evidence_admission() == PerfEvidenceAdmission::Rejected
+        {
+            PerfTargetDecision::NoDecision
+        } else if self.blocked {
+            PerfTargetDecision::Loss
+        } else {
+            PerfTargetDecision::Win
+        }
+    }
 }
 
 fn finish_evaluation(
@@ -363,12 +563,23 @@ fn finish_evaluation(
     comparisons: Vec<PerfCellComparison>,
     evidence: Vec<PerfEvidenceFile>,
 ) -> PerfRatchetEvaluation {
+    let evidence_admission = state.evidence_admission();
+    let target_decision = state.target_decision(mode, gate_activated);
+    let release_eligibility = if target_decision == PerfTargetDecision::Win {
+        PerfReleaseEligibility::Eligible
+    } else {
+        PerfReleaseEligibility::Ineligible
+    };
     PerfRatchetEvaluation {
         schema_version: PERF_RATCHET_SCHEMA_VERSION.to_owned(),
         gate,
         mode,
         gate_activated,
         decision: state.decision(),
+        evidence_admission,
+        target_decision,
+        release_eligibility,
+        flip_authorized: false,
         reasons: state.reasons,
         comparisons,
         evidence,
@@ -5414,6 +5625,168 @@ mod tests {
 
         state.fatal("test.fatal", "invalid artifact");
         assert_eq!(state.decision(), PerfGateDecision::Block);
+    }
+
+    #[test]
+    fn release_state_separates_admission_target_and_terminal_authority() {
+        let win = finish_evaluation(
+            PerfGate::Qg2,
+            PerfRatchetMode::Promotion,
+            true,
+            DecisionState::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(win.decision, PerfGateDecision::Allow);
+        assert_eq!(win.evidence_admission, PerfEvidenceAdmission::Admitted);
+        assert_eq!(win.target_decision, PerfTargetDecision::Win);
+        assert_eq!(win.release_eligibility, PerfReleaseEligibility::Eligible);
+        assert!(!win.flip_authorized);
+
+        let mut loss_state = DecisionState::default();
+        loss_state.block("test.target_missed", "valid evidence lost");
+        let loss = finish_evaluation(
+            PerfGate::Qg2,
+            PerfRatchetMode::Promotion,
+            true,
+            loss_state,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(loss.decision, PerfGateDecision::Block);
+        assert_eq!(loss.evidence_admission, PerfEvidenceAdmission::Admitted);
+        assert_eq!(loss.target_decision, PerfTargetDecision::Loss);
+        assert_eq!(loss.release_eligibility, PerfReleaseEligibility::Ineligible);
+        assert!(!loss.flip_authorized);
+
+        for mut refused_state in [
+            {
+                let mut state = DecisionState::default();
+                state.quarantine("test.inconclusive", "no decision");
+                state
+            },
+            {
+                let mut state = DecisionState::default();
+                state.fatal("test.invalid", "invalid evidence");
+                state
+            },
+        ] {
+            let refused = finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::Promotion,
+                true,
+                std::mem::take(&mut refused_state),
+                Vec::new(),
+                Vec::new(),
+            );
+            assert_eq!(refused.evidence_admission, PerfEvidenceAdmission::Rejected);
+            assert_eq!(refused.target_decision, PerfTargetDecision::NoDecision);
+            assert_eq!(
+                refused.release_eligibility,
+                PerfReleaseEligibility::Ineligible
+            );
+            assert!(!refused.flip_authorized);
+        }
+
+        for (mode, activated) in [
+            (PerfRatchetMode::RegressionAlarm, true),
+            (PerfRatchetMode::Promotion, false),
+        ] {
+            let non_terminal = finish_evaluation(
+                PerfGate::Qg2,
+                mode,
+                activated,
+                DecisionState::default(),
+                Vec::new(),
+                Vec::new(),
+            );
+            assert_eq!(non_terminal.target_decision, PerfTargetDecision::NoDecision);
+            assert_eq!(
+                non_terminal.release_eligibility,
+                PerfReleaseEligibility::Ineligible
+            );
+            assert!(!non_terminal.flip_authorized);
+        }
+    }
+
+    #[test]
+    fn release_state_wire_rejects_missing_unknown_and_contradictory_fields() {
+        let evaluation = finish_evaluation(
+            PerfGate::Qg2,
+            PerfRatchetMode::Promotion,
+            true,
+            DecisionState::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let value = serde_json::to_value(&evaluation).expect("serialize valid release state");
+        assert_eq!(value["schema_version"], PERF_RATCHET_SCHEMA_VERSION);
+        assert_eq!(value["evidence_admission"], "admitted");
+        assert_eq!(value["target_decision"], "win");
+        assert_eq!(value["release_eligibility"], "eligible");
+        assert_eq!(value["flip_authorized"], false);
+        assert_eq!(
+            serde_json::from_value::<PerfRatchetEvaluation>(value.clone())
+                .expect("reload valid release state"),
+            evaluation
+        );
+
+        for field in [
+            "evidence_admission",
+            "target_decision",
+            "release_eligibility",
+            "flip_authorized",
+        ] {
+            let mut missing = value.clone();
+            missing
+                .as_object_mut()
+                .expect("evaluation object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<PerfRatchetEvaluation>(missing).is_err(),
+                "missing {field} must reject"
+            );
+        }
+
+        let mut unknown = value.clone();
+        unknown.as_object_mut().expect("evaluation object").insert(
+            "caller_claimed_win".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        assert!(serde_json::from_value::<PerfRatchetEvaluation>(unknown).is_err());
+
+        for (field, replacement) in [
+            ("flip_authorized", serde_json::Value::Bool(true)),
+            (
+                "evidence_admission",
+                serde_json::Value::String("rejected".to_owned()),
+            ),
+            (
+                "target_decision",
+                serde_json::Value::String("loss".to_owned()),
+            ),
+            (
+                "release_eligibility",
+                serde_json::Value::String("ineligible".to_owned()),
+            ),
+        ] {
+            let mut contradictory = value.clone();
+            contradictory
+                .as_object_mut()
+                .expect("evaluation object")
+                .insert(field.to_owned(), replacement);
+            assert!(
+                serde_json::from_value::<PerfRatchetEvaluation>(contradictory).is_err(),
+                "contradictory {field} must reject"
+            );
+        }
+
+        let mut forged = evaluation;
+        forged.flip_authorized = true;
+        assert!(
+            serde_json::to_value(&forged).is_err(),
+            "serialization must not emit ratchet-granted flip authority"
+        );
     }
 
     #[test]

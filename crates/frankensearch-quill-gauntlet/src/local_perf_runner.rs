@@ -4768,6 +4768,7 @@ fn wait_for_qg1_authority_child(
     let mut last_sequence = None;
     let mut received_register_count = 0_u64;
     let mut startup_complete = false;
+    let mut forwarder_finished = false;
     let mut recovered_wait_error = None;
     let mut process_group_recovery = LocalPerfProcessGroupRecovery::NotRequired;
 
@@ -4838,6 +4839,15 @@ fn wait_for_qg1_authority_child(
                     "QG-1 startup authority did not complete before the total deadline".to_owned(),
                 ),
             );
+        }
+
+        // Once the forwarder has sent Closed, its thread exits and the event
+        // channel closes. Stop reading from it and just wait for the child to
+        // exit, so a subsequent RecvTimeoutError::Disconnected is not mistaken for
+        // a forwarder failure.
+        if forwarder_finished {
+            std::thread::sleep(WAIT_RECOVERY_POLL_INTERVAL);
+            continue;
         }
 
         let wait = if startup_complete {
@@ -5008,7 +5018,9 @@ fn wait_for_qg1_authority_child(
                     );
                 }
             },
-            Ok(Qg1AuthorityForwarderEvent::Closed) if startup_complete => {}
+            Ok(Qg1AuthorityForwarderEvent::Closed) if startup_complete => {
+                forwarder_finished = true;
+            }
             Ok(Qg1AuthorityForwarderEvent::Closed) => {
                 return finish_qg1_authority_after_root_exit(
                     child,

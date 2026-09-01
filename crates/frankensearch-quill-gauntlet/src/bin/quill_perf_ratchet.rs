@@ -2838,6 +2838,27 @@ mod tests {
             mode: PerfRatchetMode::Promotion,
             gate_activated: true,
             decision,
+            evidence_admission: match decision {
+                PerfGateDecision::Allow | PerfGateDecision::Block => {
+                    frankensearch_quill_gauntlet::PerfEvidenceAdmission::Admitted
+                }
+                PerfGateDecision::Quarantine => {
+                    frankensearch_quill_gauntlet::PerfEvidenceAdmission::Rejected
+                }
+            },
+            target_decision: match decision {
+                PerfGateDecision::Allow => frankensearch_quill_gauntlet::PerfTargetDecision::Win,
+                PerfGateDecision::Block => frankensearch_quill_gauntlet::PerfTargetDecision::Loss,
+                PerfGateDecision::Quarantine => {
+                    frankensearch_quill_gauntlet::PerfTargetDecision::NoDecision
+                }
+            },
+            release_eligibility: if decision == PerfGateDecision::Allow {
+                frankensearch_quill_gauntlet::PerfReleaseEligibility::Eligible
+            } else {
+                frankensearch_quill_gauntlet::PerfReleaseEligibility::Ineligible
+            },
+            flip_authorized: false,
             reasons: Vec::new(),
             comparisons: Vec::new(),
             evidence: Vec::new(),

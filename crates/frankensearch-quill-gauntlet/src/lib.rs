@@ -233,9 +233,10 @@ pub use perf_evidence::{
 };
 pub use perf_ratchet::{
     PERF_HISTORY_POINTER_SCHEMA_VERSION, PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT,
-    PERF_RATCHET_SCHEMA_VERSION, PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile,
-    PerfGateDecision, PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetQg1AuthoritySets,
-    PerfRatchetQg6AuthoritySets, PerfRatchetReason, PerfRatchetRequest, evaluate_perf_ratchet,
+    PERF_RATCHET_SCHEMA_VERSION, PERF_REGRESSION_ROBUST_Z, PerfCellComparison,
+    PerfEvidenceAdmission, PerfEvidenceFile, PerfGateDecision, PerfRatchetEvaluation,
+    PerfRatchetMode, PerfRatchetQg1AuthoritySets, PerfRatchetQg6AuthoritySets, PerfRatchetReason,
+    PerfRatchetRequest, PerfReleaseEligibility, PerfTargetDecision, evaluate_perf_ratchet,
     evaluate_perf_ratchet_against_authorities, evaluate_perf_ratchet_against_qg1_authorities,
     is_explicit_bootstrap, is_explicit_bootstrap_for,
 };
