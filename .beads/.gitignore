@@ -17,3 +17,7 @@ beads.base.jsonl
 # .beads.db.schema-migration-<ts>-<pid>-0.vacuum-fsqlite-ns-{gate,use}.
 *-fsqlite-ns-gate
 *-fsqlite-ns-use
+*.db-journal
+*.db-wal*
+*.vacuum-wal-cert*
+*.fsqlite-migration-state

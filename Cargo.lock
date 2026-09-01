@@ -1742,6 +1742,7 @@ dependencies = [
  "fsqlite-types",
  "libc",
  "memmap2",
+ "raptorq",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -4508,6 +4509,12 @@ checksum = "5da7e78a036ce858e8d55b7e7dc8ba3a88b78350fd2155d3591bbd966b58589e"
 dependencies = [
  "rustversion",
 ]
+
+[[package]]
+name = "raptorq"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "rawpointer"

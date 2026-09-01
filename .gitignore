@@ -165,3 +165,5 @@ newfile.txt
 # Skill-loop / repo-janitor scratch
 .skill-loop-progress.md
 .skill-loop-progress-*.md
+# br doctor per-run artifacts
+.doctor/
