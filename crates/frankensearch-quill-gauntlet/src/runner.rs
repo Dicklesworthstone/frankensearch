@@ -8998,7 +8998,7 @@ mod tests {
         LexicalHydrationSelection, LexicalNonLexicalControlKind, LexicalNormalizedQuery,
         LexicalObservation, LexicalObservationContext, LexicalObservationOutcome, LexicalObserved,
         LexicalQueryClass, LexicalScoreSource, LexicalWinnerOrigin, LexicalWinnerProjection,
-        ScoreEpsilonReason, SensitiveValueObservation, lexical_mismatch_is_reviewed_score_epsilon,
+        ScoreEpsilonReason, SensitiveValueObservation,
     };
     use crate::engine::{EngineFamily, TANTIVY_ORACLE_CONFIG_HASH};
     use crate::generator::{
@@ -25142,51 +25142,16 @@ mod tests {
                 "default profile must be admissible: rank_mismatches={:?} lexical_mismatches={:?} coverage={:?} cases={:?}",
                 report.mismatches, report.lexical_mismatches, report.lexical_coverage, report.cases,
             );
-            // bd-pttxk: at current HEAD, after the post-9wu3p scoring changes,
-            // the reviewed DIV-007 summation-association mechanism is observed
-            // on query shapes whose ranks do NOT flip. Historical bisection
-            // was unavailable, so this is an observed current state rather
-            // than attribution to specific commits. The rank axis
-            // auto-classifies these cases as `ScoreEpsilon`, while the total
-            // lexical contract still reports the same one-ULP score
-            // difference. bd-gx7n4/bd-73ok3 admit exactly that shape at case
-            // level; these assertions state the SAME law at report level
-            // instead of demanding zero lexical evidence. What this still
-            // refuses: any mismatch that is not the `Score` class on a
-            // score-bits path, any bit distance outside the reviewed
-            // SummationAssociation envelope, any mismatching case whose rank
-            // axis did not auto-classify, and any non-passing disposition.
+            // bd-pttxk pinned a live DIV-007 summation-association recurrence
+            // here. bd-5o5z8's structural mirror preserves tantivy's nested
+            // Should groups, so quill now reproduces tantivy's summation
+            // order bit-for-bit and the recurrence is ELIMINATED. The live
+            // lane pins that convergence: a lexical mismatch reappearing is
+            // a NEW register observation (a mirror regression), never a
+            // revival of the reviewed DIV-007/008 envelope.
             assert!(
-                !report.lexical_mismatches.is_empty(),
-                "the live lane must retain a current summation-association recurrence"
-            );
-            for group in &report.lexical_mismatches {
-                assert!(
-                    lexical_mismatch_is_reviewed_score_epsilon(
-                        &group.mismatch,
-                        ScoreEpsilonReason::SummationAssociation,
-                    ),
-                    "a default-lane lexical mismatch group must be inside the \
-                     reviewed summation-association score envelope: {group:?}"
-                );
-                assert!(
-                    group.case_ids.iter().all(|case_id| {
-                        report.cases.iter().any(|case| {
-                            case.case_id == *case_id
-                                && case.disposition == CampaignDisposition::AutoClassified
-                                && case.comparison_status == Some(ComparisonStatus::Classified)
-                                && case.rank_class == Some(RankClass::ScoreEpsilon)
-                        })
-                    }),
-                    "every mismatch group must name only cases classified on the same rank axis: {group:?}"
-                );
-            }
-            assert!(
-                report.lexical_mismatches.iter().any(|group| {
-                    group.mismatch.path.contains("_hydration/")
-                        && group.mismatch.path.ends_with("/raw_lexical_score_bits")
-                }),
-                "the live lane must retain hydration-axis raw-score evidence: {:?}",
+                report.lexical_mismatches.is_empty(),
+                "the live default lane must be lexically exact under the structural mirror (bd-5o5z8): {:?}",
                 report.lexical_mismatches,
             );
             for case in &report.cases {
@@ -25197,40 +25162,9 @@ mod tests {
                         mismatch_count: 0,
                         ..
                     } => {}
-                    CampaignLexicalCaseSummary::CoreLexicalV3 {
-                        status: LexicalComparisonStatus::Mismatch,
-                        first_mismatch: Some(first_mismatch),
-                        mismatch_count,
-                        ..
-                    } => {
-                        assert!(
-                            *mismatch_count > 0,
-                            "a mismatch verdict must count at least one mismatch: {case:?}"
-                        );
-                        assert_eq!(
-                            case.disposition,
-                            CampaignDisposition::AutoClassified,
-                            "a lexically mismatching default-lane case must be the \
-                             auto-classified rank divergence, nothing looser: {case:?}"
-                        );
-                        assert_eq!(
-                            case.rank_class,
-                            Some(RankClass::ScoreEpsilon),
-                            "the lexical mismatch must BE the classified rank \
-                             divergence: {case:?}"
-                        );
-                        assert!(
-                            lexical_mismatch_is_reviewed_score_epsilon(
-                                first_mismatch,
-                                ScoreEpsilonReason::SummationAssociation,
-                            ),
-                            "the retained first mismatch must be inside the reviewed \
-                             summation-association score envelope: {first_mismatch:?}"
-                        );
-                    }
                     other => panic!(
-                        "default-lane lexical contract must be Equivalent or the \
-                         reviewed score mismatch: {other:?}"
+                        "default-lane lexical contract must be Equivalent under \
+                         the structural mirror (bd-5o5z8): {other:?}"
                     ),
                 }
             }
