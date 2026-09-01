@@ -24470,12 +24470,11 @@ mod tests {
                 &mutated_report,
             );
 
-            let error = match store.load_integrity_checked_campaign(&report.run_id) {
-                Err(error) => error,
-                Ok(_) => panic!(
+            let Err(error) = store.load_integrity_checked_campaign(&report.run_id) else {
+                panic!(
                     "semantic replay must reject the canonical typed mutation {label:?}, \
                      but the mutated campaign loaded integrity-checked"
-                ),
+                )
             };
             assert_reached_past_completion(label, &error);
             std::fs::write(&target_case_path, &original_case_bytes)
