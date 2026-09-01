@@ -3419,6 +3419,192 @@ pub mod authority_publisher {
             );
         }
 
+        /// Acceptance: fresh reconciliation returns `CommittedThenSuperseded`
+        /// (bd-ycng6).
+        ///
+        /// Publisher A's genesis attempt goes unknown AFTER the slot write and
+        /// floor advance (owner frame never lands), so A holds a bounded
+        /// permit for a candidate that is in fact durable. Publisher B then
+        /// resolves the live head and publishes sequence 2, advancing the
+        /// floor past A's candidate. A's fresh reconcile must recognize its
+        /// own candidate in the slot, observe the floor beyond it, resolve
+        /// the pair, and report `CommittedThenSuperseded` carrying B's head —
+        /// never `StillUnknown`, never a fork, and never a mutation.
+        #[test]
+        fn unknown_attempt_reconciles_committed_then_superseded_after_a_successor() {
+            use platform::TestBoundary as B;
+
+            let root_path = fixture_root("superseded");
+            let root = admit(&root_path);
+            let floor = InMemoryAntiRollbackFloorStoreV1::new();
+            let publisher_a = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher A binds");
+            let genesis = authority(1, None);
+            let outcome = {
+                let _hook = platform::install_test_hook(move |boundary| {
+                    if boundary == B::BeforePublishOwnerFrame {
+                        Err(GenerationRootError::new(
+                            GenerationRootErrorKind::Io,
+                            GenerationRootStage::SyncRegularFile,
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                publisher_a
+                    .publish(
+                        genesis,
+                        ExpectedAuthorityPairV1::default(),
+                        Some(&floor),
+                        [0x51; 16],
+                    )
+                    .expect("interrupted genesis runs")
+            };
+            let PublicationOutcomeV1::CommitOutcomeUnknown(permit) = outcome else {
+                panic!("owner-frame crash must be unknown: {outcome:?}");
+            };
+            assert_eq!(permit.stage, AttemptStageV1::OwnerFrame);
+
+            // B resolves the durable genesis and publishes the successor.
+            let root_b = admit(&root_path);
+            let publisher_b = root_b
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_B,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher B binds");
+            let bytes = authority_bytes(&root_path);
+            let pair = decode_pair(&bytes, ROOT_ID).expect("pair decodes");
+            let genesis_slot = pair.second.expect("genesis slot is durable");
+            assert_eq!(genesis_slot.authority, genesis);
+            let successor = authority(2, Some(genesis.fingerprint()));
+            let outcome_b = publisher_b
+                .publish(successor, pair, Some(&floor), [0x52; 16])
+                .expect("successor publication runs");
+            let PublicationOutcomeV1::Committed { slot: head, .. } = outcome_b else {
+                panic!("successor must commit: {outcome_b:?}");
+            };
+
+            // A's fresh reconcile: candidate durable, floor beyond it, head
+            // resolved to B's successor.
+            let before = authority_bytes(&root_path);
+            let verdict = publisher_a
+                .reconcile(&permit, Some(&floor))
+                .expect("reconcile runs");
+            let ReconcileOutcomeV1::CommittedThenSuperseded { head: observed } = verdict else {
+                panic!("superseded candidate must reconcile as such: {verdict:?}");
+            };
+            assert_eq!(observed, head);
+            assert_eq!(
+                authority_bytes(&root_path),
+                before,
+                "reconciliation must not mutate the authority"
+            );
+        }
+
+        /// Acceptance: two real publishers, one winner (bd-ycng6).
+        ///
+        /// Two publisher handles over independently opened descriptors race
+        /// the SAME genesis sequence from two threads. The kernel flock
+        /// serializes them: exactly one commits; the other observes either
+        /// the contended lock or, after the winner, the no-longer-default
+        /// expected pair — both ordinary `NotCommitted` with ZERO authority
+        /// mutation from the loser. A retry with the stale default pair
+        /// stays refused, and the durable bytes are exactly the winner's.
+        #[test]
+        fn two_real_publishers_race_one_wins_and_the_loser_never_mutates() {
+            let root_path = fixture_root("race");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let path_a = root_path.clone();
+            let path_b = root_path.clone();
+            let barrier_a = std::sync::Arc::clone(&barrier);
+            let barrier_b = std::sync::Arc::clone(&barrier);
+            let run = |path: std::path::PathBuf,
+                       writer: [u8; 16],
+                       key: u8,
+                       barrier: std::sync::Arc<std::sync::Barrier>| {
+                move || {
+                    let root = admit(&path);
+                    let publisher = root
+                        .authority_publisher(
+                            ROOT_ID,
+                            writer,
+                            GenerationRootSecurityProfileV1::CooperativeLocal,
+                        )
+                        .expect("racing publisher binds");
+                    barrier.wait();
+                    publisher.publish(
+                        authority(1, None),
+                        ExpectedAuthorityPairV1::default(),
+                        None,
+                        [key; 16],
+                    )
+                }
+            };
+            let thread_a = std::thread::spawn(run(path_a, WRITER_A, 0xA1, barrier_a));
+            let thread_b = std::thread::spawn(run(path_b, WRITER_B, 0xB1, barrier_b));
+            let outcome_a = thread_a
+                .join()
+                .expect("publisher A thread")
+                .expect("publisher A runs");
+            let outcome_b = thread_b
+                .join()
+                .expect("publisher B thread")
+                .expect("publisher B runs");
+
+            let (winner, loser) = match (&outcome_a, &outcome_b) {
+                (PublicationOutcomeV1::Committed { slot, .. }, other) => (*slot, other),
+                (other, PublicationOutcomeV1::Committed { slot, .. }) => (*slot, other),
+                pair => panic!("exactly one publisher must commit: {pair:?}"),
+            };
+            assert!(
+                matches!(loser, PublicationOutcomeV1::NotCommitted(_)),
+                "the loser must be an ordinary refusal, never Unknown: {loser:?}"
+            );
+
+            // Durable bytes hold exactly the winner; sequence 1 is slot 1.
+            let bytes = authority_bytes(&root_path);
+            let pair = decode_pair(&bytes, ROOT_ID).expect("pair decodes");
+            assert_eq!(
+                pair,
+                ExpectedAuthorityPairV1 {
+                    first: None,
+                    second: Some(winner)
+                }
+            );
+
+            // A retry against the stale default pair is refused with zero
+            // mutation: the bytes before and after are identical.
+            let root = admit(&root_path);
+            let retry = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_B,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("retry publisher binds");
+            let before = authority_bytes(&root_path);
+            let outcome = retry
+                .publish(
+                    authority(1, None),
+                    ExpectedAuthorityPairV1::default(),
+                    None,
+                    [0xB2; 16],
+                )
+                .expect("stale retry runs");
+            assert!(
+                matches!(outcome, PublicationOutcomeV1::NotCommitted(_)),
+                "a stale expected pair must refuse: {outcome:?}"
+            );
+            assert_eq!(authority_bytes(&root_path), before);
+        }
+
         #[test]
         fn many_publications_never_change_directory_entries_or_anchor_inodes() {
             use std::os::unix::fs::MetadataExt as _;
