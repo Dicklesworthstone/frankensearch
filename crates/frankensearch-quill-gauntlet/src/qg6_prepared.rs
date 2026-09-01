@@ -1352,6 +1352,7 @@ impl Qg6SemanticContract {
             });
         }
         let mut previous_query_id: Option<&str> = None;
+        let mut roles_with_hits = BTreeSet::new();
         for (index, group) in self.groups.iter().enumerate() {
             if group.group_id != usize_to_u64(index)?
                 || previous_query_id
@@ -1363,9 +1364,23 @@ impl Qg6SemanticContract {
             }
             group.query.verify()?;
             for role in Qg6ArmRole::ALL {
-                group.roles.get(role).verify(self.k, self.document_count)?;
+                let receipt = group.roles.get(role);
+                receipt.verify(self.k, self.document_count)?;
+                if receipt.returned_count != 0 {
+                    roles_with_hits.insert(role);
+                }
             }
             previous_query_id = Some(group.query.query_id.as_str());
+        }
+        if let Some(role) = Qg6ArmRole::ALL
+            .into_iter()
+            .find(|role| !roles_with_hits.contains(role))
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!(
+                    "QG-6 semantic contract has vacuous zero-hit correctness evidence for {role:?}"
+                ),
+            });
         }
         Ok(())
     }
@@ -7237,6 +7252,79 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].query.query_id < pair[1].query.query_id)
         );
+    }
+
+    #[test]
+    fn semantic_contract_rejects_vacuous_zero_hit_evidence_for_every_role() {
+        let queries = queries();
+        let nonempty = Qg6ResultReceipt::from_redacted_hits(
+            vec![Qg6RankedHitReceipt {
+                document_id_sha256: "1".repeat(64),
+                score_bits: 1.0_f32.to_bits(),
+            }],
+            1,
+            100_000,
+            10,
+        )
+        .expect("nonempty result receipt");
+        let empty = Qg6ResultReceipt::from_redacted_hits(Vec::new(), 0, 100_000, 10)
+            .expect("empty result receipt remains valid for an individual no-match query");
+        let identity = Qg6ExperimentIdentity {
+            corpus_sha256: "a".repeat(64),
+            query_manifest_sha256: query_manifest_sha256(&queries),
+            config_contract_sha256: "b".repeat(64),
+            document_count: 100_000,
+            k: 10,
+        };
+
+        let per_query_no_match = queries
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let receipt = if index == 0 { &empty } else { &nonempty };
+                Qg6SixArmResultReceipts {
+                    tantivy_null_left: receipt.clone(),
+                    tantivy_null_right: receipt.clone(),
+                    quill_null_left: receipt.clone(),
+                    quill_null_right: receipt.clone(),
+                    effect_control: receipt.clone(),
+                    effect_treatment: receipt.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        Qg6SemanticContract::from_receipts(&identity, &queries, &per_query_no_match)
+            .expect("an individual no-match query remains valid when every role does real work");
+
+        for empty_role in Qg6ArmRole::ALL {
+            let mut receipts = queries
+                .iter()
+                .map(|_| Qg6SixArmResultReceipts {
+                    tantivy_null_left: nonempty.clone(),
+                    tantivy_null_right: nonempty.clone(),
+                    quill_null_left: nonempty.clone(),
+                    quill_null_right: nonempty.clone(),
+                    effect_control: nonempty.clone(),
+                    effect_treatment: nonempty.clone(),
+                })
+                .collect::<Vec<_>>();
+            for roles in &mut receipts {
+                match empty_role {
+                    Qg6ArmRole::TantivyNullLeft => roles.tantivy_null_left = empty.clone(),
+                    Qg6ArmRole::TantivyNullRight => roles.tantivy_null_right = empty.clone(),
+                    Qg6ArmRole::QuillNullLeft => roles.quill_null_left = empty.clone(),
+                    Qg6ArmRole::QuillNullRight => roles.quill_null_right = empty.clone(),
+                    Qg6ArmRole::EffectControl => roles.effect_control = empty.clone(),
+                    Qg6ArmRole::EffectTreatment => roles.effect_treatment = empty.clone(),
+                }
+            }
+
+            let error = Qg6SemanticContract::from_receipts(&identity, &queries, &receipts)
+                .expect_err("an all-zero execution role must not certify correctness parity");
+            assert!(
+                error.to_string().contains(&format!("{empty_role:?}")),
+                "refusal must name the vacuous role: {error}"
+            );
+        }
     }
 
     #[test]
