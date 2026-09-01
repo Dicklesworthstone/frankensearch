@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 //! Quill is frankensearch's native, deterministic lexical engine.
 //!
 //! This crate owns the schema and scoring contracts shared by the ingest,

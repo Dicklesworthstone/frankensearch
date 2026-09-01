@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! E3.5 whole-segment concat-merge scaling benchmark.
 //!
 //! Every case contains the same 1,024 logical documents, 16 tombstones, and

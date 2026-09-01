@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Shared-nothing parallel segment build and radix execution controls.
 //!
 //! Quill partitions ingest into `W` shard accumulators and builds independent

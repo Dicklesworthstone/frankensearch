@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Same-binary TERMDICT-versus-sorted-`Vec<String>` honesty benchmark.
 //!
 //! Deterministic field-major rows, section spans, exact probes, and prefix

@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Sealed-segment query fan-out A/B: serial per-segment scoring vs rayon
 //! fan-out with per-segment partial collectors (`bd-quill-e4-argus-3ycz.9`).
 //!

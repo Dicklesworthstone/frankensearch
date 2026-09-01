@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! E3.6 tombstone-folding compaction versus canonical live-document rebuild.
 //!
 //! Every timed cell starts from one immutable 20k-document FSLX segment with

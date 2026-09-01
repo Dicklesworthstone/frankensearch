@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Deferred grouped `MaxScore` A/B for nested pure-term unions
 //! (`bd-quill-e8-perf-doctrine-x4e4.5.1`).
 //!

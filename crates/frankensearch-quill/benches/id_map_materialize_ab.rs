@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Same-binary IDMAP winner-materialization benchmark.
 //!
 //! The baseline is the incumbent reopened ordinal sidecar shape: a resident

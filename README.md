@@ -508,7 +508,7 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
         // `open_hybrid` opens every arm of the index directory and attaches
         // the active lexical reader (blue-green roots resolve to their
         // active engine dir; foreign or damaged layouts are typed errors).
-        use frankensearch::LexicalSearch;
+        use frankensearch::LexicalRead;
 
         let parts = frankensearch::open_hybrid(
             &cx,

@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Same-binary scalar-versus-`wide::u32x8` differential and throughput probe.
 //!
 //! Correctness is asserted before timing. The paired A/B ratio alternates the

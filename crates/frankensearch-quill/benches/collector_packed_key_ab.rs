@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Top-k collector selection-key A/B: the shipping `HeapEntry` (f32
 //! `total_cmp` + docid tiebreak) vs a packed-u64 selection key that reduces
 //! each heap comparison to one native integer compare (`bd-y1ab`).

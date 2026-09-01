@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! bd-8nqz.4.1: run the native enriched witness against the REAL engines.
 //!
 //! The unit tests beside the oracle exercise the adjudicator on synthetic

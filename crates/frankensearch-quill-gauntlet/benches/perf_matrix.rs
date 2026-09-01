@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Same-binary Quill/Tantivy performance matrix for QG-1 through QG-10.
 //!
 //! The default invocation is deliberately a one-cell smoke slice. A release

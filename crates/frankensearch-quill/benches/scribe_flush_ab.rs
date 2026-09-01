@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Hash/arena-chain Delta seal vs columnar/radix Scribe seal
 //! (`bd-quill-e1-scribe-bejd.7`).
 //!

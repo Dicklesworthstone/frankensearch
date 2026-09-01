@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 //! Dev-only conformance harness for Quill and the pinned Tantivy oracle.
 //!
 //! This crate is a workspace member but intentionally excluded from

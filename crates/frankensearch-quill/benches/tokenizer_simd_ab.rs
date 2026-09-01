@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Default-analyzer tokenizer admission probe: the `bd-l5x3` boundary-mask
 //! candidate vs Quill's shipping two-pass SWAR classifier.
 //!
