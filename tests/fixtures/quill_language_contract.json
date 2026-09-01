@@ -9,8 +9,22 @@
     "score_epsilon": 0.0001
   },
   "fixture_execution": {
-    "lexical_loader_executes": ["schema", "analyzers", "helpers", "bm25_operation_order"],
-    "quill_differential_executes": ["canonical_query_trees", "ranking", "statistics_transitions", "writer_reader_lifecycle", "snippets", "durability", "errors", "concurrency"]
+    "lexical_loader_executes": [
+      "schema",
+      "analyzers",
+      "helpers",
+      "bm25_operation_order"
+    ],
+    "quill_differential_executes": [
+      "canonical_query_trees",
+      "ranking",
+      "statistics_transitions",
+      "writer_reader_lifecycle",
+      "snippets",
+      "durability",
+      "errors",
+      "concurrency"
+    ]
   },
   "source_corpora": [
     {
@@ -36,26 +50,62 @@
       "analyzer": "frankensearch_default",
       "input": "Rust POL-358",
       "expected_tokens": [
-        { "text": "rust", "position": 0, "offset_from": 0, "offset_to": 4, "position_length": 1 },
-        { "text": "pol", "position": 1, "offset_from": 5, "offset_to": 8, "position_length": 1 },
-        { "text": "358", "position": 2, "offset_from": 9, "offset_to": 12, "position_length": 1 }
+        {
+          "text": "rust",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 4,
+          "position_length": 1
+        },
+        {
+          "text": "pol",
+          "position": 1,
+          "offset_from": 5,
+          "offset_to": 8,
+          "position_length": 1
+        },
+        {
+          "text": "358",
+          "position": 2,
+          "offset_from": 9,
+          "offset_to": 12,
+          "position_length": 1
+        }
       ]
     },
     {
       "id": "analyzer-default-unicode-lower-offsets",
       "analyzer": "frankensearch_default",
-      "input": "ÉCLAIR 東京",
+      "input": "\u00c9CLAIR \u6771\u4eac",
       "expected_tokens": [
-        { "text": "éclair", "position": 0, "offset_from": 0, "offset_to": 7, "position_length": 1 },
-        { "text": "東京", "position": 1, "offset_from": 8, "offset_to": 14, "position_length": 1 }
+        {
+          "text": "\u00e9clair",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 7,
+          "position_length": 1
+        },
+        {
+          "text": "\u6771\u4eac",
+          "position": 1,
+          "offset_from": 8,
+          "offset_to": 14,
+          "position_length": 1
+        }
       ]
     },
     {
       "id": "analyzer-default-unicode-lower-expansion",
       "analyzer": "frankensearch_default",
-      "input": "İ",
+      "input": "\u0130",
       "expected_tokens": [
-        { "text": "i̇", "position": 0, "offset_from": 0, "offset_to": 2, "position_length": 1 }
+        {
+          "text": "i\u0307",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 2,
+          "position_length": 1
+        }
       ]
     },
     {
@@ -63,48 +113,132 @@
       "analyzer": "hyphen_normalize",
       "input": "BD-Q3FY search",
       "expected_tokens": [
-        { "text": "bd-q3fy", "position": 0, "offset_from": 0, "offset_to": 7, "position_length": 1 },
-        { "text": "bd", "position": 0, "offset_from": 0, "offset_to": 7, "position_length": 1 },
-        { "text": "q3fy", "position": 0, "offset_from": 0, "offset_to": 7, "position_length": 1 },
-        { "text": "search", "position": 1, "offset_from": 8, "offset_to": 14, "position_length": 1 }
+        {
+          "text": "bd-q3fy",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 7,
+          "position_length": 1
+        },
+        {
+          "text": "bd",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 7,
+          "position_length": 1
+        },
+        {
+          "text": "q3fy",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 7,
+          "position_length": 1
+        },
+        {
+          "text": "search",
+          "position": 1,
+          "offset_from": 8,
+          "offset_to": 14,
+          "position_length": 1
+        }
       ]
     },
     {
       "id": "analyzer-hyphen-cjk-bigrams",
       "analyzer": "hyphen_normalize",
-      "input": "搜索引擎",
+      "input": "\u641c\u7d22\u5f15\u64ce",
       "expected_tokens": [
-        { "text": "搜索", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
-        { "text": "索引", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
-        { "text": "引擎", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 }
+        {
+          "text": "\u641c\u7d22",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 12,
+          "position_length": 1
+        },
+        {
+          "text": "\u7d22\u5f15",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 12,
+          "position_length": 1
+        },
+        {
+          "text": "\u5f15\u64ce",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 12,
+          "position_length": 1
+        }
       ]
     },
     {
       "id": "analyzer-hyphen-cjk-extension-b",
       "analyzer": "hyphen_normalize",
-      "input": "𠀀𠀁",
+      "input": "\ud840\udc00\ud840\udc01",
       "expected_tokens": [
-        { "text": "𠀀𠀁", "position": 0, "offset_from": 0, "offset_to": 8, "position_length": 1 }
+        {
+          "text": "\ud840\udc00\ud840\udc01",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 8,
+          "position_length": 1
+        }
       ]
     },
     {
       "id": "analyzer-hyphen-japanese-bigrams",
       "analyzer": "hyphen_normalize",
-      "input": "かなカナ",
+      "input": "\u304b\u306a\u30ab\u30ca",
       "expected_tokens": [
-        { "text": "かな", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
-        { "text": "なカ", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
-        { "text": "カナ", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 }
+        {
+          "text": "\u304b\u306a",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 12,
+          "position_length": 1
+        },
+        {
+          "text": "\u306a\u30ab",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 12,
+          "position_length": 1
+        },
+        {
+          "text": "\u30ab\u30ca",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 12,
+          "position_length": 1
+        }
       ]
     },
     {
       "id": "analyzer-hyphen-korean-bigrams",
       "analyzer": "hyphen_normalize",
-      "input": "한글검색",
+      "input": "\ud55c\uae00\uac80\uc0c9",
       "expected_tokens": [
-        { "text": "한글", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
-        { "text": "글검", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
-        { "text": "검색", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 }
+        {
+          "text": "\ud55c\uae00",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 12,
+          "position_length": 1
+        },
+        {
+          "text": "\uae00\uac80",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 12,
+          "position_length": 1
+        },
+        {
+          "text": "\uac80\uc0c9",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 12,
+          "position_length": 1
+        }
       ]
     },
     {
@@ -112,13 +246,22 @@
       "analyzer": "prefix_normalize",
       "input": "bd-q3fy",
       "expected_tokens": [
-        { "text": "bd-q3fy", "position": 0, "offset_from": 0, "offset_to": 7, "position_length": 1 }
+        {
+          "text": "bd-q3fy",
+          "position": 0,
+          "offset_from": 0,
+          "offset_to": 7,
+          "position_length": 1
+        }
       ]
     },
     {
       "id": "analyzer-cass-limit-256-kept",
       "analyzer": "hyphen_normalize",
-      "generated_input": { "repeat": "A", "count": 256 },
+      "generated_input": {
+        "repeat": "A",
+        "count": 256
+      },
       "expected_token_count": 1,
       "expected_token_bytes": 256,
       "expected_token_repeat": "a"
@@ -126,30 +269,48 @@
     {
       "id": "analyzer-cass-limit-257-dropped",
       "analyzer": "hyphen_normalize",
-      "generated_input": { "repeat": "A", "count": 257 },
+      "generated_input": {
+        "repeat": "A",
+        "count": 257
+      },
       "expected_tokens": []
     },
     {
       "id": "analyzer-tantivy-index-limit-65530-kept",
       "analyzer": "frankensearch_default",
-      "generated_input": { "repeat": "x", "count_bytes": 65530 },
+      "generated_input": {
+        "repeat": "x",
+        "count_bytes": 65530
+      },
       "token_admission": "kept",
-      "applies_to": ["document_indexing"]
+      "applies_to": [
+        "document_indexing"
+      ]
     },
     {
       "id": "analyzer-tantivy-index-limit-65531-dropped",
       "analyzer": "frankensearch_default",
-      "generated_input": { "repeat": "x", "count_bytes": 65531 },
+      "generated_input": {
+        "repeat": "x",
+        "count_bytes": 65531
+      },
       "token_admission": "dropped",
       "diagnostic": "warning",
-      "applies_to": ["document_indexing"]
+      "applies_to": [
+        "document_indexing"
+      ]
     },
     {
       "id": "analyzer-quill-query-limit-65531-dropped",
       "analyzer": "frankensearch_default",
-      "generated_input": { "repeat": "x", "count_bytes": 65531 },
+      "generated_input": {
+        "repeat": "x",
+        "count_bytes": 65531
+      },
       "token_admission": "dropped",
-      "applies_to": ["quill_query_analysis"],
+      "applies_to": [
+        "quill_query_analysis"
+      ],
       "classification": "explicit Quill hardening amendment; Tantivy QueryParser does not enforce MAX_TOKEN_LEN",
       "ordinary_string_query_reachable": false
     }
@@ -164,8 +325,8 @@
     {
       "id": "helper-edge-prefix-unicode",
       "helper": "cass_generate_edge_ngrams",
-      "input": "éclair",
-      "expected": "éc écl écla éclai éclair"
+      "input": "\u00e9clair",
+      "expected": "\u00e9c \u00e9cl \u00e9cla \u00e9clai \u00e9clair"
     },
     {
       "id": "helper-edge-prefix-cap-20",
@@ -177,31 +338,43 @@
     {
       "id": "helper-preview-unicode",
       "helper": "cass_build_preview",
-      "input": "éclair",
+      "input": "\u00e9clair",
       "max_chars": 3,
-      "expected": "écl…"
+      "expected": "\u00e9cl\u2026"
     },
     {
       "id": "helper-preview-zero",
       "helper": "cass_build_preview",
       "input": "hello",
       "max_chars": 0,
-      "expected": "…"
+      "expected": "\u2026"
     },
     {
       "id": "helper-query-truncate-ascii",
       "helper": "truncate_query",
-      "generated_input": { "repeat": "a", "count_chars": 10001 },
+      "generated_input": {
+        "repeat": "a",
+        "count_chars": 10001
+      },
       "expected_chars": 10000,
-      "backends": ["tantivy", "fts5"]
+      "backends": [
+        "tantivy",
+        "fts5"
+      ]
     },
     {
       "id": "helper-query-truncate-unicode",
       "helper": "truncate_query",
-      "generated_input": { "repeat": "é", "count_chars": 10001 },
+      "generated_input": {
+        "repeat": "\u00e9",
+        "count_chars": 10001
+      },
       "expected_chars": 10000,
       "expected_bytes": 20000,
-      "backends": ["tantivy", "fts5"]
+      "backends": [
+        "tantivy",
+        "fts5"
+      ]
     }
   ],
   "parse_tree_cases": [
@@ -213,9 +386,22 @@
       "source": "contract extension for the path-shaped identifier class",
       "expected_ast": {
         "type": "Phrase",
-        "terms": ["src", "main", "rs"],
+        "terms": [
+          "src",
+          "main",
+          "rs"
+        ],
         "slop": 0,
-        "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }]
+        "fields": [
+          {
+            "name": "content",
+            "boost": 1.0
+          },
+          {
+            "name": "title",
+            "boost": 2.0
+          }
+        ]
       }
     },
     {
@@ -224,7 +410,9 @@
       "parser": "default_lenient",
       "input": "SearchIndex::new",
       "source": "tests/fixtures/queries.json",
-      "expected_ast": { "type": "Empty" },
+      "expected_ast": {
+        "type": "Empty"
+      },
       "expected_diagnostic": "unknown field SearchIndex"
     },
     {
@@ -233,15 +421,111 @@
       "parser": "default_lenient",
       "input": "rust ownership borrowing",
       "expected_ast": {
-        "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "title", "boost": 2.0 }] } }
-        ]
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "rust",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "rust",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "ownership",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "ownership",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "borrowing",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "borrowing",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          }
+        ],
+        "type": "Boolean"
       }
     },
     {
@@ -250,23 +534,247 @@
       "parser": "default_lenient",
       "input": "how do transformers work for text embeddings",
       "expected_ast": {
-        "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "how", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "how", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "do", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "do", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "transformers", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "transformers", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "work", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "work", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "for", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "for", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "text", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "text", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "embeddings", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "embeddings", "fields": [{ "name": "title", "boost": 2.0 }] } }
-        ]
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "how",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "how",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "do",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "do",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "transformers",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "transformers",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "work",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "work",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "for",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "for",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "text",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "text",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "embeddings",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "embeddings",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          }
+        ],
+        "type": "Boolean"
       }
     },
     {
@@ -276,9 +784,21 @@
       "input": "\"error handling\"",
       "expected_ast": {
         "type": "Phrase",
-        "terms": ["error", "handling"],
+        "terms": [
+          "error",
+          "handling"
+        ],
         "slop": 0,
-        "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }]
+        "fields": [
+          {
+            "name": "content",
+            "boost": 1.0
+          },
+          {
+            "name": "title",
+            "boost": 2.0
+          }
+        ]
       }
     },
     {
@@ -289,8 +809,32 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } }
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "rust",
+              "fields": [
+                {
+                  "name": "content",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "rust",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 2.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -300,22 +844,121 @@
       "parser": "default_lenient",
       "input": "rust OR ownership AND borrowing",
       "expected_ast": {
-        "type": "Boolean",
-        "operator": "OR",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Boolean", "operator": "AND", "children": [
-            { "occur": "Must", "query": { "type": "Boolean", "children": [
-              { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }] } },
-              { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "title", "boost": 2.0 }] } }
-            ] } },
-            { "occur": "Must", "query": { "type": "Boolean", "children": [
-              { "occur": "Should", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "content", "boost": 1.0 }] } },
-              { "occur": "Should", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "title", "boost": 2.0 }] } }
-            ] } }
-          ] } }
-        ]
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 1.0,
+                        "name": "content"
+                      }
+                    ],
+                    "text": "rust",
+                    "type": "Term"
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "fields": [
+                      {
+                        "boost": 2.0,
+                        "name": "title"
+                      }
+                    ],
+                    "text": "rust",
+                    "type": "Term"
+                  }
+                }
+              ],
+              "type": "Boolean"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "children": [
+                {
+                  "occur": "Must",
+                  "query": {
+                    "children": [
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "fields": [
+                            {
+                              "boost": 1.0,
+                              "name": "content"
+                            }
+                          ],
+                          "text": "ownership",
+                          "type": "Term"
+                        }
+                      },
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "fields": [
+                            {
+                              "boost": 2.0,
+                              "name": "title"
+                            }
+                          ],
+                          "text": "ownership",
+                          "type": "Term"
+                        }
+                      }
+                    ],
+                    "type": "Boolean"
+                  }
+                },
+                {
+                  "occur": "Must",
+                  "query": {
+                    "children": [
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "fields": [
+                            {
+                              "boost": 1.0,
+                              "name": "content"
+                            }
+                          ],
+                          "text": "borrowing",
+                          "type": "Term"
+                        }
+                      },
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "fields": [
+                            {
+                              "boost": 2.0,
+                              "name": "title"
+                            }
+                          ],
+                          "text": "borrowing",
+                          "type": "Term"
+                        }
+                      }
+                    ],
+                    "type": "Boolean"
+                  }
+                }
+              ],
+              "operator": "AND",
+              "type": "Boolean"
+            }
+          }
+        ],
+        "operator": "OR",
+        "type": "Boolean"
       }
     },
     {
@@ -329,7 +972,12 @@
         "query": {
           "type": "Term",
           "text": "rust",
-          "fields": [{ "name": "title", "boost": 2.0 }]
+          "fields": [
+            {
+              "name": "title",
+              "boost": 2.0
+            }
+          ]
         }
       }
     },
@@ -341,11 +989,46 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "MustNot", "query": { "type": "Boolean", "children": [
-            { "occur": "Should", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "content", "boost": 1.0 }] } },
-            { "occur": "Should", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "title", "boost": 2.0 }] } }
-          ] } },
-          { "occur": "Should", "query": { "type": "All" } }
+          {
+            "occur": "MustNot",
+            "query": {
+              "type": "Boolean",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "deprecated",
+                    "fields": [
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "deprecated",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 2.0
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "All"
+            }
+          }
         ]
       },
       "expected_diagnostic": "all-negative query repaired with All"
@@ -357,11 +1040,35 @@
       "input": "rust rust",
       "rationale": "The pinned default grammar stably deduplicates exact raw parser siblings before field analysis; generic post-parse canonicalization still retains programmatic scoring duplicates",
       "expected_ast": {
-        "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } }
-        ]
+          {
+            "occur": "Should",
+            "query": {
+              "fields": [
+                {
+                  "boost": 1.0,
+                  "name": "content"
+                }
+              ],
+              "text": "rust",
+              "type": "Term"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "fields": [
+                {
+                  "boost": 2.0,
+                  "name": "title"
+                }
+              ],
+              "text": "rust",
+              "type": "Term"
+            }
+          }
+        ],
+        "type": "Boolean"
       }
     },
     {
@@ -372,8 +1079,32 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } }
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "rust",
+              "fields": [
+                {
+                  "name": "content",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "rust",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 2.0
+                }
+              ]
+            }
+          }
         ]
       },
       "expected_diagnostic": "syntax recovery"
@@ -384,11 +1115,35 @@
       "parser": "default_lenient",
       "input": "unknown_field:value rust",
       "expected_ast": {
-        "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } }
-        ]
+          {
+            "occur": "Should",
+            "query": {
+              "fields": [
+                {
+                  "boost": 1.0,
+                  "name": "content"
+                }
+              ],
+              "text": "rust",
+              "type": "Term"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "fields": [
+                {
+                  "boost": 2.0,
+                  "name": "title"
+                }
+              ],
+              "text": "rust",
+              "type": "Term"
+            }
+          }
+        ],
+        "type": "Boolean"
       },
       "expected_diagnostic": "unsupported field fragment dropped"
     },
@@ -400,8 +1155,14 @@
       "expected_ast": {
         "type": "RangeStr",
         "field": "title",
-        "lower": { "bound": "Included", "value": "a" },
-        "upper": { "bound": "Excluded", "value": "b" }
+        "lower": {
+          "bound": "Included",
+          "value": "a"
+        },
+        "upper": {
+          "bound": "Excluded",
+          "value": "b"
+        }
       }
     },
     {
@@ -412,7 +1173,10 @@
       "expected_ast": {
         "type": "SetStr",
         "field": "id",
-        "values": ["alpha", "beta"]
+        "values": [
+          "alpha",
+          "beta"
+        ]
       }
     },
     {
@@ -427,14 +1191,74 @@
           "type": "Boolean",
           "operator": "OR",
           "children": [
-            { "occur": "Should", "query": { "type": "Boolean", "children": [
-              { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
-              { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } }
-            ] } },
-            { "occur": "Should", "query": { "type": "Boolean", "children": [
-              { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }] } },
-              { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "title", "boost": 2.0 }] } }
-            ] } }
+            {
+              "occur": "Should",
+              "query": {
+                "type": "Boolean",
+                "children": [
+                  {
+                    "occur": "Should",
+                    "query": {
+                      "type": "Term",
+                      "text": "rust",
+                      "fields": [
+                        {
+                          "name": "content",
+                          "boost": 1.0
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "occur": "Should",
+                    "query": {
+                      "type": "Term",
+                      "text": "rust",
+                      "fields": [
+                        {
+                          "name": "title",
+                          "boost": 2.0
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "occur": "Should",
+              "query": {
+                "type": "Boolean",
+                "children": [
+                  {
+                    "occur": "Should",
+                    "query": {
+                      "type": "Term",
+                      "text": "ownership",
+                      "fields": [
+                        {
+                          "name": "content",
+                          "boost": 1.0
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "occur": "Should",
+                    "query": {
+                      "type": "Term",
+                      "text": "ownership",
+                      "fields": [
+                        {
+                          "name": "title",
+                          "boost": 2.0
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
           ]
         }
       }
@@ -448,8 +1272,36 @@
         "type": "Boolean",
         "operator": "OR",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Phrase", "terms": ["error", "handling"], "slop": 0, "fields": [{ "name": "title", "boost": 2.0 }] } }
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "rust",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 2.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Phrase",
+              "terms": [
+                "error",
+                "handling"
+              ],
+              "slop": 0,
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 2.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -462,8 +1314,32 @@
         "type": "Boolean",
         "operator": "AND",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } },
-          { "occur": "Must", "query": { "type": "Term", "text": "Doc-1", "fields": [{ "name": "id", "boost": 1.0 }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "rust",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 2.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "Doc-1",
+              "fields": [
+                {
+                  "name": "id",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -476,8 +1352,31 @@
         "type": "Boolean",
         "operator": "OR",
         "children": [
-          { "occur": "Should", "query": { "type": "RangeStr", "field": "id", "lower": { "bound": "Included", "value": "a" }, "upper": { "bound": "Excluded", "value": "m" } } },
-          { "occur": "Should", "query": { "type": "SetStr", "field": "id", "values": ["z"] } }
+          {
+            "occur": "Should",
+            "query": {
+              "type": "RangeStr",
+              "field": "id",
+              "lower": {
+                "bound": "Included",
+                "value": "a"
+              },
+              "upper": {
+                "bound": "Excluded",
+                "value": "m"
+              }
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "SetStr",
+              "field": "id",
+              "values": [
+                "z"
+              ]
+            }
+          }
         ]
       }
     },
@@ -490,11 +1389,90 @@
         "type": "Boolean",
         "operator": "AND",
         "children": [
-          { "occur": "Must", "query": { "type": "Boolean", "operator": "OR", "children": [
-            { "occur": "Should", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-            { "occur": "Should", "query": { "type": "Term", "text": "token", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
-          ] } },
-          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "auth",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "token",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -506,8 +1484,38 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "All" } },
-          { "occur": "MustNot", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }], "score": 0.0 } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "All"
+            }
+          },
+          {
+            "occur": "MustNot",
+            "query": {
+              "type": "Term",
+              "text": "deprecated",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ],
+              "score": 0.0
+            }
+          }
         ]
       },
       "known_shipping_gap": "cass_compat currently emits a negative-only BooleanQuery for this shape"
@@ -521,14 +1529,68 @@
         "type": "Boolean",
         "operator": "OR",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "auth",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
           {
             "occur": "Should",
             "query": {
               "type": "Boolean",
               "children": [
-                { "occur": "Must", "query": { "type": "All" } },
-                { "occur": "MustNot", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }], "score": 0.0 } }
+                {
+                  "occur": "Must",
+                  "query": {
+                    "type": "All"
+                  }
+                },
+                {
+                  "occur": "MustNot",
+                  "query": {
+                    "type": "Term",
+                    "text": "deprecated",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ],
+                    "score": 0.0
+                  }
+                }
               ]
             }
           }
@@ -544,8 +1606,57 @@
         "type": "Boolean",
         "operator": "AND",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "MustNot", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }], "score": 0.0 } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "auth",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "MustNot",
+            "query": {
+              "type": "Term",
+              "text": "deprecated",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ],
+              "score": 0.0
+            }
+          }
         ]
       }
     },
@@ -558,8 +1669,57 @@
         "type": "Boolean",
         "operator": "AND",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "MustNot", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }], "score": 0.0 } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "auth",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "MustNot",
+            "query": {
+              "type": "Term",
+              "text": "deprecated",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ],
+              "score": 0.0
+            }
+          }
         ]
       },
       "double_negation": false
@@ -574,7 +1734,12 @@
         "pattern": "exact",
         "class": "Exact",
         "strategy": "TermQuery",
-        "fields": ["title", "content", "title_prefix", "content_prefix"]
+        "fields": [
+          "title",
+          "content",
+          "title_prefix",
+          "content_prefix"
+        ]
       }
     },
     {
@@ -588,7 +1753,12 @@
         "normalized_term": "prefix",
         "class": "Prefix",
         "strategy": "TermQuery",
-        "fields": ["title", "content", "title_prefix", "content_prefix"]
+        "fields": [
+          "title",
+          "content",
+          "title_prefix",
+          "content_prefix"
+        ]
       }
     },
     {
@@ -602,7 +1772,10 @@
         "class": "Suffix",
         "strategy": "RegexQuery",
         "regex": ".*suffix",
-        "fields": ["content", "title"]
+        "fields": [
+          "content",
+          "title"
+        ]
       }
     },
     {
@@ -616,7 +1789,10 @@
         "class": "Substring",
         "strategy": "RegexQuery",
         "regex": ".*middle.*",
-        "fields": ["content", "title"]
+        "fields": [
+          "content",
+          "title"
+        ]
       }
     },
     {
@@ -630,7 +1806,10 @@
         "class": "Complex",
         "strategy": "RegexQuery",
         "regex": "a.*b.*c",
-        "fields": ["content", "title"],
+        "fields": [
+          "content",
+          "title"
+        ],
         "question_mark_operator": false
       }
     },
@@ -639,12 +1818,54 @@
       "query_class": "range",
       "parser": "cass",
       "input": "cache",
-      "filters": { "created_from": 1700000000000, "created_to": 1700000000999 },
+      "filters": {
+        "created_from": 1700000000000,
+        "created_to": 1700000000999
+      },
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "RangeI64", "field": "created_at", "lower": { "value": 1700000000000, "bound": "Included" }, "upper": { "value": 1700000000999, "bound": "Included" }, "matched_score": 1.0 } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "RangeI64",
+              "field": "created_at",
+              "lower": {
+                "value": 1700000000000,
+                "bound": "Included"
+              },
+              "upper": {
+                "value": 1700000000999,
+                "bound": "Included"
+              },
+              "matched_score": 1.0
+            }
+          }
         ]
       }
     },
@@ -653,13 +1874,112 @@
       "query_class": "structured_filter",
       "parser": "cass",
       "input": "cache",
-      "filters": { "agents": ["claude", "codex"], "workspaces": ["/alpha", "/beta"] },
+      "filters": {
+        "agents": [
+          "claude",
+          "codex"
+        ],
+        "workspaces": [
+          "/alpha",
+          "/beta"
+        ]
+      },
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "Boolean", "children": [{ "occur": "Should", "query": { "type": "Term", "text": "claude", "fields": [{ "name": "agent", "boost": 1.0 }] } }, { "occur": "Should", "query": { "type": "Term", "text": "codex", "fields": [{ "name": "agent", "boost": 1.0 }] } }] } },
-          { "occur": "Must", "query": { "type": "Boolean", "children": [{ "occur": "Should", "query": { "type": "Term", "text": "/alpha", "fields": [{ "name": "workspace", "boost": 1.0 }] } }, { "occur": "Should", "query": { "type": "Term", "text": "/beta", "fields": [{ "name": "workspace", "boost": 1.0 }] } }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Boolean",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "claude",
+                    "fields": [
+                      {
+                        "name": "agent",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "codex",
+                    "fields": [
+                      {
+                        "name": "agent",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Boolean",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "/alpha",
+                    "fields": [
+                      {
+                        "name": "workspace",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "/beta",
+                    "fields": [
+                      {
+                        "name": "workspace",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -668,12 +1988,31 @@
       "query_class": "structured_filter",
       "parser": "cass",
       "input": "",
-      "filters": { "source_filter": "local" },
+      "filters": {
+        "source_filter": "local"
+      },
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "All" } },
-          { "occur": "Must", "query": { "type": "Term", "text": "local", "fields": [{ "name": "origin_kind", "boost": 1.0 }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "All"
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "local",
+              "fields": [
+                {
+                  "name": "origin_kind",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -682,12 +2021,31 @@
       "query_class": "structured_filter",
       "parser": "cass",
       "input": "",
-      "filters": { "source_filter": "remote" },
+      "filters": {
+        "source_filter": "remote"
+      },
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "All" } },
-          { "occur": "Must", "query": { "type": "Term", "text": "ssh", "fields": [{ "name": "origin_kind", "boost": 1.0 }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "All"
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "ssh",
+              "fields": [
+                {
+                  "name": "origin_kind",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -696,12 +2054,32 @@
       "query_class": "structured_filter",
       "parser": "cass",
       "input": "",
-      "filters": { "source_filter": "source_id", "source_id": "archive-7" },
+      "filters": {
+        "source_filter": "source_id",
+        "source_id": "archive-7"
+      },
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "All" } },
-          { "occur": "Must", "query": { "type": "Term", "text": "archive-7", "fields": [{ "name": "source_id", "boost": 1.0 }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "All"
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "archive-7",
+              "fields": [
+                {
+                  "name": "source_id",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -709,14 +2087,86 @@
       "id": "query-cjk-all-bigrams",
       "query_class": "short_keyword",
       "parser": "cass",
-      "input": "搜索引擎",
+      "input": "\u641c\u7d22\u5f15\u64ce",
       "expected_ast": {
         "type": "Boolean",
         "operator": "AND",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "搜索", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "Term", "text": "索引", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "Term", "text": "引擎", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "\u641c\u7d22",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "\u7d22\u5f15",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "\u5f15\u64ce",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -724,11 +2174,28 @@
       "id": "query-cjk-mixed-script-keeps-cjk-only",
       "query_class": "short_keyword",
       "parser": "cass",
-      "input": "abc搜索def",
+      "input": "abc\u641c\u7d22def",
       "expected_ast": {
         "type": "Term",
-        "text": "搜索",
-        "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }]
+        "text": "\u641c\u7d22",
+        "fields": [
+          {
+            "name": "title",
+            "boost": 1.0
+          },
+          {
+            "name": "content",
+            "boost": 1.0
+          },
+          {
+            "name": "title_prefix",
+            "boost": 1.0
+          },
+          {
+            "name": "content_prefix",
+            "boost": 1.0
+          }
+        ]
       },
       "discarded_query_characters": "abcdef"
     },
@@ -736,11 +2203,28 @@
       "id": "query-cjk-single-character-unigram",
       "query_class": "short_keyword",
       "parser": "cass",
-      "input": "搜",
+      "input": "\u641c",
       "expected_ast": {
         "type": "Term",
-        "text": "搜",
-        "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }]
+        "text": "\u641c",
+        "fields": [
+          {
+            "name": "title",
+            "boost": 1.0
+          },
+          {
+            "name": "content",
+            "boost": 1.0
+          },
+          {
+            "name": "title_prefix",
+            "boost": 1.0
+          },
+          {
+            "name": "content_prefix",
+            "boost": 1.0
+          }
+        ]
       },
       "does_not_match_inside_multi_character_run": true
     },
@@ -749,7 +2233,9 @@
       "query_class": "short_keyword",
       "parser": "cass",
       "input": "",
-      "expected_ast": { "type": "All" }
+      "expected_ast": {
+        "type": "All"
+      }
     },
     {
       "id": "query-cass-phrase-two-term",
@@ -758,9 +2244,21 @@
       "input": "\"error handling\"",
       "expected_ast": {
         "type": "Phrase",
-        "terms": ["error", "handling"],
+        "terms": [
+          "error",
+          "handling"
+        ],
         "slop": 0,
-        "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }]
+        "fields": [
+          {
+            "name": "title",
+            "boost": 1.0
+          },
+          {
+            "name": "content",
+            "boost": 1.0
+          }
+        ]
       }
     },
     {
@@ -771,7 +2269,24 @@
       "expected_ast": {
         "type": "Term",
         "text": "auth",
-        "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }]
+        "fields": [
+          {
+            "name": "title",
+            "boost": 1.0
+          },
+          {
+            "name": "content",
+            "boost": 1.0
+          },
+          {
+            "name": "title_prefix",
+            "boost": 1.0
+          },
+          {
+            "name": "content_prefix",
+            "boost": 1.0
+          }
+        ]
       }
     },
     {
@@ -783,8 +2298,52 @@
         "type": "Boolean",
         "operator": "AND",
         "children": [
-          { "occur": "Must", "query": { "type": "Phrase", "terms": ["error", "handling"], "slop": 0, "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Phrase",
+              "terms": [
+                "error",
+                "handling"
+              ],
+              "slop": 0,
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -792,8 +2351,10 @@
       "id": "query-cass-cjk-quoted-phrase-bigrams",
       "query_class": "phrase",
       "parser": "cass",
-      "input": "\"搜索引擎\"",
-      "expected_ast": { "ref": "query-cjk-all-bigrams" }
+      "input": "\"\u641c\u7d22\u5f15\u64ce\"",
+      "expected_ast": {
+        "ref": "query-cjk-all-bigrams"
+      }
     },
     {
       "id": "query-cass-implicit-and",
@@ -804,8 +2365,56 @@
         "type": "Boolean",
         "operator": "AND",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "Term", "text": "token", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "auth",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "token",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -814,14 +2423,18 @@
       "query_class": "boolean",
       "parser": "cass",
       "input": "auth AND token",
-      "expected_ast": { "ref": "query-cass-implicit-and" }
+      "expected_ast": {
+        "ref": "query-cass-implicit-and"
+      }
     },
     {
       "id": "query-cass-symbolic-and-equivalent",
       "query_class": "boolean",
       "parser": "cass",
       "input": "auth&&token",
-      "expected_ast": { "ref": "query-cass-implicit-and" }
+      "expected_ast": {
+        "ref": "query-cass-implicit-and"
+      }
     },
     {
       "id": "query-cass-or-chain",
@@ -832,9 +2445,81 @@
         "type": "Boolean",
         "operator": "OR",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "token", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "auth",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "token",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -847,8 +2532,56 @@
         "type": "Boolean",
         "operator": "OR",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "token", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "auth",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "token",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -861,11 +2594,90 @@
         "type": "Boolean",
         "operator": "AND",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "Boolean", "operator": "OR", "children": [
-            { "occur": "Should", "query": { "type": "Term", "text": "token", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-            { "occur": "Should", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
-          ] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "auth",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "token",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -874,19 +2686,61 @@
       "query_class": "boolean",
       "parser": "cass",
       "input": "auth -deprecated",
-      "expected_ast": { "ref": "query-boolean-and-not-no-all-score" }
+      "expected_ast": {
+        "ref": "query-boolean-and-not-no-all-score"
+      }
     },
     {
       "id": "query-cass-created-from-only",
       "query_class": "range",
       "parser": "cass",
       "input": "cache",
-      "filters": { "created_from": 1700000000000 },
+      "filters": {
+        "created_from": 1700000000000
+      },
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "RangeI64", "field": "created_at", "lower": { "value": 1700000000000, "bound": "Included" }, "upper": { "bound": "Unbounded" }, "matched_score": 1.0 } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "RangeI64",
+              "field": "created_at",
+              "lower": {
+                "value": 1700000000000,
+                "bound": "Included"
+              },
+              "upper": {
+                "bound": "Unbounded"
+              },
+              "matched_score": 1.0
+            }
+          }
         ]
       }
     },
@@ -895,12 +2749,52 @@
       "query_class": "range",
       "parser": "cass",
       "input": "cache",
-      "filters": { "created_to": 1700000000999 },
+      "filters": {
+        "created_to": 1700000000999
+      },
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "RangeI64", "field": "created_at", "lower": { "bound": "Unbounded" }, "upper": { "value": 1700000000999, "bound": "Included" }, "matched_score": 1.0 } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "RangeI64",
+              "field": "created_at",
+              "lower": {
+                "bound": "Unbounded"
+              },
+              "upper": {
+                "value": 1700000000999,
+                "bound": "Included"
+              },
+              "matched_score": 1.0
+            }
+          }
         ]
       }
     },
@@ -909,12 +2803,60 @@
       "query_class": "structured_filter",
       "parser": "cass",
       "input": "cache",
-      "filters": { "agents": ["codex"] },
+      "filters": {
+        "agents": [
+          "codex"
+        ]
+      },
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "Boolean", "children": [{ "occur": "Should", "query": { "type": "Term", "text": "codex", "fields": [{ "name": "agent", "boost": 1.0 }] } }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Boolean",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "codex",
+                    "fields": [
+                      {
+                        "name": "agent",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -923,15 +2865,117 @@
       "query_class": "structured_filter",
       "parser": "cass",
       "input": "cache",
-      "filters": { "agents": ["codex"], "workspaces": ["/alpha"], "created_from": 1700000000000, "created_to": 1700000000999, "source_filter": "source_id", "source_id": "archive-7" },
+      "filters": {
+        "agents": [
+          "codex"
+        ],
+        "workspaces": [
+          "/alpha"
+        ],
+        "created_from": 1700000000000,
+        "created_to": 1700000000999,
+        "source_filter": "source_id",
+        "source_id": "archive-7"
+      },
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "Boolean", "children": [{ "occur": "Should", "query": { "type": "Term", "text": "codex", "fields": [{ "name": "agent", "boost": 1.0 }] } }] } },
-          { "occur": "Must", "query": { "type": "Boolean", "children": [{ "occur": "Should", "query": { "type": "Term", "text": "/alpha", "fields": [{ "name": "workspace", "boost": 1.0 }] } }] } },
-          { "occur": "Must", "query": { "type": "RangeI64", "field": "created_at", "lower": { "value": 1700000000000, "bound": "Included" }, "upper": { "value": 1700000000999, "bound": "Included" }, "matched_score": 1.0 } },
-          { "occur": "Must", "query": { "type": "Term", "text": "archive-7", "fields": [{ "name": "source_id", "boost": 1.0 }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Boolean",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "codex",
+                    "fields": [
+                      {
+                        "name": "agent",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Boolean",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "/alpha",
+                    "fields": [
+                      {
+                        "name": "workspace",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "RangeI64",
+              "field": "created_at",
+              "lower": {
+                "value": 1700000000000,
+                "bound": "Included"
+              },
+              "upper": {
+                "value": 1700000000999,
+                "bound": "Included"
+              },
+              "matched_score": 1.0
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "archive-7",
+              "fields": [
+                {
+                  "name": "source_id",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -940,7 +2984,9 @@
       "query_class": "boolean",
       "parser": "cass",
       "input": "AND auth",
-      "expected_ast": { "ref": "query-cass-phrase-single-token-collapses" },
+      "expected_ast": {
+        "ref": "query-cass-phrase-single-token-collapses"
+      },
       "expected_diagnostic": "AND without an adjacent operand was recovered"
     },
     {
@@ -948,7 +2994,9 @@
       "query_class": "boolean",
       "parser": "cass",
       "input": "auth OR",
-      "expected_ast": { "ref": "query-cass-phrase-single-token-collapses" },
+      "expected_ast": {
+        "ref": "query-cass-phrase-single-token-collapses"
+      },
       "expected_diagnostic": "dangling binary operator has no operand"
     },
     {
@@ -956,7 +3004,9 @@
       "query_class": "phrase",
       "parser": "cass",
       "input": "\"error handling",
-      "expected_ast": { "ref": "query-cass-phrase-two-term" },
+      "expected_ast": {
+        "ref": "query-cass-phrase-two-term"
+      },
       "expected_diagnostic": "unterminated phrase"
     },
     {
@@ -964,7 +3014,9 @@
       "query_class": "boolean",
       "parser": "cass",
       "input": "auth NOT",
-      "expected_ast": { "ref": "query-cass-phrase-single-token-collapses" },
+      "expected_ast": {
+        "ref": "query-cass-phrase-single-token-collapses"
+      },
       "expected_diagnostic": "dangling NOT has no operand"
     },
     {
@@ -976,9 +3028,81 @@
         "type": "Boolean",
         "operator": "AND",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "Term", "text": "or", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
-          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "auth",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "or",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -990,9 +3114,28 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Must", "query": { "type": "Term", "text": "required" } },
-          { "occur": "Should", "query": { "type": "Term", "text": "bonus" } },
-          { "occur": "MustNot", "query": { "type": "Term", "text": "excluded", "score": 0.0 } }
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "required"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "bonus"
+            }
+          },
+          {
+            "occur": "MustNot",
+            "query": {
+              "type": "Term",
+              "text": "excluded",
+              "score": 0.0
+            }
+          }
         ],
         "minimum_should_match": 0
       }
@@ -1005,8 +3148,20 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "first" } },
-          { "occur": "Should", "query": { "type": "Term", "text": "second" } }
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "first"
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "second"
+            }
+          }
         ],
         "minimum_should_match": 1
       }
@@ -1019,8 +3174,21 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "included" } },
-          { "occur": "MustNot", "query": { "type": "Term", "text": "excluded", "score": 0.0 } }
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "included"
+            }
+          },
+          {
+            "occur": "MustNot",
+            "query": {
+              "type": "Term",
+              "text": "excluded",
+              "score": 0.0
+            }
+          }
         ],
         "minimum_should_match": 1
       }
@@ -1033,7 +3201,14 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "MustNot", "query": { "type": "Term", "text": "excluded", "score": 0.0 } }
+          {
+            "occur": "MustNot",
+            "query": {
+              "type": "Term",
+              "text": "excluded",
+              "score": 0.0
+            }
+          }
         ],
         "matching_semantics": "empty"
       }
@@ -1055,7 +3230,13 @@
     {
       "id": "score-bm25-operation-order-bits",
       "conformance": "RankExact",
-      "input": { "doc_freq": 1, "doc_count": 1, "term_freq": 1, "fieldnorm_id": 0, "avgdl": 1.0 },
+      "input": {
+        "doc_freq": 1,
+        "doc_count": 1,
+        "term_freq": 1,
+        "fieldnorm_id": 0,
+        "avgdl": 1.0
+      },
       "comparison": "compute both expressions on the executing platform",
       "expect_exact_and_reassociated_bits_to_differ": true,
       "universal_libm_bit_pattern": false
@@ -1063,14 +3244,28 @@
     {
       "id": "score-fieldnorm-landmarks",
       "conformance": "RankExact",
-      "decoded": { "0": 0, "40": 40, "41": 42, "64": 152, "128": 32792, "200": 16777240, "255": 2013265944 },
+      "decoded": {
+        "0": 0,
+        "40": 40,
+        "41": 42,
+        "64": 152,
+        "128": 32792,
+        "200": 16777240,
+        "255": 2013265944
+      },
       "table_checksum_u64": 24696067732
     },
     {
       "id": "score-avgdl-uses-raw-statistics",
       "conformance": "RankExact",
-      "segment_max_docs": [2, 1],
-      "segment_total_tokens": [13, 8],
+      "segment_max_docs": [
+        2,
+        1
+      ],
+      "segment_total_tokens": [
+        13,
+        8
+      ],
       "deleted_docs": 1,
       "expected_total_num_docs": 3,
       "expected_total_num_tokens": 21,
@@ -1080,16 +3275,30 @@
     {
       "id": "score-deleted-doc-statistics-until-merge",
       "conformance": "RankExact",
-      "before_merge": { "matching_docs": "live only", "N": "sum segment max_doc", "doc_freq": "sealed postings including deleted", "total_num_tokens": "sealed statistics including deleted" },
-      "after_merge": { "matching_docs": "live only", "statistics": "recomputed from retained live documents" }
+      "before_merge": {
+        "matching_docs": "live only",
+        "N": "sum segment max_doc",
+        "doc_freq": "sealed postings including deleted",
+        "total_num_tokens": "sealed statistics including deleted"
+      },
+      "after_merge": {
+        "matching_docs": "live only",
+        "statistics": "recomputed from retained live documents"
+      }
     },
     {
       "id": "score-multifield-title-boost",
       "conformance": "RankExact",
       "scope": "default_lenient",
       "fields": [
-        { "name": "content", "boost": 1.0 },
-        { "name": "title", "boost": 2.0 }
+        {
+          "name": "content",
+          "boost": 1.0
+        },
+        {
+          "name": "title",
+          "boost": 2.0
+        }
       ],
       "accumulation": "f32 in Tantivy scorer-tree order; required aggregate before optional Should aggregate"
     },
@@ -1098,10 +3307,22 @@
       "conformance": "RankExact",
       "scope": "cass",
       "fields": [
-        { "name": "title", "boost": 1.0 },
-        { "name": "content", "boost": 1.0 },
-        { "name": "title_prefix", "boost": 1.0 },
-        { "name": "content_prefix", "boost": 1.0 }
+        {
+          "name": "title",
+          "boost": 1.0
+        },
+        {
+          "name": "content",
+          "boost": 1.0
+        },
+        {
+          "name": "title_prefix",
+          "boost": 1.0
+        },
+        {
+          "name": "content_prefix",
+          "boost": 1.0
+        }
       ]
     },
     {
@@ -1115,7 +3336,11 @@
     {
       "id": "score-phrase-bm25",
       "conformance": "RankExact",
-      "term_doc_freqs_in_phrase_order": [2, 3, 2],
+      "term_doc_freqs_in_phrase_order": [
+        2,
+        3,
+        2
+      ],
       "doc_count": 8,
       "phrase_occurrences": 2,
       "fieldnorm_id": 8,
@@ -1126,16 +3351,34 @@
     {
       "id": "score-required-scorers-cost-order",
       "conformance": "RankExact",
-      "construction_order": ["common", "rare", "medium", "equal_cost_later"],
-      "runtime_costs": [900, 3, 200, 200],
-      "expected_evaluation_order": ["rare", "medium", "equal_cost_later", "common"],
+      "construction_order": [
+        "common",
+        "rare",
+        "medium",
+        "equal_cost_later"
+      ],
+      "runtime_costs": [
+        900,
+        3,
+        200,
+        200
+      ],
+      "expected_evaluation_order": [
+        "rare",
+        "medium",
+        "equal_cost_later",
+        "common"
+      ],
       "equal_cost_rule": "stable construction order"
     },
     {
       "id": "score-cass-regex-fields-constant",
       "conformance": "RankExact",
       "scope": "cass suffix, substring, and complex glob",
-      "fields": ["content", "title"],
+      "fields": [
+        "content",
+        "title"
+      ],
       "matched_score_per_field": 1.0,
       "term_dictionary_expansion_bound": null
     },
@@ -1161,12 +3404,33 @@
       "id": "score-epsilon-component-boundary",
       "conformance": "ScoreEpsilon",
       "oracle_order": [
-        { "id": "a", "score": 1.0 },
-        { "id": "b", "score": 0.99995 },
-        { "id": "c", "score": 0.9999 },
-        { "id": "d", "score": 0.9997 }
+        {
+          "id": "a",
+          "score": 1.0
+        },
+        {
+          "id": "b",
+          "score": 0.99995
+        },
+        {
+          "id": "c",
+          "score": 0.9999
+        },
+        {
+          "id": "d",
+          "score": 0.9997
+        }
       ],
-      "expected_components": [["a", "b", "c"], ["d"]],
+      "expected_components": [
+        [
+          "a",
+          "b",
+          "c"
+        ],
+        [
+          "d"
+        ]
+      ],
       "rule": "connect adjacent oracle-order scores when relative delta <= 0.0001, then take maximal connected components"
     }
   ],
@@ -1175,27 +3439,84 @@
       "id": "behavior-schema-default-fields",
       "surface": "schema",
       "fields": [
-        { "name": "id", "type": "text", "indexed": true, "record_option": "Basic", "stored": true, "fast": false, "tokenizer": "raw" },
-        { "name": "content", "type": "text", "indexed": true, "record_option": "WithFreqsAndPositions", "stored": true, "fast": false, "tokenizer": "frankensearch_default" },
-        { "name": "title", "type": "text", "indexed": true, "record_option": "WithFreqsAndPositions", "stored": true, "fast": false, "tokenizer": "frankensearch_default" },
-        { "name": "metadata_json", "type": "text", "indexed": false, "record_option": null, "stored": true, "fast": false, "tokenizer": null },
-        { "name": "ord", "type": "u64", "indexed": false, "record_option": null, "stored": true, "fast": true, "tokenizer": null }
+        {
+          "name": "id",
+          "type": "text",
+          "indexed": true,
+          "record_option": "Basic",
+          "stored": true,
+          "fast": false,
+          "tokenizer": "raw"
+        },
+        {
+          "name": "content",
+          "type": "text",
+          "indexed": true,
+          "record_option": "WithFreqsAndPositions",
+          "stored": true,
+          "fast": false,
+          "tokenizer": "frankensearch_default"
+        },
+        {
+          "name": "title",
+          "type": "text",
+          "indexed": true,
+          "record_option": "WithFreqsAndPositions",
+          "stored": true,
+          "fast": false,
+          "tokenizer": "frankensearch_default"
+        },
+        {
+          "name": "metadata_json",
+          "type": "text",
+          "indexed": false,
+          "record_option": null,
+          "stored": true,
+          "fast": false,
+          "tokenizer": null
+        },
+        {
+          "name": "ord",
+          "type": "u64",
+          "indexed": false,
+          "record_option": null,
+          "stored": true,
+          "fast": true,
+          "tokenizer": null
+        }
       ]
     },
     {
       "id": "behavior-collectors",
       "surface": "collectors",
-      "contracts": ["top-k plus offset", "exact count", "unscored id set", "count-free top-k rank parity"]
+      "contracts": [
+        "top-k plus offset",
+        "exact count",
+        "unscored id set",
+        "count-free top-k rank parity"
+      ]
     },
     {
       "id": "behavior-writer-mutations",
       "surface": "writer",
-      "contracts": ["add", "batch add", "upsert delete then add", "delete", "delete_all", "commit or seal", "cancellation classification"]
+      "contracts": [
+        "add",
+        "batch add",
+        "upsert delete then add",
+        "delete",
+        "delete_all",
+        "commit or seal",
+        "cancellation classification"
+      ]
     },
     {
       "id": "behavior-reader-snapshot",
       "surface": "reader",
-      "contracts": ["immediate Quill visibility", "live doc_count", "stable external doc-id materialization"]
+      "contracts": [
+        "immediate Quill visibility",
+        "live doc_count",
+        "stable external doc-id materialization"
+      ]
     },
     {
       "id": "behavior-snippet-output",
@@ -1206,53 +3527,103 @@
       "suffix": "</b>",
       "comparison": "exact unless a reviewed divergence entry names a tie window",
       "unicode_golden": {
-        "content": "éé alpha",
-        "query": "éé",
+        "content": "\u00e9\u00e9 alpha",
+        "query": "\u00e9\u00e9",
         "max_chars_argument": 6,
-        "expected_html": "<b>éé</b>",
+        "expected_html": "<b>\u00e9\u00e9</b>",
         "note": "two Unicode scalars consume four UTF-8 bytes; adding the next token would end at byte 10"
       }
     },
     {
       "id": "behavior-segments-durability",
       "surface": "segments_durability",
-      "contracts": ["checksummed FSLX", "checksummed manifest", "owned relative paths", "repair or quarantine", "tombstone-aware open"]
+      "contracts": [
+        "checksummed FSLX",
+        "checksummed manifest",
+        "owned relative paths",
+        "repair or quarantine",
+        "tombstone-aware open"
+      ]
     },
     {
       "id": "behavior-errors-no-panic",
       "surface": "errors",
-      "contracts": ["IndexNotFound", "Cancelled", "InvalidConfig", "I/O or corruption", "SubsystemError quill", "invalid input never panics"]
+      "contracts": [
+        "IndexNotFound",
+        "Cancelled",
+        "InvalidConfig",
+        "I/O or corruption",
+        "SubsystemError quill",
+        "invalid input never panics"
+      ]
     },
     {
       "id": "behavior-concurrency",
       "surface": "concurrency",
-      "contracts": ["Send + Sync", "Cx on operations", "immediately-ready lexical SearchFuture", "no private runtime"]
+      "contracts": [
+        "Send + Sync",
+        "Cx on operations",
+        "immediately-ready lexical SearchFuture",
+        "no private runtime"
+      ]
     },
     {
       "id": "behavior-pagination-and-limit-zero",
       "surface": "collectors",
-      "contracts": ["limit zero returns no hits without collector panic", "counted limit zero still returns exact total", "offset pages use page-local rank starting at zero", "exact total when requested"]
+      "contracts": [
+        "limit zero returns no hits without collector panic",
+        "counted limit zero still returns exact total",
+        "offset pages use page-local rank starting at zero",
+        "exact total when requested"
+      ]
     },
     {
       "id": "behavior-boolean-occur",
       "surface": "queries",
-      "contracts": ["Should-only requires one", "Should optional only with a positive Must", "Should plus MustNot still requires one Should", "MustNot-only matches nothing", "MustNot contributes no score"]
+      "contracts": [
+        "Should-only requires one",
+        "Should optional only with a positive Must",
+        "Should plus MustNot still requires one Should",
+        "MustNot-only matches nothing",
+        "MustNot contributes no score"
+      ]
     },
     {
       "id": "behavior-scoring",
       "surface": "scoring",
-      "contracts": ["BM25 constants", "raw avgdl", "decoded per-document fieldnorm", "title boost", "f32 order", "stable tie key"]
+      "contracts": [
+        "BM25 constants",
+        "raw avgdl",
+        "decoded per-document fieldnorm",
+        "title boost",
+        "f32 order",
+        "stable tie key"
+      ]
     },
     {
       "id": "behavior-analyzers",
       "surface": "analyzers",
-      "contracts": ["exact token stream", "default", "hyphen", "CJK", "prefix", "oversized term admission"]
+      "contracts": [
+        "exact token stream",
+        "default",
+        "hyphen",
+        "CJK",
+        "prefix",
+        "oversized term admission"
+      ]
     },
     {
       "id": "behavior-oversized-token-position-gap",
       "surface": "analyzers",
-      "input_shape": ["kept at position 0", "65531-byte dropped token at position 1", "tail at position 2"],
-      "expected_retained_positions": [0, 2],
+      "input_shape": [
+        "kept at position 0",
+        "65531-byte dropped token at position 1",
+        "tail at position 2"
+      ],
+      "expected_retained_positions": [
+        0,
+        2
+      ],
       "contract": "dropping an oversized token preserves the following token's position gap"
     },
     {
@@ -1272,43 +3643,245 @@
       "token_bytes": 65531,
       "status": "G0 target; executable G1 classification tracked by bd-quill-e0-contracts-j53p.8",
       "shapes": [
-        { "shape": "standalone oversized term", "expected": "Empty" },
-        { "shape": "Must(valid, oversized)", "expected": "Empty" },
-        { "shape": "Phrase(valid, oversized)", "expected": "Empty" },
-        { "shape": "Should(valid, oversized)", "expected": "Should(valid)" },
-        { "shape": "Must(valid) + MustNot(oversized)", "expected": "Must(valid)" }
+        {
+          "shape": "standalone oversized term",
+          "expected": "Empty"
+        },
+        {
+          "shape": "Must(valid, oversized)",
+          "expected": "Empty"
+        },
+        {
+          "shape": "Phrase(valid, oversized)",
+          "expected": "Empty"
+        },
+        {
+          "shape": "Should(valid, oversized)",
+          "expected": "Should(valid)"
+        },
+        {
+          "shape": "Must(valid) + MustNot(oversized)",
+          "expected": "Must(valid)"
+        }
       ],
       "ordinary_string_query_reachable": false,
       "ast_or_diagnostic_difference_requires_divergence_entry": true
     }
   ],
   "harvested_queries": [
-    { "id": "harvest-identifier", "query_class": "identifier", "query": "SearchIndex::new", "source_kind": "harvested", "source": "tests/fixtures/queries.json" },
-    { "id": "harvest-short-keyword", "query_class": "short_keyword", "query": "rust ownership borrowing", "source_kind": "harvested", "source": "tests/fixtures/queries.json" },
-    { "id": "harvest-natural-language", "query_class": "natural_language", "query": "how do transformers work for text embeddings", "source_kind": "harvested", "source": "tests/fixtures/queries.json" },
-    { "id": "harvest-phrase", "query_class": "phrase", "query": "\"error handling\"", "source_kind": "constructed", "source_fact": "phrase contract extension seeded from tests/fixtures/queries.json" },
-    { "id": "harvest-boolean", "query_class": "boolean", "query": "auth OR token AND cache", "source_kind": "constructed", "source_fact": "CASS OR-over-AND grammar in crates/frankensearch-lexical/src/cass_compat.rs" },
-    { "id": "harvest-glob", "query_class": "glob", "query": "config*", "source_kind": "constructed", "source_fact": "CassWildcardPattern Prefix branch in crates/frankensearch-lexical/src/cass_compat.rs" },
+    {
+      "id": "harvest-identifier",
+      "query_class": "identifier",
+      "query": "SearchIndex::new",
+      "source_kind": "harvested",
+      "source": "tests/fixtures/queries.json"
+    },
+    {
+      "id": "harvest-short-keyword",
+      "query_class": "short_keyword",
+      "query": "rust ownership borrowing",
+      "source_kind": "harvested",
+      "source": "tests/fixtures/queries.json"
+    },
+    {
+      "id": "harvest-natural-language",
+      "query_class": "natural_language",
+      "query": "how do transformers work for text embeddings",
+      "source_kind": "harvested",
+      "source": "tests/fixtures/queries.json"
+    },
+    {
+      "id": "harvest-phrase",
+      "query_class": "phrase",
+      "query": "\"error handling\"",
+      "source_kind": "constructed",
+      "source_fact": "phrase contract extension seeded from tests/fixtures/queries.json"
+    },
+    {
+      "id": "harvest-boolean",
+      "query_class": "boolean",
+      "query": "auth OR token AND cache",
+      "source_kind": "constructed",
+      "source_fact": "CASS OR-over-AND grammar in crates/frankensearch-lexical/src/cass_compat.rs"
+    },
+    {
+      "id": "harvest-glob",
+      "query_class": "glob",
+      "query": "config*",
+      "source_kind": "constructed",
+      "source_fact": "CassWildcardPattern Prefix branch in crates/frankensearch-lexical/src/cass_compat.rs"
+    },
     {
       "id": "harvest-range",
       "query_class": "range",
       "query": "cache",
-      "filters": { "created_from": 1700000000000, "created_to": 1700000000999 },
+      "filters": {
+        "created_from": 1700000000000,
+        "created_to": 1700000000999
+      },
       "source_kind": "constructed",
       "source_fact": "CassQueryFilters structured created_from/created_to bounds in crates/frankensearch-lexical/src/cass_compat.rs"
     }
   ],
   "surface_coverage": [
-    { "surface": "schema", "fixture_ids": ["behavior-schema-default-fields"] },
-    { "surface": "analyzers", "fixture_ids": ["analyzer-default-ascii-split-lower", "analyzer-default-unicode-lower-offsets", "analyzer-default-unicode-lower-expansion", "analyzer-hyphen-compound-and-parts", "analyzer-hyphen-cjk-bigrams", "analyzer-prefix-no-hyphen-decompose", "analyzer-cass-limit-256-kept", "analyzer-cass-limit-257-dropped", "analyzer-tantivy-index-limit-65530-kept", "analyzer-tantivy-index-limit-65531-dropped", "analyzer-quill-query-limit-65531-dropped", "helper-edge-prefix-ascii", "helper-preview-unicode", "behavior-analyzers", "behavior-oversized-token-position-gap"] },
-    { "surface": "queries", "fixture_ids": ["query-identifier-path-phrase", "query-identifier-raw-colon-dropped", "query-short-keyword-default-or", "query-natural-language-default-or", "query-phrase-both-fields", "query-quoted-single-token-is-term", "query-default-and-precedes-or", "query-default-field-and-boost", "query-default-all-negative-complement", "query-default-recursive-dedup", "query-lenient-unterminated-quote-recovers", "query-lenient-diagnostic-keeps-valid-sibling", "query-default-string-range-mixed-bounds", "query-default-string-set-stable-dedup", "query-default-group-boost", "query-default-field-scoped-group", "query-default-field-scope-explicit-override", "query-default-field-scoped-typed-leaves", "query-boolean-or-tighter-than-and", "query-boolean-negative-standalone-universe", "query-boolean-negative-or-operand-universe", "query-boolean-and-not-no-all-score", "query-boolean-repeated-not-is-idempotent", "query-glob-exact", "query-glob-prefix", "query-glob-suffix", "query-glob-substring", "query-glob-complex", "query-range-inclusive-created-at", "query-cass-agent-workspace-filters", "query-cass-source-local-filter", "query-cass-source-remote-filter", "query-cass-source-id-filter", "query-cjk-all-bigrams", "query-cjk-mixed-script-keeps-cjk-only", "query-cjk-single-character-unigram", "query-empty-cass-all", "query-cass-phrase-two-term", "query-cass-phrase-single-token-collapses", "query-cass-phrase-implicit-and", "query-cass-cjk-quoted-phrase-bigrams", "query-cass-implicit-and", "query-cass-explicit-and-equivalent", "query-cass-symbolic-and-equivalent", "query-cass-or-chain", "query-cass-symbolic-or", "query-cass-right-or-precedence", "query-cass-hyphen-negative-with-positive", "query-cass-created-from-only", "query-cass-created-to-only", "query-cass-single-agent-filter-group", "query-cass-all-filter-order", "query-cass-recovery-leading-and", "query-cass-recovery-dangling-or", "query-cass-recovery-unterminated-phrase", "query-cass-recovery-dangling-not", "query-cass-carriage-return-is-not-grammar-whitespace", "query-boolean-should-optional-with-must", "query-boolean-should-only-required", "query-boolean-should-plus-mustnot-required", "query-boolean-mustnot-only-empty", "helper-query-truncate-unicode", "behavior-boolean-occur", "behavior-cass-prefix-and-cjk-boundaries", "behavior-quill-oversized-query-lowering"] },
-    { "surface": "collectors", "fixture_ids": ["behavior-collectors", "behavior-pagination-and-limit-zero"] },
-    { "surface": "scoring", "fixture_ids": ["score-bm25-constants-operation-order", "score-bm25-operation-order-bits", "score-fieldnorm-landmarks", "score-avgdl-uses-raw-statistics", "score-deleted-doc-statistics-until-merge", "score-multifield-title-boost", "score-cass-fields-unboosted", "score-cass-fast-range-constant", "score-phrase-bm25", "score-required-scorers-cost-order", "score-cass-regex-fields-constant", "score-deterministic-total-order", "score-epsilon-layout-class", "score-epsilon-component-boundary", "behavior-scoring"] },
-    { "surface": "writer", "fixture_ids": ["behavior-writer-mutations"] },
-    { "surface": "reader", "fixture_ids": ["behavior-reader-snapshot"] },
-    { "surface": "snippets", "fixture_ids": ["behavior-snippet-output"] },
-    { "surface": "segments_durability", "fixture_ids": ["behavior-segments-durability"] },
-    { "surface": "errors", "fixture_ids": ["behavior-errors-no-panic"] },
-    { "surface": "concurrency", "fixture_ids": ["behavior-concurrency"] }
+    {
+      "surface": "schema",
+      "fixture_ids": [
+        "behavior-schema-default-fields"
+      ]
+    },
+    {
+      "surface": "analyzers",
+      "fixture_ids": [
+        "analyzer-default-ascii-split-lower",
+        "analyzer-default-unicode-lower-offsets",
+        "analyzer-default-unicode-lower-expansion",
+        "analyzer-hyphen-compound-and-parts",
+        "analyzer-hyphen-cjk-bigrams",
+        "analyzer-prefix-no-hyphen-decompose",
+        "analyzer-cass-limit-256-kept",
+        "analyzer-cass-limit-257-dropped",
+        "analyzer-tantivy-index-limit-65530-kept",
+        "analyzer-tantivy-index-limit-65531-dropped",
+        "analyzer-quill-query-limit-65531-dropped",
+        "helper-edge-prefix-ascii",
+        "helper-preview-unicode",
+        "behavior-analyzers",
+        "behavior-oversized-token-position-gap"
+      ]
+    },
+    {
+      "surface": "queries",
+      "fixture_ids": [
+        "query-identifier-path-phrase",
+        "query-identifier-raw-colon-dropped",
+        "query-short-keyword-default-or",
+        "query-natural-language-default-or",
+        "query-phrase-both-fields",
+        "query-quoted-single-token-is-term",
+        "query-default-and-precedes-or",
+        "query-default-field-and-boost",
+        "query-default-all-negative-complement",
+        "query-default-recursive-dedup",
+        "query-lenient-unterminated-quote-recovers",
+        "query-lenient-diagnostic-keeps-valid-sibling",
+        "query-default-string-range-mixed-bounds",
+        "query-default-string-set-stable-dedup",
+        "query-default-group-boost",
+        "query-default-field-scoped-group",
+        "query-default-field-scope-explicit-override",
+        "query-default-field-scoped-typed-leaves",
+        "query-boolean-or-tighter-than-and",
+        "query-boolean-negative-standalone-universe",
+        "query-boolean-negative-or-operand-universe",
+        "query-boolean-and-not-no-all-score",
+        "query-boolean-repeated-not-is-idempotent",
+        "query-glob-exact",
+        "query-glob-prefix",
+        "query-glob-suffix",
+        "query-glob-substring",
+        "query-glob-complex",
+        "query-range-inclusive-created-at",
+        "query-cass-agent-workspace-filters",
+        "query-cass-source-local-filter",
+        "query-cass-source-remote-filter",
+        "query-cass-source-id-filter",
+        "query-cjk-all-bigrams",
+        "query-cjk-mixed-script-keeps-cjk-only",
+        "query-cjk-single-character-unigram",
+        "query-empty-cass-all",
+        "query-cass-phrase-two-term",
+        "query-cass-phrase-single-token-collapses",
+        "query-cass-phrase-implicit-and",
+        "query-cass-cjk-quoted-phrase-bigrams",
+        "query-cass-implicit-and",
+        "query-cass-explicit-and-equivalent",
+        "query-cass-symbolic-and-equivalent",
+        "query-cass-or-chain",
+        "query-cass-symbolic-or",
+        "query-cass-right-or-precedence",
+        "query-cass-hyphen-negative-with-positive",
+        "query-cass-created-from-only",
+        "query-cass-created-to-only",
+        "query-cass-single-agent-filter-group",
+        "query-cass-all-filter-order",
+        "query-cass-recovery-leading-and",
+        "query-cass-recovery-dangling-or",
+        "query-cass-recovery-unterminated-phrase",
+        "query-cass-recovery-dangling-not",
+        "query-cass-carriage-return-is-not-grammar-whitespace",
+        "query-boolean-should-optional-with-must",
+        "query-boolean-should-only-required",
+        "query-boolean-should-plus-mustnot-required",
+        "query-boolean-mustnot-only-empty",
+        "helper-query-truncate-unicode",
+        "behavior-boolean-occur",
+        "behavior-cass-prefix-and-cjk-boundaries",
+        "behavior-quill-oversized-query-lowering"
+      ]
+    },
+    {
+      "surface": "collectors",
+      "fixture_ids": [
+        "behavior-collectors",
+        "behavior-pagination-and-limit-zero"
+      ]
+    },
+    {
+      "surface": "scoring",
+      "fixture_ids": [
+        "score-bm25-constants-operation-order",
+        "score-bm25-operation-order-bits",
+        "score-fieldnorm-landmarks",
+        "score-avgdl-uses-raw-statistics",
+        "score-deleted-doc-statistics-until-merge",
+        "score-multifield-title-boost",
+        "score-cass-fields-unboosted",
+        "score-cass-fast-range-constant",
+        "score-phrase-bm25",
+        "score-required-scorers-cost-order",
+        "score-cass-regex-fields-constant",
+        "score-deterministic-total-order",
+        "score-epsilon-layout-class",
+        "score-epsilon-component-boundary",
+        "behavior-scoring"
+      ]
+    },
+    {
+      "surface": "writer",
+      "fixture_ids": [
+        "behavior-writer-mutations"
+      ]
+    },
+    {
+      "surface": "reader",
+      "fixture_ids": [
+        "behavior-reader-snapshot"
+      ]
+    },
+    {
+      "surface": "snippets",
+      "fixture_ids": [
+        "behavior-snippet-output"
+      ]
+    },
+    {
+      "surface": "segments_durability",
+      "fixture_ids": [
+        "behavior-segments-durability"
+      ]
+    },
+    {
+      "surface": "errors",
+      "fixture_ids": [
+        "behavior-errors-no-panic"
+      ]
+    },
+    {
+      "surface": "concurrency",
+      "fixture_ids": [
+        "behavior-concurrency"
+      ]
+    }
   ]
 }

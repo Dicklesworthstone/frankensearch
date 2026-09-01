@@ -17545,11 +17545,28 @@ mod tests {
                     "corpus_hash={} query_seed={} deterministic regression was vacuous",
                     first.corpus_manifest_hash, fixture.query_suite.manifest.spec.seed,
                 );
+                // Determinism is a LOGICAL statement (bd-pjvl1, bd-5o5z8):
+                // each campaign run builds its own physical publication, and
+                // the same-snapshot certificates seal that physical identity
+                // into every retained object, so per-case artifact addresses
+                // legitimately differ between two same-process runs — the
+                // same law the cross-rebuild proof states via
+                // `UnionHorizonProof::physically_normalized`. Everything
+                // ELSE — dispositions, rank classes, mismatch groups, lexical
+                // summaries, counts, manifests — must be byte-identical.
+                let logically_normalized = |report: &CampaignReport| {
+                    let mut normalized = report.clone();
+                    for case in &mut normalized.cases {
+                        case.artifact_hash = None;
+                    }
+                    normalized
+                };
                 assert_eq!(
-                    first.report_hash().expect("first report hash"),
-                    second.report_hash().expect("second report hash")
+                    logically_normalized(&first),
+                    logically_normalized(&second),
+                    "repeated deterministic regression drifted beyond physical \
+                     artifact identity"
                 );
-                assert_eq!(first, second, "repeated deterministic regression drifted");
             });
         });
         let logs = String::from_utf8(
@@ -21138,19 +21155,20 @@ mod tests {
                 grouped_run.comparison.divergences,
             );
 
-            // Typed-error lane: phrase slop is a declared Quill capability gap.
-            // The subject must refuse every generated slop AST with its exact
-            // typed error while the oracle executes. Crucially, the ordinary
-            // differential harness must also stop at that error instead of
-            // fabricating a comparison report from one engine's result.
+            // Phrase-slop lane (bd-5o5z8): slop is no longer a capability
+            // gap. Quill's slop execution matches the pinned oracle
+            // bit-for-bit — membership, ordering, and score bits across slop
+            // widths (probe_slop_execution_against_tantivy receipts on the
+            // bead) — so the lane pins PARITY. If a slop case stops being
+            // Exact, that is a scoring or matching regression, never a
+            // tolerance candidate.
+            // Witness base "checkout pipeline" is adjacent in test-rust-001,
+            // so every slop width matches and the parity law never passes
+            // vacuously on an empty intersection.
             for (label, slop) in [("one", 1_u32), ("two", 2), ("wide", 9)] {
-                let slop_query = format!(
-                    "\"{} {}\"~{slop}",
-                    vocabulary[0],
-                    vocabulary[1.min(vocabulary.len() - 1)]
-                );
+                let slop_query = format!("\"checkout pipeline\"~{slop}");
                 let slop_case = DifferentialCase {
-                    fixture_id: format!("bsjw-typed-error-slop-{label}"),
+                    fixture_id: format!("bsjw-slop-parity-{label}"),
                     query: slop_query.clone(),
                     limit: 20,
                     offset: 0,
@@ -21163,28 +21181,23 @@ mod tests {
                         corpus_hash: Some(corpus_hash.clone()),
                     },
                 };
-                let subject_error =
-                    crate::engine::GauntletEngine::observe(&subject, &cx, &slop_case)
-                        .await
-                        .expect_err(
-                            "phrase slop must be a typed Quill refusal, not a silent execution",
-                        );
-                assert!(
-                    subject_error.to_string().contains("slop"),
-                    "slop refusal must name the capability for {label}: {subject_error}"
-                );
-                crate::engine::GauntletEngine::observe(&oracle, &cx, &slop_case)
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("the oracle must execute slop case {label}: {error}")
-                    });
-                let harness_error = harness
+                let run = harness
                     .run(&cx, &subject, &oracle, &slop_case)
                     .await
-                    .expect_err("a typed subject refusal must not manufacture a comparison report");
+                    .unwrap_or_else(|error| {
+                        panic!("slop case {label} must execute on both engines: {error}")
+                    });
+                assert_eq!(
+                    run.comparison.status,
+                    ComparisonStatus::Exact,
+                    "slop case {label} must be bit-exact: {:?}",
+                    run.comparison.divergences
+                );
+                assert!(run.comparison.divergences.is_empty());
                 assert!(
-                    harness_error.to_string().contains("slop"),
-                    "harness must preserve the typed slop refusal for {label}: {harness_error}"
+                    !run.comparison.subject.hits.is_empty(),
+                    "the witness phrase guarantees matches; an empty page \
+                     would make this parity vacuous"
                 );
             }
 
@@ -21193,14 +21206,15 @@ mod tests {
             // exact generator: the oracle executes, while Quill names the
             // unsupported prefix capability and the harness stops before a
             // one-sided result can become a comparison report.
-            for (label, word_count) in [("two", 2_usize), ("three", 3)] {
-                let prefix_query = format!(
-                    "\"{}\"*",
-                    (0..word_count)
-                        .map(|index| vocabulary[index].as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
+            // Witness phrases from the FIXED scalar-g1a corpus: test-rust-001
+            // opens "A checkout pipeline can fail ...", so both bases match
+            // adjacently and the oracle's prefix execution returns hits — the
+            // lane can never pass vacuously on an empty intersection.
+            for (label, base) in [
+                ("two", "checkout pipeline"),
+                ("three", "checkout pipeline can"),
+            ] {
+                let prefix_query = format!("\"{base}\"*");
                 let prefix_case = DifferentialCase {
                     fixture_id: format!("bsjw-typed-error-prefix-{label}"),
                     query: prefix_query,
@@ -21211,34 +21225,33 @@ mod tests {
                     snippet_max_chars: None,
                     metadata: DifferentialCaseMetadata {
                         generator_id: Some("bsjw-query-tree-v1".to_owned()),
-                        generator_seed: Some(
-                            u64::try_from(word_count).expect("prefix word count fits u64"),
-                        ),
+                        generator_seed: Some(u64::try_from(base.len()).expect("base fits u64")),
                         corpus_hash: Some(corpus_hash.clone()),
                     },
                 };
-                let subject_error =
-                    crate::engine::GauntletEngine::observe(&subject, &cx, &prefix_case)
-                        .await
-                        .expect_err(
-                            "phrase prefix must be a typed Quill refusal, not a silent execution",
-                        );
-                assert!(
-                    subject_error.to_string().contains("prefix"),
-                    "prefix refusal must name the capability for {label}: {subject_error}"
-                );
-                crate::engine::GauntletEngine::observe(&oracle, &cx, &prefix_case)
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("the oracle must execute prefix case {label}: {error}")
-                    });
-                let harness_error = harness
+                // bd-5o5z8: MULTI-WORD phrase prefix is a working parity
+                // capability — both engines execute PhrasePrefix over the
+                // witness base and agree bit-for-bit (probe receipts on the
+                // bead). Only the single-word `"w"*` form drops at parse,
+                // and that law stays pinned in
+                // `quoted_escapes_single_quotes_and_phrase_prefix_errors_are_pinned`.
+                let run = harness
                     .run(&cx, &subject, &oracle, &prefix_case)
                     .await
-                    .expect_err("a typed prefix refusal must not manufacture a comparison report");
+                    .unwrap_or_else(|error| {
+                        panic!("prefix case {label} must compare, not error: {error}")
+                    });
+                assert_eq!(
+                    run.comparison.status,
+                    ComparisonStatus::Exact,
+                    "prefix case {label} must be bit-exact: {:?}",
+                    run.comparison.divergences
+                );
+                assert!(run.comparison.divergences.is_empty());
                 assert!(
-                    harness_error.to_string().contains("prefix"),
-                    "harness must preserve the typed prefix refusal for {label}: {harness_error}"
+                    !run.comparison.subject.hits.is_empty(),
+                    "the witness base guarantees matches; an empty page would \
+                     make this parity vacuous"
                 );
             }
 
@@ -21266,13 +21279,20 @@ mod tests {
                 .run(&cx, &subject, &oracle, &overflow_case)
                 .await
                 .expect_err("DIV-005 non-finite oracle score must fail closed before comparison");
+            // The refusal moved one gate EARLIER (bd-pjvl1, bd-5o5z8): the
+            // same-snapshot certificate derives from the native prefix before
+            // the observation validator runs, and a non-finite native score
+            // cannot certify a cutoff. Same law — non-finite oracle evidence
+            // fails closed before any comparison — stricter voice.
             assert!(
                 matches!(
                     overflow_error,
                     GauntletError::InvalidObservation { ref reason }
-                        if reason.contains("oracle.hits") && reason.contains("non-finite score")
+                        if reason.contains("cannot certify the cutoff")
+                            && reason.contains("not canonical and finite")
                 ),
-                "DIV-005 must remain a non-finite observation refusal: {overflow_error}"
+                "DIV-005 must remain a non-finite refusal at the certificate \
+                 gate: {overflow_error}"
             );
         });
     }
@@ -21296,18 +21316,6 @@ mod tests {
     const PTTXK_CURRENT_RECURRENCE_QUERY: &str = "rust ownership borrowing";
     #[cfg(feature = "tantivy-oracle")]
     const PTTXK_CURRENT_CONTROL_QUERY: &str = "rust ownership";
-
-    #[cfg(feature = "tantivy-oracle")]
-    fn split_scored_hit(value: &str) -> (&str, u32) {
-        let (doc_id, bits) = value
-            .rsplit_once('@')
-            .unwrap_or_else(|| panic!("scored hit must render as id@bits: {value:?}"));
-        (
-            doc_id,
-            u32::from_str_radix(bits, 16)
-                .unwrap_or_else(|error| panic!("hit score bits {bits:?} are not hex: {error}")),
-        )
-    }
 
     /// External counted-parity pin at a horizon-spanning tie shape
     /// (bd-1i4j4): 5,000 near-identical documents (one high-tf outlier at
@@ -21581,51 +21589,27 @@ mod tests {
                 }
             }
 
+            // bd-5o5z8: the structural mirror lowers unfielded terms as the
+            // per-term nested groups tantivy itself evaluates, so the
+            // recurrence that survived the flat design converges. If it
+            // diverges again the MIRROR regressed — a new register
+            // observation, never a revival of DIV-008.
             let fixture_id = "pttxk-current-recurrence";
             let recurrence = witness_case(fixture_id, PTTXK_CURRENT_RECURRENCE_QUERY);
-            let raw = zero_tolerance
-                .run(&cx, &subject, &oracle, &recurrence)
-                .await
-                .unwrap_or_else(|error| panic!("{fixture_id} zero-tolerance run: {error}"));
-            assert_eq!(raw.comparison.status, ComparisonStatus::Failed);
-            assert_eq!(raw.comparison.rank_class, RankClass::RankMismatch);
-            assert_eq!(
-                raw.comparison.divergences.len(),
-                1,
-                "current recurrence must remain a single minimized divergence: {:?}",
-                raw.comparison.divergences
-            );
-            let divergence = &raw.comparison.divergences[0];
-            assert_eq!(divergence.class, DivergenceClass::RankMismatch);
-            let (oracle_doc, oracle_bits) = split_scored_hit(&divergence.oracle);
-            let (subject_doc, subject_bits) = split_scored_hit(&divergence.subject);
-            assert_eq!(
-                oracle_doc, subject_doc,
-                "current recurrence must differ in score, not membership"
-            );
-            assert_eq!(
-                subject_bits.abs_diff(oracle_bits),
-                1,
-                "current recurrence must remain exactly one ULP: oracle={oracle_bits:#010x} subject={subject_bits:#010x}"
-            );
-
-            let classified = enveloped
-                .run(&cx, &subject, &oracle, &recurrence)
-                .await
-                .unwrap_or_else(|error| panic!("{fixture_id} enveloped run: {error}"));
-            assert_eq!(classified.comparison.status, ComparisonStatus::Classified);
-            assert_eq!(classified.comparison.rank_class, RankClass::ScoreEpsilon);
-            assert_eq!(
-                classified.comparison.score_epsilon_reason,
-                Some(ScoreEpsilonReason::SummationAssociation)
-            );
-            assert!(
-                classified
-                    .comparison
-                    .divergences
-                    .iter()
-                    .all(|divergence| divergence.class == DivergenceClass::ScoreEpsilon)
-            );
+            for (label, harness) in [("raw", &zero_tolerance), ("enveloped", &enveloped)] {
+                let outcome = harness
+                    .run(&cx, &subject, &oracle, &recurrence)
+                    .await
+                    .unwrap_or_else(|error| panic!("{fixture_id} {label} run: {error}"));
+                assert_eq!(
+                    outcome.comparison.status,
+                    ComparisonStatus::Exact,
+                    "{fixture_id} must be bit-exact under the {label} comparator once the \
+                     lowering mirrors tantivy's nesting: {:?}",
+                    outcome.comparison.divergences
+                );
+                assert!(outcome.comparison.divergences.is_empty());
+            }
 
             let control = zero_tolerance
                 .run(

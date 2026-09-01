@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "corpus_manifest_hash": "28640a81dce43433fd33b16b62c265b51ad7e0973466d1f790f688b4441e39c9",
-  "query_manifest_hash": "591de0cbe2a393685eb9c578e34a4c60ad9211db0f381d7c30a2220d9b9001f6",
+  "corpus_manifest_hash": "439138e14438757ebef4e7f1acbd1532e2f41999b3c38c40123cba4579a7c8cb",
+  "query_manifest_hash": "f21547dc4ab889b547f7bcb4bc6e84b7fb43f687aca324ba6a25f80474c554ef",
   "query_seed": 25089,
   "cases": [
     {
@@ -126,11 +126,17 @@
     },
     {
       "query_id": "harvested-06",
-      "ranked_document_ids": ["test-ml-006", "test-sysadmin-010"]
+      "ranked_document_ids": [
+        "test-ml-006",
+        "test-sysadmin-010"
+      ]
     },
     {
       "query_id": "harvested-07",
-      "ranked_document_ids": ["test-cooking-006", "test-cooking-009"]
+      "ranked_document_ids": [
+        "test-cooking-006",
+        "test-cooking-009"
+      ]
     },
     {
       "query_id": "harvested-08",
@@ -144,7 +150,10 @@
     },
     {
       "query_id": "harvested-09",
-      "ranked_document_ids": ["test-rust-017", "test-ml-004"]
+      "ranked_document_ids": [
+        "test-rust-017",
+        "test-ml-004"
+      ]
     },
     {
       "query_id": "harvested-10",
@@ -173,7 +182,9 @@
     },
     {
       "query_id": "harvested-11",
-      "ranked_document_ids": ["test-sysadmin-007"]
+      "ranked_document_ids": [
+        "test-sysadmin-007"
+      ]
     },
     {
       "query_id": "harvested-12",
@@ -185,7 +196,9 @@
     },
     {
       "query_id": "harvested-13",
-      "ranked_document_ids": ["test-ml-014"]
+      "ranked_document_ids": [
+        "test-ml-014"
+      ]
     },
     {
       "query_id": "harvested-14",
@@ -214,7 +227,10 @@
     },
     {
       "query_id": "harvested-15",
-      "ranked_document_ids": ["test-ml-006", "test-sysadmin-010"]
+      "ranked_document_ids": [
+        "test-ml-006",
+        "test-sysadmin-010"
+      ]
     },
     {
       "query_id": "harvested-16",
@@ -268,11 +284,16 @@
     },
     {
       "query_id": "harvested-18",
-      "ranked_document_ids": ["test-ml-001"]
+      "ranked_document_ids": [
+        "test-ml-001"
+      ]
     },
     {
       "query_id": "harvested-19",
-      "ranked_document_ids": ["test-cooking-001", "test-cooking-005"]
+      "ranked_document_ids": [
+        "test-cooking-001",
+        "test-cooking-005"
+      ]
     },
     {
       "query_id": "harvested-20",

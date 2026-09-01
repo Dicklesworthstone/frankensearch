@@ -1216,7 +1216,13 @@ impl DefaultQueryParser {
             if let Some(node) = parsed.as_mut() {
                 rewrite_parser_syntax(node);
                 trim_parser_dropped(&mut node.query, &node.dedup_key);
-                flatten_should_of_should(&mut node.query);
+                // PROTOTYPE (bd-1i4j4): tantivy preserves Should nesting and
+                // evaluates it with generic unions, so full flattening broke
+                // f32 association parity on every unfielded multi-term shape.
+                // Only the flatten's SEMANTIC duty survives: parser-dropped
+                // fragments leave empty groups behind, and refusal surfaces
+                // key on the collapsed Empty root.
+                collapse_degenerate_groups(&mut node.query);
             }
             repair_root_all_negative(&mut parsed, &mut grammar);
         }
@@ -3985,6 +3991,149 @@ fn negative_boolean_dedup_key(child: SyntaxKey) -> SyntaxKey {
 /// generic)`). Flattening after dedup reproduces the oracle's association
 /// exactly. A non-`Should` occurrence or a mixed-occurrence child is a
 /// boundary, as is any non-boolean node (boosts included).
+/// Collapse parser-drop residue without disturbing live Should nesting
+/// (bd-1i4j4).
+///
+/// Tantivy preserves nested `Should` groups and evaluates each level with its
+/// generic union, so the f32 accumulation association follows the parse tree;
+/// merging that nesting away broke score-bit parity on every unfielded
+/// multi-term shape. What must still collapse is DROP RESIDUE: a fragment the
+/// parser deleted leaves an empty group behind, and the typed-refusal
+/// surfaces key on the query collapsing to `Empty`. Post-order: an
+/// `Occur::Should` clause whose child is `Empty` or an empty `Boolean` is
+/// dropped, and a `Boolean` left with no clauses becomes `Empty`. `Must` and
+/// `MustNot` clauses are never touched, and singleton groups are kept —
+/// lowering's `scorer_union` pops a one-child union, so the wrapper never
+/// constructs and cannot change association.
+#[cfg(test)]
+mod pttxk_slop_probe {
+    use super::*;
+    #[test]
+    #[ignore = "bd-1i4j4 measurement probe; run explicitly"]
+    fn probe_slop_parse() {
+        let parser = DefaultQueryParser::new(crate::DEFAULT_SCHEMA).expect("parser");
+        let parsed = parser.parse_lenient("\"alpha beta\"~2");
+        println!("PROBE diagnostics = {:?}", parsed.diagnostics);
+        println!("PROBE query root = {:?}", parsed.query.root());
+        println!("PROBE nodes = {}", parsed.query.node_count());
+    }
+}
+
+fn collapse_degenerate_groups(query: &mut Query) {
+    let mut pending = Vec::new();
+    if pending.try_reserve_exact(query.node_count()).is_err() {
+        return;
+    }
+    pending.push((query.root_id(), false));
+    while let Some((node_id, visited)) = pending.pop() {
+        let QueryNode::Boolean { clauses, .. } = query.node(node_id) else {
+            continue;
+        };
+        if !visited {
+            pending.push((node_id, true));
+            pending.extend(clauses.iter().rev().map(|clause| (clause.query, false)));
+            continue;
+        }
+        let is_degenerate = |query: &Query, node| match query.node(node) {
+            QueryNode::Empty => true,
+            QueryNode::Boolean { clauses, .. } => clauses.is_empty(),
+            _ => false,
+        };
+        let retained_len = clauses.iter().fold(0_usize, |len, clause| {
+            if clause.occur == Occur::Should && is_degenerate(query, clause.query) {
+                len
+            } else {
+                len.saturating_add(1)
+            }
+        });
+        if retained_len == clauses.len() {
+            continue;
+        }
+        let mut retained = Vec::new();
+        if retained.try_reserve_exact(retained_len).is_err() {
+            continue;
+        }
+        for clause in clauses {
+            if clause.occur == Occur::Should && is_degenerate(query, clause.query) {
+                continue;
+            }
+            retained.push(*clause);
+        }
+        if let QueryNode::Boolean { clauses, .. } = query.node_mut(node_id) {
+            *clauses = retained;
+        }
+    }
+    // The flatten's OTHER retained duty (bd-htcun): a post-trim SINGLETON
+    // `Should` group splices into its parent. Execution-neutral either way —
+    // lowering's `scorer_union` pops a one-child union — but the parser-AST
+    // hygiene laws (raw-identity dedup, diagnostics siblings) are pinned over
+    // the spliced shape, and tantivy's own grammar rewrite performs the same
+    // singleton transfer. Multi-child groups are NEVER spliced: their nesting
+    // is the association the structural mirror exists to preserve.
+    let mut pending = Vec::new();
+    if pending.try_reserve_exact(query.node_count()).is_err() {
+        return;
+    }
+    pending.push(query.root_id());
+    while let Some(node_id) = pending.pop() {
+        let QueryNode::Boolean { clauses, .. } = query.node(node_id) else {
+            continue;
+        };
+        pending.extend(clauses.iter().map(|clause| clause.query));
+        let mut spliced = Vec::new();
+        if spliced.try_reserve_exact(clauses.len()).is_err() {
+            continue;
+        }
+        let mut changed = false;
+        for clause in clauses {
+            if clause.occur == Occur::Should
+                && let QueryNode::Boolean {
+                    clauses: children, ..
+                } = query.node(clause.query)
+                && children.len() == 1
+                && children[0].occur == Occur::Should
+            {
+                spliced.push(children[0]);
+                changed = true;
+            } else {
+                spliced.push(*clause);
+            }
+        }
+        if changed && let QueryNode::Boolean { clauses, .. } = query.node_mut(node_id) {
+            *clauses = spliced;
+        }
+        // A Boolean holding exactly one `Should` clause is a pure wrapper:
+        // a one-child union IS its child at lowering (`scorer_union` pops
+        // it), and the flat-era flatten always erased it. Unwrapping keeps
+        // the pinned root/sibling AST laws intact without ever touching
+        // multi-child nesting.
+        let QueryNode::Boolean { clauses, .. } = query.node(node_id) else {
+            continue;
+        };
+        if clauses.len() == 1
+            && clauses[0].occur == Occur::Should
+            && matches!(query.node(clauses[0].query), QueryNode::Boolean { .. })
+        {
+            // Only a BOOLEAN child unwraps: the flat-era flatten spliced
+            // Should-of-Should exclusively, so `B[Should=Range]`-style
+            // wrappers around leaf nodes are pinned shapes and stay.
+            let child = clauses[0].query;
+            let replacement = query.node(child).clone();
+            *query.node_mut(node_id) = replacement;
+        }
+    }
+    if let QueryNode::Boolean { clauses, .. } = query.node(query.root_id())
+        && clauses.is_empty()
+    {
+        *query = Query::empty();
+    }
+}
+
+/// RETIRED from the scored parse (bd-5o5z8): tantivy preserves Should
+/// nesting and evaluates it with generic unions, so the shipping pipeline
+/// now runs `collapse_degenerate_groups` instead. Retained solely for the
+/// tests-module legacy-pipeline replica that pins what the flat era did.
+#[cfg(test)]
 fn flatten_should_of_should(query: &mut Query) {
     let mut pending = Vec::new();
     if pending.try_reserve_exact(query.node_count()).is_err() {
@@ -5630,6 +5779,25 @@ mod tests {
 
     fn parser() -> DefaultQueryParser {
         DefaultQueryParser::new(DEFAULT_SCHEMA).expect("default schema supports its parser")
+    }
+
+    /// Whether `node` is the default two-field expansion group of `text`:
+    /// `Boolean[Should content-term, Should title-term(^2)]` — the shape an
+    /// unfielded term lowers to under the structural mirror (bd-5o5z8),
+    /// matching tantivy's nested `(content OR title^2)` evaluation unit.
+    fn is_expansion_group(query: &Query, node: QueryNodeId, text: &str) -> bool {
+        let QueryNode::Boolean { clauses, .. } = query.node(node) else {
+            return false;
+        };
+        clauses.len() == 2
+            && clauses.iter().all(|clause| clause.occur == Occur::Should)
+            && is_single_field_term(query, clauses[0].query, text, QueryField::new(1, 1.0))
+            && is_single_field_term(
+                query,
+                clauses[1].query,
+                text,
+                QueryField::new(2, TITLE_BOOST),
+            )
     }
 
     fn is_single_field_term(
@@ -7350,39 +7518,37 @@ mod tests {
         let QueryNode::Boolean { clauses, .. } = mixed.query.root() else {
             panic!("mixed chain must lower to a boolean: {:?}", mixed.query);
         };
+        // Structural mirror (bd-5o5z8): the OR-chain keeps its own group and
+        // each unfielded term keeps its two-field expansion group, exactly
+        // the nesting tantivy evaluates; only the trailing raw duplicate
+        // survives beside it.
         assert_eq!(
             clauses.len(),
-            5,
-            "flattened execution shape: two alpha field leaves, the AND group, and the \
-             two SURVIVING trailing alpha field leaves: {clauses:?}"
+            2,
+            "mirrored execution shape: the OR/AND chain group and the \
+             surviving trailing duplicate group: {clauses:?}"
         );
+        let QueryNode::Boolean { clauses: chain, .. } = mixed.query.node(clauses[0].query) else {
+            panic!("the leading OR chain keeps its group: {clauses:?}");
+        };
+        assert_eq!(chain.len(), 2);
         assert!(
-            is_single_field_term(
-                &mixed.query,
-                clauses[0].query,
-                "alpha",
-                QueryField::new(1, 1.0),
-            ) && is_single_field_term(
-                &mixed.query,
-                clauses[1].query,
-                "alpha",
-                QueryField::new(2, TITLE_BOOST),
-            ),
-            "leading operand fields first: {clauses:?}"
+            is_expansion_group(&mixed.query, chain[0].query, "alpha"),
+            "leading operand keeps its expansion group: {chain:?}"
         );
+        let QueryNode::Boolean {
+            clauses: and_arm, ..
+        } = mixed.query.node(chain[1].query)
+        else {
+            panic!("the AND arm keeps its group: {chain:?}");
+        };
+        assert_eq!(and_arm.len(), 2);
+        assert!(and_arm.iter().all(|clause| clause.occur == Occur::Must));
+        assert!(is_expansion_group(&mixed.query, and_arm[0].query, "beta"));
+        assert!(is_expansion_group(&mixed.query, and_arm[1].query, "gamma"));
         assert!(
-            is_single_field_term(
-                &mixed.query,
-                clauses[3].query,
-                "alpha",
-                QueryField::new(1, 1.0),
-            ) && is_single_field_term(
-                &mixed.query,
-                clauses[4].query,
-                "alpha",
-                QueryField::new(2, TITLE_BOOST),
-            ),
-            "the trailing duplicate fields survive after flattening: {clauses:?}"
+            is_expansion_group(&mixed.query, clauses[1].query, "alpha"),
+            "the trailing raw duplicate survives as its own group: {clauses:?}"
         );
 
         let pure = parser().parse("alpha alpha");
@@ -7422,7 +7588,7 @@ mod tests {
     }
 
     #[test]
-    fn default_terms_expand_to_ordered_single_field_should_leaves() {
+    fn default_terms_expand_to_per_term_should_groups() {
         let single = parser().parse("content:release").query;
         assert!(
             matches!(
@@ -7433,29 +7599,28 @@ mod tests {
             "an explicitly single-field term must remain one leaf"
         );
 
+        // Structural mirror (bd-5o5z8): the parenthesised pair keeps its
+        // group and each unfielded term keeps its per-term expansion group —
+        // tantivy's exact evaluation tree, whose nesting decides the f32
+        // association the gauntlet pins bit-for-bit.
         let parsed = parser().parse("(release OR require) OR return");
         let QueryNode::Boolean { clauses, operator } = parsed.query.root() else {
             panic!("unfielded three-term OR must lower to an ordered boolean");
         };
         assert_eq!(*operator, Some(BooleanOperator::Or));
-        let expected = [
-            ("release", QueryField::new(1, 1.0)),
-            ("release", QueryField::new(2, TITLE_BOOST)),
-            ("require", QueryField::new(1, 1.0)),
-            ("require", QueryField::new(2, TITLE_BOOST)),
-            ("return", QueryField::new(1, 1.0)),
-            ("return", QueryField::new(2, TITLE_BOOST)),
-        ];
-        assert_eq!(clauses.len(), expected.len());
-        for (clause, (text, field)) in clauses.iter().zip(expected) {
-            assert_eq!(clause.occur, Occur::Should);
-            assert!(is_single_field_term(
-                &parsed.query,
-                clause.query,
-                text,
-                field
-            ));
-        }
+        assert_eq!(clauses.len(), 2, "paren group plus trailing term group");
+        assert!(clauses.iter().all(|clause| clause.occur == Occur::Should));
+        let QueryNode::Boolean { clauses: paren, .. } = parsed.query.node(clauses[0].query) else {
+            panic!("the parenthesised pair keeps its group");
+        };
+        assert_eq!(paren.len(), 2);
+        assert!(is_expansion_group(&parsed.query, paren[0].query, "release"));
+        assert!(is_expansion_group(&parsed.query, paren[1].query, "require"));
+        assert!(is_expansion_group(
+            &parsed.query,
+            clauses[1].query,
+            "return"
+        ));
     }
 
     #[test]
@@ -7598,63 +7763,65 @@ mod tests {
 
     #[test]
     fn parser_syntax_rewrite_flattens_singletons_and_transfers_occurrence() {
-        assert!(is_default_term(&parser().parse("+a").query, "a"));
-        assert!(is_default_term(&parser().parse("(+a)").query, "a"));
+        // Structural mirror (bd-5o5z8): singleton wrappers still erase and
+        // occurrences still transfer, but each unfielded term keeps its
+        // two-field expansion group — the erased wrapper leaves the GROUP as
+        // the surviving node, never a re-flattened leaf list.
+        let unary = parser().parse("+a").query;
+        assert!(is_expansion_group(&unary, unary.root_id(), "a"));
+        let grouped = parser().parse("(+a)").query;
+        assert!(is_expansion_group(&grouped, grouped.root_id(), "a"));
         let rewritten = parser().parse("(+a) a").query;
-        let QueryNode::Boolean { clauses, .. } = rewritten.root() else {
-            panic!("the rewritten duplicate keeps its root Boolean");
-        };
-        assert_eq!(
-            clauses.len(),
-            2,
-            "singleton unary Must is erased before the surviving term expands by field"
+        assert!(
+            is_expansion_group(&rewritten, rewritten.root_id(), "a"),
+            "the raw-deduplicated singleton unwraps to the expansion group"
         );
 
         let boosted_empty = parser().parse("(+unknown:x^2) a").query;
         let QueryNode::Boolean { clauses, .. } = boosted_empty.root() else {
             panic!("the optional boosted-empty branch and term remain Boolean");
         };
-        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses.len(), 2);
         assert!(clauses.iter().all(|clause| clause.occur == Occur::Should));
         assert!(matches!(
             boosted_empty.node(clauses[0].query),
             QueryNode::Boost { .. }
         ));
+        assert!(is_expansion_group(&boosted_empty, clauses[1].query, "a"));
 
         let negative = parser().parse("(-a) b").query;
         let QueryNode::Boolean { clauses, .. } = negative.root() else {
             panic!("negative group plus optional term must remain Boolean");
         };
-        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses.len(), 2);
         assert_eq!(clauses[0].occur, Occur::MustNot);
+        assert!(is_expansion_group(&negative, clauses[0].query, "a"));
         assert_eq!(clauses[1].occur, Occur::Should);
-        assert_eq!(clauses[2].occur, Occur::Should);
+        assert!(is_expansion_group(&negative, clauses[1].query, "b"));
 
         let required = parser().parse("(a AND a) b").query;
         let QueryNode::Boolean { clauses, .. } = required.root() else {
             panic!("required group plus optional term must remain Boolean");
         };
-        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses.len(), 2);
         assert_eq!(clauses[0].occur, Occur::Must);
+        assert!(is_expansion_group(&required, clauses[0].query, "a"));
         assert_eq!(clauses[1].occur, Occur::Should);
-        assert_eq!(clauses[2].occur, Occur::Should);
+        assert!(is_expansion_group(&required, clauses[1].query, "b"));
 
         let equal_groups = parser().parse("((a AND a) b) (+a b)").query;
         let QueryNode::Boolean { clauses, .. } = equal_groups.root() else {
-            panic!("the rewritten root must remain Boolean");
+            panic!("recursively equal groups deduplicate and unwrap to the pair");
         };
-        assert_eq!(clauses.len(), 1, "recursively equal groups deduplicate");
-        let QueryNode::Boolean { clauses: inner, .. } = equal_groups.node(clauses[0].query) else {
-            panic!("the two-clause child must retain its grouping");
-        };
-        assert_eq!(inner.len(), 3);
-        assert_eq!(inner[0].occur, Occur::Must);
-        assert_eq!(inner[1].occur, Occur::Should);
-        assert_eq!(inner[2].occur, Occur::Should);
+        assert_eq!(clauses.len(), 2, "the deduplicated singleton unwraps");
+        assert_eq!(clauses[0].occur, Occur::Must);
+        assert!(is_expansion_group(&equal_groups, clauses[0].query, "a"));
+        assert_eq!(clauses[1].occur, Occur::Should);
+        assert!(is_expansion_group(&equal_groups, clauses[1].query, "b"));
 
         let flattened = parser().parse("(a AND a) +a").query;
         let QueryNode::Boolean { clauses, .. } = flattened.root() else {
-            panic!("dedup-before-flatten must leave the root Boolean");
+            panic!("dedup-before-unwrap must leave the root Boolean");
         };
         assert_eq!(clauses.len(), 2, "the rewrite does not dedup a second time");
         assert!(clauses.iter().all(|clause| clause.occur == Occur::Must));
@@ -7671,32 +7838,32 @@ mod tests {
         let QueryNode::Boolean { clauses, .. } = distinct_regex.root() else {
             panic!("raw-distinct groups must both survive");
         };
-        assert_eq!(clauses.len(), 4);
+        assert_eq!(clauses.len(), 2);
         // Raw-identity dedup ran on the NESTED syntax (distinct /x/ vs /y/
-        // prevent it), then the post-trim singleton groups splice into the
-        // parent for oracle-associated execution (bd-htcun flatten).
-        assert!(clauses.iter().all(|clause| {
-            matches!(
-                distinct_regex.node(clause.query),
-                QueryNode::Term { text, .. } if text == "a"
-            )
-        }));
+        // prevent it); under the structural mirror each survivor keeps its
+        // expansion group instead of splicing to leaves (bd-5o5z8).
+        assert!(
+            clauses
+                .iter()
+                .all(|clause| { is_expansion_group(&distinct_regex, clause.query, "a") })
+        );
 
         let duplicate_regex = parser().parse("(a /x/) (a /x/)").query;
-        let QueryNode::Boolean { clauses, .. } = duplicate_regex.root() else {
-            panic!("the rewritten duplicate keeps its root Boolean");
-        };
-        assert_eq!(
-            clauses.len(),
-            2,
-            "raw-identical groups deduplicate before the two-field expansion"
+        assert!(
+            is_expansion_group(&duplicate_regex, duplicate_regex.root_id(), "a"),
+            "raw-identical groups deduplicate and the singleton unwraps to the group"
         );
 
         let distinct_unknown = parser().parse("(a unknown:x) (a unknown:y)").query;
         let QueryNode::Boolean { clauses, .. } = distinct_unknown.root() else {
             panic!("distinct unknown-field syntax must prevent parent dedup");
         };
-        assert_eq!(clauses.len(), 4);
+        assert_eq!(clauses.len(), 2);
+        assert!(
+            clauses
+                .iter()
+                .all(|clause| { is_expansion_group(&distinct_unknown, clause.query, "a") })
+        );
 
         let boosted = parser().parse("(a AND unknown:x)^2").query;
         let QueryNode::Boost { query, .. } = boosted.root() else {
@@ -7709,13 +7876,9 @@ mod tests {
         assert_eq!(clauses[0].occur, Occur::Must);
 
         let f64_only = parser().parse("a unknown:x^1.00000001").query;
-        let QueryNode::Boolean { clauses, .. } = f64_only.root() else {
-            panic!("the valid sibling keeps the root Boolean");
-        };
-        assert_eq!(
-            clauses.len(),
-            2,
-            "an f64-only boost boundary erases before ordered field expansion"
+        assert!(
+            is_expansion_group(&f64_only, f64_only.root_id(), "a"),
+            "an f64-only boost boundary erases and the survivor keeps its group"
         );
     }
 
@@ -8028,22 +8191,15 @@ mod tests {
         let QueryNode::Boolean { clauses, .. } = malformed_slop.query.root() else {
             panic!("malformed slop must retain phrase and trailing fragments");
         };
-        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses.len(), 2);
         assert!(matches!(
             malformed_slop.query.node(clauses[0].query),
             QueryNode::Phrase { slop: 0, .. }
         ));
-        assert!(is_single_field_term(
+        assert!(is_expansion_group(
             &malformed_slop.query,
             clauses[1].query,
             "deprecated",
-            QueryField::new(1, 1.0),
-        ));
-        assert!(is_single_field_term(
-            &malformed_slop.query,
-            clauses[2].query,
-            "deprecated",
-            QueryField::new(2, TITLE_BOOST),
         ));
         assert!(malformed_slop.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
@@ -8056,22 +8212,15 @@ mod tests {
         let QueryNode::Boolean { clauses, .. } = overflowing_slop.query.root() else {
             panic!("overflowing slop must retain phrase and trailing fragments");
         };
-        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses.len(), 2);
         assert!(matches!(
             overflowing_slop.query.node(clauses[0].query),
             QueryNode::Phrase { slop: 0, .. }
         ));
-        assert!(is_single_field_term(
+        assert!(is_expansion_group(
             &overflowing_slop.query,
             clauses[1].query,
             "4294967296",
-            QueryField::new(1, 1.0),
-        ));
-        assert!(is_single_field_term(
-            &overflowing_slop.query,
-            clauses[2].query,
-            "4294967296",
-            QueryField::new(2, TITLE_BOOST),
         ));
     }
 
@@ -8121,11 +8270,12 @@ mod tests {
         assert!(matches!(distinct.root(), QueryNode::Boolean { .. }));
         assert_eq!(term_leaf_count(&distinct, "rust"), 4);
 
-        // Idempotent MustNot clauses DO merge, even nested.
+        // Idempotent MustNot clauses DO merge, even nested: the a-group and
+        // one merged negation wrapper survive (bd-5o5z8 nesting).
         let recursive = parser().parse("a OR -b OR (-b)").query;
         assert!(matches!(
             recursive.root(),
-            QueryNode::Boolean { clauses, .. } if clauses.len() == 3
+            QueryNode::Boolean { clauses, .. } if clauses.len() == 2
         ));
     }
 
@@ -8136,13 +8286,14 @@ mod tests {
         let QueryNode::Boolean { clauses, .. } = query.root() else {
             return;
         };
+        assert_eq!(clauses.len(), 2, "rust group plus the negation wrapper");
         assert!(matches!(
-            query.node(clauses[2].query),
+            query.node(clauses[1].query),
             QueryNode::Boolean { .. }
         ));
         let QueryNode::Boolean {
             clauses: negative, ..
-        } = query.node(clauses[2].query)
+        } = query.node(clauses[1].query)
         else {
             return;
         };

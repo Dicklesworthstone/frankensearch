@@ -27690,27 +27690,33 @@ mod tests {
         );
 
         let default_two = parser.parse("alpha OR beta");
-        assert!(
+        // Structural mirror (bd-5o5z8): unfielded terms keep their per-term
+        // expansion groups, so this root classifies TermGroups; grouped
+        // MaxScore is gated on GROUPED_MAX_SCORE_ENABLED (bd-2zsx6) and the
+        // gate must agree with the runtime either way.
+        assert_eq!(
             query_has_prunable_root_union(&default_two.query, 1.0),
-            "four direct default-field terms are MaxScore-capable"
+            GROUPED_MAX_SCORE_ENABLED,
+            "grouped default-field roots follow the grouped-MaxScore lever"
         );
 
         let default_nine = parser
             .parse("alpha OR beta OR gamma OR delta OR epsilon OR zeta OR eta OR theta OR iota");
         assert!(
-            query_has_prunable_root_union(&default_nine.query, 1.0),
-            "eighteen direct default-field terms are BMW-capable"
+            !query_has_prunable_root_union(&default_nine.query, 1.0),
+            "nine term groups have no grouped BMW: a group owns no physical \
+             block-max list, so wide grouped roots stay postings-only"
         );
 
         assert!(
             matches!(
                 prunable_scorer_shape(&default_two.query, 1.0),
                 Some(PrunableScorerShape::Union {
-                    children: 4,
-                    kind: UnionChildKind::DirectTerms,
+                    children: 2,
+                    kind: UnionChildKind::TermGroups,
                 })
             ),
-            "a default two-word query lowers to four direct frequency-term leaves"
+            "a default two-word query lowers to two per-term expansion groups"
         );
         assert!(
             matches!(
@@ -27727,15 +27733,16 @@ mod tests {
             matches!(
                 prunable_scorer_shape(&mixed.query, 1.0),
                 Some(PrunableScorerShape::Union {
-                    children: 3,
-                    kind: UnionChildKind::DirectTerms,
+                    children: 2,
+                    kind: UnionChildKind::Mixed,
                 })
             ),
-            "a field-scoped term plus one default term lowers to three direct leaves"
+            "a field-scoped term beside a default-term group is a Mixed root"
         );
         assert!(
-            query_has_prunable_root_union(&mixed.query, 1.0),
-            "three direct term children are MaxScore-capable"
+            !query_has_prunable_root_union(&mixed.query, 1.0),
+            "mixed direct/grouped roots have no pruning lever and stay \
+             postings-only"
         );
 
         let direct_nine = parser.parse(
@@ -27993,8 +28000,10 @@ mod tests {
             }
             assert_eq!(
                 segment.cached_rank_pruning_term_count(),
-                3,
-                "flat default-field leaves validate the three present terms, not absent title:beta"
+                2,
+                "the two per-term expansion groups validate their present \
+                 members once each (bd-5o5z8); absent title:beta still never \
+                 validates"
             );
         });
     }

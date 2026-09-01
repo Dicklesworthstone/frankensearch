@@ -53,8 +53,21 @@ const QG6_CORPUS_GENERATOR_REVISION: &str =
 /// was measured against the pre-50c14df5 query universe and is incomparable to
 /// evidence measured here. Re-freezing records that; it does not restore
 /// comparability or establish a performance win.
+///
+/// GOLDEN-CHANGE (structural mirror of tantivy default-field nesting,
+/// bd-5o5z8). The scored parse now preserves per-term
+/// `(content OR title^2)` Should GROUPS instead of flattening them, so
+/// every unfielded normative query's AST identity moved again and
+/// `quill_language_contract.json` was re-minted from measured parser
+/// receipts. Query text, sampling, class membership, support state,
+/// supported k, and generator revisions are again unchanged; the parser
+/// change itself is witnessed by the re-pinned parse-tree contract cases
+/// and the gauntlet structural lanes. Artifacts carrying the previous
+/// identity `6207a48e57714f2acf39f34d0f30e20e1f3eaa209afafaa4b56cb5118ccca748`
+/// were measured against the flat-expansion query universe and are
+/// incomparable to evidence measured here.
 const QG6_FROZEN_MANIFEST_SHA256: &str =
-    "6207a48e57714f2acf39f34d0f30e20e1f3eaa209afafaa4b56cb5118ccca748";
+    "db20d486c7d2e535bad2a6082270ad8e92628046ca18bb1cea612bf4384aef5b";
 const EMPTY_DOCUMENT_ID_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const QG6_AD_HOC_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-ad-hoc-query-v1";
