@@ -4442,7 +4442,8 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
             // request cancellation and then have the caller told `Ok(())`,
             // leaving a cancelled query to keep walking its plan. No work is
             // metered here, so only the observation and the typed error apply.
-            if self.cx.is_cancel_requested() {
+            // bd-tb4c4: per-posting cancellation poll uses the Cx cancellation flag.
+            if self.cx.is_cancelled() {
                 #[cfg(feature = "profile-internals")]
                 if let Some(profile) = self.profile {
                     profile.record_cancellation_observation();
@@ -4455,7 +4456,8 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
         if let Some(profile) = self.profile {
             profile.record_work_requested(kind, units);
         }
-        if self.cx.is_cancel_requested() {
+        // bd-tb4c4: per-posting cancellation poll uses the Cx cancellation flag.
+        if self.cx.is_cancelled() {
             #[cfg(feature = "profile-internals")]
             if let Some(profile) = self.profile {
                 profile.record_cancellation_observation();
@@ -13241,7 +13243,8 @@ fn query_work_upper_bound(
 }
 
 fn check_cancel(cx: &Cx, phase: &'static str) -> Result<(), QuillIndexError> {
-    if cx.is_cancel_requested() {
+    // bd-tb4c4: hot-path cancellation poll uses the Cx cancellation flag.
+    if cx.is_cancelled() {
         Err(QuillIndexError::Cancelled { phase })
     } else {
         Ok(())
