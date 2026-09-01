@@ -349,6 +349,10 @@ where
 
     // For search command, capture an explicit query token before flags.
     if command == CliCommand::Search && idx < tokens.len() {
+        if is_help_flag(tokens[idx].as_str()) {
+            input.command = CliCommand::Help;
+            return Ok(input);
+        }
         if tokens[idx] == "--" {
             let query = tokens
                 .get(idx + 1)
@@ -1251,6 +1255,16 @@ mod tests {
         let input = parse_cli_args(["status", "--help"]).expect("parse");
         assert_eq!(input.command, CliCommand::Help);
         assert_eq!(input.command_source, CommandSource::Explicit);
+    }
+
+    #[test]
+    fn parse_help_flag_after_search_command() {
+        // `search --help` must be treated as a help request, not a query
+        // string named "--help".
+        let input = parse_cli_args(["search", "--help"]).expect("parse");
+        assert_eq!(input.command, CliCommand::Help);
+        assert_eq!(input.command_source, CommandSource::Explicit);
+        assert!(input.query.is_none());
     }
 
     #[test]
