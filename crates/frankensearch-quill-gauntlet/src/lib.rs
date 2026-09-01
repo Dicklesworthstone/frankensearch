@@ -226,8 +226,11 @@ pub use perf_evidence::{
     PerfConcurrencyWitness, PerfEvidenceArtifact, QG6_JOINT_TAIL_MAX_BOOTSTRAP_REPLICATES,
     QG6_JOINT_TAIL_MIN_BOOTSTRAP_REPLICATES, QG6_JOINT_TAIL_SCHEMA_VERSION,
     QG6_P50_TOST_WINDOW_RATIO, QG6_P99_UCB_LIMIT_RATIO, QG6_PER_CELL_ALPHA,
-    Qg1IncumbentScreenEvidence, Qg6FormalProtocolEvidence, Qg6JointTailContrast,
-    Qg6JointTailEstimate, command_sha256_from_argv, estimate_hierarchical_latency,
+    QG10_DEPENDENCY_FACTS_SCHEMA_VERSION, QG10_MAX_CARGO_TREE_STDOUT_BYTES,
+    QG10_MAX_PACKAGE_ID_BYTES, QG10_MAX_PACKAGE_IDS, QG10_MEASURED_FEATURES,
+    QG10_POSITIVE_CONTROL_FEATURES, QG10_POSITIVE_CONTROL_REFUSAL, Qg1IncumbentScreenEvidence,
+    Qg6FormalProtocolEvidence, Qg6JointTailContrast, Qg6JointTailEstimate, Qg10DependencyFacts,
+    Qg10DependencyGraph, command_sha256_from_argv, estimate_hierarchical_latency,
     estimate_qg6_joint_tail, human_table_from_json, load_legacy_gate_artifact_v3,
     required_estimand,
 };

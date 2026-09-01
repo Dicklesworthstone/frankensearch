@@ -6884,7 +6884,7 @@ mod tests {
             .flat_map(|source| source.cells.iter())
             .find_map(|cell| match &cell.body {
                 EvidenceCellBody::Paired { paired, .. } => Some(paired.config.clone()),
-                EvidenceCellBody::Facts { .. } => None,
+                EvidenceCellBody::DependencyFacts { .. } => None,
             })
             .expect("first source carries paired QG-1 evidence");
         let independent_estimator = independent_authority
@@ -6892,7 +6892,7 @@ mod tests {
             .flat_map(|source| source.cells.iter())
             .find_map(|cell| match &cell.body {
                 EvidenceCellBody::Paired { paired, .. } => Some(paired.config.clone()),
-                EvidenceCellBody::Facts { .. } => None,
+                EvidenceCellBody::DependencyFacts { .. } => None,
             })
             .expect("independent source carries paired QG-1 evidence");
         assert_ne!(

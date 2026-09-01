@@ -59,9 +59,10 @@ use frankensearch_quill_gauntlet::{
     QG1_STREAM_ROLE_QUILL_NULL, QG1_STREAM_ROLE_TANTIVY_NULL, QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
     QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, QG1_TANTIVY_ENGINE_ID, QG5_DURABILITY_WITNESS_FILE_NAME,
     QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, QG6_TIMED_SEARCHES_PER_SAMPLE,
-    Qg1AuthorityRegisterEntryV1, Qg1BatchCoverage, Qg1ExpectedAuthority,
-    Qg1IncumbentScreenEvidence, Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding,
-    Qg1StartupHandshakeV1, Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind,
+    QG10_DEPENDENCY_FACTS_SCHEMA_VERSION, QG10_MEASURED_FEATURES, QG10_POSITIVE_CONTROL_FEATURES,
+    QG10_POSITIVE_CONTROL_REFUSAL, Qg1AuthorityRegisterEntryV1, Qg1BatchCoverage,
+    Qg1ExpectedAuthority, Qg1IncumbentScreenEvidence, Qg1LifecycleProducer, Qg1LifecycleWitness,
+    Qg1SampleBinding, Qg1StartupHandshakeV1, Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind,
     Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentPilot, Qg1TantivyIncumbentScreen,
     Qg1TantivyIncumbentScreenPlan, Qg1TantivySemanticContract, Qg1TantivyWriterMode,
     Qg5CellDurabilityWitness, Qg5DeletePublicationObservation, Qg5DurabilityEngine,
@@ -69,15 +70,15 @@ use frankensearch_quill_gauntlet::{
     Qg5SampleDurabilityWitness, Qg5StreamRole, Qg5TimedMaintenanceObservation, Qg6ArmRole,
     Qg6Comparison, Qg6ExperimentIdentity, Qg6FormalProtocolEvidence, Qg6Phase,
     Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6ScheduleAuthority,
-    Qg6SearchHit, Qg6SearchResult, Qg6SemanticContract, Qg6StartupAuthoritySetV1, RankClass,
-    RankedHit, ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
-    command_sha256_from_argv, compare_observations, estimate_hierarchical_latency,
-    estimate_paired_experiment, estimate_paired_experiment_against_qg1_authority,
-    machine_fingerprint, oracle_version_contract, peak_rss_bytes, perf_manifest_contract_sha256,
-    perf_writer_heap_bytes, preregister_qg1_tantivy_incumbents,
-    project_qg6_effect_leaf_distributions, publish_qg6_startup_authorities_and_wait_for_ack,
-    query_manifest_sha256, seeded_balanced_pair_order, seeded_interleaved_six_arm_schedule,
-    validate_matrix,
+    Qg6SearchHit, Qg6SearchResult, Qg6SemanticContract, Qg6StartupAuthoritySetV1,
+    Qg10DependencyFacts, Qg10DependencyGraph, RankClass, RankedHit, ScoreEpsilonReason,
+    SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv,
+    compare_observations, estimate_hierarchical_latency, estimate_paired_experiment,
+    estimate_paired_experiment_against_qg1_authority, machine_fingerprint, oracle_version_contract,
+    peak_rss_bytes, perf_manifest_contract_sha256, perf_writer_heap_bytes,
+    preregister_qg1_tantivy_incumbents, project_qg6_effect_leaf_distributions,
+    publish_qg6_startup_authorities_and_wait_for_ack, query_manifest_sha256,
+    seeded_balanced_pair_order, seeded_interleaved_six_arm_schedule, validate_matrix,
 };
 use rustix::fs::{RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
@@ -4733,6 +4734,7 @@ fn cold_open_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm)
     elapsed.as_secs_f64() * 1_000.0
 }
 
+#[cfg(test)]
 fn cargo_tree_line_is_tantivy_family(line: &str) -> bool {
     let mut fields = line.split_whitespace();
     let Some(mut package) = fields.next() else {
@@ -4747,37 +4749,65 @@ fn cargo_tree_line_is_tantivy_family(line: &str) -> bool {
     false
 }
 
-/// Count Tantivy-family nodes in one `frankensearch` feature graph.
-///
-/// The classifier is the only fact QG-10 decides on, so it is applied through
-/// this single seam for both the measured graph and its positive control.
-fn dependency_surface_tantivy_nodes(features: &str) -> usize {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+fn qg10_cargo_executable() -> PathBuf {
+    let configured = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let configured_path = PathBuf::from(&configured);
+    if configured_path.components().count() > 1 {
+        assert!(
+            configured_path.is_file(),
+            "QG-10 Cargo executable {} is not a file",
+            configured_path.display()
+        );
+        return configured_path;
+    }
+    let path = std::env::var_os("PATH").expect("QG-10 requires PATH to resolve Cargo");
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(&configured_path))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "QG-10 cannot resolve Cargo executable {:?} through PATH",
+                configured
+            )
+        })
+}
+
+/// Capture one exact `frankensearch` feature graph as typed structural facts.
+fn qg10_dependency_graph(cargo: &Path, features: &str) -> Qg10DependencyGraph {
+    let cargo_text = cargo
+        .to_str()
+        .expect("QG-10 Cargo executable path must be UTF-8")
+        .to_owned();
+    let arguments = [
+        "tree",
+        "--locked",
+        "-p",
+        "frankensearch",
+        "--features",
+        features,
+        "--edges",
+        "normal",
+        "--prefix",
+        "none",
+        "--format",
+        "{p}",
+    ];
     let output = Command::new(cargo)
-        .args(["tree", "--locked", "-p", "frankensearch", "--features"])
-        .arg(features)
+        .args(arguments)
         .output()
         .expect("run QG-10 cargo tree");
     assert!(
         output.status.success(),
-        "QG-10 cargo tree failed for features {features:?}"
+        "QG-10 cargo tree failed for features {features:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| cargo_tree_line_is_tantivy_family(line))
-        .count()
+    let stdout = String::from_utf8(output.stdout).expect("QG-10 cargo tree stdout must be UTF-8");
+    let cargo_argv = std::iter::once(cargo_text)
+        .chain(arguments.into_iter().map(str::to_owned))
+        .collect();
+    Qg10DependencyGraph::from_cargo_tree_stdout(cargo_argv, stdout)
+        .expect("canonicalize QG-10 cargo tree")
 }
-
-/// The measured graph, and the control that makes its zero admissible.
-const QG10_MEASURED_FEATURES: &str = "lexical";
-const QG10_POSITIVE_CONTROL_FEATURES: &str = "lexical-tantivy";
-
-/// Exact text the fail-closed branch panics with.
-///
-/// Shared with the planted negative so that test can require *this* refusal
-/// rather than accepting any panic, which would let an unrelated `cargo tree`
-/// failure impersonate the guard.
-const QG10_POSITIVE_CONTROL_REFUSAL: &str = "QG-10 positive control found no Tantivy nodes";
 
 #[cfg(test)]
 thread_local! {
@@ -4809,24 +4839,30 @@ fn with_qg10_control_features_override<R>(features: &str, body: impl FnOnce() ->
     }
 }
 
+fn qg10_dependency_facts() -> Qg10DependencyFacts {
+    let cargo = qg10_cargo_executable();
+    let measured_graph = qg10_dependency_graph(&cargo, QG10_MEASURED_FEATURES);
+    let positive_control_graph = qg10_dependency_graph(&cargo, &qg10_positive_control_features());
+    let cargo_tool_sha256 = lower_hex(&Sha256::digest(
+        fs::read(&cargo).expect("read QG-10 Cargo executable"),
+    ));
+    let cargo_lock_sha256 = lower_hex(&Sha256::digest(
+        fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+            .expect("read QG-10 Cargo.lock"),
+    ));
+    let facts = Qg10DependencyFacts {
+        schema_version: QG10_DEPENDENCY_FACTS_SCHEMA_VERSION.to_owned(),
+        cargo_tool_sha256,
+        cargo_lock_sha256,
+        measured_graph,
+        positive_control_graph,
+    };
+    facts.validate().unwrap_or_else(|error| panic!("{error}"));
+    facts
+}
+
 fn dependency_surface_metric() -> f64 {
-    let measured = dependency_surface_tantivy_nodes(QG10_MEASURED_FEATURES);
-    if measured == 0 {
-        // A zero is only evidence of a clean surface if the classifier can
-        // still recognize a Tantivy node at all. `lexical-tantivy` pulls
-        // `frankensearch-lexical`, so its graph is Tantivy-bearing by
-        // construction; a zero there means the classifier -- not the
-        // dependency surface -- went silent, and QG-10 must fail closed
-        // rather than report the clean result that silence imitates.
-        let control_features = qg10_positive_control_features();
-        let control = dependency_surface_tantivy_nodes(&control_features);
-        assert!(
-            control > 0,
-            "{QG10_POSITIVE_CONTROL_REFUSAL} in the {control_features:?} feature \
-             graph, so the measured {QG10_MEASURED_FEATURES:?} count of 0 is unproven"
-        );
-    }
-    measured as f64
+    qg10_dependency_facts().measured_tantivy_family_count() as f64
 }
 
 fn measure_metric(
@@ -6507,6 +6543,7 @@ fn qg6_preflight_result(
                     hits,
                     cutoff_tie_group,
                     cutoff_tie_complete: observed.cutoff_tie_complete,
+                    cutoff_certificate: None,
                     offset_tie_group: Vec::new(),
                     offset_tie_complete: false,
                     snippets: BTreeMap::new(),
@@ -6557,6 +6594,7 @@ fn qg6_preflight_result(
                     hits,
                     cutoff_tie_group: Vec::new(),
                     cutoff_tie_complete: false,
+                    cutoff_certificate: None,
                     offset_tie_group: Vec::new(),
                     offset_tie_complete: false,
                     snippets: BTreeMap::new(),
@@ -7748,17 +7786,17 @@ fn collect_cell(
     qg6_schedule_authority: Option<&Qg6ScheduleAuthority>,
 ) -> CellCollection {
     if spec.gate == PerfGate::Qg10 {
-        let samples = (0..runs)
-            .map(|_| dependency_surface_metric())
-            .collect::<Vec<_>>();
+        let facts = qg10_dependency_facts();
+        let exact_count = facts.measured_tantivy_family_count() as f64;
         let results = vec![PerfCellResult {
             fixture: spec.fixture.clone(),
             metric: spec.metric.clone(),
             engine: "default_feature_graph".to_owned(),
             unit: unit(spec).to_owned(),
-            distribution: DistributionSummary::from_samples(&samples).expect("QG-10 distribution"),
+            distribution: DistributionSummary::from_samples(&[exact_count])
+                .expect("QG-10 exact compatibility projection"),
         }];
-        let cell = EvidenceCell::facts(
+        let cell = EvidenceCell::qg10_dependency_facts(
             EvidenceCellSpec {
                 gate: spec.gate,
                 fixture: spec.fixture.clone(),
@@ -7770,7 +7808,7 @@ fn collect_cell(
                 cold_cache: None,
                 concurrency_witness: None,
             },
-            samples,
+            facts,
             &evidence.policy,
         )
         .expect("QG-10 facts evidence cell");
@@ -11806,21 +11844,26 @@ mod tests {
             );
         }
 
-        let control = dependency_surface_tantivy_nodes(QG10_POSITIVE_CONTROL_FEATURES);
+        let facts = qg10_dependency_facts();
+        facts
+            .validate()
+            .expect("QG-10 producer must emit a verifiable typed witness");
+        let control = facts
+            .positive_control_graph
+            .tantivy_family_package_ids
+            .len();
         assert!(
             control > 0,
             "QG-10 positive control graph {QG10_POSITIVE_CONTROL_FEATURES:?} must \
              contain Tantivy nodes"
         );
-        let measured = dependency_surface_tantivy_nodes(QG10_MEASURED_FEATURES);
+        let measured = facts.measured_tantivy_family_count();
         assert_eq!(
             measured, 0,
             "QG-10 measured graph {QG10_MEASURED_FEATURES:?} must be Tantivy-free"
         );
-        assert!(
-            dependency_surface_metric().abs() < f64::EPSILON,
-            "QG-10 producer must report its corroborated zero"
-        );
+        assert_eq!(facts.cargo_lock_sha256.len(), 64);
+        assert_eq!(facts.cargo_tool_sha256.len(), 64);
         eprintln!(
             "[qg10-self-check] measured={measured} control={control} \
              measured_features={QG10_MEASURED_FEATURES:?} \

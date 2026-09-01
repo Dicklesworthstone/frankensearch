@@ -3225,7 +3225,7 @@ impl PerfMatrixSpec {
 }
 
 fn canonical_cell_is_diagnostic(cell: &PerfCellSpec) -> bool {
-    cell.gate == PerfGate::Qg10 || cell.metric == "tokenize_docs_per_second"
+    cell.metric == "tokenize_docs_per_second"
 }
 
 /// Distribution summary required for every timed cell.

@@ -32,15 +32,15 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::perf::{
-    DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PERF_NULL_MARGIN_MULTIPLIER,
-    PairedClaimState, PairedEstimatorConfig, PairedEstimatorError, PairedEvidenceStatus,
-    PairedExperimentResult, PerfApplicabilityPlan, PerfApplicabilityPlanBinding,
-    PerfCellApplicability, PerfCellSpec, PerfExecutionProvenance, PerfGate, PerfGateArtifact,
-    PerfInputIdentity, PerfMatrixSpec, PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS,
-    QG6_QUERY_GROUPS, Qg1ExpectedAuthority, Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentError,
-    Qg1TantivyIncumbentScreen, Qg1TantivySemanticContract, Qg1TantivyWriterMode, median_sorted,
-    parse_cpu_list_ids, percentile, perf_metric_unit, perf_operation_scope,
-    resolve_qg1_expected_authority_for_replay, splitmix64, validate_paired_blocks,
+    LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PERF_NULL_MARGIN_MULTIPLIER, PairedClaimState,
+    PairedEstimatorConfig, PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult,
+    PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfCellApplicability, PerfCellSpec,
+    PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
+    PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1ExpectedAuthority,
+    Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentError, Qg1TantivyIncumbentScreen,
+    Qg1TantivySemanticContract, Qg1TantivyWriterMode, median_sorted, parse_cpu_list_ids,
+    percentile, perf_metric_unit, perf_operation_scope, resolve_qg1_expected_authority_for_replay,
+    splitmix64, validate_paired_blocks,
 };
 use crate::qg6_prepared::{
     Qg6ArmRole, Qg6Comparison, Qg6QueryIdentityReceipt, Qg6QuerySpec, Qg6SampleOrder,
@@ -55,7 +55,21 @@ use crate::{MachineClassEvidenceBinding, MachineClassRegistry, VerifiedRunnerIde
 /// [`EvidenceArtifactError::SchemaMismatch`], and legacy v3 gate artifacts are
 /// only readable through the explicit, read-only
 /// [`load_legacy_gate_artifact_v3`].
-pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v7";
+pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v8";
+/// Version of the deterministic QG-10 dependency-graph witness.
+pub const QG10_DEPENDENCY_FACTS_SCHEMA_VERSION: &str = "frankensearch.qg10-dependency-facts.v1";
+/// Default lexical graph whose Tantivy-family dependency set QG-10 decides on.
+pub const QG10_MEASURED_FEATURES: &str = "lexical";
+/// Explicit Tantivy graph that proves the dependency classifier is live.
+pub const QG10_POSITIVE_CONTROL_FEATURES: &str = "lexical-tantivy";
+/// Stable refusal text for a positive control that finds no Tantivy package.
+pub const QG10_POSITIVE_CONTROL_REFUSAL: &str = "QG-10 positive control found no Tantivy nodes";
+/// Bounded dependency records retained in each QG-10 graph observation.
+pub const QG10_MAX_PACKAGE_IDS: usize = 4_096;
+/// Bounded UTF-8 bytes retained for one canonical Cargo package record.
+pub const QG10_MAX_PACKAGE_ID_BYTES: usize = 512;
+/// Maximum retained UTF-8 bytes from one `cargo tree` invocation.
+pub const QG10_MAX_CARGO_TREE_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 /// Version of the hierarchical latency estimate carried by latency cells.
 pub const HIERARCHICAL_LATENCY_SCHEMA_VERSION: &str = "quill-hierarchical-latency-v1";
 /// Version of the joint six-arm QG-6 p50/p99 estimate.
@@ -1632,6 +1646,233 @@ pub struct EvidenceCellSpec {
     pub concurrency_witness: Option<PerfConcurrencyWitness>,
 }
 
+/// One canonical `cargo tree` graph retained for deterministic QG-10 replay.
+///
+/// The package records are the exact `{p}` records emitted with tree prefixes
+/// disabled, sorted and deduplicated before sealing. The Tantivy-family subset
+/// is redundant on purpose: verification recomputes it from `package_ids`, so
+/// a producer cannot present a clean subset beside a Tantivy-bearing graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg10DependencyGraph {
+    /// Exact Cargo executable plus arguments used to resolve this graph.
+    pub cargo_argv: Vec<String>,
+    /// SHA-256 of the exact NUL-delimited Cargo argv bytes.
+    pub cargo_argv_sha256: String,
+    /// Exact bounded UTF-8 stdout emitted by `cargo tree`.
+    pub cargo_tree_stdout: String,
+    /// SHA-256 of `cargo_tree_stdout`.
+    pub cargo_tree_stdout_sha256: String,
+    /// Canonical sorted unique `{p}` package records from `cargo tree`.
+    pub package_ids: Vec<String>,
+    /// Canonical sorted Tantivy-family subset recomputed from `package_ids`.
+    pub tantivy_family_package_ids: Vec<String>,
+}
+
+impl Qg10DependencyGraph {
+    /// Canonicalize one exact Cargo graph and derive its Tantivy-family subset.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, unbounded, multiline, or NUL-bearing package records.
+    pub fn from_cargo_tree_stdout(
+        cargo_argv: Vec<String>,
+        cargo_tree_stdout: String,
+    ) -> Result<Self, EvidenceArtifactError> {
+        let mut package_ids = cargo_tree_stdout
+            .lines()
+            .map(|package_id| package_id.trim().trim_end_matches(" (*)").to_owned())
+            .filter(|package_id| !package_id.is_empty())
+            .collect::<Vec<_>>();
+        package_ids.sort();
+        package_ids.dedup();
+        let graph = Self {
+            cargo_argv_sha256: command_sha256_from_argv(
+                cargo_argv.iter().map(|argument| argument.as_bytes()),
+            ),
+            cargo_argv,
+            cargo_tree_stdout_sha256: lower_hex(&Sha256::digest(cargo_tree_stdout.as_bytes())),
+            cargo_tree_stdout,
+            tantivy_family_package_ids: package_ids
+                .iter()
+                .filter(|package_id| qg10_package_id_is_tantivy_family(package_id))
+                .cloned()
+                .collect(),
+            package_ids,
+        };
+        graph.validate_shape()?;
+        Ok(graph)
+    }
+
+    fn validate_shape(&self) -> Result<(), EvidenceArtifactError> {
+        let canonical = self.package_ids.windows(2).all(|pair| pair[0] < pair[1]);
+        if self.cargo_argv.is_empty()
+            || self.cargo_argv.iter().any(|argument| {
+                argument.is_empty() || argument.contains('\0') || argument.contains(['\n', '\r'])
+            })
+            || self.cargo_tree_stdout.is_empty()
+            || self.cargo_tree_stdout.len() > QG10_MAX_CARGO_TREE_STDOUT_BYTES
+            || self.package_ids.is_empty()
+            || self.package_ids.len() > QG10_MAX_PACKAGE_IDS
+            || !canonical
+            || self.package_ids.iter().any(|package_id| {
+                package_id.is_empty()
+                    || package_id.len() > QG10_MAX_PACKAGE_ID_BYTES
+                    || package_id.contains('\0')
+                    || package_id.contains(['\n', '\r'])
+            })
+        {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-10 dependency graph requires bounded canonical Cargo argv and sorted unique package records"
+                    .to_owned(),
+            });
+        }
+        let recomputed_argv_sha256 =
+            command_sha256_from_argv(self.cargo_argv.iter().map(|argument| argument.as_bytes()));
+        let recomputed_stdout_sha256 =
+            lower_hex(&Sha256::digest(self.cargo_tree_stdout.as_bytes()));
+        let mut recomputed_package_ids = self
+            .cargo_tree_stdout
+            .lines()
+            .map(str::trim)
+            .map(|package_id| package_id.trim_end_matches(" (*)").to_owned())
+            .filter(|package_id| !package_id.is_empty())
+            .collect::<Vec<_>>();
+        recomputed_package_ids.sort();
+        recomputed_package_ids.dedup();
+        if self.cargo_argv_sha256 != recomputed_argv_sha256
+            || self.cargo_tree_stdout_sha256 != recomputed_stdout_sha256
+            || self.package_ids != recomputed_package_ids
+        {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-10 Cargo argv, stdout, or canonical package records do not recompute"
+                    .to_owned(),
+            });
+        }
+        let recomputed = self
+            .package_ids
+            .iter()
+            .filter(|package_id| qg10_package_id_is_tantivy_family(package_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if recomputed != self.tantivy_family_package_ids {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-10 Tantivy-family package records do not recompute from the canonical Cargo graph"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_for_features(&self, features: &str) -> Result<(), EvidenceArtifactError> {
+        self.validate_shape()?;
+        let expected_suffix = [
+            "tree",
+            "--locked",
+            "-p",
+            "frankensearch",
+            "--features",
+            features,
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+        ];
+        if self.cargo_argv.len() != expected_suffix.len() + 1
+            || self.cargo_argv[1..]
+                .iter()
+                .map(String::as_str)
+                .ne(expected_suffix)
+        {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "QG-10 dependency graph does not use the exact locked {features:?} cargo-tree argv"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Typed deterministic dependency evidence consumed by the QG-10 ratchet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg10DependencyFacts {
+    /// Exact typed schema for this structural witness.
+    pub schema_version: String,
+    /// SHA-256 of the Cargo executable that emitted both graphs.
+    pub cargo_tool_sha256: String,
+    /// SHA-256 of the exact workspace `Cargo.lock` used with `--locked`.
+    pub cargo_lock_sha256: String,
+    /// Default lexical graph whose Tantivy-family set is the target input.
+    pub measured_graph: Qg10DependencyGraph,
+    /// Explicit Tantivy graph proving the classifier recognizes the family.
+    pub positive_control_graph: Qg10DependencyGraph,
+}
+
+impl Qg10DependencyFacts {
+    /// Validate the complete structural witness independently of its legacy
+    /// one-number compatibility projection.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale schemas, malformed digests, argv/feature substitution,
+    /// recomputation mismatches, and an empty positive-control family.
+    pub fn validate(&self) -> Result<(), EvidenceArtifactError> {
+        let is_sha256 = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if self.schema_version != QG10_DEPENDENCY_FACTS_SCHEMA_VERSION
+            || !is_sha256(&self.cargo_tool_sha256)
+            || !is_sha256(&self.cargo_lock_sha256)
+        {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-10 dependency facts require the current schema and lowercase Cargo/Cargo.lock SHA-256 identities"
+                    .to_owned(),
+            });
+        }
+        if self
+            .positive_control_graph
+            .tantivy_family_package_ids
+            .is_empty()
+        {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: QG10_POSITIVE_CONTROL_REFUSAL.to_owned(),
+            });
+        }
+        self.measured_graph
+            .validate_for_features(QG10_MEASURED_FEATURES)?;
+        self.positive_control_graph
+            .validate_for_features(QG10_POSITIVE_CONTROL_FEATURES)?;
+        if self.measured_graph.cargo_argv[0] != self.positive_control_graph.cargo_argv[0] {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason:
+                    "QG-10 measured and positive-control graphs use different Cargo executables"
+                        .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Exact number retained only for the legacy threshold projection.
+    #[must_use]
+    pub fn measured_tantivy_family_count(&self) -> usize {
+        self.measured_graph.tantivy_family_package_ids.len()
+    }
+}
+
+fn qg10_package_id_is_tantivy_family(package_id: &str) -> bool {
+    let Some(name) = package_id.split_whitespace().next() else {
+        return false;
+    };
+    name == "tantivy" || name.starts_with("tantivy-")
+}
+
 /// Measured body of one evidence cell.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1657,18 +1898,18 @@ pub enum EvidenceCellBody {
         hierarchical: Option<HierarchicalLatencyEstimate>,
         /// Two-stage same-invocation A/A null estimate for hierarchical latency
         /// cells. A hierarchical effect can never borrow a flat null inference.
+        /// Boxed to keep `EvidenceCellBody` from carrying the large paired
+        /// payload size in every enum value.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        hierarchical_null: Option<HierarchicalLatencyEstimate>,
+        hierarchical_null: Option<Box<HierarchicalLatencyEstimate>>,
         /// Same-scope absolute-versus-paired reconciliation. This is a
         /// diagnostic projection for QG-6, whose inference is hierarchical.
         reconciliation: AbsoluteRelativeReconciliation,
     },
-    /// Direct facts outside noisy timing A/A, such as dependency counts.
-    Facts {
-        /// Raw observed values.
-        raw_values: Vec<f64>,
-        /// Summary recomputable from `raw_values`.
-        summary: DistributionSummary,
+    /// Deterministic QG-10 dependency facts outside noisy timing A/A.
+    DependencyFacts {
+        /// Complete typed graph witness; target state derives only from this.
+        facts: Box<Qg10DependencyFacts>,
     },
 }
 
@@ -2513,7 +2754,7 @@ impl EvidenceCell {
                 treatment_arm_null: None,
                 qg6_protocol: None,
                 hierarchical,
-                hierarchical_null,
+                hierarchical_null: hierarchical_null.map(Box::new),
                 reconciliation,
             },
             status,
@@ -2694,55 +2935,45 @@ impl EvidenceCell {
         Ok(())
     }
 
-    /// Build a facts cell for measurements outside noisy timing A/A.
+    /// Build one typed QG-10 dependency-facts cell outside noisy timing A/A.
     ///
     /// # Errors
     ///
-    /// Rejects non-diagnostic roles, gates whose estimand is not
-    /// [`EvidenceEstimand::DependencyFacts`], and invalid raw values.
-    pub fn facts(
+    /// Rejects any non-QG-10 cell, semantic/timing-only fields, and malformed
+    /// structural evidence.
+    pub fn qg10_dependency_facts(
         spec: EvidenceCellSpec,
-        raw_values: Vec<f64>,
+        facts: Qg10DependencyFacts,
         policy: &EvidencePolicy,
     ) -> Result<Self, EvidenceArtifactError> {
         policy.validate()?;
         let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
         let estimand = required_estimand(spec.gate);
-        if estimand != EvidenceEstimand::DependencyFacts {
+        if spec.gate != PerfGate::Qg10 || estimand != EvidenceEstimand::DependencyFacts {
             return Err(EvidenceArtifactError::InconsistentArtifact {
-                reason: format!("gate {} does not admit a facts cell", spec.gate),
+                reason: format!("gate {} does not admit QG-10 dependency facts", spec.gate),
             });
         }
-        if spec.input_identity.is_some() || spec.qg6_semantic_contract.is_some() {
+        if spec.fixture != "dependency_surface/default_lexical"
+            || spec.metric != "tantivy_nodes"
+            || spec.unit != "nodes"
+            || spec.input_identity.is_some()
+            || spec.qg6_semantic_contract.is_some()
+            || spec.cold_cache.is_some()
+            || spec.concurrency_witness.is_some()
+        {
             return Err(EvidenceArtifactError::InconsistentArtifact {
-                reason: "dependency facts cannot carry QG-6 identity or semantic contracts"
+                reason: "QG-10 dependency facts require the canonical fixture/metric/unit and no timing-only evidence fields"
                     .to_owned(),
             });
         }
-        if spec.role != EvidenceRole::Diagnostic && raw_values.len() < 2 {
-            return Err(EvidenceArtifactError::InconsistentArtifact {
-                reason: "required facts cells need at least two observations".to_owned(),
-            });
-        }
-        if raw_values.len() > policy.max_raw_samples {
-            return Err(EvidenceArtifactError::UnboundedRawSamples {
-                cell_id,
-                count: raw_values.len(),
-                max: policy.max_raw_samples,
-            });
-        }
-        let summary = DistributionSummary::from_samples(&raw_values).map_err(|error| {
-            EvidenceArtifactError::InconsistentArtifact {
-                reason: format!("facts summary rejected raw values: {error}"),
-            }
-        })?;
+        facts.validate()?;
         Ok(Self {
             cell_id,
             spec,
             estimand,
-            body: EvidenceCellBody::Facts {
-                raw_values,
-                summary,
+            body: EvidenceCellBody::DependencyFacts {
+                facts: Box::new(facts),
             },
             status: EvidenceDecisionStatus::MeasuredProvisional,
             reasons: Vec::new(),
@@ -2778,7 +3009,10 @@ impl EvidenceCell {
                                 && null.claim_state == PairedClaimState::EligibleForDecision
                         }))
             }
-            EvidenceCellBody::Facts { .. } => false,
+            EvidenceCellBody::DependencyFacts { facts } => {
+                self.status == EvidenceDecisionStatus::MeasuredProvisional
+                    && facts.validate().is_ok()
+            }
         }
     }
 
@@ -2894,23 +3128,18 @@ impl EvidenceCell {
                     })
                 }
             }
-            EvidenceCellBody::Facts {
-                raw_values,
-                summary,
-            } => {
-                let recomputed =
-                    DistributionSummary::from_samples(raw_values).map_err(|error| {
-                        EvidenceArtifactError::InconsistentArtifact {
-                            reason: format!("facts raw values no longer summarize: {error}"),
-                        }
-                    })?;
-                if recomputed == *summary
-                    && self.status == EvidenceDecisionStatus::MeasuredProvisional
-                {
+            EvidenceCellBody::DependencyFacts { facts } => {
+                facts.validate()?;
+                let rebuilt =
+                    Self::qg10_dependency_facts(self.spec.clone(), facts.as_ref().clone(), policy)?;
+                if rebuilt == *self {
                     Ok(())
                 } else {
                     Err(EvidenceArtifactError::InconsistentArtifact {
-                        reason: format!("facts cell {} does not recompute", self.cell_id),
+                        reason: format!(
+                            "QG-10 dependency facts cell {} does not recompute",
+                            self.cell_id
+                        ),
                     })
                 }
             }
@@ -3500,6 +3729,20 @@ impl PerfEvidenceArtifact {
     }
 
     fn verify_cell_provenance(&self, cell: &EvidenceCell) -> Result<(), EvidenceArtifactError> {
+        if let EvidenceCellBody::DependencyFacts { facts } = &cell.body {
+            facts.validate()?;
+            if self.provenance.build.cargo_lock_sha256.as_deref()
+                != Some(facts.cargo_lock_sha256.as_str())
+            {
+                return Err(EvidenceArtifactError::InvalidProvenance {
+                    reason: format!(
+                        "cell {} QG-10 Cargo.lock identity differs from top-level build provenance",
+                        cell.cell_id
+                    ),
+                });
+            }
+            return Ok(());
+        }
         let EvidenceCellBody::Paired {
             paired,
             treatment_arm_null,
@@ -4764,16 +5007,15 @@ impl PerfEvidenceArtifact {
                         cell.reasons.len(),
                     );
                 }
-                EvidenceCellBody::Facts { summary, .. } => {
+                EvidenceCellBody::DependencyFacts { facts } => {
                     let _ = writeln!(
                         table,
-                        "{} | {} | {} | {} | {:.6} | - | - | - | {} | {}",
+                        "{} | {} | {} | {} | {} | - | - | - | 1 | {}",
                         cell.cell_id,
                         role,
                         cell.estimand,
                         cell.status,
-                        summary.p50,
-                        summary.runs,
+                        facts.measured_tantivy_family_count(),
                         cell.reasons.len(),
                     );
                 }
@@ -5361,7 +5603,7 @@ pub enum EvidenceArtifactError {
         reason: String,
     },
     /// The artifact carries a non-current schema version.
-    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v7")]
+    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v8")]
     SchemaMismatch {
         /// The version string found in the file.
         found: String,
@@ -5791,10 +6033,11 @@ pub mod qg6_test_fixture {
 mod tests {
     use super::*;
     use crate::perf::{
-        PerfCellResult, PerfMetricSemantics, PerfOperationScope, PerfSampleArm, PerfSampleOrder,
-        PerfSamplePhase, PerfSampleProvenance, QG6_QUERY_GROUP_IDS, Qg1BatchCoverage,
-        Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding, estimate_paired_experiment,
-        estimate_paired_experiment_against_qg1_authority, seeded_balanced_pair_order,
+        DistributionSummary, PerfCellResult, PerfMetricSemantics, PerfOperationScope,
+        PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, QG6_QUERY_GROUP_IDS,
+        Qg1BatchCoverage, Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding,
+        estimate_paired_experiment, estimate_paired_experiment_against_qg1_authority,
+        seeded_balanced_pair_order,
     };
     use crate::qg6_prepared::{Qg6ExperimentIdentity, Qg6ResultReceipt};
 
@@ -6630,6 +6873,44 @@ mod tests {
         }
     }
 
+    fn qg10_test_graph(features: &str, package_ids: &[&str]) -> Qg10DependencyGraph {
+        let arguments = [
+            "tree",
+            "--locked",
+            "-p",
+            "frankensearch",
+            "--features",
+            features,
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+        ];
+        let cargo_argv = std::iter::once("/test/toolchain/cargo".to_owned())
+            .chain(arguments.into_iter().map(str::to_owned))
+            .collect();
+        Qg10DependencyGraph::from_cargo_tree_stdout(
+            cargo_argv,
+            format!("{}\n", package_ids.join("\n")),
+        )
+        .expect("canonical QG-10 test graph")
+    }
+
+    fn qg10_test_facts(measured_package_ids: &[&str]) -> Qg10DependencyFacts {
+        Qg10DependencyFacts {
+            schema_version: QG10_DEPENDENCY_FACTS_SCHEMA_VERSION.to_owned(),
+            cargo_tool_sha256: "e".repeat(64),
+            cargo_lock_sha256: "c".repeat(64),
+            measured_graph: qg10_test_graph(QG10_MEASURED_FEATURES, measured_package_ids),
+            positive_control_graph: qg10_test_graph(
+                QG10_POSITIVE_CONTROL_FEATURES,
+                &["frankensearch v0.2.1", "tantivy v0.25.0"],
+            ),
+        }
+    }
+
     fn provisional_cell_with_authority() -> (EvidenceCell, Qg1ExpectedAuthority) {
         let spec = cell_spec(PerfGate::Qg1, EvidenceRole::Required);
         let fixture = valid_qg1_experiment_for_spec(&spec, 1.10);
@@ -7034,7 +7315,7 @@ mod tests {
                 assert!(reconciliation.direction_agrees);
                 assert!(reconciliation.within_tolerance);
             }
-            EvidenceCellBody::Facts { .. } => panic!("expected a paired body"),
+            EvidenceCellBody::DependencyFacts { .. } => panic!("expected a paired body"),
         }
     }
 
@@ -7961,7 +8242,9 @@ mod tests {
                 EvidenceCellBody::Paired { paired, .. } => {
                     paired.provenance.input_identity.clone()
                 }
-                EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+                EvidenceCellBody::DependencyFacts { .. } => {
+                    unreachable!("QG-6 must be paired")
+                }
             }
         );
     }
@@ -8913,14 +9196,103 @@ mod tests {
     }
 
     #[test]
-    fn facts_cells_are_diagnostic_and_never_gate_alone() {
-        let mut spec = cell_spec(PerfGate::Qg10, EvidenceRole::Diagnostic);
-        spec.metric = "tantivy_nodes".to_owned();
-        spec.unit = "nodes".to_owned();
-        let cell = EvidenceCell::facts(spec, vec![76.0; 10], &policy()).expect("facts cell");
-        assert_eq!(cell.status, EvidenceDecisionStatus::MeasuredProvisional);
-        assert!(!cell.claim_eligible());
+    fn qg10_typed_dependency_facts_admit_clean_and_contaminated_targets() {
+        for packages in [
+            vec!["frankensearch v0.2.1", "frankensearch-quill v0.2.1"],
+            vec!["frankensearch v0.2.1", "tantivy v0.25.0"],
+        ] {
+            let facts = qg10_test_facts(&packages);
+            let cell = EvidenceCell::qg10_dependency_facts(
+                cell_spec(PerfGate::Qg10, EvidenceRole::Required),
+                facts,
+                &policy(),
+            )
+            .expect("typed QG-10 facts cell");
+            assert_eq!(cell.status, EvidenceDecisionStatus::MeasuredProvisional);
+            assert!(cell.claim_eligible());
 
+            let artifact = PerfEvidenceArtifact::assemble(
+                PerfGate::Qg10,
+                plan_binding(PerfGate::Qg10),
+                policy(),
+                evidence_provenance(PerfGate::Qg10),
+                vec![cell],
+            )
+            .expect("typed QG-10 artifact");
+            assert_eq!(
+                artifact.gate_status,
+                EvidenceDecisionStatus::MeasuredProvisional
+            );
+        }
+    }
+
+    #[test]
+    fn qg10_typed_dependency_facts_reject_tampered_structure() {
+        let valid = qg10_test_facts(&["frankensearch v0.2.1", "serde v1.0.0"]);
+        valid.validate().expect("valid QG-10 test facts");
+
+        let mut wrong_family = valid.clone();
+        wrong_family
+            .measured_graph
+            .tantivy_family_package_ids
+            .push("tantivy v0.25.0".to_owned());
+        assert!(wrong_family.validate().is_err());
+
+        let mut wrong_argv = valid.clone();
+        wrong_argv.measured_graph.cargo_argv[6] = "full".to_owned();
+        assert!(wrong_argv.validate().is_err());
+
+        let mut wrong_stdout = valid.clone();
+        wrong_stdout
+            .measured_graph
+            .cargo_tree_stdout
+            .push_str("serde v1.0.0\n");
+        assert!(wrong_stdout.validate().is_err());
+
+        let mut wrong_order = valid.clone();
+        wrong_order.measured_graph.package_ids.reverse();
+        assert!(wrong_order.validate().is_err());
+
+        let mut stale = valid.clone();
+        stale.schema_version = "frankensearch.qg10-dependency-facts.v0".to_owned();
+        assert!(stale.validate().is_err());
+
+        let mut malformed_tool = valid.clone();
+        malformed_tool.cargo_tool_sha256 = "not-a-digest".to_owned();
+        assert!(malformed_tool.validate().is_err());
+
+        let mut unknown = serde_json::to_value(&valid).expect("serialize QG-10 facts");
+        unknown
+            .as_object_mut()
+            .expect("QG-10 facts serialize as an object")
+            .insert("unknown".to_owned(), serde_json::json!(true));
+        assert!(serde_json::from_value::<Qg10DependencyFacts>(unknown).is_err());
+        let mut missing = serde_json::to_value(&valid).expect("serialize QG-10 facts");
+        missing
+            .as_object_mut()
+            .expect("QG-10 facts serialize as an object")
+            .remove("cargo_tool_sha256");
+        assert!(serde_json::from_value::<Qg10DependencyFacts>(missing).is_err());
+
+        let mut missing_control = valid;
+        missing_control.positive_control_graph =
+            qg10_test_graph(QG10_POSITIVE_CONTROL_FEATURES, &["frankensearch v0.2.1"]);
+        let error = missing_control
+            .validate()
+            .expect_err("empty QG-10 positive control must fail closed");
+        assert!(error.to_string().contains(QG10_POSITIVE_CONTROL_REFUSAL));
+    }
+
+    #[test]
+    fn qg10_cargo_lock_is_cross_bound_to_top_level_provenance() {
+        let mut facts = qg10_test_facts(&["frankensearch v0.2.1"]);
+        facts.cargo_lock_sha256 = "f".repeat(64);
+        let cell = EvidenceCell::qg10_dependency_facts(
+            cell_spec(PerfGate::Qg10, EvidenceRole::Required),
+            facts,
+            &policy(),
+        )
+        .expect("internally valid QG-10 facts");
         let artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg10,
             plan_binding(PerfGate::Qg10),
@@ -8928,15 +9300,12 @@ mod tests {
             evidence_provenance(PerfGate::Qg10),
             vec![cell],
         )
-        .expect("artifact");
-        assert_eq!(artifact.gate_status, EvidenceDecisionStatus::NoDecision);
-        assert!(
-            artifact
-                .reasons
-                .iter()
-                .any(|reason| reason.code == "evidence.gate_without_required_cells")
-        );
-        assert!(!artifact.ratchet_admissible());
+        .expect("assemble QG-10 lock-substitution fixture");
+        let cell = artifact
+            .cells
+            .first()
+            .expect("QG-10 artifact has one evidence cell");
+        assert!(artifact.verify_cell_provenance(cell).is_err());
     }
 
     #[test]

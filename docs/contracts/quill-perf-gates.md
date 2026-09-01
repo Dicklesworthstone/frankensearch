@@ -181,7 +181,7 @@ were the paired evidence.
 
 The v8 QG writer's `paired_ab`, `paired_null` (Tantivy/Tantivy), and
 `paired_null_quill` rows are diagnostics only.
-Decision-grade output is the `quill-perf-evidence-v7` artifact (`bd-uh2f` /
+Decision-grade output is the `quill-perf-evidence-v8` artifact (`bd-uh2f` /
 `bd-uh2f.1`), which the harness emits beside every v8 artifact from the
 exact same raw paired blocks.
 
@@ -196,15 +196,22 @@ contrasts and confidence intervals. Either T/T or Q/Q p50/p99 null failure is
 `NoDecision`; it can never be replaced by the older flat or parent-median
 projection.
 
-## Evidence artifacts (`quill-perf-evidence-v7`)
+## Evidence artifacts (`quill-perf-evidence-v8`)
 
 One `<gate>.evidence.json` (plus a derived `<gate>.evidence.md` table) per
-gate, sealed with an embedded SHA-256 over its own canonical JSON. Every cell
-carries: both engines' absolute distributions from the same paired blocks, the
+gate, sealed with an embedded SHA-256 over its own canonical JSON. Every timed
+cell carries both engines' absolute distributions from the same paired blocks, the
 paired log-ratio effect with a seeded bootstrap CI, same-invocation
 Tantivy/Tantivy and Quill/Quill A/A results for QG-1, bounded raw samples that
 every summary recomputes from on load, and a same-scope
-absolute-versus-paired reconciliation. Run provenance records the benchmark
+absolute-versus-paired reconciliation. QG-10 instead carries a strict
+`frankensearch.qg10-dependency-facts.v1` structural witness: the exact locked
+Cargo argv and its digest, Cargo executable and `Cargo.lock` digests, bounded
+raw `cargo tree` output and its digest, canonical sorted package records, and
+the Tantivy-family subset recomputed from those records for both the default
+`lexical` graph and a required Tantivy-bearing `lexical-tantivy` positive
+control. Its legacy threshold row is a one-observation compatibility projection;
+target evaluation reads only the typed family list. Run provenance records the benchmark
 ELF SHA-256, git revision plus dirty-state hash, `Cargo.lock` hash,
 the exact NUL-separated and NUL-terminated argv SHA-256,
 rustc/target/profile/features, host identity, host-wide physical cores and
@@ -238,7 +245,7 @@ snapshots, every recomputed hardware/cpuset/snapshot/execution hash, and the
 SHA-256 plus exact bytes of one verified
 `frankensearch.perf-runner-completion.v6` receipt and its exact
 `frankensearch.perf-runner-artifact-manifest.v3` manifest. The manifest hashes
-the actual run log, canonical v8 threshold artifact, and exact pre-binding v7
+the actual run log, canonical v8 threshold artifact, and exact pre-binding v8
 evidence bytes. It also binds the exact matrix, normalized performance
 manifest, machine registry, profile contract, class/profile, capacity
 semantics, execution capacity, maximum exercised width, applicability-plan

@@ -2990,7 +2990,7 @@ mod tests {
             .to_string();
         assert!(
             stale_error.contains("schemas.evidence_artifact")
-                && stale_error.contains("quill-perf-evidence-v7"),
+                && stale_error.contains("quill-perf-evidence-v8"),
             "unexpected stale-schema error: {stale_error}"
         );
 

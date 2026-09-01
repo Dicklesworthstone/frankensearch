@@ -1746,7 +1746,16 @@ fn validate_artifact<'a>(
                 ),
             );
         }
-        if cell.distribution.runs < PERF_MIN_RUNS {
+        if gate == PerfGate::Qg10 && cell.distribution.runs != 1 {
+            state.fatal(
+                "perf.ratchet.qg10_projection_not_exact",
+                format!(
+                    "{role} {}/{}/{} has runs={}; deterministic QG-10 projections require \
+                     exactly one structural observation",
+                    cell.fixture, cell.metric, cell.engine, cell.distribution.runs,
+                ),
+            );
+        } else if gate != PerfGate::Qg10 && cell.distribution.runs < PERF_MIN_RUNS {
             state.quarantine(
                 "perf.ratchet.insufficient_samples",
                 format!(
@@ -1822,7 +1831,7 @@ fn validate_current_evidence(
         state.fatal(
             "perf.ratchet.evidence_applicability_plan_mismatch",
             format!(
-                "{role} v6 evidence does not bind the exact threshold profile/applicability plan"
+                "{role} current evidence does not bind the exact threshold profile/applicability plan"
             ),
         );
         return false;
@@ -2034,13 +2043,7 @@ fn validate_current_evidence(
         );
     }
 
-    if legacy.gate == PerfGate::Qg10 {
-        state.quarantine(
-            "perf.ratchet.qg10_structural_evidence_not_decision_capable",
-            "QG-10 dependency facts remain diagnostic until typed structural facts become \
-             decision-capable",
-        );
-    } else if !evidence.ratchet_admissible() {
+    if !evidence.ratchet_admissible() {
         state.quarantine(
             "perf.ratchet.current_evidence_not_admissible",
             format!(
@@ -2049,7 +2052,7 @@ fn validate_current_evidence(
             ),
         );
     }
-    true
+    !state.fatal && (legacy.gate != PerfGate::Qg10 || evidence.ratchet_admissible())
 }
 
 fn validate_current_evidence_cell(
@@ -2111,10 +2114,7 @@ fn validate_current_evidence_cell(
                 );
             }
         }
-        EvidenceCellBody::Facts {
-            raw_values: _,
-            summary,
-        } => {
+        EvidenceCellBody::DependencyFacts { facts } => {
             if cell.spec.gate != PerfGate::Qg10 {
                 state.fatal(
                     "perf.ratchet.current_evidence_unexpected_facts",
@@ -2124,6 +2124,13 @@ fn validate_current_evidence_cell(
                     ),
                 );
             }
+            if let Err(error) = facts.validate() {
+                state.fatal(
+                    "perf.ratchet.qg10_structural_evidence_invalid",
+                    format!("{role} QG-10 structural facts do not verify: {error}"),
+                );
+                return;
+            }
             if normative {
                 let key = CellKey {
                     fixture: cell.spec.fixture.clone(),
@@ -2131,12 +2138,17 @@ fn validate_current_evidence_cell(
                     engine: "default_feature_graph".to_owned(),
                     unit: cell.spec.unit.clone(),
                 };
+                let expected_projection = DistributionSummary::from_samples(&[facts
+                    .measured_tantivy_family_count()
+                    as f64])
+                .expect("one finite QG-10 dependency count always summarizes");
                 match legacy_cells.get(&key) {
-                    Some(projected) if projected.distribution == *summary => {}
+                    Some(projected) if projected.distribution == expected_projection => {}
                     Some(_) => state.fatal(
                         "perf.ratchet.current_evidence_projection_mismatch",
                         format!(
-                            "{role} QG-10 facts summary does not match its threshold projection"
+                            "{role} QG-10 threshold projection is not the exact one-observation \
+                             count derived from its typed dependency graph"
                         ),
                     ),
                     None => state.fatal(
@@ -2367,21 +2379,38 @@ fn compare_current_evidence_reproduction(
             );
             continue;
         };
-        let (
-            EvidenceCellBody::Paired {
-                paired: candidate_pair,
-                ..
-            },
-            EvidenceCellBody::Paired {
-                paired: rerun_pair, ..
-            },
-        ) = (&cell.body, &other.body)
-        else {
-            state.quarantine(
-                "perf.ratchet.current_rerun_body_mismatch",
-                format!("current evidence cell {} changed body kind", cell.cell_id),
-            );
-            continue;
+        let (candidate_pair, rerun_pair) = match (&cell.body, &other.body) {
+            (
+                EvidenceCellBody::DependencyFacts { facts: candidate },
+                EvidenceCellBody::DependencyFacts { facts: rerun },
+            ) => {
+                if candidate != rerun {
+                    state.quarantine(
+                        "perf.ratchet.qg10_structural_reproduction_failed",
+                        format!(
+                            "QG-10 candidate and rerun dependency facts differ for {}",
+                            cell.cell_id
+                        ),
+                    );
+                }
+                continue;
+            }
+            (
+                EvidenceCellBody::Paired {
+                    paired: candidate_pair,
+                    ..
+                },
+                EvidenceCellBody::Paired {
+                    paired: rerun_pair, ..
+                },
+            ) => (candidate_pair, rerun_pair),
+            _ => {
+                state.quarantine(
+                    "perf.ratchet.current_rerun_body_mismatch",
+                    format!("current evidence cell {} changed body kind", cell.cell_id),
+                );
+                continue;
+            }
         };
         if candidate.gate == PerfGate::Qg6 {
             compare_qg6_hierarchical_reproduction(cell, other, candidate_pair, rerun_pair, state);
@@ -3321,7 +3350,7 @@ fn evaluate_gate_targets(
         PerfGate::Qg7 => evaluate_qg7(&mut target),
         PerfGate::Qg8 => evaluate_qg8(&mut target),
         PerfGate::Qg9 => evaluate_qg9(&mut target),
-        PerfGate::Qg10 => evaluate_qg10(&mut target),
+        PerfGate::Qg10 => evaluate_qg10(&mut target, current_evidence),
     }
 }
 
@@ -3670,7 +3699,7 @@ fn exact_qg6_hierarchical_cell<'a>(
         } if paired.provenance.corpus_sha256 == artifact.provenance.corpus.corpus_sha256
             && paired.provenance.input_identity == cell.spec.input_identity =>
         {
-            Some((estimate, null))
+            Some((estimate, null.as_ref()))
         }
         _ => None,
     }
@@ -3800,17 +3829,51 @@ fn evaluate_qg9(target: &mut GateTargetEvaluator<'_, '_>) {
     }
 }
 
-fn evaluate_qg10(target: &mut GateTargetEvaluator<'_, '_>) {
-    if let Some(nodes) = target.value(
-        "dependency_surface/default_lexical",
-        "tantivy_nodes",
-        "default_feature_graph",
-    ) {
-        target.target(
-            nodes == 0.0,
-            format!("QG-10 default feature graph still contains {nodes:.0} Tantivy nodes"),
+fn evaluate_qg10(
+    target: &mut GateTargetEvaluator<'_, '_>,
+    current_evidence: Option<&PerfEvidenceArtifact>,
+) {
+    let Some(evidence) = current_evidence else {
+        target.state.quarantine(
+            "perf.ratchet.qg10_structural_evidence_missing",
+            "QG-10 target evaluation requires typed dependency facts",
         );
+        return;
+    };
+    let mut fact_cells = evidence.cells.iter().filter_map(|cell| match &cell.body {
+        EvidenceCellBody::DependencyFacts { facts } => Some(facts.as_ref()),
+        EvidenceCellBody::Paired { .. } => None,
+    });
+    let Some(facts) = fact_cells.next() else {
+        target.state.quarantine(
+            "perf.ratchet.qg10_structural_evidence_missing",
+            "QG-10 current evidence contains no typed dependency facts",
+        );
+        return;
+    };
+    if fact_cells.next().is_some() {
+        target.state.fatal(
+            "perf.ratchet.qg10_structural_evidence_duplicated",
+            "QG-10 current evidence contains more than one dependency-facts witness",
+        );
+        return;
     }
+    if let Err(error) = facts.validate() {
+        target.state.fatal(
+            "perf.ratchet.qg10_structural_evidence_invalid",
+            format!("QG-10 target facts do not verify: {error}"),
+        );
+        return;
+    }
+    let tantivy_packages = &facts.measured_graph.tantivy_family_package_ids;
+    target.target(
+        tantivy_packages.is_empty(),
+        format!(
+            "QG-10 default feature graph still contains {} Tantivy-family package record(s): {}",
+            tantivy_packages.len(),
+            tantivy_packages.join(", ")
+        ),
+    );
 }
 
 #[cfg(test)]
@@ -3821,8 +3884,10 @@ mod tests {
         BuildIdentity, CorpusIdentity, DistributionSummary, EvidenceArtifactError, EvidenceCell,
         EvidenceCellSpec, EvidencePolicy, EvidenceProvenance, MachineIdentity,
         PairedEstimatorConfig, PeakRssEvidence, PerfCellResult, PerfRawSample, PerfSampleArm,
-        PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, estimate_paired_experiment,
-        seeded_balanced_pair_order,
+        PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
+        QG10_DEPENDENCY_FACTS_SCHEMA_VERSION, QG10_MEASURED_FEATURES,
+        QG10_POSITIVE_CONTROL_FEATURES, Qg10DependencyFacts, Qg10DependencyGraph,
+        estimate_paired_experiment, seeded_balanced_pair_order,
     };
     use sha2::{Digest, Sha256};
 
@@ -4683,7 +4748,7 @@ mod tests {
         .expect("evidence cell");
         let paired = match &cell.body {
             EvidenceCellBody::Paired { paired, .. } => Some(paired),
-            EvidenceCellBody::Facts { .. } => None,
+            EvidenceCellBody::DependencyFacts { .. } => None,
         }
         .expect("QG-2 must be paired");
         let artifact = PerfGateArtifact {
@@ -4782,6 +4847,249 @@ mod tests {
         .expect("evidence artifact");
         bind_test_evidence(&artifact, &mut evidence, run_id, &[]);
         (artifact, evidence)
+    }
+
+    fn qg10_test_graph(features: &str, package_ids: &[&str]) -> Qg10DependencyGraph {
+        let arguments = [
+            "tree",
+            "--locked",
+            "-p",
+            "frankensearch",
+            "--features",
+            features,
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+        ];
+        Qg10DependencyGraph::from_cargo_tree_stdout(
+            std::iter::once("/test/toolchain/cargo".to_owned())
+                .chain(arguments.into_iter().map(str::to_owned))
+                .collect(),
+            format!("{}\n", package_ids.join("\n")),
+        )
+        .expect("canonical QG-10 test graph")
+    }
+
+    fn qg10_current_pair(
+        revision: &str,
+        run_id: &str,
+        measured_package_ids: &[&str],
+    ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        let revision = match revision {
+            "new" => "1".repeat(40),
+            "old" => "0".repeat(40),
+            revision => revision.to_owned(),
+        };
+        let facts = Qg10DependencyFacts {
+            schema_version: QG10_DEPENDENCY_FACTS_SCHEMA_VERSION.to_owned(),
+            cargo_tool_sha256: "b".repeat(64),
+            cargo_lock_sha256: "e".repeat(64),
+            measured_graph: qg10_test_graph(QG10_MEASURED_FEATURES, measured_package_ids),
+            positive_control_graph: qg10_test_graph(
+                QG10_POSITIVE_CONTROL_FEATURES,
+                &["frankensearch v0.2.1", "tantivy v0.25.0"],
+            ),
+        };
+        let exact_count = facts.measured_tantivy_family_count() as f64;
+        let cell = EvidenceCell::qg10_dependency_facts(
+            EvidenceCellSpec {
+                gate: PerfGate::Qg10,
+                fixture: "dependency_surface/default_lexical".to_owned(),
+                metric: "tantivy_nodes".to_owned(),
+                unit: "nodes".to_owned(),
+                role: EvidenceRole::Required,
+                input_identity: None,
+                qg6_semantic_contract: None,
+                cold_cache: None,
+                concurrency_witness: None,
+            },
+            facts,
+            &EvidencePolicy::predeclared(),
+        )
+        .expect("typed QG-10 evidence cell");
+        let artifact = PerfGateArtifact {
+            schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
+            gate: PerfGate::Qg10,
+            applicability_plan: Some(plan_binding(PerfGate::Qg10)),
+            bench_elf_sha256: "c".repeat(64),
+            machine_fingerprint: TEST_MACHINE_FINGERPRINT.to_owned(),
+            execution: Some(execution_provenance(PerfGate::Qg10)),
+            git_rev: revision.clone(),
+            run_window: "test-window".to_owned(),
+            run_id: run_id.to_owned(),
+            corpus_manifest_hash: "a".repeat(64),
+            manifest_sha256: normalized_manifest_sha256(),
+            cells: vec![PerfCellResult {
+                fixture: "dependency_surface/default_lexical".to_owned(),
+                metric: "tantivy_nodes".to_owned(),
+                engine: "default_feature_graph".to_owned(),
+                unit: "nodes".to_owned(),
+                distribution: DistributionSummary::from_samples(&[exact_count])
+                    .expect("exact QG-10 projection"),
+            }],
+            laws_attested: true,
+        };
+        let mut evidence = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg10,
+            plan_binding(PerfGate::Qg10),
+            EvidencePolicy::predeclared(),
+            EvidenceProvenance {
+                run_id: run_id.to_owned(),
+                run_window: "test-window".to_owned(),
+                manifest_sha256: normalized_manifest_sha256(),
+                build: BuildIdentity {
+                    executable_sha256: "c".repeat(64),
+                    git_revision: revision,
+                    git_dirty: false,
+                    worktree_state_sha256: None,
+                    cargo_lock_sha256: Some("e".repeat(64)),
+                    command_sha256: "f".repeat(64),
+                    environment_sha256: Some("d".repeat(64)),
+                    rustc_version: "rustc test".to_owned(),
+                    target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+                    build_profile: "release-perf".to_owned(),
+                    cargo_features: vec!["perf-harness".to_owned()],
+                },
+                machine: MachineIdentity {
+                    fingerprint: TEST_MACHINE_FINGERPRINT.to_owned(),
+                    os: "linux".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    logical_cpus: 64,
+                    execution: execution_provenance(PerfGate::Qg10),
+                    cpu_governor: Some("performance".to_owned()),
+                    load_average_start: None,
+                    load_average_end: None,
+                },
+                peak_rss: PeakRssEvidence {
+                    method: "unsupported".to_owned(),
+                    bytes: None,
+                },
+                corpus: CorpusIdentity {
+                    corpus_sha256: "a".repeat(64),
+                    query_set_sha256: None,
+                    qrels_sha256: None,
+                    document_count: 0,
+                    content_bytes: None,
+                    generator_seed: 0,
+                    generator_revision: "qg10-structural-v1".to_owned(),
+                },
+            },
+            vec![cell],
+        )
+        .expect("QG-10 evidence artifact");
+        bind_test_evidence(&artifact, &mut evidence, run_id, &[]);
+        (artifact, evidence)
+    }
+
+    #[test]
+    fn qg10_typed_empty_and_nonempty_facts_drive_target_outcome() {
+        for (packages, gate_decision, target_decision, release_eligibility) in [
+            (
+                vec!["frankensearch v0.2.1", "frankensearch-quill v0.2.1"],
+                PerfGateDecision::Allow,
+                PerfTargetDecision::Win,
+                PerfReleaseEligibility::Eligible,
+            ),
+            (
+                vec!["frankensearch v0.2.1", "tantivy v0.25.0"],
+                PerfGateDecision::Block,
+                PerfTargetDecision::Loss,
+                PerfReleaseEligibility::Ineligible,
+            ),
+        ] {
+            let (baseline, baseline_evidence) = qg10_current_pair("old", "base", &packages);
+            let (candidate, candidate_evidence) = qg10_current_pair("new", "candidate", &packages);
+            let (rerun, rerun_evidence) = qg10_current_pair("new", "rerun", &packages);
+            let evaluation = evaluate_verified_promotion(
+                &baseline,
+                &baseline_evidence,
+                &candidate,
+                &candidate_evidence,
+                &rerun,
+                &rerun_evidence,
+                test_profile(),
+                PerfRatchetQg6AuthoritySets::empty(),
+            );
+            assert_eq!(
+                evaluation.evidence_admission,
+                PerfEvidenceAdmission::Admitted
+            );
+            assert_eq!(evaluation.decision, gate_decision);
+            assert_eq!(evaluation.target_decision, target_decision);
+            assert_eq!(evaluation.release_eligibility, release_eligibility);
+        }
+    }
+
+    #[test]
+    fn qg10_mixed_scalar_projection_rejects_before_target_evaluation() {
+        let packages = ["frankensearch v0.2.1", "frankensearch-quill v0.2.1"];
+        let (baseline, baseline_evidence) = qg10_current_pair("old", "base", &packages);
+        let (mut candidate, mut candidate_evidence) =
+            qg10_current_pair("new", "candidate", &packages);
+        candidate
+            .cells
+            .first_mut()
+            .expect("QG-10 has one threshold projection")
+            .distribution =
+            DistributionSummary::from_samples(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+                .expect("hostile mixed QG-10 projection");
+        bind_test_evidence(&candidate, &mut candidate_evidence, "candidate", &[]);
+        let (rerun, rerun_evidence) = qg10_current_pair("new", "rerun", &packages);
+        let evaluation = evaluate_verified_promotion(
+            &baseline,
+            &baseline_evidence,
+            &candidate,
+            &candidate_evidence,
+            &rerun,
+            &rerun_evidence,
+            test_profile(),
+            PerfRatchetQg6AuthoritySets::empty(),
+        );
+        assert_eq!(
+            evaluation.evidence_admission,
+            PerfEvidenceAdmission::Rejected
+        );
+        assert_eq!(evaluation.target_decision, PerfTargetDecision::NoDecision);
+        assert!(evaluation.reasons.iter().any(|reason| {
+            matches!(
+                reason.code.as_str(),
+                "perf.ratchet.qg10_projection_not_exact"
+                    | "perf.ratchet.current_evidence_projection_mismatch"
+            )
+        }));
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .all(|reason| reason.code != "perf.ratchet.gate_target_missed")
+        );
+    }
+
+    #[test]
+    fn qg10_structural_reproduction_compares_complete_typed_facts() {
+        let (_, candidate) = qg10_current_pair("new", "candidate", &["frankensearch v0.2.1"]);
+        let (_, matching_rerun) = qg10_current_pair("new", "rerun-a", &["frankensearch v0.2.1"]);
+        let mut state = DecisionState::default();
+        compare_current_evidence_reproduction(&candidate, &matching_rerun, &mut state);
+        assert!(
+            state
+                .reasons
+                .iter()
+                .all(|reason| reason.code != "perf.ratchet.qg10_structural_reproduction_failed")
+        );
+
+        let (_, different_rerun) =
+            qg10_current_pair("new", "rerun-b", &["frankensearch v0.2.1", "serde v1.0.0"]);
+        let mut state = DecisionState::default();
+        compare_current_evidence_reproduction(&candidate, &different_rerun, &mut state);
+        assert!(
+            state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.qg10_structural_reproduction_failed"
+            })
+        );
     }
 
     fn qg6_fixture_authority_for_cell<const ROUNDS: usize>(
@@ -5115,7 +5423,7 @@ mod tests {
         .expect("attach QG-6 ratchet fixture formal protocol");
         let paired = match &cell.body {
             EvidenceCellBody::Paired { paired, .. } => paired,
-            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+            EvidenceCellBody::DependencyFacts { .. } => unreachable!("QG-6 must be paired"),
         };
         let leaf_distributions =
             crate::project_qg6_effect_leaf_distributions(&paired.effect_samples, &paired.config)
@@ -8002,7 +8310,7 @@ mod tests {
         );
         let paired = match &evidence.cells[0].body {
             EvidenceCellBody::Paired { paired, .. } => paired,
-            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+            EvidenceCellBody::DependencyFacts { .. } => unreachable!("QG-6 must be paired"),
         };
         assert_eq!(
             paired.provenance.corpus_sha256,
@@ -8406,11 +8714,11 @@ mod tests {
         let (_, rerun) = qg6_current_pair("rerun", rerun_groups);
         let candidate_pair = match &candidate.cells[0].body {
             EvidenceCellBody::Paired { paired, .. } => paired,
-            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+            EvidenceCellBody::DependencyFacts { .. } => unreachable!("QG-6 must be paired"),
         };
         let rerun_pair = match &rerun.cells[0].body {
             EvidenceCellBody::Paired { paired, .. } => paired,
-            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+            EvidenceCellBody::DependencyFacts { .. } => unreachable!("QG-6 must be paired"),
         };
         assert!(
             candidate_pair
@@ -8448,11 +8756,11 @@ mod tests {
         let (_, rerun) = qg6_current_pair_with_null("rerun", [[0.95; 3]; 4], rerun_null_groups);
         let candidate_pair = match &candidate.cells[0].body {
             EvidenceCellBody::Paired { paired, .. } => paired,
-            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+            EvidenceCellBody::DependencyFacts { .. } => unreachable!("QG-6 must be paired"),
         };
         let rerun_pair = match &rerun.cells[0].body {
             EvidenceCellBody::Paired { paired, .. } => paired,
-            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+            EvidenceCellBody::DependencyFacts { .. } => unreachable!("QG-6 must be paired"),
         };
         assert_eq!(
             projected_ratio_distribution(&candidate_pair.null_samples),
@@ -8662,7 +8970,7 @@ mod tests {
                 qg6_protocol: Some(protocol),
                 ..
             } => (paired, protocol.as_ref()),
-            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+            EvidenceCellBody::DependencyFacts { .. } => unreachable!("QG-6 must be paired"),
             EvidenceCellBody::Paired {
                 qg6_protocol: None, ..
             } => unreachable!("QG-6 must carry formal protocol evidence"),
