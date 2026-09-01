@@ -21310,6 +21310,143 @@ mod tests {
         )
     }
 
+    /// External counted-parity pin at a horizon-spanning tie shape
+    /// (bd-1i4j4): 5,000 near-identical documents (one high-tf outlier at
+    /// ordinal 4352, alternating title boosts, far beyond one `UNION_HORIZON`
+    /// window) indexed identically into Quill and pinned Tantivy. The counted
+    /// path pairs `TopDocs` with `Count` in Tantivy's `MultiCollector`, which
+    /// never takes the specialized direct-term union traversal; Quill mirrors
+    /// that route (`execute_ranked_query_inner` lowers counted trees
+    /// ordinarily).
+    /// Measured 2026-09-01: all four arms (both engines, both modes) agree
+    /// bit-for-bit at limits 1/10/100/1000 for both the fielded and the
+    /// unfielded disjunction. If this fires, the counted or uncounted route
+    /// diverged from the oracle at scale — not a tolerance candidate.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn counted_and_uncounted_horizon_ties_match_tantivy_bit_for_bit() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            use frankensearch_core::LexicalWrite;
+
+            let (mut subject, mut oracle) = live_campaign_engines();
+            subject.claim_fresh_campaign().expect("claim probe subject");
+            oracle.claim_fresh_campaign().expect("claim probe oracle");
+            let mut documents = Vec::with_capacity(5_000);
+            for ordinal in 0_u32..5_000 {
+                let content = if ordinal == 4_352 {
+                    std::iter::repeat_n("alpha", 64)
+                        .chain(std::iter::once("beta"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    "alpha beta".to_owned()
+                };
+                let title = if ordinal.is_multiple_of(2) {
+                    "alpha"
+                } else {
+                    "unrelated"
+                };
+                documents.push(
+                    frankensearch_core::IndexableDocument::new(
+                        format!("sealed-{ordinal:05}"),
+                        content,
+                    )
+                    .with_title(title.to_owned()),
+                );
+            }
+            subject
+                .index_mut()
+                .expect("probe quill index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index probe quill corpus");
+            subject
+                .index_mut()
+                .expect("probe quill index")
+                .commit(&cx)
+                .await
+                .expect("commit probe quill corpus");
+            oracle
+                .index()
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index probe oracle corpus");
+            oracle
+                .index()
+                .commit(&cx)
+                .await
+                .expect("commit probe oracle corpus");
+            subject.mark_committed().expect("publish probe quill");
+            oracle.mark_committed().expect("publish probe oracle");
+
+            for query in ["content:alpha OR content:beta", "alpha OR beta"] {
+                for limit in [1_usize, 10, 100, 1_000] {
+                    let quill_ranked = subject
+                        .index()
+                        .expect("committed quill")
+                        .search_paginated(&cx, query, limit, 0, false)
+                        .expect("quill uncounted page");
+                    let quill_counted = subject
+                        .index()
+                        .expect("committed quill")
+                        .search_paginated(&cx, query, limit, 0, true)
+                        .expect("quill counted page");
+                    let tantivy_ranked = oracle
+                        .index()
+                        .search_doc_ids(&cx, query, limit)
+                        .expect("tantivy uncounted page");
+                    let tantivy_counted = oracle
+                        .index()
+                        .search_doc_ids_counted(&cx, query, limit)
+                        .expect("tantivy counted page");
+                    let quill_rows = |result: &frankensearch_quill::QuillSearchResult| {
+                        result
+                            .hits
+                            .iter()
+                            .map(|hit| format!("{}@{:08x}", hit.document_id, hit.score.to_bits()))
+                            .collect::<Vec<_>>()
+                    };
+                    let quill_ranked_row = quill_rows(&quill_ranked);
+                    let quill_counted_row = quill_rows(&quill_counted);
+                    let tantivy_ranked_row = tantivy_ranked
+                        .iter()
+                        .map(|hit| format!("{}@{:08x}", hit.doc_id, hit.bm25_score.to_bits()))
+                        .collect::<Vec<_>>();
+                    let tantivy_counted_row = tantivy_counted
+                        .iter()
+                        .map(|hit| format!("{}@{:08x}", hit.doc_id, hit.bm25_score.to_bits()))
+                        .collect::<Vec<_>>();
+                    let diff = |label: &str, left: &[String], right: &[String]| {
+                        assert_eq!(
+                            left, right,
+                            "{query:?} limit={limit} {label}: horizon-tie pages diverged"
+                        );
+                    };
+                    diff(
+                        "quill_ranked vs tantivy_ranked",
+                        &quill_ranked_row,
+                        &tantivy_ranked_row,
+                    );
+                    diff(
+                        "quill_counted vs tantivy_counted",
+                        &quill_counted_row,
+                        &tantivy_counted_row,
+                    );
+                    diff(
+                        "quill_counted vs quill_ranked",
+                        &quill_counted_row,
+                        &quill_ranked_row,
+                    );
+                    diff(
+                        "tantivy_counted vs tantivy_ranked",
+                        &tantivy_counted_row,
+                        &tantivy_ranked_row,
+                    );
+                }
+            }
+        });
+    }
+
     /// bd-quill-e6-gauntlet-scale-rm3q.8 / bd-pttxk: the DIV-008 witness
     /// pair, re-pinned to its CONVERGED behaviour.
     ///

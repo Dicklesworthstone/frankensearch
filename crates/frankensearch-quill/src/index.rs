@@ -9690,6 +9690,7 @@ impl QuillReader {
             limit,
             offset,
             exact_count,
+            false,
             parsed.diagnostics,
             checkpoint,
             checkpoint_metering,
@@ -9929,6 +9930,7 @@ impl QuillReader {
             limit,
             offset,
             exact_count,
+            false,
             Vec::new(),
             None,
             None,
@@ -10115,6 +10117,7 @@ impl QuillReader {
             limit,
             offset,
             exact_count,
+            false,
             diagnostics,
             None,
             None,
@@ -10133,6 +10136,13 @@ impl QuillReader {
         limit: usize,
         offset: usize,
         exact_count: bool,
+        // Test-only escape hatch (bd-1i4j4): lower the ranked direct-term
+        // specialization even for an exact-count invocation, reproducing the
+        // pre-repair counted route so internal mixed-snapshot tests can build
+        // a same-route exhaustive reference. Every shipping caller passes
+        // `false`; Tantivy's MultiCollector semantics forbid the
+        // specialization on counted paths.
+        force_specialized_root: bool,
         diagnostics: Vec<QueryDiagnostic>,
         supplied_checkpoint: Option<&QueryCheckpointHandle<'a>>,
         supplied_checkpoint_metering: Option<bool>,
@@ -10200,7 +10210,18 @@ impl QuillReader {
         } else {
             TopDocsCollector::new(limit, offset)?
         };
-        let topdocs_root = limit != 0;
+        // A ranked DIRECT-TERM root may take Tantivy's specialized term-union
+        // traversal (doc-major pivot-prefix f32 accumulation) only when the
+        // oracle itself does: Tantivy runs that specialization for a lone
+        // `TopDocs` collector, but an exact-count request pairs `TopDocs`
+        // with `Count` in a MultiCollector, which forces the generic union
+        // (scorer-vector accumulation order). Lowering the counted tree with
+        // the specialization produced the RANKED association on the counted
+        // path — one ULP off Tantivy's counted aggregate
+        // (`harvested_14_score_bits_preserve_ranked_and_counted_orders`,
+        // counted pin 0x4005_5FC8 vs ranked 0x4005_5FC7; bd-r1-exact-repair-
+        // or-residual-1i4j4).
+        let topdocs_root = limit != 0 && (force_specialized_root || !exact_count);
         let rank_pruning =
             !exact_count && topdocs_root && query_has_prunable_root_union(query, 1.0);
         let sealed_docs: u64 = keeper
@@ -19888,6 +19909,11 @@ mod tests {
             .expect("fan-out fixture snapshot is authoritative");
         let rank_pruning =
             !exact_count && limit != 0 && query_has_prunable_root_union(&parsed.query, 1.0);
+        // DELIBERATELY NOT the shipping executor's route (bd-1i4j4): shipping
+        // lowers an exact-count invocation WITHOUT the specialized ranked
+        // term-union root, mirroring Tantivy's MultiCollector. This test-only
+        // helper keeps the specialized route so internal pruning-safety tests
+        // can build a same-route, pruning-free exhaustive REFERENCE page.
         let topdocs_root = limit != 0;
         let mut collector = if exact_count {
             TopDocsCollector::with_exact_count(limit, offset)
@@ -22062,6 +22088,7 @@ mod tests {
                     10,
                     0,
                     true,
+                    false,
                     Vec::new(),
                     None,
                     None,
@@ -27883,8 +27910,30 @@ mod tests {
                 let count_free = mixed
                     .search_paginated(&cx, direct_query, limit, 0, false)
                     .expect("execute count-free disjunction");
+                // Same-route exhaustive reference (bd-1i4j4): shipping
+                // counted invocations now lower the ORDINARY union to match
+                // Tantivy's MultiCollector, so the pruning-safety oracle here
+                // forces the pre-repair specialized route explicitly.
                 let exhaustive = mixed
-                    .search_paginated(&cx, direct_query, limit, 0, true)
+                    .reader
+                    .execute_ranked_query_inner(
+                        &cx,
+                        &parsed.query,
+                        &mixed
+                            .search_snapshot()
+                            .expect("mixed pruning search snapshot is authoritative"),
+                        limit,
+                        0,
+                        true,
+                        true,
+                        Vec::new(),
+                        None,
+                        None,
+                        #[cfg(feature = "pruning-conformance")]
+                        None,
+                        #[cfg(feature = "profile-internals")]
+                        None,
+                    )
                     .expect("execute exhaustive counted disjunction");
                 assert_eq!(count_free.total_count, None);
                 assert_eq!(
@@ -27903,8 +27952,32 @@ mod tests {
             let nested_count_free = mixed
                 .search_paginated(&cx, "alpha OR beta", 10, 0, false)
                 .expect("execute nested count-free fallback");
+            let mut nested_parsed = mixed
+                .reader
+                .default_parser()
+                .expect("mixed fixture has a default parser")
+                .parse_lenient("alpha OR beta");
+            let _ = canonicalize_query(&mut nested_parsed.query);
             let nested_exhaustive = mixed
-                .search_paginated(&cx, "alpha OR beta", 10, 0, true)
+                .reader
+                .execute_ranked_query_inner(
+                    &cx,
+                    &nested_parsed.query,
+                    &mixed
+                        .search_snapshot()
+                        .expect("mixed pruning search snapshot is authoritative"),
+                    10,
+                    0,
+                    true,
+                    true,
+                    Vec::new(),
+                    None,
+                    None,
+                    #[cfg(feature = "pruning-conformance")]
+                    None,
+                    #[cfg(feature = "profile-internals")]
+                    None,
+                )
                 .expect("execute nested exhaustive oracle");
             assert_eq!(nested_count_free.total_count, None);
             assert_eq!(nested_exhaustive.total_count, Some(10_000));
