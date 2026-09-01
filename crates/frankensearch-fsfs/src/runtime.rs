@@ -9228,30 +9228,18 @@ impl FsfsRuntime {
         let mut total_deleted = 0usize;
 
         if self.cli_input.delete_prefix {
-            // Prefix matching: scan all doc IDs and collect those matching any prefix.
-            let record_count = index.record_count();
+            // Prefix matching: scan all live doc IDs (main index + WAL) and
+            // collect those matching any prefix. soft_delete_batch handles
+            // both main-index tombstones and WAL tombstones idempotently.
+            let live_doc_ids = index.live_doc_ids()?;
             let mut to_delete = Vec::new();
-            for i in 0..record_count {
-                if index.is_deleted(i) {
-                    continue;
-                }
-                if let Ok(doc_id) = index.doc_id_at(i) {
-                    for prefix in ids {
-                        if doc_id.starts_with(prefix.as_str()) {
-                            to_delete.push(doc_id.to_owned());
-                            break;
-                        }
+            for doc_id in live_doc_ids {
+                for prefix in ids {
+                    if doc_id.starts_with(prefix.as_str()) {
+                        to_delete.push(doc_id);
+                        break;
                     }
                 }
-            }
-            // Also scan WAL entries for prefix matches.
-            let wal_count = index.wal_record_count();
-            for wal_idx in 0..wal_count {
-                // WAL entries are accessible only through the index's internal state,
-                // but soft_delete_batch handles both main and WAL deletion.
-                // We collect IDs from the main index and rely on soft_delete_batch
-                // to handle WAL entries with matching doc_ids.
-                let _ = wal_idx;
             }
 
             if !to_delete.is_empty() {
