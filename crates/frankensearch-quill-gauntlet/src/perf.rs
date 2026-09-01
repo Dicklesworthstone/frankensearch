@@ -12929,16 +12929,14 @@ mod tests {
 
     #[test]
     fn qg1_profile_plans_have_frozen_exhaustive_applicability_counts() {
-        // GOLDEN-CHANGE (QG-6 authenticated six-arm protocol): a plan identity
-        // binds the normalized normative manifest, so advancing the artifact,
-        // evidence, timing-leaf, semantic-contract, and startup-handshake
-        // schemas advances all three profile plan hashes. Every structural
-        // assertion below is unchanged and still passes -- 74 cells, the same
-        // Required/Diagnostic/NotApplicable split per profile, the same
-        // capacities, matrix identity, and primary target width -- which is
-        // what distinguishes this manifest-identity advance from a gate or
-        // matrix change. The hashes are recomputed from the frozen registry and
-        // manifest; they are not selected from measured performance outcomes.
+        // GOLDEN-CHANGE (QG-10 typed dependency facts): a plan identity binds
+        // the normalized normative manifest, so evidence v8 and the QG-10
+        // Diagnostic-to-Required transition advance all three profile plan
+        // hashes. The QG-1 structural assertions below are unchanged -- 74
+        // cells, the same Required/Diagnostic/NotApplicable split per profile,
+        // capacities, matrix identity, and primary target width. The hashes are
+        // recomputed from the frozen registry and manifest; they are not
+        // selected from measured performance outcomes.
         let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
         let cases = [
             (
@@ -12948,7 +12946,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "23781d5b1004ddc1a9201f2348a21d0d586c6fa33e23e6516754dfa5ede92a41",
+                "897f5bb1060b878b86929a601c1e1956932208b68affa99e59fa183412c82c33",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -12957,7 +12955,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "29851a69bbf4b1cd76e499e84abee71b18c39f6f65df621619800834f414228e",
+                "50f4acc1845ea0f211d280a7d5f16d5d2e0ae449b786a217b95393741ca278d6",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -12966,7 +12964,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "eb440bde845aa79bc80467979039b6aa34af99b0d4c7b779c0ede21f0a0ffe9a",
+                "aca7560099c4b105ad5b5689524aff8040b345278bd3fb3a93f37e6175076beb",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -13866,14 +13864,14 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
-        // GOLDEN-CHANGE (QG-6 authenticated six-arm protocol): the manifest
-        // now binds artifact v8, evidence v7, timing-leaf v3, semantic-contract
-        // v2, and the external startup-authority handshake. No threshold,
-        // fixture, or activation policy changed. Activation remains the sole
-        // administrative normalization exception.
+        // GOLDEN-CHANGE (QG-10 typed dependency facts): the manifest now binds
+        // evidence v8 and declares QG-10's deterministic structural witness as
+        // Required instead of Diagnostic. No threshold, fixture, or activation
+        // policy changed. Activation remains the sole administrative
+        // normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "d4a751d3dcbae22f282744a927971ccacb16df107784fc35346a316fb0f6993e",
+            "03b5b0ab47a3d79b2418b720fec716aa11056792b8ca86678e35ccd8d052403a",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(

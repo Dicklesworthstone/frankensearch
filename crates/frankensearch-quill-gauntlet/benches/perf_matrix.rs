@@ -4766,8 +4766,8 @@ fn qg10_cargo_executable() -> PathBuf {
         .find(|candidate| candidate.is_file())
         .unwrap_or_else(|| {
             panic!(
-                "QG-10 cannot resolve Cargo executable {:?} through PATH",
-                configured
+                "QG-10 cannot resolve Cargo executable {} through PATH",
+                configured_path.display()
             )
         })
 }

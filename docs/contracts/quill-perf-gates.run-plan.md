@@ -5,7 +5,7 @@ compiled `PerfMatrixSpec` by `render_perf_run_plan_markdown`; the gauntlet test
 `perf_run_plan_document_matches_the_manifest` fails closed on any drift. Regenerate
 deliberately with `QUILL_PERF_RUN_PLAN_UPDATE=1`.
 
-- manifest contract SHA-256: `d4a751d3dcbae22f282744a927971ccacb16df107784fc35346a316fb0f6993e`
+- manifest contract SHA-256: `03b5b0ab47a3d79b2418b720fec716aa11056792b8ca86678e35ccd8d052403a`
 - canonical matrix cells: 120
 
 ## Registered machines
