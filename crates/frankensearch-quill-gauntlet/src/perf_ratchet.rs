@@ -24,7 +24,7 @@ use crate::{
 };
 
 /// Version of the machine-readable ratchet decision artifact.
-pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v5";
+pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v6";
 /// Strict schema for the immutable pointer to an admitted history artifact pair.
 pub const PERF_HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v3";
 /// Maximum directional pass-over-pass regression admitted for a cell.
@@ -235,7 +235,7 @@ impl PerfRatchetEvaluation {
                 PerfRatchetMode::Promotion,
                 true,
                 PerfEvidenceAdmission::Admitted,
-                PerfTargetDecision::Loss,
+                PerfTargetDecision::Win | PerfTargetDecision::Loss,
                 PerfReleaseEligibility::Ineligible,
                 PerfGateDecision::Block,
             ) | (
@@ -496,9 +496,17 @@ impl EvidenceCellKey {
 }
 
 #[derive(Default)]
+enum TargetOutcomeState {
+    #[default]
+    NotMissed,
+    Missed,
+}
+
+#[derive(Default)]
 struct DecisionState {
     fatal: bool,
     blocked: bool,
+    target_outcome: TargetOutcomeState,
     quarantined: bool,
     reasons: Vec<PerfRatchetReason>,
 }
@@ -518,6 +526,11 @@ impl DecisionState {
             code: code.to_owned(),
             message: message.into(),
         });
+    }
+
+    fn target_miss(&mut self, code: &str, message: impl Into<String>) {
+        self.target_outcome = TargetOutcomeState::Missed;
+        self.block(code, message);
     }
 
     fn quarantine(&mut self, code: &str, message: impl Into<String>) {
@@ -559,7 +572,7 @@ impl DecisionState {
             || self.evidence_admission() == PerfEvidenceAdmission::Rejected
         {
             PerfTargetDecision::NoDecision
-        } else if self.blocked {
+        } else if matches!(self.target_outcome, TargetOutcomeState::Missed) {
             PerfTargetDecision::Loss
         } else {
             PerfTargetDecision::Win
@@ -577,17 +590,19 @@ fn finish_evaluation(
 ) -> PerfRatchetEvaluation {
     let evidence_admission = state.evidence_admission();
     let target_decision = state.target_decision(mode, gate_activated);
-    let release_eligibility = if target_decision == PerfTargetDecision::Win {
-        PerfReleaseEligibility::Eligible
-    } else {
-        PerfReleaseEligibility::Ineligible
-    };
+    let decision = state.decision();
+    let release_eligibility =
+        if target_decision == PerfTargetDecision::Win && decision == PerfGateDecision::Allow {
+            PerfReleaseEligibility::Eligible
+        } else {
+            PerfReleaseEligibility::Ineligible
+        };
     PerfRatchetEvaluation {
         schema_version: PERF_RATCHET_SCHEMA_VERSION.to_owned(),
         gate,
         mode,
         gate_activated,
-        decision: state.decision(),
+        decision,
         evidence_admission,
         target_decision,
         release_eligibility,
@@ -3209,7 +3224,8 @@ impl GateTargetEvaluator<'_, '_> {
             self.state
                 .note("perf.ratchet.bootstrap_target_missed", message);
         } else if self.activated {
-            self.state.block("perf.ratchet.gate_target_missed", message);
+            self.state
+                .target_miss("perf.ratchet.gate_target_missed", message);
         } else {
             self.state
                 .quarantine("perf.ratchet.provisional_target_missed", message);
@@ -5655,8 +5671,30 @@ mod tests {
         assert_eq!(win.release_eligibility, PerfReleaseEligibility::Eligible);
         assert!(!win.flip_authorized);
 
+        let mut regression_state = DecisionState::default();
+        regression_state.block("test.regression", "target passed but baseline regressed");
+        let regression = finish_evaluation(
+            PerfGate::Qg2,
+            PerfRatchetMode::Promotion,
+            true,
+            regression_state,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(regression.decision, PerfGateDecision::Block);
+        assert_eq!(
+            regression.evidence_admission,
+            PerfEvidenceAdmission::Admitted
+        );
+        assert_eq!(regression.target_decision, PerfTargetDecision::Win);
+        assert_eq!(
+            regression.release_eligibility,
+            PerfReleaseEligibility::Ineligible
+        );
+        assert!(!regression.flip_authorized);
+
         let mut loss_state = DecisionState::default();
-        loss_state.block("test.target_missed", "valid evidence lost");
+        loss_state.target_miss("test.target_missed", "valid evidence lost");
         let loss = finish_evaluation(
             PerfGate::Qg2,
             PerfRatchetMode::Promotion,
@@ -5723,9 +5761,18 @@ mod tests {
 
     #[test]
     fn release_state_wire_rejects_missing_unknown_and_contradictory_fields() {
-        fn blocked_state() -> DecisionState {
+        fn operator_block_state() -> DecisionState {
             let mut state = DecisionState::default();
-            state.block("test.loss", "admitted target loss");
+            state.block(
+                "test.regression",
+                "admitted target win with baseline regression",
+            );
+            state
+        }
+
+        fn target_loss_state() -> DecisionState {
+            let mut state = DecisionState::default();
+            state.target_miss("test.loss", "admitted target loss");
             state
         }
 
@@ -5782,7 +5829,15 @@ mod tests {
                 PerfGate::Qg2,
                 PerfRatchetMode::Promotion,
                 true,
-                blocked_state(),
+                operator_block_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::Promotion,
+                true,
+                target_loss_state(),
                 Vec::new(),
                 Vec::new(),
             ),
@@ -5814,7 +5869,15 @@ mod tests {
                 PerfGate::Qg2,
                 PerfRatchetMode::Promotion,
                 false,
-                blocked_state(),
+                operator_block_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::Promotion,
+                false,
+                target_loss_state(),
                 Vec::new(),
                 Vec::new(),
             ),
@@ -5846,7 +5909,15 @@ mod tests {
                 PerfGate::Qg2,
                 PerfRatchetMode::RegressionAlarm,
                 true,
-                blocked_state(),
+                operator_block_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::RegressionAlarm,
+                true,
+                target_loss_state(),
                 Vec::new(),
                 Vec::new(),
             ),
@@ -5876,6 +5947,65 @@ mod tests {
             );
         }
 
+        let operator_block = finish_evaluation(
+            PerfGate::Qg2,
+            PerfRatchetMode::Promotion,
+            true,
+            operator_block_state(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let operator_block_value =
+            serde_json::to_value(&operator_block).expect("operator block must serialize");
+        assert_eq!(operator_block_value["decision"], "block");
+        assert_eq!(operator_block_value["target_decision"], "win");
+        assert_eq!(operator_block_value["release_eligibility"], "ineligible");
+        assert_eq!(
+            serde_json::from_value::<PerfRatchetEvaluation>(operator_block_value.clone())
+                .expect("operator block must reload"),
+            operator_block
+        );
+        assert_wire_rejected(
+            operator_block_value.clone(),
+            &[(
+                "release_eligibility",
+                serde_json::Value::String("eligible".to_owned()),
+            )],
+            "blocked target win cannot be release eligible",
+        );
+        assert_wire_rejected(
+            operator_block_value,
+            &[(
+                "decision",
+                serde_json::Value::String("quarantine".to_owned()),
+            )],
+            "admitted target win cannot quarantine",
+        );
+
+        let target_loss = finish_evaluation(
+            PerfGate::Qg2,
+            PerfRatchetMode::Promotion,
+            true,
+            target_loss_state(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let target_loss_value =
+            serde_json::to_value(&target_loss).expect("target loss must serialize");
+        assert_wire_rejected(
+            target_loss_value.clone(),
+            &[(
+                "release_eligibility",
+                serde_json::Value::String("eligible".to_owned()),
+            )],
+            "target loss cannot be release eligible",
+        );
+        assert_wire_rejected(
+            target_loss_value,
+            &[("decision", serde_json::Value::String("allow".to_owned()))],
+            "target loss cannot allow",
+        );
+
         for field in [
             "evidence_admission",
             "target_decision",
@@ -5904,7 +6034,7 @@ mod tests {
             value.clone(),
             &[(
                 "schema_version",
-                serde_json::Value::String("quill-perf-ratchet-v4".to_owned()),
+                serde_json::Value::String("quill-perf-ratchet-v5".to_owned()),
             )],
             "stale schema",
         );
@@ -8710,7 +8840,82 @@ mod tests {
     }
 
     #[test]
-    fn reproducible_pass_over_pass_regression_blocks() {
+    fn target_clearing_baseline_regression_blocks_release_without_reclassifying_win() {
+        let baseline = qg2_artifact("old", 200.0, 100.0);
+        let candidate = qg2_artifact("new", 160.0, 100.0);
+        let mut rerun = qg2_artifact("new", 160.0, 100.0);
+        rerun.run_id = "rerun".to_owned();
+        let result = evaluate(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            true,
+            PerfRatchetMode::Promotion,
+        );
+        assert_eq!(result.decision, PerfGateDecision::Block);
+        assert_eq!(result.evidence_admission, PerfEvidenceAdmission::Admitted);
+        assert_eq!(result.target_decision, PerfTargetDecision::Win);
+        assert_eq!(
+            result.release_eligibility,
+            PerfReleaseEligibility::Ineligible
+        );
+        assert!(!result.flip_authorized);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.regression_detected")
+        );
+        assert!(
+            result
+                .reasons
+                .iter()
+                .all(|reason| reason.code != "perf.ratchet.gate_target_missed")
+        );
+        let encoded = serde_json::to_value(&result).expect("blocked target win must serialize");
+        assert_eq!(
+            serde_json::from_value::<PerfRatchetEvaluation>(encoded)
+                .expect("blocked target win must reload"),
+            result
+        );
+    }
+
+    #[test]
+    fn target_miss_without_baseline_regression_is_a_loss() {
+        let baseline = qg2_artifact("old", 140.0, 100.0);
+        let candidate = qg2_artifact("new", 140.0, 100.0);
+        let mut rerun = qg2_artifact("new", 140.0, 100.0);
+        rerun.run_id = "rerun".to_owned();
+        let result = evaluate(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            true,
+            PerfRatchetMode::Promotion,
+        );
+        assert_eq!(result.decision, PerfGateDecision::Block);
+        assert_eq!(result.evidence_admission, PerfEvidenceAdmission::Admitted);
+        assert_eq!(result.target_decision, PerfTargetDecision::Loss);
+        assert_eq!(
+            result.release_eligibility,
+            PerfReleaseEligibility::Ineligible
+        );
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.gate_target_missed")
+        );
+        assert!(
+            result
+                .reasons
+                .iter()
+                .all(|reason| reason.code != "perf.ratchet.regression_detected")
+        );
+    }
+
+    #[test]
+    fn combined_baseline_regression_and_target_miss_remains_a_loss() {
         let baseline = qg2_artifact("old", 160.0, 100.0);
         let candidate = qg2_artifact("new", 140.0, 100.0);
         let mut rerun = qg2_artifact("new", 140.0, 100.0);
@@ -8723,12 +8928,21 @@ mod tests {
             PerfRatchetMode::Promotion,
         );
         assert_eq!(result.decision, PerfGateDecision::Block);
-        assert!(
-            result
-                .reasons
-                .iter()
-                .any(|reason| reason.code == "perf.ratchet.regression_detected")
+        assert_eq!(result.target_decision, PerfTargetDecision::Loss);
+        assert_eq!(
+            result.release_eligibility,
+            PerfReleaseEligibility::Ineligible
         );
+        for code in [
+            "perf.ratchet.regression_detected",
+            "perf.ratchet.gate_target_missed",
+        ] {
+            assert!(
+                result.reasons.iter().any(|reason| reason.code == code),
+                "combined failure must retain {code}: {:?}",
+                result.reasons
+            );
+        }
     }
 
     #[test]
