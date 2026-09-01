@@ -15,9 +15,10 @@ use frankensearch_quill_gauntlet::{
     ExecutionProfileId, HardwareClassId, LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
     LocalPerfAttemptReceipt, MachineClassAdmissionContext, MachineClassRegistry, MachineProfileKey,
     PERF_ARTIFACT_SCHEMA_VERSION, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES, PERF_EVIDENCE_SCHEMA_VERSION,
-    PERF_HISTORY_POINTER_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile, PerfGate,
-    PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetQg1AuthoritySets,
-    PerfRatchetQg6AuthoritySets, PerfRatchetRequest, QG6_TIMED_SEARCHES_PER_SAMPLE,
+    PERF_HISTORY_POINTER_SCHEMA_VERSION, PerfEvidenceAdmission, PerfEvidenceArtifact,
+    PerfEvidenceFile, PerfGate, PerfGateArtifact, PerfGateDecision, PerfRatchetMode,
+    PerfRatchetQg1AuthoritySets, PerfRatchetQg6AuthoritySets, PerfRatchetRequest,
+    PerfReleaseEligibility, PerfTargetDecision, QG6_TIMED_SEARCHES_PER_SAMPLE,
     Qg1AuthorityRegisterEntryV1, Qg1ExpectedAuthority, Qg1StartupHandshakeV1, Qg1TargetPinV1,
     Qg6ScheduleAuthority, Qg6StartupAuthoritySetV1, Qg6StartupHandshakeV1, VerifiedRunnerIdentity,
     evaluate_perf_ratchet_against_authorities, is_explicit_bootstrap, is_explicit_bootstrap_for,
@@ -2664,7 +2665,12 @@ fn plan_history_if_allowed(
     verified_machine_profile: Option<MachineProfileKey>,
     evaluation: &mut frankensearch_quill_gauntlet::PerfRatchetEvaluation,
 ) -> Result<Option<HistoryPublicationPlan>, Box<dyn Error>> {
-    if evaluation.decision != PerfGateDecision::Allow {
+    if evaluation.decision != PerfGateDecision::Allow
+        || evaluation.evidence_admission != PerfEvidenceAdmission::Admitted
+        || evaluation.target_decision != PerfTargetDecision::Win
+        || evaluation.release_eligibility != PerfReleaseEligibility::Eligible
+        || evaluation.flip_authorized
+    {
         return Ok(None);
     }
     plan_history_if_requested(
@@ -3933,6 +3939,32 @@ mod tests {
             &mut evaluation,
         )
         .expect("denial must not open history");
+
+        assert!(plan.is_none());
+        assert!(!history_dir.exists());
+        assert!(evaluation.history_updates.is_empty());
+    }
+
+    #[test]
+    fn release_state_legacy_allow_without_release_eligibility_cannot_plan_history() {
+        let parent = tempfile::tempdir().expect("history parent");
+        let history_dir = parent.path().join("not-created");
+        let args = test_args(&history_dir);
+        let mut evaluation = evaluation(PerfGateDecision::Allow);
+        evaluation.release_eligibility = PerfReleaseEligibility::Ineligible;
+
+        let plan = plan_history_if_allowed(
+            &args,
+            PerfGate::Qg6,
+            "candidate-1",
+            b"forbidden-candidate",
+            Some(b"forbidden-receipt-bound-evidence"),
+            None,
+            None,
+            Some(test_profile()),
+            &mut evaluation,
+        )
+        .expect("release-ineligible Allow must not open history");
 
         assert!(plan.is_none());
         assert!(!history_dir.exists());

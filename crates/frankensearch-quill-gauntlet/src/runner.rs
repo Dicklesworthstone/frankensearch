@@ -21886,6 +21886,7 @@ mod tests {
     /// corpus identity comes from the row under audit.
     /// The corpus identity a committed observation row pins, across ledger
     /// generations (bd-dc0ab).
+    #[cfg(feature = "tantivy-oracle")]
     fn committed_corpus_hash(revisions: &DivergenceRevisionSet) -> &str {
         match revisions {
             DivergenceRevisionSet::CurrentV2 {
@@ -21899,6 +21900,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn e68_minimized_fixture_sha256_for_committed_corpus(
         committed_corpus_hash: &str,
         fixture: &Fixture,

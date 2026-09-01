@@ -215,44 +215,56 @@ impl PerfRatchetEvaluation {
         if self.flip_authorized {
             return Err("a ratchet evaluation can never authorize the lexical replacement");
         }
-        let expected_release_eligibility = if self.mode == PerfRatchetMode::Promotion
-            && self.gate_activated
-            && self.evidence_admission == PerfEvidenceAdmission::Admitted
-            && self.target_decision == PerfTargetDecision::Win
-        {
-            PerfReleaseEligibility::Eligible
-        } else {
-            PerfReleaseEligibility::Ineligible
-        };
-        if self.release_eligibility != expected_release_eligibility {
-            return Err("release eligibility is inconsistent with admission and target decision");
+        let state_is_canonical = matches!(
+            (
+                self.mode,
+                self.gate_activated,
+                self.evidence_admission,
+                self.target_decision,
+                self.release_eligibility,
+                self.decision,
+            ),
+            (
+                PerfRatchetMode::Promotion,
+                true,
+                PerfEvidenceAdmission::Admitted,
+                PerfTargetDecision::Win,
+                PerfReleaseEligibility::Eligible,
+                PerfGateDecision::Allow,
+            ) | (
+                PerfRatchetMode::Promotion,
+                true,
+                PerfEvidenceAdmission::Admitted,
+                PerfTargetDecision::Loss,
+                PerfReleaseEligibility::Ineligible,
+                PerfGateDecision::Block,
+            ) | (
+                PerfRatchetMode::Promotion | PerfRatchetMode::RegressionAlarm,
+                _,
+                PerfEvidenceAdmission::Rejected,
+                PerfTargetDecision::NoDecision,
+                PerfReleaseEligibility::Ineligible,
+                PerfGateDecision::Block | PerfGateDecision::Quarantine,
+            ) | (
+                PerfRatchetMode::Promotion,
+                false,
+                PerfEvidenceAdmission::Admitted,
+                PerfTargetDecision::NoDecision,
+                PerfReleaseEligibility::Ineligible,
+                PerfGateDecision::Allow | PerfGateDecision::Block,
+            ) | (
+                PerfRatchetMode::RegressionAlarm,
+                _,
+                PerfEvidenceAdmission::Admitted,
+                PerfTargetDecision::NoDecision,
+                PerfReleaseEligibility::Ineligible,
+                PerfGateDecision::Allow | PerfGateDecision::Block,
+            )
+        );
+        if !state_is_canonical {
+            return Err("ratchet release-state fields do not form a canonical decision tuple");
         }
-        if self.evidence_admission == PerfEvidenceAdmission::Rejected
-            && self.target_decision != PerfTargetDecision::NoDecision
-        {
-            return Err("rejected evidence cannot carry a target decision");
-        }
-        if (self.mode != PerfRatchetMode::Promotion || !self.gate_activated)
-            && self.target_decision != PerfTargetDecision::NoDecision
-        {
-            return Err("only an active-gate promotion can carry a target decision");
-        }
-        match self.target_decision {
-            PerfTargetDecision::Win if self.decision != PerfGateDecision::Allow => {
-                Err("a target WIN requires an Allow operator decision")
-            }
-            PerfTargetDecision::Loss if self.decision != PerfGateDecision::Block => {
-                Err("a target loss requires a Block operator decision")
-            }
-            PerfTargetDecision::NoDecision
-                if self.mode == PerfRatchetMode::Promotion
-                    && self.gate_activated
-                    && self.decision == PerfGateDecision::Allow =>
-            {
-                Err("an active promotion cannot Allow without a target WIN")
-            }
-            _ => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -2739,7 +2751,7 @@ fn validate_complete_gate(
         gate.label()
     );
     if activated {
-        state.block("perf.ratchet.incomplete_matrix", message);
+        state.fatal("perf.ratchet.incomplete_matrix", message);
     } else {
         state.quarantine("perf.ratchet.incomplete_matrix", message);
     }
@@ -5711,6 +5723,39 @@ mod tests {
 
     #[test]
     fn release_state_wire_rejects_missing_unknown_and_contradictory_fields() {
+        fn blocked_state() -> DecisionState {
+            let mut state = DecisionState::default();
+            state.block("test.loss", "admitted target loss");
+            state
+        }
+
+        fn quarantined_state() -> DecisionState {
+            let mut state = DecisionState::default();
+            state.quarantine("test.quarantine", "rejected inconclusive evidence");
+            state
+        }
+
+        fn fatal_state() -> DecisionState {
+            let mut state = DecisionState::default();
+            state.fatal("test.invalid", "rejected invalid evidence");
+            state
+        }
+
+        fn assert_wire_rejected(
+            mut value: serde_json::Value,
+            changes: &[(&str, serde_json::Value)],
+            scenario: &str,
+        ) {
+            let object = value.as_object_mut().expect("evaluation object");
+            for (field, replacement) in changes {
+                object.insert((*field).to_owned(), replacement.clone());
+            }
+            assert!(
+                serde_json::from_value::<PerfRatchetEvaluation>(value).is_err(),
+                "forged release-state tuple must reject: {scenario}"
+            );
+        }
+
         let evaluation = finish_evaluation(
             PerfGate::Qg2,
             PerfRatchetMode::Promotion,
@@ -5730,6 +5775,106 @@ mod tests {
                 .expect("reload valid release state"),
             evaluation
         );
+
+        for legitimate in [
+            evaluation.clone(),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::Promotion,
+                true,
+                blocked_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::Promotion,
+                true,
+                quarantined_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::Promotion,
+                true,
+                fatal_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::Promotion,
+                false,
+                DecisionState::default(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::Promotion,
+                false,
+                blocked_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::Promotion,
+                false,
+                quarantined_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::Promotion,
+                false,
+                fatal_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::RegressionAlarm,
+                true,
+                DecisionState::default(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::RegressionAlarm,
+                true,
+                blocked_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::RegressionAlarm,
+                true,
+                quarantined_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            finish_evaluation(
+                PerfGate::Qg2,
+                PerfRatchetMode::RegressionAlarm,
+                true,
+                fatal_state(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ] {
+            let encoded = serde_json::to_value(&legitimate)
+                .expect("every constructor-derived release-state tuple must serialize");
+            assert_eq!(
+                serde_json::from_value::<PerfRatchetEvaluation>(encoded)
+                    .expect("every constructor-derived release-state tuple must reload"),
+                legitimate
+            );
+        }
 
         for field in [
             "evidence_admission",
@@ -5755,6 +5900,26 @@ mod tests {
         );
         assert!(serde_json::from_value::<PerfRatchetEvaluation>(unknown).is_err());
 
+        assert_wire_rejected(
+            value.clone(),
+            &[(
+                "schema_version",
+                serde_json::Value::String("quill-perf-ratchet-v4".to_owned()),
+            )],
+            "stale schema",
+        );
+        for (field, unknown_token) in [
+            ("evidence_admission", "caller_admitted"),
+            ("target_decision", "optimization_debt"),
+            ("release_eligibility", "conditionally_eligible"),
+        ] {
+            assert_wire_rejected(
+                value.clone(),
+                &[(field, serde_json::Value::String(unknown_token.to_owned()))],
+                unknown_token,
+            );
+        }
+
         for (field, replacement) in [
             ("flip_authorized", serde_json::Value::Bool(true)),
             (
@@ -5778,6 +5943,62 @@ mod tests {
             assert!(
                 serde_json::from_value::<PerfRatchetEvaluation>(contradictory).is_err(),
                 "contradictory {field} must reject"
+            );
+        }
+
+        assert_wire_rejected(
+            value.clone(),
+            &[
+                ("decision", serde_json::Value::String("block".to_owned())),
+                (
+                    "target_decision",
+                    serde_json::Value::String("no_decision".to_owned()),
+                ),
+                (
+                    "release_eligibility",
+                    serde_json::Value::String("ineligible".to_owned()),
+                ),
+            ],
+            "active admitted promotion without a target decision",
+        );
+        assert_wire_rejected(
+            value.clone(),
+            &[
+                (
+                    "decision",
+                    serde_json::Value::String("quarantine".to_owned()),
+                ),
+                (
+                    "target_decision",
+                    serde_json::Value::String("no_decision".to_owned()),
+                ),
+                (
+                    "release_eligibility",
+                    serde_json::Value::String("ineligible".to_owned()),
+                ),
+            ],
+            "admitted quarantine",
+        );
+        for (mode, activated) in [("regression_alarm", true), ("promotion", false)] {
+            assert_wire_rejected(
+                value.clone(),
+                &[
+                    ("mode", serde_json::Value::String(mode.to_owned())),
+                    ("gate_activated", serde_json::Value::Bool(activated)),
+                    (
+                        "evidence_admission",
+                        serde_json::Value::String("rejected".to_owned()),
+                    ),
+                    (
+                        "target_decision",
+                        serde_json::Value::String("no_decision".to_owned()),
+                    ),
+                    (
+                        "release_eligibility",
+                        serde_json::Value::String("ineligible".to_owned()),
+                    ),
+                ],
+                "rejected evidence with an Allow operator decision",
             );
         }
 
@@ -6924,6 +7145,17 @@ mod tests {
         );
 
         assert_ne!(result.decision, PerfGateDecision::Allow);
+        assert_eq!(
+            result.evidence_admission,
+            PerfEvidenceAdmission::Rejected,
+            "an incomplete matrix must reject before target comparison"
+        );
+        assert_eq!(result.target_decision, PerfTargetDecision::NoDecision);
+        assert_eq!(
+            result.release_eligibility,
+            PerfReleaseEligibility::Ineligible
+        );
+        assert!(!result.flip_authorized);
         assert!(
             result.reasons.iter().any(|reason| {
                 reason.code == "perf.ratchet.threshold_verified_reload_failed"
@@ -6934,6 +7166,34 @@ mod tests {
             "filtered artifacts escaped every strict rejection seam: {:?}",
             result.reasons
         );
+    }
+
+    #[test]
+    fn release_state_activated_incomplete_matrix_rejects_before_target_decision() {
+        let plan = applicability_plan(PerfGate::Qg2);
+        let candidate_cells = BTreeMap::new();
+        let mut state = DecisionState::default();
+
+        validate_complete_gate(&plan, &candidate_cells, true, &mut state);
+        let result = finish_evaluation(
+            PerfGate::Qg2,
+            PerfRatchetMode::Promotion,
+            true,
+            state,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(result.decision, PerfGateDecision::Block);
+        assert_eq!(result.evidence_admission, PerfEvidenceAdmission::Rejected);
+        assert_eq!(result.target_decision, PerfTargetDecision::NoDecision);
+        assert_eq!(
+            result.release_eligibility,
+            PerfReleaseEligibility::Ineligible
+        );
+        assert!(!result.flip_authorized);
+        assert_eq!(result.reasons.len(), 1);
+        assert_eq!(result.reasons[0].code, "perf.ratchet.incomplete_matrix");
     }
 
     #[test]
