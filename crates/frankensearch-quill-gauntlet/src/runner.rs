@@ -21733,6 +21733,54 @@ mod tests {
         lower_hex(&hasher.finalize())
     }
 
+    /// The same digest, re-derived against the corpus identity a COMMITTED
+    /// register row pins rather than today's embedded shared fixtures
+    /// (bd-dc0ab).
+    ///
+    /// A committed observation is final history: its `fixture_sha256` was
+    /// minted from the corpus manifest hash recorded in its own `revisions`,
+    /// and the shared fixture suite legitimately advances after a mint (the
+    /// unfielded-OR scoring convergence moved the language-contract fixture,
+    /// which is part of the shared source recipe). Re-deriving a committed
+    /// row against the LIVE corpus hash would redden the join forever after
+    /// any such advance — while silently accepting a tampered case. So the
+    /// canonical case is still re-derived from the current builder (drift in
+    /// the minimized reproduction inputs still changes this digest), and the
+    /// corpus identity comes from the row under audit.
+    /// The corpus identity a committed observation row pins, across ledger
+    /// generations (bd-dc0ab).
+    fn committed_corpus_hash(revisions: &DivergenceRevisionSet) -> &str {
+        match revisions {
+            DivergenceRevisionSet::CurrentV2 {
+                corpus_manifest_sha256,
+                ..
+            }
+            | DivergenceRevisionSet::LegacyV1 {
+                corpus_manifest_sha256,
+                ..
+            } => corpus_manifest_sha256,
+        }
+    }
+
+    fn e68_minimized_fixture_sha256_for_committed_corpus(
+        committed_corpus_hash: &str,
+        fixture: &Fixture,
+        case_id: &str,
+    ) -> String {
+        let case = fixture
+            .query_suite
+            .cases
+            .iter()
+            .find(|case| case.id == case_id)
+            .unwrap_or_else(|| panic!("E6.8 fixture is missing case {case_id}"));
+        let mut hasher = Sha256::new();
+        hasher.update(E68_MINIMIZED_FIXTURE_DOMAIN);
+        hasher.update(committed_corpus_hash.as_bytes());
+        hasher.update([0_u8]);
+        hasher.update(serde_json::to_vec(case).expect("canonical minimized case"));
+        lower_hex(&hasher.finalize())
+    }
+
     /// Seed an append for ONE divergence: the base register's events with that
     /// divergence's own prior events dropped, and the sequence its freshly
     /// minted observation takes.
@@ -23269,7 +23317,11 @@ mod tests {
         assert_eq!(observation.class, DivergenceClass::RankMismatch);
         assert_eq!(
             observation.fixture.fixture_sha256,
-            e68_minimized_fixture_sha256(&fixture, E68_WITNESS_CASE_ID),
+            e68_minimized_fixture_sha256_for_committed_corpus(
+                committed_corpus_hash(&observation.revisions),
+                &fixture,
+                E68_WITNESS_CASE_ID,
+            ),
             "the recorded minimized fixture no longer hashes to the committed case"
         );
 
@@ -23299,7 +23351,11 @@ mod tests {
         assert_eq!(refusal.class, DivergenceClass::OracleBug);
         assert_eq!(
             refusal.fixture.fixture_sha256,
-            e68_minimized_fixture_sha256(&fixture, E68_REFUSAL_CASE_ID),
+            e68_minimized_fixture_sha256_for_committed_corpus(
+                committed_corpus_hash(&refusal.revisions),
+                &fixture,
+                E68_REFUSAL_CASE_ID,
+            ),
             "the recorded minimized fixture no longer hashes to the committed refusal case"
         );
         let div009_dispositions = dispositions_for(E68_REFUSAL_DIVERGENCE_ID);
@@ -23349,7 +23405,11 @@ mod tests {
         for observation in [raw, attributed] {
             assert_eq!(
                 observation.fixture.fixture_sha256,
-                e68_minimized_fixture_sha256(&fixture, E68_AND_NOT_CASE_ID),
+                e68_minimized_fixture_sha256_for_committed_corpus(
+                    committed_corpus_hash(&observation.revisions),
+                    &fixture,
+                    E68_AND_NOT_CASE_ID,
+                ),
                 "the recorded minimized fixture no longer hashes to the committed \
                  negated-conjunction case"
             );
