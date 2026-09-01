@@ -18116,7 +18116,6 @@ mod tests {
     /// and the move that exhausts a cursor charges none at all. Such a build
     /// reports the seek as the query's last checkpoint and answers a
     /// cancelled query with a complete result set.
-
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     #[test]
     fn salej_union_horizon_final_refill_checkpoints_are_exact_and_atomic() {

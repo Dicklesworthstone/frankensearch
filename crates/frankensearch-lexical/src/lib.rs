@@ -3219,6 +3219,18 @@ impl TantivyIndex {
         &query[..end]
     }
 
+    /// Render the shipping parser's tantivy query tree for one input.
+    ///
+    /// Diagnostic-only surface for differential structure archaeology
+    /// (bd-1i4j4): the execution tree tantivy evaluates decides its f32
+    /// accumulation association, so divergence work needs to SEE it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_shipping_parse(&self, query: &str) -> String {
+        let query = Self::truncate_query(query);
+        format!("{:?}", self.parse_query_shipping(query))
+    }
+
     /// Search with snippet generation and query explanation.
     ///
     /// Returns [`LexicalHit`] results enriched with highlighted snippets

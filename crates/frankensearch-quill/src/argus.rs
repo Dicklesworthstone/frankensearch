@@ -368,6 +368,149 @@ pub trait QueryWorkCheckpoint: Send + Sync {
     fn set_conformance_query_work_context(&self, _context: Option<ConformanceQueryWorkContext>) {}
 }
 
+/// One f32 accumulation step inside a buffered union window (bd-rtnwu).
+///
+/// Records the exact addition the union performed: which child (by stable
+/// construction ordinal and by current runtime index), on which document,
+/// with which accumulator, contribution, and result bit patterns.
+#[cfg(feature = "pruning-conformance")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionAddTrace {
+    /// 1-based refill ordinal within this union's lifetime.
+    pub refill_ordinal: u64,
+    /// First document of the window being filled.
+    pub window_start: u32,
+    /// Which fill path performed the addition.
+    pub fill_path: UnionFillPath,
+    /// Stable child identity assigned at union construction.
+    pub child_construction_ordinal: u32,
+    /// Child position in the evolving scorer vector at the time of the add.
+    pub runtime_index: usize,
+    /// Document receiving the contribution.
+    pub doc: u32,
+    /// Accumulator bits BEFORE the addition (0.0 when first contribution).
+    pub accumulator_bits: u32,
+    /// Contribution bits returned by the child scorer.
+    pub contribution_bits: u32,
+    /// Accumulator bits AFTER the addition.
+    pub result_bits: u32,
+}
+
+/// Which buffered-union fill implementation performed a traced step.
+#[cfg(feature = "pruning-conformance")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnionFillPath {
+    /// Ordinary scorer-vector exhaustive fill.
+    Exhaustive,
+    /// Ordinary scorer-vector candidate-restricted fill.
+    Candidate,
+    /// Specialized doc-major pivot-prefix exhaustive fill.
+    TantivyTopDocsTerm,
+    /// Specialized doc-major candidate-restricted fill.
+    TantivyTopDocsTermCandidate,
+}
+
+/// One traced buffered-union lifecycle event (bd-rtnwu).
+#[cfg(feature = "pruning-conformance")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnionTraceEvent {
+    /// Union constructed: route decision inputs and stable child identities.
+    Constructed {
+        /// Whether the specialized doc-major route was taken.
+        route_specialized: bool,
+        /// The `topdocs_root` flag the lowering passed in.
+        topdocs_root: bool,
+        /// Children in construction order, described by cursor kind.
+        child_kinds: Vec<&'static str>,
+        /// Whole-group ceiling bits captured at construction, when bounded.
+        group_ceiling_bits: Option<u32>,
+    },
+    /// A window refill began.
+    Refill {
+        /// 1-based refill ordinal.
+        ordinal: u64,
+        /// First document of the window.
+        window_start: u32,
+        /// Rank-pruning cutoff bits when one applied to this window.
+        cutoff_bits: Option<u32>,
+        /// Which fill path serviced the refill.
+        fill_path: UnionFillPath,
+    },
+    /// One f32 accumulation step.
+    Add(UnionAddTrace),
+    /// An exhausted child left the scorer vector.
+    SwapRemove {
+        /// Runtime index removed.
+        runtime_index: usize,
+        /// Construction ordinal of the removed child.
+        child_construction_ordinal: u32,
+    },
+    /// The evolving scorer vector was stably re-sorted (specialized path).
+    SortSnapshot {
+        /// Construction ordinals in post-sort runtime order.
+        order: Vec<u32>,
+    },
+    /// A specialized-path pivot prefix was summed.
+    PivotPrefix {
+        /// Pivot document.
+        doc: u32,
+        /// Number of equal-document children summed.
+        len: usize,
+    },
+}
+
+/// Invocation-bound consumer of buffered-union trace events (bd-rtnwu).
+///
+/// Installed BEFORE `BufferedUnionScorer` construction because construction
+/// immediately refills. Shipping builds contain no producer of these events:
+/// every emission site is `pruning-conformance`-gated, and an absent sink
+/// costs one `Option` check.
+#[cfg(feature = "pruning-conformance")]
+pub trait ScorerTraceSink: Send + Sync {
+    /// Record one union lifecycle event.
+    fn record(&self, event: UnionTraceEvent);
+}
+
+#[cfg(feature = "pruning-conformance")]
+std::thread_local! {
+    /// Invocation-scoped trace sink (bd-rtnwu). Thread-local by design:
+    /// installing a sink threads NO lowering signatures, and the caveat is
+    /// stated rather than hidden — segment fan-out workers do not inherit
+    /// it, so trace fixtures must execute serially (single sealed segment).
+    static SCORER_TRACE_SINK: std::cell::RefCell<Option<std::sync::Arc<dyn ScorerTraceSink>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII installer for the invocation-scoped scorer trace sink (bd-rtnwu).
+///
+/// The sink is active on THIS thread from construction until drop. Install
+/// BEFORE running the query: `BufferedUnionScorer` construction refills
+/// immediately, and the construction event itself is part of the evidence.
+#[cfg(feature = "pruning-conformance")]
+pub struct ScorerTraceSinkGuard(());
+
+#[cfg(feature = "pruning-conformance")]
+impl ScorerTraceSinkGuard {
+    /// Install `sink` for the current thread and return the guard.
+    #[must_use]
+    pub fn install(sink: std::sync::Arc<dyn ScorerTraceSink>) -> Self {
+        SCORER_TRACE_SINK.with(|cell| *cell.borrow_mut() = Some(sink));
+        Self(())
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl Drop for ScorerTraceSinkGuard {
+    fn drop(&mut self) {
+        SCORER_TRACE_SINK.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+fn active_scorer_trace_sink() -> Option<std::sync::Arc<dyn ScorerTraceSink>> {
+    SCORER_TRACE_SINK.with(|cell| cell.borrow().clone())
+}
+
 /// Unforgeable evidence that a cursor's backing codec validates each
 /// post-move scorer invariant.
 ///
@@ -3797,6 +3940,30 @@ fn classify_seek_result(target: u32, result: Option<u32>) -> Result<SeekDangerRe
 pub struct ReferenceScorer<'a> {
     node: ScorerNode<'a>,
     subtree_nodes: usize,
+    /// Stable identity assigned when a buffered union adopts this child
+    /// (bd-rtnwu); `None` outside a traced union.
+    #[cfg(feature = "pruning-conformance")]
+    construction_ordinal: Option<u32>,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ReferenceScorer<'_> {
+    /// Cursor-kind label for trace evidence (bd-rtnwu).
+    const fn trace_node_kind(&self) -> &'static str {
+        match &self.node {
+            ScorerNode::Empty => "empty",
+            ScorerNode::All(_) => "all",
+            ScorerNode::Term(_) => "term",
+            ScorerNode::Phrase(_) => "phrase",
+            ScorerNode::NumericRange(_) => "numeric_range",
+            ScorerNode::ConstantScore(_) => "constant_score",
+            ScorerNode::Intersection(_) => "intersection",
+            ScorerNode::Union(_) => "union",
+            ScorerNode::UnscoredUnion(_) => "unscored_union",
+            ScorerNode::RequiredOptional(_) => "required_optional",
+            ScorerNode::Exclude(_) => "exclude",
+        }
+    }
 }
 
 fn take_scorer_node(mut scorer: ReferenceScorer<'_>) -> ScorerNode<'_> {
@@ -3863,6 +4030,8 @@ impl<'a> ReferenceScorer<'a> {
         Self {
             node: ScorerNode::Empty,
             subtree_nodes: 1,
+            #[cfg(feature = "pruning-conformance")]
+            construction_ordinal: None,
         }
     }
 
@@ -3909,6 +4078,8 @@ impl<'a> ReferenceScorer<'a> {
             Ok(Self {
                 node: ScorerNode::All(all),
                 subtree_nodes: 1,
+                #[cfg(feature = "pruning-conformance")]
+                construction_ordinal: None,
             })
         }
     }
@@ -3922,6 +4093,8 @@ impl<'a> ReferenceScorer<'a> {
             Self {
                 node: ScorerNode::Term(term),
                 subtree_nodes: 1,
+                #[cfg(feature = "pruning-conformance")]
+                construction_ordinal: None,
             }
         }
     }
@@ -3935,6 +4108,8 @@ impl<'a> ReferenceScorer<'a> {
             Self {
                 node: ScorerNode::Phrase(phrase),
                 subtree_nodes: 1,
+                #[cfg(feature = "pruning-conformance")]
+                construction_ordinal: None,
             }
         }
     }
@@ -4002,6 +4177,8 @@ impl<'a> ReferenceScorer<'a> {
                 boost,
             )),
             subtree_nodes: 1,
+            #[cfg(feature = "pruning-conformance")]
+            construction_ordinal: None,
         })
     }
 
@@ -4047,6 +4224,8 @@ impl<'a> ReferenceScorer<'a> {
                 boost,
             )),
             subtree_nodes: 1,
+            #[cfg(feature = "pruning-conformance")]
+            construction_ordinal: None,
         })
     }
 
@@ -4100,6 +4279,8 @@ impl<'a> ReferenceScorer<'a> {
                 score,
             }),
             subtree_nodes: 1,
+            #[cfg(feature = "pruning-conformance")]
+            construction_ordinal: None,
         })
     }
 
@@ -4484,6 +4665,8 @@ impl<'a> ReferenceScorer<'a> {
                             required, optional,
                         )?),
                         subtree_nodes,
+                        #[cfg(feature = "pruning-conformance")]
+                        construction_ordinal: None,
                     }
                 }
             }
@@ -4529,6 +4712,8 @@ impl<'a> ReferenceScorer<'a> {
         Ok(Self {
             node: ScorerNode::Exclude(ExcludeScorer::new(include, excluded)?),
             subtree_nodes,
+            #[cfg(feature = "pruning-conformance")]
+            construction_ordinal: None,
         })
     }
 
@@ -4887,6 +5072,8 @@ fn scorer_intersection(
                 Ok(ReferenceScorer {
                     node: ScorerNode::Intersection(intersection),
                     subtree_nodes,
+                    #[cfg(feature = "pruning-conformance")]
+                    construction_ordinal: None,
                 })
             }
         }
@@ -4920,6 +5107,8 @@ fn scorer_union<'a>(
                     conformance_checkpoint,
                 )?),
                 subtree_nodes,
+                #[cfg(feature = "pruning-conformance")]
+                construction_ordinal: None,
             })
         }
     }
@@ -4940,6 +5129,8 @@ fn scorer_union_unscored(
             Ok(ReferenceScorer {
                 node: ScorerNode::UnscoredUnion(UnscoredUnionScorer::new(scorers)?),
                 subtree_nodes,
+                #[cfg(feature = "pruning-conformance")]
+                construction_ordinal: None,
             })
         }
     }
@@ -5622,6 +5813,12 @@ struct BufferedUnionScorer<'a> {
     conformance_refills: Vec<ConformanceUnionRefill>,
     #[cfg(feature = "pruning-conformance")]
     conformance_checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
+    /// Invocation-scoped trace sink captured at construction (bd-rtnwu).
+    #[cfg(feature = "pruning-conformance")]
+    trace_sink: Option<std::sync::Arc<dyn ScorerTraceSink>>,
+    /// 1-based refill ordinal for trace events (bd-rtnwu).
+    #[cfg(feature = "pruning-conformance")]
+    trace_refill_ordinal: u64,
     /// Whole-group score ceiling captured once at construction, before the
     /// first refill drains any child into [`Self::score_window`].
     ///
@@ -5647,6 +5844,17 @@ impl<'a> BufferedUnionScorer<'a> {
         >,
     ) -> Result<Self, ArgusError> {
         let segment_num_docs = shared_segment_num_docs(&scorers)?;
+        #[cfg(feature = "pruning-conformance")]
+        let trace_sink = active_scorer_trace_sink();
+        #[cfg(feature = "pruning-conformance")]
+        if trace_sink.is_some() {
+            // Stable identity predates the empty-child retain below: a child
+            // that dies at construction still had an identity in the lowered
+            // tree the trace describes.
+            for (ordinal, scorer) in scorers.iter_mut().enumerate() {
+                scorer.construction_ordinal = u32::try_from(ordinal).ok();
+            }
+        }
         scorers.retain(|scorer| scorer.doc().is_some());
         let tantivy_topdocs_term_union = topdocs_root
             && scorers
@@ -5674,6 +5882,18 @@ impl<'a> BufferedUnionScorer<'a> {
         } else {
             None
         };
+        #[cfg(feature = "pruning-conformance")]
+        if let Some(sink) = &trace_sink {
+            sink.record(UnionTraceEvent::Constructed {
+                route_specialized: tantivy_topdocs_term_union,
+                topdocs_root,
+                child_kinds: scorers
+                    .iter()
+                    .map(ReferenceScorer::trace_node_kind)
+                    .collect(),
+                group_ceiling_bits: group_ceiling.map(f32::to_bits),
+            });
+        }
         let mut scorer = Self {
             active: scorers,
             tantivy_topdocs_term_union,
@@ -5688,6 +5908,10 @@ impl<'a> BufferedUnionScorer<'a> {
             conformance_refills: Vec::new(),
             #[cfg(feature = "pruning-conformance")]
             conformance_checkpoint,
+            #[cfg(feature = "pruning-conformance")]
+            trace_sink,
+            #[cfg(feature = "pruning-conformance")]
+            trace_refill_ordinal: 0,
             group_ceiling,
         };
         if scorer.refill()? {
@@ -5752,6 +5976,24 @@ impl<'a> BufferedUnionScorer<'a> {
         }
     }
 
+    /// Emit one trace event when an invocation-scoped sink is installed
+    /// (bd-rtnwu).
+    #[cfg(feature = "pruning-conformance")]
+    fn trace(&self, event: UnionTraceEvent) {
+        if let Some(sink) = &self.trace_sink {
+            sink.record(event);
+        }
+    }
+
+    /// Construction ordinal of one active child, when identity was assigned.
+    #[cfg(feature = "pruning-conformance")]
+    fn trace_ordinal(&self, runtime_index: usize) -> u32 {
+        self.active
+            .get(runtime_index)
+            .and_then(|scorer| scorer.construction_ordinal)
+            .unwrap_or(u32::MAX)
+    }
+
     fn refill(&mut self) -> Result<bool, ArgusError> {
         self.refill_with_cutoff(None)
     }
@@ -5793,6 +6035,20 @@ impl<'a> BufferedUnionScorer<'a> {
         };
         self.window_start = Some(window_start);
         let horizon_end = u64::from(window_start) + UNION_HORIZON_U64;
+        #[cfg(feature = "pruning-conformance")]
+        {
+            self.trace_refill_ordinal = self.trace_refill_ordinal.saturating_add(1);
+            self.trace(UnionTraceEvent::Refill {
+                ordinal: self.trace_refill_ordinal,
+                window_start,
+                cutoff_bits: cutoff.map(f32::to_bits),
+                fill_path: if self.tantivy_topdocs_term_union {
+                    UnionFillPath::TantivyTopDocsTerm
+                } else {
+                    UnionFillPath::Exhaustive
+                },
+            });
+        }
         #[cfg(feature = "pruning-conformance")]
         if cutoff.is_some_and(f32::is_finite) {
             self.set_conformance_query_work_context(
@@ -5901,6 +6157,11 @@ impl<'a> BufferedUnionScorer<'a> {
         while index < self.active.len() {
             loop {
                 let Some(doc) = self.active[index].doc() else {
+                    #[cfg(feature = "pruning-conformance")]
+                    self.trace(UnionTraceEvent::SwapRemove {
+                        runtime_index: index,
+                        child_construction_ordinal: self.trace_ordinal(index),
+                    });
                     self.active.swap_remove(index);
                     break;
                 };
@@ -5911,10 +6172,28 @@ impl<'a> BufferedUnionScorer<'a> {
                 let offset = usize::try_from(u64::from(doc) - u64::from(window_start))
                     .map_err(|_| ArgusError::CursorInvariant("union offset does not fit usize"))?;
                 let contribution = self.active[index].score()?;
-                let total = self.score_window[offset].unwrap_or(0.0) + contribution;
+                let accumulator = self.score_window[offset].unwrap_or(0.0);
+                let total = accumulator + contribution;
                 self.score_window[offset] = Some(finite_score(total, doc)?);
+                #[cfg(feature = "pruning-conformance")]
+                self.trace(UnionTraceEvent::Add(UnionAddTrace {
+                    refill_ordinal: self.trace_refill_ordinal,
+                    window_start,
+                    fill_path: UnionFillPath::Exhaustive,
+                    child_construction_ordinal: self.trace_ordinal(index),
+                    runtime_index: index,
+                    doc,
+                    accumulator_bits: accumulator.to_bits(),
+                    contribution_bits: contribution.to_bits(),
+                    result_bits: total.to_bits(),
+                }));
                 self.active[index].next()?;
                 if self.active[index].doc().is_none() {
+                    #[cfg(feature = "pruning-conformance")]
+                    self.trace(UnionTraceEvent::SwapRemove {
+                        runtime_index: index,
+                        child_construction_ordinal: self.trace_ordinal(index),
+                    });
                     self.active.swap_remove(index);
                     break;
                 }
