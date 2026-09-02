@@ -21607,6 +21607,63 @@ mod tests {
     }
 
     #[test]
+    fn delete_prefix_tombstones_documents_that_exist_only_in_the_wal() {
+        // Regression for the dead WAL loop in `delete --prefix` (fixed in
+        // 367f894a without a test): a document appended through the WAL and
+        // never compacted must still be found by a prefix delete, and a
+        // non-matching prefix must delete nothing.
+        let temp = tempfile::tempdir().expect("index root");
+        let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector parent");
+        let vector = vec![0.125_f32; 8];
+        let mut writer =
+            VectorIndex::create(&vector_path, "hash-8", vector.len()).expect("create vector index");
+        writer
+            .write_record("main/keep.md", &vector)
+            .expect("write main-generation vector");
+        writer.finish().expect("finish main vector generation");
+        let mut mutator = VectorIndex::open_writer(&vector_path).expect("open WAL append writer");
+        mutator
+            .append("wal/only.md", &vector)
+            .expect("append WAL-only document");
+        drop(mutator);
+
+        let run_delete = |ids: Vec<&str>| {
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                delete_ids: ids.into_iter().map(str::to_owned).collect(),
+                delete_prefix: true,
+                format: OutputFormat::Json,
+                ..CliInput::default()
+            });
+            runtime
+                .run_delete_command()
+                .expect("delete --prefix succeeds");
+            let index = VectorIndex::open(&vector_path).expect("reopen vector index");
+            super::vector_live_doc_ids(&index).expect("read live doc ids")
+        };
+
+        // Planted negative: a prefix that matches nothing tombstones nothing.
+        let untouched = run_delete(vec!["nope/"]);
+        assert!(untouched.contains("wal/only.md") && untouched.contains("main/keep.md"));
+
+        // Positive: the WAL-only document is reachable by prefix delete and
+        // the main-generation document with a different prefix survives.
+        let after = run_delete(vec!["wal/"]);
+        assert!(
+            !after.contains("wal/only.md"),
+            "WAL-only document must be tombstoned by prefix delete: {after:?}"
+        );
+        assert!(
+            after.contains("main/keep.md"),
+            "documents outside the prefix must survive: {after:?}"
+        );
+    }
+
+    #[test]
     fn search_resources_rebind_on_vector_wal_append_and_tombstone() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("index root");
