@@ -25,10 +25,11 @@ const CONFIG_LOADED_EMIT_FIELDS: [&str; 4] = [
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FAST_ONLY_WARNING_CODE: &str = "config.search.fast_only_with_quality_model";
 
-/// Leading token of `storage.db_path` that stands for the resolved index root
-/// (`--index-dir`, `FRANKENSEARCH_INDEX_DIR`, or `storage.index_dir` under the
-/// target root). The default catalog lives under the index it belongs to: a
-/// catalog shared across roots is keyed by relative path, so a document
+/// Leading token of `storage.db_path` that stands for the resolved index root.
+///
+/// The root is `--index-dir`, `FRANKENSEARCH_INDEX_DIR`, or `storage.index_dir`
+/// under the target root. The default catalog lives under the index it belongs
+/// to: a catalog shared across roots is keyed by relative path, so a document
 /// already known from another project counted as "unchanged" and never got
 /// vectors in watch mode (bd-3tym7). An absolute path opts back into sharing.
 pub const STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER: &str = "{index_dir}";
@@ -1666,7 +1667,10 @@ fn resolve_relative_config_paths(config: &mut FsfsConfig, base_file: &Path) {
 
     // db_path: `{index_dir}/...` resolves against the index root at runtime
     // (`FsfsRuntime::resolve_storage_db_path`), not against the config file.
-    if !config.storage.db_path.starts_with(STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER)
+    if !config
+        .storage
+        .db_path
+        .starts_with(STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER)
         && is_relative_non_tilde(&config.storage.db_path)
     {
         config.storage.db_path = base_dir

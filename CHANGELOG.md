@@ -26,7 +26,7 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.8.0...main>
 
-Nothing yet.
+- **One catalog per index root** (bd-3tym7). `storage.db_path` now defaults to `{index_dir}/catalog.db`, the leading token standing for the resolved index root, instead of one global `~/.local/share/fsfs/fsfs.db`. The catalog is keyed by relative document path, so with a shared catalog a file already seen under another project counted as "unchanged" and watch mode wrote no vectors for it in a second root. `~/...` and absolute paths keep a shared catalog as an explicit choice; every consumer (watch ingest, status, doctor probes, tombstone cleanup, disk budget) resolves the path the same way. **Behaviour change:** an existing global catalog is no longer read; the first watch batch under a root simply ingests changed files as new.
 
 ---
 

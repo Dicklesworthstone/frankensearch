@@ -2997,7 +2997,7 @@ struct FsfsIndexStatus {
     vector_index_bytes: u64,
     lexical_index_bytes: u64,
     /// Catalog bytes that live under the index root. A catalog kept
-    /// elsewhere (the default `~/.local/share/fsfs/fsfs.db`) is reported
+    /// elsewhere (an explicit `~/...` or absolute `storage.db_path`) is reported
     /// under `catalog_path`/`catalog_bytes` instead, so an empty index
     /// directory never shows phantom bytes.
     metadata_bytes: u64,
@@ -13545,8 +13545,7 @@ impl FsfsRuntime {
         }
         // `{index_dir}/...`: the catalog lives under the index it belongs to
         // (the default; bd-3tym7). Only the leading token is substituted.
-        if let Some(rest) = raw.strip_prefix(crate::config::STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER)
-        {
+        if let Some(rest) = raw.strip_prefix(crate::config::STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER) {
             let rest = rest.trim_start_matches(['/', '\\']);
             if rest.is_empty() || rest.contains("..") {
                 return Err(SearchError::InvalidConfig {
@@ -25498,12 +25497,19 @@ mod tests {
             let terminal_apply_calls_for_writer = Arc::clone(&terminal_apply_calls);
             let coordinator_for_writer = Arc::clone(&coordinator);
             let mutator = thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(10);
+                // The session is constructed only after the one-shot index
+                // build that precedes watch mode; on a loaded host that build
+                // alone has taken 17 s. If the deadline still passes, request
+                // shutdown BEFORE panicking: the runtime below waits for a
+                // shutdown reason without a bound of its own, so a mutator
+                // that merely panics leaves the test hung forever instead of
+                // failing (observed 2026-09-02, 40+ min stall).
+                let deadline = Instant::now() + Duration::from_secs(60);
                 while !session_prepared_for_writer.load(Ordering::SeqCst) {
-                    assert!(
-                        Instant::now() < deadline,
-                        "watch shutdown test session was not constructed"
-                    );
+                    if Instant::now() >= deadline {
+                        coordinator_for_writer.request_shutdown(ShutdownReason::UserRequest);
+                        panic!("watch shutdown test session was not constructed within 60 s");
+                    }
                     thread::sleep(Duration::from_millis(5));
                 }
 
