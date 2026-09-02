@@ -307,13 +307,13 @@ impl GenerationRootError {
         }
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn at_component(mut self, component_index: usize) -> Self {
         self.component_index = Some(u16::try_from(component_index).unwrap_or(u16::MAX));
         self
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const fn with_raw_os_error(mut self, raw_os_error: i32) -> Self {
         self.raw_os_error = Some(raw_os_error);
         self
@@ -504,12 +504,12 @@ impl GenerationRootObjectWitness {
         self.filesystem
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn same_object(self, other: Self) -> bool {
         self.device == other.device && self.inode == other.inode
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn same_directory_security_identity(self, other: Self) -> bool {
         self.same_object(other)
             && self.mode == other.mode
@@ -519,12 +519,12 @@ impl GenerationRootObjectWitness {
             && self.filesystem == other.filesystem
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn same_file_security_identity(self, other: Self) -> bool {
         self.same_directory_security_identity(other) && self.hard_links == other.hard_links
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn same_control_anchor_identity(self, other: Self) -> bool {
         self.same_file_security_identity(other) && self.byte_len == other.byte_len
     }
@@ -539,7 +539,7 @@ impl GenerationRootObjectWitness {
             && self.changed_nanoseconds == other.changed_nanoseconds
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn mutation_stable_eq(self, other: Self) -> bool {
         self.same_file_security_identity(other)
             && self.byte_len == other.byte_len
@@ -738,7 +738,7 @@ impl GenerationFileExpectation {
         self.role
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const fn max_byte_len(self) -> u64 {
         match self.role {
             GenerationFileRole::ImmutableArtifact => GENERATION_ROOT_MAX_FILE_BYTES,
@@ -746,7 +746,7 @@ impl GenerationFileExpectation {
         }
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const fn expected_mode(self) -> u32 {
         match self.role {
             GenerationFileRole::ImmutableArtifact => GENERATION_ROOT_IMMUTABLE_FILE_MODE,
@@ -979,10 +979,7 @@ impl QualifiedGenerationDirectory {
     /// On Apple Silicon this path-only API always returns
     /// [`GenerationRootErrorKind::PreopenedDescriptorRequired`]; use
     /// [`Self::admit_preopened_file`].
-    #[cfg_attr(
-        all(target_os = "macos", target_arch = "aarch64"),
-        allow(clippy::unused_self)
-    )]
+    #[cfg_attr(target_os = "macos", allow(clippy::unused_self))]
     fn admit_file(
         &self,
         path: &ConfinedGenerationPath,
@@ -994,7 +991,7 @@ impl QualifiedGenerationDirectory {
                 GenerationRootStage::OpenRegularFile,
             ));
         }
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         {
             let _ = path;
             Err(GenerationRootError::new(
@@ -1002,7 +999,7 @@ impl QualifiedGenerationDirectory {
                 GenerationRootStage::OpenRegularFile,
             ))
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(not(target_os = "macos"))]
         {
             let admission = platform::admit_file(&self.inner, &path.inner, expectation)?;
             Ok(QualifiedGenerationFile {
@@ -1030,7 +1027,7 @@ impl QualifiedGenerationDirectory {
     ///
     /// Returns a typed fail-closed error for any descriptor, route, security,
     /// identity, content, or resource uncertainty.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn admit_preopened_file(
         &self,
         path: &ConfinedGenerationPath,
@@ -1085,10 +1082,7 @@ impl QualifiedGenerationDirectory {
     /// path-only API always returns
     /// [`GenerationRootErrorKind::PreopenedDescriptorRequired`]; use
     /// [`Self::admit_preopened_control_file`].
-    #[cfg_attr(
-        all(target_os = "macos", target_arch = "aarch64"),
-        allow(clippy::unused_self)
-    )]
+    #[cfg_attr(target_os = "macos", allow(clippy::unused_self))]
     fn admit_control_file(
         &self,
         path: &ConfinedGenerationPath,
@@ -1100,7 +1094,7 @@ impl QualifiedGenerationDirectory {
                 GenerationRootStage::OpenRegularFile,
             ));
         }
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         {
             let _ = path;
             Err(GenerationRootError::new(
@@ -1108,7 +1102,7 @@ impl QualifiedGenerationDirectory {
                 GenerationRootStage::OpenRegularFile,
             ))
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(not(target_os = "macos"))]
         {
             platform::admit_control_file(&self.inner, &path.inner, expectation)
                 .map(|inner| QualifiedGenerationControlFile { inner })
@@ -1128,7 +1122,7 @@ impl QualifiedGenerationDirectory {
     ///
     /// Returns a typed fail-closed error for any descriptor, route, security,
     /// identity, content, or resource uncertainty.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn admit_preopened_control_file(
         &self,
         path: &ConfinedGenerationPath,
@@ -1151,13 +1145,13 @@ impl QualifiedGenerationDirectory {
 ///
 /// The trusted provider must transfer fresh, solely owned, read-write,
 /// close-on-exec descriptors for the exact top-level LOCK and AUTHORITY files.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 pub struct PreopenedGenerationRootAnchors {
     lock: std::os::fd::OwnedFd,
     authority: std::os::fd::OwnedFd,
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 impl PreopenedGenerationRootAnchors {
     /// Bind provider-labelled LOCK and AUTHORITY descriptors without exposing
     /// an order-dependent tuple at the root-admission call site.
@@ -1224,7 +1218,7 @@ impl QualifiedGenerationRoot {
     ///
     /// Returns a typed fail-closed descriptor, route, security, filesystem,
     /// anchor-identity, length, or content-admission error.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     pub fn admit_preopened(
         path: &Path,
         layout: GenerationRootAnchorLayout,
@@ -1312,7 +1306,7 @@ impl QualifiedGenerationRoot {
     /// # Errors
     ///
     /// Returns the same typed errors as preopened file admission.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     pub fn admit_preopened_file(
         &self,
         path: &ConfinedGenerationPath,
@@ -1362,14 +1356,14 @@ impl QualifiedGenerationRoot {
     /// or the precise tuple/content failure. Apple Silicon requires
     /// [`Self::read_guard_preopened`].
     pub fn read_guard(&self) -> GenerationRootResult<GenerationRootReadGuard<'_>> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         {
             Err(GenerationRootError::new(
                 GenerationRootErrorKind::PreopenedDescriptorRequired,
                 GenerationRootStage::AcquireLock,
             ))
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(not(target_os = "macos"))]
         {
             let flock =
                 platform::try_anchor_lock(&self.lock.inner, GenerationRootLockMode::Shared)?;
@@ -1384,7 +1378,7 @@ impl QualifiedGenerationRoot {
     ///
     /// Returns a typed fail-closed descriptor, contention, tuple, or content
     /// error.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     pub fn read_guard_preopened(
         &self,
         fresh_lock_descriptor: std::os::fd::OwnedFd,
@@ -1433,21 +1427,18 @@ impl QualifiedGenerationRoot {
 
     // This deliberately lands one bead before the writer-lease consumer.
     #[allow(dead_code)]
-    #[cfg_attr(
-        all(target_os = "macos", target_arch = "aarch64"),
-        allow(clippy::unused_self)
-    )]
+    #[cfg_attr(target_os = "macos", allow(clippy::unused_self))]
     pub(crate) fn try_exclusive_anchor_guard(
         &self,
     ) -> GenerationRootResult<GenerationRootExclusiveAnchorGuard<'_>> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         {
             Err(GenerationRootError::new(
                 GenerationRootErrorKind::PreopenedDescriptorRequired,
                 GenerationRootStage::AcquireLock,
             ))
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(not(target_os = "macos"))]
         {
             let flock =
                 platform::try_anchor_lock(&self.lock.inner, GenerationRootLockMode::Exclusive)?;
@@ -1461,7 +1452,7 @@ impl QualifiedGenerationRoot {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     #[allow(dead_code)]
     pub(crate) fn try_exclusive_anchor_guard_preopened(
         &self,
@@ -6687,12 +6678,9 @@ impl QualifiedGenerationControlFile {
     /// blocking. Route replacement, process-identity drift, and all normal
     /// file-admission errors remain fail-closed.
     #[cfg(test)]
-    #[cfg_attr(
-        all(target_os = "macos", target_arch = "aarch64"),
-        allow(clippy::unused_self)
-    )]
+    #[cfg_attr(target_os = "macos", allow(clippy::unused_self))]
     fn try_lock(&self, mode: GenerationRootLockMode) -> GenerationRootResult<GenerationRootLock> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         {
             let _ = mode;
             Err(GenerationRootError::new(
@@ -6700,7 +6688,7 @@ impl QualifiedGenerationControlFile {
                 GenerationRootStage::AcquireLock,
             ))
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(not(target_os = "macos"))]
         {
             platform::try_lock(&self.inner, mode).map(|inner| GenerationRootLock { inner })
         }
@@ -6841,7 +6829,7 @@ impl fmt::Debug for GenerationRootLock {
     }
 }
 
-#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod platform {
     #[cfg(target_os = "linux")]
     use super::GENERATION_ROOT_MAX_MOUNTINFO_BYTES;
@@ -6865,7 +6853,7 @@ mod platform {
     use std::path::Path;
     use std::sync::Arc;
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     use rustix::fs::openat;
     #[cfg(target_os = "linux")]
     use std::os::fd::{AsRawFd, RawFd};
@@ -7029,13 +7017,13 @@ mod platform {
         AfterExactNameEnumeration,
         BeforeAclRead,
         AfterAclRead,
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         BeforePreopenedQualification,
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         AfterPreopenedQualification,
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         BeforeFinalRouteStat,
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         AfterFinalRouteStat,
         // Publisher crash points (bd-ycng6): a hook error here models a crash
         // or fault exactly between two durable steps of one publication.
@@ -7168,7 +7156,7 @@ mod platform {
         component_identities: Arc<[BasicObjectIdentity]>,
         creator_process_id: u32,
         lock_held: bool,
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         descriptor_status_flags: OFlags,
         #[cfg(test)]
         mode: GenerationRootLockMode,
@@ -7476,7 +7464,7 @@ mod platform {
         })
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     pub(super) fn admit_preopened_file(
         root: &RootHandle,
         path: &RelativePath,
@@ -7636,7 +7624,7 @@ mod platform {
         })
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     pub(super) fn admit_preopened_control_file(
         root: &RootHandle,
         path: &RelativePath,
@@ -7900,7 +7888,7 @@ mod platform {
         })
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     pub(super) fn try_anchor_lock_preopened(
         control: &ControlHandle,
         descriptor: OwnedFd,
@@ -8226,10 +8214,7 @@ mod platform {
         lock.mode
     }
 
-    #[cfg(all(
-        test,
-        any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))
-    ))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(super) fn set_root_creator_process_id_for_test(root: &mut RootHandle, process_id: u32) {
         Arc::get_mut(&mut root.state)
             .expect("test root must have sole state ownership")
@@ -8521,7 +8506,7 @@ mod platform {
         revalidate_root(&control.root)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn revalidate_anchor_route(control: &ControlHandle) -> GenerationRootResult<()> {
         revalidate_root(&control.root)?;
         validate_preopened_regular_descriptor_status(
@@ -8642,7 +8627,7 @@ mod platform {
         revalidate_root(&lock.root)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn revalidate_lock_route(lock: &LockHandle) -> GenerationRootResult<()> {
         validate_lock_process(lock, GenerationRootStage::RevalidateRegularFile)?;
         revalidate_preopened_file_route(
@@ -8672,14 +8657,14 @@ mod platform {
         component_identities: Arc<[BasicObjectIdentity]>,
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     #[derive(Clone, Copy)]
     enum PreopenedAccess {
         ReadOnly,
         ReadWrite,
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn qualify_preopened_file(
         root: &RootHandle,
         path: &RelativePath,
@@ -8708,7 +8693,7 @@ mod platform {
         })
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn validate_preopened_regular_descriptor(
         descriptor: &OwnedFd,
         expected_access: PreopenedAccess,
@@ -8721,7 +8706,7 @@ mod platform {
         validate_preopened_regular_descriptor_status(descriptor, expected_status_flags, stage)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn validate_preopened_regular_descriptor_status(
         descriptor: &OwnedFd,
         expected_status_flags: OFlags,
@@ -8753,7 +8738,7 @@ mod platform {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn bind_preopened_route(
         root: &RootHandle,
         path: &RelativePath,
@@ -8827,7 +8812,7 @@ mod platform {
         Ok(Arc::from(component_identities))
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn macos_route_stat_matches_witness(
         stat: &rustix::fs::Stat,
         witness: GenerationRootObjectWitness,
@@ -8849,7 +8834,7 @@ mod platform {
             && stat.st_ctime_nsec == witness.changed_nanoseconds
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn revalidate_preopened_file_route(
         root: &RootHandle,
         path: &RelativePath,
@@ -8920,7 +8905,7 @@ mod platform {
         revalidate_root(&file.root)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn revalidate_file_route(
         file: &FileHandle,
         expected: GenerationRootObjectWitness,
@@ -9360,7 +9345,7 @@ mod platform {
         #[cfg(target_os = "linux")]
         let changed_nanoseconds = i64::try_from(stat.st_ctime_nsec)
             .map_err(|_| GenerationRootError::new(GenerationRootErrorKind::ObjectChanged, stage))?;
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_os = "macos")]
         let changed_nanoseconds = stat.st_ctime_nsec;
         Ok(AbsoluteAncestorSecurityWitness {
             identity: basic_identity(descriptor, stage)?,
@@ -9425,7 +9410,7 @@ mod platform {
                 let before = absolute_ancestor_security_witness(descriptor, stage)?;
                 #[cfg(target_os = "linux")]
                 let raw_mode = before.identity.mode;
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                #[cfg(target_os = "macos")]
                 let raw_mode = u16::try_from(before.identity.mode).map_err(|_| {
                     GenerationRootError::new(GenerationRootErrorKind::ObjectChanged, stage)
                 })?;
@@ -11031,7 +11016,7 @@ mod platform {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn open_absolute_route(
         route: &AbsoluteRoute,
         stage: GenerationRootStage,
@@ -11081,7 +11066,7 @@ mod platform {
         })
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn open_relative_directory_component(
         parent: &OwnedFd,
         component: &OsStr,
@@ -11117,7 +11102,7 @@ mod platform {
         Ok(descriptor)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn route_mount_identity(
         descriptor: &OwnedFd,
         stage: GenerationRootStage,
@@ -11132,7 +11117,7 @@ mod platform {
         Ok(identity)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn qualify_filesystem(
         descriptor: &OwnedFd,
         stage: GenerationRootStage,
@@ -11180,7 +11165,7 @@ mod platform {
         Ok(qualified)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn validate_root_writable(
         descriptor: &OwnedFd,
         filesystem: QualifiedFilesystem,
@@ -11196,7 +11181,7 @@ mod platform {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn object_witness(
         descriptor: &OwnedFd,
         expected_filesystem: QualifiedFilesystem,
@@ -11238,7 +11223,7 @@ mod platform {
         Ok(witness)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn validate_macos_object_flags(
         flags: u32,
         stage: GenerationRootStage,
@@ -11258,7 +11243,7 @@ mod platform {
         validate_macos_object_flags(flags, GenerationRootStage::OpenRegularFile)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn inspect_acl_if_required(
         descriptor: &OwnedFd,
         witness: GenerationRootObjectWitness,
@@ -11445,7 +11430,7 @@ mod platform {
         )
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn macos_fixed_name<const N: usize>(value: &[libc::c_char; N]) -> Vec<u8> {
         value
             .iter()
@@ -11454,7 +11439,7 @@ mod platform {
             .collect()
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn macos_mount_identity(stat: &rustix::fs::StatFs, device: u64) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update(b"frankensearch.generation-root.macos-mount.v1");
@@ -11471,7 +11456,7 @@ mod platform {
         digest.finalize().into()
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn stat_device_as_u64(device: i32) -> u64 {
         u64::from_ne_bytes(i64::from(device).to_ne_bytes())
     }
@@ -11481,7 +11466,7 @@ mod platform {
         stat_device_as_u64(device)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn macos_open_error(stage: GenerationRootStage, error: Errno) -> GenerationRootError {
         let kind = if error == Errno::LOOP {
             GenerationRootErrorKind::SymbolicLink
@@ -11493,7 +11478,7 @@ mod platform {
         GenerationRootError::new(kind, stage).with_raw_os_error(error.raw_os_error())
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn macos_component_open_error(
         parent: &OwnedFd,
         component: &OsStr,
@@ -11514,7 +11499,7 @@ mod platform {
         macos_open_error(stage, error).at_component(index)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn sync_file_descriptor(descriptor: &OwnedFd) -> GenerationRootResult<()> {
         #[cfg(test)]
         test_boundary(TestBoundary::BeforeFileSync)?;
@@ -11530,7 +11515,7 @@ mod platform {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     fn sync_directory_descriptor(descriptor: &OwnedFd) -> GenerationRootResult<()> {
         #[cfg(test)]
         test_boundary(TestBoundary::BeforeDirectorySync)?;
@@ -11547,7 +11532,7 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[allow(dead_code)] // Typed zero-I/O stubs intentionally have no native consumers yet.
 mod platform {
     use super::{
@@ -11762,7 +11747,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn confined_routes_are_bounded_unambiguous_and_non_utf8_safe() {
         use super::{
@@ -11893,7 +11878,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn unsupported_targets_return_typed_platform_errors_without_path_access() {
         use super::{
@@ -17122,7 +17107,7 @@ if not close_only_contended or not explicit_unlock_released:
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     mod macos_arm64 {
         use super::super::platform::{
             TestBoundary, install_test_hook, set_control_root_creator_process_id_for_test,
