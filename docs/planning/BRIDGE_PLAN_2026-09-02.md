@@ -261,7 +261,19 @@ public `explain_term` on `QuillSearchIndex`).
 
 ### Gap #8: V15 — Rerank stage in the product — DARK → WORKING (opt-in)
 
-**Current state:** `capabilities_for_mode` hardcodes `rerank: CapabilityState::Disabled`; fsfs has
+**Status 2026-09-02 (bd-7as5x): WORKING, opt-in.** `fsfs search --rerank` / `search.rerank` /
+`FRANKENSEARCH_RERANK` re-scores the REFINED head with the native ms-marco cross-encoder; the
+payload carries a `rerank` block (status, reason code, per-hit scores), `explain` prints the
+score, the daemon honours the request per query and keys its caches on the effective reranker.
+The manifest now provisions `model.safetensors`, so `fsfs download-models ms-marco-minilm-l-6-v2`
+is the whole install. Receipts: unit test with a reversing double (applied / unavailable /
+no_quality), real-model CLI lane (relevant doc first at 0.77; model-less root skips with the
+typed reason), reranker crate parity tests green on Linux against the registered cache, daemon
+proof (58 ms warm). Still open from the plan below: `rerank_score` sits in the payload's
+`rerank.scores` rather than on each hit (kept the hit schema stable), and a per-doc timeout is
+not enforced (the plan budget is logged; ~90 ms/doc cold on this box).
+
+**Current state (before bd-7as5x):** `capabilities_for_mode` hardcodes `rerank: CapabilityState::Disabled`; fsfs has
 no dependency on `frankensearch-rerank`; the native frankentorch cross-encoder is real and tested
 only against a macOS-only fixture path. The README lists "Optional reranking" as a core feature.
 **Target state:** `fsfs index`/`search` honour `search.rerank = true` (config + `--rerank`) when
