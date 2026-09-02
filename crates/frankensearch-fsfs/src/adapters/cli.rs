@@ -468,6 +468,14 @@ where
                 input.overrides.fast_only = Some(false);
                 idx += 1;
             }
+            "--rerank" => {
+                input.overrides.rerank = Some(true);
+                idx += 1;
+            }
+            "--no-rerank" => {
+                input.overrides.rerank = Some(false);
+                idx += 1;
+            }
             "--offline" => {
                 input.overrides.offline = Some(true);
                 idx += 1;
@@ -1054,6 +1062,8 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "-f"
             | "--fast-only"
             | "--no-fast-only"
+            | "--rerank"
+            | "--no-rerank"
             | "--offline"
             | "--online"
             | "--watch-mode"
@@ -1112,6 +1122,7 @@ mod tests {
             "--limit",
             "25",
             "--fast-only",
+            "--rerank",
             "--offline",
             "--watch-mode",
             "--explain",
@@ -1126,6 +1137,7 @@ mod tests {
         assert_eq!(input.query.as_deref(), Some("hello world"));
         assert_eq!(input.overrides.limit, Some(25));
         assert_eq!(input.overrides.fast_only, Some(true));
+        assert_eq!(input.overrides.rerank, Some(true));
         assert_eq!(input.overrides.offline, Some(true));
         assert_eq!(input.overrides.allow_background_indexing, Some(true));
         assert_eq!(input.overrides.explain, Some(true));
@@ -1976,6 +1988,7 @@ mod tests {
         "fsfs status --index-dir <X> --format json",
         "fsfs search <X>",
         "fsfs search --fast-only --format json -- <X>",
+        "fsfs search --rerank --format json -- <X>",
         "fsfs search --index-dir <X> --format json -- <X>",
         "fsfs config validate --format json",
         "fsfs config set search.quality_timeout_ms 1000",

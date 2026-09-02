@@ -1783,6 +1783,7 @@ dependencies = [
  "frankensearch-index",
  "frankensearch-lexical",
  "frankensearch-quill",
+ "frankensearch-rerank",
  "frankensearch-storage",
  "frankensearch-tui",
  "fsqlite",

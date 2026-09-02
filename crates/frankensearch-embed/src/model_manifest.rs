@@ -1574,6 +1574,20 @@ impl ModelManifest {
             repo: REPO.to_owned(),
             revision: REVISION.to_owned(),
             files: vec![
+                // The f32 safetensors export feeds the pure-Rust frankentorch
+                // cross-encoder (`frankensearch-rerank` `native`), which is
+                // the reranker fsfs ships; the ONNX export below stays for the
+                // optional `fastembed-reranker` backend.
+                ModelFile {
+                    name: "model.safetensors".to_owned(),
+                    sha256: "821d1aa69520101d6e0737f78a042ae25b19e5cb9160701909d10434f4aeb0ae"
+                        .to_owned(),
+                    size: 90_870_598,
+                    url: Some(
+                        "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/c5ee24cb16019beea0893ab7796b1df96625c6b8/model.safetensors"
+                            .to_owned(),
+                    ),
+                },
                 ModelFile {
                     name: "onnx/model.onnx".to_owned(),
                     sha256: "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a"
@@ -1628,7 +1642,7 @@ impl ModelManifest {
             license: "Apache-2.0".to_owned(),
             dimension: None, // Cross-encoder produces scores, not embeddings
             tier: Some(ModelTier::Reranker),
-            download_size_bytes: 91_724_882,
+            download_size_bytes: 182_595_480,
         }
     }
 

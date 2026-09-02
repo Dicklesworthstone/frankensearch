@@ -26,7 +26,8 @@ use asupersync::runtime::{RuntimeBuilder, spawn_blocking};
 use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
-    HitExplanation, IndexableDocument, ModelCategory, ScoreComponent, SearchError, SearchResult,
+    HitExplanation, IndexableDocument, ModelCategory, RerankDocument, Reranker, ScoreComponent,
+    SearchError, SearchResult,
 };
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FileProtector, FsviProtector, FsviVerifyResult,
@@ -117,7 +118,8 @@ use crate::lifecycle::{
 use crate::mount_info::{MountTable, read_system_mounts};
 use crate::output_schema::{
     IndexFreshnessPayload, OutputEnvelope, OutputError, OutputWarning, OutputWarningCode,
-    SearchHitPayload, SearchOutputPhase, SearchPayload, error_code_for,
+    RerankHitScore, RerankStagePayload, RerankStageStatus, SearchHitPayload, SearchOutputPhase,
+    SearchPayload, error_code_for,
 };
 use crate::pressure::{
     DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
@@ -130,7 +132,7 @@ use crate::query_execution::{
 };
 use crate::query_expansion;
 use crate::query_planning::{
-    CapabilityState, QueryExecutionCapabilities, QueryIntentClass, QueryPlanner,
+    CapabilityState, QueryExecutionCapabilities, QueryIntentClass, QueryPlanner, StageDirective,
 };
 use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
 use crate::stream_protocol::{
@@ -548,6 +550,24 @@ fn set_test_quality_embedder(embedder: Option<Arc<dyn Embedder>>) {
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only cross-encoder injection for the rerank stage. Unset, test
+    /// builds resolve the registered model cache like production does.
+    static TEST_RERANKER: std::cell::RefCell<Option<Arc<dyn Reranker>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_reranker_override() -> Option<Arc<dyn Reranker>> {
+    TEST_RERANKER.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+fn set_test_reranker(reranker: Option<Arc<dyn Reranker>>) {
+    TEST_RERANKER.with(|slot| *slot.borrow_mut() = reranker);
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test-only fast embedder injection. Unset, test builds keep their
     /// explicit hash control fixture; a test that needs the planner to admit
     /// a quality stage (which refuses to refine over hash-control ranks)
@@ -864,6 +884,10 @@ struct SearchCacheKey {
     filter: Option<String>,
     fast_only: bool,
     rrf_k_milli: u64,
+    /// Reranked and un-reranked answers to the same query are different
+    /// payloads; the key must not conflate them.
+    #[serde(default)]
+    rerank: bool,
 }
 
 type SharedSearchServeState = Arc<
@@ -890,6 +914,9 @@ struct SearchServeRequest {
     mode: Option<String>,
     #[serde(default)]
     filter: Option<String>,
+    /// Client's effective `search.rerank`; `None` keeps the daemon's own.
+    #[serde(default)]
+    rerank: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2014,6 +2041,9 @@ struct ExplainSessionHit {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     hash_score: Option<f32>,
     in_both_sources: bool,
+    /// Cross-encoder score when the rerank stage re-scored this hit.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    rerank_score: Option<f32>,
 }
 
 impl ExplainSession {
@@ -2038,6 +2068,7 @@ impl ExplainSession {
                 semantic_score: candidate.semantic_score,
                 hash_score: candidate.hash_score,
                 in_both_sources: candidate.in_both_sources,
+                rerank_score: None,
             })
             .collect();
 
@@ -4162,11 +4193,47 @@ struct DoctorCheck {
     suggestion: Option<String>,
 }
 
+/// Manifest id of the cross-encoder the rerank stage loads
+/// (`fsfs download-models ms-marco-minilm-l-6-v2`).
+const FSFS_RERANKER_MODEL_ID: &str = "ms-marco-minilm-l-6-v2";
+/// Runtime reason codes for the rerank stage; the planner's own
+/// `query.stage.rerank.*` codes cover the plan-level skips.
+const REASON_RERANK_NOT_REQUESTED: &str = "query.stage.rerank.disabled.not_requested";
+const REASON_RERANK_UNAVAILABLE: &str = "query.stage.rerank.disabled.unavailable";
+const REASON_RERANK_NO_TEXT: &str = "query.stage.rerank.disabled.no_document_text";
+const REASON_RERANK_APPLIED: &str = "query.stage.rerank.applied";
+const REASON_RERANK_FAILED: &str = "query.stage.rerank.failed";
+/// Bytes read from a candidate file for reranking. The cross-encoder
+/// truncates at 512 tokens, so this head already covers what it can see.
+const FSFS_RERANK_DOCUMENT_READ_LIMIT: u64 = 16 * 1024;
+
+/// Process-wide cross-encoder handle for the opt-in rerank stage. Clones of
+/// the runtime share the cell, so a daemon loads the model once and serves it
+/// to every request that asks for the stage.
+#[derive(Clone, Default)]
+struct RerankerSlot(Option<Arc<dyn Reranker>>);
+
+impl std::fmt::Debug for RerankerSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RerankerSlot")
+            .field("loaded", &self.0.is_some())
+            .finish()
+    }
+}
+
+/// Fused ranking after the rerank stage, with the evidence the payload carries.
+struct RerankStageOutcome {
+    fused: Vec<FusedCandidate>,
+    payload: RerankStagePayload,
+}
+
 /// Shared runtime entrypoint used by interface adapters.
 #[derive(Debug, Clone)]
 pub struct FsfsRuntime {
     config: FsfsConfig,
     cli_input: CliInput,
+    reranker: Arc<std::sync::OnceLock<RerankerSlot>>,
 }
 
 impl FsfsRuntime {
@@ -4175,6 +4242,7 @@ impl FsfsRuntime {
         Self {
             config,
             cli_input: CliInput::default(),
+            reranker: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -6246,6 +6314,7 @@ impl FsfsRuntime {
                 limit: None,
                 mode: None,
                 filter: None,
+                rerank: None,
             })
         }
     }
@@ -6286,6 +6355,10 @@ impl FsfsRuntime {
         let mut cli = runtime.cli_input.clone();
         cli.filter = request.filter.clone();
         runtime = runtime.with_cli_input(cli);
+        // The client's effective `search.rerank` travels with the request so
+        // `fsfs search --rerank` means the same thing through the daemon; the
+        // clone shares this process's loaded cross-encoder.
+        runtime.config.search.rerank = request.rerank.unwrap_or(self.config.search.rerank);
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode);
 
         let (cached, payloads) = if hot_cache_enabled {
@@ -6523,6 +6596,7 @@ impl FsfsRuntime {
                 limit: Some(limit),
                 mode: Some("full".to_owned()),
                 filter: self.cli_input.filter.clone(),
+                rerank: Some(self.config.search.rerank),
             };
             let request_json =
                 serde_json::to_vec(&request).map_err(|source| SearchError::SubsystemError {
@@ -7092,6 +7166,13 @@ impl FsfsRuntime {
             for (hit, source) in session.hits.iter_mut().zip(payload.hits.iter()) {
                 hit.semantic_rank = source.semantic_rank;
                 hit.hash_rank = source.hash_rank;
+                hit.rerank_score = payload.rerank.as_ref().and_then(|stage| {
+                    stage
+                        .scores
+                        .iter()
+                        .find(|score| score.path == hit.path)
+                        .map(|score| score.score)
+                });
             }
         }
         Self::attach_explain_session_generation(&mut session, index_root, payload);
@@ -7580,6 +7661,7 @@ impl FsfsRuntime {
             filter: self.cli_input.filter.clone(),
             fast_only: self.config.search.fast_only,
             rrf_k_milli: u64::from(f64_to_per_mille(self.config.search.rrf_k)),
+            rerank: self.config.search.rerank,
         }
     }
 
@@ -8301,7 +8383,16 @@ impl FsfsRuntime {
         let planning_limit = Self::resolve_planning_limit(output_limit);
         let search_start = Instant::now();
 
-        let capabilities = resources.capabilities_for_mode(mode, self.config.search.fast_only);
+        let mut capabilities =
+            resources.capabilities_for_mode(mode, self.config.search.fast_only);
+        // The cross-encoder is a process resource, not an index resource: the
+        // runtime owns it, so its capability is decided here. Nothing is
+        // loaded unless the caller asked for the stage.
+        capabilities.rerank = if self.prepared_reranker().is_some() {
+            CapabilityState::Enabled
+        } else {
+            CapabilityState::Disabled
+        };
         let planner = QueryPlanner::from_fsfs(&self.config);
         let plan =
             planner.execution_plan_for_query(&normalized_query, Some(planning_limit), capabilities);
@@ -8678,7 +8769,7 @@ impl FsfsRuntime {
             } else {
                 filtered_initial_head.clone()
             };
-        let payload = Self::attach_search_context(
+        let mut payload = Self::attach_search_context(
             Self::build_limited_payload(
                 orchestrator,
                 &normalized_query,
@@ -8693,6 +8784,14 @@ impl FsfsRuntime {
             resources,
             mode,
         );
+        if self.config.search.rerank && !plan.quality_stage.enabled {
+            // The stage only re-scores a REFINED head. When no quality stage
+            // will follow, say so on the phase the caller actually receives.
+            payload.rerank = Some(RerankStagePayload::skipped(
+                plan.rerank_stage.reason_code,
+                plan.rerank_stage.candidate_budget,
+            ));
+        }
         let fusion_elapsed_ms = fusion_start.elapsed().as_millis();
 
         let initial_artifact = SearchPhaseArtifact {
@@ -8777,7 +8876,19 @@ impl FsfsRuntime {
                         &fused_initial,
                         output_limit,
                     );
-                    let refined_payload = Self::attach_search_context(
+                    let RerankStageOutcome {
+                        fused: fused_refined,
+                        payload: rerank_payload,
+                    } = self
+                        .apply_rerank_stage(
+                            cx,
+                            &plan.rerank_stage,
+                            &resources.index_root,
+                            &normalized_query,
+                            fused_refined,
+                        )
+                        .await?;
+                    let mut refined_payload = Self::attach_search_context(
                         Self::build_limited_payload(
                             orchestrator,
                             &normalized_query,
@@ -8791,6 +8902,9 @@ impl FsfsRuntime {
                         resources,
                         mode,
                     );
+                    if self.config.search.rerank {
+                        refined_payload.rerank = Some(rerank_payload);
+                    }
                     let refined_artifact = SearchPhaseArtifact {
                         phase: SearchOutputPhase::Refined,
                         fused: fused_refined,
@@ -12054,6 +12168,7 @@ impl FsfsRuntime {
         let expected_tier = match tier {
             "fast" => ManifestModelTier::Fast,
             "quality" => ManifestModelTier::Quality,
+            "reranker" => ManifestModelTier::Reranker,
             _ => return None,
         };
         let requested_key = normalize_model_key(model_name);
@@ -14265,6 +14380,221 @@ impl FsfsRuntime {
 
             quality
         }
+    }
+
+    /// The cross-encoder for the opt-in rerank stage, resolved once per
+    /// runtime family (clones share the cell). `None` when `search.rerank`
+    /// is off (nothing is loaded) or when no verified model is installed;
+    /// the reason is logged once, on the first search that asked.
+    fn prepared_reranker(&self) -> Option<Arc<dyn Reranker>> {
+        if !self.config.search.rerank {
+            return None;
+        }
+        self.reranker
+            .get_or_init(|| RerankerSlot(self.resolve_reranker()))
+            .0
+            .clone()
+    }
+
+    fn resolve_reranker(&self) -> Option<Arc<dyn Reranker>> {
+        #[cfg(test)]
+        if let Some(reranker) = test_reranker_override() {
+            return Some(reranker);
+        }
+        match self.load_registered_reranker() {
+            Ok(Some(reranker)) => {
+                info!(
+                    model = FSFS_RERANKER_MODEL_ID,
+                    reranker_id = reranker.id(),
+                    "fsfs rerank stage: cross-encoder loaded"
+                );
+                Some(reranker)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                warn!(
+                    error_code = error_code_for(&error),
+                    error = %error,
+                    model = FSFS_RERANKER_MODEL_ID,
+                    "fsfs rerank stage disabled: the cross-encoder failed to load"
+                );
+                None
+            }
+        }
+    }
+
+    /// Load the registered cross-encoder from the model cache. Only a
+    /// verified installation (`fsfs download-models ms-marco-minilm-l-6-v2`)
+    /// is admitted; anything else is a typed skip, never a guess.
+    #[cfg(feature = "rerank")]
+    fn load_registered_reranker(&self) -> SearchResult<Option<Arc<dyn Reranker>>> {
+        let model_root = PathBuf::from(&self.config.indexing.model_dir);
+        let inspection = Self::inspect_registered_model_cache(
+            "reranker",
+            FSFS_RERANKER_MODEL_ID,
+            &model_root,
+        )?;
+        if !inspection.state.is_verified() {
+            warn!(
+                state = ?inspection.state,
+                path = %inspection.path.display(),
+                diagnostic = inspection.diagnostic.as_deref().unwrap_or(""),
+                "fsfs rerank stage disabled: no verified cross-encoder in the model cache; run `fsfs download-models ms-marco-minilm-l-6-v2`"
+            );
+            return Ok(None);
+        }
+        let reranker = frankensearch_rerank::NativeReranker::load(&inspection.path)?;
+        Ok(Some(Arc::new(frankensearch_core::SyncRerankerAdapter(
+            reranker,
+        ))))
+    }
+
+    #[cfg(not(feature = "rerank"))]
+    fn load_registered_reranker(&self) -> SearchResult<Option<Arc<dyn Reranker>>> {
+        warn!("fsfs rerank stage disabled: this build omits the `rerank` feature");
+        Ok(None)
+    }
+
+    /// Re-score the head of a fused ranking with the cross-encoder.
+    ///
+    /// The plan's `candidate_budget` bounds the head. Scored hits are ordered
+    /// by descending cross-encoder score; head hits whose text could not be
+    /// read keep their fused order after them; the tail is untouched. A model
+    /// failure keeps the fused order and reports `query.stage.rerank.failed`;
+    /// cancellation propagates.
+    async fn apply_rerank_stage(
+        &self,
+        cx: &Cx,
+        stage: &StageDirective,
+        index_root: &Path,
+        query: &str,
+        fused: Vec<FusedCandidate>,
+    ) -> SearchResult<RerankStageOutcome> {
+        let budget = stage.candidate_budget;
+        let skipped = |fused: Vec<FusedCandidate>, reason_code: &str| RerankStageOutcome {
+            fused,
+            payload: RerankStagePayload::skipped(reason_code, budget),
+        };
+        if !self.config.search.rerank {
+            return Ok(skipped(fused, REASON_RERANK_NOT_REQUESTED));
+        }
+        if !stage.enabled {
+            return Ok(skipped(fused, stage.reason_code));
+        }
+        let Some(reranker) = self.prepared_reranker() else {
+            return Ok(skipped(fused, REASON_RERANK_UNAVAILABLE));
+        };
+        let depth = budget.min(fused.len());
+        if depth == 0 {
+            return Ok(skipped(fused, stage.reason_code));
+        }
+
+        let started = Instant::now();
+        let sentinel = match Self::read_index_sentinel(index_root) {
+            Ok(sentinel) => sentinel,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "fsfs rerank stage: index sentinel unreadable; resolving candidate paths against the index root"
+                );
+                None
+            }
+        };
+        let canonicalizer = DefaultCanonicalizer::default();
+        let documents = fused[..depth]
+            .iter()
+            .filter_map(|candidate| {
+                let path =
+                    resolve_manifest_file_path(&candidate.doc_id, sentinel.as_ref(), index_root);
+                read_rerank_document_text(&path, &canonicalizer).map(|text| RerankDocument {
+                    doc_id: candidate.doc_id.clone(),
+                    text,
+                })
+            })
+            .collect::<Vec<_>>();
+        if documents.is_empty() {
+            warn!(
+                head = depth,
+                "fsfs rerank stage skipped: no candidate text could be read from the target root"
+            );
+            return Ok(skipped(fused, REASON_RERANK_NO_TEXT));
+        }
+
+        let mut scores = match reranker.rerank(cx, query, &documents).await {
+            Ok(scores) => scores,
+            Err(error) if matches!(error, SearchError::Cancelled { .. }) => return Err(error),
+            Err(error) => {
+                warn!(
+                    error_code = error_code_for(&error),
+                    error = %error,
+                    "fsfs rerank stage failed; keeping the fused order"
+                );
+                let mut payload = RerankStagePayload::skipped(REASON_RERANK_FAILED, budget);
+                payload.status = RerankStageStatus::Failed;
+                payload.elapsed_ms =
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                return Ok(RerankStageOutcome { fused, payload });
+            }
+        };
+        scores.sort_by(|left, right| right.score.total_cmp(&left.score));
+
+        let original_rank = fused
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (candidate.doc_id.as_str(), index.saturating_add(1)))
+            .collect::<HashMap<_, _>>();
+        let mut head_by_doc = fused[..depth]
+            .iter()
+            .cloned()
+            .map(|candidate| (candidate.doc_id.clone(), candidate))
+            .collect::<HashMap<_, _>>();
+        let mut reordered = Vec::with_capacity(fused.len());
+        let mut hit_scores = Vec::with_capacity(scores.len());
+        for score in &scores {
+            let Some(candidate) = head_by_doc.remove(&score.doc_id) else {
+                continue;
+            };
+            hit_scores.push(RerankHitScore {
+                rank: reordered.len().saturating_add(1),
+                path: candidate.doc_id.clone(),
+                score: score.score,
+                original_rank: original_rank
+                    .get(candidate.doc_id.as_str())
+                    .copied()
+                    .unwrap_or(0),
+            });
+            reordered.push(candidate);
+        }
+        for candidate in &fused[..depth] {
+            if let Some(unscored) = head_by_doc.remove(&candidate.doc_id) {
+                reordered.push(unscored);
+            }
+        }
+        reordered.extend(fused[depth..].iter().cloned());
+
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        info!(
+            phase = "rerank",
+            status = "applied",
+            reranked_hits = hit_scores.len(),
+            head = depth,
+            elapsed_ms,
+            budget_timeout_ms = stage.timeout_ms,
+            model = reranker.model_name(),
+            "fsfs search rerank stage applied"
+        );
+        Ok(RerankStageOutcome {
+            fused: reordered,
+            payload: RerankStagePayload {
+                status: RerankStageStatus::Applied,
+                reason_code: REASON_RERANK_APPLIED.to_owned(),
+                candidate_budget: budget,
+                reranked_hits: hit_scores.len(),
+                elapsed_ms,
+                model: Some(reranker.model_name().to_owned()),
+                scores: hit_scores,
+            },
+        })
     }
 
     /// Decide whether this index run builds the quality tier, and with which
@@ -17271,7 +17601,9 @@ fn render_explain_table(
         .or(hit.semantic_score)
         .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"));
     let quality_score = "n/a";
-    let rerank_score = "n/a";
+    let rerank_score = hit
+        .rerank_score
+        .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"));
     let lexical_rrf = rrf_contribution_for_rank(rrf_k, hit.lexical_rank);
     let vector_rank = hit.hash_rank.or(hit.semantic_rank);
     let semantic_rrf = rrf_contribution_for_rank(rrf_k, vector_rank);
@@ -17453,6 +17785,40 @@ fn resolve_manifest_file_path(
         return PathBuf::from(&value.target_root).join(file_path);
     }
     index_root.join(file_key)
+}
+
+/// Canonical text of one candidate file for the cross-encoder, or `None` when
+/// the file is unreadable or canonicalizes to nothing. Reads at most
+/// [`FSFS_RERANK_DOCUMENT_READ_LIMIT`] bytes: the model truncates at 512
+/// tokens, so a longer read would only cost I/O.
+fn read_rerank_document_text(path: &Path, canonicalizer: &DefaultCanonicalizer) -> Option<String> {
+    use std::io::Read as _;
+
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            debug!(
+                path = %path.display(),
+                error = %error,
+                "fsfs rerank stage: candidate file unreadable; it keeps its fused rank"
+            );
+            return None;
+        }
+    };
+    let mut bytes = Vec::new();
+    if let Err(error) = file
+        .take(FSFS_RERANK_DOCUMENT_READ_LIMIT)
+        .read_to_end(&mut bytes)
+    {
+        debug!(
+            path = %path.display(),
+            error = %error,
+            "fsfs rerank stage: candidate read failed; it keeps its fused rank"
+        );
+        return None;
+    }
+    let text = canonicalizer.canonicalize(&String::from_utf8_lossy(&bytes));
+    (!text.trim().is_empty()).then_some(text)
 }
 
 fn normalize_model_key(value: &str) -> String {
@@ -23341,6 +23707,240 @@ mod tests {
         });
     }
 
+    /// A cross-encoder that scores a document by its input position, so the
+    /// reranked head comes back in REVERSE fused order: an unmistakable
+    /// reordering that no fusion tie-break could produce by accident.
+    struct ReverseReranker;
+
+    impl frankensearch_core::SyncRerank for ReverseReranker {
+        fn rerank_sync(
+            &self,
+            _query: &str,
+            documents: &[frankensearch_core::RerankDocument],
+        ) -> SearchResult<Vec<frankensearch_core::RerankScore>> {
+            Ok(documents
+                .iter()
+                .enumerate()
+                .map(|(index, document)| frankensearch_core::RerankScore {
+                    doc_id: document.doc_id.clone(),
+                    score: 0.1_f32 * f32::from(u8::try_from(index).unwrap_or(u8::MAX)) + 0.1,
+                    original_rank: index,
+                    raw_logit: None,
+                })
+                .collect())
+        }
+
+        fn id(&self) -> &str {
+            "reverse-reranker-test"
+        }
+
+        fn model_name(&self) -> &str {
+            "reverse reranker (test double)"
+        }
+    }
+
+    /// The opt-in rerank stage, end to end inside the runtime: with
+    /// `search.rerank` on and a cross-encoder available, the REFINED head is
+    /// re-scored and reordered and the payload carries the evidence; (planted
+    /// negatives) with no verified model the same search keeps its fused
+    /// order and reports `query.stage.rerank.disabled.unavailable`, and a
+    /// fast-only search reports the stage skipped for want of a quality stage
+    /// on the INITIAL phase it actually returns.
+    #[test]
+    fn rerank_stage_reorders_the_refined_head_and_reports_its_evidence() {
+        async fn search_artifacts(
+            cx: &Cx,
+            config: FsfsConfig,
+            index_root: &Path,
+            query: &str,
+        ) -> Vec<super::SearchPhaseArtifact> {
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(index_root.to_path_buf()),
+                query: Some(query.to_owned()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_execution_resources(cx, super::SearchExecutionMode::Full)
+                .await
+                .expect("prepare search resources");
+            runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    cx,
+                    query,
+                    3,
+                    super::SearchExecutionMode::Full,
+                    &mut resources,
+                    super::SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                    None,
+                )
+                .await
+                .expect("search")
+        }
+
+        fn refined(artifacts: &[super::SearchPhaseArtifact]) -> &super::SearchPhaseArtifact {
+            artifacts
+                .iter()
+                .find(|artifact| artifact.phase.to_string() == "refined")
+                .expect("a generation with a quality tier emits REFINED")
+        }
+
+        fn order(artifact: &super::SearchPhaseArtifact) -> Vec<String> {
+            artifact
+                .payload
+                .hits
+                .iter()
+                .map(|hit| hit.path.clone())
+                .collect()
+        }
+
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("docs")).expect("create project docs dir");
+            for (name, text) in [
+                (
+                    "docs/retry.md",
+                    "Recover transient network failures with exponential backoff, bounded retries, and random jitter.",
+                ),
+                (
+                    "docs/cache.md",
+                    "Invalidate cache entries by key when the upstream record changes.",
+                ),
+                (
+                    "docs/auth.md",
+                    "Authenticate a session token before authorizing a request.",
+                ),
+            ] {
+                fs::write(project.join(name), text).expect("write doc");
+            }
+            let index_root = project.join(".frankensearch");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            config.indexing.watch_mode = false;
+            // No registered cache is reachable from here, so the planted
+            // negative below finds no cross-encoder at all.
+            config.indexing.model_dir = temp.path().join("no-models").display().to_string();
+
+            super::set_test_fast_embedder(Some(Arc::new(SemanticFastEmbedder)));
+            super::set_test_quality_embedder(Some(Arc::new(SemanticQualityStub)));
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                .await
+                .expect("one-shot index with a quality model");
+            let query = "recover after a temporary network outage";
+
+            // Baseline: the fused REFINED order without the stage, and no
+            // rerank block because nobody asked.
+            let baseline = search_artifacts(&cx, config.clone(), &index_root, query).await;
+            let baseline_refined = refined(&baseline);
+            assert!(baseline_refined.payload.rerank.is_none());
+            let baseline_order = order(baseline_refined);
+            assert_eq!(baseline_order.len(), 3, "{baseline_order:?}");
+
+            // Positive: requested + a cross-encoder => the head follows the
+            // cross-encoder order, the payload and the fused artifact agree.
+            let mut rerank_config = config.clone();
+            rerank_config.search.rerank = true;
+            super::set_test_reranker(Some(Arc::new(frankensearch_core::SyncRerankerAdapter(
+                ReverseReranker,
+            ))));
+            let reranked = search_artifacts(&cx, rerank_config.clone(), &index_root, query).await;
+            assert!(
+                reranked[0].payload.rerank.is_none(),
+                "INITIAL is never reranked"
+            );
+            let refined_artifact = refined(&reranked);
+            let stage = refined_artifact
+                .payload
+                .rerank
+                .as_ref()
+                .expect("rerank block on the refined phase");
+            assert_eq!(stage.status, crate::output_schema::RerankStageStatus::Applied);
+            assert_eq!(stage.reason_code, super::REASON_RERANK_APPLIED);
+            assert_eq!(stage.reranked_hits, 3);
+            assert_eq!(stage.model.as_deref(), Some("reverse reranker (test double)"));
+            let reranked_order = order(refined_artifact);
+            let mut expected = baseline_order.clone();
+            expected.reverse();
+            assert_eq!(
+                reranked_order, expected,
+                "the reranked head must follow the cross-encoder order"
+            );
+            assert_eq!(
+                stage
+                    .scores
+                    .iter()
+                    .map(|score| score.path.clone())
+                    .collect::<Vec<_>>(),
+                reranked_order
+            );
+            assert!(
+                stage
+                    .scores
+                    .windows(2)
+                    .all(|pair| pair[0].score >= pair[1].score),
+                "scores are reported in descending order: {:?}",
+                stage.scores
+            );
+            assert_eq!(stage.scores[0].original_rank, 3);
+            assert_eq!(
+                refined_artifact
+                    .fused
+                    .iter()
+                    .map(|candidate| candidate.doc_id.clone())
+                    .collect::<Vec<_>>(),
+                reranked_order,
+                "the fused artifact the explain session persists follows the reranked order"
+            );
+
+            // Planted negative: requested, no cross-encoder anywhere => the
+            // fused order is kept and the reason is typed.
+            super::set_test_reranker(None);
+            let unavailable =
+                search_artifacts(&cx, rerank_config.clone(), &index_root, query).await;
+            let refined_artifact = refined(&unavailable);
+            let stage = refined_artifact
+                .payload
+                .rerank
+                .as_ref()
+                .expect("rerank block reports the skip");
+            assert_eq!(stage.status, crate::output_schema::RerankStageStatus::Skipped);
+            assert_eq!(stage.reason_code, super::REASON_RERANK_UNAVAILABLE);
+            assert!(stage.scores.is_empty());
+            assert_eq!(order(refined_artifact), baseline_order);
+
+            // Planted negative: fast-only => no quality stage to rerank; the
+            // INITIAL phase the caller receives says so.
+            let mut fast_only_config = rerank_config;
+            fast_only_config.search.fast_only = true;
+            super::set_test_reranker(Some(Arc::new(frankensearch_core::SyncRerankerAdapter(
+                ReverseReranker,
+            ))));
+            let fast_only = search_artifacts(&cx, fast_only_config, &index_root, query).await;
+            assert_eq!(fast_only.len(), 1, "fast-only serves INITIAL only");
+            let stage = fast_only[0]
+                .payload
+                .rerank
+                .as_ref()
+                .expect("rerank block on the initial phase");
+            assert_eq!(stage.status, crate::output_schema::RerankStageStatus::Skipped);
+            assert_eq!(stage.reason_code, "query.stage.rerank.disabled.no_quality");
+
+            super::set_test_reranker(None);
+            super::set_test_quality_embedder(None);
+            super::set_test_fast_embedder(None);
+        });
+    }
+
     /// The product's two-tier promise, end to end inside the runtime: a
     /// standard `fsfs index` run writes a quality-tier generation beside the
     /// fast tier when a quality model resolves, search binds it and emits
@@ -23790,6 +24390,7 @@ mod tests {
                 limit: Some(10),
                 mode: Some("lexical_only".to_owned()),
                 filter: None,
+                rerank: None,
             };
 
             let first = runtime
@@ -31232,6 +31833,7 @@ mod tests {
                 semantic_score: Some(0.1),
                 hash_score: None,
                 in_both_sources: false,
+                rerank_score: None,
             },
             60.0,
             true,
@@ -33641,6 +34243,7 @@ mod tests {
                         limit: Some(10),
                         mode: Some("lexical_only".to_owned()),
                         filter: None,
+                        rerank: None,
                     },
                     &mut resources,
                     &mut hot_cache,
@@ -33659,6 +34262,7 @@ mod tests {
                             limit: Some(10),
                             mode: Some(mode.to_owned()),
                             filter: None,
+                            rerank: None,
                         },
                         &mut resources,
                         &mut hot_cache,
@@ -33734,6 +34338,7 @@ mod tests {
                         limit: Some(10),
                         mode: Some("lexical_only".to_owned()),
                         filter: None,
+                        rerank: None,
                     },
                     &mut resources,
                     &mut hot_cache,
@@ -33767,6 +34372,7 @@ mod tests {
                         limit: Some(10),
                         mode: Some("full".to_owned()),
                         filter: None,
+                        rerank: None,
                     },
                     &mut resources,
                     &mut hot_cache,

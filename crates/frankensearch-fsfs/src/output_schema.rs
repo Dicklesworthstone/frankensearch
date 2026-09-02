@@ -456,6 +456,73 @@ pub struct SearchPayload {
     /// True when that identity is a hash/fnv control artifact.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vector_generation_is_hash: bool,
+    /// Outcome of the opt-in cross-encoder rerank stage for this phase.
+    /// Present only when the caller asked for the stage (`search.rerank` /
+    /// `--rerank`), so consumers can tell "not requested" from "skipped".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rerank: Option<RerankStagePayload>,
+}
+
+/// Status of the cross-encoder rerank stage inside a [`SearchPayload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankStageStatus {
+    /// The head was re-scored and reordered by the cross-encoder.
+    Applied,
+    /// The stage did not run; `reason_code` says why.
+    Skipped,
+    /// The cross-encoder failed; the fused order was kept.
+    Failed,
+}
+
+/// Cross-encoder score for one reranked hit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RerankHitScore {
+    /// Final 1-based rank after reranking.
+    pub rank: usize,
+    pub path: String,
+    /// Sigmoid-activated relevance score in `[0, 1]`.
+    pub score: f32,
+    /// 1-based rank the hit held before reranking.
+    pub original_rank: usize,
+}
+
+/// Outcome of the cross-encoder rerank stage for one search phase.
+///
+/// Hits keep their fused fields; the rerank evidence lives here so the hit
+/// schema stays stable for consumers that never asked for the stage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RerankStagePayload {
+    pub status: RerankStageStatus,
+    /// Planner or runtime reason code (`query.stage.rerank.*`).
+    pub reason_code: String,
+    /// Head depth the plan allowed the stage to re-score.
+    pub candidate_budget: usize,
+    /// Hits that actually received a cross-encoder score.
+    pub reranked_hits: usize,
+    pub elapsed_ms: u64,
+    /// Cross-encoder model identity, when the stage ran.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model: Option<String>,
+    /// Scores for the reranked head in final rank order.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub scores: Vec<RerankHitScore>,
+}
+
+impl RerankStagePayload {
+    /// A stage that did not run, with the planner or runtime reason.
+    #[must_use]
+    pub fn skipped(reason_code: impl Into<String>, candidate_budget: usize) -> Self {
+        Self {
+            status: RerankStageStatus::Skipped,
+            reason_code: reason_code.into(),
+            candidate_budget,
+            reranked_hits: 0,
+            elapsed_ms: 0,
+            model: None,
+            scores: Vec::new(),
+        }
+    }
 }
 
 impl SearchPayload {
@@ -478,6 +545,7 @@ impl SearchPayload {
             skip_reason: None,
             vector_generation_id: None,
             vector_generation_is_hash: false,
+            rerank: None,
         }
     }
 

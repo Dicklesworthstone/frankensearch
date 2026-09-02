@@ -869,6 +869,10 @@ pub struct SearchConfig {
     pub quality_timeout_ms: u64,
     pub fast_only: bool,
     pub explain: bool,
+    /// Opt in to the cross-encoder rerank stage over the REFINED head
+    /// (`--rerank`). Needs the verified `ms-marco-minilm-l-6-v2` model in the
+    /// cache; without it the stage is skipped with a typed reason.
+    pub rerank: bool,
     /// Opt in to bounded lexical shadow-oracle comparisons.
     pub shadow_mode: bool,
     /// Deterministic shadow sample rate in basis points.
@@ -888,6 +892,7 @@ impl Default for SearchConfig {
             quality_timeout_ms: 500,
             fast_only: false,
             explain: false,
+            rerank: false,
             shadow_mode: false,
             shadow_sample_rate_basis_points: 1_000,
             shadow_max_in_flight: 2,
@@ -1028,6 +1033,7 @@ struct SearchConfigPatch {
     quality_timeout_ms: Option<u64>,
     fast_only: Option<bool>,
     explain: Option<bool>,
+    rerank: Option<bool>,
     shadow_mode: Option<bool>,
     shadow_sample_rate_basis_points: Option<u16>,
     shadow_max_in_flight: Option<usize>,
@@ -1222,6 +1228,10 @@ pub struct ContractSearchConfig {
     pub shadow_max_in_flight: usize,
     #[serde(default = "default_shadow_score_epsilon")]
     pub shadow_score_epsilon: f32,
+    // `rerank` arrived with the fsfs rerank stage (bd-7as5x); same rule as
+    // the shadow keys above: defaulted for legacy documents, always serialized.
+    #[serde(default)]
+    pub rerank: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1291,6 +1301,7 @@ impl From<&FsfsConfig> for ConfigContractValues {
                     quality_timeout_ms,
                     fast_only,
                     explain,
+                    rerank,
                     shadow_mode,
                     shadow_sample_rate_basis_points,
                     shadow_max_in_flight,
@@ -1307,6 +1318,7 @@ impl From<&FsfsConfig> for ConfigContractValues {
                     shadow_sample_rate_basis_points,
                     shadow_max_in_flight,
                     shadow_score_epsilon,
+                    rerank,
                 }
             },
             pressure: ContractPressureConfig {
@@ -1432,6 +1444,7 @@ pub struct CliOverrides {
     pub offline: Option<bool>,
     pub allow_background_indexing: Option<bool>,
     pub explain: Option<bool>,
+    pub rerank: Option<bool>,
     pub profile: Option<PressureProfile>,
     pub degradation_override: Option<DegradationOverrideMode>,
     pub hard_pause_requested: Option<bool>,
@@ -1464,6 +1477,9 @@ impl CliOverrides {
         }
         if self.explain.is_some() {
             flags.push("--explain".into());
+        }
+        if let Some(rerank) = self.rerank {
+            flags.push(if rerank { "--rerank" } else { "--no-rerank" }.into());
         }
         if self.profile.is_some() {
             flags.push("--profile".into());
@@ -2116,6 +2132,9 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         if let Some(explain) = search.explain {
             config.search.explain = explain;
         }
+        if let Some(rerank) = search.rerank {
+            config.search.rerank = rerank;
+        }
         if let Some(shadow_mode) = search.shadow_mode {
             config.search.shadow_mode = shadow_mode;
         }
@@ -2308,6 +2327,13 @@ fn apply_env_overrides(
         env_override(env, "FRANKENSEARCH_SEARCH_EXPLAIN", "FSFS_SEARCH_EXPLAIN")
     {
         config.search.explain = parse_bool(value, "search.explain")?;
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(env, "FRANKENSEARCH_RERANK", "FRANKENSEARCH_SEARCH_RERANK")
+        .or_else(|| env_override(env, "FSFS_RERANK", "FSFS_SEARCH_RERANK"))
+    {
+        config.search.rerank = parse_bool(value, "search.rerank")?;
         keys_used.push(key.into());
     }
 
@@ -2547,6 +2573,10 @@ fn apply_cli_overrides(config: &mut FsfsConfig, cli: &CliOverrides) -> ProfileSo
         config.search.explain = explain;
     }
 
+    if let Some(rerank) = cli.rerank {
+        config.search.rerank = rerank;
+    }
+
     if let Some(profile) = cli.profile {
         config.pressure.profile = profile;
     }
@@ -2649,6 +2679,7 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
                 "quality_timeout_ms",
                 "fast_only",
                 "explain",
+                "rerank",
                 "shadow_mode",
                 "shadow_sample_rate_basis_points",
                 "shadow_max_in_flight",
@@ -4924,6 +4955,7 @@ mod tests {
             offline: Some(true),
             allow_background_indexing: Some(false),
             explain: Some(true),
+            rerank: Some(true),
             profile: Some(super::PressureProfile::Strict),
             degradation_override: Some(super::DegradationOverrideMode::ForcePaused),
             hard_pause_requested: Some(true),
@@ -4932,7 +4964,8 @@ mod tests {
             config_path: Some(Path::new("/tmp/config.toml").to_path_buf()),
         };
         let flags = cli.used_flags();
-        assert_eq!(flags.len(), 13);
+        assert_eq!(flags.len(), 14);
+        assert!(flags.contains(&"--rerank".to_string()));
         assert!(flags.contains(&"--roots".to_string()));
         assert!(flags.contains(&"--exclude".to_string()));
         assert!(flags.contains(&"--limit".to_string()));

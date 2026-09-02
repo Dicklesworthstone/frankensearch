@@ -10,7 +10,10 @@ keywords = ["search", "cli", "semantic", "bm25", "hybrid"]
 categories = ["command-line-utilities", "text-processing", "development-tools"]
 
 [features]
-default = ["semantic-loaders"]
+default = ["semantic-loaders", "rerank"]
+# Opt-in cross-encoder rerank stage (`search.rerank` / `--rerank`) on the pure-Rust
+# frankentorch backend; the ms-marco weights arrive via `fsfs download-models`.
+rerank = ["dep:frankensearch-rerank"]
 # Loader-capable source/crates.io profile: model bytes stay outside the crate,
 # while explicit `fsfs download-models` installs pinned, verified artifacts.
 semantic-loaders = ["frankensearch-embed/model2vec", "frankensearch-embed/fastembed"]
@@ -75,6 +78,7 @@ frankensearch-index = { workspace = true }
 frankensearch-quill = { workspace = true, features = ["durability"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 frankensearch-durability = { workspace = true }
+frankensearch-rerank = { workspace = true, optional = true, default-features = false, features = ["native"] }
 frankensearch-lexical = { workspace = true, optional = true }
 frankensearch-storage = { workspace = true }
 frankensearch-tui = { workspace = true }
