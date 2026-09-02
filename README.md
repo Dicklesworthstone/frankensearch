@@ -933,6 +933,7 @@ Useful docs:
 - `docs/e2e-artifact-contract.md`
 - `docs/dependency-semantics-policy.md`
 - `docs/planning/UPGRADE_LOG.md` — upgrade history (relocated from repo root)
+- `docs/planning/BRIDGE_PLAN_2026-09-02.md` — the gap-closing plan from the 2026-09 reality check (what is left between the README and the code, per goal)
 
 ## License
 

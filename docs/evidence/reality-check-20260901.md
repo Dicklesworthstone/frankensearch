@@ -207,6 +207,10 @@ superseded → close bd-3beo/d0tx.6 as superseded, amend plan §1.4, and state t
 
 ## 7. Bridge plan (sequenced by user impact)
 
+*Superseded on 2026-09-02 by the Phase 2 document `docs/planning/BRIDGE_PLAN_2026-09-02.md`
+(29 gaps against 22 re-scored vision goals, with per-gap current state, target, criteria, steps,
+dependencies, and bead coverage). The list below is the 09-01 sequencing and is kept for history.*
+
 1. **Ruling on §6**, then one commit that makes graph, plan, AGENTS and code agree.
 2. **Product two-tier (G1).** `fsfs index` writes a quality generation (384-d MiniLM, its own identity) beside the fast one; `quality_stage_viable` reads the quality tier; Refined emitted on a real corpus with a red-then-green e2e test on the actual binary; stop loading MiniLM/ORT when the stage is unavailable; README output made true. This is GH#30.
 3. **Daemon amortization (G2).** Detach (`setsid`/double fork) or a supervised long-lived daemon with idle timeout; `fsfs daemon stop`; stale-socket ownership check; a test that the second search costs < 500 ms.
