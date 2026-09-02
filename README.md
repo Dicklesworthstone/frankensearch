@@ -201,7 +201,7 @@ Result: responsive first answers plus better final ranking without blocking the 
 - Multiple output formats: `table`, `json`, `jsonl`, `toon`, `csv`
 - Watch/incremental indexing mode for local corpus updates
 - Portable SIMD vector search + quantized FSVI storage
-- Optional reranking and ANN paths via feature flags
+- Opt-in cross-encoder reranking of the refined head (`fsfs search --rerank`, `search.rerank`); ANN path via feature flags
 
 ## CLI At A Glance
 
@@ -217,6 +217,10 @@ fsfs search "query" --stream --format toon
 
 # Explain one result of the last search: by rank, R0-style id, or path
 fsfs explain 1
+
+# Re-score the refined head with the cross-encoder (one-time model install)
+fsfs download-models ms-marco-minilm-l-6-v2
+fsfs search "query" --rerank --format json
 
 # Keep index fresh
 fsfs index ~/projects --watch
@@ -259,6 +263,7 @@ Common environment variables:
 |---|---|---|
 | `FRANKENSEARCH_INDEX_DIR` | Override index/data directory | `~/.local/share/frankensearch` |
 | `FRANKENSEARCH_MODEL_DIR` | Override model location | `~/.cache/frankensearch/models` |
+| `FRANKENSEARCH_RERANK` | Re-score the refined head with the cross-encoder (same as `--rerank`); needs `fsfs download-models ms-marco-minilm-l-6-v2` once | `1` |
 | `FRANKENSEARCH_FAST_ONLY` | Skip quality refinement. Rejected with a warning under the default `performance` pressure profile, which locks the quality stage on; use `FRANKENSEARCH_PRESSURE_PROFILE=strict` for fast-only | `true` |
 | `FRANKENSEARCH_QUALITY_WEIGHT` | Blend quality vs fast tier | `0.7` |
 | `FRANKENSEARCH_RRF_K` | RRF constant | `60` |
@@ -292,7 +297,7 @@ Model path used in the default quality lane:
 - fast tier: potion-128M (or fallback)
 - fusion: RRF over lexical + semantic ranks
 - quality tier: MiniLM
-- optional final rerank (library `rerank` feature; not wired into the `fsfs` CLI): pure-Rust frankentorch cross-encoder (`native`, ms-marco-MiniLM-L-6-v2 or jina-reranker), with a FastEmbed/ONNX alternative behind `fastembed-reranker`
+- optional final rerank (`fsfs search --rerank` / `search.rerank`; library `rerank` feature): pure-Rust frankentorch cross-encoder (`native`, ms-marco-MiniLM-L-6-v2 or jina-reranker) re-scores the refined head once `fsfs download-models ms-marco-minilm-l-6-v2` has installed the weights; without a verified model the stage is skipped with a typed reason (`query.stage.rerank.disabled.unavailable`). A FastEmbed/ONNX alternative sits behind `fastembed-reranker`
 
 ## Architecture Breakdown
 

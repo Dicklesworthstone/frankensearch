@@ -273,7 +273,7 @@ Query → Canonicalize → Classify → ┬─ Fast Embed (potion, 0.57ms) → V
                                                                                     │
                                                                 Two-Tier Blend (0.7/0.3)
                                                                                     │
-                                                  Optional cross-encoder rerank (library `rerank`)
+                                       Optional cross-encoder rerank (`fsfs search --rerank`; library `rerank`)
                                                                                     │
                                                                    yield Refined (~150ms)
 ```
@@ -326,7 +326,7 @@ frankensearch/
 | `frankensearch-fsfs` | `src/runtime.rs` | CLI command execution lanes, search/index orchestration, stream protocol wiring |
 | `frankensearch-tui` | `src/shell.rs` | Shared app-shell frame loop, navigation, overlays, and status plumbing |
 | `frankensearch-ops` | `src/storage.rs` | Ops telemetry storage/materialization and control-plane persistence |
-| `frankensearch-rerank` | `src/native.rs` | Pure-Rust frankentorch cross-encoder (int8 BERT forward pass, ms-marco-MiniLM / jina); `src/fastembed_reranker.rs` is the optional ONNX alternative. Not used by `fsfs` (no dependency); library `rerank` feature only |
+| `frankensearch-rerank` | `src/native.rs` | Pure-Rust frankentorch cross-encoder (int8 BERT forward pass, ms-marco-MiniLM / jina); `src/fastembed_reranker.rs` is the optional ONNX alternative. Wired into `fsfs search --rerank` / `search.rerank` (fsfs cargo feature `rerank`, default on; the model arrives via `fsfs download-models ms-marco-minilm-l-6-v2`) and the library `rerank` feature |
 | `frankensearch-quill` | `src/index.rs` | Native pure-Rust BM25 index, postings, queries, and segment lifecycle |
 | `frankensearch-quill` | `src/argus.rs` | BM25 query execution and scoring |
 | `frankensearch-quill` | `src/quiver.rs` | Postings and positions store |

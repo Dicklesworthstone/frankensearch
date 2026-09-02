@@ -72,6 +72,7 @@ Path expansion rule:
 - `quality_timeout_ms: int` (`>=50`)
 - `fast_only: bool`
 - `explain: bool`
+- `rerank: bool` (default `false`; `--rerank` / `FRANKENSEARCH_RERANK`. Re-scores the REFINED head with the `ms-marco-minilm-l-6-v2` cross-encoder when that model is verified in the cache; otherwise the search payload's `rerank` block reports `query.stage.rerank.disabled.unavailable` and the fused order stands)
 
 ## `[pressure]`
 
