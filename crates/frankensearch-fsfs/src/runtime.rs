@@ -381,6 +381,9 @@ const FSFS_VECTOR_QUALITY_INDEX_FILE: &str = "vector/quality.fsvi";
 /// Pid file the compaction daemon (`fsfs daemon`) publishes under the index
 /// root so `fsfs daemon --stop` can find the process to signal.
 const FSFS_DAEMON_PID_FILE: &str = "daemon.pid";
+/// How long watch mode waits for the vector generations' writer lock before
+/// giving up at startup (bd-ql03m).
+const WATCH_OPEN_BUDGET: Duration = Duration::from_secs(30);
 /// Sentinel/checkpoint reason codes describing the quality tier of a generation.
 const REASON_VECTOR_QUALITY_TIER_BUILT: &str = "vector.quality_tier.built";
 const REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY: &str = "vector.quality_tier.skipped.fast_only";
@@ -10217,18 +10220,49 @@ impl FsfsRuntime {
     /// Writer open that tolerates the brief window between a quiesced
     /// daemon's socket closing and its process releasing the map lock.
     fn open_vector_index_for_mutation(path: &Path) -> SearchResult<VectorIndex> {
-        const OPEN_BUDGET: Duration = Duration::from_secs(2);
+        Self::open_vector_index_for_mutation_within(path, Duration::from_secs(2))
+    }
+
+    /// Writer open with an explicit budget. Watch mode uses a longer one:
+    /// its live pipeline opens the generations seconds after the same
+    /// process published them, and an intermittent holder (bd-ql03m: seen
+    /// to clear within 30 s, never caught under tracing) refused that open.
+    fn open_vector_index_for_mutation_within(
+        path: &Path,
+        budget: Duration,
+    ) -> SearchResult<VectorIndex> {
         const OPEN_POLL: Duration = Duration::from_millis(50);
 
         let started = Instant::now();
+        let mut refusals = 0u32;
         loop {
             match VectorIndex::open(path) {
-                Err(SearchError::InvalidConfig { field, .. })
-                    if field == "fsvi.map_lock" && started.elapsed() < OPEN_BUDGET =>
+                Err(SearchError::InvalidConfig { field, reason, .. })
+                    if field == "fsvi.map_lock" && started.elapsed() < budget =>
                 {
+                    if refusals == 0 {
+                        info!(
+                            path = %path.display(),
+                            budget_ms = budget.as_millis(),
+                            reason,
+                            "vector index writer open refused by the map lock; waiting for the holder"
+                        );
+                    }
+                    refusals += 1;
                     std::thread::sleep(OPEN_POLL);
                 }
-                result => return result,
+                result => {
+                    if refusals > 0 {
+                        info!(
+                            path = %path.display(),
+                            refusals,
+                            waited_ms = started.elapsed().as_millis(),
+                            opened = result.is_ok(),
+                            "vector index writer open retry finished"
+                        );
+                    }
+                    return result;
+                }
             }
         }
     }
@@ -14809,10 +14843,12 @@ impl FsfsRuntime {
         )
         .await?;
         // The one-shot pass that precedes watch mode in the same process can
-        // still be releasing its writer for a few milliseconds (bd-ql03m: an
-        // intermittent `fsvi.map_lock` refusal right after the summary line);
-        // use the same bounded retry every other in-place mutation uses.
-        let vector_index = Self::open_vector_index_for_mutation(&vector_path)?;
+        // still hold (or a sibling can still inherit) its writer for seconds
+        // (bd-ql03m: an intermittent `fsvi.map_lock` refusal right after the
+        // summary line that clears within 30 s); wait with a generous budget
+        // and log the wait rather than die at startup.
+        let vector_index =
+            Self::open_vector_index_for_mutation_within(&vector_path, WATCH_OPEN_BUDGET)?;
         let embedder = self.resolve_fast_embedder()?;
         Self::admit_vector_generation_for_embedder(&vector_index, embedder.as_ref())?;
 
@@ -14830,7 +14866,10 @@ impl FsfsRuntime {
                     ),
                 }
             })?;
-            let quality_index = Self::open_vector_index_for_mutation(&quality_vector_path)?;
+            let quality_index = Self::open_vector_index_for_mutation_within(
+                &quality_vector_path,
+                WATCH_OPEN_BUDGET,
+            )?;
             Self::admit_quality_generation_for_embedder(&quality_index, quality_embedder.as_ref())?;
             Some((quality_index, quality_embedder))
         } else {
