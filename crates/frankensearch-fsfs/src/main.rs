@@ -182,6 +182,23 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     let event = loaded.to_loaded_event();
     emit_config_loaded(&event);
 
+    // An override the active pressure profile locks (`--fast-only` or
+    // `FRANKENSEARCH_FAST_ONLY=true` under the default `performance`
+    // profile) used to be dropped with no trace outside `fsfs config`; say so
+    // at the command that asked for it (bd-k7x34).
+    if !cli_input.quiet {
+        for warning in loaded
+            .warnings
+            .iter()
+            .filter(|warning| warning.reason_code == "override.rejected.locked_field")
+        {
+            eprintln!(
+                "warning: [{}] {} ({}); select FRANKENSEARCH_PRESSURE_PROFILE=strict for fast-only",
+                warning.reason_code, warning.field, warning.message
+            );
+        }
+    }
+
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let Some(command) = detect_auto_mode(cli_input.command, is_tty, cli_input.command_source)
     else {

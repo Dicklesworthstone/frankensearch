@@ -708,8 +708,9 @@ where
                         return Err(SearchError::InvalidConfig {
                             field: "cli.flag".into(),
                             value: "--idle-timeout-ms".into(),
-                            reason: "--idle-timeout-ms is only valid for the serve and daemon commands"
-                                .into(),
+                            reason:
+                                "--idle-timeout-ms is only valid for the serve and daemon commands"
+                                    .into(),
                         });
                     }
                 };
@@ -1391,7 +1392,9 @@ mod tests {
         let error = parse_cli_args(["search", "--stop", "query"])
             .expect_err("--stop must be refused for search");
         assert!(
-            error.to_string().contains("--stop is only valid for the daemon command"),
+            error
+                .to_string()
+                .contains("--stop is only valid for the daemon command"),
             "unexpected error: {error}"
         );
 

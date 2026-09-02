@@ -637,6 +637,10 @@ impl OutputWarningCode {
     pub const NO_VECTOR_INDEX: &str = "no_vector_index";
     /// Schema version is newer than consumer expects.
     pub const SCHEMA_NEWER: &str = "schema_version_newer";
+    /// `explain` could not obtain per-term BM25 statistics from the lexical
+    /// engine: `matched_terms` lists the query terms and `tf`/`idf` are
+    /// placeholders (0.0); the raw score and RRF contribution are real.
+    pub const BM25_STATS_UNAVAILABLE: &str = "bm25_stats_unavailable";
 }
 
 /// All stable warning codes for enumeration.
@@ -648,6 +652,7 @@ pub const ALL_OUTPUT_WARNING_CODES: &[&str] = &[
     OutputWarningCode::HASH_FALLBACK,
     OutputWarningCode::NO_VECTOR_INDEX,
     OutputWarningCode::SCHEMA_NEWER,
+    OutputWarningCode::BM25_STATS_UNAVAILABLE,
 ];
 
 // ─── Field Optionality ──────────────────────────────────────────────────────

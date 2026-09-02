@@ -1945,8 +1945,27 @@ impl ExplainSession {
         }
     }
 
-    fn resolve(&self, id: &str) -> Option<&ExplainSessionHit> {
-        self.hits.iter().find(|hit| hit.result_id == id)
+    /// Resolve an operator-supplied target: a session id (`R0`), the 1-based
+    /// rank printed by the search table and JSON (`1`), or a path (exact, or
+    /// the unique hit whose path ends with `/<target>`).
+    fn resolve(&self, target: &str) -> Option<&ExplainSessionHit> {
+        let target = target.trim();
+        if let Some(hit) = self.hits.iter().find(|hit| hit.result_id == target) {
+            return Some(hit);
+        }
+        if let Ok(rank) = target.parse::<usize>() {
+            return self.hits.iter().find(|hit| hit.rank == rank);
+        }
+        if let Some(hit) = self.hits.iter().find(|hit| hit.path == target) {
+            return Some(hit);
+        }
+        let mut suffix_matches = self.hits.iter().filter(|hit| {
+            hit.path
+                .strip_suffix(target)
+                .is_some_and(|prefix| prefix.ends_with('/'))
+        });
+        let first = suffix_matches.next()?;
+        suffix_matches.next().is_none().then_some(first)
     }
 
     fn preview_ids(&self) -> String {
@@ -6702,7 +6721,7 @@ impl FsfsRuntime {
                 field: "cli.explain.result_id".to_owned(),
                 value: result_id.to_owned(),
                 reason: format!(
-                    "unknown result id; available ids: {}",
+                    "unknown result id (use a session id such as R0, the 1-based rank printed by the last search, or a path); available ids: {}",
                     session.preview_ids()
                 ),
             })?;
@@ -6806,7 +6825,7 @@ impl FsfsRuntime {
         fusion.remap_hash_control_ranks();
         ranking.fusion = Some(fusion);
         let payload = FsfsExplanationPayload::new(session.query.clone(), ranking);
-        let warnings = if session.vector_generation_is_hash {
+        let mut warnings = if session.vector_generation_is_hash {
             let generation = session.vector_generation_id.as_deref().unwrap_or("hash");
             vec![OutputWarning::new(
                 OutputWarningCode::HASH_FALLBACK,
@@ -6817,6 +6836,14 @@ impl FsfsRuntime {
         } else {
             Vec::new()
         };
+        if hit.lexical_score.is_some() {
+            // Typed omission rather than a fabricated statistic: the lexical
+            // engine does not export per-term BM25 stats to the session.
+            warnings.push(OutputWarning::new(
+                OutputWarningCode::BM25_STATS_UNAVAILABLE,
+                "BM25 tf/idf are placeholders (0.0) and matched_terms lists the query terms; the lexical raw score and its RRF contribution are real",
+            ));
+        }
 
         if self.cli_input.format == OutputFormat::Table {
             println!(
@@ -6830,6 +6857,9 @@ impl FsfsRuntime {
                     session.vector_generation_id.as_deref(),
                 )
             );
+            for warning in &warnings {
+                println!("warning[{}]: {}", warning.code, warning.message);
+            }
             return Ok(());
         }
 
@@ -8690,7 +8720,7 @@ impl FsfsRuntime {
             warn!(
                 error = %error,
                 path = %Self::explain_session_path(&resources.index_root).display(),
-                "failed to persist explain-session context for follow-up `fsfs explain <result-id>`"
+                "failed to persist explain-session context for follow-up `fsfs explain <rank>`"
             );
         }
 
@@ -9535,7 +9565,12 @@ impl FsfsRuntime {
             let lexical_mutations = targets
                 .iter()
                 .map(|doc_id| {
-                    LexicalMutation::delete(doc_id.clone(), 0, IngestionClass::Skip, "delete_command")
+                    LexicalMutation::delete(
+                        doc_id.clone(),
+                        0,
+                        IngestionClass::Skip,
+                        "delete_command",
+                    )
                 })
                 .collect::<Vec<_>>();
             self.apply_one_shot_lexical_mutations(cx, &index_root, &lexical_mutations)
@@ -9707,8 +9742,7 @@ impl FsfsRuntime {
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
         // Published under the index root so `fsfs daemon --stop` can find this
         // process; released on every exit path (clean, idle, SIGTERM) by drop.
-        let mut pid_file =
-            crate::lifecycle::PidFile::new(index_root.join(FSFS_DAEMON_PID_FILE));
+        let mut pid_file = crate::lifecycle::PidFile::new(index_root.join(FSFS_DAEMON_PID_FILE));
         pid_file
             .acquire(env!("CARGO_PKG_VERSION"))
             .map_err(SearchError::Io)?;
@@ -16704,7 +16738,9 @@ fn print_cli_help() {
     );
     println!("  index [path]              Build/update index");
     println!("  watch [path]              Alias for index --watch");
-    println!("  explain <result-id>       Explain ranking details");
+    println!(
+        "  explain <rank|R-id|path>  Explain one hit of the last search (rank as printed, R0-style id, or path)"
+    );
     println!("  status                    Show index and runtime status");
     println!("  flush                     Publish pending lexical writes durably");
     println!("  config <action>           Manage configuration");
@@ -30804,6 +30840,65 @@ mod tests {
         assert_eq!(session.hits[0].semantic_rank, None);
     }
 
+    /// bd-iw2w9: search output never prints the session ids, so explain must
+    /// also take the rank it does print, or a path.
+    #[test]
+    fn explain_session_resolves_rank_path_and_unique_suffix() {
+        let fused = ["src/lib.rs", "docs/lib.rs", "src/main.rs"]
+            .iter()
+            .enumerate()
+            .map(|(idx, doc_id)| FusedCandidate {
+                doc_id: (*doc_id).into(),
+                fused_score: 1.0 - idx as f64 * 0.1,
+                prior_boost: 0.0,
+                lexical_rank: Some(idx),
+                semantic_rank: None,
+                hash_rank: None,
+                lexical_score: Some(1.0),
+                semantic_score: None,
+                hash_score: None,
+                in_both_sources: false,
+            })
+            .collect::<Vec<_>>();
+        let session =
+            super::ExplainSession::from_fused("lib", SearchOutputPhase::Initial, 60.0, &fused);
+
+        assert_eq!(
+            session.resolve("R0").map(|hit| hit.path.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            session.resolve("1").map(|hit| hit.path.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            session.resolve(" 3 ").map(|hit| hit.path.as_str()),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            session.resolve("docs/lib.rs").map(|hit| hit.path.as_str()),
+            Some("docs/lib.rs")
+        );
+        assert_eq!(
+            session.resolve("main.rs").map(|hit| hit.path.as_str()),
+            Some("src/main.rs")
+        );
+        assert!(
+            session.resolve("lib.rs").is_none(),
+            "ambiguous suffix must not guess"
+        );
+        assert!(
+            session.resolve("b.rs").is_none(),
+            "a partial file name is not a path suffix"
+        );
+        assert!(
+            session.resolve("0").is_none(),
+            "ranks are 1-based as printed"
+        );
+        assert!(session.resolve("4").is_none());
+        assert!(session.resolve("R7").is_none());
+    }
+
     #[test]
     fn persist_explain_session_copies_fused_hash_rank() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -31196,7 +31291,10 @@ mod tests {
         };
 
         let external = status_for(&external_catalog);
-        assert_eq!(external.index.size_bytes, 0, "an empty index root owns no bytes");
+        assert_eq!(
+            external.index.size_bytes, 0,
+            "an empty index root owns no bytes"
+        );
         assert_eq!(external.index.metadata_bytes, 0);
         assert_eq!(external.index.catalog_bytes, 659);
         assert_eq!(
@@ -31247,7 +31345,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_root = temp.path().join("index");
         fs::create_dir_all(&index_root).expect("create index root");
-        let pid_path = index_root.join(FSFS_DAEMON_PID_FILE);
+        let pid_path = index_root.join(super::FSFS_DAEMON_PID_FILE);
         let write_pid_file = |pid: u32| {
             let mut contents = crate::lifecycle::PidFileContents::current("test");
             contents.pid = pid;
@@ -31267,14 +31365,20 @@ mod tests {
         // A reaper thread waits on the child concurrently: a real daemon is
         // reaped by init, but this child stays a zombie (and therefore
         // "alive" to kill(pid, 0)) until someone waits on it.
-        let mut live = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        let mut live = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
         write_pid_file(live.id());
         let reaper = std::thread::spawn(move || live.wait().expect("wait for the signalled child"));
         daemon_stop_runtime(&index_root)
             .run_daemon_stop(&index_root)
             .expect("a live process must be terminated");
         let status = reaper.join().expect("reaper thread");
-        assert!(!status.success(), "sleep must have died from the signal: {status:?}");
+        assert!(
+            !status.success(),
+            "sleep must have died from the signal: {status:?}"
+        );
     }
 
     #[test]

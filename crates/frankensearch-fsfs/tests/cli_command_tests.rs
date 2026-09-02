@@ -945,6 +945,113 @@ fn explain_json_produces_score_decomposition() {
     }
 }
 
+/// bd-iw2w9: search output prints ranks and paths, never the `R0` session
+/// ids, so explain must resolve both.
+#[test]
+fn explain_accepts_the_rank_and_path_that_search_prints() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+
+    let search_output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "retry backoff",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--limit",
+            "2",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("explain by rank: prereq search", &search_output);
+    let search_json = parse_json("explain by rank: prereq search", &search_output);
+    let Some(first_hit_path) = search_json
+        .pointer("/data/hits/0/path")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        eprintln!("no hits for the fixture query; nothing to explain");
+        return;
+    };
+    assert_eq!(
+        search_json
+            .pointer("/data/hits/0/rank")
+            .and_then(Value::as_u64),
+        Some(1),
+        "search ranks are 1-based as printed"
+    );
+
+    for target in ["1", first_hit_path.as_str(), "R0"] {
+        let explain_output = ctx.run(
+            temp.path(),
+            &[
+                "explain",
+                target,
+                "--index-dir",
+                &index_arg,
+                "--no-watch-mode",
+                "--format",
+                "json",
+            ],
+        );
+        assert_success(&format!("explain {target}"), &explain_output);
+        let json = parse_json(&format!("explain {target}"), &explain_output);
+        assert_eq!(json.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            json.pointer("/data/ranking/doc_id")
+                .or_else(|| json.pointer("/data/ranking/path"))
+                .and_then(Value::as_str),
+            Some(first_hit_path.as_str()),
+            "explain {target} must describe the first hit: {json}"
+        );
+    }
+
+    let unknown = ctx.run(
+        temp.path(),
+        &[
+            "explain",
+            "999",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(!unknown.status.success(), "rank 999 must not resolve");
+}
+
+/// bd-k7x34: the default `performance` profile locks the quality stage on,
+/// so `--fast-only` is rejected; that rejection must be visible at the
+/// command that asked for it, not only under `fsfs config`.
+#[test]
+fn fast_only_under_performance_profile_warns_on_stderr() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "retry backoff",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--fast-only",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("search --fast-only", &output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("override.rejected.locked_field")
+            && stderr.contains("FRANKENSEARCH_PRESSURE_PROFILE=strict"),
+        "the rejected --fast-only override must be reported on stderr: {stderr}"
+    );
+}
+
 #[test]
 fn explain_table_renders_human_readable_breakdown() {
     let (temp, ctx, index_arg) = indexed_fixture();

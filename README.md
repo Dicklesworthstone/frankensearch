@@ -188,7 +188,7 @@ Result: responsive first answers plus better final ranking without blocking the 
 - Release binaries ship the Model2Vec/FastEmbed loaders; the installer downloads and verifies the two default models (`potion-multilingual-128M` + `all-MiniLM-L6-v2`) on first run. The `embedded-models` build profile additionally embeds those bytes for a zero-download first run (macOS/Windows full assets); the Linux full asset uses the loader + verified-download path
 - Progressive search phases (`Initial`, `Refined`, `RefinementFailed`)
 - Agent-friendly streaming (`--stream`) with machine-readable output
-- Result explanation surfaces (`fsfs explain <result-id>`)
+- Result explanation surfaces (`fsfs explain <rank|R-id|path>` against the last search)
 - Multiple output formats: `table`, `json`, `jsonl`, `toon`, `csv`
 - Watch/incremental indexing mode for local corpus updates
 - Portable SIMD vector search + quantized FSVI storage
@@ -206,8 +206,8 @@ fsfs search "query" --stream --format jsonl
 # TOON mode
 fsfs search "query" --stream --format toon
 
-# Explain one result
-fsfs explain result-123
+# Explain one result of the last search: by rank, R0-style id, or path
+fsfs explain 1
 
 # Keep index fresh
 fsfs index ~/projects --watch

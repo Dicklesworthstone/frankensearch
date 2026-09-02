@@ -10191,7 +10191,10 @@ mod tests {
         let mut index = VectorIndex::open(&path).expect("open");
         index.append("w1", &sample_vector(0.1, dim)).expect("a1");
         index.append("w2", &sample_vector(0.2, dim)).expect("a2");
-        assert!(wal::wal_path_for(&path).exists(), "append must create the sidecar");
+        assert!(
+            wal::wal_path_for(&path).exists(),
+            "append must create the sidecar"
+        );
 
         let recorder = std::sync::Arc::new(WarnRecorder {
             messages: std::sync::Mutex::new(Vec::new()),
