@@ -18,6 +18,7 @@ mod engine;
 mod generator;
 mod local_perf_runner;
 mod machine_class_registry;
+pub mod r1_resolution;
 // E6.3 metamorphic-law infrastructure is test-only, exactly like the law
 // executors it feeds in `engine.rs`, which all live inside that file's
 // `#[cfg(test)] mod tests`. Declaring it `#[cfg(test)]` states that honestly

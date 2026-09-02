@@ -1297,6 +1297,49 @@ mod lexical {
         });
     }
 
+    /// bd-r1-exact-repair-or-residual-1i4j4: the Long John Silver family is
+    /// the R1 epic's named real-prose divergence surface. Pre-repair, two
+    /// mechanisms made Quill drift from Tantivy on exactly these shapes:
+    /// nested per-term default-field expansion association (repaired by the
+    /// bd-5o5z8 structural mirror) and the counted-route lowering mismatch
+    /// (repaired by `topdocs_root = limit != 0 && !exact_count`). This pin
+    /// is the focused ExactRepair replay: every family shape must match
+    /// Tantivy in document order and exact f32 score bits on the full
+    /// 339-passage Treasure Island corpus, and no shape may be vacuous.
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_long_john_silver_family_matches_tantivy_score_bits_and_order() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            const LIMIT: usize = 20;
+            const FAMILY: [&str; 6] = [
+                "Long John Silver",
+                "long john silver",
+                "John Silver",
+                "Silver",
+                "\"Long John Silver\"",
+                "(Long OR John) Silver",
+            ];
+
+            let documents = indexable_documents(&corpus());
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &documents).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &documents).await;
+
+            for query in FAMILY {
+                let tantivy_hits = public_observation(&tantivy, &cx, query, LIMIT).await;
+                assert!(
+                    !tantivy_hits.is_empty(),
+                    "{query:?}: the Long John Silver family must never be vacuous"
+                );
+                let quill_hits = public_observation(&quill, &cx, query, LIMIT).await;
+                assert_eq!(
+                    quill_hits, tantivy_hits,
+                    "{query:?}: public Quill must match Tantivy in document order and exact f32 score bits"
+                );
+            }
+        });
+    }
+
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_single_batch_upsert_is_last_write_wins_by_identity() {
