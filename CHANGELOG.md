@@ -10,7 +10,8 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.7.0...main) | HEAD | 2026-09-02 | Two-tier fsfs delivered end to end (quality generation at index time, REFINED phase); daemon lifetime; append/delete reach every arm; dsr quality gate; crates.io 0.4.x patches (gh#416, gh#39, gh#40) |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.8.0...main) | HEAD | 2026-09-02 | nothing yet |
+| [v1.8.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.8.0) | Release | 2026-09-02 | Two-tier fsfs delivered end to end (quality generation at index time, REFINED phase); daemon lifetime and stop verb; append/delete/watch reach every arm; RaptorQ sidecars for both vector generations; dsr quality gate; crates.io 0.4.x patches (gh#416, gh#39, gh#40) |
 | [v1.7.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.7.0) | Release | 2026-08-23 | Registry refresh (FrankenSQLite 0.3.8, Asupersync 0.4.9, fastembed 6), hash-control fuse follow-through, Quill CASS ingest |
 | [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) | Release | 2026-08-14 | Hash control no longer presented as semantic search |
 | [v1.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.5.0) | Release | 2026-08-05 | Multi-platform assets; remedy for #31 |
@@ -21,9 +22,19 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 ---
 
-## [Unreleased] -- development on `main` since [v1.7.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.7.0)
+## [Unreleased] -- development on `main` since [v1.8.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.8.0)
 
-Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.7.0...main>
+Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.8.0...main>
+
+Nothing yet.
+
+---
+
+## [1.8.0] -- 2026-09-02
+
+Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.7.0...v1.8.0>
+
+fsfs 1.8.0 (library line unchanged at `frankensearch 0.4.2`). Release commit 66341808; `scripts/quality-gate.sh` passed 7/7 on it (fmt, check, clippy `-D warnings`, workspace lib tests, fsfs test binaries, real-model e2e, executable quick-start) on 2026-09-02T09:26Z. Assets: `fsfs-lite-1.8.0-{x86_64,aarch64}-unknown-linux-musl`, `fsfs-lite-1.8.0-{x86_64,aarch64}-apple-darwin`, `fsfs-1.8.0-x86_64-unknown-linux-gnu`, `fsfs-1.8.0-aarch64-apple-darwin` (each `.tar.xz` + `.sha256`) and `SHA256SUMS`.
 
 ### Two-tier product, daemon lifetime, mutation parity, and the dsr gate (2026-09-01 .. 2026-09-02)
 
