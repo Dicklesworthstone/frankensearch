@@ -2446,6 +2446,10 @@ impl VectorIndex {
             }
         }
 
+        if !modified_main_entries.is_empty() {
+            self.touch_main_file()?;
+        }
+
         Ok(deleted)
     }
 
@@ -3531,6 +3535,21 @@ impl VectorIndex {
 
         self.data
             .write_and_flush(flags_offset, &flags.to_le_bytes())
+    }
+
+    /// In-place flag writes go through the shared mapping. On tmpfs a page
+    /// that is already dirty never faults again, so the file's mtime/ctime can
+    /// stay exactly as they were and every consumer that fingerprints the
+    /// generation by metadata (the fsfs search-resource rebind) would keep
+    /// serving tombstoned records. Bump the timestamp explicitly after such a
+    /// write; ext4 does this on the write fault, tmpfs does not.
+    fn touch_main_file(&self) -> SearchResult<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(SearchError::Io)?;
+        file.set_modified(SystemTime::now())
+            .map_err(SearchError::Io)
     }
 
     fn rewrite_wal_sidecar(&self) -> SearchResult<()> {
@@ -10222,6 +10241,44 @@ mod tests {
         let reopened = VectorIndex::open(&path).expect("reopen");
         assert_eq!(reopened.record_count(), 3);
         assert_eq!(reopened.wal_record_count(), 1);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    /// A main-generation tombstone is an in-place write through the shared
+    /// mapping; consumers fingerprint the generation by file metadata, so the
+    /// write must be visible as a timestamp change on every filesystem
+    /// (tmpfs does not bump mtime for a write to an already-dirty page).
+    #[test]
+    fn soft_delete_of_a_main_record_bumps_the_file_timestamp() {
+        let path = temp_index_path("soft-delete-touches-main");
+        let dim = 4;
+        let mut writer = VectorIndex::create(&path, "test", dim).expect("writer");
+        writer
+            .write_record("main-0", &sample_vector(1.0, dim))
+            .expect("write");
+        writer.finish().expect("finish");
+
+        let before = std::fs::metadata(&path)
+            .expect("metadata before")
+            .modified()
+            .expect("mtime before");
+        // Coarse-clock filesystems stamp at jiffy resolution; step past it.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut index = VectorIndex::open(&path).expect("open");
+        assert!(index.soft_delete("main-0").expect("tombstone main record"));
+        drop(index);
+
+        let after = std::fs::metadata(&path)
+            .expect("metadata after")
+            .modified()
+            .expect("mtime after");
+        assert!(
+            after > before,
+            "an in-place tombstone must advance the file's mtime: before={before:?} after={after:?}"
+        );
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(wal::wal_path_for(&path)).ok();

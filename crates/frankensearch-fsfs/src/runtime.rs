@@ -22955,7 +22955,12 @@ mod tests {
                     .run_delete_command(&cx)
                     .await
                     .expect("delete --prefix succeeds");
-                let index = VectorIndex::open(&vector_path).expect("reopen vector index");
+                // A sibling test forking at this instant inherits the writer
+                // descriptor the command just dropped until its exec, so the
+                // exclusive reopen can see a transient map-lock refusal; use
+                // the same bounded retry production mutations use.
+                let index = super::FsfsRuntime::open_vector_index_for_mutation(&vector_path)
+                    .expect("reopen vector index");
                 live_after.push(super::vector_live_doc_ids(&index).expect("read live doc ids"));
             }
             let untouched = &live_after[0];
