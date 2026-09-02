@@ -21979,6 +21979,34 @@ mod tests {
         }
     }
 
+    /// Execute a fixture script this test just wrote.
+    ///
+    /// The lib-test binary is multithreaded and other tests fork children
+    /// concurrently. A child forked while this fixture's write descriptor was
+    /// still open in this process holds that descriptor until its own exec,
+    /// and `execve` of the fixture then fails with `ETXTBSY` ("Text file
+    /// busy"). Observed on the 2026-09-02 quality gate:
+    /// `Os { code: 26, kind: ExecutableFileBusy }`. The window is
+    /// milliseconds, so a short bounded retry is the correct fix; any other
+    /// error is returned unchanged.
+    #[cfg(unix)]
+    fn run_fixture_binary(binary: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+        const ETXTBSY_RETRY_BUDGET: usize = 50;
+        let mut attempt = 0usize;
+        loop {
+            match std::process::Command::new(binary).args(args).output() {
+                Err(error)
+                    if error.kind() == ErrorKind::ExecutableFileBusy
+                        && attempt < ETXTBSY_RETRY_BUDGET =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn with_test_backup_dir<F, T>(label: &str, f: F) -> T
     where
         F: FnOnce(PathBuf) -> T,
@@ -33107,8 +33135,16 @@ mod tests {
 
         // This mirrors the verification logic at line 3712-3715 in collect_update_payload:
         //   Command::new(&current_exe).arg("version").output()
-        let verify = std::process::Command::new(&binary).arg("version").output();
-        assert!(verify.is_ok(), "command should execute successfully");
+        let verify = run_fixture_binary(&binary, &["version"]);
+        // Surface the spawn error itself: under a fully parallel lib-test run
+        // this fixture has failed to execute once (2026-09-02 quality gate)
+        // with no io::Error in the panic, which made the flake undiagnosable.
+        assert!(
+            verify.is_ok(),
+            "command should execute successfully: {:?} (fixture {})",
+            verify.as_ref().err(),
+            binary.display()
+        );
         let out = verify.unwrap();
         assert!(
             out.status.success(),
@@ -33132,10 +33168,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let verify = std::process::Command::new(&binary)
-            .arg("version")
-            .output()
-            .expect("should be able to run fake binary");
+        let verify =
+            run_fixture_binary(&binary, &["version"]).expect("should be able to run fake binary");
         assert!(verify.status.success());
         let stdout = String::from_utf8_lossy(&verify.stdout);
         assert!(stdout.contains("1.2.3"));
@@ -33152,10 +33186,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let verify = std::process::Command::new(&binary)
-            .arg("version")
-            .output()
-            .expect("should be able to run fake binary");
+        let verify =
+            run_fixture_binary(&binary, &["version"]).expect("should be able to run fake binary");
         assert!(
             !verify.status.success(),
             "binary that exits with error should fail verification"
@@ -33453,7 +33485,7 @@ mod tests {
         fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Mirrors the verification logic at line 3712-3735.
-        let verify = std::process::Command::new(&binary).arg("version").output();
+        let verify = run_fixture_binary(&binary, &["version"]);
 
         let out = verify.expect("should be able to execute the binary");
         assert!(
@@ -33487,10 +33519,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let out = std::process::Command::new(&binary)
-            .arg("version")
-            .output()
-            .expect("should execute");
+        let out = run_fixture_binary(&binary, &["version"]).expect("should execute");
 
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
