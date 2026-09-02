@@ -9776,10 +9776,15 @@ impl FsfsRuntime {
         let request_path = lexical_path.join(FSFS_FLUSH_REQUEST_FILE);
         write_durable_json(&request_path, &request, "fsfs.flush.request.write")?;
 
+        // The caller only gets here when a live writer holds the keeper, so
+        // this bounds how long that writer may take to publish and ack, not
+        // whether one exists. Publishing means fsync on a possibly busy disk:
+        // a 2 s floor timed out under IO pressure (full parallel test run,
+        // 2026-09-02) and would do the same to a user's `fsfs flush`.
         let budget_ms = QuillConfig::default()
             .max_visibility_lag_ms
             .saturating_mul(2)
-            .max(2_000);
+            .max(10_000);
         let started = Instant::now();
         let ack_path = lexical_path.join(FSFS_FLUSH_ACK_FILE);
         loop {
@@ -25850,6 +25855,11 @@ mod tests {
 
             let mut config = FsfsConfig::default();
             config.indexing.watch_mode = true;
+            // Host pressure must not decide this test: a saturated box (a
+            // full parallel test run) samples as Degraded or Emergency, which
+            // switches the watcher off and starves the ingest pipeline of the
+            // events the test waits for. Never sample.
+            config.pressure.sample_interval_ms = u64::MAX;
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 command: CliCommand::Watch,
                 target_path: Some(project.clone()),
@@ -26107,6 +26117,11 @@ mod tests {
 
             let mut config = FsfsConfig::default();
             config.indexing.watch_mode = true;
+            // Host pressure must not decide this test: a saturated box (a
+            // full parallel test run) samples as Degraded or Emergency, which
+            // switches the watcher off and starves the ingest pipeline of the
+            // events the test waits for. Never sample.
+            config.pressure.sample_interval_ms = u64::MAX;
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 command: CliCommand::Watch,
                 target_path: Some(project.clone()),
