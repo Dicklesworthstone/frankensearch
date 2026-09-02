@@ -888,6 +888,11 @@ struct SearchCacheKey {
     /// payloads; the key must not conflate them.
     #[serde(default)]
     rerank: bool,
+    /// Identity of the cross-encoder that would score this request, when one
+    /// is requested and available. A payload reranked by one model must not
+    /// be served to a request that finds a different one, or none.
+    #[serde(default)]
+    rerank_model: Option<String>,
 }
 
 type SharedSearchServeState = Arc<
@@ -7662,6 +7667,9 @@ impl FsfsRuntime {
             fast_only: self.config.search.fast_only,
             rrf_k_milli: u64::from(f64_to_per_mille(self.config.search.rrf_k)),
             rerank: self.config.search.rerank,
+            rerank_model: self
+                .prepared_reranker()
+                .map(|reranker| reranker.id().to_owned()),
         }
     }
 
@@ -8383,8 +8391,7 @@ impl FsfsRuntime {
         let planning_limit = Self::resolve_planning_limit(output_limit);
         let search_start = Instant::now();
 
-        let mut capabilities =
-            resources.capabilities_for_mode(mode, self.config.search.fast_only);
+        let mut capabilities = resources.capabilities_for_mode(mode, self.config.search.fast_only);
         // The cross-encoder is a process resource, not an index resource: the
         // runtime owns it, so its capability is decided here. Nothing is
         // loaded unless the caller asked for the stage.
@@ -14429,11 +14436,8 @@ impl FsfsRuntime {
     #[cfg(feature = "rerank")]
     fn load_registered_reranker(&self) -> SearchResult<Option<Arc<dyn Reranker>>> {
         let model_root = PathBuf::from(&self.config.indexing.model_dir);
-        let inspection = Self::inspect_registered_model_cache(
-            "reranker",
-            FSFS_RERANKER_MODEL_ID,
-            &model_root,
-        )?;
+        let inspection =
+            Self::inspect_registered_model_cache("reranker", FSFS_RERANKER_MODEL_ID, &model_root)?;
         if !inspection.state.is_verified() {
             warn!(
                 state = ?inspection.state,
@@ -23730,11 +23734,11 @@ mod tests {
                 .collect())
         }
 
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "reverse-reranker-test"
         }
 
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "reverse reranker (test double)"
         }
     }
@@ -23864,10 +23868,16 @@ mod tests {
                 .rerank
                 .as_ref()
                 .expect("rerank block on the refined phase");
-            assert_eq!(stage.status, crate::output_schema::RerankStageStatus::Applied);
+            assert_eq!(
+                stage.status,
+                crate::output_schema::RerankStageStatus::Applied
+            );
             assert_eq!(stage.reason_code, super::REASON_RERANK_APPLIED);
             assert_eq!(stage.reranked_hits, 3);
-            assert_eq!(stage.model.as_deref(), Some("reverse reranker (test double)"));
+            assert_eq!(
+                stage.model.as_deref(),
+                Some("reverse reranker (test double)")
+            );
             let reranked_order = order(refined_artifact);
             let mut expected = baseline_order.clone();
             expected.reverse();
@@ -23913,7 +23923,10 @@ mod tests {
                 .rerank
                 .as_ref()
                 .expect("rerank block reports the skip");
-            assert_eq!(stage.status, crate::output_schema::RerankStageStatus::Skipped);
+            assert_eq!(
+                stage.status,
+                crate::output_schema::RerankStageStatus::Skipped
+            );
             assert_eq!(stage.reason_code, super::REASON_RERANK_UNAVAILABLE);
             assert!(stage.scores.is_empty());
             assert_eq!(order(refined_artifact), baseline_order);
@@ -23932,7 +23945,10 @@ mod tests {
                 .rerank
                 .as_ref()
                 .expect("rerank block on the initial phase");
-            assert_eq!(stage.status, crate::output_schema::RerankStageStatus::Skipped);
+            assert_eq!(
+                stage.status,
+                crate::output_schema::RerankStageStatus::Skipped
+            );
             assert_eq!(stage.reason_code, "query.stage.rerank.disabled.no_quality");
 
             super::set_test_reranker(None);

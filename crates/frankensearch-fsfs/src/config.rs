@@ -861,6 +861,10 @@ impl Default for IndexingConfig {
     }
 }
 
+// A `[search]` section mirrors its TOML keys one to one; the on/off knobs
+// (`fast_only`, `explain`, `rerank`, `shadow_mode`) are independent switches,
+// not a state machine to fold into an enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchConfig {
     pub default_limit: usize,
@@ -1201,7 +1205,8 @@ fn default_shadow_score_epsilon() -> f32 {
     SearchConfig::default().shadow_score_epsilon
 }
 
-#[allow(clippy::derive_partial_eq_without_eq)]
+// Same switches as `SearchConfig`, serialized for the effective-config contract.
+#[allow(clippy::derive_partial_eq_without_eq, clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContractSearchConfig {
     pub default_limit: usize,
@@ -2330,8 +2335,9 @@ fn apply_env_overrides(
         keys_used.push(key.into());
     }
 
-    if let Some((key, value)) = env_override(env, "FRANKENSEARCH_RERANK", "FRANKENSEARCH_SEARCH_RERANK")
-        .or_else(|| env_override(env, "FSFS_RERANK", "FSFS_SEARCH_RERANK"))
+    if let Some((key, value)) =
+        env_override(env, "FRANKENSEARCH_RERANK", "FRANKENSEARCH_SEARCH_RERANK")
+            .or_else(|| env_override(env, "FSFS_RERANK", "FSFS_SEARCH_RERANK"))
     {
         config.search.rerank = parse_bool(value, "search.rerank")?;
         keys_used.push(key.into());

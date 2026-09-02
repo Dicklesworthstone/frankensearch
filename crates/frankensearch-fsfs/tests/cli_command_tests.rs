@@ -1146,6 +1146,244 @@ fn append_batch_reaches_the_lexical_arm_and_delete_removes_it_everywhere() {
     );
 }
 
+/// The registered model cache, when it carries both semantic tiers and the
+/// ms-marco cross-encoder weights (`fsfs download-models ms-marco-minilm-l-6-v2`).
+/// `None` means the real-model rerank lane must skip, never fake a pass.
+fn registered_model_cache_with_reranker() -> Option<PathBuf> {
+    let root = std::env::var_os("FRANKENSEARCH_MODEL_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".local/share/frankensearch/models"))
+        })?;
+    let reranker = root.join("ms-marco-MiniLM-L-6-v2");
+    let required = [
+        reranker.join("model.safetensors"),
+        reranker.join("tokenizer.json"),
+        reranker.join(".verified"),
+        root.join("all-MiniLM-L6-v2"),
+        root.join("potion-base-128M"),
+    ];
+    required.iter().all(|path| path.exists()).then_some(root)
+}
+
+/// bd-7as5x: `search --rerank` re-scores the REFINED head with the real
+/// cross-encoder and reports the evidence; `explain` shows the score; and
+/// (planted negative) a model root without the cross-encoder keeps the fused
+/// order and says `query.stage.rerank.disabled.unavailable`. Runs only where
+/// the registered model cache carries the semantic tiers and the ms-marco
+/// weights; skips elsewhere.
+#[cfg(unix)]
+#[test]
+fn search_rerank_re_scores_the_refined_head_with_the_real_cross_encoder() {
+    let Some(model_root) = registered_model_cache_with_reranker() else {
+        eprintln!(
+            "[cli_command_tests] SKIP rerank lane: the registered model cache lacks the semantic tiers or the ms-marco weights"
+        );
+        return;
+    };
+    let model_root_arg = model_root.display().to_string();
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let corpus = temp.path().join("corpus");
+    let index_dir = temp.path().join("index");
+    fs::create_dir_all(&corpus).expect("create corpus dir");
+    for (name, text) in [
+        (
+            "retry.md",
+            "Recover from transient network failures with exponential backoff, bounded retries, and random jitter.",
+        ),
+        (
+            "cache.md",
+            "Invalidate cache entries by key when the upstream record changes.",
+        ),
+        (
+            "auth.md",
+            "Authenticate a session token before authorizing a request.",
+        ),
+        (
+            "readme.md",
+            "# Project Overview\n\nA search library for indexing and querying documents.",
+        ),
+    ] {
+        fs::write(corpus.join(name), text).expect("write fixture");
+    }
+    let ctx = TestContext::new(temp.path());
+    let corpus_arg = corpus.display().to_string();
+    let index_arg = index_dir.display().to_string();
+    let real_models = [("FRANKENSEARCH_MODEL_DIR", model_root_arg.as_str())];
+
+    let index = ctx.run_with_env(
+        temp.path(),
+        &[
+            "index",
+            &corpus_arg,
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ],
+        &real_models,
+    );
+    assert_success("index with the registered models", &index);
+
+    let query = "how do I recover after a temporary network outage";
+    let base_args = [
+        "search",
+        query,
+        "--index-dir",
+        &index_arg,
+        "--no-watch-mode",
+        "--no-daemon",
+        "--format",
+        "json",
+    ];
+    let plain = ctx.run_with_env(temp.path(), &base_args, &real_models);
+    assert_success("search without --rerank", &plain);
+    let plain_json = parse_json("search without --rerank", &plain);
+    assert_eq!(
+        plain_json.pointer("/data/phase").and_then(Value::as_str),
+        Some("refined"),
+        "the registered models must yield a REFINED phase: {plain_json}"
+    );
+    assert!(
+        plain_json.pointer("/data/rerank").is_none(),
+        "no rerank block unless requested: {plain_json}"
+    );
+    let hit_paths = |json: &Value| -> Vec<String> {
+        json.pointer("/data/hits")
+            .and_then(Value::as_array)
+            .map(|hits| {
+                hits.iter()
+                    .filter_map(|hit| hit.get("path").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let fused_order = hit_paths(&plain_json);
+    assert!(fused_order.len() >= 2, "{plain_json}");
+
+    let mut rerank_args = base_args.to_vec();
+    rerank_args.push("--rerank");
+    let reranked = ctx.run_with_env(temp.path(), &rerank_args, &real_models);
+    assert_success("search --rerank", &reranked);
+    let json = parse_json("search --rerank", &reranked);
+    assert_eq!(
+        json.pointer("/data/phase").and_then(Value::as_str),
+        Some("refined"),
+        "{json}"
+    );
+    let stage = json
+        .pointer("/data/rerank")
+        .cloned()
+        .unwrap_or_else(|| panic!("the refined payload must carry the rerank block: {json}"));
+    assert_eq!(
+        stage.get("status").and_then(Value::as_str),
+        Some("applied"),
+        "{stage}"
+    );
+    assert_eq!(
+        stage.get("reason_code").and_then(Value::as_str),
+        Some("query.stage.rerank.applied")
+    );
+    assert_eq!(
+        stage.get("model").and_then(Value::as_str),
+        Some("ms-marco-minilm-l-6-v2")
+    );
+    let scores = stage
+        .get("scores")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(!scores.is_empty(), "{stage}");
+    let reranked_order = hit_paths(&json);
+    assert_eq!(
+        reranked_order.first().map(String::as_str),
+        Some("retry.md"),
+        "the cross-encoder must put the relevant document first: {json}"
+    );
+    assert_eq!(
+        scores[0].get("path").and_then(Value::as_str),
+        reranked_order.first().map(String::as_str),
+        "scores are reported in final rank order: {stage}"
+    );
+    let values = scores
+        .iter()
+        .filter_map(|score| score.get("score").and_then(Value::as_f64))
+        .collect::<Vec<_>>();
+    assert!(
+        values.windows(2).all(|pair| pair[0] >= pair[1]),
+        "descending scores: {values:?}"
+    );
+    assert!(
+        values[0] > 0.5,
+        "the relevant document must score as relevant, not merely first: {values:?}"
+    );
+
+    // The explain session persisted by that search carries the score.
+    let explain = ctx.run(
+        temp.path(),
+        &[
+            "explain",
+            "1",
+            "--index-dir",
+            &index_arg,
+            "--format",
+            "table",
+        ],
+    );
+    assert_success("explain after --rerank", &explain);
+    let explain_text = stdout_str(&explain);
+    assert!(
+        explain_text.contains("Reranker: 0.") || explain_text.contains("Reranker: 1.0"),
+        "explain must print the reranker score for the top hit:\n{explain_text}"
+    );
+
+    // Planted negative: a model root with both semantic tiers but no
+    // cross-encoder. The search still refines, keeps the fused order, and
+    // reports the typed reason instead of pretending.
+    let partial_root = temp.path().join("models-without-reranker");
+    fs::create_dir_all(&partial_root).expect("create partial model root");
+    for dir in ["potion-base-128M", "all-MiniLM-L6-v2"] {
+        std::os::unix::fs::symlink(model_root.join(dir), partial_root.join(dir))
+            .expect("link semantic tier into the partial model root");
+    }
+    let partial_root_arg = partial_root.display().to_string();
+    let without = ctx.run_with_env(
+        temp.path(),
+        &rerank_args,
+        &[("FRANKENSEARCH_MODEL_DIR", partial_root_arg.as_str())],
+    );
+    assert_success("search --rerank without the cross-encoder", &without);
+    let json = parse_json("search --rerank without the cross-encoder", &without);
+    assert_eq!(
+        json.pointer("/data/phase").and_then(Value::as_str),
+        Some("refined"),
+        "{json}"
+    );
+    assert_eq!(
+        json.pointer("/data/rerank/status").and_then(Value::as_str),
+        Some("skipped"),
+        "{json}"
+    );
+    assert_eq!(
+        json.pointer("/data/rerank/reason_code")
+            .and_then(Value::as_str),
+        Some("query.stage.rerank.disabled.unavailable"),
+        "{json}"
+    );
+    assert!(
+        json.pointer("/data/rerank/scores").is_none(),
+        "no scores without a model: {json}"
+    );
+    assert_eq!(
+        hit_paths(&json),
+        fused_order,
+        "without the model the fused order must stand: {json}"
+    );
+}
+
 #[test]
 fn explain_table_renders_human_readable_breakdown() {
     let (temp, ctx, index_arg) = indexed_fixture();

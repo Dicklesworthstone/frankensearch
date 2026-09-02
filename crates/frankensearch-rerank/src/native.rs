@@ -1818,8 +1818,7 @@ mod tests {
 
     fn dir_has_model(dir: &Path) -> bool {
         dir.join(TOKENIZER_JSON).is_file()
-            && (dir.join(SAFETENSORS_PRIMARY).is_file()
-                || dir.join(SAFETENSORS_FALLBACK).is_file())
+            && (dir.join(SAFETENSORS_PRIMARY).is_file() || dir.join(SAFETENSORS_FALLBACK).is_file())
     }
 
     /// Resolve the model directory the real-model tests load from:
@@ -1889,7 +1888,8 @@ mod tests {
             );
             return;
         }
-        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load native reranker");
+        let reranker = NativeReranker::load(model_dir().expect("reranker model dir"))
+            .expect("load native reranker");
         let mut logits = Vec::new();
         let mut max_diff = 0.0_f64;
         eprintln!("[native_reranker] idx |     ft_logit |    ref_logit |     diff");
@@ -1927,7 +1927,8 @@ mod tests {
             eprintln!("[native_reranker] SKIP batch-equiv: model dir not present");
             return;
         }
-        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load native reranker");
+        let reranker = NativeReranker::load(model_dir().expect("reranker model dir"))
+            .expect("load native reranker");
         let query = CASES[0].0;
         let mut batch: Vec<(Vec<i64>, Vec<i64>)> = Vec::new();
         for (_, document, _) in CASES {
@@ -1963,7 +1964,8 @@ mod tests {
             eprintln!("[native_reranker] SKIP empty-docs: model dir not present");
             return;
         }
-        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
+        let reranker =
+            NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
         let scored = reranker.rerank_sync("any query", &[]).expect("empty ok");
         assert!(scored.is_empty());
         eprintln!("[native_reranker] empty-docs -> empty scores OK");
@@ -1975,7 +1977,8 @@ mod tests {
             eprintln!("[native_reranker] SKIP whitespace/long: model dir not present");
             return;
         }
-        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
+        let reranker =
+            NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
         // whitespace-only doc
         let ws = reranker
             .rerank_sync("q", &[doc("ws", "   ")])
@@ -2000,7 +2003,8 @@ mod tests {
             eprintln!("[native_reranker] SKIP determinism: model dir not present");
             return;
         }
-        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
+        let reranker =
+            NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
         let docs: Vec<RerankDocument> = CASES
             .iter()
             .enumerate()
@@ -2036,7 +2040,8 @@ mod tests {
             eprintln!("[native_reranker] SKIP many-docs: model dir not present");
             return;
         }
-        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
+        let reranker =
+            NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
         // 24 docs >> the 8-session pool cap, so several workers share a slot.
         let docs: Vec<RerankDocument> = (0..24)
             .map(|i| doc(&format!("d{i}"), CASES[i % CASES.len()].1))
