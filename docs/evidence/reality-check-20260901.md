@@ -378,6 +378,18 @@ section. Every row below was re-executed on the real dev binary by
 | bd-k7x34 | `--fast-only` / `FRANKENSEARCH_FAST_ONLY` silently rejected under the default profile | the rejected locked override is printed on stderr at the command; README rows corrected to name `FRANKENSEARCH_PRESSURE_PROFILE=strict` | CLI test; real binary stderr line |
 | #18 CHANGELOG | no entries since 2026-08-28 | `[Unreleased]` section for everything above and the earlier two-tier / daemon / gate work | this commit |
 
-Not closed here: watch-mode freshness proof on the real binary (#6 tail), real per-term BM25
-statistics (needs a Quill stats API; the warning is the honest interim), and the release itself
-(#1), which is the next step.
+Not closed here: real per-term BM25 statistics (needs a Quill stats API; the warning is the
+honest interim) and the release itself (#1), which is the next step.
+
+### 12.1 Second batch (2026-09-02, after the sweep commits)
+
+| Item | What was wrong | What landed | Proof |
+|---|---|---|---|
+| FsviProtector (bd-9ekrw) | 1.1k lines of RaptorQ protection for FSVI files had no consumer; both vector generations were unprotected while Quill segments were | sidecars written at one-shot publication (after the writer handles drop, under the lease) and after every `compact` (command and daemon); `compact` restores a drifted generation from its sidecar before merging, unrepairable damage is a typed `IndexCorrupted`; in-place tombstones (`delete`, watch deletes) remove the sidecar so a stale one can never resurrect a record; `doctor` check `durability.vector_sidecars` | unit test (protect, flip, fail verdict, byte-exact repair, tombstone invalidation); real binary: `index` writes two 8250-byte sidecars, doctor pass; midpoint byte flip → doctor exit 1 naming the repairable corruption; `compact` → `.corrupted` backup, doctor pass, search refined; `delete` → sidecars gone, doctor warn; `compact` → re-protected (a37a64fe) |
+| In-place tombstones on tmpfs | a main-record tombstone through the shared mapping left mtime/ctime unchanged on tmpfs, so the metadata fingerprint kept serving tombstoned records to retained search resources | `VectorIndex` touches the file after in-place flag writes | index test; fsfs rebind test failed 2/2 under a tmpfs temp dir before, passes after (155de5c1) |
+| Quality gate environment | the gate unit ran with a tmpfs temp dir (the three serve-socket tests need a short path, the rebind test needs ext4) | `gate-run.sh` uses `/data/tmp/bl` (short and ext4); memory note | targeted runs green on both filesystems |
+| Watch mode searchability (bd-z2nfa, new) | while `fsfs index --watch` runs, `fsfs search` from another process and the query daemon are refused with `fsvi.map_lock` (shared reader); unchanged since the map lock landed, v1.7.0 behaves the same; existing tests pin the exclusive-for-life writer | README states the limit; design bead filed (WAL tombstones so a published generation is immutable and readers never need excluding) | v1.7.0 full binary: search refused while watching, `gamma.md` found the moment the watcher exited |
+| Watch mode startup (bd-ql03m) | the live pipeline's writer open was refused seconds after the same process published the generations; 5/6 plain runs died right after the summary line, 8/8 traced runs passed, a 30 s gap passed, no external holder, no fork | map-lock lifecycle tracing in the index crate (`RUST_LOG=frankensearch_index::map_lock=debug`, abe65c82); the live pipeline waits up to 30 s and logs the wait | see the bead for the measured wait; root cause open |
+| Beads (bd-hpvkk) | a second cross-issue comment-id collision (3583) after a peer's JSONL sync broke every `br` call | renumbered to 3608, DB rebuilt from the harmonized JSONL, promoted by rename; recipe on the bead | `br ready` = 10, sync status healthy |
+| frankensearch-ops (bd-p6k61) | README/AGENTS presented a control plane with no shipped telemetry source | marked experimental with the dated decision | docs (a37a64fe) |
+| Dead source files (bd-d7xk1) | seven files compiled by nothing | per-file disposition recorded; removal needs the owner's written approval | bead comment |
