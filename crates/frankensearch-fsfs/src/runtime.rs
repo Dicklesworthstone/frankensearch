@@ -23665,7 +23665,8 @@ mod tests {
             .write_record("main/keep.md", &vector)
             .expect("write main-generation vector");
         writer.finish().expect("finish main vector generation");
-        let mut mutator = VectorIndex::open_writer(&vector_path).expect("open WAL append writer");
+        let mut mutator = super::FsfsRuntime::open_vector_index_for_mutation(&vector_path)
+            .expect("open WAL append writer");
         mutator
             .append("wal/only.md", &vector)
             .expect("append WAL-only document");
@@ -24198,8 +24199,12 @@ mod tests {
             ));
 
             drop(resources.vector_index.take());
-            let mut mutator =
-                VectorIndex::open_writer(&vector_path).expect("open WAL append writer");
+            // A sibling test forking at this instant inherits the reader
+            // descriptor the resources just dropped until its exec, so the
+            // exclusive open can see a transient map-lock refusal; use the
+            // same bounded retry production mutations use.
+            let mut mutator = super::FsfsRuntime::open_vector_index_for_mutation(&vector_path)
+                .expect("open WAL append writer");
             mutator
                 .append("new.md", &vector)
                 .expect("append successor vector through WAL");
@@ -24227,8 +24232,8 @@ mod tests {
             );
 
             drop(resources.vector_index.take());
-            let mut mutator =
-                VectorIndex::open_writer(&vector_path).expect("open WAL tombstone writer");
+            let mut mutator = super::FsfsRuntime::open_vector_index_for_mutation(&vector_path)
+                .expect("open WAL tombstone writer");
             assert!(
                 mutator
                     .soft_delete("old.md")
@@ -26134,7 +26139,15 @@ mod tests {
                 // seam returns. Repeated writes cross its baseline/setup race
                 // without faking an event or a stop result.
                 thread::sleep(Duration::from_millis(50));
-                for sequence in 0..200 {
+                // Keep writing until the terminal pipeline has seen an event
+                // or a generous deadline passes: under a full parallel test
+                // run the watcher's debounce and ingest turn can take far
+                // longer than the ~2 s a fixed write count allowed (observed
+                // 2026-09-02: 200 writes exhausted, the runtime shut down
+                // cleanly, and the test failed for want of the error).
+                let mutation_deadline = Instant::now() + Duration::from_secs(30);
+                let mut sequence = 0_usize;
+                while Instant::now() < mutation_deadline {
                     fs::write(
                         &mutation_path,
                         format!("pub const TERMINAL_EVENT_{sequence}: usize = {sequence};\n"),
@@ -26143,6 +26156,7 @@ mod tests {
                     if terminal_apply_calls_for_writer.load(Ordering::SeqCst) > 0 {
                         return;
                     }
+                    sequence = sequence.saturating_add(1);
                     thread::sleep(Duration::from_millis(10));
                 }
 
