@@ -41,7 +41,7 @@ hnsw_rs = { workspace = true, optional = true }
 # same-ELF bd-u3wt A/B runner. Never enabled by shipping feature aggregates.
 hnsw_rs_034 = { package = "hnsw_rs", version = "=0.3.4", optional = true }
 
-[target.'cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 rustix = { workspace = true }
 
 [dev-dependencies]
