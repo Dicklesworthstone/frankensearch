@@ -358,3 +358,26 @@ and surfacing its spawn error identified the cause as `ExecutableFileBusy`: a mu
 binary racing `execve` of a just-written fixture script against sibling forks. The five fixtures
 that share the pattern now retry only that error (5f5b0c40); the same pattern exists in production
 update verification and is recorded on bd-9j1ga as a hazard, not changed.
+
+## 12. Bridge execution receipts (BlueLynx, 2026-09-02)
+
+Bridge plan items closed from the "wiring finished code" tier of
+[`docs/planning/BRIDGE_PLAN_2026-09-02.md`](../planning/BRIDGE_PLAN_2026-09-02.md); the owner's
+sweep commit 5d228943 banked the first half of this work mid-session, the rest lands with this
+section. Every row below was re-executed on the real dev binary by
+`proof-bridge.sh` (scratchpad, seven steps, exit 0) after the final rebuild.
+
+| Gap | What was wrong | What landed | Proof |
+|---|---|---|---|
+| #5 ETXTBSY | `fsfs update` verified the new binary with a bare `Command::output()`; a sibling fork could hold the write descriptor and `execve` failed | `spawn_verifying_executable` (50 x 10 ms bounded retry on `ExecutableFileBusy`) at the update and rollback sites; the test fixtures share it | unit: writer closed after 120 ms succeeds; writer never closed surfaces the error after the budget (two tests) |
+| #6 append-batch (bd-a2hct) | appended docs never reached the Quill arm; then, once written, still invisible because Quill buffers until `commit`; then, once committed, `delete`/`compact` were refused for 10 min after any search because the now long-lived query daemon holds the FSVI map lock | one-shot lexical helper applies upserts/tombstones and **commits**; `quiesce_query_daemon` (`:shutdown` on the daemon socket, bounded wait) plus a retrying writer open before every in-place mutation, including the compaction daemon | real binary: appended doc `rank 1, lexical_rank 0, semantic_rank 0, in_both_sources true, phase refined`; delete + compact remove it from every arm; CLI test `append_batch_reaches_the_lexical_arm_and_delete_removes_it_everywhere` |
+| #7 explain (bd-iw2w9) | only never-printed `R0` ids resolved; BM25 tf/idf were silent placeholders | `fsfs explain <rank|R-id|path>` (unique file-name suffix too); `bm25_stats_unavailable` typed warning in JSON and table; help, README, tutorial corrected | unit resolve test; CLI tests by rank, path and `R0`; real binary `explain 1` and `explain alpha.md` |
+| #19 WAL warn (bd-k1vcc) | compaction reloaded the new generation while the just-merged sidecar was still on disk and warned about discarding it | superseded sidecar removed before the reload when the generation bumps | index unit test with an in-crate WARN recorder; real binary `fsfs index` prints zero `discarding stale` lines |
+| #20 status (bd-f8j9z) | the global catalog's bytes were reported as index metadata | only an in-root catalog counts; `catalog_path`/`catalog_bytes` report it either way | unit test; real binary in an empty dir: `size_bytes 0, metadata_bytes 0, catalog_bytes 659456` with the path |
+| #21 daemon | no stop verb, no pid file, help named a flag that does not exist | `daemon.pid` under the index root, `fsfs daemon --stop` (SIGTERM, 10 s wait, stale file cleared), `--idle-timeout-ms`, help fixed | parser + runtime tests (stale pid, live child); real binary: idle exit after 1.7 s, `--stop` in 50 ms with the pid file gone, second `--stop` is a typed error |
+| bd-k7x34 | `--fast-only` / `FRANKENSEARCH_FAST_ONLY` silently rejected under the default profile | the rejected locked override is printed on stderr at the command; README rows corrected to name `FRANKENSEARCH_PRESSURE_PROFILE=strict` | CLI test; real binary stderr line |
+| #18 CHANGELOG | no entries since 2026-08-28 | `[Unreleased]` section for everything above and the earlier two-tier / daemon / gate work | this commit |
+
+Not closed here: watch-mode freshness proof on the real binary (#6 tail), real per-term BM25
+statistics (needs a Quill stats API; the warning is the honest interim), and the release itself
+(#1), which is the next step.

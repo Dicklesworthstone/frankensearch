@@ -9346,12 +9346,13 @@ impl FsfsRuntime {
             .await?;
 
         publication_lease.fence("append-batch WAL publication")?;
+        self.quiesce_query_daemon("append-batch")?;
         if let Some((quality_embedder, _)) = quality.as_ref() {
-            let mut quality_index = VectorIndex::open(&quality_vector_path)?;
+            let mut quality_index = Self::open_vector_index_for_mutation(&quality_vector_path)?;
             Self::admit_quality_generation_for_embedder(&quality_index, quality_embedder.as_ref())?;
             quality_index.append_batch(&quality_entries)?;
         }
-        let mut index = VectorIndex::open(&vector_path)?;
+        let mut index = Self::open_vector_index_for_mutation(&vector_path)?;
         Self::admit_vector_generation_for_embedder(&index, embedder.as_ref())?;
         index.append_batch(&entries)?;
 
@@ -9519,7 +9520,8 @@ impl FsfsRuntime {
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         publication_lease.fence("delete WAL publication")?;
-        let mut index = VectorIndex::open(&vector_path)?;
+        self.quiesce_query_daemon("delete")?;
+        let mut index = Self::open_vector_index_for_mutation(&vector_path)?;
         let ids = &self.cli_input.delete_ids;
 
         let mut total_deleted = 0usize;
@@ -9552,7 +9554,7 @@ impl FsfsRuntime {
             let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
             if quality_vector_path.exists() {
                 publication_lease.fence("delete quality WAL publication")?;
-                let mut quality_index = VectorIndex::open(&quality_vector_path)?;
+                let mut quality_index = Self::open_vector_index_for_mutation(&quality_vector_path)?;
                 let quality_deleted = quality_index.soft_delete_batch(&refs)?;
                 info!(
                     quality_deleted,
@@ -9631,7 +9633,8 @@ impl FsfsRuntime {
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         publication_lease.fence("explicit vector compaction")?;
-        let mut index = VectorIndex::open(&vector_path)?;
+        self.quiesce_query_daemon("compact")?;
+        let mut index = Self::open_vector_index_for_mutation(&vector_path)?;
 
         // First compact WAL into main index.
         let compaction_stats = index.compact()?;
@@ -9644,7 +9647,7 @@ impl FsfsRuntime {
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
         let quality_stats = if quality_vector_path.exists() {
             publication_lease.fence("explicit quality vector compaction")?;
-            let mut quality_index = VectorIndex::open(&quality_vector_path)?;
+            let mut quality_index = Self::open_vector_index_for_mutation(&quality_vector_path)?;
             let quality_compaction = quality_index.compact()?;
             let quality_vacuum = quality_index.vacuum()?;
             info!(
@@ -9821,7 +9824,10 @@ impl FsfsRuntime {
                 // exclusivity (lock file substituted); abort rather than
                 // compact alongside a possible second publisher.
                 publication_lease.fence("daemon vector compaction")?;
-                match VectorIndex::open(&vector_path) {
+                if let Err(error) = self.quiesce_query_daemon("daemon vector compaction") {
+                    warn!(error = %error, "daemon: query daemon quiesce failed; compaction may be refused");
+                }
+                match Self::open_vector_index_for_mutation(&vector_path) {
                     Ok(mut index) => match index.compact() {
                         Ok(stats) => {
                             info!(
@@ -9870,7 +9876,10 @@ impl FsfsRuntime {
                     "daemon: quality-tier WAL changed, triggering compaction"
                 );
                 publication_lease.fence("daemon quality vector compaction")?;
-                match VectorIndex::open(&quality_vector_path) {
+                if let Err(error) = self.quiesce_query_daemon("daemon quality vector compaction") {
+                    warn!(error = %error, "daemon: query daemon quiesce failed; compaction may be refused");
+                }
+                match Self::open_vector_index_for_mutation(&quality_vector_path) {
                     Ok(mut quality_index) => match quality_index.compact() {
                         Ok(stats) => info!(
                             wal_merged = stats.wal_records,
@@ -9990,6 +9999,72 @@ impl FsfsRuntime {
             println!("{payload}");
         }
         Ok(())
+    }
+
+    /// A live query daemon (spawned by an earlier `fsfs search`, alive until
+    /// its idle timeout) keeps the FSVI mapped under the reader side of the
+    /// map lock, so every in-place mutation would be refused with
+    /// `fsvi.map_lock` for minutes. Ask it to exit over its socket and wait
+    /// for the socket to go away; the next search respawns it. No daemon is
+    /// the common case and not an error.
+    #[cfg(unix)]
+    fn quiesce_query_daemon(&self, reason: &str) -> SearchResult<()> {
+        const QUIESCE_BUDGET: Duration = Duration::from_secs(5);
+        const QUIESCE_POLL: Duration = Duration::from_millis(25);
+
+        let socket_path = self.resolve_daemon_socket_path()?;
+        let Ok(mut stream) = UnixStream::connect(&socket_path) else {
+            return Ok(());
+        };
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(
+            FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS,
+        )));
+        if let Err(error) = stream.write_all(b":shutdown\n") {
+            debug!(error = %error, reason, "query daemon shutdown request not delivered");
+            return Ok(());
+        }
+        drop(stream);
+        let started = Instant::now();
+        while started.elapsed() < QUIESCE_BUDGET {
+            if UnixStream::connect(&socket_path).is_err() {
+                info!(
+                    reason,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "query daemon quiesced for an in-place mutation"
+                );
+                return Ok(());
+            }
+            std::thread::sleep(QUIESCE_POLL);
+        }
+        warn!(
+            reason,
+            "query daemon did not exit within the quiesce budget; the mutation may be refused by the map lock"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn quiesce_query_daemon(&self, _reason: &str) -> SearchResult<()> {
+        Ok(())
+    }
+
+    /// Writer open that tolerates the brief window between a quiesced
+    /// daemon's socket closing and its process releasing the map lock.
+    fn open_vector_index_for_mutation(path: &Path) -> SearchResult<VectorIndex> {
+        const OPEN_BUDGET: Duration = Duration::from_secs(2);
+        const OPEN_POLL: Duration = Duration::from_millis(50);
+
+        let started = Instant::now();
+        loop {
+            match VectorIndex::open(path) {
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "fsvi.map_lock" && started.elapsed() < OPEN_BUDGET =>
+                {
+                    std::thread::sleep(OPEN_POLL);
+                }
+                result => return result,
+            }
+        }
     }
 
     fn directory_write_permission_doctor_check(name: &str, path: &Path) -> DoctorCheck {
@@ -13907,14 +13982,27 @@ impl FsfsRuntime {
             fsfs_quill_protector()?,
         )
         .await?;
-        let backend = QuillLexicalBackend::new(&index);
-        let mut pipeline = LexicalPipeline::new(backend);
-        let stats = pipeline.apply_incremental(mutations)?;
-        pipeline.backend_mut().flush(cx).await?;
+        let stats = {
+            let backend = QuillLexicalBackend::new(&index);
+            let mut pipeline = LexicalPipeline::new(backend);
+            let stats = pipeline.apply_incremental(mutations)?;
+            pipeline.backend_mut().flush(cx).await?;
+            stats
+        };
+        // `flush` only hands the documents to Quill's accumulator; readers see
+        // them once `commit` seals the segment and publishes the next
+        // MANIFEST (watch mode commits on its own cadence; a one-shot command
+        // has no later chance).
+        let published_generation = index
+            .commit(cx)
+            .await?
+            .segment_stats()?
+            .published_generation;
         info!(
             mutations = mutations.len(),
             ?stats,
-            "one-shot lexical mutations flushed to the active Quill generation"
+            published_generation,
+            "one-shot lexical mutations committed to the active Quill generation"
         );
         Ok(())
     }
@@ -31370,11 +31458,12 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         write_pid_file(live.id());
-        let reaper = std::thread::spawn(move || live.wait().expect("wait for the signalled child"));
+        let wait_thread =
+            std::thread::spawn(move || live.wait().expect("wait for the signalled child"));
         daemon_stop_runtime(&index_root)
             .run_daemon_stop(&index_root)
             .expect("a live process must be terminated");
-        let status = reaper.join().expect("reaper thread");
+        let status = wait_thread.join().expect("wait thread");
         assert!(
             !status.success(),
             "sleep must have died from the signal: {status:?}"

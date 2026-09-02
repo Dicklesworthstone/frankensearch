@@ -250,7 +250,7 @@ Common environment variables:
 |---|---|---|
 | `FRANKENSEARCH_INDEX_DIR` | Override index/data directory | `~/.local/share/frankensearch` |
 | `FRANKENSEARCH_MODEL_DIR` | Override model location | `~/.cache/frankensearch/models` |
-| `FRANKENSEARCH_FAST_ONLY` | Skip quality refinement | `true` |
+| `FRANKENSEARCH_FAST_ONLY` | Skip quality refinement. Rejected with a warning under the default `performance` pressure profile, which locks the quality stage on; use `FRANKENSEARCH_PRESSURE_PROFILE=strict` for fast-only | `true` |
 | `FRANKENSEARCH_QUALITY_WEIGHT` | Blend quality vs fast tier | `0.7` |
 | `FRANKENSEARCH_RRF_K` | RRF constant | `60` |
 | `FRANKENSEARCH_LOG` | Tracing filter | `info` |
@@ -436,7 +436,7 @@ without forcing you into remote services or heavyweight distributed systems.
 Common tuning patterns:
 
 - Need lower tail latency:
-  - enable `FRANKENSEARCH_FAST_ONLY=true`
+  - run fast-only: `FRANKENSEARCH_PRESSURE_PROFILE=strict` (the default `performance` profile locks the quality stage on and rejects `FRANKENSEARCH_FAST_ONLY=true` / `--fast-only` with a warning)
   - reduce candidate budget and rerank depth
   - keep lexical enabled for exact-match recovery
 

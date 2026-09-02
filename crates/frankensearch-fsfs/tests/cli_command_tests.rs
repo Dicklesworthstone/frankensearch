@@ -1052,6 +1052,100 @@ fn fast_only_under_performance_profile_warns_on_stderr() {
     );
 }
 
+// ─── Append-batch / delete parity across arms ───────────────────────────────
+
+/// bd-a2hct: `append-batch` used to write only the vector WAL, so an appended
+/// document had no BM25 rank and could never be `in_both_sources`; `delete`
+/// then had to tombstone every arm as well.
+#[test]
+fn append_batch_reaches_the_lexical_arm_and_delete_removes_it_everywhere() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+    let batch = temp.path().join("batch.jsonl");
+    fs::write(
+        &batch,
+        "{\"id\":\"zzz-appended-doc\",\"path\":\"zzz-appended-doc.md\",\"text\":\"The frobnicator quantum widget calibrates flux capacitors for temporal search.\"}\n",
+    )
+    .expect("write batch");
+    let batch_arg = batch.display().to_string();
+
+    let append = ctx.run(
+        temp.path(),
+        &[
+            "append-batch",
+            "--index-dir",
+            &index_arg,
+            "--file",
+            &batch_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("append-batch", &append);
+
+    let search_args = [
+        "search",
+        "frobnicator quantum widget",
+        "--index-dir",
+        &index_arg,
+        "--no-watch-mode",
+        "--no-daemon",
+        "--format",
+        "json",
+    ];
+    let search = ctx.run(temp.path(), &search_args);
+    assert_success("search after append-batch", &search);
+    let json = parse_json("search after append-batch", &search);
+    let appended = json
+        .pointer("/data/hits")
+        .and_then(Value::as_array)
+        .and_then(|hits| {
+            hits.iter()
+                .find(|hit| hit.get("path").and_then(Value::as_str) == Some("zzz-appended-doc"))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("appended document must be searchable: {json}"));
+    assert!(
+        appended
+            .get("lexical_rank")
+            .and_then(Value::as_u64)
+            .is_some(),
+        "the appended document must carry a BM25 rank from the Quill arm: {appended}"
+    );
+
+    let delete = ctx.run(
+        temp.path(),
+        &[
+            "delete",
+            "zzz-appended-doc",
+            "--index-dir",
+            &index_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("delete appended document", &delete);
+    let compact = ctx.run(
+        temp.path(),
+        &["compact", "--index-dir", &index_arg, "--format", "json"],
+    );
+    assert_success("compact after delete", &compact);
+
+    let search = ctx.run(temp.path(), &search_args);
+    assert_success("search after delete", &search);
+    let json = parse_json("search after delete", &search);
+    let still_present = json
+        .pointer("/data/hits")
+        .and_then(Value::as_array)
+        .is_some_and(|hits| {
+            hits.iter()
+                .any(|hit| hit.get("path").and_then(Value::as_str) == Some("zzz-appended-doc"))
+        });
+    assert!(
+        !still_present,
+        "a deleted document must be gone from every arm: {json}"
+    );
+}
+
 #[test]
 fn explain_table_renders_human_readable_breakdown() {
     let (temp, ctx, index_arg) = indexed_fixture();
