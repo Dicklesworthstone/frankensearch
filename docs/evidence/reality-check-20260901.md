@@ -293,3 +293,54 @@ README's two-tier promise — a design, not a patch), the flip ruling (§6), re-
 `crates/frankensearch-index/src/lib.rs:1913-1925` flags `wal_gen == main_gen` as stale on a
 brand-new generation), the phantom `metadata_bytes` in `status` for a missing index (counts a
 metadata DB outside the index root), orphaned modules, ops telemetry source, FSVI protector wiring.
+
+## 11. Owner mandate 2026-09-02 and what landed against it
+
+The owner ruled: Quill is the default everywhere (the flip stands); the product's two-tier
+promise must be built, not designed; CI runs through `dsr`, not GitHub Actions; and the beads
+workspace is to be repaired with `/fixing-beads-problems`. All four were done the same night.
+
+**Ruling recorded (d8336095).** bd-3beo and bd-quill-e7-integration-flip-d0tx.6 closed as
+superseded with the ruling text; comments on bd-8nqz, the E7/E8/E8-H epics and the renegotiation
+checkpoint; plan §1.4 amended (carried by d9a53ce0). Beads repaired per the skill: cross-issue
+comment ids 3581/3582 renumbered to 3590/3591 in one issue, temp DB rebuilt from the harmonized
+JSONL (1260 created), verified (show / status healthy / doctor), promoted; old family kept aside
+as `.beads/beads.db.bad_20260902T0101Z*`. `br` works again; two beads that were `blocked` with
+every blocker closed (bd-2ba5, bd-fsfs-cross-platform-semantic-installer-46z3u) reopened; ten new
+beads filed (bd-pyzzd quality tier, bd-9j1ga dsr gate, bd-a2hct, bd-iw2w9, bd-k7x34, bd-k1vcc,
+bd-f8j9z, bd-d7xk1, bd-9ekrw, bd-p6k61); `br dep cycles` empty.
+
+**Two-tier product (bd-pyzzd).** `fsfs index` now writes `vector/quality.fsvi` (all-MiniLM-L6-v2,
+384-d, own identity and WAL) beside `vector/index.fsvi` under the same publication lease, from the
+same documents, batch by batch after the fast tier with the same retry budget; the tier is
+all-or-nothing per generation (retry exhaustion retires the partial file), reuse follows the fast
+tier's exact-identity rule, incremental and final reconciliation compact both, and a run without a
+quality model (or under a fast-only profile) records `vector.quality_tier.skipped.*` on the sentinel
+and retires any stale quality file. Search binds the quality tier as its own resource, the quality
+stage runs against it and fails closed on identity mismatch, and the generation fingerprint covers
+the new file and its WAL. `append-batch`, `delete`, `compact`, the compaction daemon and watch mode
+keep both tiers in step. `fsfs status` reports `quality_generation_id/dimension`; `fsfs doctor`
+gained `semantic.quality_generation`. The `FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION` gate that made
+refinement structurally unreachable is gone. Quality-embedder resolution no longer re-opens the fast
+model (`EmbedderStack::auto_detect_quality_with_options`, d9a53ce0).
+
+| Proof | Result |
+|---|---|
+| Unit: `one_shot_index_builds_the_quality_tier_and_search_emits_refined` (semantic doubles in two distinct spaces; planted negative without a quality model) | pass; 55/55 in the targeted set incl. the three quality-phase fixtures, serve-socket and delete-prefix tests |
+| Real binary, 54-doc corpus, real models | `quality.fsvi` 54/54 live, MiniLM 384; sentinel `vector.quality_tier.built`; status shows both generations; doctor `semantic.quality_generation` pass |
+| Real binary search | stream `initial_ready` then `refined_ready`; JSON `phase: "refined"`; table `PHASE REFINED` |
+| Real binary mutations | append → both WALs, appended doc refined rank 0; delete mirrored; compact both 54/54; doctor pass |
+| Real binary, strict profile | quality tier retired (`vector.quality_tier.skipped.fast_only`), doctor warn with the reason, search INITIAL only; re-index under the default profile restores `built` |
+| Real-model quickstart lane | 2 passed: `durable-quality-vector records=10 dimension=384 embedder_id=all-minilm-l6-v2`, hybrid `phase: refined`, `fast_only_quality_loaded=false two_tier_quality_loads=1 refined_ready=true`, daemon stages green |
+| Gates | fmt clean; check clean; clippy `-D warnings` clean (embed, fsfs, index, all targets) |
+
+Known limit found on the way (filed as bd-k7x34): `FRANKENSEARCH_FAST_ONLY` and `--fast-only`
+are no-ops under the default performance pressure profile because that profile locks the quality
+override; the strict profile is the only way to build a fast-only generation today.
+
+**CI via dsr (bd-9j1ga).** `scripts/quality-gate.sh` runs fmt, check, clippy, workspace lib tests
+(excluding the gauntlet unit binary), the fsfs test binaries, the real-model quickstart lane and the
+executable quick-start gate on a real host with the rch shim bypassed; `~/.config/dsr/repos.yaml`
+and `repos.d/frankensearch.yaml` now name it as the frankensearch check (dry run: 8 checks).
+README and AGENTS.md point at it; the GitHub Actions description in README now states that those
+lanes do not run.

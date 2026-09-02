@@ -34,9 +34,11 @@ use frankensearch_embed::HashEmbedder;
 #[cfg(feature = "embedded-models")]
 use frankensearch_embed::ensure_default_semantic_models;
 use frankensearch_embed::{
-    ConsentSource, DetectOptions, DownloadConsent, EmbedderStack, ModelDownloader, ModelLifecycle,
-    ModelManifest, ModelTier as ManifestModelTier, verify_dir_and_record, verify_dir_cached,
+    ConsentSource, DownloadConsent, ModelDownloader, ModelLifecycle, ModelManifest,
+    ModelTier as ManifestModelTier, verify_dir_and_record, verify_dir_cached,
 };
+#[cfg(not(test))]
+use frankensearch_embed::{DetectOptions, EmbedderStack};
 #[cfg(feature = "semantic-loaders")]
 use frankensearch_embed::{FastEmbedEmbedder, Model2VecEmbedder};
 use frankensearch_index::VectorIndex;
@@ -502,6 +504,26 @@ fn test_quality_embedder_override() -> Option<Arc<dyn Embedder>> {
 #[cfg(test)]
 fn set_test_quality_embedder(embedder: Option<Arc<dyn Embedder>>) {
     TEST_QUALITY_EMBEDDER.with(|slot| *slot.borrow_mut() = embedder);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fast embedder injection. Unset, test builds keep their
+    /// explicit hash control fixture; a test that needs the planner to admit
+    /// a quality stage (which refuses to refine over hash-control ranks)
+    /// installs a semantic double here.
+    static TEST_FAST_EMBEDDER: std::cell::RefCell<Option<Arc<dyn Embedder>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_fast_embedder_override() -> Option<Arc<dyn Embedder>> {
+    TEST_FAST_EMBEDDER.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+fn set_test_fast_embedder(embedder: Option<Arc<dyn Embedder>>) {
+    TEST_FAST_EMBEDDER.with(|slot| *slot.borrow_mut() = embedder);
 }
 
 #[cfg(all(test, unix))]
@@ -1918,8 +1940,16 @@ struct LiveIngestPipeline {
     lexical_index: QuillIndex,
     vector_index: Arc<std::sync::Mutex<VectorIndex>>,
     embedder: Arc<dyn Embedder>,
+    /// Quality-tier generation and its embedder, when the watched generation
+    /// carries one. Every live upsert and delete is mirrored into it.
+    quality_tier: Option<LiveQualityTier>,
     canonicalizer: DefaultCanonicalizer,
     storage_db_path: Option<PathBuf>,
+}
+
+struct LiveQualityTier {
+    vector_index: Arc<std::sync::Mutex<VectorIndex>>,
+    embedder: Arc<dyn Embedder>,
 }
 
 #[derive(Debug)]
@@ -2107,6 +2137,7 @@ impl LiveIngestPipeline {
             lexical_index,
             vector_index: Arc::new(std::sync::Mutex::new(vector_index)),
             embedder,
+            quality_tier: None,
             canonicalizer: DefaultCanonicalizer::default(),
             storage_db_path: None,
         }
@@ -2115,6 +2146,20 @@ impl LiveIngestPipeline {
     fn with_storage_db_path(mut self, storage_db_path: PathBuf) -> Self {
         self.storage_db_path = Some(storage_db_path);
         self
+    }
+
+    fn with_quality_tier(mut self, vector_index: VectorIndex, embedder: Arc<dyn Embedder>) -> Self {
+        self.quality_tier = Some(LiveQualityTier {
+            vector_index: Arc::new(std::sync::Mutex::new(vector_index)),
+            embedder,
+        });
+        self
+    }
+
+    fn quality_vector_handle(&self) -> Option<Arc<std::sync::Mutex<VectorIndex>>> {
+        self.quality_tier
+            .as_ref()
+            .map(|tier| Arc::clone(&tier.vector_index))
     }
 
     fn resolve_paths(&self, file_key: &str) -> frankensearch_core::SearchResult<(PathBuf, String)> {
@@ -2160,6 +2205,14 @@ impl LiveIngestPipeline {
         // integrity failure and must not be reported as a successful delete.
         let _was_present = vi.soft_delete(rel_key)?;
         drop(vi);
+        if let Some(tier) = self.quality_tier.as_ref() {
+            let mut quality = tier
+                .vector_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _was_present = quality.soft_delete(rel_key)?;
+            drop(quality);
+        }
         Ok(())
     }
 
@@ -2262,6 +2315,7 @@ impl LiveIngestPipeline {
     }
 
     fn plan_live_vector_upsert(
+        quality_tier_available: bool,
         rel_key: &str,
         revision: i64,
         ingestion_class: IngestionClass,
@@ -2269,11 +2323,19 @@ impl LiveIngestPipeline {
     ) -> VectorPipelinePlan {
         let (tier, reason_code, chunk_count) =
             if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
-                (
-                    VectorSchedulingTier::FastOnly,
-                    "vector.plan.fast_only_quality_unavailable".to_owned(),
-                    FsfsRuntime::chunk_count_for_bytes(content_len_bytes),
-                )
+                if quality_tier_available {
+                    (
+                        VectorSchedulingTier::FastAndQuality,
+                        "vector.plan.fast_and_quality".to_owned(),
+                        FsfsRuntime::chunk_count_for_bytes(content_len_bytes),
+                    )
+                } else {
+                    (
+                        VectorSchedulingTier::FastOnly,
+                        "vector.plan.fast_only_quality_unavailable".to_owned(),
+                        FsfsRuntime::chunk_count_for_bytes(content_len_bytes),
+                    )
+                }
             } else {
                 (
                     VectorSchedulingTier::Skip,
@@ -2339,12 +2401,42 @@ impl LiveIngestPipeline {
                     }
                 }
                 VectorIndexWriteAction::AppendQuality { .. } => {
-                    tracing::debug!(
-                        file_key = %rel_key,
-                        revision,
-                        reason_code = %vector_plan.reason_code,
-                        "watcher ingest: quality vector append action skipped (fast-tier live ingest)"
-                    );
+                    let Some(tier) = self.quality_tier.as_ref() else {
+                        tracing::debug!(
+                            file_key = %rel_key,
+                            revision,
+                            reason_code = %vector_plan.reason_code,
+                            "watcher ingest: quality vector append planned but this generation carries no quality tier"
+                        );
+                        continue;
+                    };
+                    match tier.embedder.embed(cx, canonical).await {
+                        Ok(embedding) => {
+                            let mut quality = tier
+                                .vector_index
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            quality.append(rel_key, &embedding)?;
+                        }
+                        Err(error) => {
+                            // The fast vector is already durable; a document
+                            // that cannot be quality-embedded must not keep a
+                            // stale quality vector, or REFINED would rank the
+                            // old content.
+                            warn!(
+                                file_key = %rel_key,
+                                error_code = error_code_for(&error),
+                                reason = FsfsRuntime::semantic_runtime_failure_summary(&error),
+                                reason_code = %vector_plan.reason_code,
+                                "watcher ingest: quality embedding failed; fast tier only for this file"
+                            );
+                            let mut quality = tier
+                                .vector_index
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let _was_present = quality.soft_delete(rel_key)?;
+                        }
+                    }
                 }
                 VectorIndexWriteAction::MarkLexicalFallback { .. }
                 | VectorIndexWriteAction::Skip { .. } => {
@@ -2461,6 +2553,7 @@ impl LiveIngestPipeline {
                 {
                     let content_len_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
                     let vector_plan = Self::plan_live_vector_upsert(
+                        self.quality_tier.is_some(),
                         &rel_key,
                         revision,
                         ingestion_class,
@@ -2478,6 +2571,7 @@ impl LiveIngestPipeline {
             } else {
                 let content_len_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
                 let vector_plan = Self::plan_live_vector_upsert(
+                    self.quality_tier.is_some(),
                     &rel_key,
                     revision,
                     ingestion_class,
@@ -2557,6 +2651,7 @@ impl LiveIngestPipeline {
 
         if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
             let vector_plan = Self::plan_live_vector_upsert(
+                self.quality_tier.is_some(),
                 &rel_key,
                 revision,
                 ingestion_class,
@@ -9137,14 +9232,15 @@ impl FsfsRuntime {
             }
             entries.push((id.clone(), embedding));
             if let Some((quality_embedder, quality_dimension)) = quality.as_ref() {
-                let quality_embedding = quality_embedder.embed(cx, text).await.map_err(
-                    |source| SearchError::SubsystemError {
-                        subsystem: "fsfs.append_batch.embed_quality",
-                        source: Box::new(std::io::Error::other(format!(
-                            "failed to quality-embed doc '{id}': {source}"
-                        ))),
-                    },
-                )?;
+                let quality_embedding =
+                    quality_embedder.embed(cx, text).await.map_err(|source| {
+                        SearchError::SubsystemError {
+                            subsystem: "fsfs.append_batch.embed_quality",
+                            source: Box::new(std::io::Error::other(format!(
+                                "failed to quality-embed doc '{id}': {source}"
+                            ))),
+                        }
+                    })?;
                 if quality_embedding.len() != *quality_dimension {
                     return Err(SearchError::DimensionMismatch {
                         expected: *quality_dimension,
@@ -9339,7 +9435,7 @@ impl FsfsRuntime {
 
         let mut total_deleted = 0usize;
 
-        if self.cli_input.delete_prefix {
+        let targets: Vec<String> = if self.cli_input.delete_prefix {
             // Prefix matching: scan all live doc IDs (main index + WAL) and
             // collect those matching any prefix. soft_delete_batch handles
             // both main-index tombstones and WAL tombstones idempotently.
@@ -9353,15 +9449,27 @@ impl FsfsRuntime {
                     }
                 }
             }
-
-            if !to_delete.is_empty() {
-                let refs: Vec<&str> = to_delete.iter().map(String::as_str).collect();
-                total_deleted = index.soft_delete_batch(&refs)?;
-            }
+            to_delete
         } else {
             // Exact match.
-            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            ids.clone()
+        };
+
+        if !targets.is_empty() {
+            let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
             total_deleted = index.soft_delete_batch(&refs)?;
+            // Mirror the tombstones into the quality tier so a deleted
+            // document cannot resurface in REFINED results.
+            let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+            if quality_vector_path.exists() {
+                publication_lease.fence("delete quality WAL publication")?;
+                let mut quality_index = VectorIndex::open(&quality_vector_path)?;
+                let quality_deleted = quality_index.soft_delete_batch(&refs)?;
+                info!(
+                    quality_deleted,
+                    "delete mirrored tombstones into the quality tier"
+                );
+            }
         }
 
         info!(
@@ -9546,10 +9654,8 @@ impl FsfsRuntime {
         }
 
         let mut last_wal_len: u64 = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
-        let mut last_quality_wal_len: u64 = quality_wal_sidecar
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let mut last_quality_wal_len: u64 =
+            quality_wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
 
         let shutdown = Arc::new(ShutdownCoordinator::new());
         shutdown.register_signals()?;
@@ -9631,10 +9737,8 @@ impl FsfsRuntime {
 
             // The quality tier's WAL is compacted on the same trigger so the
             // two tiers never drift in what they serve.
-            let current_quality_wal_len = quality_wal_sidecar
-                .metadata()
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let current_quality_wal_len =
+                quality_wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
             if current_quality_wal_len > last_quality_wal_len && quality_vector_path.exists() {
                 info!(
                     previous_bytes = last_quality_wal_len,
@@ -9650,16 +9754,15 @@ impl FsfsRuntime {
                             elapsed_ms = %format!("{:.1}", stats.elapsed_ms),
                             "daemon: quality-tier compaction completed"
                         ),
-                        Err(error) => warn!(error = %error, "daemon: quality-tier compaction failed"),
+                        Err(error) => {
+                            warn!(error = %error, "daemon: quality-tier compaction failed");
+                        }
                     },
                     Err(error) => {
                         warn!(error = %error, "daemon: failed to open quality tier for compaction");
                     }
                 }
-                last_quality_wal_len = quality_wal_sidecar
-                    .metadata()
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                last_quality_wal_len = quality_wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
             } else {
                 last_quality_wal_len = current_quality_wal_len;
             }
@@ -10161,16 +10264,20 @@ impl FsfsRuntime {
                         .find(|code| code.starts_with("vector.quality_tier."))
                         .cloned()
                 });
-            let detail = match recorded_reason.as_deref() {
-                Some(code) => format!(
-                    "no quality-tier generation at {} ({code}); searches serve INITIAL only",
-                    quality_path.display()
-                ),
-                None => format!(
-                    "no quality-tier generation at {}; searches serve INITIAL only",
-                    quality_path.display()
-                ),
-            };
+            let detail = recorded_reason.as_deref().map_or_else(
+                || {
+                    format!(
+                        "no quality-tier generation at {}; searches serve INITIAL only",
+                        quality_path.display()
+                    )
+                },
+                |code| {
+                    format!(
+                        "no quality-tier generation at {} ({code}); searches serve INITIAL only",
+                        quality_path.display()
+                    )
+                },
+            );
             return DoctorCheck {
                 name: NAME.to_owned(),
                 verdict: DoctorVerdict::Warn,
@@ -10224,7 +10331,8 @@ impl FsfsRuntime {
                     "quality tier covers {quality_live} live documents but the fast tier covers {fast_live}; the tiers have diverged"
                 ),
                 suggestion: Some(
-                    "run `fsfs compact`, then `fsfs index <dir>` if the counts still differ".to_owned(),
+                    "run `fsfs compact`, then `fsfs index <dir>` if the counts still differ"
+                        .to_owned(),
                 ),
             };
         }
@@ -11362,8 +11470,10 @@ impl FsfsRuntime {
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
     {
-        self.run_one_shot_index_scaffold_internal(cx, command, on_progress, true)
-            .await
+        // Boxed: the one-shot index future carries both tiers' embedding
+        // state and would otherwise inflate every caller's future past the
+        // `large_futures` budget.
+        Box::pin(self.run_one_shot_index_scaffold_internal(cx, command, on_progress, true)).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -12368,8 +12478,10 @@ impl FsfsRuntime {
                                     retries_executed.saturating_add(1)
                                 ),
                             );
-                            quality_tier_reason = REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED;
-                            publication_lease.fence("one-shot abandoned quality generation retirement")?;
+                            quality_tier_reason =
+                                REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED;
+                            publication_lease
+                                .fence("one-shot abandoned quality generation retirement")?;
                             quality_vector_index = None;
                             Self::retire_quality_generation(
                                 &quality_vector_path,
@@ -12421,7 +12533,8 @@ impl FsfsRuntime {
                 publication_lease.fence("one-shot incremental vector reconciliation")?;
                 reconcile_vector_generation(&mut vector_index, &checkpoint)?;
                 if let Some(quality_index) = quality_vector_index.as_mut() {
-                    publication_lease.fence("one-shot incremental quality vector reconciliation")?;
+                    publication_lease
+                        .fence("one-shot incremental quality vector reconciliation")?;
                     reconcile_vector_generation(quality_index, &checkpoint)?;
                 }
                 vector_elapsed_ms =
@@ -12849,9 +12962,13 @@ impl FsfsRuntime {
         migration_input.watch = false;
         migration_input.quiet = true;
         let migration_runtime = Self::new(self.config.clone()).with_cli_input(migration_input);
-        migration_runtime
-            .run_one_shot_index_scaffold_internal(cx, CliCommand::Index, |_| Ok(()), false)
-            .await?;
+        Box::pin(migration_runtime.run_one_shot_index_scaffold_internal(
+            cx,
+            CliCommand::Index,
+            |_| Ok(()),
+            false,
+        ))
+        .await?;
 
         let migrated = Self::resolve_lexical_engine(index_root)?;
         if migrated.engine() != Some(BlueGreenEngine::Quill) {
@@ -13416,7 +13533,8 @@ impl FsfsRuntime {
 
         #[cfg(test)]
         {
-            Ok(Arc::new(HashEmbedder::default_256()))
+            Ok(test_fast_embedder_override()
+                .unwrap_or_else(|| Arc::new(HashEmbedder::default_256())))
         }
 
         #[cfg(not(test))]
@@ -13453,13 +13571,21 @@ impl FsfsRuntime {
     /// Resolve the quality-tier embedder alone (never re-opening the fast
     /// model). Test builds return the injected test-only quality embedder,
     /// or `None` when no test set one.
+    #[cfg_attr(
+        test,
+        allow(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            reason = "the test body is the injected double; the production body uses self and can fail"
+        )
+    )]
     fn resolve_quality_embedder(&self) -> SearchResult<Option<Arc<dyn Embedder>>> {
         #[cfg(feature = "embedded-models")]
         self.prepare_bundled_semantic_models_for_execution()?;
 
         #[cfg(test)]
         {
-            return Ok(test_quality_embedder_override());
+            Ok(test_quality_embedder_override())
         }
 
         #[cfg(not(test))]
@@ -14051,16 +14177,42 @@ impl FsfsRuntime {
         let embedder = self.resolve_fast_embedder()?;
         Self::admit_vector_generation_for_embedder(&vector_index, embedder.as_ref())?;
 
+        // A watched generation that carries a quality tier keeps it in step
+        // with every live change; if the tier exists but its model cannot be
+        // resolved, fail closed rather than let the two tiers drift.
+        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+        let quality_tier = if quality_vector_path.exists() {
+            let quality_embedder = self.resolve_quality_embedder()?.ok_or_else(|| {
+                SearchError::EmbedderUnavailable {
+                    model: self.config.indexing.quality_model.clone(),
+                    reason: format!(
+                        "this generation carries a quality tier at {} but no verified quality model is available for watch mode; run `fsfs download-models` or rebuild fast-only with `search.fast_only = true`",
+                        quality_vector_path.display()
+                    ),
+                }
+            })?;
+            let quality_index = VectorIndex::open(&quality_vector_path)?;
+            Self::admit_quality_generation_for_embedder(&quality_index, quality_embedder.as_ref())?;
+            Some((quality_index, quality_embedder))
+        } else {
+            None
+        };
+
         info!(
             target_root = %target_root.display(),
             index_root = %index_root.display(),
             storage_db_path = %storage_db_path.display(),
             embedder = embedder.id(),
+            quality_tier = quality_tier.is_some(),
             "live ingest pipeline initialized for watch mode"
         );
 
-        let pipeline = LiveIngestPipeline::new(target_root, lexical_index, vector_index, embedder)
-            .with_storage_db_path(storage_db_path);
+        let mut pipeline =
+            LiveIngestPipeline::new(target_root, lexical_index, vector_index, embedder)
+                .with_storage_db_path(storage_db_path);
+        if let Some((quality_index, quality_embedder)) = quality_tier {
+            pipeline = pipeline.with_quality_tier(quality_index, quality_embedder);
+        }
         self.repair_quarantined_lexical_gap(cx, &index_root, &pipeline)
             .await?;
         let vi_handle = Arc::clone(&pipeline.vector_index);
@@ -14078,7 +14230,11 @@ impl FsfsRuntime {
     async fn build_live_watcher_shutdown(
         &self,
         cx: &Cx,
-    ) -> SearchResult<(FsWatcher, Arc<std::sync::Mutex<VectorIndex>>)> {
+    ) -> SearchResult<(
+        FsWatcher,
+        Arc<std::sync::Mutex<VectorIndex>>,
+        Option<Arc<std::sync::Mutex<VectorIndex>>>,
+    )> {
         let target_root = self.resolve_target_root()?;
 
         #[cfg(test)]
@@ -14087,10 +14243,12 @@ impl FsfsRuntime {
             return Ok((
                 FsWatcher::new(vec![target_root], self.config.discovery.clone(), ingest),
                 vector_index,
+                None,
             ));
         }
 
         let (pipeline, vector_index) = self.build_live_ingest_pipeline(cx).await?;
+        let quality_vector_index = pipeline.quality_vector_handle();
         Ok((
             FsWatcher::new(
                 vec![target_root],
@@ -14098,6 +14256,7 @@ impl FsfsRuntime {
                 Arc::new(pipeline),
             ),
             vector_index,
+            quality_vector_index,
         ))
     }
 
@@ -15858,7 +16017,7 @@ impl FsfsRuntime {
 
         if watch_enabled_for_command {
             match self.build_live_watcher_shutdown(cx).await {
-                Ok((watcher, vi_handle)) => {
+                Ok((watcher, vi_handle, quality_handle)) => {
                     watcher.start(cx).await?;
                     let policy = watcher.execution_policy();
                     let storage_paths = self.default_index_storage_paths();
@@ -15881,7 +16040,12 @@ impl FsfsRuntime {
                         .await;
                     Self::complete_watcher_shutdown(
                         watcher.stop_checked(cx),
-                        self.finalize_shutdown(cx, reason, Some(&vi_handle)),
+                        self.finalize_shutdown(
+                            cx,
+                            reason,
+                            Some(&vi_handle),
+                            quality_handle.as_ref(),
+                        ),
                     )
                     .await?;
                 }
@@ -15914,7 +16078,7 @@ impl FsfsRuntime {
             return Ok(());
         }
         let reason = self.await_shutdown(cx, shutdown, None, None).await;
-        self.finalize_shutdown(cx, reason, None).await
+        self.finalize_shutdown(cx, reason, None, None).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -16078,11 +16242,18 @@ impl FsfsRuntime {
         _cx: &Cx,
         reason: ShutdownReason,
         vector_index: Option<&Arc<std::sync::Mutex<VectorIndex>>>,
+        quality_vector_index: Option<&Arc<std::sync::Mutex<VectorIndex>>>,
     ) -> SearchResult<()> {
         #[cfg(test)]
         observe_watcher_shutdown_test_finalization();
 
-        if let Some(vi_handle) = vector_index {
+        for (label, handle) in [
+            ("vector index", vector_index),
+            ("quality-tier vector index", quality_vector_index),
+        ] {
+            let Some(vi_handle) = handle else {
+                continue;
+            };
             let mut vi = vi_handle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -16090,6 +16261,7 @@ impl FsfsRuntime {
             if wal_count > 0 {
                 info!(
                     wal_records = wal_count,
+                    tier = label,
                     "shutdown: compacting WAL into vector index"
                 );
                 match vi.compact() {
@@ -16098,6 +16270,7 @@ impl FsfsRuntime {
                             wal_records = stats.wal_records,
                             total_after = stats.total_records_after,
                             elapsed_ms = stats.elapsed_ms,
+                            tier = label,
                             "shutdown: vector index WAL compaction complete"
                         );
                     }
@@ -16105,6 +16278,7 @@ impl FsfsRuntime {
                         tracing::error!(
                             error = %err,
                             wal_records = wal_count,
+                            tier = label,
                             "shutdown: WAL compaction failed; \
                              pending WAL entries will replay on next open"
                         );
@@ -21838,6 +22012,8 @@ mod tests {
                 vector_generation_id: Some("potion-multilingual-128m".to_owned()),
                 vector_generation_dimension: Some(256),
                 vector_generation_is_hash: false,
+                quality_generation_id: None,
+                quality_generation_dimension: None,
                 dashboard_state: "ready".to_owned(),
                 index_freshness: Some(IndexFreshnessPayload {
                     published_generation: 7,
@@ -22317,6 +22493,205 @@ mod tests {
         );
     }
 
+    /// The product's two-tier promise, end to end inside the runtime: a
+    /// standard `fsfs index` run writes a quality-tier generation beside the
+    /// fast tier when a quality model resolves, search binds it and emits
+    /// INITIAL then REFINED; and (planted negative) with no quality model the
+    /// same corpus produces no quality tier, the sentinel records why, and
+    /// search serves INITIAL only with the stage reported as unavailable.
+    #[test]
+    fn one_shot_index_builds_the_quality_tier_and_search_emits_refined() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("docs")).expect("create project docs dir");
+            fs::write(
+                project.join("docs/retry.md"),
+                "Recover transient network failures with exponential backoff, bounded retries, and random jitter.",
+            )
+            .expect("write retry doc");
+            fs::write(
+                project.join("docs/cache.md"),
+                "Invalidate cache entries by key when the upstream record changes.",
+            )
+            .expect("write cache doc");
+            fs::write(
+                project.join("docs/auth.md"),
+                "Authenticate a session token before authorizing a request.",
+            )
+            .expect("write auth doc");
+            let index_root = project.join(".frankensearch");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            config.indexing.watch_mode = false;
+
+            // Positive: a semantic fast double (the planner refuses to refine
+            // over hash-control ranks) plus a distinct semantic quality double
+            // resolve -> both tiers built in two different spaces.
+            super::set_test_fast_embedder(Some(Arc::new(SemanticFastEmbedder)));
+            super::set_test_quality_embedder(Some(Arc::new(SemanticQualityStub)));
+            let index_runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(project.clone()),
+                ..CliInput::default()
+            });
+            index_runtime
+                .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                .await
+                .expect("one-shot index with a quality model");
+
+            let fast_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            let quality_path = index_root.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE);
+            assert!(fast_path.is_file(), "fast tier must be published");
+            assert!(quality_path.is_file(), "quality tier must be published");
+            let quality = VectorIndex::open_read_only(&quality_path).expect("open quality tier");
+            assert_eq!(quality.embedder_id(), SemanticQualityStub.id());
+            assert_eq!(quality.dimension(), SemanticQualityStub.dimension());
+            let fast = VectorIndex::open_read_only(&fast_path).expect("open fast tier");
+            assert_eq!(
+                super::vector_live_doc_ids(&quality).expect("quality live ids"),
+                super::vector_live_doc_ids(&fast).expect("fast live ids"),
+                "both tiers must cover the same live documents"
+            );
+            assert_eq!(
+                quality.wal_record_count(),
+                0,
+                "published tier is reconciled"
+            );
+            let sentinel = FsfsRuntime::read_index_sentinel(&index_root)
+                .expect("read sentinel")
+                .expect("sentinel written");
+            assert!(
+                sentinel
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == super::REASON_VECTOR_QUALITY_TIER_BUILT),
+                "sentinel must record the built quality tier: {:?}",
+                sentinel.reason_codes
+            );
+            drop(quality);
+            drop(fast);
+
+            let search_runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(index_root.clone()),
+                query: Some("recover after a temporary network outage".to_owned()),
+                ..CliInput::default()
+            });
+            let mut resources = search_runtime
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::Full)
+                .await
+                .expect("prepare two-tier search resources");
+            assert!(resources.quality_vector_index.is_some());
+            assert!(resources.quality_stage_viable(false));
+            let artifacts = search_runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    "recover after a temporary network outage",
+                    3,
+                    super::SearchExecutionMode::Full,
+                    &mut resources,
+                    super::SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                    None,
+                )
+                .await
+                .expect("two-tier search");
+            let phases = artifacts
+                .iter()
+                .map(|artifact| artifact.phase.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                phases,
+                vec!["initial".to_owned(), "refined".to_owned()],
+                "a generation with a quality tier must emit INITIAL then REFINED"
+            );
+            assert!(
+                artifacts[1]
+                    .payload
+                    .hits
+                    .iter()
+                    .any(|hit| hit.path.ends_with("retry.md")),
+                "the refined phase must rank the relevant document: {:?}",
+                artifacts[1].payload.hits
+            );
+            drop(resources);
+
+            // Planted negative: no quality model -> no quality tier, reason
+            // recorded, INITIAL only, stage reported unavailable.
+            super::set_test_quality_embedder(None);
+            let project_fast_only = temp.path().join("project-fast-only");
+            fs::create_dir_all(project_fast_only.join("docs")).expect("create fast-only docs dir");
+            fs::write(
+                project_fast_only.join("docs/retry.md"),
+                "Recover transient network failures with exponential backoff and jitter.",
+            )
+            .expect("write fast-only doc");
+            let fast_only_root = project_fast_only.join(".frankensearch");
+            let index_runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(project_fast_only.clone()),
+                ..CliInput::default()
+            });
+            index_runtime
+                .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                .await
+                .expect("one-shot index without a quality model");
+            assert!(fast_only_root.join(super::FSFS_VECTOR_INDEX_FILE).is_file());
+            assert!(
+                !fast_only_root
+                    .join(super::FSFS_VECTOR_QUALITY_INDEX_FILE)
+                    .exists(),
+                "no quality model must mean no quality tier"
+            );
+            let sentinel = FsfsRuntime::read_index_sentinel(&fast_only_root)
+                .expect("read fast-only sentinel")
+                .expect("fast-only sentinel written");
+            assert!(
+                sentinel.reason_codes.iter().any(|code| {
+                    code == super::REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE
+                }),
+                "sentinel must record why the quality tier is absent: {:?}",
+                sentinel.reason_codes
+            );
+            let search_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(fast_only_root.clone()),
+                query: Some("recover after a temporary network outage".to_owned()),
+                ..CliInput::default()
+            });
+            let mut resources = search_runtime
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::Full)
+                .await
+                .expect("prepare fast-only search resources");
+            assert!(resources.quality_vector_index.is_none());
+            assert!(!resources.quality_stage_viable(false));
+            let artifacts = search_runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    "recover after a temporary network outage",
+                    3,
+                    super::SearchExecutionMode::Full,
+                    &mut resources,
+                    super::SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                    None,
+                )
+                .await
+                .expect("fast-only search");
+            let phases = artifacts
+                .iter()
+                .map(|artifact| artifact.phase.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(phases, vec!["initial".to_owned()]);
+            super::set_test_fast_embedder(None);
+        });
+    }
+
     #[test]
     fn search_resources_rebind_on_vector_wal_append_and_tombstone() {
         run_test_with_cx(|cx| async move {
@@ -22551,6 +22926,7 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: None,
+                quality_vector_index: None,
                 fast_embedder: None,
                 quality_embedder: None,
                 fast_embedder_attempted: true,
@@ -26659,6 +27035,7 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: None,
+                quality_vector_index: None,
                 fast_embedder: None,
                 quality_embedder: None,
                 fast_embedder_attempted: false,
@@ -27672,7 +28049,15 @@ mod tests {
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
-                vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                vector_index: Some(
+                    VectorIndex::open_read_only(&vector_path).expect("open vector index"),
+                ),
+                // These fixtures bind one 384-d generation as both tiers: the
+                // quality embedder under test owns its identity, and the
+                // fast double supplies a stable initial-phase vector.
+                quality_vector_index: Some(
+                    VectorIndex::open_read_only(&vector_path).expect("open quality index"),
+                ),
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(BarrierQualityEmbedder::new(Arc::clone(&barrier)))),
                 fast_embedder_attempted: true,
@@ -27791,7 +28176,15 @@ mod tests {
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
-                vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                vector_index: Some(
+                    VectorIndex::open_read_only(&vector_path).expect("open vector index"),
+                ),
+                // These fixtures bind one 384-d generation as both tiers: the
+                // quality embedder under test owns its identity, and the
+                // fast double supplies a stable initial-phase vector.
+                quality_vector_index: Some(
+                    VectorIndex::open_read_only(&vector_path).expect("open quality index"),
+                ),
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(FailedQualityEmbedder)),
                 fast_embedder_attempted: true,
@@ -27917,6 +28310,46 @@ mod tests {
         }
     }
 
+    /// A second, distinct semantic space for two-tier tests: same width as
+    /// the fast stub but a different producer identity and a different
+    /// (still deterministic) vector shape, so a test can prove that the
+    /// quality tier is bound by identity rather than by width alone.
+    struct SemanticQualityStub;
+
+    impl Embedder for SemanticQualityStub {
+        fn embed<'a>(
+            &'a self,
+            _cx: &'a asupersync::Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, Vec<f32>> {
+            let mut vector = vec![0.0; 384];
+            if !text.is_empty() {
+                vector[(text.len() * 7 + 3) % 384] = 1.0;
+            }
+            Box::pin(async move { Ok(vector) })
+        }
+
+        fn dimension(&self) -> usize {
+            384
+        }
+
+        fn id(&self) -> &'static str {
+            "stub-quality-384"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Semantic Quality Stub"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::TransformerEmbedder
+        }
+    }
+
     fn cancelled_terminal_frames(
         writer: &FlushVisibleWriter,
     ) -> Vec<StreamFrame<SearchHitPayload>> {
@@ -27966,6 +28399,7 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                quality_vector_index: None,
                 fast_embedder: Some(Arc::new(CancelledEmbedder)),
                 quality_embedder: None,
                 fast_embedder_attempted: true,
@@ -28046,7 +28480,15 @@ mod tests {
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
-                vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                vector_index: Some(
+                    VectorIndex::open_read_only(&vector_path).expect("open vector index"),
+                ),
+                // These fixtures bind one 384-d generation as both tiers: the
+                // quality embedder under test owns its identity, and the
+                // fast double supplies a stable initial-phase vector.
+                quality_vector_index: Some(
+                    VectorIndex::open_read_only(&vector_path).expect("open quality index"),
+                ),
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(CancelledEmbedder)),
                 fast_embedder_attempted: true,
@@ -29776,6 +30218,7 @@ mod tests {
             shadow_observer: None,
             shadow_pressure_sampler: None,
             vector_index: Some(VectorIndex::open_read_only(&vector_path).expect("open hash index")),
+            quality_vector_index: None,
             fast_embedder: Some(Arc::new(HashEmbedder::default_256())),
             quality_embedder: None,
             fast_embedder_attempted: true,
@@ -29815,6 +30258,7 @@ mod tests {
             shadow_observer: None,
             shadow_pressure_sampler: None,
             vector_index: None,
+            quality_vector_index: None,
             fast_embedder: None,
             quality_embedder: None,
             fast_embedder_attempted: true,
@@ -30251,6 +30695,7 @@ mod tests {
             shadow_observer: None,
             shadow_pressure_sampler: None,
             vector_index: Some(VectorIndex::open_read_only(&vector_path).expect("open hash index")),
+            quality_vector_index: None,
             fast_embedder: None,
             quality_embedder: None,
             fast_embedder_attempted: true,

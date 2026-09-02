@@ -817,6 +817,42 @@ mod loader_only {
             vector_index.dimension()
         );
 
+        // The two-tier promise: a standard `fsfs index` with both registered
+        // models present publishes a quality-tier generation beside the fast
+        // one, in its own (384-d MiniLM) space, covering the same documents.
+        let quality_path = index.join("vector/quality.fsvi");
+        assert!(
+            quality_path.is_file(),
+            "a standard index with the quality model present must publish {}",
+            quality_path.display()
+        );
+        let quality_index =
+            VectorIndex::open_read_only(&quality_path).expect("inspect durable quality FSVI");
+        assert_eq!(
+            quality_index.record_count(),
+            QUICKSTART_DOCUMENT_COUNT,
+            "one quality vector per fixture file"
+        );
+        assert_eq!(
+            quality_index.dimension(),
+            384,
+            "the quality tier is the 384-d MiniLM space"
+        );
+        let quality_embedder_id = quality_index.embedder_id().to_ascii_lowercase();
+        assert!(
+            quality_embedder_id.contains("minilm"),
+            "the quality FSVI must name the MiniLM producer, got {quality_embedder_id}"
+        );
+        assert_ne!(
+            quality_embedder_id, embedder_id,
+            "the quality tier must be a different embedding space from the fast tier"
+        );
+        eprintln!(
+            "[default-build-e2e] stage=durable-quality-vector event=verified records={} dimension={} embedder_id={quality_embedder_id}",
+            quality_index.record_count(),
+            quality_index.dimension()
+        );
+
         let status_outcome = fsfs.run(
             temp.path(),
             "status-verified-models",
@@ -1039,6 +1075,11 @@ mod loader_only {
             Some(true),
             "search envelope must report success: {envelope}"
         );
+        assert_eq!(
+            envelope.pointer("/data/phase").and_then(Value::as_str),
+            Some("refined"),
+            "a generation with a quality tier must finish in the REFINED phase: {envelope}"
+        );
         let hits = envelope
             .pointer("/data/hits")
             .and_then(Value::as_array)
@@ -1070,18 +1111,21 @@ mod loader_only {
             "[default-build-e2e] stage=hybrid-control event=verified path=retry.md lexical_rank=0 semantic_rank=0 in_both_sources=true"
         );
 
-        // Reality check 2026-09-01, G1 cost half: the fsfs read path serves one
-        // fast-tier generation, so a search must never open the quality model
-        // (an ONNX session load on every process start). Positive observable:
-        // the potion load is logged; planted negative: no FastEmbed load.
-        let lazy_outcome = fsfs.run_with_env(
+        // Model loading follows the generation, not the process: a search over
+        // the fast-only fixture (no quality tier) must never open the quality
+        // model, while a search over the two-tier generation opens it exactly
+        // once and finishes in REFINED. Both legs read the same log line, so
+        // the negative is real rather than vacuous.
+        let fast_only_outcome = fsfs.run_with_env(
             temp.path(),
             "search-loads-fast-tier-only",
             [
                 "search",
                 "bounded retries with exponential backoff",
                 "--index-dir",
-                index.to_str().expect("UTF-8 index path"),
+                semantic_only_index
+                    .to_str()
+                    .expect("UTF-8 semantic-only index path"),
                 "--no-daemon",
                 "--limit",
                 SEARCH_LIMIT,
@@ -1091,19 +1135,83 @@ mod loader_only {
             QUICKSTART_TIMEOUT,
             &[("FRANKENSEARCH_LOG", "info")],
         );
-        assert_finished_successfully("fast-tier-only search", &lazy_outcome);
+        assert_finished_successfully("fast-tier-only search", &fast_only_outcome);
         assert!(
-            lazy_outcome.stderr.contains("Model2Vec model loaded"),
+            fast_only_outcome.stderr.contains("Model2Vec model loaded"),
             "the fast tier must be loaded for a semantic search; stderr:\n{}",
-            lazy_outcome.stderr
+            fast_only_outcome.stderr
         );
         assert!(
-            !lazy_outcome.stderr.contains("FastEmbed model loaded"),
-            "a search over a fast-tier generation must not load the quality model; stderr:\n{}",
-            lazy_outcome.stderr
+            !fast_only_outcome.stderr.contains("FastEmbed model loaded"),
+            "a search over a fast-only generation must not load the quality model; stderr:\n{}",
+            fast_only_outcome.stderr
+        );
+        let fast_only_envelope: Value = serde_json::from_str(&fast_only_outcome.stdout)
+            .expect("parse fast-only search envelope");
+        assert_eq!(
+            fast_only_envelope
+                .pointer("/data/phase")
+                .and_then(Value::as_str),
+            Some("initial"),
+            "a fast-only generation serves INITIAL only: {fast_only_envelope}"
+        );
+
+        let two_tier_outcome = fsfs.run_with_env(
+            temp.path(),
+            "search-loads-quality-tier-once",
+            [
+                "search",
+                "bounded retries with exponential backoff",
+                "--index-dir",
+                index.to_str().expect("UTF-8 index path"),
+                "--no-daemon",
+                "--stream",
+                "--limit",
+                SEARCH_LIMIT,
+                "--format",
+                "jsonl",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[
+                ("FRANKENSEARCH_LOG", "info"),
+                ("FSFS_DISABLE_QUERY_CACHE", "1"),
+            ],
+        );
+        assert_finished_successfully("two-tier streamed search", &two_tier_outcome);
+        assert_eq!(
+            two_tier_outcome
+                .stderr
+                .matches("FastEmbed model loaded")
+                .count(),
+            1,
+            "a two-tier search must open the quality model exactly once; stderr:\n{}",
+            two_tier_outcome.stderr
+        );
+        let stream_reason_codes = two_tier_outcome
+            .stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|frame| {
+                frame
+                    .pointer("/payload/reason_code")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            stream_reason_codes
+                .iter()
+                .any(|code| code == "query.stream.initial_ready"),
+            "stream must announce INITIAL: {stream_reason_codes:?}"
+        );
+        assert!(
+            stream_reason_codes
+                .iter()
+                .any(|code| code == "query.stream.refined_ready"),
+            "stream must announce REFINED over a two-tier generation: {stream_reason_codes:?}"
         );
         eprintln!(
-            "[default-build-e2e] stage=lazy-quality-load event=verified fast_loaded=true quality_loaded=false"
+            "[default-build-e2e] stage=quality-tier-load event=verified fast_only_quality_loaded=false two_tier_quality_loads=1 refined_ready=true"
         );
 
         // Reality check 2026-09-01, G2: the auto-spawned query daemon must

@@ -147,23 +147,31 @@ explicitly want a long-running incremental watcher.
 Example output:
 
 ```text
-PHASE INITIAL: 5 hit(s) for "how does retry backoff work"
+PHASE REFINED: 5 hit(s) for "how does retry backoff work"
 vector generation: potion-multilingual-128M  class=semantic
   1. src/retry.rs  score=0.033  [lexical+semantic]
      Recover transient network failures with exponential <b>backoff</b>, bounded <b>retries</b>…
   2. docs/failures.md  score=0.016  [semantic]
      …
-5 results in 18ms
+5 results in 21ms
 ```
 
-Today the shipped `fsfs` binary serves the fast semantic tier (potion) fused with
-Quill BM25 and emits the `INITIAL` phase; the `REFINED` phase driven by the
-MiniLM quality tier is implemented in the library (`TwoTierSearcher`) but the
-CLI does not yet build a quality-tier generation at index time, so refinement
-is reported as unavailable rather than emitted. The first search in a shell
-pays the model load (about 3 s for potion); the query daemon that `fsfs
-search` starts by default keeps later searches to tens of milliseconds and
-exits on its own after ten idle minutes.
+`fsfs index` writes two vector generations from the same documents:
+`vector/index.fsvi` (the fast tier, potion) and `vector/quality.fsvi` (the
+quality tier, all-MiniLM-L6-v2, its own embedding space). A search first
+fuses the fast tier with Quill BM25 and emits `INITIAL`, then re-ranks the
+head against the quality tier and emits `REFINED`; with `--stream` both
+phases arrive as separate frames (`query.stream.initial_ready`, then
+`query.stream.refined_ready`). If the quality model is not installed when
+you index, the generation is built fast-only, `fsfs doctor` reports
+`semantic.quality_generation` as a warning with the recorded reason, and
+searches stop at `INITIAL` until you re-index with the model present.
+`fsfs status` shows both generations (`vector_generation_id`,
+`quality_generation_id`). Deletes, `append-batch`, `compact`, and watch mode
+keep the two tiers in step. The first search in a shell pays the model load
+(about 3 s for potion, plus the MiniLM session for the quality stage); the
+query daemon that `fsfs search` starts by default keeps later searches to tens
+of milliseconds and exits on its own after ten idle minutes.
 
 ## What It Does
 
@@ -601,11 +609,12 @@ Use this as a pragmatic hardening pass before rollout:
 2. Decide runtime mode per environment (`fast_only` in latency-critical paths, full two-tier where quality matters).
 3. Set `FRANKENSEARCH_MODEL_DIR` to a stable writable path with enough disk.
 4. Enable structured logs/metrics (`FRANKENSEARCH_LOG`) and capture phase timings.
-5. Run quality gates:
+5. Run quality gates: `scripts/quality-gate.sh` (or `dsr quality --tool frankensearch`), which covers
    - `cargo fmt --check`
    - `cargo check --workspace --all-targets`
    - `cargo clippy --workspace --all-targets -- -D warnings`
-   - `cargo test --workspace`
+   - `cargo test --workspace --lib --exclude frankensearch-quill-gauntlet` plus the fsfs test binaries
+   - the real-model quick-start lane and the executable quick-start gate against the built binary
 6. Run benchmark and quality harnesses on representative corpora before release.
 7. Validate degradation behavior by intentionally forcing quality timeout/failure.
 8. For large corpora, evaluate ANN thresholding and memory budget explicitly.
@@ -625,10 +634,27 @@ Behavior:
 - Runs per-crate `cargo publish --dry-run` checks before real publish.
 - Publishes crates sequentially to reduce crates.io index race failures and treats already-published crate versions as idempotent success.
 
-State as of 2026-09-01: all GitHub Actions workflows in this repository are disabled, so
-the lanes above describe the intended automation, not what produced the current releases.
-`fsfs` v1.7.0 and the `frankensearch` 0.4.x crates were built and published manually with
-the same scripts and checks; `docs/fsfs-packaging-release-install-contract.md` and
+## Quality Gate (dsr, not GitHub Actions)
+
+GitHub Actions is not used for this repository: every workflow under
+`.github/workflows/` is disabled (owner decision 2026-09-01), and the lanes
+above describe automation that no longer runs there. The gate that must pass
+before any release lives in the repository and runs on a real host:
+
+```bash
+scripts/quality-gate.sh                     # fmt, check, clippy -D warnings, lib tests,
+                                            # fsfs test binaries, real-model e2e lane,
+                                            # executable quick-start gate
+dsr quality --tool frankensearch            # the same gate plus the packaging/installer
+                                            # contract checks, driven by dsr
+```
+
+Stages can be selected with `QUALITY_GATE_STAGES=fmt,check,clippy,tests` and
+the registered model cache with `QUALITY_GATE_MODEL_DIR`. The end-to-end stage
+fails closed when the two registered models are absent unless
+`QUALITY_GATE_ALLOW_MODEL_SKIP=1` is set. Releases (`fsfs` binaries and the
+`frankensearch` crates) are built and published through `dsr`;
+`docs/fsfs-packaging-release-install-contract.md` and
 `docs/crates-publishing-contract.md` are the authoritative recipes.
 
 ## Troubleshooting by Symptom
@@ -890,13 +916,16 @@ No. Async/concurrency is built around `asupersync` and `Cx`.
 
 Project policy is no direct external merges, but issues and PRs are still useful for bug reports and proposal clarity.
 
-If you are working inside this repository as an internal/automation agent:
+If you are working inside this repository as an internal/automation agent, run
+the gate before every push (it wraps the individual commands below):
 
 ```bash
+scripts/quality-gate.sh
+# or the pieces it runs:
 cargo fmt --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace --lib --exclude frankensearch-quill-gauntlet
 ```
 
 Useful docs:

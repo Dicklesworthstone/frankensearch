@@ -159,7 +159,15 @@ We do not care about backwards compatibility—we're in early development with n
 
 ## Compiler Checks (CRITICAL)
 
-**After any substantive code changes, you MUST verify no errors were introduced:**
+**After any substantive code changes, you MUST verify no errors were introduced.** The one
+command that runs every gate this repository relies on (there is no GitHub Actions lane; the
+gate runs on real hosts through `dsr quality --tool frankensearch`) is:
+
+```bash
+scripts/quality-gate.sh          # fmt, check, clippy -D warnings, lib tests, fsfs tests, real-model e2e, quick-start gate
+```
+
+Its individual pieces, when you want just one:
 
 ```bash
 # Check for compiler errors and warnings (workspace-wide)
