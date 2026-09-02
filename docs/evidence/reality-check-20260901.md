@@ -266,3 +266,30 @@ git log -S'lexical = ["quill"]' --format='%h %ci %s' -- frankensearch/Cargo.toml
 grep -c 'activated = false' docs/contracts/quill-perf-gates.toml
 gh workflow list -R Dicklesworthstone/frankensearch --all
 ```
+
+## 10. Landed the same day (BlueLynx, 2026-09-01 evening)
+
+Operator directive: close the highest bang-for-buck gaps now. What landed, with its proof:
+
+| Gap | Change | Proof |
+|---|---|---|
+| G2 daemon amortizes nothing | `spawn_search_daemon` detaches the daemon with `setsid` instead of `PR_SET_PDEATHSIG`; accept loop exits after `--idle-timeout-ms` (default `FSFS_DAEMON_IDLE_TIMEOUT_MS = 600_000`, `0` = never) when no request is in flight; `serve --idle-timeout-ms` flag | Real binary: searches 17.0 s → 0.11 s → 0.11 s with one daemon in its own session (sid == pid); `quit` reclaims the socket; `serve --idle-timeout-ms 1500` exits 0 at 1.61 s; no strays. Quickstart lane: `daemon-survives-spawner cold_ms=4163 warm_ms=50`, `daemon-idle-exit wall_ms=1530` |
+| G1 cost half: MiniLM/ORT loaded on every search | `EmbedderStack::auto_detect_fast_semantic_with_options` (embed crate) detects the fast tier only; fsfs `resolve_fast_embedder` uses it | Real binary with `FRANKENSEARCH_LOG=info`: `FastEmbed model loaded` 0, `Model2Vec model loaded` 1, `availability=FastOnly`. Quickstart lane: `lazy-quality-load fast_loaded=true quality_loaded=false` |
+| G8.3 `delete --prefix` skipped the WAL | Peer fix 367f894a landed without a test; regression test `delete_prefix_tombstones_documents_that_exist_only_in_the_wal` (planted negative: non-matching prefix deletes nothing) | passes |
+| G8.1 `search --help` | Peer fix c840926c with test | passes |
+| G1 truth half | Table banner no longer promises a `RefinementFailed` phase the planner cannot emit; README quick-start shows the real `PHASE INITIAL` output and states that the CLI is fast-tier + Quill today | text |
+| G6 docs | README: precedence (`cli > env > file(project > user) > defaults`), envelope table sourced from the ledger, publish lane (`crates-v*`, contract-derived sequence), bundling claim, rerank truth, CI-disabled note. AGENTS.md: packaging boundary (registry renames, publishable), unsafe policy (`deny` + per-site allow classes), workspace tree, key deps. `docs/architecture{,/overview}.md`: 15 members, Quill default, gauntlet, arrows. `index/src/hnsw.rs` comment | reviewed |
+
+Gates on the touched crates (`frankensearch-embed`, `-fsfs`, `-index`): `cargo check --all-targets`
+clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean, `ubs -v` adds
+zero critical findings on the added lines, fsfs lib tests for the new CLI flag and the WAL-prefix
+regression pass, the env-gated real-model quickstart lane passes end to end (2 passed). The embed
+crate's own unit test for the fast-only detector could not run locally (shared target `E0514`
+from a peer's toolchain); it passed on the rch fleet (worker `hz4`, 1 passed, 0 failed).
+
+Deliberately NOT done here, for the owner to file: the product quality-tier generation (the
+README's two-tier promise — a design, not a patch), the flip ruling (§6), re-enabling any CI,
+`append-batch` lexical arm, explain rank/path ids, the fresh-index WAL `warn!` (rule at
+`crates/frankensearch-index/src/lib.rs:1913-1925` flags `wal_gen == main_gen` as stale on a
+brand-new generation), the phantom `metadata_bytes` in `status` for a missing index (counts a
+metadata DB outside the index root), orphaned modules, ops telemetry source, FSVI protector wiring.

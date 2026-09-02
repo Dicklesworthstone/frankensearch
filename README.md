@@ -147,14 +147,23 @@ explicitly want a long-running incremental watcher.
 Example output:
 
 ```text
-PHASE 0 (fast): 5 hits in 12ms
-  1. src/retry.rs      score=0.812
-  2. docs/failures.md  score=0.774
-
-PHASE 1 (refined): 5 hits in 151ms
-  1. src/retry.rs      score=0.923
-  2. src/http/client.rs score=0.901
+PHASE INITIAL: 5 hit(s) for "how does retry backoff work"
+vector generation: potion-multilingual-128M  class=semantic
+  1. src/retry.rs  score=0.033  [lexical+semantic]
+     Recover transient network failures with exponential <b>backoff</b>, bounded <b>retries</b>…
+  2. docs/failures.md  score=0.016  [semantic]
+     …
+5 results in 18ms
 ```
+
+Today the shipped `fsfs` binary serves the fast semantic tier (potion) fused with
+Quill BM25 and emits the `INITIAL` phase; the `REFINED` phase driven by the
+MiniLM quality tier is implemented in the library (`TwoTierSearcher`) but the
+CLI does not yet build a quality-tier generation at index time, so refinement
+is reported as unavailable rather than emitted. The first search in a shell
+pays the model load (about 3 s for potion); the query daemon that `fsfs
+search` starts by default keeps later searches to tens of milliseconds and
+exits on its own after ten idle minutes.
 
 ## What It Does
 
@@ -168,7 +177,7 @@ Result: responsive first answers plus better final ranking without blocking the 
 
 ## Core Features
 
-- Full release binaries bundle default semantic models (`potion-multilingual-128M` + `all-MiniLM-L6-v2`) with optional alternate-model downloads
+- Release binaries ship the Model2Vec/FastEmbed loaders; the installer downloads and verifies the two default models (`potion-multilingual-128M` + `all-MiniLM-L6-v2`) on first run. The `embedded-models` build profile additionally embeds those bytes for a zero-download first run (macOS/Windows full assets); the Linux full asset uses the loader + verified-download path
 - Progressive search phases (`Initial`, `Refined`, `RefinementFailed`)
 - Agent-friendly streaming (`--stream`) with machine-readable output
 - Result explanation surfaces (`fsfs explain <result-id>`)
@@ -220,12 +229,12 @@ The benchmark lane validates deterministic artifact identity fields (`dataset_sh
 
 ## Configuration
 
-Configuration precedence:
+Configuration precedence (highest first; `fsfs config` prints the resolved
+`source_precedence_applied` for the current process):
 1. CLI flags
-2. project config file
-3. user config file
-4. environment variables
-5. built-in defaults
+2. environment variables
+3. config files (project `fsfs.toml` over user `~/.config/fsfs/config.toml`)
+4. built-in defaults
 
 Common environment variables:
 
@@ -266,7 +275,7 @@ Model path used in the default quality lane:
 - fast tier: potion-128M (or fallback)
 - fusion: RRF over lexical + semantic ranks
 - quality tier: MiniLM
-- optional final rerank: pure-Rust frankentorch cross-encoder (`native`), with a FastEmbed/FlashRank-style alternative behind `fastembed-reranker`
+- optional final rerank (library `rerank` feature; not wired into the `fsfs` CLI): pure-Rust frankentorch cross-encoder (`native`, ms-marco-MiniLM-L-6-v2 or jina-reranker), with a FastEmbed/ONNX alternative behind `fastembed-reranker`
 
 ## Architecture Breakdown
 
@@ -539,17 +548,20 @@ Notes:
 ## Baseline Performance Envelope (Reference)
 
 These are practical CPU-only reference numbers for a healthy local setup.
-Treat them as orientation targets, not hard SLAs:
+Treat them as orientation targets, not hard SLAs. Rows marked *ledger* are
+the newest committed measurements in `docs/PERF_LEDGER.md`; rows marked
+*target* have no committed measurement and are design budgets:
 
-| Operation | Typical Envelope |
-|---|---|
-| Fast hash embedding | ~11 μs |
-| Fast model embedding (potion-128M) | ~0.57 ms |
-| Quality model embedding (MiniLM) | ~128 ms |
-| Vector search (10K docs, top-10) | ~2 ms |
-| RRF fusion (500 + 500 candidates) | ~1 ms |
-| Phase 1 initial delivery | usually `< 15 ms` target |
-| Phase 2 refined delivery | usually `~150 ms` target |
+| Operation | Typical Envelope | Basis |
+|---|---|---|
+| Fast hash embedding (`hash_embed_fnv`, tokenize + FNV) | ~2 μs | ledger, 2026-07-04 |
+| Fast model embedding (potion-128M) | ~0.6 ms | target |
+| Quality model embedding (MiniLM) | ~130 ms | target |
+| Vector search (10K docs, top-10) | ~2 ms | target |
+| RRF fusion (1,000 + 1,000 candidates) | ~23 μs | ledger, 2026-07-04 |
+| Phase 1 initial delivery (in-process, warm models) | `< 15 ms` | target; 18–19 ms measured on a 65-file corpus, 2026-09-01 |
+| Phase 2 refined delivery (library `TwoTierSearcher`) | `~150 ms` | target |
+| Cold process start (`fsfs search` without a running daemon) | ~3 s | measured 2026-09-01: potion vocabulary load dominates |
 
 What changes the envelope the most:
 - query class and candidate budget
@@ -608,11 +620,16 @@ Required setup:
 - Repository secret: `CARGO_REGISTRY_TOKEN` (crates.io publish token)
 
 Behavior:
-- Runs only on stable `v*` tags (skips prerelease tags containing `-`).
-- Verifies tag/version alignment for the top-level `frankensearch` crate.
-- Publishes the audited crate sequence in dependency order: `frankensearch-core`, `frankensearch-embed`, `frankensearch-index`, `frankensearch-lexical`, `frankensearch-fusion`, `frankensearch-storage`, `frankensearch`.
+- Runs only on `crates-v*` tags (the `v*` tags cut `fsfs` binary releases; the two lines are versioned independently: `fsfs 1.7.0` ships `frankensearch 0.4.2`).
+- Derives the publish sequence from `scripts/check_crates_publish_contract.sh --mode gate --scope workspace`: every workspace member without `publish = false` (`frankensearch-quill-gauntlet` and `tools/optimize_params` are excluded), in dependency order, `frankensearch-quill` before `frankensearch-fusion` and the facade.
 - Runs per-crate `cargo publish --dry-run` checks before real publish.
 - Publishes crates sequentially to reduce crates.io index race failures and treats already-published crate versions as idempotent success.
+
+State as of 2026-09-01: all GitHub Actions workflows in this repository are disabled, so
+the lanes above describe the intended automation, not what produced the current releases.
+`fsfs` v1.7.0 and the `frankensearch` 0.4.x crates were built and published manually with
+the same scripts and checks; `docs/fsfs-packaging-release-install-contract.md` and
+`docs/crates-publishing-contract.md` are the authoritative recipes.
 
 ## Troubleshooting by Symptom
 

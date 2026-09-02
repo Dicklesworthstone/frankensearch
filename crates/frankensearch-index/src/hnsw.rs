@@ -2807,7 +2807,9 @@ fn fingerprint_hnsw_sidecar(path: &Path) -> SearchResult<HnswSidecarDigest> {
 }
 
 /// Feed an `&[f32]` into the FNV-1a state in little-endian byte order without
-/// any unsafe reinterpretation (the crate is `#![forbid(unsafe_code)]`).
+/// any unsafe reinterpretation (this module holds no `unsafe`; the crate's
+/// only `unsafe` sites are the SIMD kernels and the `memmap2` read path, each
+/// under a per-site `#[allow(unsafe_code)]` beneath the workspace `deny`).
 /// One `to_le_bytes()` per element compiles to a tight loop.
 #[inline]
 fn fnv1a_update_f32(mut h: u64, vec: &[f32]) -> u64 {

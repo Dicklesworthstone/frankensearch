@@ -2,22 +2,25 @@
 
 This document is the contributor-facing map of the current `frankensearch` workspace. It focuses on runtime behavior, crate boundaries, and the design choices that matter when you are changing code.
 
-## 1) Workspace Crate Map (12 Crates)
+## 1) Workspace Crate Map (15 Members)
 
 | Crate | Purpose |
 |---|---|
-| `frankensearch-core` | Shared contracts: traits, errors, config, canonicalization, query classes, telemetry types |
-| `frankensearch-embed` | Embedder implementations and model discovery/cache/download glue |
-| `frankensearch-index` | FSVI vector format, search kernels (brute force + optional ANN), index builders |
-| `frankensearch-lexical` | Tantivy-backed `LexicalSearch` implementation |
-| `frankensearch-fusion` | RRF fusion, blending, progressive two-tier search orchestration |
-| `frankensearch-rerank` | Optional cross-encoder reranking (FlashRank/ONNX) |
+| `frankensearch-core` | Shared contracts: traits (`Embedder`, `LexicalRead`, …), errors, config, canonicalization, query classes, telemetry types |
+| `frankensearch-embed` | Embedder implementations (hash control, Model2Vec/potion, FastEmbed/MiniLM, native multilingual) and model discovery/cache/download glue |
+| `frankensearch-index` | FSVI vector format, search kernels (brute force, optional `ann` via `frankenhnsw`, in-tree `native_hnsw` not yet on the search path), index builders |
+| `frankensearch-quill` | Native pure-Rust BM25 lexical engine (FSLX segments, delta-visible indexing); the default lexical backend behind the facade `lexical`/`quill` features and the only one `fsfs` ships |
+| `frankensearch-lexical` | Tantivy-backed lexical implementation, retained as the pinned conformance oracle (`lexical-tantivy`) and for external CASS schema-v8 interop (`cass-compat`); not in default builds |
+| `frankensearch-quill-gauntlet` | Differential conformance / metamorphic / perf gauntlet certifying Quill against the Tantivy oracle (`publish = false`) |
+| `frankensearch-fusion` | RRF fusion, blending, progressive two-tier search orchestration (`TwoTierSearcher`) |
+| `frankensearch-rerank` | Optional cross-encoder reranking: pure-Rust frankentorch `native` backend, optional FastEmbed/ONNX alternative; library feature only |
 | `frankensearch-storage` | FrankenSQLite metadata, dedup/content-hash, persistent embedding queue |
-| `frankensearch-durability` | Repair trailer and durability workflows, including Tantivy/FSVI helpers |
+| `frankensearch-durability` | RaptorQ repair trailer and protect/verify/repair workflows for Quill segments and FSVI |
 | `frankensearch-fsfs` | Standalone CLI/TUI search product (`fsfs`) built on library crates |
 | `frankensearch-tui` | Shared TUI framework primitives (screens/shell/input/replay/theme) |
-| `frankensearch-ops` | Fleet/operations console crate on top of `frankensearch-tui` |
+| `frankensearch-ops` | Fleet/operations console crate on top of `frankensearch-tui` (library + simulator-fed binary; no shipped telemetry source yet) |
 | `frankensearch` | Facade crate that re-exports public APIs across the workspace |
+| `tools/optimize_params` | Parameter search helper (`optimize-params`, `publish = false`) |
 
 High-level dependency arrows:
 
@@ -32,10 +35,12 @@ frankensearch-core
   -> frankensearch-durability
   -> frankensearch-tui
 
-frankensearch-fusion -> (embed, index, optional lexical/rerank)
-frankensearch-fsfs   -> (core, tui)
+frankensearch-quill  -> (core, index formats; optional durability)
+frankensearch-fusion -> (embed, index, optional quill/lexical/rerank)
+frankensearch-quill-gauntlet -> (quill, lexical as the pinned Tantivy oracle, fusion)
+frankensearch-fsfs   -> (core, embed, index, quill, storage, durability, tui; lexical only behind `shadow-oracle`)
 frankensearch-ops    -> (core, tui)
-frankensearch facade -> (core, embed, index, fusion, optional lexical/rerank/storage/durability)
+frankensearch facade -> (core, embed, index, fusion, quill by default for `lexical`; optional lexical-tantivy/rerank/storage/durability)
 ```
 
 Mermaid dependency view:

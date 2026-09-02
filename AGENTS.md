@@ -74,7 +74,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml workspace with `workspace = true` pattern
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
+- **Unsafe code:** Workspace lint is `unsafe_code = "deny"` (root `Cargo.toml`), not `forbid`: `frankensearch-quill`, `-quill-gauntlet`, `-ops`, and `-tui` carry `#![forbid(unsafe_code)]`; the SIMD kernels (`frankensearch-index/src/simd.rs`, `frankensearch-embed/src/simd.rs`, `-core/src/simd.rs`), the `memmap2` read paths (`-index/src/mapped_file.rs`, `-durability`), and fsfs lifecycle plumbing (`kill(2)`, `setsid`) opt in per site with a commented `#[allow(unsafe_code)]`. Do not add a new `unsafe` site outside those classes.
 
 ### Async Runtime: asupersync (MANDATORY — NO TOKIO)
 
@@ -102,7 +102,8 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `fastembed` | ONNX-based text embeddings (MiniLM-L6-v2 quality tier) |
 | `safetensors` + `tokenizers` | Model2Vec static embeddings (potion-128M fast tier) |
 | `tantivy` | Full-text BM25 search engine |
-| `ort` | ONNX Runtime for cross-encoder reranking |
+| `ort` | ONNX Runtime, reached only through `fastembed` (the MiniLM quality **embedder**); reranking does not use it |
+| `frankentorch-*` (`ft-api`, `ft-core`, `ft-autograd`, …) | Pure-Rust tensor runtime behind the `native` cross-encoder reranker (crates.io `frankentorch-*`, renamed via `package =`) |
 | `serde` + `serde_json` | Serialization |
 | `thiserror` | Ergonomic error type derivation |
 | `tracing` | Structured logging and diagnostics |
@@ -264,7 +265,7 @@ Query → Canonicalize → Classify → ┬─ Fast Embed (potion, 0.57ms) → V
                                                                                     │
                                                                 Two-Tier Blend (0.7/0.3)
                                                                                     │
-                                                             Optional FlashRank Rerank
+                                                  Optional cross-encoder rerank (library `rerank`)
                                                                                     │
                                                                    yield Refined (~150ms)
 ```
@@ -280,7 +281,7 @@ frankensearch/
 │   ├── frankensearch-index/           # FSVI vector index, SIMD dot product, top-k search
 │   ├── frankensearch-lexical/         # Tantivy BM25 integration
 │   ├── frankensearch-fusion/          # RRF, blending, TwoTierSearcher, telemetry/queue utilities
-│   ├── frankensearch-rerank/          # FlashRank cross-encoder
+│   ├── frankensearch-rerank/          # Cross-encoder reranker (frankentorch native; optional fastembed/ONNX)
 │   ├── frankensearch-storage/         # FrankenSQLite metadata + job queue + optional FTS5
 │   ├── frankensearch-durability/      # Repair/protection layer for index artifacts
 │   ├── frankensearch-fsfs/            # Standalone CLI product
@@ -289,10 +290,11 @@ frankensearch/
 │   ├── frankensearch-quill/           # Native pure-Rust BM25 lexical engine
 │   └── frankensearch-quill-gauntlet/  # Differential conformance/perf gauntlet certifying Quill
 ├── frankensearch/                     # Facade crate (re-exports everything)
+│   ├── tests/                         # Cross-component integration tests (integration.rs, cross_component.rs, treasure_island_e2e.rs, …)
+│   ├── benches/                       # Facade benchmarks (search_bench.rs, fsvi_4bit_vs_incumbent.rs, …)
+│   └── examples/                      # Usage examples (basic_search.rs, streaming_search.rs, …)
 ├── tools/optimize_params/             # Parameter search/optimization helper tool
-├── tests/                             # Cross-component integration tests
-├── benches/                           # Performance benchmarks
-└── examples/                          # Usage examples
+└── tests/                             # Shell/bats fixtures only (installer tests, e2e scripts); no Rust tests live here
 ```
 
 ### Key Files by Crate
@@ -316,7 +318,7 @@ frankensearch/
 | `frankensearch-fsfs` | `src/runtime.rs` | CLI command execution lanes, search/index orchestration, stream protocol wiring |
 | `frankensearch-tui` | `src/shell.rs` | Shared app-shell frame loop, navigation, overlays, and status plumbing |
 | `frankensearch-ops` | `src/storage.rs` | Ops telemetry storage/materialization and control-plane persistence |
-| `frankensearch-rerank` | `src/lib.rs` | FlashRank cross-encoder with sigmoid activation |
+| `frankensearch-rerank` | `src/native.rs` | Pure-Rust frankentorch cross-encoder (int8 BERT forward pass, ms-marco-MiniLM / jina); `src/fastembed_reranker.rs` is the optional ONNX alternative. Not used by `fsfs` (no dependency); library `rerank` feature only |
 | `frankensearch-quill` | `src/index.rs` | Native pure-Rust BM25 index, postings, queries, and segment lifecycle |
 | `frankensearch-quill` | `src/argus.rs` | BM25 query execution and scoring |
 | `frankensearch-quill` | `src/quiver.rs` | Postings and positions store |
@@ -352,21 +354,23 @@ full = ['durable', 'rerank', 'ann', 'download', 'graph', 'api']  # Everything ex
 full-fts5 = ['full', 'fts5']                                     # Full stack + FTS5
 ```
 
-**Packaging boundary (bd-8nqz-6-ft-registry-4hca).** Two features pull dependencies that
-come from **git, not crates.io**, and they are the only two that do:
+**Packaging boundary (bd-8nqz-6-ft-registry-4hca, resolved 2026-08-24 by gh#416).** The
+workspace has **no git dependencies**: every crate resolves from crates.io, so every facade
+feature, `full`/`full-fts5` included, is publishable. Two closures are the ones that used to
+be git-sourced and are now registry renames — keep the rename form, never the bare name:
 
-| Feature | Git-sourced closure | Why it is not registry-resolvable |
-|---------|--------------------|-----------------------------------|
-| `rerank` / `native` / `fastembed-reranker` | `ft-api`, `ft-autograd`, `ft-core`, `ft-dispatch`, `ft-kernel-cpu`, `ft-runtime` (frankentorch) | None of the six are published. `ft-api` on crates.io is an unrelated FifthTry crate whose only version (`0.1.0`) collides with ours. |
-| `ann` | `hnsw_rs` (Dicklesworthstone/hnswlib-rs fork) | Registry `hnsw_rs` 0.3.4 exists, but the fork diverges from it by 12 owner commits including an HNSW search-correctness fix — switching to the registry crate silently loses that fix. |
+| Feature | Registry closure | Why the rename matters |
+|---------|------------------|------------------------|
+| `rerank` / `native` / `fastembed-reranker` | `ft-api = { package = "frankentorch-api" }`, likewise `ft-core`, `ft-autograd` (crates.io `frankentorch-*` 0.1.x) | crates.io `ft-api` belongs to an unrelated FifthTry crate; the `package =` rename keeps our import paths while resolving the right crate. |
+| `ann` | `hnsw_rs = { package = "frankenhnsw", version = "=0.3.5" }` | The published fork carries the layer-invariant/search-correctness fixes; registry `hnsw_rs` 0.3.4 is upstream and would silently drop them. |
 
-`full` and `full-fts5` include both, so **every feature at or above `rerank` or `ann` is
-unpublishable to crates.io today**. `default`, `hash`, `semantic`, `hybrid`, `persistent`,
-and `durable` are git-free and registry-clean. Note that `rerank` and `native` are exact
-aliases — there is no ONNX-only rerank lane, and `fastembed-reranker` also enables `native`.
+`rerank` and `native` are exact aliases — there is no ONNX-only rerank lane, and
+`fastembed-reranker` also enables `native`. Published line as of 2026-08-28: facade
+`frankensearch 0.4.2`, members `0.2.x` (see CHANGELOG). Never republish a version that
+exists on the registry; bumps go forward only.
 
-Do **not** try to make packaging pass by adding a `version` to a git dependency: `cargo
-package` strips the git source and rebinds the name to whatever crate owns it on crates.io.
+Do **not** "fix" a registry rename by adding a bare `version` to a git-style dependency:
+`cargo package` rebinds the name to whatever crate owns it on crates.io.
 `scripts/check_crates_publish_contract.sh` fails closed on this via
 `DEPENDENCY_GIT_REGISTRY_NAME_UNPROVEN`.
 
