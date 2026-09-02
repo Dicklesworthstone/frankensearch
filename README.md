@@ -142,7 +142,12 @@ fsfs search "how does retry backoff work" --limit 5
 
 Plain `fsfs index <path>` is a one-shot operation: it seals the generation and
 exits. Use `fsfs watch <path>` or `fsfs index <path> --watch` only when you
-explicitly want a long-running incremental watcher.
+explicitly want a long-running incremental watcher. Known limit (bd-z2nfa):
+the watcher holds the vector generations' exclusive writer lock for its whole
+life, so `fsfs search` from another process (and the query daemon) is refused
+with `fsvi.map_lock` until the watcher stops; new and changed files are
+ingested and become searchable the moment it exits, and the in-process TUI
+cockpit can search a watched index.
 
 Example output:
 

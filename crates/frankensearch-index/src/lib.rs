@@ -809,13 +809,58 @@ impl Deref for VectorIndexData {
 /// unsafe.
 #[derive(Debug)]
 enum FsviMapLock {
-    Shared { file: File },
-    Exclusive { file: File },
+    Shared {
+        file: File,
+        path: PathBuf,
+        acquired: Instant,
+    },
+    Exclusive {
+        file: File,
+        path: PathBuf,
+        acquired: Instant,
+    },
 }
 
 impl FsviMapLock {
     const fn is_writer(&self) -> bool {
         matches!(self, Self::Exclusive { .. })
+    }
+
+    const fn mode(&self) -> &'static str {
+        if self.is_writer() {
+            "exclusive"
+        } else {
+            "shared"
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Shared { path, .. } | Self::Exclusive { path, .. } => path,
+        }
+    }
+
+    fn acquired(&self) -> Instant {
+        match self {
+            Self::Shared { acquired, .. } | Self::Exclusive { acquired, .. } => *acquired,
+        }
+    }
+}
+
+/// Lock lifecycle tracing (`RUST_LOG=frankensearch_index::map_lock=debug`):
+/// a refused `fsvi.map_lock` is only diagnosable when the holder that is
+/// still alive can be named, so every acquisition and release is logged with
+/// its mode, hold time, and thread.
+impl Drop for FsviMapLock {
+    fn drop(&mut self) {
+        tracing::debug!(
+            target: "frankensearch_index::map_lock",
+            path = %self.path().display(),
+            mode = self.mode(),
+            held_ms = self.acquired().elapsed().as_millis(),
+            thread = ?std::thread::current().id(),
+            "fsvi map lock released"
+        );
     }
 }
 
@@ -1812,20 +1857,52 @@ impl VectorIndex {
         } else {
             File::open(path).map_err(SearchError::Io)?
         };
+        let acquired = Instant::now();
         let map_lock = if writer {
-            file.try_lock()
-                .map_err(|error| map_lock_error(path, "exclusive writer", &error))?;
-            FsviMapLock::Exclusive { file }
+            file.try_lock().map_err(|error| {
+                tracing::debug!(
+                    target: "frankensearch_index::map_lock",
+                    path = %path.display(),
+                    mode = "exclusive",
+                    thread = ?std::thread::current().id(),
+                    "fsvi map lock refused: {error}"
+                );
+                map_lock_error(path, "exclusive writer", &error)
+            })?;
+            FsviMapLock::Exclusive {
+                file,
+                path: path.to_path_buf(),
+                acquired,
+            }
         } else {
-            file.try_lock_shared()
-                .map_err(|error| map_lock_error(path, "shared reader", &error))?;
-            FsviMapLock::Shared { file }
+            file.try_lock_shared().map_err(|error| {
+                tracing::debug!(
+                    target: "frankensearch_index::map_lock",
+                    path = %path.display(),
+                    mode = "shared",
+                    thread = ?std::thread::current().id(),
+                    "fsvi map lock refused: {error}"
+                );
+                map_lock_error(path, "shared reader", &error)
+            })?;
+            FsviMapLock::Shared {
+                file,
+                path: path.to_path_buf(),
+                acquired,
+            }
         };
+        tracing::debug!(
+            target: "frankensearch_index::map_lock",
+            path = %path.display(),
+            mode = map_lock.mode(),
+            thread = ?std::thread::current().id(),
+            "fsvi map lock acquired"
+        );
         let data = match &map_lock {
-            FsviMapLock::Exclusive { file } => VectorIndexData::Mutable(unsafe {
+            FsviMapLock::Exclusive { file, .. } => VectorIndexData::Mutable(unsafe {
                 MmapMut::map_mut(file).map_err(SearchError::Io)?
             }),
-            FsviMapLock::Shared { file } => {
+            FsviMapLock::Shared { file, .. } => {
                 VectorIndexData::ReadOnly(unsafe { Mmap::map(file).map_err(SearchError::Io)? })
             }
         };
