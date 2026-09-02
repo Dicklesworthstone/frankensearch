@@ -143,6 +143,21 @@ mod loader_only {
             I: IntoIterator<Item = S>,
             S: AsRef<OsStr>,
         {
+            self.run_with_env(cwd, label, args, timeout, &[])
+        }
+
+        fn run_with_env<I, S>(
+            &self,
+            cwd: &Path,
+            label: &str,
+            args: I,
+            timeout: Duration,
+            extra_env: &[(&str, &str)],
+        ) -> CommandOutcome
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
             let verified_executable = fsfs_binary();
             let stdout_path = self.log_root.join(format!("{label}.stdout.log"));
             let stderr_path = self.log_root.join(format!("{label}.stderr.log"));
@@ -173,6 +188,9 @@ mod loader_only {
                 .env_remove("HUGGINGFACE_HUB_CACHE")
                 .stdout(Stdio::from(stdout_file))
                 .stderr(Stdio::from(stderr_file));
+            for (key, value) in extra_env {
+                command.env(key, value);
+            }
 
             eprintln!(
                 "[default-build-e2e] stage={label} event=spawn binary={} model_root={} timeout_ms={}",
@@ -1051,6 +1069,174 @@ mod loader_only {
         eprintln!(
             "[default-build-e2e] stage=hybrid-control event=verified path=retry.md lexical_rank=0 semantic_rank=0 in_both_sources=true"
         );
+
+        // Reality check 2026-09-01, G1 cost half: the fsfs read path serves one
+        // fast-tier generation, so a search must never open the quality model
+        // (an ONNX session load on every process start). Positive observable:
+        // the potion load is logged; planted negative: no FastEmbed load.
+        let lazy_outcome = fsfs.run_with_env(
+            temp.path(),
+            "search-loads-fast-tier-only",
+            [
+                "search",
+                "bounded retries with exponential backoff",
+                "--index-dir",
+                index.to_str().expect("UTF-8 index path"),
+                "--no-daemon",
+                "--limit",
+                SEARCH_LIMIT,
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[("FRANKENSEARCH_LOG", "info")],
+        );
+        assert_finished_successfully("fast-tier-only search", &lazy_outcome);
+        assert!(
+            lazy_outcome.stderr.contains("Model2Vec model loaded"),
+            "the fast tier must be loaded for a semantic search; stderr:\n{}",
+            lazy_outcome.stderr
+        );
+        assert!(
+            !lazy_outcome.stderr.contains("FastEmbed model loaded"),
+            "a search over a fast-tier generation must not load the quality model; stderr:\n{}",
+            lazy_outcome.stderr
+        );
+        eprintln!(
+            "[default-build-e2e] stage=lazy-quality-load event=verified fast_loaded=true quality_loaded=false"
+        );
+
+        // Reality check 2026-09-01, G2: the auto-spawned query daemon must
+        // outlive the search that spawned it (so the next search is warm), be
+        // stoppable through its protocol, and reclaim itself after its idle
+        // timeout so it can never linger as an orphan.
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::net::UnixStream;
+
+            // AF_UNIX paths are limited to ~107 bytes, so the sockets live in
+            // the runtime dir (or the system temp dir), never under the
+            // fixture root, which can be arbitrarily deep.
+            let socket_dir = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_dir())
+                .unwrap_or_else(std::env::temp_dir);
+            let socket = socket_dir.join(format!("fsfs-e2e-query-{}.sock", std::process::id()));
+            let idle_socket = socket_dir.join(format!("fsfs-e2e-idle-{}.sock", std::process::id()));
+            assert!(
+                socket.as_os_str().len() < 100 && idle_socket.as_os_str().len() < 100,
+                "daemon socket path too long for AF_UNIX; set XDG_RUNTIME_DIR or TMPDIR to a short directory: {}",
+                socket.display()
+            );
+            let socket_arg = socket.to_str().expect("UTF-8 socket path");
+            let index_arg = index.to_str().expect("UTF-8 index path");
+            let daemon_args = [
+                "search",
+                "bounded retries with exponential backoff",
+                "--index-dir",
+                index_arg,
+                "--daemon-socket",
+                socket_arg,
+                "--limit",
+                SEARCH_LIMIT,
+                "--format",
+                "json",
+            ];
+
+            let cold = fsfs.run(
+                temp.path(),
+                "daemon-search-cold",
+                daemon_args,
+                QUICKSTART_TIMEOUT,
+            );
+            assert_finished_successfully("daemon-backed cold search", &cold);
+
+            // The daemon must still accept connections after its spawning
+            // search has exited (the old PDEATHSIG hook killed it here).
+            let mut survived = false;
+            for _ in 0..40 {
+                if UnixStream::connect(&socket).is_ok() {
+                    survived = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                survived,
+                "the query daemon must outlive the search that spawned it (socket {})",
+                socket.display()
+            );
+
+            let warm = fsfs.run(
+                temp.path(),
+                "daemon-search-warm",
+                daemon_args,
+                QUICKSTART_TIMEOUT,
+            );
+            assert_finished_successfully("daemon-backed warm search", &warm);
+            let warm_envelope: Value =
+                serde_json::from_str(&warm.stdout).expect("parse warm daemon search envelope");
+            assert_eq!(
+                warm_envelope.get("ok").and_then(Value::as_bool),
+                Some(true),
+                "warm daemon search must succeed: {warm_envelope}"
+            );
+            assert!(
+                warm.elapsed * 2 < cold.elapsed,
+                "a warm daemon-backed search must not pay the model load again: cold={:?} warm={:?}",
+                cold.elapsed,
+                warm.elapsed
+            );
+            eprintln!(
+                "[default-build-e2e] stage=daemon-survives-spawner event=verified cold_ms={} warm_ms={}",
+                cold.elapsed.as_millis(),
+                warm.elapsed.as_millis()
+            );
+
+            // Protocol stop reclaims the socket.
+            let mut quit = UnixStream::connect(&socket).expect("connect to stop the daemon");
+            quit.write_all(b"quit\n").expect("send quit to the daemon");
+            drop(quit);
+            let mut reclaimed = false;
+            for _ in 0..200 {
+                if !socket.exists() {
+                    reclaimed = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            assert!(reclaimed, "the daemon must unlink its socket after quit");
+
+            // Idle timeout: a daemon with a 1.5 s idle budget exits on its own
+            // and leaves no socket behind. Planted negative: the run would
+            // time out (and fail) if the daemon ignored its idle budget.
+            let idle_outcome = fsfs.run(
+                temp.path(),
+                "daemon-idle-exit",
+                [
+                    "serve",
+                    "--daemon-socket",
+                    idle_socket.to_str().expect("UTF-8 idle socket path"),
+                    "--idle-timeout-ms",
+                    "1500",
+                    "--index-dir",
+                    index_arg,
+                    "--format",
+                    "jsonl",
+                ],
+                Duration::from_secs(90),
+            );
+            assert_finished_successfully("idle daemon self-exit", &idle_outcome);
+            assert!(
+                !idle_socket.exists(),
+                "an idle-expired daemon must unlink its socket"
+            );
+            eprintln!(
+                "[default-build-e2e] stage=daemon-idle-exit event=verified idle_timeout_ms=1500 wall_ms={}",
+                idle_outcome.elapsed.as_millis()
+            );
+        }
         Ok(())
     }
 }

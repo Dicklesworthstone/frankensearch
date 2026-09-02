@@ -466,6 +466,12 @@ const FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS: u64 = 5_000;
 const FSFS_SERVE_ACCEPT_POLL_MS: u64 = 50;
 const FSFS_DAEMON_CONNECT_MAX_ATTEMPTS: usize = 80;
 const FSFS_DAEMON_CONNECT_RETRY_DELAY_MS: u64 = 25;
+/// Default idle lifetime of an auto-spawned query daemon. The daemon detaches
+/// from the `fsfs search` that spawned it (so the second search is fast) and
+/// exits on its own after this long without a client, so it can never
+/// accumulate as an orphan. `fsfs serve --daemon --idle-timeout-ms 0` opts
+/// out for a deliberately persistent daemon.
+const FSFS_DAEMON_IDLE_TIMEOUT_MS: u64 = 600_000;
 
 #[cfg(all(test, unix))]
 thread_local! {
@@ -5384,7 +5390,7 @@ impl FsfsRuntime {
 
             if fast_cached && quality_cached && !self.config.search.fast_only {
                 return Ok(Some(
-                    "Search readiness: fast and quality model caches passed their registered manifests. Run `fsfs doctor` to exercise both compiled loaders before indexing. Full search fails before Initial if the fast lane is unavailable; a quality-only failure preserves Initial and emits an actionable RefinementFailed phase."
+                    "Search readiness: fast and quality model caches passed their registered manifests. Run `fsfs doctor` to exercise both compiled loaders before indexing. Full search fails before Initial if the fast lane is unavailable. Searches over a standard `fsfs index` generation serve the fast tier only: the quality tier is reported as unavailable (no quality-tier vector generation is built yet), so no REFINED phase follows INITIAL."
                         .to_owned(),
                 ));
             }
@@ -5650,6 +5656,22 @@ impl FsfsRuntime {
         let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         let shared = Arc::new(asupersync::sync::Mutex::new((resources, hot_cache)));
         let stop_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Idle lifetime: the daemon exits by itself once no client has
+        // connected for `idle_timeout` and no request is in flight, so a
+        // detached daemon can never linger as an orphan (see
+        // `spawn_search_daemon`). Zero disables the timeout.
+        let idle_timeout = Duration::from_millis(
+            self.cli_input
+                .daemon_idle_timeout_ms
+                .unwrap_or(FSFS_DAEMON_IDLE_TIMEOUT_MS),
+        );
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut last_activity = Instant::now();
+        info!(
+            socket = %socket_path.display(),
+            idle_timeout_ms = idle_timeout.as_millis(),
+            "fsfs query daemon listening"
+        );
 
         // Every accepted client runs on its own scoped thread so one stalled
         // or partial client cannot serialize the rest; search execution
@@ -5669,8 +5691,21 @@ impl FsfsRuntime {
                     break;
                 }
                 let (stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        last_activity = Instant::now();
+                        connection
+                    }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        if !idle_timeout.is_zero()
+                            && in_flight.load(std::sync::atomic::Ordering::Acquire) == 0
+                            && last_activity.elapsed() >= idle_timeout
+                        {
+                            info!(
+                                idle_timeout_ms = idle_timeout.as_millis(),
+                                "fsfs query daemon idle timeout reached; exiting"
+                            );
+                            break;
+                        }
                         std::thread::sleep(Duration::from_millis(FSFS_SERVE_ACCEPT_POLL_MS));
                         continue;
                     }
@@ -5698,6 +5733,8 @@ impl FsfsRuntime {
                 let shared = Arc::clone(&shared);
                 let stop_requested = Arc::clone(&stop_requested);
                 let runtime = self.clone();
+                let in_flight = Arc::clone(&in_flight);
+                in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 scope.spawn(move || {
                     Self::handle_search_serve_socket_client(
                         runtime,
@@ -5706,6 +5743,7 @@ impl FsfsRuntime {
                         stop_requested,
                         hot_cache_enabled,
                     );
+                    in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 });
             }
             Ok(())
@@ -6172,7 +6210,6 @@ impl FsfsRuntime {
 
     #[cfg(unix)]
     fn spawn_search_daemon(&self, socket_path: &Path) -> SearchResult<()> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
         use std::os::unix::process::CommandExt;
 
         if let Some(parent) = socket_path.parent()
@@ -6186,6 +6223,8 @@ impl FsfsRuntime {
             .arg("serve")
             .arg("--daemon-socket")
             .arg(socket_path)
+            .arg("--idle-timeout-ms")
+            .arg(FSFS_DAEMON_IDLE_TIMEOUT_MS.to_string())
             .arg("--format")
             .arg("jsonl")
             .stdin(Stdio::null())
@@ -6207,64 +6246,39 @@ impl FsfsRuntime {
             command.arg("--no-color");
         }
 
-        // SAFETY: pre_exec runs in the forked child before execve, so the
-        // only thing the closure can safely do is async-signal-safe
-        // syscalls. `prctl(PR_SET_PDEATHSIG)` is on the official
-        // async-signal-safe list (it's just a direct syscall with no libc
-        // heap/stdio touching), so this is sound per the std docs.
+        // Detach the daemon from the search that spawned it. Two properties
+        // must hold at once, and they come from two different places:
         //
-        // What this buys us: if the spawning process (the cargo-test
-        // parent, or the interactive shell invoking `fsfs search
-        // --daemon`) dies from any cause — SIGKILL, segfault, oomd,
-        // ctrl-c on the terminal — the kernel will deliver SIGTERM to
-        // this daemon. Without this hook, the daemon got reparented to
-        // PID 1 and stayed alive with its socket open, blocking the
-        // next index/search attempt at bind() time. The Apr 21 2026
-        // trj incident accumulated 41 orphaned daemons exactly this way.
+        //   1. The daemon OUTLIVES the spawning `fsfs search`. That is the
+        //      entire point of the daemon transport (amortize model load
+        //      across invocations). `setsid()` in the forked child gives it
+        //      its own session and process group, so neither the spawning
+        //      search's exit nor a terminal SIGHUP reaches it. The previous
+        //      `PR_SET_PDEATHSIG` hook here did the opposite: every daemon
+        //      was SIGTERMed the moment its spawning search exited, so each
+        //      `fsfs search` paid the full model load, forked a daemon, and
+        //      then killed it (measured 3 s per call, four calls in a row —
+        //      reality check 2026-09-01, G2).
         //
-        // We send SIGTERM (not SIGKILL) so the daemon gets a chance to
-        // flush in-flight writes to its index and socket. The MCP/CLI
-        // layer that starts the daemon will eventually retry if the
-        // child is gone on reconnect, so the window where the child
-        // dies mid-shutdown is handled by the existing reconnect
-        // plumbing in `search_via_daemon`.
+        //   2. The daemon NEVER ACCUMULATES AS AN ORPHAN. The Apr 21 2026
+        //      trj incident (41 orphaned daemons holding sockets open and
+        //      blocking bind()) is handled where it belongs: the accept
+        //      loop in `run_search_serve_socket_command` exits on its own
+        //      after `--idle-timeout-ms` without a client (spawned with
+        //      `FSFS_DAEMON_IDLE_TIMEOUT_MS`), and a socket left behind by a
+        //      crashed daemon refuses connections and is unlinked at the
+        //      next bind. A deliberately persistent daemon is an explicit
+        //      `fsfs serve --daemon --idle-timeout-ms 0`.
         //
-        // Note: users who intentionally want a persistent daemon that
-        // outlives their shell should use `nohup fsfs search --daemon …`
-        // or `systemd-run --user --scope fsfs search --daemon …`, both
-        // of which reparent the process before pdeathsig can fire.
-        //
-        // The crate defaults to `#![deny(unsafe_code)]`, but lifecycle
-        // plumbing (kill(2), daemonization, etc.) is explicitly allowed
-        // per the lib.rs comment. pre_exec is unsafe because the closure
-        // runs in the forked child and the stdlib can't verify the
-        // async-signal-safety of whatever the caller puts in there; the
-        // two calls we make — `prctl` and `getppid` — are both on the
-        // signal-safe list (see signal-safety(7)).
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // The crate is `#![deny(unsafe_code)]`; lifecycle plumbing is the
+        // documented allowance (lib.rs). pre_exec runs in the forked child
+        // before execve, so the closure may only make async-signal-safe
+        // calls, and `setsid` is on that list (signal-safety(7)).
         #[allow(unsafe_code)]
         unsafe {
             command.pre_exec(|| {
-                if libc::prctl(
-                    libc::PR_SET_PDEATHSIG,
-                    libc::SIGTERM as libc::c_ulong,
-                    0,
-                    0,
-                    0,
-                ) == -1
-                {
+                if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
-                }
-                // Race guard: if the parent already died between fork and
-                // this point, we won't receive the pdeathsig (the kernel
-                // only delivers it on *subsequent* parent death, not
-                // retroactively). Detect that case by checking getppid()
-                // and abort the child so we don't orphan immediately at
-                // startup.
-                if libc::getppid() == 1 {
-                    return Err(std::io::Error::other(
-                        "parent exited before daemon could install pdeathsig",
-                    ));
                 }
                 Ok(())
             });
@@ -12863,13 +12877,21 @@ impl FsfsRuntime {
             let options = DetectOptions {
                 offline: Some(self.config.indexing.offline),
             };
-            let embedder =
-                EmbedderStack::auto_detect_semantic_with_options(Some(&configured_root), &options)
-                    .and_then(|stack| {
-                        let embedder = stack.fast_arc();
-                        Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
-                        Ok(embedder)
-                    });
+            // Fast tier only: the fsfs read path serves one fast-tier vector
+            // generation, and the quality embedder is resolved lazily by
+            // `maybe_prepare_quality_embedder` if a query plan ever admits the
+            // quality stage. Detecting the full stack here loaded the ONNX
+            // quality model on every process start for a tier that was then
+            // discarded (reality check 2026-09-01, G1).
+            let embedder = EmbedderStack::auto_detect_fast_semantic_with_options(
+                Some(&configured_root),
+                &options,
+            )
+            .and_then(|stack| {
+                let embedder = stack.fast_arc();
+                Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
+                Ok(embedder)
+            });
 
             #[cfg(not(feature = "semantic-loaders"))]
             let embedder = embedder.inspect_err(|_| {
@@ -15620,7 +15642,7 @@ fn print_cli_help() {
         "  search <query>            Search indexed corpus (daemon-backed by default on unix)"
     );
     println!(
-        "  serve [--daemon]          Run long-lived query server (stdio by default, socket daemon with --daemon)"
+        "  serve [--daemon] [--idle-timeout-ms <ms>]  Run long-lived query server (stdio by default, socket daemon with --daemon; daemon exits after <ms> idle, 0 = never)"
     );
     println!("  index [path]              Build/update index");
     println!("  watch [path]              Alias for index --watch");

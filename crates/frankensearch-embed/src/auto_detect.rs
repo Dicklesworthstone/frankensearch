@@ -364,6 +364,59 @@ impl EmbedderStack {
         Self::auto_detect_with_options(model_root, options)?.require_semantic()
     }
 
+    /// Detect only the fast tier and refuse a hash-only result.
+    ///
+    /// A host whose read path never consults a quality tier (the `fsfs` CLI
+    /// serves one fast-tier vector generation) must not pay for opening the
+    /// quality model on every process start: on the registered stack that is
+    /// an ONNX session load worth hundreds of milliseconds per invocation.
+    /// This resolves the same offline/remote policy as
+    /// [`Self::auto_detect_with_options`], constructs the fast tier only, and
+    /// applies [`Self::require_semantic`]. The returned stack reports
+    /// [`TwoTierAvailability::FastOnly`] and has no quality embedder; callers
+    /// that later need the quality tier resolve it separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::EmbedderUnavailable`] when no semantic fast
+    /// model is present (hash control is refused), plus the same policy errors
+    /// as [`Self::auto_detect_with_options`].
+    pub fn auto_detect_fast_semantic_with_options(
+        model_root: Option<&Path>,
+        options: &DetectOptions,
+    ) -> SearchResult<Self> {
+        let remote_env = RemoteIntentEnv::from_environment();
+        let (offline, _remote) = resolve_remote_intent(*options, &remote_env)?;
+
+        #[cfg(all(
+            feature = "download",
+            any(feature = "model2vec", feature = "fastembed")
+        ))]
+        let fast = {
+            let policy = download_policy_from_environment(offline);
+            detect_fast_embedder(model_root)
+                .or_else(|| maybe_lazy_fast_embedder(model_root, policy))
+        };
+        #[cfg(not(all(
+            feature = "download",
+            any(feature = "model2vec", feature = "fastembed")
+        )))]
+        let fast = {
+            let _ = offline;
+            detect_fast_embedder(model_root)
+        };
+
+        let fast = fast.or_else(hash_fallback_embedder).ok_or_else(|| {
+            SearchError::EmbedderUnavailable {
+                model: "fast-tier".to_owned(),
+                reason: "no model2vec/hash embedder available in this build".to_owned(),
+            }
+        })?;
+        let stack = Self::from_parts(fast, None);
+        stack.report_readiness();
+        stack.require_semantic()
+    }
+
     /// Fail closed when this stack has no semantic fast embedder.
     ///
     /// Hash remains available via [`Self::auto_detect`] and
@@ -2275,6 +2328,32 @@ mod tests {
     }
 
     #[cfg(all(feature = "hash", not(feature = "bundled-default-models")))]
+    #[test]
+    fn fast_only_detection_refuses_hash_control_and_never_carries_a_quality_tier() {
+        // Planted negative: with no model bytes on disk and an explicit offline
+        // policy, the fast-only detector must fail closed exactly like the
+        // two-tier semantic detector (hash control is not a search engine).
+        let temp = tempfile::tempdir().unwrap();
+        let options = DetectOptions {
+            offline: Some(true),
+        };
+        let refused =
+            EmbedderStack::auto_detect_fast_semantic_with_options(Some(temp.path()), &options);
+        assert!(
+            matches!(refused, Err(SearchError::EmbedderUnavailable { .. })),
+            "an empty model root must not yield a usable fast-only stack: {refused:?}"
+        );
+
+        // Positive shape: a fast-only stack built from the same parts the
+        // detector produces never reports a quality tier, so a host that
+        // resolves quality separately cannot be handed a half-loaded pair.
+        let fast: Arc<dyn Embedder> = Arc::new(SemanticTestEmbedder::new("test-fast", 4));
+        let stack = EmbedderStack::from_parts(fast, None);
+        assert_eq!(stack.availability(), TwoTierAvailability::FastOnly);
+        assert!(stack.quality().is_none());
+        assert!(stack.require_semantic().is_ok());
+    }
+
     #[test]
     fn auto_detect_hash_only_when_no_models_present() {
         let temp = tempfile::tempdir().unwrap();

@@ -215,6 +215,10 @@ pub struct CliInput {
     pub daemon: bool,
     /// Optional daemon socket override (search/serve commands).
     pub daemon_socket: Option<PathBuf>,
+    /// `serve --idle-timeout-ms <ms>`: a socket daemon exits on its own after
+    /// this long without a client. `0` keeps it alive until `quit`/SIGTERM;
+    /// `None` uses the runtime default.
+    pub daemon_idle_timeout_ms: Option<u64>,
     /// Whether `--stream` was requested.
     pub stream: bool,
     /// Whether `--watch` was requested (for index command).
@@ -693,6 +697,19 @@ where
                 input.daemon_poll_ms = Some(parse_usize(value, "daemon.poll_ms")? as u64);
                 idx += 2;
             }
+            "--idle-timeout-ms" => {
+                if command != CliCommand::Serve {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--idle-timeout-ms".into(),
+                        reason: "--idle-timeout-ms is only valid for the serve command".into(),
+                    });
+                }
+                let value = expect_value(&tokens, idx, "--idle-timeout-ms")?;
+                input.daemon_idle_timeout_ms =
+                    Some(parse_usize(value, "serve.idle_timeout_ms")? as u64);
+                idx += 2;
+            }
             "--filter" => {
                 let value = expect_value(&tokens, idx, "--filter")?;
                 input.filter = Some(value.to_string());
@@ -1053,6 +1070,7 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--file"
             | "--prefix"
             | "--poll-ms"
+            | "--idle-timeout-ms"
     )
 }
 
@@ -1314,6 +1332,34 @@ mod tests {
         let input = parse_cli_args(["serve", "--daemon"]).expect("parse");
         assert_eq!(input.command, CliCommand::Serve);
         assert!(input.daemon);
+    }
+
+    #[test]
+    fn parse_serve_idle_timeout_flag() {
+        let input = parse_cli_args(["serve", "--daemon", "--idle-timeout-ms", "1500"])
+            .expect("parse serve idle timeout");
+        assert_eq!(input.command, CliCommand::Serve);
+        assert_eq!(input.daemon_idle_timeout_ms, Some(1500));
+
+        let persistent = parse_cli_args(["serve", "--daemon", "--idle-timeout-ms", "0"])
+            .expect("zero disables the idle timeout");
+        assert_eq!(persistent.daemon_idle_timeout_ms, Some(0));
+
+        let unset = parse_cli_args(["serve", "--daemon"]).expect("parse serve");
+        assert_eq!(unset.daemon_idle_timeout_ms, None);
+    }
+
+    #[test]
+    fn parse_idle_timeout_is_rejected_outside_serve() {
+        let error = parse_cli_args(["search", "query", "--idle-timeout-ms", "1500"])
+            .expect_err("search must not accept --idle-timeout-ms");
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { value, .. } if value == "--idle-timeout-ms"),
+            "unexpected error: {error}"
+        );
+        let malformed = parse_cli_args(["serve", "--idle-timeout-ms", "soon"])
+            .expect_err("non-numeric idle timeout must fail");
+        assert!(matches!(malformed, SearchError::InvalidConfig { .. }));
     }
 
     #[test]
