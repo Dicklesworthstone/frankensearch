@@ -1808,7 +1808,38 @@ impl SyncRerank for NativeReranker {
 mod tests {
     use super::*;
 
-    const MODEL_DIR: &str = "/private/tmp/ee-reranker-port/model";
+    /// Legacy hand-ported fixture location (the macOS port that produced the
+    /// parity reference). Kept last in the search order so a registered cache
+    /// on any host wins.
+    const LEGACY_MODEL_DIR: &str = "/private/tmp/ee-reranker-port/model";
+    /// Install dir of the `ms-marco-minilm-l-6-v2` manifest inside the
+    /// frankensearch model cache (`fsfs download-models ms-marco-minilm-l-6-v2`).
+    const CACHE_MODEL_DIR_NAME: &str = "ms-marco-MiniLM-L-6-v2";
+
+    fn dir_has_model(dir: &Path) -> bool {
+        dir.join(TOKENIZER_JSON).is_file()
+            && (dir.join(SAFETENSORS_PRIMARY).is_file()
+                || dir.join(SAFETENSORS_FALLBACK).is_file())
+    }
+
+    /// Resolve the model directory the real-model tests load from:
+    /// `FRANKENSEARCH_RERANK_MODEL_DIR`, else the registered model cache
+    /// (`FRANKENSEARCH_MODEL_DIR` / XDG / `~/.local/share/frankensearch/models`),
+    /// else the legacy port fixture. Only a directory that actually carries the
+    /// tokenizer and weights is returned.
+    fn model_dir() -> Option<std::path::PathBuf> {
+        let mut candidates = Vec::new();
+        if let Ok(explicit) = std::env::var("FRANKENSEARCH_RERANK_MODEL_DIR")
+            && !explicit.trim().is_empty()
+        {
+            candidates.push(std::path::PathBuf::from(explicit));
+        }
+        candidates.push(
+            frankensearch_embed::model_cache::resolve_cache_root().join(CACHE_MODEL_DIR_NAME),
+        );
+        candidates.push(std::path::PathBuf::from(LEGACY_MODEL_DIR));
+        candidates.into_iter().find(|dir| dir_has_model(dir))
+    }
 
     // (query, document, reference logit) from the validated parity_cases.json
     // (numpy reference in f64, itself validated bit-for-ranking against the real ONNX
@@ -1840,9 +1871,7 @@ mod tests {
     ];
 
     fn model_available() -> bool {
-        Path::new(MODEL_DIR).join(TOKENIZER_JSON).is_file()
-            && (Path::new(MODEL_DIR).join(SAFETENSORS_PRIMARY).is_file()
-                || Path::new(MODEL_DIR).join(SAFETENSORS_FALLBACK).is_file())
+        model_dir().is_some()
     }
 
     fn doc(id: &str, text: &str) -> RerankDocument {
@@ -1855,10 +1884,12 @@ mod tests {
     #[test]
     fn parity_logits_and_ranking_match_reference() {
         if !model_available() {
-            eprintln!("[native_reranker] SKIP parity: model dir {MODEL_DIR} not present");
+            eprintln!(
+                "[native_reranker] SKIP parity: no model dir (FRANKENSEARCH_RERANK_MODEL_DIR, the model cache, or {LEGACY_MODEL_DIR})"
+            );
             return;
         }
-        let reranker = NativeReranker::load(MODEL_DIR).expect("load native reranker");
+        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load native reranker");
         let mut logits = Vec::new();
         let mut max_diff = 0.0_f64;
         eprintln!("[native_reranker] idx |     ft_logit |    ref_logit |     diff");
@@ -1896,7 +1927,7 @@ mod tests {
             eprintln!("[native_reranker] SKIP batch-equiv: model dir not present");
             return;
         }
-        let reranker = NativeReranker::load(MODEL_DIR).expect("load native reranker");
+        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load native reranker");
         let query = CASES[0].0;
         let mut batch: Vec<(Vec<i64>, Vec<i64>)> = Vec::new();
         for (_, document, _) in CASES {
@@ -1932,7 +1963,7 @@ mod tests {
             eprintln!("[native_reranker] SKIP empty-docs: model dir not present");
             return;
         }
-        let reranker = NativeReranker::load(MODEL_DIR).expect("load");
+        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
         let scored = reranker.rerank_sync("any query", &[]).expect("empty ok");
         assert!(scored.is_empty());
         eprintln!("[native_reranker] empty-docs -> empty scores OK");
@@ -1944,7 +1975,7 @@ mod tests {
             eprintln!("[native_reranker] SKIP whitespace/long: model dir not present");
             return;
         }
-        let reranker = NativeReranker::load(MODEL_DIR).expect("load");
+        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
         // whitespace-only doc
         let ws = reranker
             .rerank_sync("q", &[doc("ws", "   ")])
@@ -1969,7 +2000,7 @@ mod tests {
             eprintln!("[native_reranker] SKIP determinism: model dir not present");
             return;
         }
-        let reranker = NativeReranker::load(MODEL_DIR).expect("load");
+        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
         let docs: Vec<RerankDocument> = CASES
             .iter()
             .enumerate()
@@ -2005,7 +2036,7 @@ mod tests {
             eprintln!("[native_reranker] SKIP many-docs: model dir not present");
             return;
         }
-        let reranker = NativeReranker::load(MODEL_DIR).expect("load");
+        let reranker = NativeReranker::load(model_dir().expect("reranker model dir")).expect("load");
         // 24 docs >> the 8-session pool cap, so several workers share a slot.
         let docs: Vec<RerankDocument> = (0..24)
             .map(|i| doc(&format!("d{i}"), CASES[i % CASES.len()].1))
