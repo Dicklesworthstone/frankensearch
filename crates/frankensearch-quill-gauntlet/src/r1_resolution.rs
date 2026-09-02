@@ -97,7 +97,7 @@ fn is_unset(digest: &[u8; 32]) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct R1ResolutionProvenanceV1 {
-    /// Digest of the immutable CampaignReport V7 replay-freeze bytes
+    /// Digest of the immutable `CampaignReport` V7 replay-freeze bytes
     /// (bd-campaign-report-v7-replay-freeze-715tp fixture).
     pub v7_freeze_sha256: [u8; 32],
     /// Implementing source revision the decision was taken at
@@ -203,7 +203,6 @@ impl R1BoundaryVariantV1 {
                         }
                     }
                 }
-                Ok(())
             }
             Self::ControlledResidual {
                 hypothesis,
@@ -226,9 +225,9 @@ impl R1BoundaryVariantV1 {
                 if unique.len() != falsification_arm_sha256s.len() {
                     return Err(R1ResolutionError::DuplicateFalsificationArm);
                 }
-                Ok(())
             }
         }
+        Ok(())
     }
 }
 

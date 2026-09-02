@@ -184,8 +184,8 @@ fn run(args: Vec<String>) -> SearchResult<()> {
 
     // An override the active pressure profile locks (`--fast-only` or
     // `FRANKENSEARCH_FAST_ONLY=true` under the default `performance`
-    // profile) used to be dropped with no trace outside `fsfs config`; say so
-    // at the command that asked for it (bd-k7x34).
+    // profile) used to be dropped with no trace outside the config command's
+    // warnings table; say so at the command that asked for it (bd-k7x34).
     if !cli_input.quiet {
         for warning in loaded
             .warnings
