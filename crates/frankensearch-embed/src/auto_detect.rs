@@ -417,6 +417,48 @@ impl EmbedderStack {
         stack.require_semantic()
     }
 
+    /// Detect only the quality tier under caller-supplied policy.
+    ///
+    /// The complement of [`Self::auto_detect_fast_semantic_with_options`]:
+    /// a host that already holds its fast embedder and now needs the quality
+    /// model (to build or refine against a quality-tier generation) must not
+    /// re-open the fast model to get it. Returns `None` when no quality
+    /// model is present or admissible under the effective offline policy;
+    /// a hash control embedder is never returned as a quality tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same policy errors as [`Self::auto_detect_with_options`]
+    /// (offline/remote intent resolution).
+    pub fn auto_detect_quality_with_options(
+        model_root: Option<&Path>,
+        options: &DetectOptions,
+    ) -> SearchResult<Option<Arc<dyn Embedder>>> {
+        let remote_env = RemoteIntentEnv::from_environment();
+        let (offline, remote) = resolve_remote_intent(*options, &remote_env)?;
+
+        #[cfg(all(
+            feature = "download",
+            any(feature = "model2vec", feature = "fastembed")
+        ))]
+        let quality = {
+            let policy = download_policy_from_environment(offline);
+            detect_quality_embedder(model_root)
+                .or_else(|| maybe_lazy_quality_embedder(model_root, policy))
+                .or(remote)
+        };
+        #[cfg(not(all(
+            feature = "download",
+            any(feature = "model2vec", feature = "fastembed")
+        )))]
+        let quality = {
+            let _ = offline;
+            detect_quality_embedder(model_root).or(remote)
+        };
+
+        Ok(quality.filter(|embedder| embedder.is_semantic()))
+    }
+
     /// Fail closed when this stack has no semantic fast embedder.
     ///
     /// Hash remains available via [`Self::auto_detect`] and

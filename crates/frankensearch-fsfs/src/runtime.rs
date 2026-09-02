@@ -369,6 +369,18 @@ const FSFS_VECTOR_MANIFEST_FILE: &str = "vector/index_manifest.json";
 const FSFS_LEXICAL_MANIFEST_FILE: &str = "lexical/index_manifest.json";
 const FSFS_INDEX_MANIFEST_FILE_NAME: &str = "index_manifest.json";
 const FSFS_VECTOR_INDEX_FILE: &str = "vector/index.fsvi";
+/// Quality-tier vector generation (384-d all-MiniLM-L6-v2 by default). Built
+/// by `fsfs index` beside the fast tier from the same document set and kept
+/// in step by every mutation path; its presence is what makes the REFINED
+/// search phase possible (reality check 2026-09-01, G1).
+const FSFS_VECTOR_QUALITY_INDEX_FILE: &str = "vector/quality.fsvi";
+/// Sentinel/checkpoint reason codes describing the quality tier of a generation.
+const REASON_VECTOR_QUALITY_TIER_BUILT: &str = "vector.quality_tier.built";
+const REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY: &str = "vector.quality_tier.skipped.fast_only";
+const REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE: &str =
+    "vector.quality_tier.skipped.model_unavailable";
+const REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED: &str =
+    "vector.quality_tier.abandoned.embedding_failed";
 const FSFS_EXPLAIN_SESSION_FILE: &str = "explain/last_search_session.json";
 const FSFS_FLUSH_REQUEST_FILE: &str = ".fsfs-flush-request.json";
 const FSFS_FLUSH_ACK_FILE: &str = ".fsfs-flush-ack.json";
@@ -423,7 +435,6 @@ const FSFS_TUI_SEMANTIC_IDLE_MULTIPLIER_PER_MILLE: u64 = 3_507;
 const FSFS_TUI_QUALITY_IDLE_MULTIPLIER_PER_MILLE: u64 = 5_299;
 const FSFS_TUI_SEARCH_HISTORY_LIMIT: usize = 72;
 const FSFS_TUI_FAST_STAGE_SNIPPET_MAX_CHARS: usize = 120;
-const FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION: usize = 384;
 const FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD: usize = 5;
 const FSFS_SEARCH_SHORT_QUERY_BUDGET_MULTIPLIER: usize = 1;
 
@@ -472,6 +483,26 @@ const FSFS_DAEMON_CONNECT_RETRY_DELAY_MS: u64 = 25;
 /// accumulate as an orphan. `fsfs serve --daemon --idle-timeout-ms 0` opts
 /// out for a deliberately persistent daemon.
 const FSFS_DAEMON_IDLE_TIMEOUT_MS: u64 = 600_000;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only quality embedder injection. Production resolves the quality
+    /// tier from the model cache; tests have no cache, so a test that needs a
+    /// quality tier (index-time build or search-time refinement) installs a
+    /// deterministic semantic double here for the duration of the test.
+    static TEST_QUALITY_EMBEDDER: std::cell::RefCell<Option<Arc<dyn Embedder>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_quality_embedder_override() -> Option<Arc<dyn Embedder>> {
+    TEST_QUALITY_EMBEDDER.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+fn set_test_quality_embedder(embedder: Option<Arc<dyn Embedder>>) {
+    TEST_QUALITY_EMBEDDER.with(|slot| *slot.borrow_mut() = embedder);
+}
 
 #[cfg(all(test, unix))]
 thread_local! {
@@ -604,7 +635,11 @@ struct SearchExecutionResources {
     lexical_index: Option<QuillSearchIndex>,
     shadow_observer: Option<frankensearch_core::ShadowLexicalObserver>,
     shadow_pressure_sampler: Option<Arc<ShadowPressureSampler>>,
+    /// Fast-tier generation (`vector/index.fsvi`); drives the INITIAL phase.
     vector_index: Option<VectorIndex>,
+    /// Quality-tier generation (`vector/quality.fsvi`) from the same index
+    /// run; present only when `fsfs index` built it. Drives the REFINED phase.
+    quality_vector_index: Option<VectorIndex>,
     fast_embedder: Option<Arc<dyn Embedder>>,
     quality_embedder: Option<Arc<dyn Embedder>>,
     fast_embedder_attempted: bool,
@@ -729,20 +764,21 @@ impl SearchExecutionResources {
         }
     }
 
+    /// The REFINED phase is possible only when this generation carries a
+    /// quality-tier FSVI that is a real semantic space (never a hash control
+    /// artifact) and the quality embedder, once resolution has been tried,
+    /// was bound to it. A generation built without a quality tier (fast-only
+    /// config, quality model unavailable at index time, or an abandoned
+    /// tier) reports the stage as unavailable instead of pretending.
     #[must_use]
     fn quality_stage_viable(&self, fast_only: bool) -> bool {
         if fast_only {
             return false;
         }
-        let Some(index) = self.vector_index.as_ref() else {
+        let Some(index) = self.quality_vector_index.as_ref() else {
             return false;
         };
-        if index.dimension() != FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION {
-            return false;
-        }
-        if let Some(fast_embedder) = self.fast_embedder.as_ref()
-            && index.embedder_id().eq_ignore_ascii_case(fast_embedder.id())
-        {
+        if FsfsRuntime::is_legacy_hash_vector_generation(index.embedder_id()) {
             return false;
         }
         if self.quality_embedder_attempted {
@@ -2642,6 +2678,12 @@ struct FsfsIndexStatus {
     /// True when that identity is a hash/fnv control artifact.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     vector_generation_is_hash: bool,
+    /// Published quality-tier embedder identity (`vector/quality.fsvi`),
+    /// when this generation carries one. Absent means INITIAL-only search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quality_generation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quality_generation_dimension: Option<usize>,
     /// Same operator label as the status table / dashboard (`ready`,
     /// `no vector index`, `hash control (not semantic)`, `missing`).
     #[serde(default)]
@@ -5390,7 +5432,7 @@ impl FsfsRuntime {
 
             if fast_cached && quality_cached && !self.config.search.fast_only {
                 return Ok(Some(
-                    "Search readiness: fast and quality model caches passed their registered manifests. Run `fsfs doctor` to exercise both compiled loaders before indexing. Full search fails before Initial if the fast lane is unavailable. Searches over a standard `fsfs index` generation serve the fast tier only: the quality tier is reported as unavailable (no quality-tier vector generation is built yet), so no REFINED phase follows INITIAL."
+                    "Search readiness: fast and quality model caches passed their registered manifests. Run `fsfs doctor` to exercise both compiled loaders before indexing. Full search fails before Initial if the fast lane is unavailable; a generation that carries a quality tier (`vector/quality.fsvi`) emits INITIAL then REFINED, and one without it serves INITIAL only. A quality-only failure preserves Initial and emits an actionable RefinementFailed phase."
                         .to_owned(),
                 ));
             }
@@ -7245,6 +7287,7 @@ impl FsfsRuntime {
         for rel in [
             FSFS_CHECKPOINT_FILE,
             FSFS_VECTOR_INDEX_FILE,
+            FSFS_VECTOR_QUALITY_INDEX_FILE,
             FSFS_VECTOR_MANIFEST_FILE,
             FSFS_LEXICAL_MANIFEST_FILE,
             FSFS_SENTINEL_FILE,
@@ -7256,6 +7299,13 @@ impl FsfsRuntime {
         let vector_wal_path =
             frankensearch_index::wal_path_for(&index_root.join(FSFS_VECTOR_INDEX_FILE));
         Self::hash_search_artifact_identity(&mut hasher, "vector_index_wal", &vector_wal_path)?;
+        let quality_wal_path =
+            frankensearch_index::wal_path_for(&index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE));
+        Self::hash_search_artifact_identity(
+            &mut hasher,
+            "vector_quality_index_wal",
+            &quality_wal_path,
+        )?;
 
         let lexical_layout = Self::resolve_lexical_engine(index_root)?;
         if let Some(engine_dir) = lexical_layout.engine_dir() {
@@ -8311,7 +8361,7 @@ impl FsfsRuntime {
         if plan.quality_stage.enabled {
             let quality_initialization = if matches!(mode, SearchExecutionMode::Full)
                 && !self.config.search.fast_only
-                && resources.vector_index.is_some()
+                && resources.quality_vector_index.is_some()
                 && resources.quality_embedder.is_none()
                 && !resources.quality_embedder_attempted
             {
@@ -8323,7 +8373,7 @@ impl FsfsRuntime {
                 Err(error) => Err(error),
                 Ok(()) => {
                     if let (Some(index), Some(embedder)) = (
-                        resources.vector_index.as_ref(),
+                        resources.quality_vector_index.as_ref(),
                         resources.quality_embedder.as_ref(),
                     ) {
                         let quality_budget_floor = planning_limit;
@@ -8971,6 +9021,28 @@ impl FsfsRuntime {
             Self::admit_vector_generation_for_embedder(&index, embedder.as_ref())?;
         }
         let dimension = embedder.dimension();
+        // A generation that carries a quality tier must keep it in step: an
+        // appended document that the fast tier can find but the quality tier
+        // cannot would silently vanish from REFINED results. If the quality
+        // model is unavailable while the tier exists, fail closed rather than
+        // let the tiers diverge.
+        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+        let quality = if quality_vector_path.exists() {
+            let quality_embedder = self.resolve_quality_embedder()?.ok_or_else(|| {
+                SearchError::EmbedderUnavailable {
+                    model: self.config.indexing.quality_model.clone(),
+                    reason: format!(
+                        "this generation carries a quality tier at {} but no verified quality model is available to extend it; run `fsfs download-models` or rebuild fast-only with `search.fast_only = true`",
+                        quality_vector_path.display()
+                    ),
+                }
+            })?;
+            let index = VectorIndex::open_read_only(&quality_vector_path)?;
+            Self::admit_quality_generation_for_embedder(&index, quality_embedder.as_ref())?;
+            Some((quality_embedder, index.dimension()))
+        } else {
+            None
+        };
 
         // Read input lines from --file or stdin.
         let lines: Vec<String> = if let Some(ref file_path) = self.cli_input.input_file {
@@ -9041,8 +9113,10 @@ impl FsfsRuntime {
             return Ok(());
         }
 
-        // Batch-embed all texts.
+        // Batch-embed all texts, for every tier this generation carries.
         let mut entries: Vec<(String, Vec<f32>)> = Vec::with_capacity(docs.len());
+        let mut quality_entries: Vec<(String, Vec<f32>)> =
+            Vec::with_capacity(if quality.is_some() { docs.len() } else { 0 });
         for (id, text) in &docs {
             let embedding =
                 embedder
@@ -9062,12 +9136,36 @@ impl FsfsRuntime {
                 });
             }
             entries.push((id.clone(), embedding));
+            if let Some((quality_embedder, quality_dimension)) = quality.as_ref() {
+                let quality_embedding = quality_embedder.embed(cx, text).await.map_err(
+                    |source| SearchError::SubsystemError {
+                        subsystem: "fsfs.append_batch.embed_quality",
+                        source: Box::new(std::io::Error::other(format!(
+                            "failed to quality-embed doc '{id}': {source}"
+                        ))),
+                    },
+                )?;
+                if quality_embedding.len() != *quality_dimension {
+                    return Err(SearchError::DimensionMismatch {
+                        expected: *quality_dimension,
+                        found: quality_embedding.len(),
+                    });
+                }
+                quality_entries.push((id.clone(), quality_embedding));
+            }
         }
 
         // Re-check the lease, then reopen a write handle and re-admit so a
         // replaced generation cannot be mutated after the earlier read-only
-        // check.
+        // check. The quality tier is appended first so a crash between the
+        // two appends leaves a document findable only after both tiers agree
+        // (the fast tier is what admits a document into INITIAL results).
         publication_lease.fence("append-batch WAL publication")?;
+        if let Some((quality_embedder, _)) = quality.as_ref() {
+            let mut quality_index = VectorIndex::open(&quality_vector_path)?;
+            Self::admit_quality_generation_for_embedder(&quality_index, quality_embedder.as_ref())?;
+            quality_index.append_batch(&quality_entries)?;
+        }
         let mut index = VectorIndex::open(&vector_path)?;
         Self::admit_vector_generation_for_embedder(&index, embedder.as_ref())?;
         index.append_batch(&entries)?;
@@ -9328,6 +9426,33 @@ impl FsfsRuntime {
         // Then vacuum to remove tombstoned records.
         let vacuum_stats = index.vacuum()?;
 
+        // The quality tier, when present, is compacted and vacuumed in the
+        // same run so its tombstones and WAL never lag the fast tier.
+        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+        let quality_stats = if quality_vector_path.exists() {
+            publication_lease.fence("explicit quality vector compaction")?;
+            let mut quality_index = VectorIndex::open(&quality_vector_path)?;
+            let quality_compaction = quality_index.compact()?;
+            let quality_vacuum = quality_index.vacuum()?;
+            info!(
+                main_before = quality_compaction.main_records_before,
+                wal_merged = quality_compaction.wal_records,
+                tombstones_removed = quality_vacuum.tombstones_removed,
+                total_after = quality_vacuum.records_after,
+                "quality-tier compact completed"
+            );
+            Some(serde_json::json!({
+                "main_records_before": quality_compaction.main_records_before,
+                "wal_records_merged": quality_compaction.wal_records,
+                "total_records_after": quality_vacuum.records_after,
+                "tombstones_removed": quality_vacuum.tombstones_removed,
+                "compaction_elapsed_ms": quality_compaction.elapsed_ms,
+                "vacuum_elapsed_ms": quality_vacuum.duration.as_secs_f64() * 1000.0,
+            }))
+        } else {
+            None
+        };
+
         info!(
             main_before = compaction_stats.main_records_before,
             wal_merged = compaction_stats.wal_records,
@@ -9352,7 +9477,7 @@ impl FsfsRuntime {
                 vacuum_stats.duration.as_secs_f64() * 1000.0,
             );
         } else {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "main_records_before": compaction_stats.main_records_before,
                 "wal_records_merged": compaction_stats.wal_records,
                 "total_records_after": vacuum_stats.records_after,
@@ -9360,6 +9485,9 @@ impl FsfsRuntime {
                 "compaction_elapsed_ms": compaction_stats.elapsed_ms,
                 "vacuum_elapsed_ms": vacuum_stats.duration.as_secs_f64() * 1000.0,
             });
+            if let (Some(object), Some(quality)) = (payload.as_object_mut(), quality_stats) {
+                object.insert("quality".to_owned(), quality);
+            }
             let meta = meta_for_format("compact", self.cli_input.format);
             let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
             let mut stdout = std::io::stdout();
@@ -9399,6 +9527,8 @@ impl FsfsRuntime {
 
         let poll_ms = self.cli_input.daemon_poll_ms.unwrap_or(1000);
         let wal_sidecar = frankensearch_index::wal_path_for(&vector_path);
+        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+        let quality_wal_sidecar = frankensearch_index::wal_path_for(&quality_vector_path);
 
         info!(
             poll_ms,
@@ -9416,6 +9546,10 @@ impl FsfsRuntime {
         }
 
         let mut last_wal_len: u64 = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut last_quality_wal_len: u64 = quality_wal_sidecar
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         let shutdown = Arc::new(ShutdownCoordinator::new());
         shutdown.register_signals()?;
@@ -9493,6 +9627,41 @@ impl FsfsRuntime {
                 last_wal_len = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
             } else {
                 last_wal_len = current_wal_len;
+            }
+
+            // The quality tier's WAL is compacted on the same trigger so the
+            // two tiers never drift in what they serve.
+            let current_quality_wal_len = quality_wal_sidecar
+                .metadata()
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if current_quality_wal_len > last_quality_wal_len && quality_vector_path.exists() {
+                info!(
+                    previous_bytes = last_quality_wal_len,
+                    current_bytes = current_quality_wal_len,
+                    "daemon: quality-tier WAL changed, triggering compaction"
+                );
+                publication_lease.fence("daemon quality vector compaction")?;
+                match VectorIndex::open(&quality_vector_path) {
+                    Ok(mut quality_index) => match quality_index.compact() {
+                        Ok(stats) => info!(
+                            wal_merged = stats.wal_records,
+                            total_after = stats.total_records_after,
+                            elapsed_ms = %format!("{:.1}", stats.elapsed_ms),
+                            "daemon: quality-tier compaction completed"
+                        ),
+                        Err(error) => warn!(error = %error, "daemon: quality-tier compaction failed"),
+                    },
+                    Err(error) => {
+                        warn!(error = %error, "daemon: failed to open quality tier for compaction");
+                    }
+                }
+                last_quality_wal_len = quality_wal_sidecar
+                    .metadata()
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+            } else {
+                last_quality_wal_len = current_quality_wal_len;
             }
 
             asupersync::time::sleep(cx.now(), Duration::from_millis(poll_ms)).await;
@@ -9642,6 +9811,7 @@ impl FsfsRuntime {
         checks.push(self.collect_shadow_oracle_doctor_check(&index_root)?);
         checks.push(Self::collect_zero_signal_doctor_check(&index_root));
         checks.push(Self::collect_vector_generation_doctor_check(&index_root));
+        checks.push(Self::collect_quality_generation_doctor_check(&index_root));
 
         // 5. Index directory permissions, without mutating the live index.
         if index_root.exists() {
@@ -9966,6 +10136,106 @@ impl FsfsRuntime {
             name: "semantic.vector_generation".to_owned(),
             verdict: DoctorVerdict::Pass,
             detail: format!("identity={embedder_id} dimension={}", index.dimension()),
+            suggestion: None,
+        }
+    }
+
+    /// Quality-tier generation health. A missing tier is a warning with the
+    /// sentinel's recorded reason (fast-only config, model unavailable at
+    /// index time, or an abandoned tier), because search still serves
+    /// INITIAL; an unreadable or hash-control tier, or one whose live
+    /// document set disagrees with the fast tier, is a failure because the
+    /// REFINED phase would then be wrong rather than absent.
+    fn collect_quality_generation_doctor_check(index_root: &Path) -> DoctorCheck {
+        const NAME: &str = "semantic.quality_generation";
+        let quality_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+        let fast_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+        if !quality_path.exists() {
+            let recorded_reason = Self::read_index_sentinel(index_root)
+                .ok()
+                .flatten()
+                .and_then(|sentinel| {
+                    sentinel
+                        .reason_codes
+                        .iter()
+                        .find(|code| code.starts_with("vector.quality_tier."))
+                        .cloned()
+                });
+            let detail = match recorded_reason.as_deref() {
+                Some(code) => format!(
+                    "no quality-tier generation at {} ({code}); searches serve INITIAL only",
+                    quality_path.display()
+                ),
+                None => format!(
+                    "no quality-tier generation at {}; searches serve INITIAL only",
+                    quality_path.display()
+                ),
+            };
+            return DoctorCheck {
+                name: NAME.to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail,
+                suggestion: Some(
+                    "run `fsfs download-models all-minilm-l6-v2 --verify`, then `fsfs index <dir>` to build the quality tier"
+                        .to_owned(),
+                ),
+            };
+        }
+        let index = match VectorIndex::open_read_only(&quality_path) {
+            Ok(index) => index,
+            Err(error) => {
+                return DoctorCheck {
+                    name: NAME.to_owned(),
+                    verdict: DoctorVerdict::Fail,
+                    detail: format!(
+                        "quality-tier generation at {} could not be opened: {error}",
+                        quality_path.display()
+                    ),
+                    suggestion: Some(
+                        "rebuild index artifacts in place with `fsfs index --full`".to_owned(),
+                    ),
+                };
+            }
+        };
+        let embedder_id = index.embedder_id().to_owned();
+        if Self::is_legacy_hash_vector_generation(&embedder_id) {
+            return DoctorCheck {
+                name: NAME.to_owned(),
+                verdict: DoctorVerdict::Fail,
+                detail: format!(
+                    "quality-tier identity `{embedder_id}` is a hash control artifact, not a semantic space"
+                ),
+                suggestion: Some(
+                    "rebuild with a verified quality model (`fsfs index --full`)".to_owned(),
+                ),
+            };
+        }
+        let quality_live = index.live_doc_ids().map(|ids| ids.len()).ok();
+        let fast_live = VectorIndex::open_read_only(&fast_path)
+            .ok()
+            .and_then(|fast| fast.live_doc_ids().map(|ids| ids.len()).ok());
+        if let (Some(quality_live), Some(fast_live)) = (quality_live, fast_live)
+            && quality_live != fast_live
+        {
+            return DoctorCheck {
+                name: NAME.to_owned(),
+                verdict: DoctorVerdict::Fail,
+                detail: format!(
+                    "quality tier covers {quality_live} live documents but the fast tier covers {fast_live}; the tiers have diverged"
+                ),
+                suggestion: Some(
+                    "run `fsfs compact`, then `fsfs index <dir>` if the counts still differ".to_owned(),
+                ),
+            };
+        }
+        DoctorCheck {
+            name: NAME.to_owned(),
+            verdict: DoctorVerdict::Pass,
+            detail: format!(
+                "identity={embedder_id} dimension={} live_documents={}",
+                index.dimension(),
+                quality_live.map_or_else(|| "unknown".to_owned(), |count| count.to_string())
+            ),
             suggestion: None,
         }
     }
@@ -10655,6 +10925,7 @@ impl FsfsRuntime {
         let sentinel = Self::read_index_sentinel(&index_root)?;
         let stale_files = Self::count_stale_files(&index_root, sentinel.as_ref())?;
         let published_vector = Self::inspect_published_vector_generation(&index_root);
+        let published_quality = Self::inspect_published_quality_generation(&index_root);
 
         let storage_paths = IndexStoragePaths {
             vector_index_roots: vec![index_root.join("vector")],
@@ -10737,6 +11008,10 @@ impl FsfsRuntime {
                 vector_generation_is_hash: published_vector
                     .as_ref()
                     .is_some_and(|value| value.is_hash_control),
+                quality_generation_id: published_quality.as_ref().map(|value| value.id.clone()),
+                quality_generation_dimension: published_quality
+                    .as_ref()
+                    .map(|value| value.dimension),
                 dashboard_state: String::new(),
             }
             .with_computed_dashboard_state(),
@@ -11253,6 +11528,16 @@ impl FsfsRuntime {
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
         Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
 
+        // 1b. The quality tier. Built from the same document set as the fast
+        // tier whenever the configuration allows a quality stage and a
+        // verified quality model is present; otherwise the reason is recorded
+        // on the generation and search serves INITIAL only.
+        let (quality_embedder, mut quality_tier_reason) = self.resolve_indexing_quality_embedder();
+        if let Some(quality_embedder) = quality_embedder.as_ref() {
+            Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;
+        }
+        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+
         publication_lease.fence("one-shot index artifact directories")?;
         fs::create_dir_all(index_root.join("vector"))?;
         fs::create_dir_all(index_root.join("cache"))?;
@@ -11414,6 +11699,69 @@ impl FsfsRuntime {
             HashSet::new()
         };
 
+        // Quality tier: reuse the checkpointed generation only under the same
+        // exact-identity rule as the fast tier, else start a fresh generation
+        // for the quality embedder. When this run builds no quality tier, a
+        // quality generation left by an earlier run must not outlive the fast
+        // generation it belonged to.
+        let mut quality_vector_index: Option<VectorIndex> = None;
+        let mut initial_live_quality_ids: HashSet<String> = HashSet::new();
+        if let Some(quality_embedder) = quality_embedder.as_ref() {
+            let quality_revision = quality_embedder
+                .identity()
+                .map(frankensearch_core::EmbeddingIdentityBundleV1::fingerprint)
+                .unwrap_or_default();
+            let reusable = if vector_generation_compatible && quality_vector_path.exists() {
+                match VectorIndex::open(&quality_vector_path) {
+                    Ok(index)
+                        if vector_checkpoint_reusable(
+                            &index,
+                            quality_embedder.id(),
+                            &quality_revision,
+                            quality_embedder.dimension(),
+                        ) =>
+                    {
+                        Some(index)
+                    }
+                    Ok(index) => {
+                        warn!(
+                            stored_embedder_id = index.embedder_id(),
+                            active_embedder_id = quality_embedder.id(),
+                            stored_dimension = index.dimension(),
+                            active_dimension = quality_embedder.dimension(),
+                            "checkpoint quality-tier FSVI does not match the active quality embedder; rebuilding quality vectors"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "checkpoint quality-tier FSVI is unavailable; rebuilding quality vectors");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let index = match reusable {
+                Some(index) => {
+                    initial_live_quality_ids = vector_live_doc_ids(&index)?;
+                    index
+                }
+                None => {
+                    publication_lease.fence("one-shot quality vector generation replacement")?;
+                    VectorIndex::replace_with_empty(
+                        &quality_vector_path,
+                        quality_embedder.id(),
+                        &quality_revision,
+                        quality_embedder.dimension(),
+                    )?
+                }
+            };
+            quality_vector_index = Some(index);
+        } else if quality_vector_path.exists() {
+            publication_lease.fence("one-shot stale quality generation retirement")?;
+            Self::retire_quality_generation(&quality_vector_path, quality_tier_reason)?;
+        }
+
         publication_lease.fence("one-shot lexical generation planning")?;
         let lexical_plan = Self::plan_lexical_build(&index_root)?;
         let lexical_path = lexical_plan.engine_dir.clone();
@@ -11523,6 +11871,26 @@ impl FsfsRuntime {
         if !stale_vector_ids.is_empty() {
             publication_lease.fence("one-shot stale vector tombstones")?;
             vector_index.soft_delete_batch(&stale_vector_ids)?;
+        }
+        // A document is quality-reused only when it is fast-reused AND its
+        // quality vector survives; everything else in the reused quality
+        // generation is stale and gets tombstoned before the batches run.
+        let reusable_quality_ids = reusable_semantic_ids
+            .iter()
+            .copied()
+            .filter(|file_key| initial_live_quality_ids.contains(*file_key))
+            .map(str::to_owned)
+            .collect::<HashSet<String>>();
+        if let Some(quality_index) = quality_vector_index.as_mut() {
+            let stale_quality_ids = initial_live_quality_ids
+                .iter()
+                .filter(|file_key| !reusable_quality_ids.contains(file_key.as_str()))
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            if !stale_quality_ids.is_empty() {
+                publication_lease.fence("one-shot stale quality vector tombstones")?;
+                quality_index.soft_delete_batch(&stale_quality_ids)?;
+            }
         }
 
         let mut lexical_reconciliation_ids = BTreeSet::new();
@@ -11900,6 +12268,118 @@ impl FsfsRuntime {
                 }
             }
 
+            // Quality tier for the same documents. A document is embedded here
+            // unless its fast vector AND its quality vector were both reused.
+            // The tier is all-or-nothing per generation: if its retry budget
+            // is exhausted, the tier is abandoned (never published partial)
+            // and the generation finishes fast-only with the reason recorded.
+            if let (Some(quality_embedder), Some(quality_index)) =
+                (quality_embedder.as_ref(), quality_vector_index.as_mut())
+            {
+                let quality_docs = chunk_docs
+                    .iter()
+                    .filter(|pending| {
+                        matches!(pending.ingestion_class, IngestionClass::FullSemanticLexical)
+                            && !(pending.semantic_reused
+                                && reusable_quality_ids.contains(&pending.file_key))
+                    })
+                    .collect::<Vec<_>>();
+                if !quality_docs.is_empty() {
+                    let quality_texts = quality_docs
+                        .iter()
+                        .map(|pending| pending.document.content.as_str())
+                        .collect::<Vec<_>>();
+                    const QUALITY_RETRY_BACKOFFS_MS: [u64; EMBEDDING_BATCH_MAX_ATTEMPTS - 1] =
+                        [200, 400];
+                    let quality_outcome = Self::embed_indexing_batch_with_backoffs(
+                        cx,
+                        quality_embedder.as_ref(),
+                        &quality_texts,
+                        &QUALITY_RETRY_BACKOFFS_MS,
+                        |retry_number, retry_budget, backoff_ms, error, _elapsed_ms| {
+                            let error_code = error_code_for(error);
+                            let reason = Self::semantic_runtime_failure_summary(error);
+                            warn!(
+                                chunk_size = quality_docs.len(),
+                                retry_number,
+                                retry_budget,
+                                backoff_ms,
+                                error_code,
+                                reason,
+                                "quality-tier embedding batch failed; retrying"
+                            );
+                            push_warning(
+                                &mut recent_warnings,
+                                IndexingWarningSeverity::Warn,
+                                format!(
+                                    "Quality-tier embedding batch retry {retry_number}/{retry_budget} \
+                                     ({backoff_ms}ms backoff): {error_code}: {reason}",
+                                ),
+                            );
+                            Ok(())
+                        },
+                    )
+                    .await?;
+                    match quality_outcome {
+                        IndexingBatchEmbeddingOutcome::Ready {
+                            embeddings,
+                            embedding_elapsed_ms: batch_embedding_elapsed_ms,
+                            retries_executed,
+                        } => {
+                            embedding_elapsed_ms =
+                                embedding_elapsed_ms.saturating_add(batch_embedding_elapsed_ms);
+                            embedding_retries = embedding_retries.saturating_add(retries_executed);
+                            let vector_start = Instant::now();
+                            let quality_batch = quality_docs
+                                .iter()
+                                .zip(embeddings)
+                                .map(|(pending, embedding)| {
+                                    (pending.document.id.clone(), embedding)
+                                })
+                                .collect::<Vec<_>>();
+                            publication_lease.fence("one-shot quality vector WAL append")?;
+                            quality_index.append_batch(&quality_batch)?;
+                            vector_elapsed_ms = vector_elapsed_ms
+                                .saturating_add(vector_start.elapsed().as_millis());
+                        }
+                        IndexingBatchEmbeddingOutcome::Exhausted {
+                            error,
+                            embedding_elapsed_ms: batch_embedding_elapsed_ms,
+                            retries_executed,
+                        } => {
+                            embedding_elapsed_ms =
+                                embedding_elapsed_ms.saturating_add(batch_embedding_elapsed_ms);
+                            embedding_retries = embedding_retries.saturating_add(retries_executed);
+                            embedding_failures = embedding_failures.saturating_add(1);
+                            let error_code = error_code_for(&error);
+                            let reason = Self::semantic_runtime_failure_summary(&error);
+                            warn!(
+                                chunk_size = quality_docs.len(),
+                                attempts = retries_executed.saturating_add(1),
+                                error_code,
+                                reason,
+                                "quality-tier embedding retry budget exhausted; abandoning the quality tier for this generation"
+                            );
+                            push_warning(
+                                &mut recent_warnings,
+                                IndexingWarningSeverity::Error,
+                                format!(
+                                    "Quality tier abandoned for this generation after {} attempts: {error_code}: {reason}; search will serve INITIAL only until re-indexed",
+                                    retries_executed.saturating_add(1)
+                                ),
+                            );
+                            quality_tier_reason = REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED;
+                            publication_lease.fence("one-shot abandoned quality generation retirement")?;
+                            quality_vector_index = None;
+                            Self::retire_quality_generation(
+                                &quality_vector_path,
+                                REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED,
+                            )?;
+                        }
+                    }
+                }
+            }
+
             // Update checkpoint entries for this batch
             for pending in &chunk_docs {
                 let lexical_indexed = matches!(
@@ -11940,6 +12420,10 @@ impl FsfsRuntime {
                 let vector_compact_start = Instant::now();
                 publication_lease.fence("one-shot incremental vector reconciliation")?;
                 reconcile_vector_generation(&mut vector_index, &checkpoint)?;
+                if let Some(quality_index) = quality_vector_index.as_mut() {
+                    publication_lease.fence("one-shot incremental quality vector reconciliation")?;
+                    reconcile_vector_generation(quality_index, &checkpoint)?;
+                }
                 vector_elapsed_ms =
                     vector_elapsed_ms.saturating_add(vector_compact_start.elapsed().as_millis());
 
@@ -12078,6 +12562,16 @@ impl FsfsRuntime {
         let vector_finish_start = Instant::now();
         publication_lease.fence("final vector generation reconciliation")?;
         reconcile_vector_generation(&mut vector_index, &checkpoint)?;
+        if let Some(quality_index) = quality_vector_index.as_mut() {
+            publication_lease.fence("final quality vector generation reconciliation")?;
+            reconcile_vector_generation(quality_index, &checkpoint)?;
+            info!(
+                quality_embedder = quality_index.embedder_id(),
+                quality_dimension = quality_index.dimension(),
+                quality_live_documents = vector_live_doc_ids(quality_index)?.len(),
+                "fsfs published the quality-tier vector generation"
+            );
+        }
         vector_elapsed_ms =
             vector_elapsed_ms.saturating_add(vector_finish_start.elapsed().as_millis());
 
@@ -12088,6 +12582,9 @@ impl FsfsRuntime {
         let total_canonical_bytes = manifests.iter().fold(0_u64, |total, entry| {
             total.saturating_add(entry.canonical_bytes)
         });
+        // The generation records whether it carries a quality tier and, if
+        // not, why; `fsfs doctor` and `fsfs status` read this back.
+        observed_reason_codes.insert(quality_tier_reason.to_owned());
         let reason_codes = observed_reason_codes.into_iter().collect::<Vec<_>>();
 
         publication_lease.fence("final paired manifest publication")?;
@@ -12500,6 +12997,41 @@ impl FsfsRuntime {
         Self::validate_fast_embedder_for_vector_index(index, embedder, cfg!(test))
     }
 
+    /// Admit a quality-tier generation for mutation by the given quality
+    /// embedder: same producer identity and width, never a hash control
+    /// artifact. Mirrors [`Self::admit_vector_generation_for_embedder`] for
+    /// the second tier so append and watch cannot mix embedding spaces.
+    fn admit_quality_generation_for_embedder(
+        index: &VectorIndex,
+        embedder: &dyn Embedder,
+    ) -> SearchResult<()> {
+        if Self::is_legacy_hash_vector_generation(index.embedder_id()) {
+            return Err(SearchError::InvalidConfig {
+                field: "semantic.quality_generation".to_owned(),
+                value: "legacy_hash".to_owned(),
+                reason: "the quality-tier generation is a hash control artifact; rebuild with a verified quality model"
+                    .to_owned(),
+            });
+        }
+        if !index.embedder_id().eq_ignore_ascii_case(embedder.id()) {
+            return Err(SearchError::UnverifiableRemoteSpace {
+                producer: "fsfs.quality_vector_generation".to_owned(),
+                reason: format!(
+                    "the quality embedder identity `{}` does not match the stored quality-tier generation `{}`",
+                    embedder.id(),
+                    index.embedder_id()
+                ),
+            });
+        }
+        if embedder.dimension() != index.dimension() {
+            return Err(SearchError::DimensionMismatch {
+                expected: index.dimension(),
+                found: embedder.dimension(),
+            });
+        }
+        Ok(())
+    }
+
     /// Observational identity of the published FSVI, if it can be opened.
     ///
     /// Status and doctor must not fail the whole command when the file is
@@ -12507,6 +13039,22 @@ impl FsfsRuntime {
     /// absent rather than as a healthy semantic generation.
     fn inspect_published_vector_generation(index_root: &Path) -> Option<PublishedVectorGeneration> {
         let index = VectorIndex::open_read_only(&index_root.join(FSFS_VECTOR_INDEX_FILE)).ok()?;
+        let id = index.embedder_id().to_owned();
+        let is_hash_control = Self::is_legacy_hash_vector_generation(&id);
+        Some(PublishedVectorGeneration {
+            id,
+            dimension: index.dimension(),
+            is_hash_control,
+        })
+    }
+
+    /// The quality-tier sibling of [`Self::inspect_published_vector_generation`];
+    /// `None` when this generation was built without a quality tier.
+    fn inspect_published_quality_generation(
+        index_root: &Path,
+    ) -> Option<PublishedVectorGeneration> {
+        let index =
+            VectorIndex::open_read_only(&index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE)).ok()?;
         let id = index.embedder_id().to_owned();
         let is_hash_control = Self::is_legacy_hash_vector_generation(&id);
         Some(PublishedVectorGeneration {
@@ -12902,26 +13450,82 @@ impl FsfsRuntime {
         }
     }
 
+    /// Resolve the quality-tier embedder alone (never re-opening the fast
+    /// model). Test builds return the injected test-only quality embedder,
+    /// or `None` when no test set one.
     fn resolve_quality_embedder(&self) -> SearchResult<Option<Arc<dyn Embedder>>> {
         #[cfg(feature = "embedded-models")]
         self.prepare_bundled_semantic_models_for_execution()?;
 
-        if cfg!(test) {
-            return Ok(None);
+        #[cfg(test)]
+        {
+            return Ok(test_quality_embedder_override());
         }
 
-        let configured_root = PathBuf::from(&self.config.indexing.model_dir);
-        let options = DetectOptions {
-            offline: Some(self.config.indexing.offline),
-        };
-        let stack = EmbedderStack::auto_detect_with_options(Some(&configured_root), &options);
+        #[cfg(not(test))]
+        {
+            let configured_root = PathBuf::from(&self.config.indexing.model_dir);
+            let options = DetectOptions {
+                offline: Some(self.config.indexing.offline),
+            };
+            let quality =
+                EmbedderStack::auto_detect_quality_with_options(Some(&configured_root), &options);
 
-        #[cfg(not(feature = "semantic-loaders"))]
-        let stack = stack.inspect_err(|_| {
-            emit_model_free_build_hint();
-        });
+            #[cfg(not(feature = "semantic-loaders"))]
+            let quality = quality.inspect_err(|_| {
+                emit_model_free_build_hint();
+            });
 
-        Ok(stack?.quality_arc())
+            quality
+        }
+    }
+
+    /// Decide whether this index run builds the quality tier, and with which
+    /// embedder. The tier is built whenever the configuration allows a
+    /// quality stage (`search.fast_only = false` and a non-empty
+    /// `indexing.quality_model`) and a verified semantic quality model is
+    /// available. An unavailable model does not fail the index: the run
+    /// records the reason code, builds the fast tier, and search serves
+    /// INITIAL only until a re-index with the model present.
+    fn resolve_indexing_quality_embedder(&self) -> (Option<Arc<dyn Embedder>>, &'static str) {
+        if self.config.search.fast_only || self.config.indexing.quality_model.trim().is_empty() {
+            return (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY);
+        }
+        match self.resolve_quality_embedder() {
+            Ok(Some(embedder)) if embedder.is_semantic() => {
+                (Some(embedder), REASON_VECTOR_QUALITY_TIER_BUILT)
+            }
+            Ok(_) => (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE),
+            Err(error) => {
+                warn!(
+                    error_code = error_code_for(&error),
+                    reason = Self::semantic_runtime_failure_summary(&error),
+                    "quality-tier model unavailable; building the fast tier only"
+                );
+                (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE)
+            }
+        }
+    }
+
+    /// Retire a quality-tier generation that no longer belongs to the fast
+    /// generation being published (tier disabled for this run, or its
+    /// embedding budget was exhausted). Both the FSVI and its WAL sidecar go;
+    /// a stale quality tier must never be served beside a newer fast tier.
+    fn retire_quality_generation(quality_vector_path: &Path, reason: &str) -> SearchResult<()> {
+        let wal_path = frankensearch_index::wal_path_for(quality_vector_path);
+        for path in [quality_vector_path, wal_path.as_path()] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(SearchError::Io(error)),
+            }
+        }
+        info!(
+            path = %quality_vector_path.display(),
+            reason,
+            "retired quality-tier vector generation"
+        );
+        Ok(())
     }
 
     fn validate_search_generation_at_root(
@@ -13067,6 +13671,28 @@ impl FsfsRuntime {
         } else {
             None
         };
+        // The quality tier is an enhancement over a working fast tier: a
+        // missing file simply means INITIAL-only search, and an unreadable
+        // one degrades to the same rather than refusing the whole search.
+        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+        let quality_vector_index = if vector_index.is_some()
+            && matches!(resource_mode, SearchExecutionMode::Full)
+            && quality_vector_path.exists()
+        {
+            match VectorIndex::open_read_only(&quality_vector_path) {
+                Ok(index) => Some(index),
+                Err(error) => {
+                    warn!(
+                        path = %quality_vector_path.display(),
+                        error = %error,
+                        "quality-tier vector generation is unreadable; serving the fast tier only"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         if lexical_index.is_none() && vector_index.is_none() {
             return Err(SearchError::InvalidConfig {
@@ -13094,6 +13720,7 @@ impl FsfsRuntime {
             shadow_observer,
             shadow_pressure_sampler,
             vector_index,
+            quality_vector_index,
             fast_embedder: None,
             quality_embedder: None,
             fast_embedder_attempted: false,
@@ -13349,13 +13976,18 @@ impl FsfsRuntime {
         resources.quality_embedder_attempted = true;
         match self.resolve_quality_embedder() {
             Ok(Some(embedder)) => {
-                if let Some(index) = resources.vector_index.as_ref() {
+                // Bind to the QUALITY generation: same producer identity and
+                // width, else fail closed. Vectors from two spaces are never
+                // scored against each other.
+                if let Some(index) = resources.quality_vector_index.as_ref() {
                     let index_embedder_id = index.embedder_id();
                     if !index_embedder_id.eq_ignore_ascii_case(embedder.id()) {
                         return Err(SearchError::UnverifiableRemoteSpace {
                             producer: "fsfs.quality_vector_generation".to_owned(),
-                            reason: "the quality embedder identity does not match the stored vector generation"
-                                .to_owned(),
+                            reason: format!(
+                                "the quality embedder identity `{}` does not match the stored quality-tier generation `{index_embedder_id}`; re-run `fsfs index` with the active model",
+                                embedder.id()
+                            ),
                         });
                     }
                     let index_dimension = index.dimension();
