@@ -265,6 +265,9 @@ pub struct CliInput {
     pub delete_prefix: bool,
     /// Daemon poll interval in milliseconds.
     pub daemon_poll_ms: Option<u64>,
+    /// Whether `daemon --stop` was requested: signal the compaction daemon
+    /// recorded under the index root instead of starting one.
+    pub daemon_stop: bool,
 }
 
 /// Config subcommand actions.
@@ -698,17 +701,32 @@ where
                 idx += 2;
             }
             "--idle-timeout-ms" => {
-                if command != CliCommand::Serve {
+                let field = match command {
+                    CliCommand::Serve => "serve.idle_timeout_ms",
+                    CliCommand::Daemon => "daemon.idle_timeout_ms",
+                    _ => {
+                        return Err(SearchError::InvalidConfig {
+                            field: "cli.flag".into(),
+                            value: "--idle-timeout-ms".into(),
+                            reason: "--idle-timeout-ms is only valid for the serve and daemon commands"
+                                .into(),
+                        });
+                    }
+                };
+                let value = expect_value(&tokens, idx, "--idle-timeout-ms")?;
+                input.daemon_idle_timeout_ms = Some(parse_usize(value, field)? as u64);
+                idx += 2;
+            }
+            "--stop" => {
+                if command != CliCommand::Daemon {
                     return Err(SearchError::InvalidConfig {
                         field: "cli.flag".into(),
-                        value: "--idle-timeout-ms".into(),
-                        reason: "--idle-timeout-ms is only valid for the serve command".into(),
+                        value: "--stop".into(),
+                        reason: "--stop is only valid for the daemon command".into(),
                     });
                 }
-                let value = expect_value(&tokens, idx, "--idle-timeout-ms")?;
-                input.daemon_idle_timeout_ms =
-                    Some(parse_usize(value, "serve.idle_timeout_ms")? as u64);
-                idx += 2;
+                input.daemon_stop = true;
+                idx += 1;
             }
             "--filter" => {
                 let value = expect_value(&tokens, idx, "--filter")?;
@@ -1071,6 +1089,7 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--prefix"
             | "--poll-ms"
             | "--idle-timeout-ms"
+            | "--stop"
     )
 }
 
@@ -1347,6 +1366,43 @@ mod tests {
 
         let unset = parse_cli_args(["serve", "--daemon"]).expect("parse serve");
         assert_eq!(unset.daemon_idle_timeout_ms, None);
+    }
+
+    #[test]
+    fn parse_daemon_stop_and_idle_timeout_flags() {
+        let stop = parse_cli_args(["daemon", "--stop"]).expect("parse daemon --stop");
+        assert_eq!(stop.command, CliCommand::Daemon);
+        assert!(stop.daemon_stop);
+        assert_eq!(stop.daemon_idle_timeout_ms, None);
+
+        let idle = parse_cli_args(["daemon", "--idle-timeout-ms", "2500", "--poll-ms", "100"])
+            .expect("parse daemon idle timeout");
+        assert!(!idle.daemon_stop);
+        assert_eq!(idle.daemon_idle_timeout_ms, Some(2500));
+        assert_eq!(idle.daemon_poll_ms, Some(100));
+
+        let plain = parse_cli_args(["daemon"]).expect("parse daemon");
+        assert!(!plain.daemon_stop);
+        assert_eq!(plain.daemon_idle_timeout_ms, None);
+    }
+
+    #[test]
+    fn parse_rejects_stop_outside_daemon() {
+        let error = parse_cli_args(["search", "--stop", "query"])
+            .expect_err("--stop must be refused for search");
+        assert!(
+            error.to_string().contains("--stop is only valid for the daemon command"),
+            "unexpected error: {error}"
+        );
+
+        let error = parse_cli_args(["index", "--idle-timeout-ms", "10"])
+            .expect_err("--idle-timeout-ms must be refused for index");
+        assert!(
+            error
+                .to_string()
+                .contains("only valid for the serve and daemon commands"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

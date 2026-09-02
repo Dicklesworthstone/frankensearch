@@ -3117,6 +3117,23 @@ impl VectorIndex {
         }
         result?;
 
+        // A generation bump means the merge sources absorbed the WAL sidecar
+        // and the renamed main file is now the durable home of those entries.
+        // Remove the sidecar BEFORE reloading: `open` stamps the sidecar
+        // against the just-published generation, classifies it as stale (it
+        // is merely superseded), and warns "discarding stale/mismatched WAL
+        // entries" for data it has already merged. Vacuum keeps the
+        // generation, so its still-live sidecar survives the reload.
+        if new_gen != self.metadata.compaction_gen {
+            let wal_path = wal::wal_path_for(&self.path);
+            if let Err(error) = wal::remove_wal(&wal_path) {
+                tracing::warn!(
+                    path = %wal_path.display(),
+                    "failed to remove the superseded WAL before reload: {error}"
+                );
+            }
+        }
+
         // Reload
         let config = self.wal_config.clone();
         let reloaded = Self::open(&self.path)?;
@@ -10109,6 +10126,99 @@ mod tests {
             .search_top_k(&sample_vector(1.0, dim), 100, None)
             .expect("search");
         assert_eq!(hits.len(), 6);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    /// Minimal `tracing` subscriber that records every WARN-or-worse event
+    /// message. The crate has no subscriber dev-dependency, and the
+    /// regression below is invisible to every other observable: compaction
+    /// used to reload through `open` while the just-merged WAL sidecar was
+    /// still on disk, so the reload classified it as stale and warned about
+    /// discarding entries it had already absorbed.
+    struct WarnRecorder {
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl tracing::Subscriber for WarnRecorder {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.messages.lock().unwrap().push(visitor.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn compaction_reload_does_not_warn_about_the_wal_it_just_merged() {
+        let path = temp_index_path("wal-compact-reload-quiet");
+        let dim = 4;
+
+        let mut writer = VectorIndex::create(&path, "test", dim).expect("writer");
+        writer
+            .write_record("main-0", &sample_vector(1.0, dim))
+            .expect("write");
+        writer.finish().expect("finish");
+
+        let mut index = VectorIndex::open(&path).expect("open");
+        index.append("w1", &sample_vector(0.1, dim)).expect("a1");
+        index.append("w2", &sample_vector(0.2, dim)).expect("a2");
+        assert!(wal::wal_path_for(&path).exists(), "append must create the sidecar");
+
+        let recorder = std::sync::Arc::new(WarnRecorder {
+            messages: std::sync::Mutex::new(Vec::new()),
+        });
+        let stats = tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
+            index.compact().expect("compact")
+        });
+        assert_eq!(stats.wal_records, 2);
+        assert_eq!(stats.total_records_after, 3);
+
+        let warnings = recorder.messages.lock().unwrap().clone();
+        assert!(
+            warnings.is_empty(),
+            "compacting a live WAL must not warn about discarding it: {warnings:?}"
+        );
+        assert!(
+            !wal::wal_path_for(&path).exists(),
+            "the merged sidecar must be gone after compaction"
+        );
+
+        // The merged entries are durable and a later append still lands in a
+        // fresh, valid sidecar for the new generation.
+        index.append("w3", &sample_vector(0.3, dim)).expect("a3");
+        drop(index);
+        let reopened = VectorIndex::open(&path).expect("reopen");
+        assert_eq!(reopened.record_count(), 3);
+        assert_eq!(reopened.wal_record_count(), 1);
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(wal::wal_path_for(&path)).ok();

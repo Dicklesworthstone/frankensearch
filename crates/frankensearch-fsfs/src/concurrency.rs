@@ -1331,6 +1331,34 @@ pub(crate) fn is_pid_alive(_pid: u32) -> bool {
     true
 }
 
+/// Ask a process to shut down cleanly (`SIGTERM`); the fsfs daemons trap it
+/// through `ShutdownCoordinator` and exit on their next poll.
+///
+/// # Errors
+///
+/// Returns the OS error when the signal cannot be delivered (no such
+/// process, no permission).
+#[cfg(unix)]
+#[allow(unsafe_code, clippy::cast_possible_wrap)]
+pub(crate) fn request_termination(pid: u32) -> std::io::Result<()> {
+    // SAFETY: kill(2) with SIGTERM has no memory-safety preconditions; the
+    // target is identified by pid only and the result is checked below.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn request_termination(_pid: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "daemon --stop needs Unix signals on this platform",
+    ))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

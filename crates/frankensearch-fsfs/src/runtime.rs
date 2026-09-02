@@ -376,6 +376,9 @@ const FSFS_VECTOR_INDEX_FILE: &str = "vector/index.fsvi";
 /// in step by every mutation path; its presence is what makes the REFINED
 /// search phase possible (reality check 2026-09-01, G1).
 const FSFS_VECTOR_QUALITY_INDEX_FILE: &str = "vector/quality.fsvi";
+/// Pid file the compaction daemon (`fsfs daemon`) publishes under the index
+/// root so `fsfs daemon --stop` can find the process to signal.
+const FSFS_DAEMON_PID_FILE: &str = "daemon.pid";
 /// Sentinel/checkpoint reason codes describing the quality tier of a generation.
 const REASON_VECTOR_QUALITY_TIER_BUILT: &str = "vector.quality_tier.built";
 const REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY: &str = "vector.quality_tier.skipped.fast_only";
@@ -485,6 +488,38 @@ const FSFS_DAEMON_CONNECT_RETRY_DELAY_MS: u64 = 25;
 /// accumulate as an orphan. `fsfs serve --daemon --idle-timeout-ms 0` opts
 /// out for a deliberately persistent daemon.
 const FSFS_DAEMON_IDLE_TIMEOUT_MS: u64 = 600_000;
+
+/// Execute an executable this process just wrote (an updated binary, a
+/// restored backup, a test fixture) and capture its output.
+///
+/// `execve` of a freshly written file can fail with `ETXTBSY` ("Text file
+/// busy") when another thread forked between the write and the exec: the child
+/// inherits the still-open write descriptor and holds it until its own exec.
+/// fsfs is multithreaded (the query daemon spawn, the watcher, asupersync
+/// workers), so the update path is exposed to exactly this race — observed on
+/// the 2026-09-02 quality gate as `Os { code: 26, kind: ExecutableFileBusy }`.
+/// The window is milliseconds; retry only that error, bounded, and return every
+/// other error unchanged.
+fn spawn_verifying_executable(
+    binary: &Path,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    const ETXTBSY_RETRY_BUDGET: usize = 50;
+    const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+    let mut attempt = 0usize;
+    loop {
+        match Command::new(binary).args(args).output() {
+            Err(error)
+                if error.kind() == ErrorKind::ExecutableFileBusy
+                    && attempt < ETXTBSY_RETRY_BUDGET =>
+            {
+                attempt += 1;
+                std::thread::sleep(ETXTBSY_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -2762,8 +2797,16 @@ struct FsfsIndexStatus {
     size_bytes: u64,
     vector_index_bytes: u64,
     lexical_index_bytes: u64,
+    /// Catalog bytes that live under the index root. A catalog kept
+    /// elsewhere (the default `~/.local/share/fsfs/fsfs.db`) is reported
+    /// under `catalog_path`/`catalog_bytes` instead, so an empty index
+    /// directory never shows phantom bytes.
     metadata_bytes: u64,
     embedding_cache_bytes: u64,
+    #[serde(default)]
+    catalog_path: String,
+    #[serde(default)]
+    catalog_bytes: u64,
     index_freshness: Option<IndexFreshnessPayload>,
     /// Published fast-tier embedder identity, when a readable FSVI exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4817,10 +4860,8 @@ impl FsfsRuntime {
             let _ = fs::set_permissions(&current_exe, perms);
         }
 
-        // Verify the new binary runs.
-        let verify = std::process::Command::new(&current_exe)
-            .arg("version")
-            .output();
+        // Verify the new binary runs (ETXTBSY-tolerant: see the helper).
+        let verify = spawn_verifying_executable(&current_exe, &["version"]);
         match verify {
             Ok(out) if out.status.success() => {
                 let version_out = String::from_utf8_lossy(&out.stdout);
@@ -4886,9 +4927,7 @@ impl FsfsRuntime {
 
         // Verify the restored binary.
         if let Ok(current_exe) = std::env::current_exe() {
-            let verify = std::process::Command::new(&current_exe)
-                .arg("version")
-                .output();
+            let verify = spawn_verifying_executable(&current_exe, &["version"]);
             if let Ok(out) = verify
                 && out.status.success()
             {
@@ -5254,7 +5293,7 @@ impl FsfsRuntime {
             return Ok(());
         }
         if command == CliCommand::Delete {
-            self.run_delete_command()?;
+            self.run_delete_command(cx).await?;
             return Ok(());
         }
         if command == CliCommand::Compact {
@@ -9256,6 +9295,26 @@ impl FsfsRuntime {
         // check. The quality tier is appended first so a crash between the
         // two appends leaves a document findable only after both tiers agree
         // (the fast tier is what admits a document into INITIAL results).
+        // The lexical arm first: a document must be findable by BM25 (and
+        // therefore eligible for `in_both_sources`) in the same publication
+        // that makes it findable semantically.
+        publication_lease.fence("append-batch lexical publication")?;
+        let lexical_revision = pressure_timestamp_ms();
+        let lexical_mutations = docs
+            .iter()
+            .map(|(id, text)| {
+                LexicalMutation::upsert(
+                    id.clone(),
+                    lexical_revision,
+                    IngestionClass::FullSemanticLexical,
+                    text.clone(),
+                    "append_batch",
+                )
+            })
+            .collect::<Vec<_>>();
+        self.apply_one_shot_lexical_mutations(cx, &index_root, &lexical_mutations)
+            .await?;
+
         publication_lease.fence("append-batch WAL publication")?;
         if let Some((quality_embedder, _)) = quality.as_ref() {
             let mut quality_index = VectorIndex::open(&quality_vector_path)?;
@@ -9420,7 +9479,7 @@ impl FsfsRuntime {
     ///
     /// Writes tombstone markers to the WAL. Documents are excluded from
     /// search results immediately, and physically removed on next compact.
-    fn run_delete_command(&self) -> SearchResult<()> {
+    async fn run_delete_command(&self, cx: &Cx) -> SearchResult<()> {
         let index_root = self.resolve_status_index_root()?;
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
@@ -9470,6 +9529,17 @@ impl FsfsRuntime {
                     "delete mirrored tombstones into the quality tier"
                 );
             }
+            // And the lexical arm: a deleted document must stop matching by
+            // BM25 in the same command that removes its vectors.
+            publication_lease.fence("delete lexical publication")?;
+            let lexical_mutations = targets
+                .iter()
+                .map(|doc_id| {
+                    LexicalMutation::delete(doc_id.clone(), 0, IngestionClass::Skip, "delete_command")
+                })
+                .collect::<Vec<_>>();
+            self.apply_one_shot_lexical_mutations(cx, &index_root, &lexical_mutations)
+                .await?;
         }
 
         info!(
@@ -9622,6 +9692,9 @@ impl FsfsRuntime {
     /// results fresh without manual intervention.
     async fn run_daemon_command(&self, cx: &Cx) -> SearchResult<()> {
         let index_root = self.resolve_status_index_root()?;
+        if self.cli_input.daemon_stop {
+            return self.run_daemon_stop(&index_root);
+        }
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
         if !vector_path.exists() {
@@ -9632,8 +9705,23 @@ impl FsfsRuntime {
         // Held for the daemon's whole lifetime: its WAL-triggered compactions
         // are mutually exclusive with every other mutating fsfs process.
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        // Published under the index root so `fsfs daemon --stop` can find this
+        // process; released on every exit path (clean, idle, SIGTERM) by drop.
+        let mut pid_file =
+            crate::lifecycle::PidFile::new(index_root.join(FSFS_DAEMON_PID_FILE));
+        pid_file
+            .acquire(env!("CARGO_PKG_VERSION"))
+            .map_err(SearchError::Io)?;
 
         let poll_ms = self.cli_input.daemon_poll_ms.unwrap_or(1000);
+        // Unlike the query daemon, the compaction daemon runs until stopped
+        // unless an idle budget is given; `0` also means "no idle exit".
+        let idle_timeout = self
+            .cli_input
+            .daemon_idle_timeout_ms
+            .filter(|millis| *millis > 0)
+            .map(Duration::from_millis);
+        let mut last_activity = std::time::Instant::now();
         let wal_sidecar = frankensearch_index::wal_path_for(&vector_path);
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
         let quality_wal_sidecar = frankensearch_index::wal_path_for(&quality_vector_path);
@@ -9682,6 +9770,7 @@ impl FsfsRuntime {
             let current_wal_len = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
 
             if current_wal_len > last_wal_len {
+                last_activity = std::time::Instant::now();
                 info!(
                     previous_bytes = last_wal_len,
                     current_bytes = current_wal_len,
@@ -9740,6 +9829,7 @@ impl FsfsRuntime {
             let current_quality_wal_len =
                 quality_wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
             if current_quality_wal_len > last_quality_wal_len && quality_vector_path.exists() {
+                last_activity = std::time::Instant::now();
                 info!(
                     previous_bytes = last_quality_wal_len,
                     current_bytes = current_quality_wal_len,
@@ -9767,9 +9857,104 @@ impl FsfsRuntime {
                 last_quality_wal_len = current_quality_wal_len;
             }
 
+            if let Some(limit) = idle_timeout {
+                let idle_for = last_activity.elapsed();
+                if idle_for >= limit {
+                    info!(
+                        idle_ms = idle_for.as_millis(),
+                        idle_timeout_ms = limit.as_millis(),
+                        "daemon: idle timeout reached; exiting"
+                    );
+                    if self.cli_input.format == OutputFormat::Table {
+                        println!(
+                            "daemon: no WAL activity for {}ms (idle timeout {}ms), exiting",
+                            idle_for.as_millis(),
+                            limit.as_millis()
+                        );
+                    }
+                    break;
+                }
+            }
+
             asupersync::time::sleep(cx.now(), Duration::from_millis(poll_ms)).await;
         }
 
+        pid_file.release();
+        Ok(())
+    }
+
+    /// `fsfs daemon --stop`: signal the compaction daemon recorded in the
+    /// index root's pid file and wait for it to exit. A pid file whose
+    /// process is already gone (crash, SIGKILL) is cleared so the next start
+    /// does not trip over it.
+    fn run_daemon_stop(&self, index_root: &Path) -> SearchResult<()> {
+        const STOP_WAIT_BUDGET: Duration = Duration::from_secs(10);
+        const STOP_POLL: Duration = Duration::from_millis(50);
+
+        let pid_path = index_root.join(FSFS_DAEMON_PID_FILE);
+        let contents = match crate::lifecycle::PidFile::new(&pid_path).read() {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(SearchError::InvalidConfig {
+                    field: "daemon.pid_file".into(),
+                    value: pid_path.display().to_string(),
+                    reason: "no compaction daemon pid file under the index root; nothing to stop"
+                        .into(),
+                });
+            }
+            Err(error) => return Err(SearchError::Io(error)),
+        };
+
+        let started = std::time::Instant::now();
+        let stale_pid_file_removed = if contents.is_alive() {
+            crate::concurrency::request_termination(contents.pid).map_err(SearchError::Io)?;
+            let mut alive = true;
+            while alive && started.elapsed() < STOP_WAIT_BUDGET {
+                std::thread::sleep(STOP_POLL);
+                alive = contents.is_alive();
+            }
+            if alive {
+                return Err(SearchError::InvalidConfig {
+                    field: "daemon.stop".into(),
+                    value: contents.pid.to_string(),
+                    reason: format!(
+                        "daemon PID {} did not exit within {}s of SIGTERM",
+                        contents.pid,
+                        STOP_WAIT_BUDGET.as_secs()
+                    ),
+                });
+            }
+            false
+        } else {
+            if let Err(error) = fs::remove_file(&pid_path)
+                && error.kind() != ErrorKind::NotFound
+            {
+                return Err(SearchError::Io(error));
+            }
+            true
+        };
+
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if self.cli_input.format == OutputFormat::Table {
+            if stale_pid_file_removed {
+                println!(
+                    "daemon: PID {} was not running; removed stale pid file {}",
+                    contents.pid,
+                    pid_path.display()
+                );
+            } else {
+                println!("daemon: stopped PID {} after {elapsed_ms}ms", contents.pid);
+            }
+        } else {
+            let payload = serde_json::json!({
+                "pid": contents.pid,
+                "stopped": true,
+                "stale_pid_file_removed": stale_pid_file_removed,
+                "elapsed_ms": elapsed_ms,
+                "pid_file": pid_path.display().to_string(),
+            });
+            println!("{payload}");
+        }
         Ok(())
     }
 
@@ -11035,10 +11220,20 @@ impl FsfsRuntime {
         let published_vector = Self::inspect_published_vector_generation(&index_root);
         let published_quality = Self::inspect_published_quality_generation(&index_root);
 
+        // Only a catalog that lives under the index root counts towards the
+        // index's own bytes; the default global catalog is reported on its
+        // own so `status` in an empty directory shows zero index bytes.
+        let catalog_path = PathBuf::from(&self.config.storage.db_path);
+        let catalog_inside_index_root = catalog_path.starts_with(&index_root);
+        let catalog_bytes = Self::total_bytes_for_paths(std::slice::from_ref(&catalog_path))?;
         let storage_paths = IndexStoragePaths {
             vector_index_roots: vec![index_root.join("vector")],
             lexical_index_roots: vec![index_root.join("lexical")],
-            catalog_files: vec![PathBuf::from(&self.config.storage.db_path)],
+            catalog_files: if catalog_inside_index_root {
+                vec![catalog_path.clone()]
+            } else {
+                Vec::new()
+            },
             embedding_cache_roots: vec![index_root.join("cache")],
         };
         let mut usage = self.collect_index_storage_usage(&storage_paths)?;
@@ -11110,6 +11305,8 @@ impl FsfsRuntime {
                 lexical_index_bytes: usage.lexical_index_bytes,
                 metadata_bytes: usage.catalog_bytes,
                 embedding_cache_bytes: usage.embedding_cache_bytes,
+                catalog_path: catalog_path.display().to_string(),
+                catalog_bytes,
                 index_freshness: lexical_stats.map(Self::index_freshness_payload),
                 vector_generation_id: published_vector.as_ref().map(|value| value.id.clone()),
                 vector_generation_dimension: published_vector.as_ref().map(|value| value.dimension),
@@ -13631,6 +13828,61 @@ impl FsfsRuntime {
                 (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE)
             }
         }
+    }
+
+    /// Apply lexical mutations to the ACTIVE Quill generation from a one-shot
+    /// command (`append-batch`, `delete`), through the same incremental
+    /// pipeline watch mode uses, and flush durably.
+    ///
+    /// Before this existed those commands mutated only the vector tiers: an
+    /// appended document had `lexical_rank: null` and could never be
+    /// `in_both_sources`, and a deleted document stayed findable by BM25.
+    /// The caller holds the publication lease; this opens the durable index
+    /// for the mutation only and closes it on return.
+    async fn apply_one_shot_lexical_mutations(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+        mutations: &[LexicalMutation],
+    ) -> SearchResult<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let lexical_layout = Self::resolve_lexical_engine(index_root)?;
+        let (Some(BlueGreenEngine::Quill), Some(lexical_path)) =
+            (lexical_layout.engine(), lexical_layout.engine_dir())
+        else {
+            // A vector-only root (no Quill generation) is a legitimate layout;
+            // there is no lexical arm to keep in step.
+            tracing::debug!(
+                index_root = %index_root.display(),
+                mutations = mutations.len(),
+                "no active Quill generation; lexical mutations skipped"
+            );
+            return Ok(());
+        };
+        let index = QuillIndex::create_durable(
+            cx,
+            &lexical_path,
+            QuillConfig {
+                max_ingest_shards: 1,
+                deterministic_ingest: true,
+                quarantine_on_unrepairable: true,
+                ..QuillConfig::default()
+            },
+            fsfs_quill_protector()?,
+        )
+        .await?;
+        let backend = QuillLexicalBackend::new(&index);
+        let mut pipeline = LexicalPipeline::new(backend);
+        let stats = pipeline.apply_incremental(mutations)?;
+        pipeline.backend_mut().flush(cx).await?;
+        info!(
+            mutations = mutations.len(),
+            ?stats,
+            "one-shot lexical mutations flushed to the active Quill generation"
+        );
+        Ok(())
     }
 
     /// Retire a quality-tier generation that no longer belongs to the fast
@@ -16475,7 +16727,10 @@ fn print_cli_help() {
         "  compact                                  Merge WAL into main index and vacuum tombstones"
     );
     println!(
-        "  daemon [--daemon-poll-ms <ms>]            Long-running process that auto-compacts when WAL grows"
+        "  daemon [--poll-ms <ms>] [--idle-timeout-ms <ms>]  Long-running process that auto-compacts when WAL grows"
+    );
+    println!(
+        "  daemon --stop                            Stop the compaction daemon recorded under the index root"
     );
     println!();
     println!(
@@ -19836,6 +20091,19 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         lexical_pct,
         humanize_bytes(status.index.metadata_bytes),
     );
+    if !status.index.catalog_path.is_empty() {
+        let placement = if Path::new(&status.index.catalog_path).starts_with(&status.index.path) {
+            "inside index root, counted above"
+        } else {
+            "outside index root, not counted above"
+        };
+        let _ = writeln!(
+            out,
+            "        catalog={} ({}, {placement})",
+            status.index.catalog_path,
+            humanize_bytes(status.index.catalog_bytes),
+        );
+    }
     if let Some(last_indexed_ms) = status.index.last_indexed_ms {
         let _ = writeln!(
             out,
@@ -21991,20 +22259,76 @@ mod tests {
     /// error is returned unchanged.
     #[cfg(unix)]
     fn run_fixture_binary(binary: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-        const ETXTBSY_RETRY_BUDGET: usize = 50;
-        let mut attempt = 0usize;
-        loop {
-            match std::process::Command::new(binary).args(args).output() {
-                Err(error)
-                    if error.kind() == ErrorKind::ExecutableFileBusy
-                        && attempt < ETXTBSY_RETRY_BUDGET =>
-                {
-                    attempt += 1;
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                result => return result,
-            }
-        }
+        // Same policy as production update verification; one implementation.
+        super::spawn_verifying_executable(binary, args)
+    }
+
+    /// Writes an executable shell script and returns its still-open write
+    /// handle. While that handle lives, `execve` of the script fails with
+    /// `ETXTBSY` (`ErrorKind::ExecutableFileBusy`): the kernel refuses to
+    /// execute an image that is open for writing anywhere in the process,
+    /// which is exactly what a sibling thread's forked-but-not-yet-exec'd
+    /// child produced on the 2026-09-02 gate.
+    #[cfg(unix)]
+    fn write_busy_executable(tag: &str) -> (PathBuf, fs::File) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = reserve_unique_test_dir(tag)
+            .expect("busy-executable fixture directory should be atomically reservable");
+        let binary = dir.join("fsfs-busy");
+        let mut writer = fs::File::create(&binary).unwrap();
+        writer.write_all(b"#!/bin/sh\necho busy-ok\n").unwrap();
+        writer.sync_all().unwrap();
+        fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (binary, writer)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_verifying_executable_retries_until_the_image_is_closed_for_writing() {
+        let (binary, writer) = write_busy_executable("etxtbsy_retry");
+
+        // Prove the fixture reproduces the race before trusting the retry.
+        let busy = Command::new(&binary).output();
+        assert!(
+            matches!(&busy, Err(error) if error.kind() == ErrorKind::ExecutableFileBusy),
+            "an image open for writing must fail to execute, got {busy:?}"
+        );
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(writer);
+        });
+        let output = super::spawn_verifying_executable(&binary, &[])
+            .expect("the retry budget must outlast a writer that closes after 120ms");
+        release.join().unwrap();
+
+        assert!(output.status.success(), "status: {:?}", output.status);
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "busy-ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_verifying_executable_reports_a_writer_that_never_closes() {
+        let (binary, writer) = write_busy_executable("etxtbsy_exhausted");
+
+        let started = std::time::Instant::now();
+        let result = super::spawn_verifying_executable(&binary, &["version"]);
+        let elapsed = started.elapsed();
+        drop(writer);
+
+        let error = result.expect_err("a writer held for the whole budget must surface the error");
+        assert_eq!(error.kind(), ErrorKind::ExecutableFileBusy);
+        // 50 retries x 10ms: the budget is bounded and actually consumed.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(400),
+            "the retry budget should be spent before giving up, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the retry budget must stay bounded, took {elapsed:?}"
+        );
     }
 
     fn with_test_backup_dir<F, T>(label: &str, f: F) -> T
@@ -22037,6 +22361,8 @@ mod tests {
                 lexical_index_bytes: 512 * 1024,
                 metadata_bytes: 0,
                 embedding_cache_bytes: 0,
+                catalog_path: "/home/operator/.local/share/fsfs/fsfs.db".to_owned(),
+                catalog_bytes: 0,
                 vector_generation_id: Some("potion-multilingual-128m".to_owned()),
                 vector_generation_dimension: Some(256),
                 vector_generation_is_hash: false,
@@ -22487,38 +22813,39 @@ mod tests {
             .expect("append WAL-only document");
         drop(mutator);
 
-        let run_delete = |ids: Vec<&str>| {
-            let mut config = FsfsConfig::default();
-            config.storage.index_dir = temp.path().display().to_string();
-            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
-                index_dir: Some(temp.path().to_path_buf()),
-                delete_ids: ids.into_iter().map(str::to_owned).collect(),
-                delete_prefix: true,
-                format: OutputFormat::Json,
-                ..CliInput::default()
-            });
-            runtime
-                .run_delete_command()
-                .expect("delete --prefix succeeds");
-            let index = VectorIndex::open(&vector_path).expect("reopen vector index");
-            super::vector_live_doc_ids(&index).expect("read live doc ids")
-        };
-
-        // Planted negative: a prefix that matches nothing tombstones nothing.
-        let untouched = run_delete(vec!["nope/"]);
-        assert!(untouched.contains("wal/only.md") && untouched.contains("main/keep.md"));
-
-        // Positive: the WAL-only document is reachable by prefix delete and
-        // the main-generation document with a different prefix survives.
-        let after = run_delete(vec!["wal/"]);
-        assert!(
-            !after.contains("wal/only.md"),
-            "WAL-only document must be tombstoned by prefix delete: {after:?}"
-        );
-        assert!(
-            after.contains("main/keep.md"),
-            "documents outside the prefix must survive: {after:?}"
-        );
+        run_test_with_cx(|cx| async move {
+            let mut live_after = Vec::new();
+            // Planted negative first (a prefix that matches nothing tombstones
+            // nothing), then the positive prefix.
+            for ids in [vec!["nope/"], vec!["wal/"]] {
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = temp.path().display().to_string();
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    index_dir: Some(temp.path().to_path_buf()),
+                    delete_ids: ids.into_iter().map(str::to_owned).collect(),
+                    delete_prefix: true,
+                    format: OutputFormat::Json,
+                    ..CliInput::default()
+                });
+                runtime
+                    .run_delete_command(&cx)
+                    .await
+                    .expect("delete --prefix succeeds");
+                let index = VectorIndex::open(&vector_path).expect("reopen vector index");
+                live_after.push(super::vector_live_doc_ids(&index).expect("read live doc ids"));
+            }
+            let untouched = &live_after[0];
+            assert!(untouched.contains("wal/only.md") && untouched.contains("main/keep.md"));
+            let after = &live_after[1];
+            assert!(
+                !after.contains("wal/only.md"),
+                "WAL-only document must be tombstoned by prefix delete: {after:?}"
+            );
+            assert!(
+                after.contains("main/keep.md"),
+                "documents outside the prefix must survive: {after:?}"
+            );
+        });
     }
 
     /// The product's two-tier promise, end to end inside the runtime: a
@@ -30840,6 +31167,114 @@ mod tests {
                 .exists(),
             "status must not manufacture a publication lease"
         );
+    }
+
+    /// bd-f8j9z: the default catalog lives outside the index root, so an
+    /// empty index directory used to report its bytes as index metadata.
+    #[test]
+    fn status_attributes_only_an_in_root_catalog_to_index_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let external_catalog = temp.path().join("share").join("fsfs.db");
+        fs::create_dir_all(external_catalog.parent().unwrap()).expect("create catalog dir");
+        fs::write(&external_catalog, vec![0u8; 659]).expect("seed external catalog");
+
+        let status_for = |db_path: &Path| {
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = index_root.display().to_string();
+            config.storage.db_path = db_path.display().to_string();
+            FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Status,
+                    index_dir: Some(index_root.clone()),
+                    format: OutputFormat::Json,
+                    ..CliInput::default()
+                })
+                .collect_status_payload()
+                .expect("collect status payload")
+        };
+
+        let external = status_for(&external_catalog);
+        assert_eq!(external.index.size_bytes, 0, "an empty index root owns no bytes");
+        assert_eq!(external.index.metadata_bytes, 0);
+        assert_eq!(external.index.catalog_bytes, 659);
+        assert_eq!(
+            external.index.catalog_path,
+            external_catalog.display().to_string()
+        );
+        assert_eq!(external.runtime.tracked_index_bytes, Some(0));
+
+        let internal_catalog = index_root.join("catalog.db");
+        fs::write(&internal_catalog, vec![0u8; 128]).expect("seed in-root catalog");
+        let internal = status_for(&internal_catalog);
+        assert_eq!(internal.index.metadata_bytes, 128);
+        assert_eq!(internal.index.size_bytes, 128);
+        assert_eq!(internal.index.catalog_bytes, 128);
+        assert_eq!(internal.runtime.tracked_index_bytes, Some(128));
+    }
+
+    fn daemon_stop_runtime(index_root: &Path) -> FsfsRuntime {
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Daemon,
+            index_dir: Some(index_root.to_path_buf()),
+            format: OutputFormat::Json,
+            daemon_stop: true,
+            ..CliInput::default()
+        })
+    }
+
+    #[test]
+    fn daemon_stop_without_a_pid_file_is_a_typed_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("create index root");
+
+        let error = daemon_stop_runtime(&index_root)
+            .run_daemon_stop(&index_root)
+            .expect_err("nothing to stop must be reported, not swallowed");
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { field, .. } if field == "daemon.pid_file"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_stop_clears_a_stale_pid_file_and_terminates_a_live_daemon() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let pid_path = index_root.join(FSFS_DAEMON_PID_FILE);
+        let write_pid_file = |pid: u32| {
+            let mut contents = crate::lifecycle::PidFileContents::current("test");
+            contents.pid = pid;
+            fs::write(&pid_path, serde_json::to_string(&contents).unwrap()).unwrap();
+        };
+
+        // Stale: a reaped child's pid is not running any more.
+        let mut reaped = Command::new("true").spawn().expect("spawn true");
+        reaped.wait().expect("reap");
+        write_pid_file(reaped.id());
+        daemon_stop_runtime(&index_root)
+            .run_daemon_stop(&index_root)
+            .expect("a stale pid file is cleared, not an error");
+        assert!(!pid_path.exists(), "stale pid file must be removed");
+
+        // Live: a sleeping child stands in for the daemon; SIGTERM ends it.
+        // A reaper thread waits on the child concurrently: a real daemon is
+        // reaped by init, but this child stays a zombie (and therefore
+        // "alive" to kill(pid, 0)) until someone waits on it.
+        let mut live = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        write_pid_file(live.id());
+        let reaper = std::thread::spawn(move || live.wait().expect("wait for the signalled child"));
+        daemon_stop_runtime(&index_root)
+            .run_daemon_stop(&index_root)
+            .expect("a live process must be terminated");
+        let status = reaper.join().expect("reaper thread");
+        assert!(!status.success(), "sleep must have died from the signal: {status:?}");
     }
 
     #[test]
