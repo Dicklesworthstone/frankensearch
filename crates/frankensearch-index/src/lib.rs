@@ -2226,6 +2226,12 @@ impl VectorIndex {
         self.metadata.dimension
     }
 
+    /// Path of the main FSVI file this handle is mapped from.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Embedder id stored in the index header.
     #[must_use]
     pub fn embedder_id(&self) -> &str {

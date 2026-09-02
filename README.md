@@ -168,7 +168,11 @@ you index, the generation is built fast-only, `fsfs doctor` reports
 searches stop at `INITIAL` until you re-index with the model present.
 `fsfs status` shows both generations (`vector_generation_id`,
 `quality_generation_id`). Deletes, `append-batch`, `compact`, and watch mode
-keep the two tiers in step. The first search in a shell pays the model load
+keep the two tiers in step. Both generations carry RaptorQ repair sidecars
+(`index.fsvi.fec`, `quality.fsvi.fec`) like Quill's segments: `fsfs doctor`
+verifies them as `durability.vector_sidecars`, `fsfs compact` restores a
+generation whose bytes drifted before merging, and an in-place delete drops
+the sidecar until the next compaction re-protects the file. The first search in a shell pays the model load
 (about 3 s for potion, plus the MiniLM session for the quality stage); the
 query daemon that `fsfs search` starts by default keeps later searches to tens
 of milliseconds and exits on its own after ten idle minutes.
@@ -303,7 +307,7 @@ Model path used in the default quality lane:
 | `frankensearch-durability` | Repair/protection primitives for index artifacts and segment health |
 | `crates/frankensearch-fsfs` | Standalone CLI product around the library stack |
 | `crates/frankensearch-tui` | Shared TUI shell/input/theme/replay framework used by fsfs/ops |
-| `crates/frankensearch-ops` | Fleet observability/control-plane TUI and telemetry materialization |
+| `crates/frankensearch-ops` | Fleet observability/control-plane TUI and telemetry materialization. **Experimental (decision 2026-09-02, bd-p6k61):** no shipped telemetry source yet; its only producer is its own simulator, nothing depends on it, and no release lane builds it |
 
 This separation gives you two options:
 - use the top-level library as a drop-in engine in your own app

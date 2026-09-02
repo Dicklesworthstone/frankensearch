@@ -235,7 +235,7 @@ cargo test --workspace --all-features
 | `frankensearch-durability` | Repair trailer I/O, file protection/repair pipelines, codec verification paths |
 | `frankensearch-fsfs` | CLI config precedence, stream/output contracts, query execution pipeline, watcher lifecycle |
 | `frankensearch-tui` | Shared shell/keymap/theme/determinism primitives, replay/evidence contracts |
-| `frankensearch-ops` | Fleet telemetry ingestion/materialization, discovery logic, operations screens/state projection |
+| `frankensearch-ops` | Fleet telemetry ingestion/materialization, discovery logic, operations screens/state projection. Experimental (decision 2026-09-02, bd-p6k61): no shipped telemetry source, no dependents, not built by any release lane |
 | `tests/` (workspace) | Cross-component integration, full search pipeline end-to-end, progressive iterator contract |
 | `benches/` (workspace) | SIMD dot product throughput, top-k search scaling, embedding latency, RRF fusion overhead |
 

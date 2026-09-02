@@ -28,7 +28,9 @@ use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
     HitExplanation, IndexableDocument, ModelCategory, ScoreComponent, SearchError, SearchResult,
 };
-use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileProtector};
+use frankensearch_durability::{
+    DefaultSymbolCodec, DurabilityConfig, FileProtector, FsviProtector, FsviVerifyResult,
+};
 #[cfg(test)]
 use frankensearch_embed::HashEmbedder;
 #[cfg(feature = "embedded-models")]
@@ -1444,6 +1446,127 @@ fn fsfs_quill_protector() -> SearchResult<FileProtector> {
     FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
 }
 
+fn fsfs_fsvi_protector() -> SearchResult<FsviProtector> {
+    FsviProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
+}
+
+/// The two vector generation files a root can carry, with the tier label used
+/// in reason codes.
+const FSFS_VECTOR_GENERATION_FILES: [(&str, &str); 2] = [
+    ("fast", FSFS_VECTOR_INDEX_FILE),
+    ("quality", FSFS_VECTOR_QUALITY_INDEX_FILE),
+];
+
+/// Write (or refresh) the `RaptorQ` `.fec` sidecar for every vector generation
+/// under `index_root`, the same protection Quill segments already get.
+///
+/// Called after a full rewrite of the file (one-shot publication, compaction,
+/// vacuum). A protector failure never fails the publication: the generation is
+/// intact, only its repair symbols are missing, and that is reported as a
+/// reason code (`vector.durability.protect_failed.<tier>`) and by `doctor`.
+/// Every writer handle on the file must be dropped first: the protector takes
+/// the reader side of the FSVI map lock.
+fn protect_vector_generations(index_root: &Path, reason: &str) -> Vec<String> {
+    let mut reason_codes = Vec::new();
+    let protector = match fsfs_fsvi_protector() {
+        Ok(protector) => protector,
+        Err(error) => {
+            warn!(error = %error, reason, "RaptorQ protector unavailable; vector generations left unprotected");
+            reason_codes.push("vector.durability.protector_unavailable".to_owned());
+            return reason_codes;
+        }
+    };
+    for (tier, rel) in FSFS_VECTOR_GENERATION_FILES {
+        let path = index_root.join(rel);
+        if !path.exists() {
+            continue;
+        }
+        match protector.protect_atomic(&path) {
+            Ok(result) => info!(
+                path = %path.display(),
+                sidecar = %result.sidecar_path.display(),
+                source_bytes = result.source_size,
+                repair_bytes = result.repair_size,
+                overhead = %format!("{:.3}", result.overhead_ratio),
+                reason,
+                "vector generation protected with a RaptorQ sidecar"
+            ),
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    reason,
+                    "vector generation left unprotected"
+                );
+                reason_codes.push(format!("vector.durability.protect_failed.{tier}"));
+            }
+        }
+    }
+    reason_codes
+}
+
+/// Remove the `.fec` sidecars of the given FSVI files after an in-place
+/// mutation (tombstone flags are written into the mapped file). A sidecar
+/// built before such a write would "repair" the tombstones away, so the file
+/// is left explicitly unprotected until the next compaction re-protects it.
+fn invalidate_vector_sidecars<'a>(paths: impl IntoIterator<Item = &'a Path>, reason: &str) {
+    for path in paths {
+        let sidecar = FsviProtector::sidecar_path(path);
+        match fs::remove_file(&sidecar) {
+            Ok(()) => info!(
+                sidecar = %sidecar.display(),
+                reason,
+                "stale RaptorQ sidecar removed after an in-place tombstone; the next compaction re-protects the generation"
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                sidecar = %sidecar.display(),
+                error = %error,
+                reason,
+                "could not remove a stale RaptorQ sidecar; doctor will report the file as corrupted until it is compacted"
+            ),
+        }
+    }
+}
+
+/// Before a compaction opens a generation for rewriting, restore it from its
+/// sidecar if the bytes no longer match. A corruption the sidecar cannot
+/// repair is a typed error rather than a silent merge of damaged records.
+fn repair_vector_generations_if_corrupted(index_root: &Path) -> SearchResult<usize> {
+    let protector = fsfs_fsvi_protector()?;
+    let mut repaired = 0usize;
+    for (tier, rel) in FSFS_VECTOR_GENERATION_FILES {
+        let path = index_root.join(rel);
+        if !path.exists() {
+            continue;
+        }
+        match protector.verify(&path)? {
+            FsviVerifyResult::Intact | FsviVerifyResult::NoSidecar => {}
+            FsviVerifyResult::Corrupted { repairable: true } => {
+                let result = protector.repair(&path)?;
+                repaired = repaired.saturating_add(1);
+                info!(
+                    path = %path.display(),
+                    tier,
+                    bytes_written = result.bytes_written,
+                    symbols_used = result.symbols_used,
+                    decode_ms = result.decode_time.as_millis(),
+                    "vector generation repaired from its RaptorQ sidecar"
+                );
+            }
+            FsviVerifyResult::Corrupted { repairable: false } => {
+                return Err(SearchError::IndexCorrupted {
+                    path,
+                    detail: format!(
+                        "{tier}-tier generation bytes no longer match the RaptorQ sidecar and the damage exceeds its repair budget; rebuild with `fsfs index --full`"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(repaired)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LexicalEngineLayout {
     Missing {
@@ -2257,16 +2380,28 @@ impl LiveIngestPipeline {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Missing documents are `Ok(false)`; an error is a real durability or
         // integrity failure and must not be reported as a successful delete.
-        let _was_present = vi.soft_delete(rel_key)?;
+        let fast_path = vi.path().to_path_buf();
+        let fast_present = vi.soft_delete(rel_key)?;
         drop(vi);
+        let mut tombstoned = Vec::new();
+        if fast_present {
+            tombstoned.push(fast_path);
+        }
         if let Some(tier) = self.quality_tier.as_ref() {
             let mut quality = tier
                 .vector_index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _was_present = quality.soft_delete(rel_key)?;
+            let quality_path = quality.path().to_path_buf();
+            let quality_present = quality.soft_delete(rel_key)?;
             drop(quality);
+            if quality_present {
+                tombstoned.push(quality_path);
+            }
         }
+        // In-place tombstones invalidate the RaptorQ sidecars; the next
+        // compaction re-protects the generations.
+        invalidate_vector_sidecars(tombstoned.iter().map(PathBuf::as_path), "watch delete");
         Ok(())
     }
 
@@ -9561,6 +9696,13 @@ impl FsfsRuntime {
                     "delete mirrored tombstones into the quality tier"
                 );
             }
+            // Tombstones are in-place writes: a RaptorQ sidecar built before
+            // them would restore the deleted records, so it goes now and the
+            // next compaction re-protects both tiers.
+            invalidate_vector_sidecars(
+                [vector_path.as_path(), quality_vector_path.as_path()],
+                "delete command",
+            );
             // And the lexical arm: a deleted document must stop matching by
             // BM25 in the same command that removes its vectors.
             publication_lease.fence("delete lexical publication")?;
@@ -9634,6 +9776,9 @@ impl FsfsRuntime {
 
         publication_lease.fence("explicit vector compaction")?;
         self.quiesce_query_daemon("compact")?;
+        // A generation whose bytes drifted from its RaptorQ sidecar is
+        // restored before it is merged; unrepairable damage is a typed error.
+        let repaired_generations = repair_vector_generations_if_corrupted(&index_root)?;
         let mut index = Self::open_vector_index_for_mutation(&vector_path)?;
 
         // First compact WAL into main index.
@@ -9669,6 +9814,12 @@ impl FsfsRuntime {
             None
         };
 
+        // Every rewrite above invalidated the RaptorQ sidecars; refresh them
+        // now that the writer handles are gone.
+        drop(index);
+        publication_lease.fence("vector generation durability sidecars")?;
+        let unprotected = protect_vector_generations(&index_root, "compact");
+
         info!(
             main_before = compaction_stats.main_records_before,
             wal_merged = compaction_stats.wal_records,
@@ -9676,6 +9827,8 @@ impl FsfsRuntime {
             total_after = vacuum_stats.records_after,
             compaction_ms = %format!("{:.1}", compaction_stats.elapsed_ms),
             vacuum_ms = %format!("{:.1}", vacuum_stats.duration.as_secs_f64() * 1000.0),
+            repaired_generations,
+            unprotected = ?unprotected,
             "compact completed"
         );
 
@@ -9858,6 +10011,12 @@ impl FsfsRuntime {
                     }
                 }
 
+                // The rewrite invalidated the fast tier's RaptorQ sidecar.
+                if let Err(error) = publication_lease.fence("daemon vector durability sidecars") {
+                    warn!(error = %error, "daemon: lease fence failed before re-protecting the fast tier");
+                } else {
+                    protect_vector_generations(&index_root, "daemon compaction");
+                }
                 // Re-read the current WAL length after compaction (it should be gone or reset).
                 last_wal_len = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
             } else {
@@ -9894,6 +10053,13 @@ impl FsfsRuntime {
                     Err(error) => {
                         warn!(error = %error, "daemon: failed to open quality tier for compaction");
                     }
+                }
+                if let Err(error) =
+                    publication_lease.fence("daemon quality vector durability sidecars")
+                {
+                    warn!(error = %error, "daemon: lease fence failed before re-protecting the quality tier");
+                } else {
+                    protect_vector_generations(&index_root, "daemon quality compaction");
                 }
                 last_quality_wal_len = quality_wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
             } else {
@@ -10209,6 +10375,7 @@ impl FsfsRuntime {
         checks.push(Self::collect_zero_signal_doctor_check(&index_root));
         checks.push(Self::collect_vector_generation_doctor_check(&index_root));
         checks.push(Self::collect_quality_generation_doctor_check(&index_root));
+        checks.push(Self::collect_vector_durability_doctor_check(&index_root));
 
         // 5. Index directory permissions, without mutating the live index.
         if index_root.exists() {
@@ -10543,6 +10710,91 @@ impl FsfsRuntime {
     /// INITIAL; an unreadable or hash-control tier, or one whose live
     /// document set disagrees with the fast tier, is a failure because the
     /// REFINED phase would then be wrong rather than absent.
+    /// `durability.vector_sidecars`: every published FSVI is verified against
+    /// its `RaptorQ` sidecar (xxh3 fast path, CRC fallback). Observation only:
+    /// a repairable generation is restored by the next `fsfs compact`, not
+    /// by doctor.
+    fn collect_vector_durability_doctor_check(index_root: &Path) -> DoctorCheck {
+        const NAME: &str = "durability.vector_sidecars";
+        let protector = match fsfs_fsvi_protector() {
+            Ok(protector) => protector,
+            Err(error) => {
+                return DoctorCheck {
+                    name: NAME.to_owned(),
+                    verdict: DoctorVerdict::Fail,
+                    detail: format!("RaptorQ protector unavailable: {error}"),
+                    suggestion: None,
+                };
+            }
+        };
+        let mut details = Vec::new();
+        let mut present = 0usize;
+        let mut unprotected = false;
+        let mut corrupted = false;
+        for (tier, rel) in FSFS_VECTOR_GENERATION_FILES {
+            let path = index_root.join(rel);
+            if !path.exists() {
+                continue;
+            }
+            present += 1;
+            match protector.verify(&path) {
+                Ok(FsviVerifyResult::Intact) => details.push(format!("{tier} ({rel}): intact")),
+                Ok(FsviVerifyResult::NoSidecar) => {
+                    unprotected = true;
+                    details.push(format!("{tier} ({rel}): unprotected, no .fec sidecar"));
+                }
+                Ok(FsviVerifyResult::Corrupted { repairable }) => {
+                    corrupted = true;
+                    details.push(format!(
+                        "{tier} ({rel}): CORRUPTED, {}",
+                        if repairable {
+                            "repairable from its sidecar"
+                        } else {
+                            "beyond the sidecar's repair budget"
+                        }
+                    ));
+                }
+                Err(error) => {
+                    corrupted = true;
+                    details.push(format!("{tier} ({rel}): verification failed: {error}"));
+                }
+            }
+        }
+        if present == 0 {
+            return DoctorCheck {
+                name: NAME.to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail: "no vector generation to protect".to_owned(),
+                suggestion: Some("run `fsfs index <dir>` to build one".to_owned()),
+            };
+        }
+        let (verdict, suggestion) = if corrupted {
+            (
+                DoctorVerdict::Fail,
+                Some(
+                    "run `fsfs compact`: a repairable generation is restored from its sidecar before compaction; otherwise rebuild with `fsfs index --full`"
+                        .to_owned(),
+                ),
+            )
+        } else if unprotected {
+            (
+                DoctorVerdict::Warn,
+                Some(
+                    "run `fsfs compact` to write RaptorQ sidecars for the published generations"
+                        .to_owned(),
+                ),
+            )
+        } else {
+            (DoctorVerdict::Pass, None)
+        };
+        DoctorCheck {
+            name: NAME.to_owned(),
+            verdict,
+            detail: details.join("; "),
+            suggestion,
+        }
+    }
+
     fn collect_quality_generation_doctor_check(index_root: &Path) -> DoctorCheck {
         const NAME: &str = "semantic.quality_generation";
         let quality_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
@@ -12993,6 +13245,15 @@ impl FsfsRuntime {
         }
         vector_elapsed_ms =
             vector_elapsed_ms.saturating_add(vector_finish_start.elapsed().as_millis());
+        // Both generations are final: drop the writer handles (the protector
+        // takes the reader side of the map lock) and write their RaptorQ
+        // sidecars under the same lease, like Quill's segments.
+        drop(vector_index);
+        drop(quality_vector_index);
+        publication_lease.fence("vector generation durability sidecars")?;
+        for code in protect_vector_generations(&index_root, "one-shot publication") {
+            observed_reason_codes.insert(code);
+        }
 
         let manifests = manifests.into_values().collect::<Vec<_>>();
         let source_hash_hex = index_source_hash_hex(&manifests);
@@ -14547,7 +14808,11 @@ impl FsfsRuntime {
             fsfs_quill_protector()?,
         )
         .await?;
-        let vector_index = VectorIndex::open(&vector_path)?;
+        // The one-shot pass that precedes watch mode in the same process can
+        // still be releasing its writer for a few milliseconds (bd-ql03m: an
+        // intermittent `fsvi.map_lock` refusal right after the summary line);
+        // use the same bounded retry every other in-place mutation uses.
+        let vector_index = Self::open_vector_index_for_mutation(&vector_path)?;
         let embedder = self.resolve_fast_embedder()?;
         Self::admit_vector_generation_for_embedder(&vector_index, embedder.as_ref())?;
 
@@ -14565,7 +14830,7 @@ impl FsfsRuntime {
                     ),
                 }
             })?;
-            let quality_index = VectorIndex::open(&quality_vector_path)?;
+            let quality_index = Self::open_vector_index_for_mutation(&quality_vector_path)?;
             Self::admit_quality_generation_for_embedder(&quality_index, quality_embedder.as_ref())?;
             Some((quality_index, quality_embedder))
         } else {
@@ -31403,6 +31668,94 @@ mod tests {
         assert_eq!(internal.index.size_bytes, 128);
         assert_eq!(internal.index.catalog_bytes, 128);
         assert_eq!(internal.runtime.tracked_index_bytes, Some(128));
+    }
+
+    /// bd-9ekrw: both vector generations get `RaptorQ` sidecars; doctor reports
+    /// intact / unprotected / corrupted; a flipped byte is repaired from the
+    /// sidecar before compaction; an in-place tombstone invalidates the
+    /// sidecar instead of leaving one that would resurrect the record.
+    #[test]
+    fn vector_generations_are_protected_verified_and_repaired() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let vector = vec![0.25_f32; 8];
+        for (rel, embedder) in [
+            (super::FSFS_VECTOR_INDEX_FILE, "hash-8"),
+            (super::FSFS_VECTOR_QUALITY_INDEX_FILE, "quality-8"),
+        ] {
+            let path = index_root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut writer = VectorIndex::create(&path, embedder, vector.len()).expect("create");
+            for doc in ["a.md", "b.md", "c.md"] {
+                writer.write_record(doc, &vector).expect("write");
+            }
+            writer.finish().expect("finish");
+        }
+        let fast_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        let quality_path = index_root.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE);
+        let pristine = fs::read(&fast_path).expect("read pristine fast generation");
+
+        // Unprotected: a warn with the compaction suggestion.
+        let check = super::FsfsRuntime::collect_vector_durability_doctor_check(&index_root);
+        assert_eq!(check.verdict, super::DoctorVerdict::Warn, "{check:?}");
+        assert!(check.detail.contains("unprotected"), "{check:?}");
+
+        // Protect both tiers.
+        let failures = super::protect_vector_generations(&index_root, "test");
+        assert!(failures.is_empty(), "protect failures: {failures:?}");
+        assert!(super::FsviProtector::sidecar_path(&fast_path).is_file());
+        assert!(super::FsviProtector::sidecar_path(&quality_path).is_file());
+        let check = super::FsfsRuntime::collect_vector_durability_doctor_check(&index_root);
+        assert_eq!(check.verdict, super::DoctorVerdict::Pass, "{check:?}");
+        assert!(check.detail.contains("fast (") && check.detail.contains("quality ("));
+
+        // Flip one byte in the middle of the fast tier: corrupted, repairable.
+        {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fast_path)
+                .expect("open for corruption");
+            let middle = u64::try_from(pristine.len() / 2).unwrap();
+            file.seek(SeekFrom::Start(middle)).unwrap();
+            let mut byte = [0u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            file.seek(SeekFrom::Start(middle)).unwrap();
+            file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+            file.sync_all().unwrap();
+        }
+        assert_ne!(
+            fs::read(&fast_path).unwrap(),
+            pristine,
+            "the flip must land"
+        );
+        let check = super::FsfsRuntime::collect_vector_durability_doctor_check(&index_root);
+        assert_eq!(check.verdict, super::DoctorVerdict::Fail, "{check:?}");
+        assert!(check.detail.contains("CORRUPTED, repairable"), "{check:?}");
+
+        // Compaction's pre-step restores the bytes from the sidecar.
+        let repaired = super::repair_vector_generations_if_corrupted(&index_root)
+            .expect("repair from sidecar");
+        assert_eq!(repaired, 1);
+        assert_eq!(
+            fs::read(&fast_path).unwrap(),
+            pristine,
+            "repair must restore every byte"
+        );
+        let check = super::FsfsRuntime::collect_vector_durability_doctor_check(&index_root);
+        assert_eq!(check.verdict, super::DoctorVerdict::Pass, "{check:?}");
+        assert!(VectorIndex::open_read_only(&fast_path).is_ok());
+
+        // An in-place tombstone invalidates the sidecar (a stale one would
+        // "repair" the tombstone away); doctor reports it as unprotected.
+        super::invalidate_vector_sidecars([fast_path.as_path()], "test");
+        assert!(!super::FsviProtector::sidecar_path(&fast_path).exists());
+        let check = super::FsfsRuntime::collect_vector_durability_doctor_check(&index_root);
+        assert_eq!(check.verdict, super::DoctorVerdict::Warn, "{check:?}");
+        assert!(check.detail.contains("fast (") && check.detail.contains("unprotected"));
+        assert!(check.detail.contains("quality (") && check.detail.contains("intact"));
     }
 
     fn daemon_stop_runtime(index_root: &Path) -> FsfsRuntime {
