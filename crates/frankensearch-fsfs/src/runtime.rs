@@ -23717,7 +23717,7 @@ mod tests {
             &self,
             _query: &str,
             documents: &[frankensearch_core::RerankDocument],
-        ) -> SearchResult<Vec<frankensearch_core::RerankScore>> {
+        ) -> frankensearch_core::SearchResult<Vec<frankensearch_core::RerankScore>> {
             Ok(documents
                 .iter()
                 .enumerate()
