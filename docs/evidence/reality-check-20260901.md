@@ -344,3 +344,13 @@ executable quick-start gate on a real host with the rch shim bypassed; `~/.confi
 and `repos.d/frankensearch.yaml` now name it as the frankensearch check (dry run: 8 checks).
 README and AGENTS.md point at it; the GitHub Actions description in README now states that those
 lanes do not run.
+
+Receipt (bd-9j1ga, closed): `dsr quality --tool frankensearch` passed its seven packaging and
+installer contract checks; the gate script then passed all seven of its stages in one detached
+invocation on ts1 at 2026-09-02T02:03:17Z (fmt 5 s, check 11 s, clippy 16 s, workspace lib tests
+113 s, fsfs test binaries 74 s, real-model e2e 38 s, executable quick-start gate 152 s; exit 0).
+The two earlier runs each failed exactly one test, `verify_new_binary_uses_version_subcommand_not_flag`,
+and surfacing its spawn error identified the cause as `ExecutableFileBusy`: a multithreaded test
+binary racing `execve` of a just-written fixture script against sibling forks. The five fixtures
+that share the pattern now retry only that error (5f5b0c40); the same pattern exists in production
+update verification and is recorded on bd-9j1ga as a hazard, not changed.
