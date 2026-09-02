@@ -2531,6 +2531,7 @@ impl VectorIndex {
 
         if !modified_main_entries.is_empty() {
             self.touch_main_file()?;
+            remove_durability_sidecar(&self.path);
         }
 
         Ok(deleted)
@@ -3188,6 +3189,7 @@ impl VectorIndex {
             file.sync_all()?;
             fs::rename(&tmp_path, &self.path)?;
             sync_parent_directory(&self.path)?;
+            remove_durability_sidecar(&self.path);
             Ok(())
         })();
 
@@ -4189,6 +4191,7 @@ impl VectorIndexWriter {
             }
             fs::rename(&tmp_path, &self.path)?;
             sync_parent_directory(&self.path)?;
+            remove_durability_sidecar(&self.path);
             Ok(())
         })();
 
@@ -6241,6 +6244,32 @@ pub(crate) fn sync_parent_directory(path: &Path) -> SearchResult<()> {
         let _ = path;
     }
     Ok(())
+}
+
+/// Drop the durability crate's `<fsvi>.fec` repair sidecar after the main
+/// file's bytes change (compaction, vacuum, `finish`, in-place tombstones).
+///
+/// The sidecar is a `RaptorQ` encoding of the exact bytes it was built from;
+/// a stale one would let a later repair "restore" the previous contents and
+/// silently discard everything written since (observed: a watcher's shutdown
+/// compaction followed by `fsfs compact` dropped a merged record). The file
+/// owner drops it here; publishers re-protect after they finish writing.
+fn remove_durability_sidecar(fsvi_path: &Path) {
+    let mut sidecar = fsvi_path.as_os_str().to_os_string();
+    sidecar.push(".fec");
+    let sidecar = PathBuf::from(sidecar);
+    match fs::remove_file(&sidecar) {
+        Ok(()) => tracing::debug!(
+            path = %sidecar.display(),
+            "durability sidecar removed after the FSVI bytes changed"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %sidecar.display(),
+            error = %error,
+            "stale durability sidecar could not be removed; a later repair would restore old bytes"
+        ),
+    }
 }
 
 fn map_lock_error(
@@ -10364,6 +10393,62 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    /// A `RaptorQ` sidecar encodes exact bytes; every write that changes the
+    /// main file must drop it, or a later repair restores stale contents.
+    #[test]
+    fn main_file_writes_remove_the_durability_sidecar() {
+        let path = temp_index_path("sidecar-invalidated-by-writes");
+        let dim = 4;
+        let sidecar = PathBuf::from(format!("{}.fec", path.display()));
+
+        let mut writer = VectorIndex::create(&path, "test", dim).expect("writer");
+        writer
+            .write_record("main-0", &sample_vector(1.0, dim))
+            .expect("write");
+        writer
+            .write_record("main-1", &sample_vector(0.5, dim))
+            .expect("write");
+        std::fs::write(&sidecar, b"stale sidecar from before finish").expect("plant sidecar");
+        writer.finish().expect("finish");
+        assert!(
+            !sidecar.exists(),
+            "finish must drop a sidecar built for older bytes"
+        );
+
+        // Compaction rewrites the main file.
+        std::fs::write(&sidecar, b"stale sidecar from before compaction").expect("plant sidecar");
+        let mut index = VectorIndex::open(&path).expect("open");
+        index
+            .append("w1", &sample_vector(0.1, dim))
+            .expect("append");
+        index.compact().expect("compact");
+        assert!(!sidecar.exists(), "compaction must drop the sidecar");
+
+        // An in-place tombstone changes the main file too.
+        std::fs::write(&sidecar, b"stale sidecar from before tombstone").expect("plant sidecar");
+        assert!(index.soft_delete("main-0").expect("tombstone"));
+        assert!(
+            !sidecar.exists(),
+            "an in-place tombstone must drop the sidecar"
+        );
+
+        // A WAL-only tombstone leaves the main file untouched and the sidecar alive.
+        std::fs::write(&sidecar, b"sidecar for the current bytes").expect("plant sidecar");
+        index
+            .append("w2", &sample_vector(0.2, dim))
+            .expect("append");
+        assert!(index.soft_delete("w2").expect("wal-only tombstone"));
+        assert!(
+            sidecar.exists(),
+            "a WAL-only tombstone does not change the main file"
+        );
+
+        drop(index);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&sidecar).ok();
         std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 

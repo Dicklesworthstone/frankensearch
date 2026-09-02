@@ -2547,6 +2547,45 @@ impl LiveIngestPipeline {
         }
     }
 
+    /// Embed `canonical` in the quality space and append it to the quality
+    /// tier. `append` is the atomic replacement primitive, so an updated file
+    /// supersedes its older quality vector. A quality embedding failure
+    /// tombstones the stale quality vector instead of leaving one that would
+    /// make REFINED rank the old content.
+    async fn append_quality_vector(
+        &self,
+        cx: &Cx,
+        tier: &LiveQualityTier,
+        rel_key: &str,
+        canonical: &str,
+        reason_code: &str,
+    ) -> frankensearch_core::SearchResult<()> {
+        match tier.embedder.embed(cx, canonical).await {
+            Ok(embedding) => {
+                let mut quality = tier
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                quality.append(rel_key, &embedding)?;
+            }
+            Err(error) => {
+                warn!(
+                    file_key = %rel_key,
+                    error_code = error_code_for(&error),
+                    reason = FsfsRuntime::semantic_runtime_failure_summary(&error),
+                    reason_code,
+                    "watcher ingest: quality embedding failed; fast tier only for this file"
+                );
+                let mut quality = tier
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _was_present = quality.soft_delete(rel_key)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn apply_live_vector_actions(
         &self,
         cx: &Cx,
@@ -2602,33 +2641,14 @@ impl LiveIngestPipeline {
                         );
                         continue;
                     };
-                    match tier.embedder.embed(cx, canonical).await {
-                        Ok(embedding) => {
-                            let mut quality = tier
-                                .vector_index
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            quality.append(rel_key, &embedding)?;
-                        }
-                        Err(error) => {
-                            // The fast vector is already durable; a document
-                            // that cannot be quality-embedded must not keep a
-                            // stale quality vector, or REFINED would rank the
-                            // old content.
-                            warn!(
-                                file_key = %rel_key,
-                                error_code = error_code_for(&error),
-                                reason = FsfsRuntime::semantic_runtime_failure_summary(&error),
-                                reason_code = %vector_plan.reason_code,
-                                "watcher ingest: quality embedding failed; fast tier only for this file"
-                            );
-                            let mut quality = tier
-                                .vector_index
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let _was_present = quality.soft_delete(rel_key)?;
-                        }
-                    }
+                    self.append_quality_vector(
+                        cx,
+                        tier,
+                        rel_key,
+                        canonical,
+                        &vector_plan.reason_code,
+                    )
+                    .await?;
                 }
                 VectorIndexWriteAction::MarkLexicalFallback { .. }
                 | VectorIndexWriteAction::Skip { .. } => {
@@ -2757,6 +2777,28 @@ impl LiveIngestPipeline {
                         revision,
                         &canonical,
                         &vector_plan,
+                    )
+                    .await?;
+                }
+                // The queued job feeds only the fast tier (`enqueue_quality`
+                // is off and the sink has no text to embed a second space), so
+                // a watched create/update used to leave the quality tier
+                // behind and REFINED never ranked the new content
+                // (bd-orb50). Write the quality vector inline, as the direct
+                // path does.
+                if self.embedder.is_semantic()
+                    && matches!(
+                        ingest_result.action,
+                        IngestAction::New | IngestAction::Updated
+                    )
+                    && let Some(tier) = self.quality_tier.as_ref()
+                {
+                    self.append_quality_vector(
+                        cx,
+                        tier,
+                        &rel_key,
+                        &canonical,
+                        "vector.plan.fast_and_quality",
                     )
                     .await?;
                 }
