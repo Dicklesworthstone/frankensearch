@@ -88,7 +88,12 @@ Path expansion rule:
 
 ## `[storage]`
 
-- `db_path: string`
+- `db_path: string` — catalog location. Default `{index_dir}/catalog.db`: the leading
+  `{index_dir}` token stands for the resolved index root, so every index owns its
+  catalog (the catalog is keyed by relative document path; a catalog shared across
+  roots treats a document already seen under another root as unchanged and watch
+  mode then writes no vectors for it). `~/...` and absolute paths opt into a shared
+  catalog; `:memory:` keeps it in memory.
 - `evidence_retention_days: int` (`1..3650`)
 - `summary_retention_days: int` (`1..3650`)
 

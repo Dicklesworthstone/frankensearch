@@ -25,6 +25,17 @@ const CONFIG_LOADED_EMIT_FIELDS: [&str; 4] = [
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FAST_ONLY_WARNING_CODE: &str = "config.search.fast_only_with_quality_model";
 
+/// Leading token of `storage.db_path` that stands for the resolved index root
+/// (`--index-dir`, `FRANKENSEARCH_INDEX_DIR`, or `storage.index_dir` under the
+/// target root). The default catalog lives under the index it belongs to: a
+/// catalog shared across roots is keyed by relative path, so a document
+/// already known from another project counted as "unchanged" and never got
+/// vectors in watch mode (bd-3tym7). An absolute path opts back into sharing.
+pub const STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER: &str = "{index_dir}";
+
+/// Default `storage.db_path`: one catalog per index root.
+pub const DEFAULT_STORAGE_DB_PATH: &str = "{index_dir}/catalog.db";
+
 /// Versioned profile contract revision for pressure-profile policy resolution.
 pub const PRESSURE_PROFILE_VERSION: u16 = 1;
 
@@ -950,7 +961,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             index_dir: ".frankensearch".into(),
-            db_path: "~/.local/share/fsfs/fsfs.db".into(),
+            db_path: DEFAULT_STORAGE_DB_PATH.into(),
             evidence_retention_days: 7,
             summary_retention_days: 90,
             disk_budget_bytes: None,
@@ -1653,8 +1664,11 @@ fn resolve_relative_config_paths(config: &mut FsfsConfig, base_file: &Path) {
             .into_owned();
     }
 
-    // db_path
-    if is_relative_non_tilde(&config.storage.db_path) {
+    // db_path: `{index_dir}/...` resolves against the index root at runtime
+    // (`FsfsRuntime::resolve_storage_db_path`), not against the config file.
+    if !config.storage.db_path.starts_with(STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER)
+        && is_relative_non_tilde(&config.storage.db_path)
+    {
         config.storage.db_path = base_dir
             .join(&config.storage.db_path)
             .to_string_lossy()
@@ -4854,7 +4868,7 @@ mod tests {
     fn storage_config_default_values() {
         let cfg = super::StorageConfig::default();
         assert_eq!(cfg.index_dir, ".frankensearch");
-        assert_eq!(cfg.db_path, "~/.local/share/fsfs/fsfs.db");
+        assert_eq!(cfg.db_path, "{index_dir}/catalog.db");
         assert_eq!(cfg.evidence_retention_days, 7);
         assert_eq!(cfg.summary_retention_days, 90);
         assert_eq!(cfg.disk_budget_bytes, None);

@@ -4323,7 +4323,9 @@ impl FsfsRuntime {
     #[must_use]
     pub fn default_index_storage_paths(&self) -> IndexStoragePaths {
         let index_root = PathBuf::from(&self.config.storage.index_dir);
-        let db_path = PathBuf::from(&self.config.storage.db_path);
+        let db_path = self
+            .resolve_storage_db_path()
+            .unwrap_or_else(|_| PathBuf::from(&self.config.storage.db_path));
 
         IndexStoragePaths {
             vector_index_roots: vec![index_root.join("vector")],
@@ -4444,7 +4446,7 @@ impl FsfsRuntime {
     fn cleanup_catalog_tombstones(&self, now_ms: u64) -> SearchResult<(usize, i64)> {
         let cutoff_ms = self.tombstone_cleanup_cutoff_ms(now_ms);
         let deleted_rows =
-            cleanup_tombstones_for_path(Path::new(&self.config.storage.db_path), cutoff_ms)?;
+            cleanup_tombstones_for_path(&self.resolve_storage_db_path()?, cutoff_ms)?;
         Ok((deleted_rows, cutoff_ms))
     }
 
@@ -4497,7 +4499,9 @@ impl FsfsRuntime {
         }
 
         let primary_probe = PathBuf::from(&self.config.storage.index_dir);
-        let fallback_probe = PathBuf::from(&self.config.storage.db_path);
+        let fallback_probe = self
+            .resolve_storage_db_path()
+            .unwrap_or_else(|_| PathBuf::from(&self.config.storage.db_path));
         let available = available_space_for_path(&primary_probe)
             .or_else(|| available_space_for_path(&fallback_probe))
             .or_else(|| {
@@ -11660,7 +11664,7 @@ impl FsfsRuntime {
         // Only a catalog that lives under the index root counts towards the
         // index's own bytes; the default global catalog is reported on its
         // own so `status` in an empty directory shows zero index bytes.
-        let catalog_path = PathBuf::from(&self.config.storage.db_path);
+        let catalog_path = self.resolve_storage_db_path()?;
         let catalog_inside_index_root = catalog_path.starts_with(&index_root);
         let catalog_bytes = Self::total_bytes_for_paths(std::slice::from_ref(&catalog_path))?;
         let storage_paths = IndexStoragePaths {
@@ -13364,7 +13368,7 @@ impl FsfsRuntime {
         let mut storage_usage = self.collect_index_storage_usage(&IndexStoragePaths {
             vector_index_roots: vec![index_root.join("vector")],
             lexical_index_roots: vec![index_root.join("lexical")],
-            catalog_files: vec![PathBuf::from(&self.config.storage.db_path)],
+            catalog_files: vec![self.resolve_storage_db_path()?],
             embedding_cache_roots: vec![index_root.join("cache")],
         })?;
         storage_usage.lexical_index_bytes = lexical_index.segment_stats()?.managed_disk_bytes;
@@ -13538,6 +13542,21 @@ impl FsfsRuntime {
         }
         if raw == ":memory:" {
             return Ok(PathBuf::from(raw));
+        }
+        // `{index_dir}/...`: the catalog lives under the index it belongs to
+        // (the default; bd-3tym7). Only the leading token is substituted.
+        if let Some(rest) = raw.strip_prefix(crate::config::STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER)
+        {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            if rest.is_empty() || rest.contains("..") {
+                return Err(SearchError::InvalidConfig {
+                    field: "storage.db_path".to_owned(),
+                    value: raw.to_owned(),
+                    reason: "`{index_dir}` must be followed by a relative file name inside the index root"
+                        .to_owned(),
+                });
+            }
+            return Ok(self.resolve_status_index_root()?.join(rest));
         }
         if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
             let home = home_dir().ok_or_else(|| SearchError::InvalidConfig {
