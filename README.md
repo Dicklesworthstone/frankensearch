@@ -629,7 +629,7 @@ Required setup:
 - Repository secret: `CARGO_REGISTRY_TOKEN` (crates.io publish token)
 
 Behavior:
-- Runs only on `crates-v*` tags (the `v*` tags cut `fsfs` binary releases; the two lines are versioned independently: `fsfs 1.7.0` ships `frankensearch 0.4.2`).
+- Runs only on `crates-v*` tags (the `v*` tags cut `fsfs` binary releases; the two lines are versioned independently: `fsfs 1.8.0` ships `frankensearch 0.4.2`).
 - Derives the publish sequence from `scripts/check_crates_publish_contract.sh --mode gate --scope workspace`: every workspace member without `publish = false` (`frankensearch-quill-gauntlet` and `tools/optimize_params` are excluded), in dependency order, `frankensearch-quill` before `frankensearch-fusion` and the facade.
 - Runs per-crate `cargo publish --dry-run` checks before real publish.
 - Publishes crates sequentially to reduce crates.io index race failures and treats already-published crate versions as idempotent success.
