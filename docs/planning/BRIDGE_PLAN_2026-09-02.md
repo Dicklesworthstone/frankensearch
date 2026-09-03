@@ -142,8 +142,19 @@ short-circuited by the lexical arm); MiniLM query embed p50 5.1 ms; index 17.2 s
 (15.8 s embedding both tiers, 1.3 s Quill), RSS 1.29 GB. README envelope rows cite it with dates.
 Deviations from the plan below: the lane lives in the facade (the README rows are library rows and
 the product's in-process API is private) rather than in `benchmark_baseline_matrix.rs`; the `fsfs`
-process path keeps its 2026-09-01 measurements (18–19 ms INITIAL on 65 files, ~3 s cold start) and
-is the remaining un-receipted row; no 10K-document run yet (that row stays *target*).
+process path was receipted next (below); no 10K-document run yet (that row stays *target*).
+
+**Product half (bd-8j5dc, 2026-09-03): RECEIPTED, and it paid for itself.**
+`crates/frankensearch-fsfs/tests/fsfs_latency_receipt.rs` drives the release `fsfs` binary over the
+same corpus as files: index 1,000 files in 14.1 s (26.9 MB on disk); cold `--no-daemon` search
+3.3 s; daemon-served queries (one request per connection, 50 timed, 0 cache hits, all REFINED).
+The first run measured the daemon at p50 50.3 ms / p99 52.8 ms for a 5 ms search: the accept loop
+slept a flat 50 ms between empty polls and every back-to-back query waited it out. With the
+adaptive accept poll (1 ms inside a 2 s hot window, 50 ms idle) the committed receipt reads p50
+12.7 ms / p95 13.9 ms / p99 14.8 ms, `:ready` round trip 1.1 ms, `--rerank` through the daemon
+p50 233 ms (all 20 applied). The planted control (`FRANKENSEARCH_PERF_RECEIPT_MAX_DAEMON_P95_MS=1`)
+fails as required. The README envelope now carries *product receipt* rows for daemon-served
+search, rerank, index cost and cold start.
 
 **Current state (before bd-8s0nf):** README quotes `< 15 ms` Initial and `~150 ms` Refined as targets. Measured:
 18–19 ms Initial in-process on a 65-document corpus (debug and release similar for that path);

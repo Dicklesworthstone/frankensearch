@@ -8,18 +8,18 @@
     ],
     "runs": 3,
     "samples": [
-      3483.526231,
-      3465.960005,
-      3462.7696889999997
+      3337.060609,
+      3330.1804549999997,
+      3317.4012030000004
     ],
     "summary": {
-      "max_ms": 3483.526231,
-      "mean_ms": 3470.7519749999997,
-      "min_ms": 3462.7696889999997,
+      "max_ms": 3337.060609,
+      "mean_ms": 3328.2140889999996,
+      "min_ms": 3317.4012030000004,
       "n": 3,
-      "p50_ms": 3465.960005,
-      "p95_ms": 3483.526231,
-      "p99_ms": 3483.526231
+      "p50_ms": 3330.1804549999997,
+      "p95_ms": 3337.060609,
+      "p99_ms": 3337.060609
     }
   },
   "corpus": {
@@ -37,13 +37,22 @@
     "warmup": 5
   },
   "daemon_query_ms": {
-    "max_ms": 52.839470999999996,
-    "mean_ms": 50.146470299999976,
-    "min_ms": 47.532565999999996,
+    "max_ms": 14.817421000000001,
+    "mean_ms": 12.543088920000002,
+    "min_ms": 10.471986000000001,
     "n": 50,
-    "p50_ms": 50.278007,
-    "p95_ms": 51.677329,
-    "p99_ms": 52.839470999999996
+    "p50_ms": 12.663795,
+    "p95_ms": 13.920841,
+    "p99_ms": 14.817421000000001
+  },
+  "daemon_ready_roundtrip_ms": {
+    "max_ms": 1.288266,
+    "mean_ms": 1.0795121,
+    "min_ms": 0.611726,
+    "n": 10,
+    "p50_ms": 1.1158780000000001,
+    "p95_ms": 1.288266,
+    "p99_ms": 1.288266
   },
   "daemon_rerank_queries": {
     "statuses": {
@@ -52,23 +61,23 @@
     "timed": 20
   },
   "daemon_rerank_query_ms": {
-    "max_ms": 604.465877,
-    "mean_ms": 370.03181295,
-    "min_ms": 301.13700700000004,
+    "max_ms": 478.549674,
+    "mean_ms": 247.74145255,
+    "min_ms": 193.414139,
     "n": 20,
-    "p50_ms": 370.42154700000003,
-    "p95_ms": 444.655126,
-    "p99_ms": 604.465877
+    "p50_ms": 233.195722,
+    "p95_ms": 319.590964,
+    "p99_ms": 478.549674
   },
   "fsfs_binary": "/data/tmp/cargo-target/release/fsfs",
-  "fsfs_binary_sha256": "314002a5fef83fcd7c1089ae0c8eb514f7d09549ddac56fe8d02e6bf274a2ba2",
-  "generated_at_unix": 1788400441,
-  "git_revision": "e58dba89acb4",
+  "fsfs_binary_sha256": "9016d2c72a85a57bd80b929ccc88a5ed735226c16f9eccac5e9bebc9faf9424c",
+  "generated_at_unix": 1788403637,
+  "git_revision": "1d747ac530f2",
   "host": {
     "arch": "x86_64",
     "cpu_model": "AMD Ryzen Threadripper PRO 5975WX 32-Cores",
     "hostname": "thinkstation1",
-    "loadavg_at_start": "15.14 16.37 15.15 7/7441 694891",
+    "loadavg_at_start": "8.97 7.28 5.98 5/7662 1023263",
     "logical_cores": 64,
     "os": "linux"
   },
@@ -76,7 +85,7 @@
     "index_size_bytes": 26939648,
     "indexed_files": 1000,
     "quality_tier": true,
-    "reported_ms": 13756,
+    "reported_ms": 13317,
     "status": {
       "config": {
         "fast_only": false,
@@ -90,7 +99,7 @@
       },
       "index": {
         "catalog_bytes": 0,
-        "catalog_path": "/data/tmp/bl/.tmp1XdTwa/index/catalog.db",
+        "catalog_path": "/data/tmp/bl/.tmpcWkFTr/index/catalog.db",
         "dashboard_state": "ready",
         "discovered_files": 1000,
         "embedding_cache_bytes": 0,
@@ -98,23 +107,23 @@
         "index_freshness": {
           "degraded": false,
           "estimated_missing_docs": 0,
-          "last_publish_unix": 1788400455,
+          "last_publish_unix": 1788403650,
           "live_writer": false,
           "published_generation": 5,
           "quarantined_segments": 0,
           "unknown_missing_doc_segments": 0
         },
         "indexed_files": 1000,
-        "last_indexed_iso_utc": "2026-09-03T01:54:15Z",
-        "last_indexed_ms": 1788400455384,
+        "last_indexed_iso_utc": "2026-09-03T02:47:30Z",
+        "last_indexed_ms": 1788403650386,
         "lexical_index_bytes": 23791382,
         "metadata_bytes": 0,
-        "path": "/data/tmp/bl/.tmp1XdTwa/index",
+        "path": "/data/tmp/bl/.tmpcWkFTr/index",
         "quality_generation_dimension": 384,
         "quality_generation_id": "all-MiniLM-L6-v2",
         "size_bytes": 26939612,
         "skipped_files": 0,
-        "source_hash_hex": "70a1930694fe95fb",
+        "source_hash_hex": "058be9b94d15522f",
         "stale_files": 0,
         "vector_generation_dimension": 256,
         "vector_generation_id": "potion-multilingual-128M",
@@ -150,7 +159,7 @@
       },
       "version": "1.8.0"
     },
-    "wall_ms": 14548.910283
+    "wall_ms": 14097.487226
   },
   "model_root": "/home/ubuntu/.local/share/frankensearch/models",
   "profile_note": "cargo test --release binary (opt-level 3); the shipped fsfs release adds fat LTO and codegen-units=1",
