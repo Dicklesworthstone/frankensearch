@@ -84,6 +84,24 @@ pub struct QuillConfig {
     /// Cross-process visibility bound: once unpublished changes are this old,
     /// the writer must run a seal-and-publish barrier instead of waiting for
     /// the ordinary cadence (visibility contract, `max_visibility_lag_ms`).
+    ///
+    /// The barrier seals *every* shard that holds staged documents and then
+    /// publishes a MANIFEST, so a writer that ingests continuously produces a
+    /// fresh segment per active shard per lag interval. That is the right
+    /// default for a reader that polls the MANIFEST and expects a bounded
+    /// staleness guarantee.
+    ///
+    /// An embedder that publishes explicitly — one that calls `commit` itself
+    /// at points it chooses, and whose own durable checkpoint is written
+    /// against those commits — should opt out by setting this to
+    /// [`u64::MAX`]. Zero is rejected by [`QuillConfig::validate`] on purpose:
+    /// a freshness bound of zero would read as "publish constantly", not as
+    /// "no bound", so `u64::MAX` is the sanctioned way to disable the barrier.
+    ///
+    /// Leaving the barrier on under explicit publication is not merely
+    /// wasteful: the automatic MANIFEST can run ahead of the embedder's own
+    /// checkpoint, so a resumed ingest re-inserts identities that are already
+    /// live and is refused as a duplicate live document id.
     pub max_visibility_lag_ms: u64,
     /// Permit a durability-enabled writer to quarantine an unrepairable
     /// segment and publish a degraded successor that omits it.
