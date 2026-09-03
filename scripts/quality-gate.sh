@@ -19,6 +19,12 @@
 #   examples   frankensearch/examples/run_all.sh (the validate_* e2e scripts + bench_quick);
 #              opt-in via QUALITY_GATE_STAGES because it compiles and runs four examples
 #              (~2.5 min debug)
+#   perf       the library two-tier latency/index-cost receipt (frankensearch/tests/
+#              latency_receipt.rs) on --release with the registered models: 1,000-document
+#              corpus, 50 timed queries, p50/p95/p99 per phase, written to
+#              docs/evidence/perf/library-two-tier-latency-<date>-<host>.json (override with
+#              QUALITY_GATE_PERF_RECEIPT_OUT). Opt-in: it builds the facade in release
+#              and takes minutes; commit the receipt it writes.
 #   e2e        the real-model quickstart lane (index + INITIAL/REFINED search on the real
 #              binary) when the registered models are present; otherwise a typed SKIP that
 #              still fails the gate unless QUALITY_GATE_ALLOW_MODEL_SKIP=1
@@ -92,6 +98,21 @@ fi
 
 if want examples; then
   run_stage examples env FRANKENSEARCH_MODEL_DIR="$MODEL_DIR" frankensearch/examples/run_all.sh
+fi
+
+# Release-profile latency/index-cost receipt for the library two-tier path. The lane refuses a
+# hash-only stack, so it needs the registered models; the JSON it writes is the evidence the
+# README's envelope rows cite, and is meant to be committed.
+if want perf; then
+  if [ -d "$MODEL_DIR/all-MiniLM-L6-v2" ]; then
+    perf_out="${QUALITY_GATE_PERF_RECEIPT_OUT:-docs/evidence/perf/library-two-tier-latency-$(date -u +%Y%m%d)-$(hostname).json}"
+    run_stage perf env FRANKENSEARCH_MODEL_DIR="$MODEL_DIR" FRANKENSEARCH_PERF_RECEIPT=1 \
+      FRANKENSEARCH_PERF_RECEIPT_OUT="$perf_out" \
+      cargo test --locked --release -p frankensearch --features hybrid --test latency_receipt -- --nocapture
+    echo "[quality-gate] perf receipt: $perf_out"
+  else
+    fail perf "registered models absent under $MODEL_DIR; the latency receipt needs potion + MiniLM"
+  fi
 fi
 
 if want e2e; then
