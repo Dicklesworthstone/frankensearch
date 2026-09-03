@@ -2804,11 +2804,31 @@ fn run_ingest_loop<'a>(
             // This is the point of no replay. Once the sink future is created it
             // may mutate lexical, vector, or storage state before returning. Any
             // non-success from here requires a filesystem-authoritative rescan.
+            let apply_started = std::time::Instant::now();
+            let oldest_observed_ms = lease
+                .events()
+                .iter()
+                .map(|event| event.observed_at_ms)
+                .min();
             lease.begin_live_apply();
             match ingest.apply_batch(cx, &prepared.ops).await {
                 Ok(reindexed) => {
                     let events = lease.events().to_vec();
                     let outcome = prepared.outcome(reindexed);
+                    // Freshness per applied batch: how old the oldest event in
+                    // the batch was once the sink finished with it (debounce +
+                    // queueing + ingest), and the ingest itself. The product
+                    // latency receipt reads these lines (bd-thic0).
+                    tracing::info!(
+                        batch_ops = prepared.ops.len(),
+                        reindexed = outcome.reindexed,
+                        skipped = outcome.skipped,
+                        oldest_event_age_ms = oldest_observed_ms
+                            .map(|observed| now_millis().saturating_sub(observed)),
+                        apply_ms =
+                            u64::try_from(apply_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "fsfs watch batch applied"
+                    );
                     match record_successful_events(
                         roots,
                         discovery,
