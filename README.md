@@ -590,7 +590,7 @@ and are design budgets:
 | Fast hash embedding (`hash_embed_fnv`, tokenize + FNV) | ~2 μs | ledger, 2026-07-04 |
 | Fast model embedding (potion-128M, short query) | ~0.1 ms | receipt, 2026-09-03 (p50 0.10 ms, p95 0.17 ms) |
 | Quality model embedding (MiniLM, short query) | ~5 ms | receipt, 2026-09-03 (p50 5.1 ms, p95 6.1 ms); at index time both tiers together cost ≈16 ms per document |
-| Vector search (1K docs, top-10, fast tier) | ~0.1 ms | receipt, 2026-09-03 (p50 0.07 ms); 10K docs remains a *target* at ~2 ms |
+| Vector search (fast tier, top-10; 1K and 10K docs) | ~0.1 ms / ~0.3 ms | receipt, 2026-09-03 (p50 0.07 ms on 1K docs; p50 0.29 ms on 10K docs from `library-two-tier-latency-10k-20260903-thinkstation1.json`, where INITIAL is p50 1.0 ms, REFINED delivery p50 7.6 ms / p99 11.0 ms, and indexing 10,000 docs / 6.5 MB costs 190 s, 16.8 ms per document for both tiers, with 5.4 MB fast, 7.9 MB quality and 91 MB lexical artifacts) |
 | Lexical search (Quill, 1K docs) | ~0.2 ms | receipt, 2026-09-03 (p50 0.23 ms, p95 0.38 ms) |
 | RRF fusion (1,000 + 1,000 candidates) | ~23 μs | ledger, 2026-07-04 |
 | Phase 1 initial delivery (library `TwoTierSearcher`, hybrid Quill + potion, warm) | `< 1 ms` | receipt, 2026-09-03 (p50 0.40 ms, p95 0.58 ms, p99 2.4 ms) against the `< 15 ms` target; the `fsfs` in-process path measured 18–19 ms on a 65-file corpus on 2026-09-01 and is not yet receipted |

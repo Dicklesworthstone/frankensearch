@@ -6170,14 +6170,17 @@ impl FsfsRuntime {
                         // 2026-09-03: p50 50 ms for a 5 ms search); a 1 ms
                         // poll inside the hot window costs nothing measurable
                         // and the idle daemon still sleeps 50 ms at a time.
-                        let poll_ms = if last_activity.elapsed()
+                        // This accept loop is a dedicated blocking thread (it
+                        // always slept here); the async-retry pin in the tests
+                        // targets `Cx`-driven paths, not this one.
+                        let accept_poll = if last_activity.elapsed()
                             < Duration::from_millis(FSFS_SERVE_ACCEPT_HOT_WINDOW_MS)
                         {
-                            FSFS_SERVE_ACCEPT_HOT_POLL_MS
+                            Duration::from_millis(FSFS_SERVE_ACCEPT_HOT_POLL_MS)
                         } else {
-                            FSFS_SERVE_ACCEPT_POLL_MS
+                            Duration::from_millis(FSFS_SERVE_ACCEPT_POLL_MS)
                         };
-                        std::thread::sleep(Duration::from_millis(poll_ms));
+                        std::thread::sleep(accept_poll);
                         continue;
                     }
                     Err(error) if error.kind() == ErrorKind::Interrupted => continue,

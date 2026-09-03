@@ -27,6 +27,13 @@
 //! 4. The same through the request's `rerank` flag (20 timed queries) so the
 //!    cross-encoder's cost has a receipt too; skipped with the reason when the
 //!    ms-marco model is not installed.
+//! 5. Watch-mode freshness: `fsfs index --watch` on the same corpus, 20 files
+//!    written one at a time, the watcher's own per-batch `oldest_event_age_ms`
+//!    (event observed to batch applied) and the client-side write-to-visible
+//!    wall, a graceful stop, and a fresh-process search proving the new files
+//!    are searchable once the watcher has exited. Host-pressure sampling is
+//!    pinned to one sample per hour for this section (a saturated host would
+//!    otherwise pause the watcher by design); the receipt records the pin.
 //!
 //! `FRANKENSEARCH_PERF_RECEIPT_MAX_DAEMON_P95_MS=<ms>` turns the lane into a
 //! threshold check (the planted-regression control).
@@ -462,6 +469,44 @@ fn parse_index_summary(stdout: &str) -> Option<(u64, u64, u64)> {
     Some((files, after("in")?, after("size")?))
 }
 
+/// Lines of the watcher's stderr that carry the per-batch freshness record.
+fn watch_batch_lines(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("fsfs watch batch applied"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `key=<digits>` out of a tracing line.
+fn tracing_field_u64(line: &str, key: &str) -> Option<u64> {
+    let start = line.find(key)? + key.len();
+    let digits: String = line[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+fn wait_for_log_line(log: &Path, needle: &str, budget: Duration) {
+    let started = Instant::now();
+    while started.elapsed() < budget {
+        if std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "{needle:?} not seen in {} within {budget:?}:\n{}",
+        log.display(),
+        std::fs::read_to_string(log).unwrap_or_default()
+    );
+}
+
 fn host_fingerprint() -> Value {
     let hostname = std::fs::read_to_string("/etc/hostname")
         .map(|value| value.trim().to_owned())
@@ -720,6 +765,139 @@ fn fsfs_latency_receipt() {
     }
     drop(daemon);
 
+    // 5. Watch-mode freshness. The daemon is gone (it held a reader lock on
+    //    the vector generations; the watcher needs the writer). Start the
+    //    watcher, write files one at a time, and read the per-batch
+    //    `fsfs watch batch applied` lines it logs: `oldest_event_age_ms` is
+    //    the age of the oldest event in the batch when the sink finished
+    //    (debounce + queueing + ingest). The client-side wall from the write
+    //    to the line becoming visible is kept as an upper bound (it includes
+    //    this test's 10 ms poll). Then stop the watcher and prove a new file
+    //    is searchable from a fresh process.
+    const WATCH_FILES: usize = 20;
+    let watch_log_path = temp.path().join("watch.stderr");
+    let watch_log = std::fs::File::create(&watch_log_path).expect("create watcher log");
+    let watch_started = Instant::now();
+    let mut watcher = harness
+        .command(&[
+            "index",
+            &corpus_arg,
+            "--index-dir",
+            &index_arg,
+            "--watch",
+            "--format",
+            "json",
+        ])
+        .env("RUST_LOG", "info")
+        // Host pressure is not the subject: on a saturated host the pressure
+        // controller moves the watcher to Degraded/Emergency, where watching
+        // is switched off by design (observed mid-measurement on a loaded
+        // 64-core box). One sample per hour keeps the measurement about the
+        // watcher; the receipt says so.
+        .env("FRANKENSEARCH_PRESSURE_SAMPLE_INTERVAL_MS", "3600000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(watch_log)
+        .spawn()
+        .expect("spawn the watcher");
+    wait_for_log_line(&watch_log_path, "watcher started", Duration::from_secs(120));
+    let watcher_startup_ms = ms(watch_started.elapsed());
+
+    let mut write_to_visible_ms = Vec::with_capacity(WATCH_FILES);
+    let mut event_to_applied_ms = Vec::new();
+    let mut batch_apply_ms = Vec::new();
+    let mut seen_batches = 0_usize;
+    for index in 0..WATCH_FILES {
+        let path = corpus.join(format!("watch-{index:04}.md"));
+        std::fs::write(
+            &path,
+            format!(
+                "watch freshness probe {index}: zorblax calibrates temporal flux with quorum heartbeat.\n"
+            ),
+        )
+        .expect("write watch file");
+        let written = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let lines = watch_batch_lines(&watch_log_path);
+            if lines.len() > seen_batches {
+                for line in &lines[seen_batches..] {
+                    if let Some(age) = tracing_field_u64(line, "oldest_event_age_ms=") {
+                        #[allow(clippy::cast_precision_loss)]
+                        event_to_applied_ms.push(age as f64);
+                    }
+                    if let Some(apply) = tracing_field_u64(line, "apply_ms=") {
+                        #[allow(clippy::cast_precision_loss)]
+                        batch_apply_ms.push(apply as f64);
+                    }
+                }
+                seen_batches = lines.len();
+                write_to_visible_ms.push(ms(written.elapsed()));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watcher did not apply a batch for {} within 30 s; log:\n{}",
+                path.display(),
+                std::fs::read_to_string(&watch_log_path).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = Command::new("kill")
+        .args(["-TERM", &watcher.id().to_string()])
+        .status();
+    let stop_deadline = Instant::now() + Duration::from_secs(60);
+    let watcher_exit = loop {
+        if let Some(status) = watcher.try_wait().expect("poll watcher") {
+            break status.code();
+        }
+        if Instant::now() >= stop_deadline {
+            let _ = watcher.kill();
+            let _ = watcher.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let (after_watch, _) = harness.run_json(
+        "search after the watcher exits",
+        &[
+            "search",
+            "zorblax calibrates temporal flux",
+            "--index-dir",
+            &index_arg,
+            "--no-daemon",
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ],
+    );
+    let searchable_after_exit = after_watch
+        .pointer("/data/hits")
+        .and_then(Value::as_array)
+        .is_some_and(|hits| {
+            hits.iter().any(|hit| {
+                hit.get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| path.starts_with("watch-"))
+            })
+        });
+    assert!(
+        searchable_after_exit,
+        "a file ingested by the watcher must be searchable once it exits: {after_watch}"
+    );
+    let watch_mode = serde_json::json!({
+        "files_written": WATCH_FILES,
+        "host_pressure_sampling": "pinned to one sample per hour for this measurement (FRANKENSEARCH_PRESSURE_SAMPLE_INTERVAL_MS=3600000); in production a saturated host moves the watcher to Degraded/Emergency, where watching pauses",
+        "batches_applied": seen_batches,
+        "watcher_startup_ms": watcher_startup_ms,
+        "event_to_applied_ms": distribution(&event_to_applied_ms),
+        "batch_apply_ms": distribution(&batch_apply_ms),
+        "write_to_line_visible_ms": distribution(&write_to_visible_ms),
+        "watcher_exit_code": watcher_exit,
+        "searchable_after_exit": searchable_after_exit,
+    });
+
     let receipt = serde_json::json!({
         "schema": RECEIPT_SCHEMA,
         "generated_at_unix": started_at,
@@ -745,6 +923,7 @@ fn fsfs_latency_receipt() {
         "daemon_queries": { "warmup": WARMUP_QUERIES, "timed": TIMED_QUERIES, "top_k": TOP_K, "cache_hits": daemon_cache_hits, "final_phases": daemon_phases },
         "daemon_rerank_query_ms": distribution(&rerank_ms),
         "daemon_rerank_queries": { "timed": RERANK_QUERIES, "statuses": rerank_statuses },
+        "watch_mode": watch_mode,
     });
     let encoded = serde_json::to_string_pretty(&receipt).expect("encode receipt");
     match std::env::var_os("FRANKENSEARCH_PERF_RECEIPT_OUT") {
