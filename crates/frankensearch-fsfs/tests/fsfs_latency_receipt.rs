@@ -639,6 +639,25 @@ fn fsfs_latency_receipt() {
     };
     wait_for_socket(&daemon.socket, Duration::from_secs(60));
 
+    // The daemon's overhead floor: a `:ready` round trip does no search, so
+    // whatever it costs is accept latency plus the handshake itself.
+    let mut ready_ms = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let started = Instant::now();
+        let mut stream = UnixStream::connect(&daemon.socket).expect("connect for :ready");
+        stream.write_all(b":ready\n").expect("write :ready");
+        stream.flush().expect("flush :ready");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close :ready");
+        let mut raw = String::new();
+        stream
+            .read_to_string(&mut raw)
+            .expect("read :ready response");
+        assert!(!raw.trim().is_empty(), "daemon :ready must answer");
+        ready_ms.push(ms(started.elapsed()));
+    }
+
     let mut daemon_ms = Vec::with_capacity(TIMED_QUERIES);
     let mut daemon_cache_hits = 0_usize;
     let mut daemon_phases = std::collections::BTreeMap::<String, usize>::new();
@@ -721,6 +740,7 @@ fn fsfs_latency_receipt() {
             "status": status_json.get("data").cloned().unwrap_or(Value::Null),
         },
         "cold_start_search_ms": { "runs": COLD_RUNS, "summary": distribution(&cold), "samples": cold, "phases": cold_phases },
+        "daemon_ready_roundtrip_ms": distribution(&ready_ms),
         "daemon_query_ms": distribution(&daemon_ms),
         "daemon_queries": { "warmup": WARMUP_QUERIES, "timed": TIMED_QUERIES, "top_k": TOP_K, "cache_hits": daemon_cache_hits, "final_phases": daemon_phases },
         "daemon_rerank_query_ms": distribution(&rerank_ms),
