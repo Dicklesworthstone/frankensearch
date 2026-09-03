@@ -487,6 +487,12 @@ const FSFS_DAEMON_RESPONSE_MAX_BYTES: usize = 4 << 20; // 4 MiB
 const FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS: u64 = 5_000;
 /// Idle-accept poll cadence for the shutdown-aware serve loop (bd-egkb).
 const FSFS_SERVE_ACCEPT_POLL_MS: u64 = 50;
+/// Accept poll while a client was seen recently: interactive and scripted
+/// callers issue queries back to back, and every one of them would otherwise
+/// wait out most of the idle poll.
+const FSFS_SERVE_ACCEPT_HOT_POLL_MS: u64 = 1;
+/// How long after the last accepted connection the fast poll stays in force.
+const FSFS_SERVE_ACCEPT_HOT_WINDOW_MS: u64 = 2_000;
 const FSFS_DAEMON_CONNECT_MAX_ATTEMPTS: usize = 80;
 const FSFS_DAEMON_CONNECT_RETRY_DELAY_MS: u64 = 25;
 /// Default idle lifetime of an auto-spawned query daemon. The daemon detaches
@@ -6158,7 +6164,20 @@ impl FsfsRuntime {
                             );
                             break;
                         }
-                        std::thread::sleep(Duration::from_millis(FSFS_SERVE_ACCEPT_POLL_MS));
+                        // Poll fast while clients are active, slow when idle.
+                        // A flat 50 ms poll put a near-constant ~45 ms of
+                        // pure waiting on every daemon-served query (receipt
+                        // 2026-09-03: p50 50 ms for a 5 ms search); a 1 ms
+                        // poll inside the hot window costs nothing measurable
+                        // and the idle daemon still sleeps 50 ms at a time.
+                        let poll_ms = if last_activity.elapsed()
+                            < Duration::from_millis(FSFS_SERVE_ACCEPT_HOT_WINDOW_MS)
+                        {
+                            FSFS_SERVE_ACCEPT_HOT_POLL_MS
+                        } else {
+                            FSFS_SERVE_ACCEPT_POLL_MS
+                        };
+                        std::thread::sleep(Duration::from_millis(poll_ms));
                         continue;
                     }
                     Err(error) if error.kind() == ErrorKind::Interrupted => continue,
