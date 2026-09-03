@@ -926,7 +926,11 @@ impl ModelArtifactManifestV1 {
         }
         self.artifacts.iter().all(|artifact| {
             download_manifest.files.iter().any(|file| {
-                file.name == artifact.relative_path
+                // A download-manifest file is keyed by `name`, a frozen
+                // artifact by `relative_path`; clippy's operator-grouping
+                // heuristic misreads the pair, so bind it first.
+                let same_path = file.name == artifact.relative_path;
+                same_path
                     && file.size == artifact.size
                     && file.sha256.eq_ignore_ascii_case(&artifact.sha256)
             })
@@ -5712,7 +5716,7 @@ mod tests {
         let mismatched = native.verify_dir_cached(&drifted, tmp.path());
         std::fs::set_permissions(
             &weights_path,
-            std::fs::metadata(&tmp.path().join("tokenizer.json"))
+            std::fs::metadata(tmp.path().join("tokenizer.json"))
                 .unwrap()
                 .permissions(),
         )

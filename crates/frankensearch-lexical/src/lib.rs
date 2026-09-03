@@ -5910,6 +5910,8 @@ mod tests {
                 .lock(&cx)
                 .await
                 .expect("lock writer")
+                .as_mut()
+                .expect("an in-memory index carries a writer")
                 .set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
 
             const DOC_COUNT: usize = 256;
@@ -6408,6 +6410,8 @@ mod tests {
                 .lock(&cx)
                 .await
                 .expect("lock writer")
+                .as_mut()
+                .expect("an in-memory index carries a writer")
                 .set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
 
             const DOC_COUNT: usize = 120;
