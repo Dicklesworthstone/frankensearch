@@ -1,0 +1,158 @@
+{
+  "cargo_profile": "release",
+  "cold_start_search_ms": {
+    "phases": [
+      "refined",
+      "refined",
+      "refined"
+    ],
+    "runs": 3,
+    "samples": [
+      3483.526231,
+      3465.960005,
+      3462.7696889999997
+    ],
+    "summary": {
+      "max_ms": 3483.526231,
+      "mean_ms": 3470.7519749999997,
+      "min_ms": 3462.7696889999997,
+      "n": 3,
+      "p50_ms": 3465.960005,
+      "p95_ms": 3483.526231,
+      "p99_ms": 3483.526231
+    }
+  },
+  "corpus": {
+    "files": 1000,
+    "generator": "deterministic LCG prose over 6 topic vocabularies, one file per document",
+    "total_chars": 660386
+  },
+  "daemon_queries": {
+    "cache_hits": 0,
+    "final_phases": {
+      "refined": 50
+    },
+    "timed": 50,
+    "top_k": 10,
+    "warmup": 5
+  },
+  "daemon_query_ms": {
+    "max_ms": 52.839470999999996,
+    "mean_ms": 50.146470299999976,
+    "min_ms": 47.532565999999996,
+    "n": 50,
+    "p50_ms": 50.278007,
+    "p95_ms": 51.677329,
+    "p99_ms": 52.839470999999996
+  },
+  "daemon_rerank_queries": {
+    "statuses": {
+      "applied:query.stage.rerank.applied": 20
+    },
+    "timed": 20
+  },
+  "daemon_rerank_query_ms": {
+    "max_ms": 604.465877,
+    "mean_ms": 370.03181295,
+    "min_ms": 301.13700700000004,
+    "n": 20,
+    "p50_ms": 370.42154700000003,
+    "p95_ms": 444.655126,
+    "p99_ms": 604.465877
+  },
+  "fsfs_binary": "/data/tmp/cargo-target/release/fsfs",
+  "fsfs_binary_sha256": "314002a5fef83fcd7c1089ae0c8eb514f7d09549ddac56fe8d02e6bf274a2ba2",
+  "generated_at_unix": 1788400441,
+  "git_revision": "e58dba89acb4",
+  "host": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen Threadripper PRO 5975WX 32-Cores",
+    "hostname": "thinkstation1",
+    "loadavg_at_start": "15.14 16.37 15.15 7/7441 694891",
+    "logical_cores": 64,
+    "os": "linux"
+  },
+  "index": {
+    "index_size_bytes": 26939648,
+    "indexed_files": 1000,
+    "quality_tier": true,
+    "reported_ms": 13756,
+    "status": {
+      "config": {
+        "fast_only": false,
+        "index_dir": ".frankensearch",
+        "model_dir": "/home/ubuntu/.local/share/frankensearch/models",
+        "pressure_profile": "performance",
+        "quality_timeout_ms": 500,
+        "quality_weight": 0.7,
+        "rrf_k": 60.0,
+        "source": "env + defaults"
+      },
+      "index": {
+        "catalog_bytes": 0,
+        "catalog_path": "/data/tmp/bl/.tmp1XdTwa/index/catalog.db",
+        "dashboard_state": "ready",
+        "discovered_files": 1000,
+        "embedding_cache_bytes": 0,
+        "exists": true,
+        "index_freshness": {
+          "degraded": false,
+          "estimated_missing_docs": 0,
+          "last_publish_unix": 1788400455,
+          "live_writer": false,
+          "published_generation": 5,
+          "quarantined_segments": 0,
+          "unknown_missing_doc_segments": 0
+        },
+        "indexed_files": 1000,
+        "last_indexed_iso_utc": "2026-09-03T01:54:15Z",
+        "last_indexed_ms": 1788400455384,
+        "lexical_index_bytes": 23791382,
+        "metadata_bytes": 0,
+        "path": "/data/tmp/bl/.tmp1XdTwa/index",
+        "quality_generation_dimension": 384,
+        "quality_generation_id": "all-MiniLM-L6-v2",
+        "size_bytes": 26939612,
+        "skipped_files": 0,
+        "source_hash_hex": "70a1930694fe95fb",
+        "stale_files": 0,
+        "vector_generation_dimension": 256,
+        "vector_generation_id": "potion-multilingual-128M",
+        "vector_index_bytes": 3148230
+      },
+      "models": [
+        {
+          "cache_path": "/home/ubuntu/.local/share/frankensearch/models/potion-multilingual-128M",
+          "cached": true,
+          "diagnostic": null,
+          "name": "potion-multilingual-128M",
+          "size_bytes": 530978483,
+          "tier": "fast",
+          "verification_state": "verified"
+        },
+        {
+          "cache_path": "/home/ubuntu/.local/share/frankensearch/models/all-MiniLM-L6-v2",
+          "cached": true,
+          "diagnostic": null,
+          "name": "all-MiniLM-L6-v2",
+          "size_bytes": 90874166,
+          "tier": "quality",
+          "verification_state": "verified"
+        }
+      ],
+      "runtime": {
+        "disk_budget_action": "continue",
+        "disk_budget_bytes": 5368709120,
+        "disk_budget_reason_code": "degrade.disk.within_budget",
+        "disk_budget_stage": "normal",
+        "storage_pressure_emergency": false,
+        "tracked_index_bytes": 26939612
+      },
+      "version": "1.8.0"
+    },
+    "wall_ms": 14548.910283
+  },
+  "model_root": "/home/ubuntu/.local/share/frankensearch/models",
+  "profile_note": "cargo test --release binary (opt-level 3); the shipped fsfs release adds fat LTO and codegen-units=1",
+  "schema": "frankensearch-fsfs-latency-receipt-v1"
+}
