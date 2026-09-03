@@ -2465,6 +2465,7 @@ impl TantivyIndex {
             fields,
             reader,
             writer,
+            read_only: _,
             doc_count,
             ord_table,
             path,
@@ -2512,7 +2513,10 @@ impl TantivyIndex {
                 index,
                 fields,
                 reader,
-                writer: Mutex::new(writer),
+                // The rearm always constructs a real writer, so this handle is
+                // never read-only.
+                writer: Mutex::new(Some(writer)),
+                read_only: false,
                 doc_count,
                 ord_table,
                 path,
@@ -2550,6 +2554,7 @@ impl TantivyIndex {
             fields,
             reader,
             writer,
+            read_only: _,
             doc_count,
             ord_table,
             path,
@@ -2588,7 +2593,7 @@ impl TantivyIndex {
     #[cfg(feature = "bench-internals")]
     fn benchmark_join_writer(
         index: &Index,
-        writer: Mutex<IndexWriter>,
+        writer: Mutex<Option<IndexWriter>>,
     ) -> SearchResult<BenchmarkWriterJoinReceipt> {
         let searchable_segments_before = index
             .searchable_segment_ids()
@@ -2597,9 +2602,14 @@ impl TantivyIndex {
                 source: Box::new(error),
             })?
             .len();
-        let writer = writer
+        let Some(writer) = writer
             .into_inner()
-            .map_err(|error| Self::map_writer_lock_error("tantivy.benchmark_join", error))?;
+            .map_err(|error| Self::map_writer_lock_error("tantivy.benchmark_join", error))?
+        else {
+            // A read-only handle has no indexing workers to join, so it can
+            // never be the subject of a writer-join benchmark.
+            return Err(Self::read_only_writer_error("benchmark_join"));
+        };
         let timer = std::time::Instant::now();
         writer
             .wait_merging_threads()
