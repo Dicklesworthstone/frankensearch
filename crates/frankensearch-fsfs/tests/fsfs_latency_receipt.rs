@@ -31,7 +31,9 @@
 //!    written one at a time, the watcher's own per-batch `oldest_event_age_ms`
 //!    (event observed to batch applied) and the client-side write-to-visible
 //!    wall, a graceful stop, and a fresh-process search proving the new files
-//!    are searchable once the watcher has exited.
+//!    are searchable once the watcher has exited. Host-pressure sampling is
+//!    pinned to one sample per hour for this section (a saturated host would
+//!    otherwise pause the watcher by design); the receipt records the pin.
 //!
 //! `FRANKENSEARCH_PERF_RECEIPT_MAX_DAEMON_P95_MS=<ms>` turns the lane into a
 //! threshold check (the planted-regression control).
@@ -787,6 +789,12 @@ fn fsfs_latency_receipt() {
             "json",
         ])
         .env("RUST_LOG", "info")
+        // Host pressure is not the subject: on a saturated host the pressure
+        // controller moves the watcher to Degraded/Emergency, where watching
+        // is switched off by design (observed mid-measurement on a loaded
+        // 64-core box). One sample per hour keeps the measurement about the
+        // watcher; the receipt says so.
+        .env("FRANKENSEARCH_PRESSURE_SAMPLE_INTERVAL_MS", "3600000")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(watch_log)
@@ -880,6 +888,7 @@ fn fsfs_latency_receipt() {
     );
     let watch_mode = serde_json::json!({
         "files_written": WATCH_FILES,
+        "host_pressure_sampling": "pinned to one sample per hour for this measurement (FRANKENSEARCH_PRESSURE_SAMPLE_INTERVAL_MS=3600000); in production a saturated host moves the watcher to Degraded/Emergency, where watching pauses",
         "batches_applied": seen_batches,
         "watcher_startup_ms": watcher_startup_ms,
         "event_to_applied_ms": distribution(&event_to_applied_ms),
