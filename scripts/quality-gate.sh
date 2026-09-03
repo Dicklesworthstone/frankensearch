@@ -117,6 +117,14 @@ if want perf; then
       FRANKENSEARCH_PERF_RECEIPT_OUT="$perf_out" \
       cargo test --locked --release -p frankensearch --features hybrid --test latency_receipt -- --nocapture
     echo "[quality-gate] perf receipt: $perf_out"
+    # The product half: the fsfs binary's own index cost, cold start, and daemon-served
+    # query latency (plus the rerank series), written beside the library receipt.
+    perf_fsfs_out="${QUALITY_GATE_PERF_FSFS_RECEIPT_OUT:-docs/evidence/perf/fsfs-latency-$(date -u +%Y%m%d)-$(hostname).json}"
+    case "$perf_fsfs_out" in /*) ;; *) perf_fsfs_out="$REPO_ROOT/$perf_fsfs_out" ;; esac
+    run_stage perf-fsfs env FRANKENSEARCH_MODEL_DIR="$MODEL_DIR" FRANKENSEARCH_PERF_RECEIPT=1 \
+      FRANKENSEARCH_PERF_RECEIPT_OUT="$perf_fsfs_out" \
+      cargo test --locked --release -p frankensearch-fsfs --test fsfs_latency_receipt -- --nocapture
+    echo "[quality-gate] perf-fsfs receipt: $perf_fsfs_out"
   else
     fail perf "registered models absent under $MODEL_DIR; the latency receipt needs potion + MiniLM"
   fi
