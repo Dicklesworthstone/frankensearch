@@ -779,10 +779,12 @@ fn assert_metric_parity(case: &str, sync_m: &TwoTierMetrics, async_m: &TwoTierMe
         sync_m.phase1_vectors_searched, async_m.phase1_vectors_searched,
         "[{case}] phase1_vectors_searched diverges"
     );
+    // Exact, not "both ran": the two orchestrators search the same quality
+    // generation under the same budget, so a differing count is a real
+    // divergence, not a detail to round away.
     assert_eq!(
-        sync_m.phase2_vectors_searched > 0,
-        async_m.phase2_vectors_searched > 0,
-        "[{case}] phase2 ran on one side only"
+        sync_m.phase2_vectors_searched, async_m.phase2_vectors_searched,
+        "[{case}] phase2_vectors_searched diverges"
     );
     assert_eq!(
         sync_m.lexical_candidates, async_m.lexical_candidates,

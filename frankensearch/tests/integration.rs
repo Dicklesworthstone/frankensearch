@@ -984,3 +984,131 @@ fn index_builder_reports_progress() {
         drop(calls);
     });
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 9. Real-model two-tier proof through the public API (bd-9sxov)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The registered model cache the product uses: `FRANKENSEARCH_MODEL_DIR`,
+/// else `~/.local/share/frankensearch/models`.
+#[cfg(all(feature = "model2vec", feature = "fastembed"))]
+fn registered_model_root() -> Option<PathBuf> {
+    std::env::var_os("FRANKENSEARCH_MODEL_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".local/share/frankensearch/models"))
+        })
+}
+
+/// V9 through the public API only: `IndexBuilder` with the auto-detected
+/// semantic stack (potion fast tier + MiniLM quality tier from the registered
+/// cache, the same models `fsfs` ships) writes both tiers, and
+/// `TwoTierSearcher` yields INITIAL then REFINED with the quality tier
+/// actually searched and the relevant document present. Skips with a message
+/// when the cache lacks a full semantic stack; `FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1`
+/// turns that skip into a failure so a CI lane cannot pass vacuously.
+#[cfg(all(feature = "model2vec", feature = "fastembed"))]
+#[test]
+fn real_models_two_tier_search_yields_refined_through_the_public_api() {
+    use frankensearch::embed::DetectOptions;
+
+    let require = std::env::var("FRANKENSEARCH_REQUIRE_SEMANTIC_E2E").as_deref() == Ok("1");
+    let root = registered_model_root();
+    let detected = root.as_deref().and_then(|root| {
+        EmbedderStack::auto_detect_with_options(
+            Some(root),
+            &DetectOptions {
+                offline: Some(true),
+                ..DetectOptions::default()
+            },
+        )
+        .ok()
+    });
+    let Some(stack) = detected.filter(|stack| stack.availability() == TwoTierAvailability::Full)
+    else {
+        let message = format!(
+            "SKIPPING real-model two-tier lane: no full semantic stack (fast + quality) under {}; \
+             run `fsfs download-models` or point FRANKENSEARCH_MODEL_DIR at a provisioned cache. \
+             Set FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 to make this a hard failure.",
+            root.as_deref()
+                .map_or_else(|| "<no model root>".to_owned(), |root| root.display().to_string())
+        );
+        assert!(!require, "{message}");
+        eprintln!("{message}");
+        return;
+    };
+    let fast = stack.fast_arc();
+    let quality = stack
+        .quality_arc()
+        .expect("a Full stack carries a quality embedder");
+    assert!(
+        fast.is_semantic() && quality.is_semantic(),
+        "the registered stack must be semantic on both tiers"
+    );
+    let fast_id = fast.id().to_owned();
+    let quality_id = quality.id().to_owned();
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = temp_dir("real-models-two-tier");
+        let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
+        for (id, text) in TEST_CORPUS {
+            builder = builder.add_document(*id, *text);
+        }
+        let stats = builder
+            .build(&cx)
+            .await
+            .expect("build both tiers with the registered models");
+        assert_eq!(stats.doc_count, TEST_CORPUS.len());
+        assert_eq!(stats.embedder_availability, TwoTierAvailability::Full);
+        assert!(stats.has_quality_index, "the quality tier must be written");
+        assert!(
+            dir.join(VECTOR_INDEX_QUALITY_FILENAME).is_file(),
+            "quality tier artifact missing under {}",
+            dir.display()
+        );
+
+        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_quality_embedder(quality);
+        let mut phases = Vec::new();
+        let mut refined_ids = Vec::new();
+        let metrics = searcher
+            .search(
+                &cx,
+                "consensus protocols that keep working when nodes fail",
+                5,
+                |_| None,
+                |phase| match phase {
+                    SearchPhase::Initial { .. } => phases.push("Initial"),
+                    SearchPhase::Refined { results, .. } => {
+                        phases.push("Refined");
+                        refined_ids = results
+                            .iter()
+                            .map(|result| result.doc_id.to_string())
+                            .collect();
+                    }
+                    SearchPhase::Reranked { .. } => phases.push("Reranked"),
+                    SearchPhase::RefinementFailed { .. } => phases.push("RefinementFailed"),
+                },
+            )
+            .await
+            .expect("two-tier search with the registered models");
+
+        assert_eq!(phases, vec!["Initial", "Refined"], "{metrics:?}");
+        assert!(
+            metrics.phase2_vectors_searched > 0,
+            "the quality tier must actually be searched: {metrics:?}"
+        );
+        assert_eq!(metrics.fast_embedder_id.as_deref(), Some(fast_id.as_str()));
+        assert_eq!(
+            metrics.quality_embedder_id.as_deref(),
+            Some(quality_id.as_str())
+        );
+        assert!(metrics.skip_reason.is_none(), "{metrics:?}");
+        assert!(
+            refined_ids.iter().any(|id| id == "doc-003"),
+            "the Raft/fault-tolerance document must be in the refined top 5: {refined_ids:?}"
+        );
+    });
+}
