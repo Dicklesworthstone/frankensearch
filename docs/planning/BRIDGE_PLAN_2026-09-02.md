@@ -338,7 +338,19 @@ under the lease; `verify` in `prepare_search_execution_resources` (cheap hash) a
 
 ### Gap #12: V9 — Library two-tier proven with a real model; examples wired — UNPROVEN → PROVEN
 
-**Current state:** `frankensearch/tests/integration.rs` proves Refined with semantic doubles;
+**Status 2026-09-02 (bd-9sxov): PROVEN, in the gate.** `integration.rs::real_models_two_tier_search_yields_refined_through_the_public_api`
+builds with the registered potion + MiniLM stack through `IndexBuilder` and asserts `TwoTierSearcher`
+yields INITIAL then REFINED (`phase2_vectors_searched > 0`, embedder ids match, relevant doc in the
+head); skip-with-message without models, hard failure under `FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1`
+(planted negative verified both ways). The gate's new `facade` stage runs the library crate's
+integration tests on `--features hybrid` (142 tests, ~25 s + compile) with the lane required when
+the models are present — these tests ran nowhere before. `examples/run_all.sh` (exit 0, 144 s debug)
+is the opt-in `examples` stage. The parity test compares `phase2_vectors_searched` exactly.
+Deliberately unchanged: `basic_search.rs`/`streaming_search.rs` stay explicit hash-control fixtures
+(documented, referenced by the tutorials); the frankentorch MiniLM lane in `treasure_island_e2e.rs`
+stays `native`-gated because the registered cache carries the ONNX MiniLM, not the safetensors export.
+
+**Current state (before bd-9sxov):** `frankensearch/tests/integration.rs` proves Refined with semantic doubles;
 `treasure_island_e2e.rs` (env-gated, real model) asserts no Refined; `examples/run_all.sh` is
 unwired; `basic_search.rs`/`streaming_search.rs` use hash embedders so their Refined arms are dead;
 `searcher_parity_conformance.rs` compares `phase2_vectors_searched` as a boolean.

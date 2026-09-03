@@ -566,6 +566,7 @@ Notes:
   not a Quill fallback and remains outside default builds.
 - Use `search_collect_with_text` or full `search(...)` when you need negation filtering (`-term`) and rerank text access.
 - Keep `TwoTierConfig` explicit in code for reproducible behavior across environments.
+- This path is proven with the real models, not doubles: the gate's `facade` stage runs `integration.rs::real_models_two_tier_search_yields_refined_through_the_public_api` (potion fast tier + MiniLM quality tier from the registered cache; INITIAL then REFINED with the quality tier searched). Reproduce locally with `FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 cargo test -p frankensearch --features hybrid --test integration -- real_models`.
 
 ## Baseline Performance Envelope (Reference)
 
