@@ -286,7 +286,7 @@ fn registered_model_root() -> PathBuf {
         .expect("a model root (FRANKENSEARCH_MODEL_DIR or HOME)")
 }
 
-/// A short socket path: AF_UNIX paths are capped near 107 bytes, and the
+/// A short socket path: `AF_UNIX` paths are capped near 107 bytes, and the
 /// runtime directory is the shortest writable place the daemon itself uses.
 fn short_socket_path() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
@@ -320,6 +320,26 @@ impl Harness {
             .env_remove("FSFS_INDEX_DIR")
             .env_remove("RUST_LOG");
         command
+    }
+
+    fn run_text(&self, label: &str, args: &[&str]) -> (String, Duration) {
+        let started = Instant::now();
+        let output = self
+            .command(args)
+            .output()
+            .unwrap_or_else(|error| panic!("{label}: spawn fsfs: {error}"));
+        let elapsed = started.elapsed();
+        assert!(
+            output.status.success(),
+            "{label} failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            elapsed,
+        )
     }
 
     fn run_json(&self, label: &str, args: &[&str]) -> (Value, Duration) {
@@ -359,15 +379,32 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// The daemon's own readiness handshake (`:ready`), so the timed queries
+/// never include its startup or the resource bind.
 fn wait_for_socket(path: &Path, budget: Duration) {
     let started = Instant::now();
     while started.elapsed() < budget {
-        if path.exists() && UnixStream::connect(path).is_ok() {
-            return;
+        if let Ok(mut stream) = UnixStream::connect(path) {
+            let ready = stream
+                .write_all(b":ready\n")
+                .and_then(|()| stream.flush())
+                .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
+                .and_then(|()| {
+                    let mut raw = String::new();
+                    stream.read_to_string(&mut raw).map(|_| raw)
+                })
+                .map(|raw| !raw.trim().is_empty())
+                .unwrap_or(false);
+            if ready {
+                return;
+            }
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("daemon socket {} not accepting within {budget:?}", path.display());
+    panic!(
+        "daemon socket {} not ready within {budget:?}",
+        path.display()
+    );
 }
 
 /// One request on one connection, the way the CLI client talks to the daemon.
@@ -385,6 +422,12 @@ fn daemon_query(socket: &Path, query: &str, rerank: bool) -> (Value, Duration) {
         .write_all(request.to_string().as_bytes())
         .expect("write request");
     stream.write_all(b"\n").expect("write newline");
+    stream.flush().expect("flush request");
+    // The daemon reads the request to end-of-stream, exactly like the CLI
+    // client: half-close the write side or its 5 s read timeout expires.
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close the request");
     let mut raw = String::new();
     stream.read_to_string(&mut raw).expect("read response");
     let elapsed = started.elapsed();
@@ -402,16 +445,35 @@ fn final_phase(response: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+/// `(files, reported_ms, index_size_bytes)` from the `fsfs index` summary
+/// line: `Indexed N file(s) (discovered N, skipped 0) into <dir> in M ms
+/// (index size B bytes)`.
+fn parse_index_summary(stdout: &str) -> Option<(u64, u64, u64)> {
+    let line = stdout.lines().find(|line| line.starts_with("Indexed "))?;
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    let files = tokens.get(1)?.parse().ok()?;
+    let after = |marker: &str| -> Option<u64> {
+        tokens
+            .iter()
+            .position(|token| *token == marker)
+            .and_then(|at| tokens.get(at + 1))
+            .and_then(|token| token.parse().ok())
+    };
+    Some((files, after("in")?, after("size")?))
+}
+
 fn host_fingerprint() -> Value {
     let hostname = std::fs::read_to_string("/etc/hostname")
         .map(|value| value.trim().to_owned())
         .ok();
-    let cpu_model = std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|info| {
-        info.lines()
-            .find(|line| line.starts_with("model name"))
-            .and_then(|line| line.split(':').nth(1))
-            .map(|value| value.trim().to_owned())
-    });
+    let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|info| {
+            info.lines()
+                .find(|line| line.starts_with("model name"))
+                .and_then(|line| line.split(':').nth(1))
+                .map(|value| value.trim().to_owned())
+        });
     let cores = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .ok();
@@ -443,11 +505,15 @@ fn file_sha256(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(path).ok()?;
     let digest = Sha256::digest(&bytes);
-    Some(digest.iter().fold(String::with_capacity(64), |mut hex, byte| {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    }))
+    Some(
+        digest
+            .iter()
+            .fold(String::with_capacity(64), |mut hex, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            }),
+    )
 }
 
 #[test]
@@ -486,8 +552,11 @@ fn fsfs_latency_receipt() {
     let corpus_arg = corpus.display().to_string();
     let index_arg = index_dir.display().to_string();
 
-    // 1. Index cost, end to end through the binary.
-    let (index_json, index_wall) = harness.run_json(
+    // 1. Index cost, end to end through the binary. `fsfs index` reports a
+    //    human summary line ("Indexed N file(s) ... in M ms (index size B
+    //    bytes)") rather than an envelope; the wall clock here is the
+    //    number that matters, the reported values are cross-checks.
+    let (index_text, index_wall) = harness.run_text(
         "fsfs index",
         &[
             "index",
@@ -499,14 +568,12 @@ fn fsfs_latency_receipt() {
             "json",
         ],
     );
-    let indexed_files = index_json
-        .pointer("/data/indexed_files")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let (indexed_files, index_reported_ms, index_size_bytes) = parse_index_summary(&index_text)
+        .unwrap_or_else(|| panic!("fsfs index summary line missing:\n{index_text}"));
     assert_eq!(
         indexed_files,
         u64::try_from(docs).unwrap_or(u64::MAX),
-        "every corpus file must be indexed: {index_json}"
+        "every corpus file must be indexed:\n{index_text}"
     );
     let status_json = harness
         .run_json(
@@ -648,6 +715,8 @@ fn fsfs_latency_receipt() {
         "index": {
             "wall_ms": ms(index_wall),
             "indexed_files": indexed_files,
+            "reported_ms": index_reported_ms,
+            "index_size_bytes": index_size_bytes,
             "quality_tier": quality_tier_present,
             "status": status_json.get("data").cloned().unwrap_or(Value::Null),
         },
