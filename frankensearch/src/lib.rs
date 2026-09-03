@@ -172,6 +172,11 @@
 //! parameter. The `Cx` is provided by the consumer's asupersync runtime;
 //! frankensearch never creates its own runtime.
 
+// The `Send` proof for `IndexBuilder::build`'s future nests through the Quill
+// and model-loader futures under the product feature set (`hybrid`); clippy's
+// `future_not_send` check overflows the default limit of 128 there.
+#![recursion_limit = "256"]
+
 #[cfg(all(feature = "fts5", not(feature = "storage")))]
 compile_error!("feature `fts5` requires feature `storage`");
 

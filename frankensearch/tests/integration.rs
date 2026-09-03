@@ -1002,7 +1002,7 @@ fn registered_model_root() -> Option<PathBuf> {
 }
 
 /// V9 through the public API only: `IndexBuilder` with the auto-detected
-/// semantic stack (potion fast tier + MiniLM quality tier from the registered
+/// semantic stack (potion fast tier + `MiniLM` quality tier from the registered
 /// cache, the same models `fsfs` ships) writes both tiers, and
 /// `TwoTierSearcher` yields INITIAL then REFINED with the quality tier
 /// actually searched and the relevant document present. Skips with a message
@@ -1020,7 +1020,6 @@ fn real_models_two_tier_search_yields_refined_through_the_public_api() {
             Some(root),
             &DetectOptions {
                 offline: Some(true),
-                ..DetectOptions::default()
             },
         )
         .ok()
@@ -1031,8 +1030,10 @@ fn real_models_two_tier_search_yields_refined_through_the_public_api() {
             "SKIPPING real-model two-tier lane: no full semantic stack (fast + quality) under {}; \
              run `fsfs download-models` or point FRANKENSEARCH_MODEL_DIR at a provisioned cache. \
              Set FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 to make this a hard failure.",
-            root.as_deref()
-                .map_or_else(|| "<no model root>".to_owned(), |root| root.display().to_string())
+            root.as_deref().map_or_else(
+                || "<no model root>".to_owned(),
+                |root| root.display().to_string()
+            )
         );
         assert!(!require, "{message}");
         eprintln!("{message}");

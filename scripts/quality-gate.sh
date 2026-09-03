@@ -8,7 +8,8 @@
 #
 #   fmt        cargo fmt --check
 #   check      cargo check --workspace --all-targets
-#   clippy     cargo clippy --workspace --all-targets -- -D warnings (pedantic+nursery lints)
+#   clippy     cargo clippy --workspace --all-targets -- -D warnings (pedantic+nursery lints),
+#              then the facade crate again on --features hybrid (the product feature set)
 #   tests      library unit tests for every crate except the gauntlet harness (its 894-test
 #              unit binary alone takes >50 min; it has its own lane in the perf ratchet)
 #   fsfs       every fsfs test binary buildable on the default feature set
@@ -77,6 +78,9 @@ echo "[quality-gate] repo=$REPO_ROOT rev=$(git rev-parse --short HEAD) dirty=$(g
 want fmt       && run_stage fmt    cargo fmt --check
 want check     && run_stage check  cargo check --locked --workspace --all-targets
 want clippy    && run_stage clippy cargo clippy --locked --workspace --all-targets -- -D warnings
+# The facade's product feature set (loaders + Quill) is what users build; it was never linted
+# until bd-fhy2j, and its future-Send analysis needs the crate's raised recursion limit.
+want clippy    && run_stage clippy-hybrid cargo clippy --locked -p frankensearch --features hybrid --all-targets -- -D warnings
 want tests     && run_stage tests  cargo test --locked --workspace --lib --exclude frankensearch-quill-gauntlet
 want fsfs      && run_stage fsfs   cargo test --locked -p frankensearch-fsfs --tests
 

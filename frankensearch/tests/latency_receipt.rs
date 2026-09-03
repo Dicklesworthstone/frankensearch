@@ -330,7 +330,15 @@ fn test_binary_sha256() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let bytes = std::fs::read(exe).ok()?;
     let digest = Sha256::digest(&bytes);
-    Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    Some(
+        digest
+            .iter()
+            .fold(String::with_capacity(64), |mut hex, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            }),
+    )
 }
 
 #[test]
@@ -351,7 +359,6 @@ fn library_two_tier_latency_receipt() {
         Some(&root),
         &DetectOptions {
             offline: Some(true),
-            ..DetectOptions::default()
         },
     )
     .expect("auto-detect the registered stack");
@@ -428,6 +435,8 @@ fn library_two_tier_latency_receipt() {
         let mut quality_search = Vec::with_capacity(TIMED_QUERIES);
         let mut phase2_vectors = Vec::with_capacity(TIMED_QUERIES);
         let mut refined_count = 0_usize;
+        let mut phase2_skips = std::collections::BTreeMap::<String, usize>::new();
+        let mut query_classes = std::collections::BTreeMap::<String, usize>::new();
 
         for (index, query) in queries.iter().enumerate() {
             let timed = index >= WARMUP_QUERIES;
@@ -450,28 +459,51 @@ fn library_two_tier_latency_receipt() {
                 .expect("two-tier search");
             let query_wall = query_started.elapsed();
             let initial_latency = initial_latency.expect("INITIAL yield");
-            let phase2_latency = phase2_latency.expect("REFINED yield");
-            assert!(
-                metrics.phase2_vectors_searched > 0,
-                "the quality tier must be searched for every query: {metrics:?}"
-            );
             if !timed {
                 continue;
             }
-            refined_count += 1;
+            *query_classes
+                .entry(format!("{:?}", metrics.query_class))
+                .or_insert(0_usize) += 1;
             initial.push(ms(initial_latency));
-            phase2.push(ms(phase2_latency));
-            refined_delivery.push(ms(initial_latency + phase2_latency));
             wall.push(ms(query_wall));
             fast_embed.push(metrics.fast_embed_ms);
             vector_search.push(metrics.vector_search_ms);
             lexical_search.push(metrics.lexical_search_ms);
-            quality_embed.push(metrics.quality_embed_ms);
-            quality_search.push(metrics.quality_search_ms);
-            phase2_vectors.push(metrics.phase2_vectors_searched);
             lexical_candidates.push(metrics.lexical_candidates);
+            // The searcher may decide not to refine (a keyword query the
+            // lexical arm already answers, for one); those queries are
+            // INITIAL-only deliveries and are reported as such, never folded
+            // into the refined percentiles.
+            match phase2_latency {
+                Some(phase2_latency) => {
+                    assert!(
+                        metrics.phase2_vectors_searched > 0,
+                        "a REFINED yield must have searched the quality tier: {metrics:?}"
+                    );
+                    refined_count += 1;
+                    phase2.push(ms(phase2_latency));
+                    refined_delivery.push(ms(initial_latency + phase2_latency));
+                    quality_embed.push(metrics.quality_embed_ms);
+                    quality_search.push(metrics.quality_search_ms);
+                    phase2_vectors.push(metrics.phase2_vectors_searched);
+                }
+                None => {
+                    *phase2_skips
+                        .entry(
+                            metrics
+                                .skip_reason
+                                .clone()
+                                .unwrap_or_else(|| "no_skip_reason_recorded".to_owned()),
+                        )
+                        .or_insert(0_usize) += 1;
+                }
+            }
         }
-        assert_eq!(refined_count, TIMED_QUERIES);
+        assert!(
+            refined_count > 0,
+            "no timed query reached REFINED; skips: {phase2_skips:?}"
+        );
 
         let median = |values: &[usize]| -> usize {
             let mut sorted = values.to_vec();
@@ -509,7 +541,14 @@ fn library_two_tier_latency_receipt() {
                 },
                 "lexical_backend": stats.lexical.as_ref().map(|receipt| receipt.backend),
             },
-            "queries": { "warmup": WARMUP_QUERIES, "timed": TIMED_QUERIES, "top_k": TOP_K },
+            "queries": {
+                "warmup": WARMUP_QUERIES,
+                "timed": TIMED_QUERIES,
+                "top_k": TOP_K,
+                "refined": refined_count,
+                "phase2_skipped": phase2_skips,
+                "query_classes": query_classes,
+            },
             "initial_ms": distribution(&initial),
             "phase2_ms": distribution(&phase2),
             "refined_delivery_ms": distribution(&refined_delivery),

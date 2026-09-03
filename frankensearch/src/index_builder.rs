@@ -1305,11 +1305,13 @@ mod tests {
     use frankensearch_lexical::TantivyIndex;
     #[cfg(feature = "quill")]
     use frankensearch_quill::{
-        BlueGreenEngine, DEFAULT_SCHEMA, EncodedSegment, SectionInput, SectionKind,
-        SegmentHeaderInput, SegmentReader, load_manifest_pair,
+        DEFAULT_SCHEMA, EncodedSegment, SectionInput, SectionKind, SegmentHeaderInput,
+        SegmentReader, load_manifest_pair,
     };
+    // `BlueGreenEngine` is only named by the Tantivy-pointer tests below; under
+    // `quill` alone the import would be unused (clippy -D warnings under hybrid).
     #[cfg(all(feature = "quill", feature = "lexical-tantivy"))]
-    use frankensearch_quill::{CurrentPointer, publish_current};
+    use frankensearch_quill::{BlueGreenEngine, CurrentPointer, publish_current};
 
     use super::*;
 
