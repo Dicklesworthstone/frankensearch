@@ -5679,6 +5679,16 @@ mod tests {
         );
     }
 
+    /// Prove the receipt path does not re-hash, by making the weights file
+    /// unreadable *without* touching any state the receipt records (size,
+    /// mtime, ctime, file id). A full pass must then fail while the cached
+    /// path still succeeds — the only way that can happen is if the cached
+    /// path never opened the file.
+    ///
+    /// `chmod 000` does not restrict a process running as root, which is
+    /// common in CI containers, so the test first checks whether the trick
+    /// actually works here and skips the strict half if it does not, rather
+    /// than asserting something the environment cannot honour.
     #[cfg(unix)]
     #[test]
     fn native_verify_dir_cached_skips_the_hash_pass_on_a_valid_receipt() {
@@ -5693,38 +5703,56 @@ mod tests {
         // Only the download-manifest authority mints the receipt.
         verify_dir_and_record(&manifest, tmp.path()).unwrap();
 
-        // Make the weights unreadable without changing size, mtime, or
-        // identity. A full hash pass must now fail; the receipt path only
-        // stats the file, so a cached hit is the one way this can succeed.
+        // A valid receipt must satisfy the native manifest outright.
+        native
+            .verify_dir_cached(&manifest, tmp.path())
+            .expect("a valid receipt must satisfy the derived native manifest");
+
         let original = std::fs::metadata(&weights_path).unwrap().permissions();
         std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read(&weights_path).is_err();
         let cached = native.verify_dir_cached(&manifest, tmp.path());
         let full = native.verify_dir(tmp.path());
-        std::fs::set_permissions(&weights_path, original).unwrap();
+        std::fs::set_permissions(&weights_path, original.clone()).unwrap();
 
-        assert!(
-            full.is_err(),
-            "control: the full pass must not be able to read the weights"
-        );
-        cached.expect("a valid receipt must let the native verify skip the hash pass");
-
-        // A native manifest that no longer matches the download manifest must
-        // not borrow its receipt: with the file unreadable that means Err.
+        // A native manifest whose artifact set no longer matches the download
+        // manifest must never borrow that manifest's receipt. That property is
+        // only *observable* while the file cannot be read: if the receipt were
+        // borrowed the call would succeed, and if it correctly falls through to
+        // the hash pass it must fail on the unreadable file. With a readable
+        // file, falling through simply re-verifies the real bytes against the
+        // native manifest and legitimately succeeds, which proves nothing.
         let mut drifted = manifest.clone();
-        drifted.files[1].sha256 = "0".repeat(64);
-        std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let mismatched = native.verify_dir_cached(&drifted, tmp.path());
-        std::fs::set_permissions(
-            &weights_path,
-            std::fs::metadata(tmp.path().join("tokenizer.json"))
-                .unwrap()
-                .permissions(),
-        )
-        .unwrap();
-        assert!(
-            mismatched.is_err(),
-            "a receipt for a different artifact set must never satisfy the native manifest"
-        );
+        let weights_entry = drifted
+            .files
+            .iter_mut()
+            .find(|file| file.name == "model.safetensors")
+            .expect("fixture must carry a weights entry");
+        weights_entry.sha256 = "0".repeat(64);
+
+        if unreadable {
+            assert!(
+                full.is_err(),
+                "control: the full pass must not be able to read the weights"
+            );
+            cached.expect("a valid receipt must let the native verify skip the hash pass");
+
+            std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            let borrowed_foreign_receipt = native.verify_dir_cached(&drifted, tmp.path());
+            std::fs::set_permissions(&weights_path, original).unwrap();
+            assert!(
+                borrowed_foreign_receipt.is_err(),
+                "a receipt for a different artifact set must not be borrowed; the call must fall through to the hash pass and fail on the unreadable file"
+            );
+        } else {
+            // Cannot isolate the hash pass here (running as root), but the
+            // mismatched manifest must still take the full path and, with
+            // readable and genuinely correct bytes, succeed rather than lie.
+            native
+                .verify_dir_cached(&drifted, tmp.path())
+                .expect("full verification of correct bytes must still succeed");
+        }
     }
 
     #[test]
