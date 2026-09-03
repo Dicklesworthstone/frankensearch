@@ -397,10 +397,27 @@ fn library_two_tier_latency_receipt() {
         assert_eq!(stats.embedder_availability, TwoTierAvailability::Full);
 
         let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
-        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+        let mut searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality);
+        // The README pipeline is RRF over the lexical AND semantic arms; the
+        // builder wrote the Quill arm beside the vector tiers, so the searcher
+        // must carry it or this would only measure a vector-only path.
+        let lexical_path = stats.lexical.as_ref().map(|receipt| receipt.path.clone());
+        let hybrid_lexical = lexical_path.is_some();
+        if let Some(path) = lexical_path {
+            let lexical =
+                frankensearch::QuillIndex::open(&cx, path, frankensearch::QuillConfig::default())
+                    .await
+                    .expect("open the Quill lexical arm the builder wrote");
+            searcher = searcher.with_lexical(Arc::new(lexical));
+        }
+        assert!(
+            hybrid_lexical,
+            "the hybrid feature set must build a lexical arm: {stats:?}"
+        );
 
         let mut initial = Vec::with_capacity(TIMED_QUERIES);
+        let mut lexical_candidates = Vec::with_capacity(TIMED_QUERIES);
         let mut phase2 = Vec::with_capacity(TIMED_QUERIES);
         let mut refined_delivery = Vec::with_capacity(TIMED_QUERIES);
         let mut wall = Vec::with_capacity(TIMED_QUERIES);
@@ -452,14 +469,21 @@ fn library_two_tier_latency_receipt() {
             quality_embed.push(metrics.quality_embed_ms);
             quality_search.push(metrics.quality_search_ms);
             phase2_vectors.push(metrics.phase2_vectors_searched);
+            lexical_candidates.push(metrics.lexical_candidates);
         }
         assert_eq!(refined_count, TIMED_QUERIES);
 
-        let phase2_vectors_typical = {
-            let mut sorted = phase2_vectors.clone();
+        let median = |values: &[usize]| -> usize {
+            let mut sorted = values.to_vec();
             sorted.sort_unstable();
             sorted[sorted.len() / 2]
         };
+        let phase2_vectors_typical = median(&phase2_vectors);
+        let lexical_candidates_typical = median(&lexical_candidates);
+        assert!(
+            lexical_candidates_typical > 0,
+            "the lexical arm must contribute candidates on a lexical-friendly corpus"
+        );
 
         let receipt = serde_json::json!({
             "schema": RECEIPT_SCHEMA,
@@ -497,6 +521,8 @@ fn library_two_tier_latency_receipt() {
                 "quality_embed": distribution(&quality_embed),
                 "quality_search": distribution(&quality_search),
             },
+            "hybrid_lexical": hybrid_lexical,
+            "lexical_candidates_typical": lexical_candidates_typical,
             "phase2_vectors_searched_typical": phase2_vectors_typical,
             "rss_kb_at_end": rss_kb(),
         });
