@@ -452,7 +452,17 @@ closed on cited runs.
 
 ### Gap #17: V22 — Bounded, flake-free test suite — PARTIAL → WORKING
 
-**Current state:** the gauntlet unit binary (894 tests) exceeds 50 minutes because `perf_assembly`
+**Status 2026-09-02/03 (partial):** the `TMPDIR`-length class is closed (bd-984mq: the three
+serve-socket tests bind under the runtime dir like the daemon; proven with a 115-byte `TMPDIR`).
+Four load-only failures of the fsfs unit binary under a full parallel run were traced to real
+mechanisms and fixed: a mutator thread that panicked without requesting shutdown left the
+terminal-watcher test hung for 40 min (deadline now requests shutdown first, 60 s); exclusive WAL
+writer opens in three tests raced a forking sibling's inherited descriptor (now the bounded retry
+production uses); host pressure sampled inside watch-mode tests switched the watcher off (those
+tests never sample); the live flush barrier's 2 s floor timed out under IO pressure (now 10 s,
+`494eaf08`). Still open: the gauntlet unit binary (>50 min) stays out of the gate.
+
+**Current state (before):** the gauntlet unit binary (894 tests) exceeds 50 minutes because `perf_assembly`
 and `perf_ratchet` tests each run for minutes; the gate excludes it; three fsfs serve-socket tests
 fail when `TMPDIR` exceeds ~80 bytes (AF_UNIX); the ETXTBSY class is fixed in tests only.
 **Target state:** the full workspace test suite completes in under 20 minutes on a 32-core host;
