@@ -514,6 +514,16 @@ locally (fast stages only) and refuses the push on failure; the full gate stays 
 **S**. Beads: none.
 
 ### Gap #28: V6 — Watch-mode debounce and freshness documented with numbers
+
+**Status 2026-09-03 (bd-thic0): DONE.** The watcher logs `fsfs watch batch applied` per applied
+batch (`batch_ops`, `reindexed`, `skipped`, `oldest_event_age_ms`, `apply_ms`); the product latency
+receipt's watch section (`fsfs-latency-20260903-thinkstation1.json`, `watch_mode`) writes 20 files
+one at a time into a watched 1,000-file corpus: event-to-applied p50 725 ms / p95 848 ms / max
+886 ms (500 ms debounce + p50 224 ms ingest into both tiers), write-to-line-visible p50 731 ms,
+graceful SIGTERM exit 0, all 20 files searchable from a fresh process afterwards. Host-pressure
+sampling is pinned to one sample per hour for the section (a saturated host moves the watcher to
+Degraded/Emergency, where watching pauses by design; observed mid-measurement on this box) and the
+receipt records the pin. The README envelope carries the row.
 After Gap #6's e2e, README states the freshness budget. **S**.
 
 ### Gap #29: V21 — Replay bundles for two-tier searches

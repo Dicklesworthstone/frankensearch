@@ -598,8 +598,9 @@ and are design budgets:
 | Index build, both vector tiers + Quill (1,000 docs, 659 KB) | ~17 s | receipt, 2026-09-03 (17.2 s wall: 15.8 s embedding both tiers, 1.3 s Quill; artifacts 536 KB fast, 792 KB quality, 74 MB lexical; 1.29 GB RSS at the end) |
 | `fsfs index` (1,000 files / 660 KB, both vector tiers + Quill + catalog) | ~14 s | product receipt, 2026-09-03 (14.1 s wall, 26.9 MB on disk) |
 | Daemon-served `fsfs search` (warm query daemon, one request per connection, INITIAL + REFINED) | ~13 ms | product receipt, 2026-09-03 (p50 12.7 ms, p95 13.9 ms, p99 14.8 ms over 50 queries, 0 cache hits; `:ready` round trip 1.1 ms). Before the adaptive accept poll landed the same run measured p50 50 ms: the daemon slept 50 ms between empty accept polls |
-| Daemon-served `fsfs search --rerank` (cross-encoder over the refined head) | ~230 ms | product receipt, 2026-09-03 (p50 233 ms, p95 320 ms over 20 queries, all applied) |
-| Cold process start (`fsfs search` without a running daemon, INITIAL + REFINED) | ~3.3 s | product receipt, 2026-09-03 (3.32–3.34 s over 3 runs): potion vocabulary load dominates |
+| Daemon-served `fsfs search --rerank` (cross-encoder over the refined head) | ~250–400 ms | product receipt, 2026-09-03 (p50 412 ms over 20 queries, all applied, with the host at a 15-minute load of 63; an earlier run of the same lane at load 9 measured p50 233 ms, p95 320 ms: the int8 cross-encoder is CPU-bound and shares the box) |
+| Watch mode: file written → ingested into both tiers (`fsfs index --watch`) | ~0.7 s | product receipt, 2026-09-03 (20 files written one at a time: event-to-applied p50 725 ms, p95 848 ms, max 886 ms = the 500 ms debounce plus p50 224 ms ingest; all 20 searchable from a fresh process after the watcher's graceful exit; host-pressure sampling pinned for the measurement, since a saturated host pauses the watcher by design) |
+| Cold process start (`fsfs search` without a running daemon, INITIAL + REFINED) | ~3.3–3.6 s | product receipt, 2026-09-03 (3.55 s median of 3 runs at load 63; 3.32–3.34 s at load 9): potion vocabulary load dominates |
 
 What changes the envelope the most:
 - query class and candidate budget
