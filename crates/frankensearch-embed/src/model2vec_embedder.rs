@@ -127,7 +127,14 @@ impl Model2VecEmbedder {
         }
         #[cfg(not(test))]
         {
-            let verified = ModelArtifactManifestV1::potion_128m_native()?.verify_dir(model_dir)?;
+            // The native manifest is derived from the potion download manifest,
+            // whose `.verified` receipt is minted after a full hash pass. Reuse
+            // that receipt instead of re-hashing the 512 MB safetensors file on
+            // every process start; any mismatch falls back to the full pass.
+            let verified = ModelArtifactManifestV1::potion_128m_native()?.verify_dir_cached(
+                &crate::model_manifest::ModelManifest::potion_128m(),
+                model_dir,
+            )?;
             let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
             validate_registered_execution_contract(&identity)?;
             Self::load_preverified(model_dir, name, identity)

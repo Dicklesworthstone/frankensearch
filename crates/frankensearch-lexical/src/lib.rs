@@ -1231,6 +1231,9 @@ enum WriterPlan {
     /// Ordinary shipping construction through Tantivy's own width selection.
     /// Never produces a benchmark receipt.
     Shipping,
+    /// Read-only construction: no `IndexWriter`, no writer lock, no indexing
+    /// thread pool. Only [`TantivyIndex::open_read_only`] produces this plan.
+    ReadOnly,
     /// Ordinary construction at a pinned width. Never produces a benchmark
     /// receipt either.
     ///
@@ -1261,7 +1264,7 @@ impl WriterPlan {
     const fn benchmark_threads(self) -> Option<usize> {
         match self {
             Self::BenchmarkFixed(threads) => Some(threads),
-            Self::Shipping | Self::BenchmarkShippingAuto => None,
+            Self::Shipping | Self::ReadOnly | Self::BenchmarkShippingAuto => None,
             #[cfg(feature = "tantivy-oracle")]
             Self::PinnedWidth(_) => None,
         }
@@ -1897,7 +1900,15 @@ pub struct TantivyIndex {
     index: Index,
     fields: SchemaFields,
     reader: IndexReader,
-    writer: Mutex<IndexWriter>,
+    /// `None` when the index was opened through [`Self::open_read_only`]: no
+    /// `IndexWriter` is constructed, so Tantivy's exclusive
+    /// `.tantivy-writer.lock` is never taken and concurrent read-only
+    /// processes can all serve the same published generation. Every write
+    /// entry point returns a typed `InvalidConfig` error instead of a writer
+    /// in that state.
+    writer: Mutex<Option<IndexWriter>>,
+    /// True when opened through [`Self::open_read_only`].
+    read_only: bool,
     doc_count: AtomicUsize,
     /// Append-only `ordinal -> doc_id` table backing the fast id-materialization
     /// path. Index `i` holds the `doc_id` of the document assigned ordinal `i`.
@@ -1986,6 +1997,7 @@ impl std::fmt::Debug for TantivyIndex {
                 &self.doc_count.load(Ordering::Relaxed),
             )
             .field("path", &self.path)
+            .field("read_only", &self.read_only)
             .finish_non_exhaustive()
     }
 }
@@ -1996,6 +2008,16 @@ impl TantivyIndex {
             subsystem: "tantivy",
             source: "current Tantivy reader document count does not fit usize".into(),
         })
+    }
+
+    /// Typed error for a write attempted through a read-only handle.
+    fn read_only_writer_error(phase: &str) -> SearchError {
+        SearchError::InvalidConfig {
+            field: format!("tantivy.writer.{phase}"),
+            value: "read_only".to_owned(),
+            reason: "index was opened with TantivyIndex::open_read_only and holds no IndexWriter"
+                .to_owned(),
+        }
     }
 
     fn map_writer_lock_error(phase: &str, error: asupersync::sync::LockError) -> SearchError {
@@ -2144,6 +2166,51 @@ impl TantivyIndex {
         )
     }
 
+    /// Open an existing on-disk index for reading only.
+    ///
+    /// Unlike [`Self::open`], no [`IndexWriter`] is constructed, so this never
+    /// takes Tantivy's exclusive `.tantivy-writer.lock`, never allocates the
+    /// writer heap, and never spawns indexing threads. Any number of processes
+    /// can open the same published generation this way while a writer holds
+    /// the lock elsewhere. Write entry points on the returned index fail with
+    /// a typed `InvalidConfig` error instead of mutating anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::IndexNotFound` if the path does not exist, or
+    /// `SearchError::SubsystemError` if the index cannot be opened.
+    pub fn open_read_only(path: &Path) -> SearchResult<Self> {
+        if !path.exists() {
+            return Err(SearchError::IndexNotFound {
+                path: path.to_path_buf(),
+            });
+        }
+
+        let (schema, fields) = build_schema();
+        let index = Index::open_in_dir(path).map_err(|e| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(e),
+        })?;
+
+        Self::from_index_with_writer_threads(
+            index,
+            schema,
+            fields,
+            Some(path.to_path_buf()),
+            WRITER_HEAP_BYTES,
+            WriterPlan::ReadOnly,
+            #[cfg(feature = "bench-internals")]
+            None,
+        )
+    }
+
+    /// True when this handle was opened through [`Self::open_read_only`] and
+    /// therefore holds no writer.
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// Create an in-memory Tantivy index (useful for testing).
     ///
     /// # Errors
@@ -2197,11 +2264,14 @@ impl TantivyIndex {
     #[cfg(feature = "tantivy-oracle")]
     #[doc(hidden)]
     pub async fn oracle_disable_auto_merge(&self, cx: &Cx) -> SearchResult<()> {
-        let writer = self
+        let writer_guard = self
             .writer
             .lock(cx)
             .await
             .map_err(|error| Self::map_writer_lock_error("tantivy.oracle_no_merge", error))?;
+        let Some(writer) = writer_guard.as_ref() else {
+            return Err(Self::read_only_writer_error("oracle_no_merge"));
+        };
         writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
         Ok(())
     }
@@ -2561,10 +2631,13 @@ impl TantivyIndex {
     #[cfg(feature = "bench-internals")]
     #[doc(hidden)]
     pub async fn benchmark_disable_auto_merge(&self, cx: &Cx) -> SearchResult<()> {
-        let writer =
+        let writer_guard =
             self.writer.lock(cx).await.map_err(|error| {
                 Self::map_writer_lock_error("tantivy.benchmark_no_merge", error)
             })?;
+        let Some(writer) = writer_guard.as_ref() else {
+            return Err(Self::read_only_writer_error("benchmark_no_merge"));
+        };
         writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
         Ok(())
     }
@@ -2585,9 +2658,12 @@ impl TantivyIndex {
                     .to_owned(),
             });
         }
-        let writer = self.writer.lock(cx).await.map_err(|error| {
+        let writer_guard = self.writer.lock(cx).await.map_err(|error| {
             Self::map_writer_lock_error("tantivy.qg4.directory_sync_no_merge", error)
         })?;
+        let Some(writer) = writer_guard.as_ref() else {
+            return Err(Self::read_only_writer_error("qg4.directory_sync_no_merge"));
+        };
         if self.doc_count.load(Ordering::Acquire) != 0 {
             return Err(SearchError::InvalidConfig {
                 field: "tantivy.qg4.directory_sync_no_merge".to_owned(),
@@ -2685,11 +2761,14 @@ impl TantivyIndex {
         }
 
         let opstamp = {
-            let mut writer = self
+            let mut writer_guard = self
                 .writer
                 .lock(cx)
                 .await
                 .map_err(|error| Self::map_writer_lock_error("tantivy.qg4.commit", error))?;
+            let Some(writer) = writer_guard.as_mut() else {
+                return Err(Self::read_only_writer_error("qg4.commit"));
+            };
             writer
                 .commit()
                 .map_err(|error| SearchError::SubsystemError {
@@ -2768,11 +2847,14 @@ impl TantivyIndex {
             return Ok(());
         }
         {
-            let mut writer = self
+            let mut writer_guard = self
                 .writer
                 .lock(cx)
                 .await
                 .map_err(|error| Self::map_writer_lock_error("tantivy.force_merge", error))?;
+            let Some(writer) = writer_guard.as_mut() else {
+                return Err(Self::read_only_writer_error("force_merge"));
+            };
             writer
                 .merge(&segment_ids)
                 .wait()
@@ -2869,6 +2951,10 @@ impl TantivyIndex {
         #[cfg(test)]
         let mut observed_writer_call = WriterCall::Auto;
         let writer = match plan {
+            // Read-only handles never construct a writer: that is the whole
+            // point of the plan. Tantivy's writer lock stays free for the
+            // process that actually publishes generations.
+            WriterPlan::ReadOnly => Ok(None),
             // Ordinary shipping construction reaches the same Tantivy call as a
             // benchmark shipping-auto construction, and deliberately produces no
             // receipt: only an explicit benchmark plan may claim one.
@@ -2877,7 +2963,8 @@ impl TantivyIndex {
                 writer_heap_bytes,
                 #[cfg(test)]
                 &mut observed_writer_call,
-            ),
+            )
+            .map(Some),
             // Pinned but unscreened: the same Tantivy call a benchmark fixed
             // plan makes, deliberately without a receipt.
             #[cfg(feature = "tantivy-oracle")]
@@ -2887,7 +2974,8 @@ impl TantivyIndex {
                 writer_heap_bytes,
                 #[cfg(test)]
                 &mut observed_writer_call,
-            ),
+            )
+            .map(Some),
             #[cfg(feature = "bench-internals")]
             WriterPlan::BenchmarkShippingAuto => {
                 let writer = call_auto_writer(
@@ -2906,7 +2994,7 @@ impl TantivyIndex {
                         Some(BenchmarkWriterAttestation::mint(receipt.clone()));
                     benchmark_writer_receipt = Some(receipt);
                 }
-                writer
+                writer.map(Some)
             }
             #[cfg(feature = "bench-internals")]
             WriterPlan::BenchmarkFixed(thread_count) => {
@@ -2929,13 +3017,14 @@ impl TantivyIndex {
                         Some(BenchmarkWriterAttestation::mint(receipt.clone()));
                     benchmark_writer_receipt = Some(receipt);
                 }
-                writer
+                writer.map(Some)
             }
         }
         .map_err(|e| SearchError::SubsystemError {
             subsystem: "tantivy",
             source: Box::new(e),
         })?;
+        let read_only = writer.is_none();
 
         // Count existing documents.
         let searcher = reader.searcher();
@@ -2981,6 +3070,7 @@ impl TantivyIndex {
             fields,
             reader,
             writer: Mutex::new(writer),
+            read_only,
             doc_count: AtomicUsize::new(doc_count),
             ord_table: RwLock::new(ord_table),
             path,
@@ -3155,11 +3245,14 @@ impl TantivyIndex {
     /// or cancelled.
     pub async fn delete_document(&self, cx: &Cx, doc_id: &str) -> SearchResult<()> {
         let term = Term::from_field_text(self.fields.id, doc_id);
-        let mut writer = self
+        let mut writer_guard = self
             .writer
             .lock(cx)
             .await
             .map_err(|error| Self::map_writer_lock_error("tantivy.delete", error))?;
+        let Some(writer) = writer_guard.as_mut() else {
+            return Err(Self::read_only_writer_error("delete"));
+        };
         writer.delete_term(term);
         writer
             .commit()
@@ -4056,11 +4149,14 @@ impl frankensearch_core::traits::LexicalWrite for TantivyIndex {
             let mut tantivy_doc = self.to_tantivy_doc(doc);
 
             {
-                let writer = self
+                let writer_guard = self
                     .writer
                     .lock(cx)
                     .await
                     .map_err(|e| Self::map_writer_lock_error("tantivy.index", e))?;
+                let Some(writer) = writer_guard.as_ref() else {
+                    return Err(Self::read_only_writer_error("index"));
+                };
 
                 // Delete any existing document with same ID (upsert semantics).
                 let term = Term::from_field_text(self.fields.id, &doc.id);
@@ -4086,11 +4182,14 @@ impl frankensearch_core::traits::LexicalWrite for TantivyIndex {
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
             {
-                let writer = self
+                let writer_guard = self
                     .writer
                     .lock(cx)
                     .await
                     .map_err(|e| Self::map_writer_lock_error("tantivy.batch_index", e))?;
+                let Some(writer) = writer_guard.as_ref() else {
+                    return Err(Self::read_only_writer_error("batch_index"));
+                };
 
                 for doc in docs {
                     let mut tantivy_doc = self.to_tantivy_doc(doc);
@@ -4117,11 +4216,14 @@ impl frankensearch_core::traits::LexicalWrite for TantivyIndex {
     fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
         Box::pin(async move {
             {
-                let mut writer = self
+                let mut writer_guard = self
                     .writer
                     .lock(cx)
                     .await
                     .map_err(|e| Self::map_writer_lock_error("tantivy.commit", e))?;
+                let Some(writer) = writer_guard.as_mut() else {
+                    return Err(Self::read_only_writer_error("commit"));
+                };
 
                 writer.commit().map_err(|e| SearchError::SubsystemError {
                     subsystem: "tantivy",
@@ -5295,6 +5397,105 @@ mod tests {
                 ids_before, ids_after,
                 "reopened index must return identical ranked doc_ids"
             );
+        });
+    }
+
+    /// A read-only open must succeed while another handle still holds
+    /// Tantivy's exclusive writer lock, must rank identically, and must refuse
+    /// writes with a typed error instead of a panic or a silent no-op.
+    ///
+    /// Before `open_read_only` existed, every reader went through `open`,
+    /// which constructs an `IndexWriter` and therefore takes
+    /// `.tantivy-writer.lock`; a second concurrent reader process failed the
+    /// open and callers silently dropped the lexical arm.
+    #[test]
+    fn open_read_only_serves_while_a_writer_holds_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        run_with_cx(|cx| async move {
+            let docs: Vec<IndexableDocument> = (0..12)
+                .map(|i| {
+                    IndexableDocument::new(
+                        format!("doc-{i:03}"),
+                        format!("gamma delta document number {i} searchable content"),
+                    )
+                })
+                .collect();
+
+            // The writer-holding handle stays alive for the whole test.
+            let writer_index = TantivyIndex::create(&path).expect("create");
+            writer_index
+                .index_documents(&cx, &docs)
+                .await
+                .expect("index");
+            writer_index.commit(&cx).await.expect("commit");
+            let ids_via_writer = writer_index
+                .search_doc_ids(&cx, "document", 20)
+                .expect("search")
+                .into_iter()
+                .map(|h| h.doc_id)
+                .collect::<Vec<_>>();
+            assert!(
+                path.join(".tantivy-writer.lock").exists(),
+                "the writer handle must hold Tantivy's writer lock for this test to mean anything"
+            );
+
+            // A second `open` would contend for the writer lock; the read-only
+            // open must not, so it succeeds while `writer_index` is alive.
+            let reader = TantivyIndex::open_read_only(&path)
+                .expect("read-only open must not need the writer lock");
+            assert!(reader.is_read_only());
+            assert!(!writer_index.is_read_only());
+
+            let ids_via_reader = reader
+                .search_doc_ids(&cx, "document", 20)
+                .expect("search")
+                .into_iter()
+                .map(|h| h.doc_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids_via_writer, ids_via_reader,
+                "read-only handle must rank the published generation identically"
+            );
+
+            // Writes through the read-only handle fail closed with a typed error.
+            let extra = IndexableDocument::new("doc-extra".to_owned(), "gamma extra".to_owned());
+            let index_err = reader
+                .index_document(&cx, &extra)
+                .await
+                .expect_err("read-only index must refuse index_document");
+            assert!(
+                matches!(&index_err, SearchError::InvalidConfig { field, value, .. }
+                    if field == "tantivy.writer.index" && value == "read_only"),
+                "unexpected error for read-only index_document: {index_err}"
+            );
+            let commit_err = reader
+                .commit(&cx)
+                .await
+                .expect_err("read-only index must refuse commit");
+            assert!(
+                matches!(&commit_err, SearchError::InvalidConfig { field, .. }
+                    if field == "tantivy.writer.commit"),
+                "unexpected error for read-only commit: {commit_err}"
+            );
+            let delete_err = reader
+                .delete_document(&cx, "doc-000")
+                .await
+                .expect_err("read-only index must refuse delete_document");
+            assert!(
+                matches!(&delete_err, SearchError::InvalidConfig { field, .. }
+                    if field == "tantivy.writer.delete"),
+                "unexpected error for read-only delete: {delete_err}"
+            );
+
+            // The refused writes changed nothing visible to either handle.
+            let ids_after = reader
+                .search_doc_ids(&cx, "document", 20)
+                .expect("search")
+                .into_iter()
+                .map(|h| h.doc_id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids_via_writer, ids_after);
         });
     }
 

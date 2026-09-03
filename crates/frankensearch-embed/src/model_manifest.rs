@@ -883,6 +883,56 @@ impl ModelArtifactManifestV1 {
         Ok(VerifiedModelArtifactsV1 { frozen })
     }
 
+    /// Verify a model directory against this frozen manifest, reusing the
+    /// download manifest's verification receipt when it is still valid.
+    ///
+    /// A native manifest is derived from its download manifest by
+    /// [`Self::from_download_manifest`], so both describe one artifact set.
+    /// When `download_manifest` carries a valid `.verified` receipt for
+    /// `model_dir` (minted only by [`verify_dir_and_record`] after a full
+    /// SHA-256 pass, and invalidated by any size, mtime, or identity change)
+    /// and every artifact here matches that manifest's file entry on relative
+    /// path, size, and SHA-256, the full hash pass is skipped. This is what
+    /// keeps a 512 MB model from being re-hashed on every process start. Any
+    /// mismatch, missing receipt, or stale receipt falls back to
+    /// [`Self::verify_dir`]; nothing is minted here.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::verify_dir`].
+    pub fn verify_dir_cached(
+        &self,
+        download_manifest: &ModelManifest,
+        model_dir: &Path,
+    ) -> SearchResult<VerifiedModelArtifactsV1> {
+        if self.artifacts_match_download_manifest(download_manifest)
+            && is_verification_cached(download_manifest, model_dir)
+        {
+            let frozen = self.freeze()?;
+            verify_no_extra_artifacts(model_dir, &self.artifacts)?;
+            return Ok(VerifiedModelArtifactsV1 { frozen });
+        }
+        self.verify_dir(model_dir)
+    }
+
+    /// True when every artifact here is byte-for-byte the same file entry
+    /// (relative path, size, SHA-256) as in `download_manifest`, and the two
+    /// describe the same logical model with the same number of files.
+    fn artifacts_match_download_manifest(&self, download_manifest: &ModelManifest) -> bool {
+        if self.logical_model_id != download_manifest.id
+            || self.artifacts.len() != download_manifest.files.len()
+        {
+            return false;
+        }
+        self.artifacts.iter().all(|artifact| {
+            download_manifest.files.iter().any(|file| {
+                file.name == artifact.relative_path
+                    && file.size == artifact.size
+                    && file.sha256.eq_ignore_ascii_case(&artifact.sha256)
+            })
+        })
+    }
+
     /// Promote a fully verified frozen artifact set into its final directory.
     ///
     /// Every registered file is synced before the sibling-directory rename.
@@ -5554,6 +5604,123 @@ mod tests {
 
         // The consumer operation may then admit the unchanged receipt.
         verify_dir_cached(&manifest, tmp.path()).unwrap();
+    }
+
+    /// Build a two-file download manifest plus the native manifest derived
+    /// from it, exactly the way `potion_128m_native` derives from
+    /// `ModelManifest::potion_128m`, but over small fixture bytes.
+    fn native_fixture(
+        tokenizer: &[u8],
+        weights: &[u8],
+    ) -> (ModelManifest, ModelArtifactManifestV1) {
+        use sha2::{Digest, Sha256};
+        let sha = |bytes: &[u8]| {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            to_hex_lowercase(&hasher.finalize())
+        };
+        let mut manifest = make_test_manifest("tokenizer.json", tokenizer);
+        manifest.files.push(ModelFile {
+            name: "model.safetensors".to_owned(),
+            sha256: sha(weights),
+            size: u64::try_from(weights.len()).unwrap(),
+            url: None,
+        });
+        manifest.dimension = Some(4);
+        manifest.download_size_bytes = u64::try_from(tokenizer.len() + weights.len()).unwrap();
+        let execution = ModelExecutionContractV1 {
+            backend: "test-native".to_owned(),
+            implementation_revision: "test-impl-v1".to_owned(),
+            protocol_revision: "test-proto-v1".to_owned(),
+            numeric_profile: "f32-test-v1".to_owned(),
+            weights_format: "safetensors-f32-matrix-v1".to_owned(),
+            tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
+            model_preprocessing: MODEL2VEC_PREPROCESSING_V1.to_owned(),
+            sequence_policy: MODEL2VEC_SEQUENCE_POLICY_V1.to_owned(),
+            pooling: MODEL2VEC_POOLING_V1.to_owned(),
+            output_normalization: MODEL2VEC_OUTPUT_NORMALIZATION_V1.to_owned(),
+            query_instruction: String::new(),
+            document_instruction: String::new(),
+            input_contract: default_plain_text_input_contract(),
+            golden_vectors: GoldenVectorCertificateV1 {
+                corpus_sha256: conformance_corpus_fingerprint().unwrap(),
+                vectors_sha256: "f".repeat(64),
+                vector_count: 4,
+                dimension: 4,
+            },
+        };
+        let native =
+            ModelArtifactManifestV1::from_download_manifest(&manifest, "test-provider", execution)
+                .expect("fixture native manifest must validate");
+        (manifest, native)
+    }
+
+    #[test]
+    fn native_verify_dir_cached_falls_back_to_full_hash_without_a_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, native) = native_fixture(b"{\"tokenizer\":1}", b"weights-for-test");
+        write_temp_file(&tmp.path().join("tokenizer.json"), b"{\"tokenizer\":1}");
+        write_temp_file(&tmp.path().join("model.safetensors"), b"weights-for-test");
+
+        // No receipt yet: the cached entry point must behave exactly like the
+        // full pass, succeed on matching bytes, and mint nothing.
+        native.verify_dir_cached(&manifest, tmp.path()).unwrap();
+        assert!(!tmp.path().join(VERIFIED_MARKER_FILE).exists());
+
+        // Drifted bytes with no receipt are still caught by the full pass.
+        write_temp_file(&tmp.path().join("model.safetensors"), b"weights-for-tesT");
+        assert!(
+            native.verify_dir_cached(&manifest, tmp.path()).is_err(),
+            "without a receipt the cached path must still hash and reject drift"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_verify_dir_cached_skips_the_hash_pass_on_a_valid_receipt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, native) = native_fixture(b"{\"tokenizer\":2}", b"weights-cached");
+        write_temp_file(&tmp.path().join("tokenizer.json"), b"{\"tokenizer\":2}");
+        let weights_path = tmp.path().join("model.safetensors");
+        write_temp_file(&weights_path, b"weights-cached");
+
+        // Only the download-manifest authority mints the receipt.
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
+
+        // Make the weights unreadable without changing size, mtime, or
+        // identity. A full hash pass must now fail; the receipt path only
+        // stats the file, so a cached hit is the one way this can succeed.
+        let original = std::fs::metadata(&weights_path).unwrap().permissions();
+        std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let cached = native.verify_dir_cached(&manifest, tmp.path());
+        let full = native.verify_dir(tmp.path());
+        std::fs::set_permissions(&weights_path, original).unwrap();
+
+        assert!(
+            full.is_err(),
+            "control: the full pass must not be able to read the weights"
+        );
+        cached.expect("a valid receipt must let the native verify skip the hash pass");
+
+        // A native manifest that no longer matches the download manifest must
+        // not borrow its receipt: with the file unreadable that means Err.
+        let mut drifted = manifest.clone();
+        drifted.files[1].sha256 = "0".repeat(64);
+        std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mismatched = native.verify_dir_cached(&drifted, tmp.path());
+        std::fs::set_permissions(
+            &weights_path,
+            std::fs::metadata(&tmp.path().join("tokenizer.json"))
+                .unwrap()
+                .permissions(),
+        )
+        .unwrap();
+        assert!(
+            mismatched.is_err(),
+            "a receipt for a different artifact set must never satisfy the native manifest"
+        );
     }
 
     #[test]
