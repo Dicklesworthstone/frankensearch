@@ -8,18 +8,18 @@
     ],
     "runs": 3,
     "samples": [
-      3337.060609,
-      3330.1804549999997,
-      3317.4012030000004
+      3430.13256,
+      3553.323227,
+      3615.23915
     ],
     "summary": {
-      "max_ms": 3337.060609,
-      "mean_ms": 3328.2140889999996,
-      "min_ms": 3317.4012030000004,
+      "max_ms": 3615.23915,
+      "mean_ms": 3532.8983123333333,
+      "min_ms": 3430.13256,
       "n": 3,
-      "p50_ms": 3330.1804549999997,
-      "p95_ms": 3337.060609,
-      "p99_ms": 3337.060609
+      "p50_ms": 3553.323227,
+      "p95_ms": 3615.23915,
+      "p99_ms": 3615.23915
     }
   },
   "corpus": {
@@ -37,22 +37,22 @@
     "warmup": 5
   },
   "daemon_query_ms": {
-    "max_ms": 14.817421000000001,
-    "mean_ms": 12.543088920000002,
-    "min_ms": 10.471986000000001,
+    "max_ms": 14.9637,
+    "mean_ms": 12.810377720000002,
+    "min_ms": 10.992208999999999,
     "n": 50,
-    "p50_ms": 12.663795,
-    "p95_ms": 13.920841,
-    "p99_ms": 14.817421000000001
+    "p50_ms": 12.722198,
+    "p95_ms": 14.568437999999999,
+    "p99_ms": 14.9637
   },
   "daemon_ready_roundtrip_ms": {
-    "max_ms": 1.288266,
-    "mean_ms": 1.0795121,
-    "min_ms": 0.611726,
+    "max_ms": 1.904471,
+    "mean_ms": 1.1804232000000003,
+    "min_ms": 0.675614,
     "n": 10,
-    "p50_ms": 1.1158780000000001,
-    "p95_ms": 1.288266,
-    "p99_ms": 1.288266
+    "p50_ms": 1.1376330000000001,
+    "p95_ms": 1.904471,
+    "p99_ms": 1.904471
   },
   "daemon_rerank_queries": {
     "statuses": {
@@ -61,23 +61,23 @@
     "timed": 20
   },
   "daemon_rerank_query_ms": {
-    "max_ms": 478.549674,
-    "mean_ms": 247.74145255,
-    "min_ms": 193.414139,
+    "max_ms": 646.323978,
+    "mean_ms": 420.84800765,
+    "min_ms": 325.02725,
     "n": 20,
-    "p50_ms": 233.195722,
-    "p95_ms": 319.590964,
-    "p99_ms": 478.549674
+    "p50_ms": 411.823975,
+    "p95_ms": 500.33674400000007,
+    "p99_ms": 646.323978
   },
   "fsfs_binary": "/data/tmp/cargo-target/release/fsfs",
-  "fsfs_binary_sha256": "9016d2c72a85a57bd80b929ccc88a5ed735226c16f9eccac5e9bebc9faf9424c",
-  "generated_at_unix": 1788403637,
-  "git_revision": "1d747ac530f2",
+  "fsfs_binary_sha256": "21cfdbccae3ddfb57ae4132f125e04b15d0a234e99e15c4778199d079eb518be",
+  "generated_at_unix": 1788411189,
+  "git_revision": "393bc870d281",
   "host": {
     "arch": "x86_64",
     "cpu_model": "AMD Ryzen Threadripper PRO 5975WX 32-Cores",
     "hostname": "thinkstation1",
-    "loadavg_at_start": "8.97 7.28 5.98 5/7662 1023263",
+    "loadavg_at_start": "14.72 22.18 62.95 18/7798 2791002",
     "logical_cores": 64,
     "os": "linux"
   },
@@ -85,7 +85,7 @@
     "index_size_bytes": 26939648,
     "indexed_files": 1000,
     "quality_tier": true,
-    "reported_ms": 13317,
+    "reported_ms": 13050,
     "status": {
       "config": {
         "fast_only": false,
@@ -99,7 +99,7 @@
       },
       "index": {
         "catalog_bytes": 0,
-        "catalog_path": "/data/tmp/bl/.tmpcWkFTr/index/catalog.db",
+        "catalog_path": "/data/tmp/bl/.tmpsKKnNu/index/catalog.db",
         "dashboard_state": "ready",
         "discovered_files": 1000,
         "embedding_cache_bytes": 0,
@@ -107,23 +107,23 @@
         "index_freshness": {
           "degraded": false,
           "estimated_missing_docs": 0,
-          "last_publish_unix": 1788403650,
+          "last_publish_unix": 1788411201,
           "live_writer": false,
           "published_generation": 5,
           "quarantined_segments": 0,
           "unknown_missing_doc_segments": 0
         },
         "indexed_files": 1000,
-        "last_indexed_iso_utc": "2026-09-03T02:47:30Z",
-        "last_indexed_ms": 1788403650386,
+        "last_indexed_iso_utc": "2026-09-03T04:53:22Z",
+        "last_indexed_ms": 1788411202150,
         "lexical_index_bytes": 23791382,
         "metadata_bytes": 0,
-        "path": "/data/tmp/bl/.tmpcWkFTr/index",
+        "path": "/data/tmp/bl/.tmpsKKnNu/index",
         "quality_generation_dimension": 384,
         "quality_generation_id": "all-MiniLM-L6-v2",
         "size_bytes": 26939612,
         "skipped_files": 0,
-        "source_hash_hex": "058be9b94d15522f",
+        "source_hash_hex": "057fe2faf6ac6c69",
         "stale_files": 0,
         "vector_generation_dimension": 256,
         "vector_generation_id": "potion-multilingual-128M",
@@ -159,9 +159,44 @@
       },
       "version": "1.8.0"
     },
-    "wall_ms": 14097.487226
+    "wall_ms": 13845.42717
   },
   "model_root": "/home/ubuntu/.local/share/frankensearch/models",
   "profile_note": "cargo test --release binary (opt-level 3); the shipped fsfs release adds fat LTO and codegen-units=1",
-  "schema": "frankensearch-fsfs-latency-receipt-v1"
+  "schema": "frankensearch-fsfs-latency-receipt-v1",
+  "watch_mode": {
+    "batch_apply_ms": {
+      "max_ms": 376.0,
+      "mean_ms": 237.9,
+      "min_ms": 183.0,
+      "n": 20,
+      "p50_ms": 224.0,
+      "p95_ms": 346.0,
+      "p99_ms": 376.0
+    },
+    "batches_applied": 20,
+    "event_to_applied_ms": {
+      "max_ms": 886.0,
+      "mean_ms": 742.6,
+      "min_ms": 689.0,
+      "n": 20,
+      "p50_ms": 725.0,
+      "p95_ms": 848.0,
+      "p99_ms": 886.0
+    },
+    "files_written": 20,
+    "host_pressure_sampling": "pinned to one sample per hour for this measurement (FRANKENSEARCH_PRESSURE_SAMPLE_INTERVAL_MS=3600000); in production a saturated host moves the watcher to Degraded/Emergency, where watching pauses",
+    "searchable_after_exit": true,
+    "watcher_exit_code": 0,
+    "watcher_startup_ms": 16884.326813,
+    "write_to_line_visible_ms": {
+      "max_ms": 895.90565,
+      "mean_ms": 748.7443338999999,
+      "min_ms": 694.075299,
+      "n": 20,
+      "p50_ms": 730.964228,
+      "p95_ms": 849.4575140000001,
+      "p99_ms": 895.90565
+    }
+  }
 }
