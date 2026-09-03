@@ -573,17 +573,25 @@ Notes:
 These are practical CPU-only reference numbers for a healthy local setup.
 Treat them as orientation targets, not hard SLAs. Rows marked *ledger* are
 the newest committed measurements in `docs/PERF_LEDGER.md`; rows marked
-*target* have no committed measurement and are design budgets:
+*receipt* come from the committed latency receipt
+`docs/evidence/perf/library-two-tier-latency-20260903-thinkstation1.json`
+(release profile, AMD Ryzen Threadripper PRO 5975WX / 64 threads, registered
+potion-multilingual-128M + all-MiniLM-L6-v2, a 1,000-document / 659 KB
+synthetic prose corpus, 50 timed queries after 5 warm-ups; regenerate with
+`QUALITY_GATE_STAGES=perf scripts/quality-gate.sh`); rows marked *target*
+have no committed measurement and are design budgets:
 
 | Operation | Typical Envelope | Basis |
 |---|---|---|
 | Fast hash embedding (`hash_embed_fnv`, tokenize + FNV) | ~2 μs | ledger, 2026-07-04 |
-| Fast model embedding (potion-128M) | ~0.6 ms | target |
-| Quality model embedding (MiniLM) | ~130 ms | target |
-| Vector search (10K docs, top-10) | ~2 ms | target |
+| Fast model embedding (potion-128M, short query) | ~0.1 ms | receipt, 2026-09-03 (p50 0.10 ms, p95 0.17 ms) |
+| Quality model embedding (MiniLM, short query) | ~5 ms | receipt, 2026-09-03 (p50 5.1 ms, p95 6.1 ms); at index time both tiers together cost ≈16 ms per document |
+| Vector search (1K docs, top-10, fast tier) | ~0.1 ms | receipt, 2026-09-03 (p50 0.07 ms); 10K docs remains a *target* at ~2 ms |
+| Lexical search (Quill, 1K docs) | ~0.2 ms | receipt, 2026-09-03 (p50 0.23 ms, p95 0.38 ms) |
 | RRF fusion (1,000 + 1,000 candidates) | ~23 μs | ledger, 2026-07-04 |
-| Phase 1 initial delivery (in-process, warm models) | `< 15 ms` | target; 18–19 ms measured on a 65-file corpus, 2026-09-01 |
-| Phase 2 refined delivery (library `TwoTierSearcher`) | `~150 ms` | target |
+| Phase 1 initial delivery (library `TwoTierSearcher`, hybrid Quill + potion, warm) | `< 1 ms` | receipt, 2026-09-03 (p50 0.40 ms, p95 0.58 ms, p99 2.4 ms) against the `< 15 ms` target; the `fsfs` in-process path measured 18–19 ms on a 65-file corpus on 2026-09-01 and is not yet receipted |
+| Phase 2 refined delivery (library `TwoTierSearcher`, INITIAL + REFINED) | `~6 ms` | receipt, 2026-09-03 (p50 5.5 ms, p95 6.8 ms, p99 7.8 ms over the 40 of 50 queries that refined; the 10 short-keyword queries were answered by the lexical arm alone) against the `~150 ms` target |
+| Index build, both vector tiers + Quill (1,000 docs, 659 KB) | ~17 s | receipt, 2026-09-03 (17.2 s wall: 15.8 s embedding both tiers, 1.3 s Quill; artifacts 536 KB fast, 792 KB quality, 74 MB lexical; 1.29 GB RSS at the end) |
 | Cold process start (`fsfs search` without a running daemon) | ~3 s | measured 2026-09-01: potion vocabulary load dominates |
 
 What changes the envelope the most:

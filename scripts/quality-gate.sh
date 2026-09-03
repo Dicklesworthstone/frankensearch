@@ -106,6 +106,9 @@ fi
 if want perf; then
   if [ -d "$MODEL_DIR/all-MiniLM-L6-v2" ]; then
     perf_out="${QUALITY_GATE_PERF_RECEIPT_OUT:-docs/evidence/perf/library-two-tier-latency-$(date -u +%Y%m%d)-$(hostname).json}"
+    # cargo runs the test with the PACKAGE directory as cwd, so a relative
+    # receipt path would land under frankensearch/ instead of the repo root.
+    case "$perf_out" in /*) ;; *) perf_out="$REPO_ROOT/$perf_out" ;; esac
     run_stage perf env FRANKENSEARCH_MODEL_DIR="$MODEL_DIR" FRANKENSEARCH_PERF_RECEIPT=1 \
       FRANKENSEARCH_PERF_RECEIPT_OUT="$perf_out" \
       cargo test --locked --release -p frankensearch --features hybrid --test latency_receipt -- --nocapture

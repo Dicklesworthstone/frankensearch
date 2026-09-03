@@ -131,7 +131,21 @@ asset (x86_64-pc-windows-msvc, default features) built on `wlap`/`wsurf` and an 
 
 ### Gap #3: V3 — Prove the product's own latency and index-cost envelope — UNPROVEN → PROVEN
 
-**Current state:** README quotes `< 15 ms` Initial and `~150 ms` Refined as targets. Measured:
+**Status 2026-09-03 (bd-8s0nf): PROVEN for the library path; receipt committed.**
+`frankensearch/tests/latency_receipt.rs` (opt-in, release profile, registered potion + MiniLM +
+Quill, 1,000-document deterministic corpus, 5 warm-up + 50 timed hybrid queries) writes
+`docs/evidence/perf/library-two-tier-latency-<date>-<host>.json` through the gate's opt-in `perf`
+stage; the planted-regression bound (`FRANKENSEARCH_PERF_RECEIPT_MAX_REFINED_P95_MS`) was verified
+to fail. First receipt (thinkstation1, Threadripper PRO 5975WX): INITIAL p50 0.40 ms / p99 2.4 ms;
+REFINED delivery p50 5.5 ms / p95 6.8 ms / p99 7.8 ms (40/50 refined, 10 short-keyword queries
+short-circuited by the lexical arm); MiniLM query embed p50 5.1 ms; index 17.2 s for 1,000 docs
+(15.8 s embedding both tiers, 1.3 s Quill), RSS 1.29 GB. README envelope rows cite it with dates.
+Deviations from the plan below: the lane lives in the facade (the README rows are library rows and
+the product's in-process API is private) rather than in `benchmark_baseline_matrix.rs`; the `fsfs`
+process path keeps its 2026-09-01 measurements (18–19 ms INITIAL on 65 files, ~3 s cold start) and
+is the remaining un-receipted row; no 10K-document run yet (that row stays *target*).
+
+**Current state (before bd-8s0nf):** README quotes `< 15 ms` Initial and `~150 ms` Refined as targets. Measured:
 18–19 ms Initial in-process on a 65-document corpus (debug and release similar for that path);
 Refined only on a debug build (21 s, dominated by the MiniLM session on a debug tokenizer). Index
 time with the quality tier: 61 s for 54 docs on a debug build; no release number. No committed

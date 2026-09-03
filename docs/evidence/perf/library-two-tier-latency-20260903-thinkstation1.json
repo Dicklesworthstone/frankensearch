@@ -1,0 +1,140 @@
+{
+  "cargo_profile": "release",
+  "corpus": {
+    "docs": 1000,
+    "generator": "deterministic LCG prose over 6 topic vocabularies",
+    "total_chars": 659386
+  },
+  "generated_at_unix": 1788398743,
+  "git_revision": "408166bf57f3",
+  "host": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen Threadripper PRO 5975WX 32-Cores",
+    "hostname": "thinkstation1",
+    "loadavg_at_start": "4.54 3.85 11.75 4/7249 368636",
+    "logical_cores": 64,
+    "os": "linux"
+  },
+  "hybrid_lexical": true,
+  "index": {
+    "build_wall_ms": 17241.319841,
+    "builder_total_ms": 17240.247259,
+    "embed_ms_both_tiers": 15843.548496000001,
+    "lexical_backend": "quill",
+    "lexical_ms": 1317.441448,
+    "quality_docs": 1000,
+    "size_bytes": {
+      "lexical": 74373690,
+      "total": 75701946,
+      "vector_fast": 536128,
+      "vector_quality": 792128
+    }
+  },
+  "initial_ms": {
+    "max_ms": 2.420666,
+    "mean_ms": 0.43947914000000005,
+    "min_ms": 0.20133099999999998,
+    "n": 50,
+    "p50_ms": 0.395349,
+    "p95_ms": 0.5793079999999999,
+    "p99_ms": 2.420666
+  },
+  "lexical_candidates_typical": 15,
+  "models": {
+    "fast": "potion-multilingual-128M",
+    "model_root": "/home/ubuntu/.local/share/frankensearch/models",
+    "quality": "all-MiniLM-L6-v2"
+  },
+  "phase2_ms": {
+    "max_ms": 7.252019,
+    "mean_ms": 5.160657775000001,
+    "min_ms": 4.025436,
+    "n": 40,
+    "p50_ms": 5.1119140000000005,
+    "p95_ms": 6.204725000000001,
+    "p99_ms": 7.252019
+  },
+  "phase2_vectors_searched_typical": 60,
+  "profile_note": "cargo test --release (opt-level 3, thin LTO default); the shipped fsfs binary adds fat LTO and codegen-units=1, so its numbers can only be better",
+  "queries": {
+    "phase2_skipped": {
+      "lexical_short_circuit": 10
+    },
+    "query_classes": {
+      "Some(NaturalLanguage)": 40,
+      "Some(ShortKeyword)": 10
+    },
+    "refined": 40,
+    "timed": 50,
+    "top_k": 10,
+    "warmup": 5
+  },
+  "refined_delivery_ms": {
+    "max_ms": 7.823332000000001,
+    "mean_ms": 5.628210475000001,
+    "min_ms": 4.368926,
+    "n": 40,
+    "p50_ms": 5.484891,
+    "p95_ms": 6.834408,
+    "p99_ms": 7.823332000000001
+  },
+  "rss_kb_at_end": 1291772,
+  "schema": "frankensearch-library-two-tier-latency-receipt-v1",
+  "search_wall_ms": {
+    "max_ms": 7.829351999999999,
+    "mean_ms": 4.57432734,
+    "min_ms": 0.203335,
+    "n": 50,
+    "p50_ms": 5.387967,
+    "p95_ms": 6.8403789999999995,
+    "p99_ms": 7.829351999999999
+  },
+  "stages_ms": {
+    "fast_embed": {
+      "max_ms": 0.18659399999999998,
+      "mean_ms": 0.10523984,
+      "min_ms": 0.059994,
+      "n": 50,
+      "p50_ms": 0.097044,
+      "p95_ms": 0.167457,
+      "p99_ms": 0.18659399999999998
+    },
+    "lexical_search": {
+      "max_ms": 0.42704899999999996,
+      "mean_ms": 0.24799994000000009,
+      "min_ms": 0.14513500000000001,
+      "n": 50,
+      "p50_ms": 0.232671,
+      "p95_ms": 0.375661,
+      "p99_ms": 0.42704899999999996
+    },
+    "quality_embed": {
+      "max_ms": 7.193899,
+      "mean_ms": 5.103232225,
+      "min_ms": 3.971304,
+      "n": 40,
+      "p50_ms": 5.060948,
+      "p95_ms": 6.105817,
+      "p99_ms": 7.193899
+    },
+    "quality_search": {
+      "max_ms": 0.0207,
+      "mean_ms": 0.014088275000000003,
+      "min_ms": 0.010771000000000001,
+      "n": 40,
+      "p50_ms": 0.014077,
+      "p95_ms": 0.016411,
+      "p99_ms": 0.0207
+    },
+    "vector_search": {
+      "max_ms": 0.13009600000000002,
+      "mean_ms": 0.06355699999999999,
+      "min_ms": 0.0,
+      "n": 50,
+      "p50_ms": 0.071826,
+      "p95_ms": 0.106191,
+      "p99_ms": 0.13009600000000002
+    }
+  },
+  "test_binary_sha256": "c4d0241881598594f6648029589dc5dcca61926dfae7d690b449f90b9da5a0a1"
+}
