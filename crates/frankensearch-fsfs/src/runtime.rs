@@ -24593,6 +24593,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// A socket-friendly temp dir. `AF_UNIX` paths are capped near 107 bytes
+    /// and `TMPDIR` alone can exceed that (macOS `/var/folders/...`, a deep
+    /// CI workspace), which silently turned these tests red off the gate
+    /// host. Bind where the daemon binds: the runtime dir, else `/tmp`.
+    fn short_socket_tempdir() -> tempfile::TempDir {
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        tempfile::Builder::new()
+            .prefix("fsfs-sock-")
+            .tempdir_in(base)
+            .expect("short socket tempdir")
+    }
+
     fn connect_socket_with_retry(path: &Path) -> std::os::unix::net::UnixStream {
         for _ in 0..200 {
             match std::os::unix::net::UnixStream::connect(path) {
@@ -24658,7 +24673,8 @@ mod tests {
         fs::write(project.join("src/auth.rs"), "/// Authentication tokens.\n")
             .expect("write source");
         let index_root = project.join(".frankensearch");
-        let socket_path = temp.path().join("serve.sock");
+        let socket_dir = short_socket_tempdir();
+        let socket_path = socket_dir.path().join("serve.sock");
         let mut config = FsfsConfig::default();
         config.storage.index_dir = ".frankensearch".to_owned();
         futures_lite_block_on(async {
@@ -24694,7 +24710,8 @@ mod tests {
         fs::write(project.join("src/auth.rs"), "/// Authentication tokens.\n")
             .expect("write source");
         let index_root = project.join(".frankensearch");
-        let socket_path = temp.path().join("serve.sock");
+        let socket_dir = short_socket_tempdir();
+        let socket_path = socket_dir.path().join("serve.sock");
         let mut config = FsfsConfig::default();
         config.storage.index_dir = ".frankensearch".to_owned();
         futures_lite_block_on(async {
@@ -24756,7 +24773,8 @@ mod tests {
         )
         .expect("write source");
         let index_root = project.join(".frankensearch");
-        let socket_path = temp.path().join("serve.sock");
+        let socket_dir = short_socket_tempdir();
+        let socket_path = socket_dir.path().join("serve.sock");
         let mut config = FsfsConfig::default();
         config.storage.index_dir = ".frankensearch".to_owned();
         futures_lite_block_on(async {
