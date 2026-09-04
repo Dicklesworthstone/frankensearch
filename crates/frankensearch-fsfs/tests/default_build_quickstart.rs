@@ -412,6 +412,21 @@ mod loader_only {
             hex
         };
         let query = "How should a network client recover from transient failures using exponential backoff, bounded retries, and random jitter?";
+        #[cfg(unix)]
+        struct DaemonOwner(PathBuf);
+        #[cfg(unix)]
+        impl Drop for DaemonOwner {
+            fn drop(&mut self) {
+                use std::io::Write as _;
+                if let Ok(mut socket) = std::os::unix::net::UnixStream::connect(&self.0) {
+                    let _ = socket.write_all(b"quit\n");
+                }
+            }
+        }
+        #[cfg(unix)]
+        let daemon = DaemonOwner(
+            std::env::temp_dir().join(format!("fsfs-blend-{}.sock", std::process::id())),
+        );
         let stack = frankensearch_embed::EmbedderStack::auto_detect_with_options(
             Some(&fsfs.model_root),
             &frankensearch_embed::DetectOptions {
@@ -429,6 +444,16 @@ mod loader_only {
             VectorIndex::open_read_only(&fast_index_path).expect("open actual fast generation");
         let quality_index = VectorIndex::open_read_only(&quality_index_path)
             .expect("open actual quality generation");
+        let lexical_root = index.join("lexical");
+        let lexical_pointer = frankensearch_quill::CurrentPointer::decode(
+            &fs::read(lexical_root.join(frankensearch_quill::CURRENT_FILE_NAME)).unwrap(),
+        )
+        .expect("decode the actual lexical generation");
+        assert_eq!(
+            lexical_pointer.engine(),
+            frankensearch_quill::BlueGreenEngine::Quill
+        );
+        let lexical_path = lexical_pointer.engine_dir(&lexical_root);
         let binary_sha = file_sha(&fsfs_binary());
         eprintln!(
             "[default-build-e2e] stage=blend-provenance binary_sha256={binary_sha} fast_id={} quality_id={} fast_identity={} quality_identity={} fast_index_sha256={} quality_index_sha256={}",
@@ -444,9 +469,21 @@ mod loader_only {
             .build()
             .unwrap();
         let task = scheduler.handle().spawn(async move {
+            use frankensearch_core::LexicalRead as _;
             let cx = asupersync::Cx::current().expect("runtime-owned comparison context");
             let fast_vector = fast.embed(&cx, query).await.unwrap();
             let quality_vector = quality.embed(&cx, query).await.unwrap();
+            let lexical = frankensearch_quill::QuillSearchIndex::open(
+                &cx,
+                lexical_path,
+                frankensearch_quill::QuillConfig::default(),
+            )
+            .await
+            .unwrap();
+            let lexical_pool = lexical
+                .search(&cx, query, QUICKSTART_DOCUMENT_COUNT)
+                .await
+                .unwrap();
             (
                 fast_index
                     .search_top_k(&fast_vector, QUICKSTART_DOCUMENT_COUNT, None)
@@ -454,9 +491,10 @@ mod loader_only {
                 quality_index
                     .search_top_k(&quality_vector, QUICKSTART_DOCUMENT_COUNT, None)
                     .unwrap(),
+                lexical_pool,
             )
         });
-        let (fast_pool, quality_pool) = scheduler.block_on(task);
+        let (fast_pool, quality_pool, lexical_pool) = scheduler.block_on(task);
         for weight in [0.0_f32, 0.7, 1.0] {
             let config_path = root.join(format!("blend-{weight}.toml"));
             // This leg measures numerical policy parity under a comfortably
@@ -473,6 +511,8 @@ mod loader_only {
                 let mut args = vec![
                     "search",
                     query,
+                    "--config",
+                    config_str,
                     "--index-dir",
                     index.to_str().unwrap(),
                     "--limit",
@@ -482,15 +522,50 @@ mod loader_only {
                 ];
                 if route == "direct" {
                     args.push("--no-daemon");
+                } else {
+                    #[cfg(unix)]
+                    args.extend(["--daemon-socket", daemon.0.to_str().unwrap()]);
+                    #[cfg(not(unix))]
+                    continue;
                 }
                 let outcome = fsfs.run_with_env(
                     root,
                     &format!("blend-{weight}-{route}"),
                     args,
                     QUICKSTART_TIMEOUT,
-                    &[("FSFS_CONFIG", config_str)],
+                    &[],
                 );
                 let envelope = parse_success_envelope("real policy search", &outcome);
+                assert!(
+                    !outcome
+                        .stderr
+                        .contains("falling back to in-process retrieval"),
+                    "the selected serving route must execute: {}",
+                    outcome.stderr
+                );
+                #[cfg(unix)]
+                if route != "direct" {
+                    use std::io::{Read as _, Write as _};
+                    let mut socket = std::os::unix::net::UnixStream::connect(&daemon.0)
+                        .expect("the same live daemon must serve successive policies");
+                    socket.set_read_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();
+                    let request = serde_json::json!({
+                        "query": query, "limit": usize::MAX, "quality_weight": weight,
+                        "quality_timeout_ms": 5000, "rrf_k": 60.0, "fast_only": false
+                    });
+                    writeln!(socket, "{request}").unwrap();
+                    socket.shutdown(std::net::Shutdown::Write).unwrap();
+                    let mut raw = String::new();
+                    socket.read_to_string(&mut raw).unwrap();
+                    let response: Value = serde_json::from_str(&raw).unwrap();
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v2");
+                    assert_eq!(response["policy"]["quality_weight_bits"], weight.to_bits());
+                    assert_eq!(response["policy"]["quality_timeout_ms"], 5000);
+                    assert_eq!(
+                        response["cached"], true,
+                        "matching policy uses the live daemon cache"
+                    );
+                }
                 assert_eq!(
                     envelope.pointer("/data/phase").and_then(Value::as_str),
                     Some("refined")
@@ -515,15 +590,49 @@ mod loader_only {
                         observed.path
                     );
                 }
+                let blended_vectors = expected
+                    .iter()
+                    .map(|hit| frankensearch_core::VectorHit {
+                        index: 0,
+                        score: hit.score,
+                        doc_id: hit.doc_id.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let expected_fused = frankensearch::rrf_fuse(
+                    &lexical_pool,
+                    &blended_vectors,
+                    QUICKSTART_DOCUMENT_COUNT,
+                    0,
+                    &frankensearch::RrfConfig::default(),
+                );
+                let output_hits = envelope.pointer("/data/hits").unwrap().as_array().unwrap();
+                assert_eq!(output_hits.len(), expected_fused.len());
+                for hit in &expected_fused {
+                    let observed = output_hits
+                        .iter()
+                        .find(|row| row["path"] == hit.doc_id.as_str())
+                        .unwrap();
+                    assert!(
+                        (observed["score"].as_f64().unwrap() - hit.rrf_score).abs() < 1e-12,
+                        "independently retrieved Quill/public-facade RRF differs for {}",
+                        hit.doc_id
+                    );
+                }
+                // Existing planner tie rules are intentionally retained: fsfs
+                // uses semantic score before doc ID after equal RRF/lexical
+                // scores; the facade defaults to doc ID at that last boundary.
+                // Compare every final ID and numeric score without pretending
+                // those pre-existing equal-score tie policies are identical.
                 if let Some(direct) = &direct_blend {
                     assert_eq!(&actual, direct, "daemon uses caller's policy");
                 } else {
                     direct_blend = Some(actual.clone());
                 }
                 eprintln!(
-                    "[default-build-e2e] stage=blend-parity weight={weight} route={route} independently_retrieved_fast={} independently_retrieved_quality={} returned={} max_score_error_lt=0.000001 no_quality_win_claim=true",
+                    "[default-build-e2e] stage=blend-parity weight={weight} route={route} independently_retrieved_fast={} independently_retrieved_quality={} independently_retrieved_quill={} returned={} blend_error_lt=0.000001 joint_rrf_error_lt=0.000000000001 no_quality_win_claim=true",
                     fast_pool.len(),
                     quality_pool.len(),
+                    lexical_pool.len(),
                     actual.hits.len()
                 );
             }
@@ -533,13 +642,15 @@ mod loader_only {
                 [
                     "explain",
                     "1",
+                    "--config",
+                    config_str,
                     "--index-dir",
                     index.to_str().unwrap(),
                     "--format",
                     "json",
                 ],
                 QUICKSTART_TIMEOUT,
-                &[("FSFS_CONFIG", config_str)],
+                &[],
             );
             let envelope = parse_success_envelope("cached policy explain", &explain);
             assert!(
@@ -556,6 +667,20 @@ mod loader_only {
             );
         }
 
+        #[cfg(unix)]
+        {
+            let socket_path = daemon.0.clone();
+            drop(daemon);
+            let deadline = Instant::now() + QUICKSTART_TIMEOUT;
+            while socket_path.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(25));
+            }
+            assert!(
+                !socket_path.exists(),
+                "policy daemon must finish structured shutdown"
+            );
+        }
+
         let timeout_config = root.join("quality-deadline-50.toml");
         fs::write(&timeout_config, "[search]\nquality_timeout_ms = 50\n").unwrap();
         let outcome = fsfs.run_with_env(
@@ -564,6 +689,8 @@ mod loader_only {
             [
                 "search",
                 query,
+                "--config",
+                timeout_config.to_str().unwrap(),
                 "--index-dir",
                 index.to_str().unwrap(),
                 "--no-daemon",
@@ -573,7 +700,6 @@ mod loader_only {
             ],
             QUICKSTART_TIMEOUT,
             &[
-                ("FSFS_CONFIG", timeout_config.to_str().unwrap()),
                 ("FSFS_DISABLE_QUERY_CACHE", "1"),
                 ("FRANKENSEARCH_LOG", "info"),
             ],
@@ -609,6 +735,21 @@ mod loader_only {
             "actual cold backend must respect 50ms boundary"
         );
         assert!(failures[0].0 > initial);
+        let initial_hits = frames[initial + 1..failures[0].0]
+            .iter()
+            .filter(|frame| frame["event"] == "result")
+            .map(|frame| frame["payload"].clone())
+            .collect::<Vec<_>>();
+        let failure_hits = frames[failures[0].0 + 1..]
+            .iter()
+            .filter(|frame| frame["event"] == "result")
+            .map(|frame| frame["payload"].clone())
+            .collect::<Vec<_>>();
+        assert!(!initial_hits.is_empty(), "actual Initial returns real hits");
+        assert_eq!(
+            failure_hits, initial_hits,
+            "timeout preserves every actual Initial item, score and rank"
+        );
         assert!(
             failures[0]
                 .1

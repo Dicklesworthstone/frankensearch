@@ -26,7 +26,7 @@
 //!   optional `removed_in` version. They remain present (possibly null) until
 //!   the `removed_in` version.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 
@@ -468,6 +468,10 @@ pub struct SearchPayload {
     /// Raw lexical evidence retained for the same explanation after cache reuse.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub lexical_scores: BTreeMap<String, f32>,
+    /// Hits appended after the RRF head whose retained score is raw BM25.
+    /// A later quality promotion removes the hit from this set.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty", default)]
+    pub lexical_fallback_tail: BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub quality_timeout: Option<QualityTimeoutPayload>,
 }
@@ -594,6 +598,7 @@ impl SearchPayload {
             rerank: None,
             semantic_blend: None,
             lexical_scores: BTreeMap::new(),
+            lexical_fallback_tail: BTreeSet::new(),
             quality_timeout: None,
         }
     }

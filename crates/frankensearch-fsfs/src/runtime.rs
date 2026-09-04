@@ -480,7 +480,7 @@ const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
 const FSFS_SEARCH_SEMANTIC_HEAD_PROGRESSIVE_STEP: usize = 16;
 const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v2";
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v3";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v2";
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -2081,6 +2081,19 @@ struct ExplainSessionHit {
     /// Cross-encoder score when the rerank stage re-scored this hit.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     rerank_score: Option<f32>,
+    /// This hit retained its raw BM25 score after the fused head.
+    #[serde(default)]
+    lexical_fallback_tail: bool,
+}
+
+impl ExplainSessionHit {
+    fn rrf_contributions(&self, k: f64) -> Option<crate::explanation_payload::RrfContributions> {
+        (!self.lexical_fallback_tail).then(|| crate::explanation_payload::RrfContributions {
+            k,
+            lexical: rrf_contribution_for_rank(k, self.lexical_rank),
+            vector: rrf_contribution_for_rank(k, self.hash_rank.or(self.semantic_rank)),
+        })
+    }
 }
 
 impl ExplainSession {
@@ -2143,6 +2156,7 @@ impl ExplainSession {
                 hash_score: candidate.hash_score,
                 in_both_sources: candidate.in_both_sources,
                 rerank_score: None,
+                lexical_fallback_tail: false,
             })
             .collect();
 
@@ -7197,7 +7211,11 @@ impl FsfsRuntime {
                 },
                 raw_score: f64::from(lexical_score),
                 normalized_score: f64::from(lexical_score),
-                rrf_contribution: rrf_contribution_for_rank(session.rrf_k, hit.lexical_rank),
+                rrf_contribution: if hit.lexical_fallback_tail {
+                    0.0
+                } else {
+                    rrf_contribution_for_rank(session.rrf_k, hit.lexical_rank)
+                },
                 weight: if session.semantic_blend.is_some() {
                     1.0
                 } else {
@@ -7262,7 +7280,9 @@ impl FsfsRuntime {
         let mut ranking = RankingExplanation::from_hit_explanation(
             &hit.path,
             &explanation,
-            if session.semantic_blend.is_some() {
+            if hit.lexical_fallback_tail {
+                "query.explain.lexical_fallback_tail"
+            } else if session.semantic_blend.is_some() {
                 "query.explain.semantic_blend"
             } else {
                 "query.explain.attached"
@@ -7279,14 +7299,7 @@ impl FsfsRuntime {
             hash_score: hit.hash_score,
             in_both_sources: hit.in_both_sources,
             vector_generation_is_hash: session.vector_generation_is_hash,
-            rrf: Some(crate::explanation_payload::RrfContributions {
-                k: session.rrf_k,
-                lexical: rrf_contribution_for_rank(session.rrf_k, hit.lexical_rank),
-                vector: rrf_contribution_for_rank(
-                    session.rrf_k,
-                    hit.hash_rank.or(hit.semantic_rank),
-                ),
-            }),
+            rrf: hit.rrf_contributions(session.rrf_k),
         };
         fusion.remap_hash_control_ranks();
         ranking.fusion = Some(fusion);
@@ -7307,7 +7320,11 @@ impl FsfsRuntime {
             // engine does not export per-term BM25 stats to the session.
             warnings.push(OutputWarning::new(
                 OutputWarningCode::BM25_STATS_UNAVAILABLE,
-                "BM25 tf/idf are placeholders (0.0) and matched_terms lists the query terms; the lexical raw score and its RRF contribution are real",
+                if hit.lexical_fallback_tail {
+                    "BM25 tf/idf are placeholders (0.0) and matched_terms lists the query terms; the raw lexical score was retained without RRF for this fallback tail hit"
+                } else {
+                    "BM25 tf/idf are placeholders (0.0) and matched_terms lists the query terms; the lexical raw score and its RRF contribution are real"
+                },
             ));
         }
 
@@ -7375,6 +7392,7 @@ impl FsfsRuntime {
             for (hit, source) in session.hits.iter_mut().zip(payload.hits.iter()) {
                 hit.semantic_rank = source.semantic_rank;
                 hit.hash_rank = source.hash_rank;
+                hit.lexical_fallback_tail = payload.lexical_fallback_tail.contains(&hit.path);
                 if let Some(score) = payload.lexical_scores.get(&hit.path) {
                     hit.lexical_score = Some(*score);
                 }
@@ -8234,11 +8252,13 @@ impl FsfsRuntime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_limited_payload(
         orchestrator: QueryExecutionOrchestrator,
         query: &str,
         phase: SearchOutputPhase,
         fused: &[FusedCandidate],
+        rrf_head: &[FusedCandidate],
         snippets_by_doc: &HashMap<String, String>,
         limit: usize,
         vector_is_hash: bool,
@@ -8256,6 +8276,18 @@ impl FsfsRuntime {
             vector_is_hash,
         );
         payload.total_candidates = fused.len();
+        // The merge, rather than a numeric score comparison, identifies which
+        // hits retain raw BM25. A quality-promoted tail hit now belongs to the
+        // refined RRF head and therefore loses the fallback-tail marker.
+        let rrf_ids = rrf_head
+            .iter()
+            .map(|hit| hit.doc_id.as_str())
+            .collect::<HashSet<_>>();
+        payload.lexical_fallback_tail = limited
+            .iter()
+            .filter(|hit| !rrf_ids.contains(hit.doc_id.as_str()))
+            .map(|hit| hit.doc_id.clone())
+            .collect();
         payload.lexical_scores = limited
             .iter()
             .filter_map(|hit| {
@@ -9129,6 +9161,7 @@ impl FsfsRuntime {
                 &normalized_query,
                 SearchOutputPhase::Initial,
                 &fused_initial,
+                &filtered_initial_head,
                 &snippets_by_doc,
                 output_limit,
                 Self::vector_generation_is_hash_control(resources),
@@ -9160,13 +9193,26 @@ impl FsfsRuntime {
         let mut artifacts = vec![initial_artifact];
 
         if plan.quality_stage.enabled {
-            let quality_budget = plan.quality_stage.candidate_budget.max(planning_limit).min(
-                if lexical_tail_complete {
-                    planning_limit
-                } else {
-                    output_limit
-                },
-            );
+            let quality_budget = if limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
+                // `all` must admit every quality-only ID even when progressive
+                // head widening is smaller than the quality generation.
+                resources
+                    .quality_vector_index
+                    .as_ref()
+                    .map_or(output_limit, |index| {
+                        index
+                            .record_count()
+                            .saturating_add(index.wal_record_count())
+                    })
+            } else {
+                plan.quality_stage.candidate_budget.max(planning_limit).min(
+                    if lexical_tail_complete {
+                        planning_limit
+                    } else {
+                        output_limit
+                    },
+                )
+            };
             // The window starts after Initial has been published and includes
             // cold initialization, waiting for model capacity, inference and
             // independent quality retrieval. Optional reranking has its own
@@ -9223,6 +9269,7 @@ impl FsfsRuntime {
                             &normalized_query,
                             SearchOutputPhase::Refined,
                             &fused_refined,
+                            &filtered_refined_head,
                             &snippets_by_doc,
                             output_limit,
                             Self::vector_generation_is_hash_control(resources),
@@ -9294,6 +9341,7 @@ impl FsfsRuntime {
                             &normalized_query,
                             SearchOutputPhase::RefinementFailed,
                             &fused_initial,
+                            &filtered_initial_head,
                             &snippets_by_doc,
                             output_limit,
                             Self::vector_generation_is_hash_control(resources),
@@ -9342,6 +9390,7 @@ impl FsfsRuntime {
                             &normalized_query,
                             SearchOutputPhase::RefinementFailed,
                             &fused_initial,
+                            &filtered_initial_head,
                             &snippets_by_doc,
                             output_limit,
                             Self::vector_generation_is_hash_control(resources),
@@ -18141,7 +18190,12 @@ fn render_explain_table(
         );
     }
     lines.push(format!("Reranker: {rerank_score}"));
-    if vector_generation_is_hash {
+    if hit.lexical_fallback_tail {
+        lines.push(
+            "Lexical fallback tail: raw BM25 score retained; RRF was not applied to this hit."
+                .to_owned(),
+        );
+    } else if vector_generation_is_hash {
         lines.push(format!(
             "RRF: k={rrf_k:.1}, lexical_rank={lexical_rank}, hash_rank={semantic_rank}, lexical_contrib={lexical_rrf:.6}, hash_contrib={semantic_rrf:.6}, total={total_rrf:.6}"
         ));
@@ -22981,6 +23035,188 @@ mod tests {
     }
 
     #[test]
+    fn quality_blend_all_admits_large_quality_only_generation() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let path = temp.path().join("large-quality.fsvi");
+            let mut writer = VectorIndex::create(&path, "blend-quality-2", 2).unwrap();
+            let mut expected = ["a.rs", "b.rs", "fast-only.rs"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>();
+            for index in 0..10_000 {
+                let id = format!("quality-{index:05}.rs");
+                writer.write_record(&id, &[1.0, 0.0]).unwrap();
+                expected.insert(id);
+            }
+            writer.finish().unwrap();
+            resources.quality_vector_index =
+                Some(Arc::new(VectorIndex::open_read_only(&path).unwrap()));
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config);
+            let phases = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    "how do independent quality candidates survive",
+                    FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                )
+                .await
+                .unwrap();
+            let refined = phases.last().unwrap();
+            assert_eq!(refined.phase, SearchOutputPhase::Refined);
+            let actual = refined
+                .hits
+                .iter()
+                .map(|hit| hit.path.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                actual, expected,
+                "all covers quality-only rows beyond the progressive head budget"
+            );
+            assert_eq!(
+                refined.hits.len(),
+                10_003,
+                "deduplication preserves the independent identity union"
+            );
+        });
+    }
+
+    #[test]
+    fn quality_blend_lexical_tail_explanation_keeps_actual_scoring_provenance() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let query = "how do independent quality candidates survive";
+            let quill = create_test_quill(&cx, &temp.path().join("lexical")).await;
+            for index in 0..2_000 {
+                quill
+                    .index_document(
+                        &cx,
+                        &IndexableDocument::new(format!("document-{index:04}.rs"), query),
+                    )
+                    .await
+                    .unwrap();
+            }
+            quill.commit(&cx).await.unwrap();
+            resources.lexical_index = Some(
+                QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap(),
+            );
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config);
+            let phases = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    query,
+                    2_000,
+                    SearchExecutionMode::LexicalOnly,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: true,
+                    },
+                )
+                .await
+                .unwrap();
+            let initial = phases.last().unwrap();
+            assert_eq!(initial.hits.len(), 2_000);
+            assert!(
+                !initial.lexical_fallback_tail.is_empty(),
+                "corpus must extend beyond the fused head"
+            );
+            let cold = runtime.load_explain_session().unwrap().unwrap();
+            let tail = cold
+                .hits
+                .iter()
+                .find(|hit| hit.lexical_fallback_tail)
+                .unwrap();
+            let tail_path = tail.path.clone();
+            assert_eq!(
+                tail.final_score.to_bits(),
+                f64::from(tail.lexical_score.unwrap()).to_bits(),
+                "tail retains raw BM25; ranking is unchanged"
+            );
+            assert!(
+                tail.rrf_contributions(cold.rrf_k).is_none(),
+                "no hypothetical RRF arithmetic for a raw tail score"
+            );
+            assert!(
+                cold.hits[0].rrf_contributions(cold.rrf_k).is_some(),
+                "actual fused head still reports RRF"
+            );
+            let key = runtime.search_cache_key(query, 2_000, SearchExecutionMode::LexicalOnly);
+            runtime
+                .write_search_payload_cache(&key, &phases, &resources.generation_fingerprint)
+                .unwrap();
+            let cached = runtime
+                .try_load_search_payload_cache(&key, &resources.generation_fingerprint)
+                .unwrap()
+                .unwrap();
+            runtime
+                .persist_explain_session_for_cached_payloads(query, &cached)
+                .unwrap();
+            assert_eq!(
+                cold.hits,
+                runtime.load_explain_session().unwrap().unwrap().hits
+            );
+
+            // Promote a document that was actually in the raw lexical tail.
+            // Its new semantic contribution makes it a real RRF head member.
+            let quality_path = temp.path().join("promoted-quality.fsvi");
+            let mut writer = VectorIndex::create(&quality_path, "blend-quality-2", 2).unwrap();
+            writer.write_record(&tail_path, &[1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            resources.quality_vector_index = Some(Arc::new(
+                VectorIndex::open_read_only(&quality_path).unwrap(),
+            ));
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let refined = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    query,
+                    2_000,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: true,
+                    },
+                )
+                .await
+                .unwrap();
+            let refined = refined.last().unwrap();
+            assert_eq!(refined.phase, SearchOutputPhase::Refined);
+            assert!(!refined.lexical_fallback_tail.contains(&tail_path));
+            let session = runtime.load_explain_session().unwrap().unwrap();
+            let promoted = session
+                .hits
+                .iter()
+                .find(|hit| hit.path == tail_path)
+                .unwrap();
+            assert!(promoted.semantic_rank.is_some());
+            assert!(!promoted.lexical_fallback_tail);
+            assert!(promoted.rrf_contributions(session.rrf_k).is_some());
+        });
+    }
+
+    #[test]
     fn quality_blend_daemon_requires_exact_applied_policy_acknowledgement() {
         let runtime = FsfsRuntime::new(FsfsConfig::default());
         let mut response = super::SearchServeResponse {
@@ -23174,6 +23410,7 @@ mod tests {
     #[test]
     fn quality_socket_timeout_flushes_before_owned_backend_join() {
         use std::io::Read as _;
+        use std::os::unix::net::UnixStream;
         let temp = tempfile::tempdir().unwrap();
         let mut resources = disagreeing_blend_resources(temp.path());
         let completed = Arc::new(AtomicUsize::new(0));
@@ -33089,6 +33326,7 @@ mod tests {
                 hash_score: None,
                 in_both_sources: false,
                 rerank_score: None,
+                lexical_fallback_tail: false,
             },
             60.0,
             true,

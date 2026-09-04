@@ -379,7 +379,8 @@ impl FastEmbedEmbedder {
     /// ONNX is synchronous and cannot be preempted mid-call. Keep its owned
     /// model lock in a region-owned blocking worker: timeout can stop waiting
     /// without blocking the executor or admitting another call on this model.
-    /// A running call is joined by the runtime's blocking pool at shutdown.
+    /// The caller must retain and fully drain its blocking pool at shutdown;
+    /// a pool with a bounded shutdown wait cannot guarantee that by itself.
     async fn infer(&self, cx: &Cx, texts: Vec<String>) -> SearchResult<Vec<Vec<f32>>> {
         let mut model = OwnedMutexGuard::lock(Arc::clone(&self.model), cx)
             .await

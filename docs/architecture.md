@@ -128,6 +128,8 @@ semantic ranking with the lexical head and applies optional reranking. Daemon
 requests acknowledge the caller's policy; cache keys retain the effective
 weight, exact RRF configuration, and deadline. Explanation payloads retain the
 source scores, blend weights, and joint lexical/vector RRF contributions.
+Raw BM25 fallback tails carry explicit provenance instead of hypothetical RRF
+contributions; a later quality promotion moves the hit into the refined head.
 
 ```text
 query
@@ -224,14 +226,15 @@ This layer is deliberately optional so lightweight deployments can skip its over
 
 The workspace uses `asupersync` for async/concurrency contracts.
 
-FastEmbed inference requires a blocking pool supplied by the caller's runtime
-through `Cx`. The fsfs main runtime and each socket request runtime configure
-that pool. Quality-model initialization and index scans also run on blocking
-workers so the executor can drive the deadline. A synchronous ONNX call already
-in progress cannot be preempted: it retains its model permit until completion,
-and the runtime joins its worker during shutdown. Process exit can therefore
-follow the timeout response later. The socket daemon flushes the response and
-closes its write side before dropping the request runtime and joining its pool.
+To keep real-model inference from blocking the executor, callers supply a
+blocking pool through `Cx`. The fsfs main runtime and each socket handler retain
+a `SearchBlockingPool` outside the scheduler and attach its handle to the live
+context. Quality-model initialization and index scans use the same bounded
+capacity. A synchronous ONNX call already in progress cannot be preempted: it
+retains its model permit until completion, and the pool owner drains every
+admitted job at shutdown. Process exit can therefore follow the timeout
+response later. The socket daemon flushes the response and closes its write
+side before dropping its scheduler and draining the owned pool.
 
 Operational implications:
 

@@ -918,14 +918,17 @@ fn quarantine_torn_wal_header(path: &Path, cause: SearchError) -> SearchResult<(
     };
     // Proving no appender is live is what makes moving the pathname safe.
     // Without it this recovery would race a writer mid-batch.
-    if let Err(lock_error) = acquire_wal_writer_lock(path, &live) {
-        warn!(
-            path = %path.display(),
-            %lock_error,
-            "torn WAL header cannot be quarantined while another writer holds the sidecar"
-        );
-        return Err(cause);
-    }
+    let live = match acquire_wal_writer_lock(path, live) {
+        Ok(guard) => guard,
+        Err(lock_error) => {
+            warn!(
+                path = %path.display(),
+                %lock_error,
+                "torn WAL header cannot be quarantined while another writer holds the sidecar"
+            );
+            return Err(cause);
+        }
+    };
 
     let quarantine = stage_quarantine_path(path)?;
     fs::rename(path, &quarantine)?;
@@ -1196,12 +1199,12 @@ pub(crate) fn append_wal_batch(
         .open(wal_path);
 
     let mut created_fresh = false;
-    let mut file = match created {
-        Ok(mut file) => {
-            acquire_wal_writer_lock(wal_path, &file)?;
+    let mut writer = match created {
+        Ok(file) => {
+            let mut writer = acquire_wal_writer_lock(wal_path, file)?;
             created_fresh = true;
-            write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
-            file
+            write_wal_header(&mut writer.file, dimension, quantization, compaction_gen)?;
+            writer
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // File exists — open in write mode (not append) so we can
@@ -1212,7 +1215,7 @@ pub(crate) fn append_wal_batch(
             // create_new check above and this open. If that happens, we create
             // a new empty file, which `existing_len` check below will catch
             // and initialize with a header.
-            let mut file = OpenOptions::new()
+            let file = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(false)
@@ -1221,8 +1224,8 @@ pub(crate) fn append_wal_batch(
             // appender that reads the end offset concurrently would clobber
             // this batch, and the refusal must happen before a single byte
             // of this one is written.
-            acquire_wal_writer_lock(wal_path, &file)?;
-            let existing_len = file.metadata()?.len();
+            let mut writer = acquire_wal_writer_lock(wal_path, file)?;
+            let existing_len = writer.file.metadata()?.len();
             if existing_len < WAL_HEADER_SIZE as u64 {
                 // Empty or truncated file — the creator likely crashed before
                 // flushing the header. Truncate in-place and write a fresh
@@ -1234,9 +1237,9 @@ pub(crate) fn append_wal_batch(
                     existing_len,
                     "WAL file smaller than header; truncating and writing fresh header"
                 );
-                file.set_len(0)?;
-                file.seek(std::io::SeekFrom::Start(0))?;
-                write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
+                writer.file.set_len(0)?;
+                writer.file.seek(std::io::SeekFrom::Start(0))?;
+                write_wal_header(&mut writer.file, dimension, quantization, compaction_gen)?;
                 // `.create(true)` above may have re-created a dirent that a
                 // concurrent delete removed after our `create_new` failed, or
                 // repaired one a crashed creator never durably linked; either
@@ -1244,9 +1247,9 @@ pub(crate) fn append_wal_batch(
                 created_fresh = true;
             } else {
                 // Seek to end so the batch is appended after existing data.
-                file.seek(std::io::SeekFrom::End(0))?;
+                writer.file.seek(std::io::SeekFrom::End(0))?;
             }
-            file
+            writer
         }
         Err(error) => return Err(error.into()),
     };
@@ -1268,10 +1271,10 @@ pub(crate) fn append_wal_batch(
     let crc = crc32_of(&batch);
     batch.extend_from_slice(&crc.to_le_bytes());
 
-    file.write_all(&batch)?;
+    writer.file.write_all(&batch)?;
 
     if fsync {
-        file.sync_all()?;
+        writer.file.sync_all()?;
         if created_fresh {
             // A durable first append also needs the CREATE dirent persisted:
             // file fsync alone does not guarantee the new sidecar survives a
@@ -1430,9 +1433,32 @@ fn wal_writer_lock_error(path: &Path, error: &dyn std::fmt::Display) -> SearchEr
 /// This is the same retained-descriptor idiom the FSVI main file uses
 /// (`fsvi.map_lock`, bd-x06p5); it arbitrates cooperating writers and makes
 /// no claim about a process that ignores the lock entirely.
-fn acquire_wal_writer_lock(path: &Path, file: &fs::File) -> SearchResult<()> {
+fn acquire_wal_writer_lock(path: &Path, file: fs::File) -> SearchResult<WalWriterLock> {
     file.try_lock()
-        .map_err(|error| wal_writer_lock_error(path, &error))
+        .map_err(|error| wal_writer_lock_error(path, &error))?;
+    Ok(WalWriterLock {
+        file,
+        creator_pid: std::process::id(),
+    })
+}
+
+/// Own the locked file through every mutation and error exit. Closing a file
+/// alone does not release its open-description lock while an inherited or
+/// duplicated descriptor remains alive. A child must only close its copy;
+/// explicitly unlocking there would also release the creator's lock.
+struct WalWriterLock {
+    file: fs::File,
+    creator_pid: u32,
+}
+
+impl Drop for WalWriterLock {
+    fn drop(&mut self) {
+        if self.creator_pid == std::process::id()
+            && let Err(error) = self.file.unlock()
+        {
+            warn!(%error, "WAL writer explicit unlock failed; closing its descriptor");
+        }
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -2712,6 +2738,9 @@ mod tests {
 
         // Once the foreign writer is done, the same append succeeds and the
         // already-committed batch is still there.
+        foreign
+            .unlock()
+            .expect("foreign writer explicitly releases its completed mutation");
         drop(foreign);
         append_wal_batch(
             &path,
@@ -2733,6 +2762,130 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Exercise the kernel's real duplicated-open-description behavior, the
+    /// same lifetime issue an inherited descriptor can cause across fork/exec.
+    /// This is descriptor-level evidence, not a claim to have executed fork.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn wal_writer_release_survives_a_retained_duplicate_without_losing_batches() {
+        let path = temp_wal_path("writer-retained-duplicate");
+        let dimension = 4;
+        let quantization = Quantization::F16;
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-first", 1.0, dimension)],
+            dimension,
+            quantization,
+            0,
+            false,
+        )
+        .expect("first committed batch");
+        let committed = fs::read(&path).expect("original WAL bytes");
+        let owner =
+            acquire_wal_writer_lock(&path, OpenOptions::new().write(true).open(&path).unwrap())
+                .expect("take writer ownership");
+        let retained = owner.file.try_clone().expect("retain the same description");
+
+        let refused = append_wal_batch(
+            &path,
+            &[make_entry("doc-second", 2.0, dimension)],
+            dimension,
+            quantization,
+            0,
+            false,
+        );
+        assert!(matches!(
+            refused,
+            Err(SearchError::InvalidConfig { field, .. }) if field == "wal.writer_lock"
+        ));
+        assert_eq!(fs::read(&path).unwrap(), committed);
+
+        drop(owner);
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-second", 2.0, dimension)],
+            dimension,
+            quantization,
+            0,
+            false,
+        )
+        .expect("owner release frees the lock while its duplicate stays open");
+        let after = fs::read(&path).unwrap();
+        assert!(
+            after.starts_with(&committed),
+            "original batch bytes survive"
+        );
+        assert_eq!(
+            retained.metadata().unwrap().len(),
+            fs::metadata(&path).unwrap().len(),
+            "the duplicate remains open through the successful append"
+        );
+        let (entries, _, _) = read_wal(&path, dimension, quantization).unwrap();
+        let ids = entries
+            .iter()
+            .map(|entry| entry.doc_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["doc-first", "doc-second"]);
+    }
+
+    /// Simulate the PID guard's child-side branch while retaining a real
+    /// duplicate for the creator. No unsafe fork is needed for this boundary.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn wal_writer_noncreator_drop_cannot_unlock_the_creators_description() {
+        let path = temp_wal_path("writer-noncreator-drop");
+        let dimension = 4;
+        let quantization = Quantization::F16;
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-first", 1.0, dimension)],
+            dimension,
+            quantization,
+            0,
+            false,
+        )
+        .unwrap();
+        let committed = fs::read(&path).unwrap();
+        let mut child_copy =
+            acquire_wal_writer_lock(&path, OpenOptions::new().write(true).open(&path).unwrap())
+                .unwrap();
+        let creator = child_copy.file.try_clone().unwrap();
+        child_copy.creator_pid = std::process::id().wrapping_add(1);
+        drop(child_copy);
+
+        let refused = append_wal_batch(
+            &path,
+            &[make_entry("doc-second", 2.0, dimension)],
+            dimension,
+            quantization,
+            0,
+            false,
+        );
+        assert!(matches!(
+            refused,
+            Err(SearchError::InvalidConfig { field, .. }) if field == "wal.writer_lock"
+        ));
+        assert_eq!(fs::read(&path).unwrap(), committed);
+        creator
+            .unlock()
+            .expect("only the creator releases its lock");
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-second", 2.0, dimension)],
+            dimension,
+            quantization,
+            0,
+            false,
+        )
+        .expect("append succeeds after creator release");
+        let (entries, _, _) = read_wal(&path, dimension, quantization).unwrap();
+        let ids = entries
+            .iter()
+            .map(|entry| entry.doc_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["doc-first", "doc-second"]);
     }
 
     /// A torn header at or above `WAL_HEADER_SIZE` must be quarantined, not

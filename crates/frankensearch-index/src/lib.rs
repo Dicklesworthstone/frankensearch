@@ -807,17 +807,25 @@ impl Deref for VectorIndexData {
 /// retained descriptor is load-bearing: dropping it while the mapping remains
 /// live would reopen the cross-process mutation race that `memmap2` marks
 /// unsafe.
+///
+/// Creator-process drop explicitly unlocks after the mapping is destroyed, so
+/// an incidental descriptor inherited across fork/exec cannot prolong this
+/// owner's lock. A child-side drop only closes its inherited descriptor. This
+/// does not make continued use of an inherited mapping in a fork child safe;
+/// it covers creator-owned mappings and children that close or exec.
 #[derive(Debug)]
 enum FsviMapLock {
     Shared {
         file: File,
         path: PathBuf,
         acquired: Instant,
+        creator_pid: u32,
     },
     Exclusive {
         file: File,
         path: PathBuf,
         acquired: Instant,
+        creator_pid: u32,
     },
 }
 
@@ -853,6 +861,30 @@ impl FsviMapLock {
 /// its mode, hold time, and thread.
 impl Drop for FsviMapLock {
     fn drop(&mut self) {
+        let (file, creator_pid) = match self {
+            Self::Shared {
+                file, creator_pid, ..
+            }
+            | Self::Exclusive {
+                file, creator_pid, ..
+            } => (file, *creator_pid),
+        };
+        if creator_pid != std::process::id() {
+            // An inherited descriptor shares the creator's lock. Even an
+            // explicit unlock from the child would release the creator's
+            // still-live mapping, so child drop only closes its descriptor.
+            return;
+        }
+        if let Err(error) = file.unlock() {
+            tracing::warn!(
+                target: "frankensearch_index::map_lock",
+                path = %self.path().display(),
+                mode = self.mode(),
+                %error,
+                "fsvi map lock explicit unlock failed; closing its descriptor"
+            );
+            return;
+        }
         tracing::debug!(
             target: "frankensearch_index::map_lock",
             path = %self.path().display(),
@@ -867,6 +899,8 @@ impl Drop for FsviMapLock {
 #[derive(Debug)]
 pub struct VectorIndex {
     pub(crate) path: PathBuf,
+    // Declaration order is load-bearing: destroy the mapping before the
+    // following guard explicitly releases its lock. Do not reorder these.
     pub(crate) data: VectorIndexData,
     map_lock: Option<FsviMapLock>,
     pub(crate) metadata: VectorMetadata,
@@ -1873,6 +1907,7 @@ impl VectorIndex {
                 file,
                 path: path.to_path_buf(),
                 acquired,
+                creator_pid: std::process::id(),
             }
         } else {
             file.try_lock_shared().map_err(|error| {
@@ -1889,6 +1924,7 @@ impl VectorIndex {
                 file,
                 path: path.to_path_buf(),
                 acquired,
+                creator_pid: std::process::id(),
             }
         };
         tracing::debug!(
@@ -3227,6 +3263,9 @@ impl VectorIndex {
         let config = self.wal_config.clone();
         let reloaded = Self::open(&self.path)?;
         self.data = reloaded.data;
+        // The new mapping must retain the new inode's lock. Replacing data
+        // first destroys the old mapping before releasing its former lock.
+        self.map_lock = reloaded.map_lock;
         self.metadata = reloaded.metadata;
         self.records_offset = reloaded.records_offset;
         self.strings_offset = reloaded.strings_offset;
@@ -11245,6 +11284,234 @@ mod tests {
                 .expect("writer lock permits mutation"),
             "exclusive writer mutates only after acquiring the artifact lock"
         );
+    }
+
+    /// Real duplicated descriptors exercise open-description lock lifetime;
+    /// this does not claim to execute fork or use a mapping in a child.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn map_lock_shared_release_with_duplicate_still_excludes_a_live_reader() {
+        let path = temp_index_path("map-lock-shared-retained-duplicate");
+        let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.write_record("kept", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let first = VectorIndex::open_read_only(&path).unwrap();
+        let second = VectorIndex::open_read_only(&path).unwrap();
+        let retained = match first.map_lock.as_ref().unwrap() {
+            FsviMapLock::Shared { file, .. } => file.try_clone().unwrap(),
+            FsviMapLock::Exclusive { .. } => panic!("reader acquired a writer lock"),
+        };
+        let refused = VectorIndex::open_writer(&path).unwrap_err();
+        assert!(matches!(
+            refused,
+            SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+        ));
+        drop(first);
+        let refused = VectorIndex::open_writer(&path).unwrap_err();
+        assert!(matches!(
+            refused,
+            SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+        ));
+        let hits = second
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "kept");
+
+        drop(second);
+        let mut writer = VectorIndex::open_writer(&path)
+            .expect("last real reader releases despite the first reader's retained descriptor");
+        assert!(retained.metadata().unwrap().len() > 0);
+        writer.append("added", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        drop(writer);
+        let reader = VectorIndex::open_read_only(&path).unwrap();
+        let mut ids = reader
+            .search_top_k(&[1.0, 1.0, 0.0, 0.0], 10, None)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.doc_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["added", "kept"]);
+        assert!(retained.metadata().unwrap().len() > 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn map_lock_writer_release_with_duplicate_preserves_tombstone_and_wal() {
+        let path = temp_index_path("map-lock-writer-retained-duplicate");
+        let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer
+            .write_record("deleted", &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        writer.write_record("kept", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let mut writer = VectorIndex::open_writer(&path).unwrap();
+        let retained = match writer.map_lock.as_ref().unwrap() {
+            FsviMapLock::Exclusive { file, .. } => file.try_clone().unwrap(),
+            FsviMapLock::Shared { .. } => panic!("writer acquired a reader lock"),
+        };
+        let refused = VectorIndex::open_read_only(&path).unwrap_err();
+        assert!(matches!(
+            refused,
+            SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+        ));
+        let refused = VectorIndex::open_writer(&path).unwrap_err();
+        assert!(matches!(
+            refused,
+            SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+        ));
+        writer.append("added", &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        assert!(writer.soft_delete("deleted").unwrap());
+        drop(writer);
+
+        let reader = VectorIndex::open_read_only(&path)
+            .expect("completed writer releases while its descriptor duplicate remains open");
+        assert_eq!(reader.tombstone_count(), 1);
+        assert_eq!(reader.wal_record_count(), 1);
+        let mut ids = reader
+            .search_top_k(&[1.0, 1.0, 1.0, 0.0], 10, None)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.doc_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["added", "kept"]);
+        assert_eq!(
+            retained.metadata().unwrap().len(),
+            fs::metadata(&path).unwrap().len()
+        );
+    }
+
+    /// Simulate the noncreator PID branch with a genuine retained descriptor.
+    /// The creator's live lock must survive either inherited guard variant.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn map_lock_noncreator_drop_never_unlocks_the_creators_description() {
+        for exclusive in [false, true] {
+            let path = temp_index_path(if exclusive {
+                "map-lock-noncreator-writer"
+            } else {
+                "map-lock-noncreator-reader"
+            });
+            let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
+            writer.write_record("kept", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            let mut child_copy = VectorIndex::open_with_lock(&path, exclusive).unwrap();
+            let (file, creator_pid) = match child_copy.map_lock.as_mut().unwrap() {
+                FsviMapLock::Shared {
+                    file, creator_pid, ..
+                }
+                | FsviMapLock::Exclusive {
+                    file, creator_pid, ..
+                } => (file, creator_pid),
+            };
+            let creator = file.try_clone().unwrap();
+            *creator_pid = std::process::id().wrapping_add(1);
+            drop(child_copy);
+
+            let refused = VectorIndex::open_writer(&path).unwrap_err();
+            assert!(matches!(
+                refused,
+                SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+            ));
+            if exclusive {
+                let refused = VectorIndex::open_read_only(&path).unwrap_err();
+                assert!(matches!(
+                    refused,
+                    SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+                ));
+            }
+            creator
+                .unlock()
+                .expect("only creator releases its retained lock");
+            let writer = VectorIndex::open_writer(&path).unwrap();
+            let hits = writer
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "kept");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn map_lock_rewrite_keeps_the_published_inode_exclusive_until_owner_drop() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        for compact in [false, true] {
+            let path = temp_index_path(if compact {
+                "map-lock-reload-compaction"
+            } else {
+                "map-lock-reload-vacuum"
+            });
+            let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
+            writer
+                .write_record("deleted", &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+            writer.write_record("kept", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            let mut writer = VectorIndex::open_writer(&path).unwrap();
+            let old_inode = match writer.map_lock.as_ref().unwrap() {
+                FsviMapLock::Exclusive { file, .. } => file.try_clone().unwrap(),
+                FsviMapLock::Shared { .. } => panic!("writer acquired a reader lock"),
+            };
+            writer.append("added", &[0.0, 0.0, 1.0, 0.0]).unwrap();
+            assert!(writer.soft_delete("deleted").unwrap());
+            if compact {
+                writer.compact().unwrap();
+                assert_eq!(writer.record_count(), 2);
+                assert_eq!(writer.wal_record_count(), 0);
+            } else {
+                writer.vacuum().unwrap();
+                assert_eq!(writer.record_count(), 1);
+                assert_eq!(writer.wal_record_count(), 1);
+            }
+            assert_eq!(writer.tombstone_count(), 0);
+            let new_inode = match writer.map_lock.as_ref().unwrap() {
+                FsviMapLock::Exclusive { file, .. } => file.try_clone().unwrap(),
+                FsviMapLock::Shared { .. } => panic!("reload lost its writer lock"),
+            };
+            let old_metadata = old_inode.metadata().unwrap();
+            let new_metadata = new_inode.metadata().unwrap();
+            let published_metadata = fs::metadata(&path).unwrap();
+            assert_ne!(
+                (old_metadata.dev(), old_metadata.ino()),
+                (new_metadata.dev(), new_metadata.ino()),
+                "rewrite must replace the old inode"
+            );
+            assert_eq!(
+                (new_metadata.dev(), new_metadata.ino()),
+                (published_metadata.dev(), published_metadata.ino()),
+                "the retained lock must belong to the mapped published inode"
+            );
+            let refused = VectorIndex::open_read_only(&path).unwrap_err();
+            assert!(matches!(
+                refused,
+                SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+            ));
+            let refused = VectorIndex::open_writer(&path).unwrap_err();
+            assert!(matches!(
+                refused,
+                SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+            ));
+
+            drop(writer);
+            let reader = VectorIndex::open_read_only(&path)
+                .expect("reloaded owner releases despite retained old and new descriptors");
+            let mut ids = reader
+                .search_top_k(&[1.0, 1.0, 1.0, 0.0], 10, None)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.doc_id)
+                .collect::<Vec<_>>();
+            ids.sort();
+            assert_eq!(ids, vec!["added", "kept"]);
+            assert!(old_inode.metadata().unwrap().len() > 0);
+            assert!(new_inode.metadata().unwrap().len() > 0);
+        }
     }
 
     #[test]
