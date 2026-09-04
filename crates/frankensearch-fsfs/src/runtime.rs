@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
@@ -44,8 +45,8 @@ use frankensearch_embed::{
 use frankensearch_embed::{DetectOptions, EmbedderStack};
 #[cfg(feature = "semantic-loaders")]
 use frankensearch_embed::{FastEmbedEmbedder, Model2VecEmbedder};
-use frankensearch_index::VectorIndex;
 use frankensearch_fusion::blend_two_tier;
+use frankensearch_index::VectorIndex;
 use frankensearch_quill::{
     BlueGreenEngine, CURRENT_FILE_NAME, CurrentPointer, DEFAULT_SCHEMA, FSLX_FORMAT_VERSION,
     KeeperError, KeeperSnapshot, QuillConfig, QuillIndex, QuillIndexError, QuillSearchIndex,
@@ -481,7 +482,7 @@ const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v2";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v1";
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v2";
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 const FSFS_DAEMON_REQUEST_MAX_BYTES: usize = 1 << 20; // 1 MiB
 const FSFS_DAEMON_RESPONSE_MAX_BYTES: usize = 4 << 20; // 4 MiB
@@ -728,7 +729,7 @@ struct SearchExecutionResources {
     vector_index: Option<VectorIndex>,
     /// Quality-tier generation (`vector/quality.fsvi`) from the same index
     /// run; present only when `fsfs index` built it. Drives the REFINED phase.
-    quality_vector_index: Option<VectorIndex>,
+    quality_vector_index: Option<Arc<VectorIndex>>,
     fast_embedder: Option<Arc<dyn Embedder>>,
     quality_embedder: Option<Arc<dyn Embedder>>,
     fast_embedder_attempted: bool,
@@ -890,9 +891,10 @@ struct SearchCacheKey {
     mode: String,
     filter: Option<String>,
     fast_only: bool,
-    rrf_k_milli: u64,
+    rrf_k_bits: u64,
     /// Exact bits of the f32 policy consumed by the shared blend kernel.
     quality_weight_bits: u32,
+    quality_timeout_ms: u64,
     /// Reranked and un-reranked answers to the same query are different
     /// payloads; the key must not conflate them.
     #[serde(default)]
@@ -934,10 +936,26 @@ struct SearchServeRequest {
     /// Client's resolved blend policy; omission uses the server configuration.
     #[serde(default)]
     quality_weight: Option<f64>,
+    #[serde(default)]
+    quality_timeout_ms: Option<u64>,
+    #[serde(default)]
+    rrf_k: Option<f64>,
+    #[serde(default)]
+    fast_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SearchServePolicy {
+    quality_weight_bits: u32,
+    quality_timeout_ms: u64,
+    rrf_k_bits: u64,
+    fast_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SearchServeResponse {
+    schema_version: String,
+    policy: Option<SearchServePolicy>,
     ok: bool,
     query: String,
     mode: String,
@@ -2066,6 +2084,43 @@ struct ExplainSessionHit {
 }
 
 impl ExplainSession {
+    fn blend_components(&self, path: &str) -> Option<Vec<ScoreComponent>> {
+        let blend = self.semantic_blend.as_ref()?;
+        let hit = blend.hits.iter().find(|hit| hit.path == path)?;
+        let mut components = Vec::with_capacity(2);
+        for (tier, embedder, quality) in [
+            (&hit.fast, &blend.fast_embedder, false),
+            (&hit.quality, &blend.quality_embedder, true),
+        ] {
+            let Some(tier) = tier else { continue };
+            let Some(raw_score) = tier.raw_score else {
+                continue;
+            };
+            let source = if quality {
+                ExplainedSource::SemanticQuality {
+                    embedder: embedder.clone(),
+                    cosine_sim: f64::from(raw_score),
+                }
+            } else {
+                ExplainedSource::SemanticFast {
+                    embedder: embedder.clone(),
+                    cosine_sim: f64::from(raw_score),
+                }
+            };
+            components.push(ScoreComponent {
+                source,
+                raw_score: f64::from(raw_score),
+                normalized_score: f64::from(tier.normalized_score),
+                // RRF ranks the combined semantic score once. Individual
+                // tier components are not independent RRF contributions;
+                // the joint rank/contribution is reported by FusionContext.
+                rrf_contribution: 0.0,
+                weight: f64::from(tier.weight),
+            });
+        }
+        Some(components)
+    }
+
     fn from_fused(
         query: &str,
         phase: SearchOutputPhase,
@@ -4254,6 +4309,9 @@ pub struct FsfsRuntime {
     config: FsfsConfig,
     cli_input: CliInput,
     reranker: Arc<std::sync::OnceLock<RerankerSlot>>,
+    /// Retained across daemon/TUI clones. A timed-out model initialization
+    /// keeps its permit until the actual blocking call ends.
+    quality_load_gate: Arc<asupersync::sync::Mutex<()>>,
 }
 
 impl FsfsRuntime {
@@ -4263,6 +4321,7 @@ impl FsfsRuntime {
             config,
             cli_input: CliInput::default(),
             reranker: Arc::new(std::sync::OnceLock::new()),
+            quality_load_gate: Arc::new(asupersync::sync::Mutex::new(())),
         }
     }
 
@@ -6277,11 +6336,18 @@ impl FsfsRuntime {
             return;
         }
 
+        // Keep the pool alive until the response is flushed and its write side
+        // closes. Joining a timed-out backend before writing would hide the
+        // deadline from clients which read the response through EOF.
+        let mut request_scheduler = None;
         let response = match Self::parse_search_serve_request(raw) {
             Ok(request) => {
                 let request_query = request.query.clone();
                 let request_mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
-                let scheduler = match RuntimeBuilder::current_thread().build() {
+                let scheduler = match RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 2)
+                    .build()
+                {
                     Ok(scheduler) => scheduler,
                     Err(error) => {
                         warn!(
@@ -6291,6 +6357,7 @@ impl FsfsRuntime {
                         return;
                     }
                 };
+                let scheduler = request_scheduler.insert(scheduler);
                 let execute_task = scheduler.handle().spawn(async move {
                     let cx = Cx::current().expect("asupersync runtime installs a request context");
                     let mut guard =
@@ -6333,6 +6400,8 @@ impl FsfsRuntime {
                 "fsfs daemon failed to write socket response"
             );
         }
+        // Runtime drop joins pool jobs after the client can receive its result.
+        drop(request_scheduler);
     }
 
     fn parse_search_serve_request(raw: &str) -> SearchResult<SearchServeRequest> {
@@ -6352,6 +6421,9 @@ impl FsfsRuntime {
                 filter: None,
                 rerank: None,
                 quality_weight: None,
+                quality_timeout_ms: None,
+                rrf_k: None,
+                fast_only: None,
             })
         }
     }
@@ -6406,6 +6478,27 @@ impl FsfsRuntime {
             }
             runtime.config.search.quality_weight = weight;
         }
+        if let Some(timeout_ms) = request.quality_timeout_ms {
+            if timeout_ms < 50 {
+                return Err(SearchError::InvalidConfig {
+                    field: "search.quality_timeout_ms".to_owned(),
+                    value: timeout_ms.to_string(),
+                    reason: "expected at least 50 milliseconds".to_owned(),
+                });
+            }
+            runtime.config.search.quality_timeout_ms = timeout_ms;
+        }
+        if let Some(k) = request.rrf_k {
+            if !k.is_finite() || k < 1.0 {
+                return Err(SearchError::InvalidConfig {
+                    field: "search.rrf_k".to_owned(),
+                    value: k.to_string(),
+                    reason: "expected a finite value at least 1".to_owned(),
+                });
+            }
+            runtime.config.search.rrf_k = k;
+        }
+        runtime.config.search.fast_only = request.fast_only.unwrap_or(self.config.search.fast_only);
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode);
 
         let (cached, payloads) = if hot_cache_enabled {
@@ -6425,7 +6518,9 @@ impl FsfsRuntime {
                         },
                     )
                     .await?;
-                hot_cache.insert(cache_key, payloads.clone());
+                if Self::search_payloads_cacheable(&payloads) {
+                    hot_cache.insert(cache_key, payloads.clone());
+                }
                 (false, payloads)
             }
         } else {
@@ -6447,6 +6542,8 @@ impl FsfsRuntime {
         Self::validate_bound_search_resources(resources, mode)?;
 
         Ok(SearchServeResponse {
+            schema_version: FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
+            policy: Some(runtime.search_serve_policy()),
             ok: true,
             query: request.query,
             mode: mode.label().to_owned(),
@@ -6510,6 +6607,8 @@ impl FsfsRuntime {
         error: impl Into<String>,
     ) -> SearchServeResponse {
         SearchServeResponse {
+            schema_version: FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
+            policy: None,
             ok: false,
             query: query.into(),
             mode: mode.into(),
@@ -6563,7 +6662,8 @@ impl FsfsRuntime {
         stream: &mut UnixStream,
         response: &SearchServeResponse,
     ) -> SearchResult<()> {
-        Self::write_search_serve_socket_json(stream, response)
+        Self::write_search_serve_socket_json(stream, response)?;
+        stream.shutdown(Shutdown::Write).map_err(SearchError::Io)
     }
 
     #[cfg(unix)]
@@ -6645,6 +6745,9 @@ impl FsfsRuntime {
                 filter: self.cli_input.filter.clone(),
                 rerank: Some(self.config.search.rerank),
                 quality_weight: Some(self.config.search.quality_weight),
+                quality_timeout_ms: Some(self.config.search.quality_timeout_ms),
+                rrf_k: Some(self.config.search.rrf_k),
+                fast_only: Some(self.config.search.fast_only),
             };
             let request_json =
                 serde_json::to_vec(&request).map_err(|source| SearchError::SubsystemError {
@@ -6687,6 +6790,7 @@ impl FsfsRuntime {
                         .unwrap_or_else(|| "daemon search request failed".to_owned()),
                 });
             }
+            self.validate_search_serve_policy(&response)?;
             if let Err(error) =
                 self.persist_explain_session_for_cached_payloads(query, &response.payloads)
             {
@@ -6920,6 +7024,10 @@ impl FsfsRuntime {
                 "quality refinement failed; returning initial results",
             ),
         };
+        let timeout_message = payload.quality_timeout.as_ref().map(|timeout| format!(
+            "quality refinement exceeded {}ms (observed {}ms); returning initial results; increase search.quality_timeout_ms; running backend work remains owned until completion",
+            timeout.budget_ms, timeout.elapsed_ms,
+        ));
         let progress_frame = StreamFrame::new(
             stream_id.to_owned(),
             *seq,
@@ -6930,7 +7038,7 @@ impl FsfsRuntime {
                 completed_units: u64::try_from(payload.returned_hits).unwrap_or(u64::MAX),
                 total_units: Some(u64::try_from(payload.total_candidates).unwrap_or(u64::MAX)),
                 reason_code: reason_code.to_owned(),
-                message: message.to_owned(),
+                message: timeout_message.unwrap_or_else(|| message.to_owned()),
             }),
         );
         emit_stream_frame(&progress_frame, self.cli_input.format, writer)?;
@@ -7056,10 +7164,16 @@ impl FsfsRuntime {
                 raw_score: f64::from(lexical_score),
                 normalized_score: f64::from(lexical_score),
                 rrf_contribution: rrf_contribution_for_rank(session.rrf_k, hit.lexical_rank),
-                weight: shared_weight,
+                weight: if session.semantic_blend.is_some() {
+                    1.0
+                } else {
+                    shared_weight
+                },
             });
         }
-        if let Some(vector_score) = hit.hash_score.or(hit.semantic_score) {
+        if let Some(blend_components) = session.blend_components(&hit.path) {
+            components.extend(blend_components);
+        } else if let Some(vector_score) = hit.hash_score.or(hit.semantic_score) {
             let embedder = session
                 .vector_generation_id
                 .as_deref()
@@ -7114,7 +7228,11 @@ impl FsfsRuntime {
         let mut ranking = RankingExplanation::from_hit_explanation(
             &hit.path,
             &explanation,
-            "query.explain.attached",
+            if session.semantic_blend.is_some() {
+                "query.explain.semantic_blend"
+            } else {
+                "query.explain.attached"
+            },
             920,
         );
         let mut fusion = FusionContext {
@@ -7127,6 +7245,14 @@ impl FsfsRuntime {
             hash_score: hit.hash_score,
             in_both_sources: hit.in_both_sources,
             vector_generation_is_hash: session.vector_generation_is_hash,
+            rrf: Some(crate::explanation_payload::RrfContributions {
+                k: session.rrf_k,
+                lexical: rrf_contribution_for_rank(session.rrf_k, hit.lexical_rank),
+                vector: rrf_contribution_for_rank(
+                    session.rrf_k,
+                    hit.hash_rank.or(hit.semantic_rank),
+                ),
+            }),
         };
         fusion.remap_hash_control_ranks();
         ranking.fusion = Some(fusion);
@@ -7215,6 +7341,17 @@ impl FsfsRuntime {
             for (hit, source) in session.hits.iter_mut().zip(payload.hits.iter()) {
                 hit.semantic_rank = source.semantic_rank;
                 hit.hash_rank = source.hash_rank;
+                if let Some(score) = payload.lexical_scores.get(&hit.path) {
+                    hit.lexical_score = Some(*score);
+                }
+                if let Some(blend_hit) = payload.semantic_blend.as_ref().and_then(|blend| {
+                    blend
+                        .hits
+                        .iter()
+                        .find(|candidate| candidate.path == hit.path)
+                }) {
+                    hit.semantic_score = Some(blend_hit.score);
+                }
                 hit.rerank_score = payload.rerank.as_ref().and_then(|stage| {
                     stage
                         .scores
@@ -7696,6 +7833,83 @@ impl FsfsRuntime {
             .to_owned()
     }
 
+    /// Config validation admits [0, 1]; this one conversion defines the
+    /// effective policy for ranking, cache identity and explanation alike.
+    #[allow(clippy::cast_possible_truncation)]
+    fn effective_quality_weight(&self) -> f32 {
+        let weight = self.config.search.quality_weight as f32;
+        // Canonicalize negative zero, which has the same ranking semantics.
+        if weight == 0.0 { 0.0 } else { weight }
+    }
+
+    fn blend_semantic_candidates(
+        &self,
+        fast: &[SemanticCandidate],
+        quality: &[SemanticCandidate],
+    ) -> (Vec<SemanticCandidate>, Vec<SemanticBlendHit>) {
+        let vector_hits = |candidates: &[SemanticCandidate]| {
+            candidates
+                .iter()
+                .map(|candidate| VectorHit {
+                    // The blend joins document IDs. We never dereference its
+                    // tier-local index or use it to hydrate another tier.
+                    index: 0,
+                    score: candidate.score,
+                    doc_id: candidate.doc_id.clone().into(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let fast = vector_hits(fast);
+        let quality = vector_hits(quality);
+        let weight = self.effective_quality_weight();
+        let blended = blend_two_tier(&fast, &quality, weight);
+        // The same library operation with one empty source exposes precisely
+        // its normalization/missing-source rules, including constant pools.
+        // Keep explanation arithmetic out of the ranking implementation.
+        let normalized_tier = |hits: &[VectorHit]| {
+            let mut raw = HashMap::with_capacity(hits.len());
+            for hit in hits {
+                raw.entry(hit.doc_id.as_str()).or_insert(hit.score);
+            }
+            blend_two_tier(hits, &[], weight)
+                .into_iter()
+                .map(|hit| {
+                    let raw_score = raw[hit.doc_id.as_str()];
+                    (
+                        hit.doc_id,
+                        SemanticTierScore {
+                            raw_score: raw_score.is_finite().then_some(raw_score),
+                            normalized_score: hit.score,
+                            weight: 1.0,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let mut fast_scores = normalized_tier(&fast);
+        let mut quality_scores = normalized_tier(&quality);
+        let mut details = Vec::with_capacity(blended.len());
+        let candidates = blended
+            .into_iter()
+            .map(|hit| {
+                let mut fast = fast_scores.remove(&hit.doc_id);
+                let mut quality = quality_scores.remove(&hit.doc_id);
+                if let (Some(fast), Some(quality)) = (&mut fast, &mut quality) {
+                    fast.weight = 1.0 - weight;
+                    quality.weight = weight;
+                }
+                details.push(SemanticBlendHit {
+                    path: hit.doc_id.to_string(),
+                    score: hit.score,
+                    fast,
+                    quality,
+                });
+                SemanticCandidate::new(hit.doc_id, hit.score)
+            })
+            .collect();
+        (candidates, details)
+    }
+
     #[must_use]
     fn search_cache_key(
         &self,
@@ -7709,8 +7923,9 @@ impl FsfsRuntime {
             mode: mode.label().to_owned(),
             filter: self.cli_input.filter.clone(),
             fast_only: self.config.search.fast_only,
-            rrf_k_milli: u64::from(f64_to_per_mille(self.config.search.rrf_k)),
+            rrf_k_bits: self.config.search.rrf_k.to_bits(),
             quality_weight_bits: self.effective_quality_weight().to_bits(),
+            quality_timeout_ms: self.config.search.quality_timeout_ms,
             rerank: self.config.search.rerank,
             rerank_model: self
                 .prepared_reranker()
@@ -7726,8 +7941,9 @@ impl FsfsRuntime {
         hasher.update(key.mode.as_bytes());
         hasher.update(key.filter.as_deref().unwrap_or("").as_bytes());
         hasher.update([u8::from(key.fast_only)]);
-        hasher.update(key.rrf_k_milli.to_le_bytes());
+        hasher.update(key.rrf_k_bits.to_le_bytes());
         hasher.update(key.quality_weight_bits.to_le_bytes());
+        hasher.update(key.quality_timeout_ms.to_le_bytes());
         hasher.update([u8::from(key.rerank)]);
         hasher.update(key.rerank_model.as_deref().unwrap_or("").as_bytes());
         sha256_digest_hex(hasher.finalize())
@@ -7737,6 +7953,33 @@ impl FsfsRuntime {
         let index_root = self.resolve_status_index_root()?;
         let file_name = format!("{}.json", Self::search_cache_key_hash(key));
         Ok(index_root.join(FSFS_SEARCH_CACHE_DIR_NAME).join(file_name))
+    }
+
+    fn search_serve_policy(&self) -> SearchServePolicy {
+        SearchServePolicy {
+            quality_weight_bits: self.effective_quality_weight().to_bits(),
+            quality_timeout_ms: self.config.search.quality_timeout_ms,
+            rrf_k_bits: self.config.search.rrf_k.to_bits(),
+            fast_only: self.config.search.fast_only,
+        }
+    }
+
+    fn validate_search_serve_policy(&self, response: &SearchServeResponse) -> SearchResult<()> {
+        if response.schema_version != FSFS_SEARCH_SERVE_SCHEMA_VERSION
+            || response.policy.as_ref() != Some(&self.search_serve_policy())
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.daemon".to_owned(), value: "search_policy".to_owned(),
+                reason: "daemon did not acknowledge the requested search policy; restart it with the current fsfs binary or use --no-daemon".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn search_payloads_cacheable(payloads: &[SearchPayload]) -> bool {
+        !payloads
+            .iter()
+            .any(|payload| payload.phase == SearchOutputPhase::RefinementFailed)
     }
 
     #[cfg(test)]
@@ -7885,6 +8128,9 @@ impl FsfsRuntime {
         payloads: &[SearchPayload],
         index_fingerprint: &str,
     ) -> SearchResult<()> {
+        if !Self::search_payloads_cacheable(payloads) {
+            return Ok(());
+        }
         let cache_path = self.search_cache_path(key)?;
         if let Some(parent) = cache_path.parent() {
             fs::create_dir_all(parent)?;
@@ -7976,6 +8222,14 @@ impl FsfsRuntime {
             vector_is_hash,
         );
         payload.total_candidates = fused.len();
+        payload.lexical_scores = limited
+            .iter()
+            .filter_map(|hit| {
+                hit.lexical_score
+                    .filter(|score| score.is_finite())
+                    .map(|score| (hit.doc_id.clone(), score))
+            })
+            .collect();
         payload
     }
 
@@ -8059,7 +8313,7 @@ impl FsfsRuntime {
         }
         lexical_doc_count
             .unwrap_or(0)
-            .max(vector_doc_count.unwrap_or(0))
+            .saturating_add(vector_doc_count.unwrap_or(0))
             .max(1)
     }
 
@@ -8435,7 +8689,18 @@ impl FsfsRuntime {
                 .record_count()
                 .saturating_add(index.wal_record_count())
         });
-        let output_limit = Self::resolve_output_limit(limit, lexical_doc_count, vector_doc_count);
+        // Independent generations need not contain identical document IDs.
+        // An upper bound on their union avoids truncating `--limit all` before
+        // fusion has resolved identities and removed duplicates.
+        let vector_union_bound = vector_doc_count.unwrap_or(0).saturating_add(
+            resources.quality_vector_index.as_ref().map_or(0, |index| {
+                index
+                    .record_count()
+                    .saturating_add(index.wal_record_count())
+            }),
+        );
+        let output_limit =
+            Self::resolve_output_limit(limit, lexical_doc_count, Some(vector_union_bound));
         let planning_limit = Self::resolve_planning_limit(output_limit);
         let search_start = Instant::now();
 
@@ -8861,54 +9126,23 @@ impl FsfsRuntime {
         let mut artifacts = vec![initial_artifact];
 
         if plan.quality_stage.enabled {
-            let quality_initialization = if matches!(mode, SearchExecutionMode::Full)
-                && !self.config.search.fast_only
-                && resources.quality_vector_index.is_some()
-                && resources.quality_embedder.is_none()
-                && !resources.quality_embedder_attempted
-            {
-                self.maybe_prepare_quality_embedder(resources)
-            } else {
-                Ok(())
-            };
-            let quality_outcome = match quality_initialization {
-                Err(error) => Err(error),
-                Ok(()) => {
-                    if let (Some(index), Some(embedder)) = (
-                        resources.quality_vector_index.as_ref(),
-                        resources.quality_embedder.as_ref(),
-                    ) {
-                        let quality_budget_floor = planning_limit;
-                        let quality_budget_ceiling = if lexical_tail_complete {
-                            planning_limit
-                        } else {
-                            output_limit
-                        };
-                        let quality_budget = plan
-                            .quality_stage
-                            .candidate_budget
-                            .max(quality_budget_floor)
-                            .min(quality_budget_ceiling);
-                        match embedder.embed(cx, &normalized_query).await {
-                            Ok(query_embedding) => {
-                                match index.search_top_k(&query_embedding, quality_budget, None) {
-                                    Ok(hits) => Ok(Some(
-                                        hits.into_iter()
-                                            .map(|hit| {
-                                                SemanticCandidate::new(hit.doc_id, hit.score)
-                                            })
-                                            .collect::<Vec<_>>(),
-                                    )),
-                                    Err(error) => Err(error),
-                                }
-                            }
-                            Err(error) => Err(error),
-                        }
-                    } else {
-                        Ok(None)
-                    }
-                }
-            };
+            let quality_budget = plan.quality_stage.candidate_budget.max(planning_limit).min(
+                if lexical_tail_complete {
+                    planning_limit
+                } else {
+                    output_limit
+                },
+            );
+            // The window starts after Initial has been published and includes
+            // cold initialization, waiting for model capacity, inference and
+            // independent quality retrieval. Optional reranking has its own
+            // existing stage policy and is outside this window.
+            let quality_outcome = self
+                .with_quality_deadline(
+                    cx,
+                    self.quality_candidates(cx, resources, &normalized_query, quality_budget),
+                )
+                .await;
 
             match quality_outcome {
                 Err(error) if matches!(error, SearchError::Cancelled { .. }) => {
@@ -8918,10 +9152,16 @@ impl FsfsRuntime {
                     return Err(error);
                 }
                 Ok(Some(quality_candidates)) => {
+                    let (blended_candidates, mut blend_hits) =
+                        self.blend_semantic_candidates(&semantic_candidates, &quality_candidates);
+                    let refined_budget = lexical_head_candidates
+                        .len()
+                        .saturating_add(blended_candidates.len())
+                        .max(planning_limit);
                     let fused_refined_head = orchestrator.fuse_rankings(
                         &lexical_head_candidates,
-                        &quality_candidates,
-                        fusion_budget,
+                        &blended_candidates,
+                        refined_budget,
                         0,
                     );
                     let filtered_refined_head =
@@ -8960,6 +9200,24 @@ impl FsfsRuntime {
                     if self.config.search.rerank {
                         refined_payload.rerank = Some(rerank_payload);
                     }
+                    let returned_paths = refined_payload
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.as_str())
+                        .collect::<HashSet<_>>();
+                    blend_hits.retain(|hit| returned_paths.contains(hit.path.as_str()));
+                    refined_payload.semantic_blend = Some(SemanticBlendPayload {
+                        quality_weight: self.effective_quality_weight(),
+                        fast_embedder: resources
+                            .fast_embedder
+                            .as_ref()
+                            .map_or_else(String::new, |embedder| embedder.id().to_owned()),
+                        quality_embedder: resources
+                            .quality_embedder
+                            .as_ref()
+                            .map_or_else(String::new, |embedder| embedder.id().to_owned()),
+                        hits: blend_hits,
+                    });
                     let refined_artifact = SearchPhaseArtifact {
                         phase: SearchOutputPhase::Refined,
                         fused: fused_refined,
@@ -8996,7 +9254,7 @@ impl FsfsRuntime {
                         &resources.index_root,
                         &error,
                     ));
-                    let failed_payload = Self::attach_search_context(
+                    let mut failed_payload = Self::attach_search_context(
                         Self::build_limited_payload(
                             orchestrator,
                             &normalized_query,
@@ -9011,6 +9269,19 @@ impl FsfsRuntime {
                         resources,
                         mode,
                     );
+                    if let SearchError::SearchTimeout {
+                        elapsed_ms,
+                        budget_ms,
+                    } = error
+                    {
+                        failed_payload.skip_reason = Some("quality_timeout".to_owned());
+                        failed_payload.quality_timeout =
+                            Some(crate::output_schema::QualityTimeoutPayload {
+                                budget_ms,
+                                elapsed_ms,
+                                reason_code: "query.quality.timeout".to_owned(),
+                            });
+                    }
                     let failed_artifact = SearchPhaseArtifact {
                         phase: SearchOutputPhase::RefinementFailed,
                         fused: fused_initial.clone(),
@@ -14962,7 +15233,7 @@ impl FsfsRuntime {
             shadow_observer,
             shadow_pressure_sampler,
             vector_index,
-            quality_vector_index,
+            quality_vector_index: quality_vector_index.map(Arc::new),
             fast_embedder: None,
             quality_embedder: None,
             fast_embedder_attempted: false,
@@ -15208,15 +15479,129 @@ impl FsfsRuntime {
         }
     }
 
-    fn maybe_prepare_quality_embedder(
+    async fn quality_blocking<F, T>(cx: &Cx, work: F) -> SearchResult<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut worker = cx
+            .spawn_blocking(move |child| {
+                child.checkpoint().map_err(|_| SearchError::Cancelled {
+                    phase: "quality_worker".to_owned(),
+                    reason: "quality worker cancelled before execution".to_owned(),
+                })?;
+                Ok(work())
+            })
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "fsfs.quality.worker",
+                source: Box::new(error),
+            })?;
+        worker.join(cx).await.map_err(|error| match error {
+            asupersync::runtime::JoinError::Cancelled(_) => SearchError::Cancelled {
+                phase: "quality_worker".to_owned(),
+                reason: "quality worker cancelled".to_owned(),
+            },
+            error => SearchError::SubsystemError {
+                subsystem: "fsfs.quality.worker",
+                source: Box::new(error),
+            },
+        })?
+    }
+
+    async fn with_quality_deadline<F, T>(&self, cx: &Cx, work: F) -> SearchResult<T>
+    where
+        F: Future<Output = SearchResult<T>>,
+    {
+        let budget_ms = self.config.search.quality_timeout_ms;
+        let started = Instant::now();
+        let mut timed = std::pin::pin!(asupersync::time::timeout(
+            cx.now(),
+            Duration::from_millis(budget_ms),
+            work
+        ));
+        std::future::poll_fn(|task_cx| {
+            // Caller cancellation takes precedence over timeout and late success.
+            if let Err(error) = cx.checkpoint() {
+                return Poll::Ready(Err(SearchError::Cancelled {
+                    phase: "quality_refinement".to_owned(),
+                    reason: error.to_string(),
+                }));
+            }
+            timed.as_mut().poll(task_cx).map(|result| {
+                result.unwrap_or_else(|_| {
+                    Err(SearchError::SearchTimeout {
+                        elapsed_ms: u64::try_from(started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        budget_ms,
+                    })
+                })
+            })
+        })
+        .await
+    }
+
+    async fn quality_candidates(
         &self,
+        cx: &Cx,
+        resources: &mut SearchExecutionResources,
+        query: &str,
+        budget: usize,
+    ) -> SearchResult<Option<Vec<SemanticCandidate>>> {
+        self.maybe_prepare_quality_embedder(cx, resources).await?;
+        let (Some(index), Some(embedder)) =
+            (&resources.quality_vector_index, &resources.quality_embedder)
+        else {
+            return Ok(None);
+        };
+        let query_embedding = embedder.embed(cx, query).await?;
+        let index = Arc::clone(index);
+        let hits = Self::quality_blocking(cx, move || {
+            index.search_top_k(&query_embedding, budget, None)
+        })
+        .await??;
+        Ok(Some(
+            hits.into_iter()
+                .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
+                .collect(),
+        ))
+    }
+
+    async fn maybe_prepare_quality_embedder(
+        &self,
+        cx: &Cx,
         resources: &mut SearchExecutionResources,
     ) -> SearchResult<()> {
         if resources.quality_embedder.is_some() || resources.quality_embedder_attempted {
             return Ok(());
         }
+        let permit =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.quality_load_gate), cx)
+                .await
+                .map_err(|error| SearchError::Cancelled {
+                    phase: "quality_initialization".to_owned(),
+                    reason: error.to_string(),
+                })?;
+        let runtime = self.clone();
+        // Test providers are thread-local fixtures. Capture their selection on
+        // the owning test thread, while still executing the initialization job
+        // through the same permit and worker boundary as production.
+        #[cfg(test)]
+        let selected_test_provider = runtime.resolve_quality_embedder();
+        let resolved = Self::quality_blocking(cx, move || {
+            // The permit belongs to the actual job, including after timeout.
+            let _permit = permit;
+            #[cfg(not(test))]
+            {
+                runtime.resolve_quality_embedder()
+            }
+            #[cfg(test)]
+            {
+                selected_test_provider
+            }
+        })
+        .await?;
         resources.quality_embedder_attempted = true;
-        match self.resolve_quality_embedder() {
+        match resolved {
             Ok(Some(embedder)) => {
                 // Bind to the QUALITY generation: same producer identity and
                 // width, else fail closed. Vectors from two spaces are never
@@ -17653,11 +18038,40 @@ fn render_explain_table(
     let lexical_score = hit
         .lexical_score
         .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"));
-    let semantic_fast_score = hit
-        .hash_score
-        .or(hit.semantic_score)
-        .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"));
-    let quality_score = "n/a";
+    let tier_component = |source| {
+        payload
+            .ranking
+            .components
+            .iter()
+            .find(|component| component.source == source)
+    };
+    let fast_component =
+        tier_component(crate::explanation_payload::ScoreComponentSource::SemanticFast);
+    let quality_component =
+        tier_component(crate::explanation_payload::ScoreComponentSource::SemanticQuality);
+    let semantic_fast_score = fast_component.map_or_else(
+        || {
+            (quality_component.is_none())
+                .then_some(hit.hash_score.or(hit.semantic_score))
+                .flatten()
+                .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"))
+        },
+        |component| {
+            format!(
+                "{:.6} (normalized {:.6}, weight {:.6})",
+                component.raw_score, component.normalized_score, component.weight
+            )
+        },
+    );
+    let quality_score = quality_component.map_or_else(
+        || "n/a".to_owned(),
+        |component| {
+            format!(
+                "{:.6} (normalized {:.6}, weight {:.6})",
+                component.raw_score, component.normalized_score, component.weight
+            )
+        },
+    );
     let rerank_score = hit
         .rerank_score
         .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"));
@@ -17686,6 +18100,12 @@ fn render_explain_table(
         lines.push(format!("Semantic (fast): {semantic_fast_score}"));
     }
     lines.push(format!("Semantic (quality): {quality_score}"));
+    if quality_component.is_some() {
+        lines.push(
+            "RRF ranks the combined semantic blend once; tier weights apply before fusion."
+                .to_owned(),
+        );
+    }
     lines.push(format!("Reranker: {rerank_score}"));
     if vector_generation_is_hash {
         lines.push(format!(
@@ -22075,6 +22495,7 @@ mod tests {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
             .build()
             .expect("build runtime test scheduler");
         let test_task = scheduler.handle().spawn(async move {
@@ -22140,7 +22561,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::pressure::HostPressureCollector;
     use crate::pressure::{DegradationStage, PressureSignal, PressureState, QueryCapabilityMode};
-    use crate::query_execution::{FusedCandidate, LexicalCandidate};
+    use crate::query_execution::{FusedCandidate, LexicalCandidate, SemanticCandidate};
     use crate::query_expansion;
     use crate::query_planning::QueryIntentClass;
     use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
@@ -22158,6 +22579,619 @@ mod tests {
         "FSFS_RUNTIME_PUBLICATION_LEASE_TEST_ROOT";
     const PUBLICATION_LEASE_RUNTIME_HELPER_OPERATION_ENV: &str =
         "FSFS_RUNTIME_PUBLICATION_LEASE_TEST_OPERATION";
+
+    #[test]
+    fn quality_blend_disagreeing_pools_use_effective_weight_and_source_fallback() {
+        let fast = vec![
+            SemanticCandidate::new("a", 8.0),
+            SemanticCandidate::new("fast-only", 5.0),
+            SemanticCandidate::new("b", 2.0),
+        ];
+        let quality = vec![
+            SemanticCandidate::new("b", 40.0),
+            SemanticCandidate::new("quality-only", 30.0),
+            SemanticCandidate::new("a", 20.0),
+        ];
+        for (weight, winner, expected_a, expected_b) in [
+            (0.0, "a", 1.0, 0.0),
+            (0.7, "b", 0.3, 0.7),
+            (1.0, "b", 0.0, 1.0),
+        ] {
+            let mut config = FsfsConfig::default();
+            config.search.quality_weight = weight;
+            let runtime = FsfsRuntime::new(config);
+            let (hits, details) = runtime.blend_semantic_candidates(&fast, &quality);
+            assert_eq!(hits[0].doc_id, winner);
+            assert_eq!(hits.len(), 4);
+            for (id, score) in [
+                ("a", expected_a),
+                ("b", expected_b),
+                ("fast-only", 0.5),
+                ("quality-only", 0.5),
+            ] {
+                let actual = hits.iter().find(|hit| hit.doc_id == id).unwrap();
+                assert!((actual.score - score).abs() < 1e-6, "{weight}: {id}");
+                let detail = details.iter().find(|hit| hit.path == id).unwrap();
+                let reconstructed = [&detail.fast, &detail.quality]
+                    .into_iter()
+                    .flatten()
+                    .map(|tier| tier.normalized_score * tier.weight)
+                    .sum::<f32>();
+                assert!((reconstructed - score).abs() < 1e-6);
+            }
+            let fast_only = details.iter().find(|hit| hit.path == "fast-only").unwrap();
+            assert!(fast_only.quality.is_none());
+            assert_eq!(fast_only.fast.as_ref().unwrap().weight, 1.0);
+            let quality_only = details
+                .iter()
+                .find(|hit| hit.path == "quality-only")
+                .unwrap();
+            assert!(quality_only.fast.is_none());
+            assert_eq!(quality_only.quality.as_ref().unwrap().weight, 1.0);
+        }
+    }
+
+    #[test]
+    fn quality_blend_preserves_constant_nonfinite_duplicate_and_tie_rules() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let fast = vec![
+            SemanticCandidate::new("b", 4.0),
+            SemanticCandidate::new("a", 4.0),
+            SemanticCandidate::new("b", 4.0),
+            SemanticCandidate::new("invalid", f32::NAN),
+        ];
+        let (hits, details) = runtime.blend_semantic_candidates(&fast, &[]);
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score))
+                .collect::<Vec<_>>(),
+            vec![("a", 1.0), ("b", 1.0), ("invalid", 0.0)]
+        );
+        assert_eq!(details[2].fast.as_ref().unwrap().raw_score, None);
+        assert!(serde_json::to_string(&details).is_ok());
+
+        let (hits, _) = runtime.blend_semantic_candidates(
+            &[
+                SemanticCandidate::new("best", 10.0),
+                SemanticCandidate::new("best", 5.0),
+                SemanticCandidate::new("worst", 0.0),
+            ],
+            &[],
+        );
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].score, 1.0, "duplicate keeps first best score");
+    }
+
+    #[test]
+    fn quality_blend_cache_uses_exact_effective_float_policy() {
+        let mut config = FsfsConfig::default();
+        config.search.quality_weight = 0.7;
+        let runtime = FsfsRuntime::new(config);
+        let key = runtime.search_cache_key("query", 10, SearchExecutionMode::Full);
+        let mut changed = runtime.clone();
+        changed.config.search.quality_weight = f64::from(f32::from_bits(0.7_f32.to_bits() + 1));
+        let other = changed.search_cache_key("query", 10, SearchExecutionMode::Full);
+        assert_ne!(key, other);
+        assert_ne!(
+            FsfsRuntime::search_cache_key_hash(&key),
+            FsfsRuntime::search_cache_key_hash(&other)
+        );
+        changed.config.search.quality_weight = 0.7 + f64::EPSILON;
+        assert_eq!(
+            key,
+            changed.search_cache_key("query", 10, SearchExecutionMode::Full)
+        );
+        changed.config.search.quality_weight = -0.0;
+        let negative_zero = changed.search_cache_key("query", 10, SearchExecutionMode::Full);
+        changed.config.search.quality_weight = 0.0;
+        assert_eq!(
+            negative_zero,
+            changed.search_cache_key("query", 10, SearchExecutionMode::Full)
+        );
+        changed.config.search.rrf_k = 70.0;
+        let seventy = changed.search_cache_key("query", 10, SearchExecutionMode::Full);
+        changed.config.search.rrf_k = 100.0;
+        let hundred = changed.search_cache_key("query", 10, SearchExecutionMode::Full);
+        assert_ne!(
+            seventy, hundred,
+            "large valid RRF k values must not saturate"
+        );
+        changed.config.search.rrf_k = 100.000_01;
+        assert_ne!(
+            hundred,
+            changed.search_cache_key("query", 10, SearchExecutionMode::Full)
+        );
+    }
+
+    /// Query vectors are explicit basis vectors; this is a ranking fixture,
+    /// not evidence of semantic quality. Retrieval uses actual FSVI files.
+    struct BlendQueryEmbedder(&'static str);
+
+    impl Embedder for BlendQueryEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async { Ok(vec![1.0, 0.0]) })
+        }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn model_name(&self) -> &str {
+            self.0
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    fn disagreeing_blend_resources(root: &Path) -> SearchExecutionResources {
+        let write = |name: &str, id: &str, rows: &[(&str, [f32; 2])]| {
+            let path = root.join(name);
+            let mut writer = VectorIndex::create(&path, id, 2).unwrap();
+            for (doc_id, vector) in rows {
+                writer.write_record(doc_id, vector).unwrap();
+            }
+            writer.finish().unwrap();
+            VectorIndex::open_read_only(&path).unwrap()
+        };
+        let fast = write(
+            "fast.fsvi",
+            "blend-fast-2",
+            &[
+                ("a.rs", [1.0, 0.0]),
+                ("b.rs", [0.0, 1.0]),
+                ("fast-only.rs", [0.5, 0.866_025_4]),
+            ],
+        );
+        // Different record order proves that identities, not local row numbers,
+        // bind scores from the two independent retrieval pools.
+        let quality = write(
+            "quality.fsvi",
+            "blend-quality-2",
+            &[
+                ("b.rs", [1.0, 0.0]),
+                ("quality-only.rs", [0.5, 0.866_025_4]),
+                ("a.rs", [0.0, 1.0]),
+            ],
+        );
+        SearchExecutionResources {
+            index_root: root.to_path_buf(),
+            generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(root).unwrap(),
+            lexical_index: None,
+            shadow_observer: None,
+            shadow_pressure_sampler: None,
+            vector_index: Some(fast),
+            quality_vector_index: Some(Arc::new(quality)),
+            fast_embedder: Some(Arc::new(BlendQueryEmbedder("blend-fast-2"))),
+            quality_embedder: Some(Arc::new(BlendQueryEmbedder("blend-quality-2"))),
+            fast_embedder_attempted: true,
+            quality_embedder_attempted: true,
+            degradation_advice: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn quality_blend_real_retrieval_daemon_disk_explain_and_tui_share_policy() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let query = "how do semantic policies affect ranking";
+            let mut cache = std::collections::HashMap::new();
+            for (weight, winner, expected_score) in [
+                (0.0_f32, "a.rs", 1.0),
+                (1.0, "b.rs", 1.0),
+                (0.7, "b.rs", 0.7),
+            ] {
+                let request = || SearchServeRequest {
+                    query: query.to_owned(),
+                    limit: Some(10),
+                    mode: Some("full".to_owned()),
+                    filter: None,
+                    rerank: Some(false),
+                    quality_weight: Some(f64::from(weight)),
+                    quality_timeout_ms: Some(5_000),
+                    rrf_k: None,
+                    fast_only: None,
+                };
+                let cold = runtime
+                    .execute_search_serve_request(&cx, request(), &mut resources, &mut cache, true)
+                    .await
+                    .unwrap();
+                assert!(!cold.cached, "changed policy cannot reuse previous request");
+                assert_eq!(cold.payloads.len(), 2);
+                assert_eq!(cold.payloads[0].phase, SearchOutputPhase::Initial);
+                assert_eq!(cold.payloads[0].hits[0].path, "a.rs");
+                let refined = cold.payloads.last().unwrap();
+                assert_eq!(refined.phase, SearchOutputPhase::Refined);
+                assert_eq!(refined.hits[0].path, winner);
+                assert_eq!(
+                    refined.hits.len(),
+                    4,
+                    "independent quality-only candidate survives"
+                );
+                let blend = refined.semantic_blend.as_ref().unwrap();
+                assert_eq!(blend.fast_embedder, "blend-fast-2");
+                assert_eq!(blend.quality_embedder, "blend-quality-2");
+                assert_eq!(blend.quality_weight, weight);
+                let warm = runtime
+                    .execute_search_serve_request(&cx, request(), &mut resources, &mut cache, true)
+                    .await
+                    .unwrap();
+                assert!(warm.cached);
+                assert_eq!(warm.payloads, cold.payloads);
+                let mut effective = runtime.clone();
+                effective.config.search.quality_weight = f64::from(weight);
+                let key = effective.search_cache_key(query, 10, SearchExecutionMode::Full);
+                effective
+                    .write_search_payload_cache(
+                        &key,
+                        &cold.payloads,
+                        &resources.generation_fingerprint,
+                    )
+                    .unwrap();
+                let reloaded = effective
+                    .try_load_search_payload_cache(&key, &resources.generation_fingerprint)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reloaded, cold.payloads);
+                effective
+                    .persist_explain_session_for_cached_payloads(query, &reloaded)
+                    .unwrap();
+                let session = effective.load_explain_session().unwrap().unwrap();
+                assert_eq!(session.hits[0].path, winner);
+                assert_eq!(session.hits[0].semantic_score, Some(expected_score));
+                let components = session.blend_components(winner).unwrap();
+                assert_eq!(components.len(), 2);
+                assert!(
+                    (components
+                        .iter()
+                        .map(|part| part.normalized_score * part.weight)
+                        .sum::<f64>()
+                        - f64::from(session.hits[0].semantic_score.unwrap()))
+                    .abs()
+                        < 1e-6
+                );
+                let status = effective.collect_status_payload().unwrap();
+                let mut state = SearchDashboardState::new(status, None, 10, true);
+                state.query_input.set_value(query);
+                effective
+                    .refresh_search_dashboard_quality(&cx, &mut state, &mut resources)
+                    .await;
+                assert_eq!(state.phase_payloads.last().unwrap().hits[0].path, winner);
+                assert_eq!(
+                    state.phase_payloads.last().unwrap().semantic_blend,
+                    refined.semantic_blend
+                );
+            }
+            assert_eq!(cache.len(), 3);
+            let all = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    query,
+                    FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                all.last().unwrap().hits.len(),
+                4,
+                "--limit all covers the union, not the larger single tier"
+            );
+
+            let quill = create_test_quill(&cx, &temp.path().join("lexical")).await;
+            for path in ["a.rs", "b.rs", "lexical-only.rs", "excluded.txt"] {
+                quill
+                    .index_document(&cx, &IndexableDocument::new(path, query))
+                    .await
+                    .unwrap();
+            }
+            quill.commit(&cx).await.unwrap();
+            resources.lexical_index = Some(
+                QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap(),
+            );
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let mut filtered = runtime.clone();
+            filtered.cli_input.filter = Some("ext:rs".to_owned());
+            let payloads = filtered
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    query,
+                    FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: true,
+                    },
+                )
+                .await
+                .unwrap();
+            let refined = payloads.last().unwrap();
+            assert_eq!(refined.hits.len(), 5);
+            assert!(
+                refined
+                    .hits
+                    .iter()
+                    .any(|hit| hit.path == "lexical-only.rs" && hit.semantic_rank.is_none())
+            );
+            assert!(!refined.hits.iter().any(|hit| hit.path == "excluded.txt"));
+            let cold_session = filtered.load_explain_session().unwrap().unwrap();
+            filtered
+                .persist_explain_session_for_cached_payloads(query, &payloads)
+                .unwrap();
+            let cached_session = filtered.load_explain_session().unwrap().unwrap();
+            assert_eq!(
+                cold_session.hits, cached_session.hits,
+                "cached hybrid explanation preserves both raw sources"
+            );
+        });
+    }
+
+    #[test]
+    fn quality_blend_daemon_requires_exact_applied_policy_acknowledgement() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let mut response = super::SearchServeResponse {
+            schema_version: super::FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
+            policy: Some(runtime.search_serve_policy()),
+            ok: true,
+            query: "query".to_owned(),
+            mode: "full".to_owned(),
+            cached: false,
+            payloads: Vec::new(),
+            error: None,
+        };
+        runtime.validate_search_serve_policy(&response).unwrap();
+        response.policy.as_mut().unwrap().quality_weight_bits = 0.0_f32.to_bits();
+        assert!(runtime.validate_search_serve_policy(&response).is_err());
+        response.policy = Some(runtime.search_serve_policy());
+        response.schema_version = "fsfs.search.serve.v1".to_owned();
+        assert!(runtime.validate_search_serve_policy(&response).is_err());
+        let legacy = r#"{"ok":true,"query":"query","mode":"full","cached":false,"payloads":[]}"#;
+        assert!(
+            serde_json::from_str::<super::SearchServeResponse>(legacy).is_err(),
+            "old daemon success cannot deserialize as an acknowledged policy"
+        );
+    }
+
+    struct BlockingQualityFixture {
+        gate: Arc<asupersync::sync::Mutex<()>>,
+        calls: Arc<AtomicUsize>,
+        completed: Arc<AtomicUsize>,
+    }
+
+    impl Embedder for BlockingQualityFixture {
+        fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                let permit = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.gate), cx)
+                    .await
+                    .map_err(|error| SearchError::Cancelled {
+                        phase: "fixture".to_owned(),
+                        reason: error.to_string(),
+                    })?;
+                let calls = Arc::clone(&self.calls);
+                let completed = Arc::clone(&self.completed);
+                FsfsRuntime::quality_blocking(cx, move || {
+                    let _permit = permit;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // A real blocking pool operation. No timing/quality claim
+                    // about the ONNX backend is inferred from this fixture.
+                    thread::sleep(Duration::from_millis(400));
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    vec![1.0, 0.0]
+                })
+                .await
+            })
+        }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn id(&self) -> &'static str {
+            "blend-quality-2"
+        }
+        fn model_name(&self) -> &'static str {
+            "blocking quality fixture"
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::TransformerEmbedder
+        }
+    }
+
+    #[test]
+    fn quality_deadline_retries_bound_worker_occupancy_and_do_not_cache_failures() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
+                gate: Arc::new(asupersync::sync::Mutex::new(())),
+                calls: Arc::clone(&calls),
+                completed: Arc::clone(&completed),
+            }));
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 50;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let query = "how do semantic policies affect ranking";
+            let mut cache = std::collections::HashMap::new();
+            for attempt in 0..3 {
+                let response = runtime
+                    .execute_search_serve_request(
+                        &cx,
+                        SearchServeRequest {
+                            query: format!("{query} {attempt}"),
+                            limit: Some(10),
+                            mode: Some("full".to_owned()),
+                            filter: None,
+                            rerank: None,
+                            quality_weight: None,
+                            quality_timeout_ms: Some(50),
+                            rrf_k: None,
+                            fast_only: None,
+                        },
+                        &mut resources,
+                        &mut cache,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!response.cached);
+                assert_eq!(response.payloads.len(), 2);
+                assert_eq!(response.payloads[0].phase, SearchOutputPhase::Initial);
+                let failed = &response.payloads[1];
+                assert_eq!(failed.phase, SearchOutputPhase::RefinementFailed);
+                assert_eq!(failed.hits, response.payloads[0].hits);
+                assert_eq!(failed.quality_timeout.as_ref().unwrap().budget_ms, 50);
+                assert_eq!(failed.skip_reason.as_deref(), Some("quality_timeout"));
+                assert!(cache.is_empty());
+                let key = runtime.search_cache_key(&response.query, 10, SearchExecutionMode::Full);
+                runtime
+                    .write_search_payload_cache(
+                        &key,
+                        &response.payloads,
+                        &resources.generation_fingerprint,
+                    )
+                    .unwrap();
+                assert!(!runtime.search_cache_path(&key).unwrap().exists());
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "retries wait for the actual model owner's permit"
+            );
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                0,
+                "timeout notification precedes backend completion"
+            );
+            asupersync::time::sleep(cx.now(), Duration::from_millis(450)).await;
+            assert_eq!(completed.load(Ordering::SeqCst), 1);
+            assert!(
+                cache.is_empty(),
+                "late completion cannot publish or populate a cache"
+            );
+
+            let mut recovered = runtime.clone();
+            recovered.config.search.quality_timeout_ms = 1_000;
+            let mut state = SearchDashboardState::new(
+                recovered.collect_status_payload().unwrap(),
+                None,
+                10,
+                true,
+            );
+            state
+                .query_input
+                .set_value("replacement query after timeout");
+            recovered
+                .refresh_search_dashboard_quality(&cx, &mut state, &mut resources)
+                .await;
+            let refined = state.phase_payloads.last().unwrap();
+            assert_eq!(refined.phase, SearchOutputPhase::Refined);
+            assert_eq!(refined.query, "replacement query after timeout");
+            assert_eq!(completed.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn quality_deadline_caller_cancellation_wins_without_late_publication() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let mut phases = Vec::new();
+            let mut sink = |payload: &SearchPayload| {
+                phases.push(payload.phase);
+                cx.set_cancel_requested(true);
+                Ok(())
+            };
+            let result = runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    "cancel after initial results",
+                    10,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                    Some(&mut sink),
+                )
+                .await;
+            cx.set_cancel_requested(false);
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert_eq!(phases, vec![SearchOutputPhase::Initial]);
+
+            cx.set_cancel_requested(true);
+            let result = runtime
+                .with_quality_deadline(&cx, async { Ok::<_, SearchError>(42) })
+                .await;
+            cx.set_cancel_requested(false);
+            assert!(
+                matches!(result, Err(SearchError::Cancelled { .. })),
+                "even ready success loses to caller cancellation"
+            );
+        });
+    }
+
+    #[test]
+    fn quality_deadline_exact_tie_prefers_ready_work_but_expired_work_is_rejected() {
+        use asupersync::types::Time;
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut exact = asupersync::time::timeout(
+            Time::ZERO,
+            Duration::from_millis(50),
+            std::future::ready(42),
+        );
+        assert_eq!(
+            exact.poll_with_time(&mut context, Time::from_millis(50)),
+            Poll::Ready(Ok(42))
+        );
+        let mut expired = asupersync::time::timeout(
+            Time::ZERO,
+            Duration::from_millis(50),
+            std::future::ready(42),
+        );
+        assert!(matches!(
+            expired.poll_with_time(&mut context, Time::from_millis(51)),
+            Poll::Ready(Err(_))
+        ));
+        let mut pending = asupersync::time::timeout(
+            Time::ZERO,
+            Duration::from_millis(50),
+            std::future::pending::<u32>(),
+        );
+        assert!(matches!(
+            pending.poll_with_time(&mut context, Time::from_millis(50)),
+            Poll::Ready(Err(_))
+        ));
+    }
 
     async fn create_test_quill(cx: &Cx, path: &Path) -> QuillIndex {
         QuillIndex::create(
@@ -24019,7 +25053,7 @@ mod tests {
     /// search serves INITIAL only with the stage reported as unavailable.
     #[test]
     fn one_shot_index_builds_the_quality_tier_and_search_emits_refined() {
-        run_test_with_cx(|cx| async move {
+        run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let project = temp.path().join("project");
             fs::create_dir_all(project.join("docs")).expect("create project docs dir");
@@ -24465,6 +25499,10 @@ mod tests {
                 mode: Some("lexical_only".to_owned()),
                 filter: None,
                 rerank: None,
+                quality_weight: None,
+                quality_timeout_ms: None,
+                rrf_k: None,
+                fast_only: None,
             };
 
             let first = runtime
@@ -24980,14 +26018,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_output_limit_unbounded_uses_max_index_cardinality() {
+    fn resolve_output_limit_unbounded_covers_disjoint_index_identities() {
         assert_eq!(
             FsfsRuntime::resolve_output_limit(
                 FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
                 Some(7),
                 Some(9),
             ),
-            9
+            16
         );
         assert_eq!(
             FsfsRuntime::resolve_output_limit(
@@ -24995,7 +26033,7 @@ mod tests {
                 Some(11),
                 Some(4),
             ),
-            11
+            15
         );
     }
 
@@ -29595,7 +30633,7 @@ mod tests {
 
     #[test]
     fn runtime_stream_exposes_initial_before_quality_barrier_release() {
-        run_test_with_cx(|cx| async move {
+        run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let vector_path = temp.path().join("stream-barrier.fsvi");
             let query = "quality barrier ordering";
@@ -29622,9 +30660,9 @@ mod tests {
                 // These fixtures bind one 384-d generation as both tiers: the
                 // quality embedder under test owns its identity, and the
                 // fast double supplies a stable initial-phase vector.
-                quality_vector_index: Some(
+                quality_vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&vector_path).expect("open quality index"),
-                ),
+                )),
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(BarrierQualityEmbedder::new(Arc::clone(&barrier)))),
                 fast_embedder_attempted: true,
@@ -29749,9 +30787,9 @@ mod tests {
                 // These fixtures bind one 384-d generation as both tiers: the
                 // quality embedder under test owns its identity, and the
                 // fast double supplies a stable initial-phase vector.
-                quality_vector_index: Some(
+                quality_vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&vector_path).expect("open quality index"),
-                ),
+                )),
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(FailedQualityEmbedder)),
                 fast_embedder_attempted: true,
@@ -30053,9 +31091,9 @@ mod tests {
                 // These fixtures bind one 384-d generation as both tiers: the
                 // quality embedder under test owns its identity, and the
                 // fast double supplies a stable initial-phase vector.
-                quality_vector_index: Some(
+                quality_vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&vector_path).expect("open quality index"),
-                ),
+                )),
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(CancelledEmbedder)),
                 fast_embedder_attempted: true,
@@ -34355,6 +35393,10 @@ mod tests {
                         mode: Some("lexical_only".to_owned()),
                         filter: None,
                         rerank: None,
+                        quality_weight: None,
+                        quality_timeout_ms: None,
+                        rrf_k: None,
+                        fast_only: None,
                     },
                     &mut resources,
                     &mut hot_cache,
@@ -34374,6 +35416,10 @@ mod tests {
                             mode: Some(mode.to_owned()),
                             filter: None,
                             rerank: None,
+                            quality_weight: None,
+                            quality_timeout_ms: None,
+                            rrf_k: None,
+                            fast_only: None,
                         },
                         &mut resources,
                         &mut hot_cache,
@@ -34450,6 +35496,10 @@ mod tests {
                         mode: Some("lexical_only".to_owned()),
                         filter: None,
                         rerank: None,
+                        quality_weight: None,
+                        quality_timeout_ms: None,
+                        rrf_k: None,
+                        fast_only: None,
                     },
                     &mut resources,
                     &mut hot_cache,
@@ -34484,6 +35534,10 @@ mod tests {
                         mode: Some("full".to_owned()),
                         filter: None,
                         rerank: None,
+                        quality_weight: None,
+                        quality_timeout_ms: None,
+                        rrf_k: None,
+                        fast_only: None,
                     },
                     &mut resources,
                     &mut hot_cache,

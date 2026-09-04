@@ -465,6 +465,20 @@ pub struct SearchPayload {
     /// caches and query serving so a later explain uses the policy that ran.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub semantic_blend: Option<SemanticBlendPayload>,
+    /// Raw lexical evidence retained for the same explanation after cache reuse.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub lexical_scores: BTreeMap<String, f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub quality_timeout: Option<QualityTimeoutPayload>,
+}
+
+/// A quality deadline expires after Initial. Backend shutdown may take longer
+/// because an already-running synchronous model call must be joined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QualityTimeoutPayload {
+    pub budget_ms: u64,
+    pub elapsed_ms: u64,
+    pub reason_code: String,
 }
 
 /// One present tier's input and normalized contribution to a semantic blend.
@@ -579,6 +593,8 @@ impl SearchPayload {
             vector_generation_is_hash: false,
             rerank: None,
             semantic_blend: None,
+            lexical_scores: BTreeMap::new(),
+            quality_timeout: None,
         }
     }
 

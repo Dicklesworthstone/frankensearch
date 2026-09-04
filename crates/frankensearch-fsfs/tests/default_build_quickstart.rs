@@ -400,6 +400,235 @@ mod loader_only {
         )
     }
 
+    #[cfg(feature = "semantic-loaders")]
+    fn verify_real_blend_and_deadline(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
+        let file_sha = |path: &Path| {
+            let mut hex = String::with_capacity(64);
+            for byte in sha2::Sha256::digest(fs::read(path).unwrap()) {
+                write!(hex, "{byte:02x}").unwrap();
+            }
+            hex
+        };
+        let query = "How should a network client recover from transient failures using exponential backoff, bounded retries, and random jitter?";
+        let stack = frankensearch_embed::EmbedderStack::auto_detect_with_options(
+            Some(&fsfs.model_root),
+            &frankensearch_embed::DetectOptions {
+                offline: Some(true),
+            },
+        )
+        .expect("load actual comparison models");
+        let fast = stack.fast_arc();
+        let quality = stack
+            .quality_arc()
+            .expect("actual quality comparison model");
+        let fast_index_path = index.join("vector/index.fsvi");
+        let quality_index_path = index.join("vector/quality.fsvi");
+        let fast_index =
+            VectorIndex::open_read_only(&fast_index_path).expect("open actual fast generation");
+        let quality_index = VectorIndex::open_read_only(&quality_index_path)
+            .expect("open actual quality generation");
+        let binary_sha = file_sha(&fsfs_binary());
+        eprintln!(
+            "[default-build-e2e] stage=blend-provenance binary_sha256={binary_sha} fast_id={} quality_id={} fast_identity={} quality_identity={} fast_index_sha256={} quality_index_sha256={}",
+            fast.id(),
+            quality.id(),
+            fast.identity().unwrap().fingerprint(),
+            quality.identity().unwrap().fingerprint(),
+            file_sha(&fast_index_path),
+            file_sha(&quality_index_path)
+        );
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        let task = scheduler.handle().spawn(async move {
+            let cx = asupersync::Cx::current().expect("runtime-owned comparison context");
+            let fast_vector = fast.embed(&cx, query).await.unwrap();
+            let quality_vector = quality.embed(&cx, query).await.unwrap();
+            (
+                fast_index
+                    .search_top_k(&fast_vector, QUICKSTART_DOCUMENT_COUNT, None)
+                    .unwrap(),
+                quality_index
+                    .search_top_k(&quality_vector, QUICKSTART_DOCUMENT_COUNT, None)
+                    .unwrap(),
+            )
+        });
+        let (fast_pool, quality_pool) = scheduler.block_on(task);
+        for weight in [0.0_f32, 0.7, 1.0] {
+            let config_path = root.join(format!("blend-{weight}.toml"));
+            // This leg measures numerical policy parity under a comfortably
+            // admitted budget. The stock-default lane above remains unchanged;
+            // the separate 50ms leg below exercises actual deadline failure.
+            fs::write(
+                &config_path,
+                format!("[search]\nquality_weight = {weight}\nquality_timeout_ms = 5000\n"),
+            )
+            .unwrap();
+            let config_str = config_path.to_str().unwrap();
+            let mut direct_blend = None;
+            for route in ["direct", "daemon", "daemon-warm"] {
+                let mut args = vec![
+                    "search",
+                    query,
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--limit",
+                    "all",
+                    "--format",
+                    "json",
+                ];
+                if route == "direct" {
+                    args.push("--no-daemon");
+                }
+                let outcome = fsfs.run_with_env(
+                    root,
+                    &format!("blend-{weight}-{route}"),
+                    args,
+                    QUICKSTART_TIMEOUT,
+                    &[("FSFS_CONFIG", config_str)],
+                );
+                let envelope = parse_success_envelope("real policy search", &outcome);
+                assert_eq!(
+                    envelope.pointer("/data/phase").and_then(Value::as_str),
+                    Some("refined")
+                );
+                let actual: frankensearch_fsfs::output_schema::SemanticBlendPayload =
+                    serde_json::from_value(
+                        envelope.pointer("/data/semantic_blend").unwrap().clone(),
+                    )
+                    .unwrap();
+                let expected = frankensearch::blend_two_tier(&fast_pool, &quality_pool, weight);
+                assert_eq!(actual.quality_weight, weight);
+                assert_eq!(actual.hits.len(), QUICKSTART_DOCUMENT_COUNT);
+                for expected_hit in &expected {
+                    let observed = actual
+                        .hits
+                        .iter()
+                        .find(|hit| hit.path == expected_hit.doc_id.as_str())
+                        .unwrap();
+                    assert!(
+                        (observed.score - expected_hit.score).abs() < 1e-6,
+                        "public facade/fsfs score disagreement: {weight} {route} {}",
+                        observed.path
+                    );
+                }
+                if let Some(direct) = &direct_blend {
+                    assert_eq!(&actual, direct, "daemon uses caller's policy");
+                } else {
+                    direct_blend = Some(actual.clone());
+                }
+                eprintln!(
+                    "[default-build-e2e] stage=blend-parity weight={weight} route={route} independently_retrieved_fast={} independently_retrieved_quality={} returned={} max_score_error_lt=0.000001 no_quality_win_claim=true",
+                    fast_pool.len(),
+                    quality_pool.len(),
+                    actual.hits.len()
+                );
+            }
+            let explain = fsfs.run_with_env(
+                root,
+                &format!("blend-{weight}-explain"),
+                [
+                    "explain",
+                    "1",
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+                &[("FSFS_CONFIG", config_str)],
+            );
+            let envelope = parse_success_envelope("cached policy explain", &explain);
+            assert!(
+                envelope
+                    .pointer("/data/ranking/fusion/rrf/vector")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|score| score > 0.0)
+            );
+            assert!(
+                envelope
+                    .pointer("/data/ranking/fusion/lexical_score")
+                    .and_then(Value::as_f64)
+                    .is_some()
+            );
+        }
+
+        let timeout_config = root.join("quality-deadline-50.toml");
+        fs::write(&timeout_config, "[search]\nquality_timeout_ms = 50\n").unwrap();
+        let outcome = fsfs.run_with_env(
+            root,
+            "actual-quality-deadline-50",
+            [
+                "search",
+                query,
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--no-daemon",
+                "--stream",
+                "--format",
+                "jsonl",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[
+                ("FSFS_CONFIG", timeout_config.to_str().unwrap()),
+                ("FSFS_DISABLE_QUERY_CACHE", "1"),
+                ("FRANKENSEARCH_LOG", "info"),
+            ],
+        );
+        assert_finished_successfully("actual backend quality deadline", &outcome);
+        let frames = outcome
+            .stdout
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let initial = frames
+            .iter()
+            .position(|frame| {
+                frame
+                    .pointer("/payload/reason_code")
+                    .and_then(Value::as_str)
+                    == Some("query.stream.initial_ready")
+            })
+            .unwrap();
+        let failures = frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| {
+                frame
+                    .pointer("/payload/reason_code")
+                    .and_then(Value::as_str)
+                    == Some("query.stream.refinement_failed")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures.len(),
+            1,
+            "actual cold backend must respect 50ms boundary"
+        );
+        assert!(failures[0].0 > initial);
+        assert!(
+            failures[0]
+                .1
+                .pointer("/payload/message")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("50ms")
+        );
+        assert!(!frames.iter().any(|frame| {
+            frame
+                .pointer("/payload/reason_code")
+                .and_then(Value::as_str)
+                == Some("query.stream.refined_ready")
+        }));
+        eprintln!(
+            "[default-build-e2e] stage=actual-quality-deadline budget_ms=50 initial_preserved=true failures=1 late_refined=0 process_join_ms={} backend_preemptible=false",
+            outcome.elapsed.as_millis()
+        );
+    }
+
     fn verify_pinned_model_cache(model_root: &Path) -> Result<(), String> {
         let potion_dir = model_root.join("potion-multilingual-128M");
         let minilm_dir = model_root.join("all-MiniLM-L6-v2");
@@ -1213,6 +1442,8 @@ mod loader_only {
         eprintln!(
             "[default-build-e2e] stage=quality-tier-load event=verified fast_only_quality_loaded=false two_tier_quality_loads=1 refined_ready=true"
         );
+        #[cfg(feature = "semantic-loaders")]
+        verify_real_blend_and_deadline(&fsfs, temp.path(), &index);
 
         // Reality check 2026-09-01, G2: the auto-spawned query daemon must
         // outlive the search that spawned it (so the next search is warm), be

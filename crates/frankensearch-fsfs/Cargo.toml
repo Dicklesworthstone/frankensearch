@@ -121,6 +121,7 @@ ureq = { version = "3", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [dev-dependencies]
+frankensearch = { path = "../../frankensearch", version = "0.4.2", default-features = false }
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
 frankensearch-lexical = { workspace = true }

@@ -628,6 +628,7 @@ mod tests {
                 hash_score: None,
                 in_both_sources: true,
                 vector_generation_is_hash: false,
+                rrf: None,
             }),
             components: vec![
                 ScoreComponentBreakdown {
@@ -861,6 +862,7 @@ mod tests {
             hash_score: None,
             in_both_sources: true,
             vector_generation_is_hash: false,
+            rrf: None,
         };
         let row = build_fusion_row(&fusion);
         assert!(row.overlap_label.contains("overlapping"));
@@ -879,6 +881,7 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
             vector_generation_is_hash: false,
+            rrf: None,
         };
         let row = build_fusion_row(&fusion);
         assert_eq!(row.overlap_label, "lexical-only");
@@ -896,6 +899,7 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
             vector_generation_is_hash: false,
+            rrf: None,
         };
         let row = build_fusion_row(&fusion);
         assert_eq!(row.overlap_label, "semantic-only");
@@ -913,6 +917,7 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
             vector_generation_is_hash: true,
+            rrf: None,
         };
         hash_only.remap_hash_control_ranks();
         assert_eq!(hash_only.hash_rank, Some(10));
@@ -932,6 +937,7 @@ mod tests {
             hash_score: None,
             in_both_sources: true,
             vector_generation_is_hash: true,
+            rrf: None,
         };
         both.remap_hash_control_ranks();
         assert_eq!(

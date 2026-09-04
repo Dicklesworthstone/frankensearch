@@ -244,15 +244,17 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         "fsfs command parsed and runtime wired"
     );
 
-    let scheduler =
-        RuntimeBuilder::current_thread()
-            .build()
-            .map_err(|error| SearchError::SubsystemError {
-                subsystem: "fsfs",
-                source: Box::new(io::Error::other(format!(
-                    "failed to initialize asupersync runtime: {error}"
-                ))),
-            })?;
+    let scheduler = RuntimeBuilder::current_thread()
+        // ONNX calls and quality index scans must not block the executor
+        // that publishes Initial and drives the refinement deadline.
+        .blocking_threads(0, 2)
+        .build()
+        .map_err(|error| SearchError::SubsystemError {
+            subsystem: "fsfs",
+            source: Box::new(io::Error::other(format!(
+                "failed to initialize asupersync runtime: {error}"
+            ))),
+        })?;
     let shutdown = Arc::new(ShutdownCoordinator::new());
     shutdown.register_signals()?;
     let run_with_shutdown = matches!(interface_mode, InterfaceMode::Tui)

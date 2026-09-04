@@ -1777,6 +1777,7 @@ dependencies = [
  "asupersync",
  "compact_str 0.10.0",
  "criterion",
+ "frankensearch",
  "frankensearch-core",
  "frankensearch-durability",
  "frankensearch-embed",

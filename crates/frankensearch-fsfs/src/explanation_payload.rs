@@ -290,6 +290,17 @@ pub struct FusionContext {
     /// True when the vector ranks came from a hash/fnv control generation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vector_generation_is_hash: bool,
+    /// Joint source contributions before rerank ordering. Semantic tiers are
+    /// blended first and therefore share one vector rank, not two RRF ranks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rrf: Option<RrfContributions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RrfContributions {
+    pub k: f64,
+    pub lexical: f64,
+    pub vector: f64,
 }
 
 impl FusionContext {
@@ -324,6 +335,7 @@ impl From<&FusedCandidate> for FusionContext {
             hash_score: value.hash_score,
             in_both_sources: value.in_both_sources,
             vector_generation_is_hash: false,
+            rrf: None,
         }
     }
 }
@@ -1110,6 +1122,7 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
             vector_generation_is_hash: true,
+            rrf: None,
         };
         fusion.remap_hash_control_ranks();
         assert_eq!(fusion.hash_rank, Some(2));

@@ -870,6 +870,9 @@ pub struct SearchConfig {
     pub default_limit: usize,
     pub quality_weight: f64,
     pub rrf_k: f64,
+    /// Budget after Initial publication, including cold quality model loading,
+    /// model-capacity wait, inference and retrieval. Running synchronous model
+    /// work remains owned until completion; shutdown can outlast this budget.
     pub quality_timeout_ms: u64,
     pub fast_only: bool,
     pub explain: bool,
@@ -3713,6 +3716,15 @@ mod tests {
 
     #[test]
     fn enforces_numeric_range_constraints() {
+        let minimum = load_from_str(
+            Some("[search]\nquality_timeout_ms = 50\n"),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("50ms is admitted");
+        assert_eq!(minimum.config.search.quality_timeout_ms, 50);
         assert_invalid_field(
             "[discovery]\nmax_file_size_mb = 0\n",
             "discovery.max_file_size_mb",
