@@ -19121,3 +19121,81 @@ until it happens to select a favorable incumbent. Retry only after a material,
 predeclared change to the incumbent-selection experiment or on the registered
 reference runner, while retaining the same live Tantivy screen and independent
 T/T and Q/Q controls.
+
+### 2026-09-04 — WASH (backfilled): fsfs lexical debounce floor retune is an update-to-searchable p95 wash (E7.2, bd-quill-e7-integration-flip-d0tx.2)
+
+Backfilled by the quill-e9.3 sweep; the ledger-of-record to date is
+`docs/PERF_LEDGER.md` (`REJECT` entry at `docs/PERF_LEDGER.md:7030-7057`,
+decision `:7054-7057`), which had no NEGATIVE_EVIDENCE twin and no retry
+predicate anywhere. Measured result quoted from that entry: update-to-searchable
+p95 was identical before and after the retune (36.017/36.017, 24.017/24.017,
+20.017/20.017 ms across the three refresh ladders) — the floor change moved
+nothing observable. Null control, same invocation: paired scenario p95s identical in both arms (36.017/36.017, 24.017/24.017, 20.017/20.017 ms; invocations 40/40, 25/25, 30/30, 180/180) — the deterministic harness installs the same 7 ms adaptive window in both arms.
+
+**Decision: WASH / NO SHIP (maintaining the shipping debounce floor).**
+Comparison class: SELF-SPEEDUP diagnostic; no QG or competitive claim attaches.
+
+- **Retry predicate:** retry only when the event-to-applied dynamics change —
+  i.e. after the watch-mode FSVI writer-lock redesign (bd-z2nfa) or an
+  equivalent pipeline change alters what the debounce floor actually delays —
+  and re-measure with the watch-mode freshness lane (bd-8j5dc receipt).
+
+### 2026-09-04 — REJECT (backfilled): dictionary preflight cannot profitably demand-gate low-cost Quill BLOCKMAX opening (E8.5.2, bd-quill-e8-perf-doctrine-x4e4.5.2)
+
+Backfilled by the quill-e9.3 sweep; the ledger-of-record to date is
+`docs/PERF_LEDGER.md` (`REJECT` entry at `docs/PERF_LEDGER.md:7156-7191`,
+decision and retry predicate in prose at `:7186-7191`). Quoted result: warm
+demand-gated/eager median **1.063222** with 95% CI [1.011056, 1.258719] on the
+1,024-sealed-doc / 9-live-direct-term / posting-cost-9,216 cell — a clear
+6.32% median regression. A/A null, same invocation (one strict-remote
+release-profile binary on `hz2`, 21 paired rounds): cold 0.998542
+[0.963435, 1.006618]; warm 1.003926 [0.991398, 1.010064].
+
+**Decision: REJECT / NO-SHIP.** Comparison class: SELF-SPEEDUP diagnostic.
+
+- **Retry predicate:** restate of the ledger prose — retry only after profiling
+  shows BLOCKMAX open cost has grown to a material share of the query path
+  (larger live-term counts or wider postings), and only against the same
+  null-controlled sealed-corpus cell.
+
+### 2026-09-04 — WASH (backfilled): postings-accumulation temp-Vec elimination produces no measurable throughput change (E8-H W2.2, bd-e8h-w2-postings-accumulation-3onsu)
+
+Backfilled by the quill-e9.3 sweep; the ledger-of-record to date is
+`docs/evidence/e8h-hypothesis-ledger.md` (W2.2 row), which carried the verdict
+and ratios but no NEGATIVE_EVIDENCE twin. Quoted result: base 60,361.7
+[59,987.3, 60,889.1] vs candidate 60,375.7 [59,571.3, 61,156.8] docs/s —
+"Eliminating 463k temp allocations per census run produced NO measurable
+throughput change". Null floor, same invocation: candidate median 60,375.7 docs/s sits inside the base 95% CI [59,987.3, 60,889.1]. "A/B VERDICT: **WASH — REJECT as a perf lever**". The
+allocation-hygiene change itself stays landed but "not counted as a campaign
+win anywhere".
+
+**Decision: WASH / REJECT as a perf lever.** Comparison class: SELF-SPEEDUP
+diagnostic.
+
+- **Retry predicate:** none for this site (settled) — recorded verbatim from
+  the hypothesis-ledger row. Note: this is the program's one deliberate
+  predicate-less terminal record; the e8h header rule ("rejects require a
+  retry-condition predicate — never later") is satisfied here only in the
+  terminal sense that the site is closed.
+
+### 2026-09-04 — CORRECTION (ledger-coverage backfill): E5.6 string Range/Glob term-expansion snapshot memoization lives only in its bead comment (bd-quill-e5-delta-nnqf.6)
+
+Backfilled by the quill-e9.3 sweep so document-ledger readers can find a
+measured, reverted lever that was previously recorded only in a bead comment.
+The measuring author's framing is preserved verbatim: the ledger-of-record for
+this experiment was its bead comment
+(`.beads/issues.jsonl:1066`, comment id 1739, 2026-07-24: "This bead-comment is
+the ledger-of-record (docs/NEGATIVE_EVIDENCE.md has another agent's uncommitted
+rows I won't entangle)"). Quoted result: "OLD sweep 53,158,025,682 vs NEW sweep
+52,467,454,424 => NEW -1.30% (decidable, but marginal)"; "DECISION: reverted
+the cache (byte-identical but below the perf bar)". No A/A null was recorded in
+the source-of-record; this entry adds no new measurement and makes no new
+claim.
+
+**Disposition of record: the memoization cache was reverted; output
+byte-identical; effect below the perf bar.**
+
+- **Retry predicate:** verbatim from the bead comment — "RETRY PREDICATE: only
+  if (a) a real workload profiles snapshot_string_range_terms/snapshot_glob_terms
+  as a >=1% hotspot ... or (b) pursued as throughput/CPU-waste reduction under
+  concurrent fan-out load".
