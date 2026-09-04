@@ -286,7 +286,7 @@ Pipeline summary:
 Query
   -> canonicalize
   -> classify
-  -> fast embed + lexical BM25
+  -> fast embed + Quill BM25 (default lexical)
   -> RRF fusion (initial)
   -> quality embed (top candidates)
   -> blend (and optional rerank)
@@ -700,6 +700,8 @@ fails closed when the two registered models are absent unless
 | Negation queries (`-term`) behave unexpectedly | missing text provider in convenience path | use `search_collect_with_text`/`search(...)` with text callback |
 | Output parsing issues in automation | wrong format for downstream parser | use `--format jsonl` or `--format toon` consistently |
 | High memory usage | large index + quality/rerank/ANN enabled | feature set, f16 defaults, ANN config, corpus scope |
+| Legacy or foreign lexical layout detected at open | pre-flip Tantivy directory or damaged FSLX segment | rebuild-on-detect re-derives the Quill index from canonical storage; foreign layouts are typed errors, `fsfs doctor` reports the lexical subsystem |
+| `fsfs doctor` reports `semantic.quality_generation` as a warning | quality model absent at index time, so the generation is fast-only | install and verify `all-minilm-l6-v2`, then re-index (Quick Start); searches stop at `INITIAL` until then |
 
 ## Sequence Diagram (Mermaid)
 
@@ -761,10 +763,10 @@ These are crate feature flags from `frankensearch/Cargo.toml`:
 |---|---|---|
 | Fastest dev loop / CI smoke checks | `default` (`hash`) | zero model downloads, minimal deps |
 | Better semantic quality without lexical | `semantic` | enables `hash + model2vec + fastembed` |
-| Hybrid retrieval (semantic + BM25) | `hybrid` | adds lexical precision on top of semantic recall |
+| Hybrid retrieval (semantic + BM25) | `hybrid` | adds the Quill BM25 lexical arm (the post-flip `lexical` default) on top of semantic recall |
 | Persistent local indexing | `persistent` | `hybrid + storage` for durable metadata/queues |
 | Durable + self-healing stack | `durable` | `persistent + durability` |
-| Native lexical engine | `quill` | pure-Rust Quill BM25 engine (recommended lexical path) |
+| Lexical-only library build | `quill` | pure-Rust Quill BM25 engine alone; since the flip, the `lexical` feature already selects Quill |
 | Tantivy oracle/migration lane | `lexical-tantivy` | explicit Tantivy-backed lexical path; `cass-compat` aliases it for external CASS schema-v8 interop |
 | Full capability surface | `full` | `durable + rerank + ann + download + graph + api` |
 | Full stack + FTS5 storage backend | `full-fts5` | `full + fts5` for advanced local SQL FTS paths |
@@ -789,6 +791,7 @@ cargo build -p frankensearch --features full-fts5
 Best for interactive UX where fast first answer matters most.
 
 ```bash
+export FRANKENSEARCH_PRESSURE_PROFILE=strict
 export FRANKENSEARCH_FAST_ONLY=true
 export FRANKENSEARCH_QUALITY_WEIGHT=0.7
 export FRANKENSEARCH_RRF_K=60
@@ -819,6 +822,7 @@ Operational effect:
 Best for constrained laptops or multi-tenant CI hosts.
 
 ```bash
+export FRANKENSEARCH_PRESSURE_PROFILE=strict
 export FRANKENSEARCH_FAST_ONLY=true
 export FRANKENSEARCH_QUALITY_TIMEOUT=200
 export FRANKENSEARCH_HNSW_THRESHOLD=200000
@@ -876,6 +880,10 @@ host-specific env var drift.
 | FSFS runtime orchestration | [`crates/frankensearch-fsfs/src/runtime.rs`](crates/frankensearch-fsfs/src/runtime.rs) | Command dispatch, search/index execution, stream emission |
 | Shared TUI shell | [`crates/frankensearch-tui/src/shell.rs`](crates/frankensearch-tui/src/shell.rs) | Reusable shell loop/navigation/overlay plumbing |
 | Ops telemetry storage | [`crates/frankensearch-ops/src/storage.rs`](crates/frankensearch-ops/src/storage.rs) | Control-plane telemetry persistence/materialization |
+| Native lexical engine | [`crates/frankensearch-quill/src/index.rs`](crates/frankensearch-quill/src/index.rs) | Quill index lifecycle: seal/flush, FSLX segments, MaxScore/block-max WAND clause thresholds |
+| Quill query execution | [`crates/frankensearch-quill/src/argus.rs`](crates/frankensearch-quill/src/argus.rs) | BM25 query execution, sealed cursors, block-max pruning |
+| Quill postings codec | [`crates/frankensearch-quill/src/quiver.rs`](crates/frankensearch-quill/src/quiver.rs) | Posting blocks and per-block block-max entries (`encode_with_block_max`) |
+| Quill differential gauntlet | [`crates/frankensearch-quill-gauntlet/src/runner.rs`](crates/frankensearch-quill-gauntlet/src/runner.rs) | Conformance/perf witness certifying Quill against the pinned Tantivy oracle |
 
 ### Glossary
 
@@ -887,6 +895,9 @@ host-specific env var drift.
 | `RefinementFailed` | Graceful degradation event when Phase 2 errors/times out |
 | RRF | Reciprocal Rank Fusion combining lexical + semantic rank lists |
 | BM25 | Lexical ranking function used by the lexical backends (Quill and Tantivy) |
+| FSLX | Quill's on-disk segment format: framed sections (TERMDICT, POSTINGS, POSITIONS, BLOCKMAX, DOCLEN, IDMAP, IDHASH) with reference validation |
+| Delta segment | Quill lightweight segment carrying a generation's upserts/deletes against a base; visibility is delta-resolved at read time |
+| Concat-merge | Quill segment merge mode that concatenates same-shape term streams without re-encoding (vs compacting tombstoned rows) |
 | FSVI | On-disk vector index format used by frankensearch-index |
 | `f16` quantization | Half-precision storage mode reducing memory footprint |
 | `TwoTierIndex` | Wrapper over fast and optional quality vector indexes |

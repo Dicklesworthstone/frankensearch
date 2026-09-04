@@ -229,6 +229,8 @@ cargo test --workspace --all-features
 | `frankensearch-embed` | Hash embedder determinism, Model2Vec tokenization + pooling, FastEmbed ONNX inference, auto-detection fallback chain |
 | `frankensearch-index` | FSVI binary format round-trip, f16 quantization fidelity, SIMD dot product correctness, top-k heap ordering, NaN handling |
 | `frankensearch-lexical` | Tantivy schema creation, document indexing, BM25 query parsing, search result ranking |
+| `frankensearch-quill` | FSLX section round-trips, BM25 scoring contracts, block-max bound math, delta visibility/tombstones, keeper compaction and concat-merge (gate excludes this crate from the workspace lib run: `--exclude frankensearch-quill-gauntlet` covers the gauntlet, quill itself runs in the lib stage) |
+| `frankensearch-quill-gauntlet` | Differential conformance vs the pinned Tantivy oracle, scaled corpora, perf evidence assembly and ratchet (excluded from the workspace lib-test lane; own test binaries) |
 | `frankensearch-fusion` | RRF score calculation, 4-level tie-breaking, score normalization, two-tier blending, candidate budgeting |
 | `frankensearch-rerank` | Cross-encoder scoring, sigmoid activation, pipeline integration |
 | `frankensearch-storage` | SQLite schema bootstrap, dedup/content hashing, metadata persistence, embedding queue correctness |
@@ -415,6 +417,9 @@ Do **not** "fix" a registry rename by adding a bare `version` to a git-style dep
 | Top-k search (1K vectors) | <1ms |
 | Top-k search (10K vectors) | <15ms |
 | Top-k search (100K vectors) | <150ms (with rayon) |
+Measured envelopes for the receipt-backed rows live in `docs/evidence/perf/*.json` and
+`docs/PERF_LEDGER.md`, summarized in the README "Baseline Performance Envelope" table; where a
+receipt supersedes a budget above, the README table is authoritative.
 
 ### Key Design Decisions
 
@@ -430,6 +435,11 @@ Do **not** "fix" a registry rename by adding a bare `version` to a git-style dep
 - **Rayon for data parallelism** — CPU-bound vector dot products use rayon's work-stealing; this composes with asupersync tasks
 - **Cancel-correct lifecycle** — background workers use asupersync regions, channels use two-phase reserve/commit
 - **LabRuntime for deterministic tests** — virtual time, DPOR schedule exploration, correctness oracles
+- **Quill is the default lexical backend everywhere** — facade `lexical = ['quill']` since d117ce1f; `lexical-tantivy` is the pinned conformance oracle/interop lane, never a runtime fallback (owner ruling 2026-09-01)
+- **FSLX segments are framed, reference-validated sections** — TERMDICT, POSTINGS, POSITIONS, BLOCKMAX, DOCLEN, IDMAP, IDHASH; every term's spans are contiguity-checked
+- **Delta-visible indexing** — upserts/deletes land in delta segments resolved against the base at read time; compaction re-encodes surviving rows while concat-merge concatenates same-shape streams without re-encoding
+- **Block-max pruning uses exact bounds** — per-block entries (minted by `quiver::encode_with_block_max`, scored via `contract::block_max_score`) prune MaxScore (2-8 clause) and block-max WAND (9+) direct-term unions; grouped unions stay postings-only
+- **Blue-green lexical directories with an atomic CURRENT pointer** — readers resolve the active engine dir; foreign or damaged layouts are typed errors
 
 ---
 
