@@ -1,5 +1,360 @@
 # Bridge Plan: frankensearch
 
+## Current assessment — 2026-09-04
+
+This section supersedes the September 2 assessment retained below. It is the
+current bridge plan, revised in place by ChartreuseCarp for the owner's full
+`reality-check-for-project` request. Source inspected:
+`dbc459038b17329f741c40d167aab695946d9e96` on `main`. The pre-existing untracked
+`fsfs_config_loaded_event_roundtrip_v1.golden.actual.json` was left untouched.
+During final review, fast-forwarded the concurrent upstream changes to
+`fe821ca38b64d3a3b6b0bda28d0976cdab3dc5f1`, read their AGENTS/source/gate diff,
+and imported the unchanged JSONL. Those changes add non-Unix compilation
+support with typed unsupported-platform behavior and a cross-target gate.
+They do not alter the inspected fsfs refinement/watch paths. The attempted core
+test invocation remains bound to the earlier source; no later-source test
+claim is inferred.
+
+**Verdict:** frankensearch is a functioning local semantic-search library and
+CLI, with a released two-tier product. It is not finished against the complete
+documented vision. The most consequential remaining problems are product
+refinement-policy wiring, concurrent watch/search, composite generation
+consistency, platform delivery, and proof of relevance and competitive
+performance. A completed bead is not evidence that all those outcomes hold.
+
+**Scope and precedence.** Read the suite and repository AGENTS files and the
+root README completely, then the Quill plan, architecture documents, bridge
+plan, and the design/contract/runbook corpus under `docs/`. Source behavior and
+executed artifacts determine implementation status. The September 1 owner
+ruling makes Quill the default independently of its unfinished performance
+campaign; old flip prerequisites do not reverse that decision. The September 2
+ops decision keeps the control plane experimental. Distributed native mode is
+an explicitly future design, not an implicit new release obligation. No gate,
+quality threshold, or feature promise is weakened by this assessment.
+
+### Evidence collected in this audit
+
+All local audit logs use prefix `/tmp/frankensearch-reality-20260904-`.
+They are retained diagnostic artifacts, not repository test fixtures.
+
+| Evidence | Result and precise scope |
+|---|---|
+| Live GitHub release API, `release.json` | Latest binary release is `v1.8.0`, published September 2. Full assets: Linux x86_64 GNU and Apple Silicon macOS. Four explicitly named lite assets; no Windows or full Linux ARM artifact. |
+| Downloaded GNU archive and its published checksum | SHA check passed; extracted binary SHA-256 `31ae0852163455698aa37e47219c8c8b1b3e3d4ce07d43ec88914d3dbe2c86e5`. The binary's build source revision was not independently attested. |
+| `full-quickstart.log` | `scripts/check_fsfs_executable_quickstart.sh --binary <downloaded-full-fsfs> --keep-artifacts` passed using manifest-verified cached models. Two index runs terminated; three documents; correct hybrid rank 1. |
+| `/data/tmp/fsfs-quickstart.r9pYxUa9` | Both fast and quality FSVIs and their FEC sidecars exist; sentinel says `vector.quality_tier.built`; actual JSON search phase is `refined`, with `retry.md` first and both retrieval sources contributing. |
+| `stream.jsonl` | Live release emitted Initial-ready, three result records, Refined-ready, three result records, and completed terminal. This is actual phase delivery, not just a configuration flag. |
+| `watch/summary.json`, `watch/search.stdout` | While the release watcher remained alive, a separate `search --no-daemon` exited 2 with `fsvi.map_lock`. The watcher subsequently exited 0 on SIGINT. Reproduces `bd-z2nfa`. |
+| `timeout50.{toml,status.json,jsonl,timing.jsonl,stderr}` | With cache disabled, status confirmed `quality_timeout_ms=50`. Real GNU release stream delivered Initial-ready at 2.846 s, Refined-ready at 3.264 s (about 418 ms later), then exit 0 without a timeout. Corroborates the source finding; cold preparation/scheduling are included, so this is not a latency benchmark or injected-hang proof. |
+| `quickstart.log` | This machine's installed `~/.local/bin/fsfs` is lite; it refused semantic indexing with model-unavailable exit 78 despite cached models. Correct capability refusal; not a full-release regression. |
+| `core-test.log` | First fresh source test attempt refused by RCH before execution, exit 103: capacity/project exclusion. `NO_VERDICT`. |
+| `core-test-retry.log` | `RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --locked -j 2 -p frankensearch-core --lib` admitted to `vmi1152480`. Stopped after 25 minutes compiling dependencies, before any test output: `NO_VERDICT`. RCH job `30006205099278384` cancellation completed at 21:36:43 UTC; two slots released, cleanup confirmed, no active job. Local wrapper exit 143; RCH cancellation history exit 130. |
+| Keyword and Rust AST scan | No `todo!`/`unimplemented!` implementation macros found in the searched crate/facade source. This does not prove wiring, completeness, or absence of dormant modules. |
+
+The real-model smoke replay was:
+
+```bash
+FRANKENSEARCH_MODEL_DIR=/home/ubuntu/.local/share/frankensearch/models \
+  scripts/check_fsfs_executable_quickstart.sh \
+  --binary /tmp/frankensearch-reality-20260904-release/fsfs --keep-artifacts
+```
+
+The quick-start script prints its own checkout's `git rev-parse HEAD` even
+with `--binary`; that value must not be presented as the downloaded binary's
+build revision. Its dependency-tree check likewise describes the checkout.
+The release behavior above and source inspection below are separate proofs.
+The full workspace quality gate was not rerun for this documentation/Beads
+change. No compiler, clippy, formatting or source-test pass is claimed from
+the cancelled build. `git diff --check` passed for the assessment changes.
+
+### Vision checklist and bead coverage
+
+`WORKING` below is limited to the observed release workflow. `IMPLEMENTED`
+means code and relevant tests were inspected, with no fresh comprehensive
+execution claim. `PARTIAL` names an observed gap. `UNPROVEN` means the wider
+promised result lacks sufficient current evidence. Historical receipts retain
+their original source, host, model, and corpus scope.
+
+| Goal | Current reality and source | Remaining work / bead |
+|---|---|---|
+| V1: A usable semantic install on supported platforms | PARTIAL. Full Linux release works; installer has explicit lite and typed unsupported-target behavior. Live asset matrix is narrower than older packaging contracts. | `bd-fsfs-cross-platform-semantic-installer-46z3u`; Windows/macOS generation qualification beads where applicable. |
+| V2: Index once, publish two semantic tiers, exit | WORKING for released GNU binary with cached models; runtime builds both FSVIs. The September 2 “unreleased” claim is obsolete. | Atomic multi-artifact publication remains V12; A5 quick-start proof remains open. |
+| V3: Fast Initial, later Refined or explicit failure | WORKING on live CLI and JSONL; library `TwoTierSearcher` implements both phases. TUI has real lexical/fast/quality refresh functions, but no fresh terminal interaction proof here. | Product deadline gap G2; real cross-surface checks in G1/G2 and E6.7. |
+| V4: Configurable 70/30 quality/fast blending | PARTIAL, newly uncovered. Library `blend.rs` implements normalized blending. fsfs `runtime.rs:8875` onward fuses quality candidates with lexical candidates again and merges the fallback tail. `quality_weight` is only reported in status. | `bd-fsfs-quality-weight-38u9y`. |
+| V5: Configured quality timeout and cancellation preserve Initial | PARTIAL, newly uncovered. Library wraps phase 2 in `timeout`; fsfs directly awaits quality embedding and does not consume `quality_timeout_ms` in search execution. | `bd-fsfs-quality-deadline-yrvjc`. |
+| V6: Agent output, streaming, explain, snippets | IMPLEMENTED; live JSONL phases verified. Rank/path explain resolution is present; unavailable BM25 substatistics are explicitly flagged. Tutorial `.kind=="hit"` filter matches no current stream records. | Documentation repair G3; blend explanations must change with G1. |
+| V7: Watch updates remain searchable by other processes | PARTIAL. Live GNU watch reproduces reader exclusion. In-process visibility is not cross-process visibility. | `bd-z2nfa`, `bd-ql03m`, `bd-fsfs-identity-bound-watch-staging-t9m9m`. |
+| V8: Append/delete/compact/flush/daemon | IMPLEMENTED in actual dispatch and handlers; prior lexical append/daemon-stop gaps landed. Both tiers receive updates. | Generation/lifecycle migration; no new duplicate implementation bead. |
+| V9: Truthful doctor/status and model diagnostics | IMPLEMENTED with manifest and loader checks; historical phantom-byte/WAL-warning fixes landed. Live release status corroborates model identities. | Preserve distinction between verified cache, compiled loader, loaded model, and indexed semantic space in A5/identity work. |
+| V10: Reusable facade, examples, feature composition | IMPLEMENTED: `IndexBuilder`, `open_hybrid`, real facade test and examples gate. Hash remains an explicit control/default minimal feature, not semantic proof. | Complete packaged-consumer matrix under `bd-8nqz.6`; do not infer latest registry publication from source manifests. |
+| V11: Quill default, parser/scoring/maintenance correctness | Default WORKING; broader conformance PARTIAL. Actual Quill execution, snapshot/delta/concat/compaction code exists. DIV-008..010 have typed witnesses; older prose divergences are not terminal census proof. | E6.4/.6/.7/.8.1, `bd-y7vz`, `bd-quill-flip-conformance-release-gate-0r2p`, `bd-quill-union-horizon-exactness-salej`. |
+| V12: One retained identity-bound composite generation | PARTIAL. Foundation APIs/tests exist, but fsfs still independently opens fixed fast/quality paths and checks a fingerprint before/after. This is not retained composite authority. | `bd-xomn.1`–`.4`, fixed-root publisher, retained snapshot, production migration and raw-API retirement beads. |
+| V13: Corruption repair, restart, stale-model recovery | IMPLEMENTED pieces, UNPROVEN as a complete composite lifecycle. Both vector FEC sidecars ship; repair budget and unprotected cases remain explicit. | `bd-p6z6`, `.3`, `.4`, `bd-3fy9`, `bd-a6zt`, immutable-generation lifecycle and retention-root beads. |
+| V14: Bounded scale, ANN, safe vector search | Exact SIMD/Rayon scan IMPLEMENTED. In-tree native HNSW is substantial code but no fsfs runtime consumer was found; optional registry ANN is a distinct feature. | `bd-kcek`; qualify product routing and recall before claiming native ANN use. |
+| V15: Optional real cross-encoder reranking | IMPLEMENTED and wired to refined fsfs head through native Frankentorch; unavailable/error paths carry explicit state. Historical release receipt exists, not freshly timed here. | Preserve ordering and source explanations in G1; no duplicate reranker implementation. |
+| V16: Native embedding without ONNX | NOT COMPLETE. Quality embedding still uses FastEmbed/ORT; native reranking does not establish native embedding. | `bd-2ba5`. |
+| V17: Actual quality advantage of hybrid/refinement | UNPROVEN broadly. Treasure Island and executable known-item checks are useful; Python BEIR proxy results and finite/nonzero nDCG assertions do not prove current Rust stage gains. | E6.6/.7, extended with explicit fast/quality/lexical ablations and real serving surfaces. |
+| V18: Measured latency, memory, index cost | Scoped receipts exist in `docs/evidence/perf/`; README explicitly calls them reference envelopes. They do not establish an SLA across hosts/corpora or cold starts. | Maintain source/host/corpus-qualified rows; any new optimization needs measured hotspot and incumbent evidence. |
+| V19: Competitive Quill targets QG-1..10 | UNPROVEN. All ten `activated` entries remain false. Historical self-speedups and quarantined ratios cannot satisfy the frozen targets. | Existing E8/E8-H, `bd-h6eh`; owner decision already permits Quill default without inventing a performance win. |
+| V20: Real host integrations | Library adapters exist; complete current cross-repo adoption/recovery evidence is not established by this checkout audit. | CASS `bd-cass-semantic-cross-repo-receipt-91k2`, `bd-q4rg`, total lexical contract; host-owned migration evidence for xf/Mail. |
+| V21: Privacy, scope, pressure, deterministic operation | IMPLEMENTED policy/guard/serialization modules and tests; full production fault/replay envelope UNPROVEN here. Schema fixtures are not live enforcement proof. | Existing safety/identity/recovery work; fast-only `bd-k7x34` has fresh source activity and must be verified before closure. |
+| V22: Real quality/release gate | DSR real-host `quality-gate.sh` exists; GitHub Actions intentionally disabled. A5 remains broader than the current positive quick-start. | Update A5's obsolete workflow ownership and add the missing phase/negative/provenance checks to the real-host lane. |
+| V23: Cohesive docs and no dormant-source confusion | PARTIAL. Architecture diagrams, watch tutorial, stream selector, Python quality-default prose, packaging matrices, and ops pilot claims have current/historical scope drift. | `bd-active-guidance-repair-4sdod`; `bd-d7xk1` remains the existing orphan disposition task. No file deletion authorized. |
+| V24: Ops/distributed expansion | Ops is EXPERIMENTAL by owner decision; distributed mode is FUTURE DESIGN. Mock UI fixtures cannot prove production telemetry or human usability. | Preserve explicit non-shipping scope; do not manufacture release blockers or a new platform program. |
+
+### Bridge work, ordered by user impact
+
+**G1 — Make fsfs refinement honor the configured blend.** Use the library's
+semantic normalization/blend rules, then the appropriate lexical fusion,
+without blending already-fused RRF numbers as if they were cosine scores.
+Preserve candidate coverage, lexical-only tails, filters, ties, rerank ordering,
+and accurate explain payloads. A disagreement corpus must distinguish weights
+0, 0.7, and 1. Both client/daemon transport and cache identity must preserve the
+effective policy. Acceptance includes direct CLI, stream, daemon and TUI paths,
+not a helper-only test. This is a correctness/capability change, not a claimed
+quality gain. Initial coverage search found no active bead owning it.
+
+**G2 — Enforce the fsfs quality deadline.** Apply the resolved
+`search.quality_timeout_ms` at the actual refinement boundary. Keep Initial
+available on timeout, emit a typed sanitized `RefinementFailed`, and propagate
+caller cancellation separately. A timer around a future that blocks inside a
+single poll is insufficient: inspect the real inference boundary and use the
+existing structured-concurrency facilities without detached tasks. Test a
+cooperatively delayed provider and the real loader/inference path, repeated
+timeouts, late-result rejection, and clean shutdown. Initial coverage search
+found no active bead owning this product wiring.
+
+**G3 — Repair active guidance with executed examples.** Revise existing docs
+in place. Correct the watch tutorial's second-terminal claim to current
+behavior and link its actual fix; correct stream selection to the real frame
+shape; provision models in loader-profile tutorials; reconcile architecture
+and packaging descriptions with their actual lane/source. Label historical
+Python relevance/default claims and synthetic ops pilot measurements honestly.
+Do not change promised feature requirements to make implementation appear
+complete. Generated run plans must be changed through their generator/contract,
+and performance targets remain unchanged.
+
+**G4 — Finish watch/search through immutable publication.** Reuse `bd-z2nfa`
+and the identity-bound watch/generation tasks. A durable immutable snapshot lets
+readers pin generation N while a writer prepares N+1; merely reducing debounce
+or adding reader retries does not fix a lifetime-exclusive writer. Require
+cross-process insert/update/delete visibility while the watcher and query
+daemon stay alive, bounded publish lag, complete fast/quality/lexical membership,
+and restart recovery. Promote user-facing concurrency above optional native
+inference work. Preserve `bd-ql03m` as the separate existing-index startup
+regression until its own probe passes.
+
+**G5 — Finish composite identity and recovery.** Keep one production migration
+path: fixed-root publication → retained composite snapshot → product/library
+writers and readers → watch/lifecycle/cache/retention consumers. The existing
+foundation beads already describe authority, anti-rollback, held handles,
+declared roles, platform qualification, and adversarial tests. Add no parallel
+manifest/receipt architecture. Closure needs mixed-generation rejection,
+failure at every publication boundary, readers pinned across replacement,
+model-revision mismatch, and clean restart with original data retained.
+
+**G6 — Prove delivery, not just buildability.** Reuse platform installer and A5
+beads. Separate full loader, full embedded, and lite capabilities; each claimed
+platform must actually install, index, and search with verified models. Keep
+typed unsupported outcomes explicit. A5 must check quality artifact, both
+observed phases, vector-only semantic retrieval, exact binary provenance or
+explicit unknown provenance, and intended failures. Crate publishing remains
+a separate package/consumer proof; do not close registry blockers on a binary
+release or authorize publication through this audit.
+
+**G7 — Prove quality and conformance at the serving boundary.** Extend E6.7
+rather than invent another evaluation system. Reuse its qrels, metrics,
+bootstrap and provenance machinery. Compare lexical, fast semantic, Initial,
+Refined and optional reranked outputs on identical documents/queries. Retain
+per-query and per-slice regressions, empty/fallback cases, model identities,
+candidate budgets and cache warmup history. Compare Quill and the pinned
+Tantivy oracle as the existing task requires. Statistical acceptance must be
+fixed before measurement; no retuning on the evaluation set or promise that
+refinement necessarily wins. TUI/CLI agreement is a contract test, distinct
+from relevance superiority.
+
+**G8 — Complete the existing performance campaign honestly.** Use E8/E8-H's
+registered-host, current-binary, live-incumbent, paired-control protocol. Start
+with admissible measured gaps, rank levers by recoverable end-to-end cost, and
+retain misses/no-verdicts. The September 3 product/library latency receipts
+are useful baselines but do not activate Quill competitive gates. Do not
+retime this shared loaded host or multiply harness work because a gate is
+currently unavailable.
+
+**G9 — Finish the remaining optional scope deliberately.** Native ANN routing
+and native embedding retain their existing owners and receipts. Ops/distributed
+features stay explicitly experimental/future. Dormant files stay on disk until
+the owner authorizes the exact disposal; their mere presence is not a runtime
+stub. Host migration proof must come from the actual consuming repository.
+
+### Would completing the existing queue close the gap?
+
+**Not completely.** At the initial snapshot there were 1,138 closed, 94 open,
+40 in progress, 6 blocked and 4 deferred beads. Existing work covers most
+hard architecture, installer, conformance and performance obligations, but
+does not explicitly own the fsfs blend/deadline wiring discovered above.
+Several formerly missing features have landed while older plan rows and bead
+language still say otherwise. Completing tasks by their current prose could
+also miss real serving-route quality proof and perpetuate obsolete CI/docs
+assumptions. New G1/G2/G3 tasks plus targeted amendments to existing owners
+close the identified planning holes; they do not guarantee an unexamined bug
+cannot exist or a frozen performance target is achievable.
+
+### Phase execution record
+
+- Phase 1: document, source, Beads and shipped-binary assessment completed.
+- Phase 2: current vision checklist and bridge work recorded above.
+- Phase 3a: applied the skill's frozen bead-generation prompt verbatim, then
+  reapplied it after the ambition rounds. Reused existing ownership and kept
+  implementation plus its tests in the same bead, as required by suite
+  Work-Graph Discipline. Phase 3b is the alternative for work without Beads;
+  this project uses the prescribed Beads path.
+- Phase 4: completed three ambition rounds, revising this plan in place.
+- Phase 5: completed five refinement passes and final graph checks, recorded
+  below. No implementation completion is inferred from this planning work.
+
+### Ambition round 1 — shared user semantics
+
+The first revision asks whether a user gets the same policy when moving from
+one-shot CLI to a warmed daemon or interactive TUI. Reading the actual serving
+types found that `SearchServeRequest` carries rerank but neither blend weight
+nor quality deadline; `SearchCacheKey` likewise lacks those settings. TUI also
+has an explicit one-token lexical-only shortcut. Therefore helper-level blend
+tests cannot close V3–V5. The new tasks own policy transport/cache behavior
+alongside their implementations. E6.7 must compare real serving routes, single-
+and multi-token queries, requested versus realized modes, and cold versus warm
+adaptive state. A non-PTY `fsfs tui` falls back to status and is not TUI proof.
+
+Use a small matrix of behaviorally distinct cases instead of a combinatorial
+new test framework: complete/missing/failed quality, fast-only/full, direct/
+daemon/TUI, cold/warm/replaced generation. Every fixture must name the actual
+operation exercised and the observable result that could falsify the claim.
+
+### Ambition round 2 — measure the value of each delivered stage
+
+A Refined event proves a stage ran, not that results improved. Extend E6.7's
+existing real-model evaluation with lexical, fast semantic, Initial, Refined
+and reranked ablations on the same held-out queries and corpus. Keep paired
+per-query deltas and intervals, and separate identifier, prose, code, negation,
+partial-coverage and failure slices. Predeclare the statistical rule under
+E6.6; do not tune the blend or candidate budgets on the evaluation set. A
+negative refinement effect is an actionable result, not grounds to drop that
+slice. Distinguish conformance against Tantivy from superiority over an
+ablation; neither result implies the other.
+
+The same receipt must identify the actual serving route and realized policy.
+Library adaptive NQC history cannot be assumed to exist in fsfs. A warm daemon
+must not silently return an earlier weight's output. The final corrected-path
+E6.7 result therefore consumes G1/G2, while corpus construction and baseline
+diagnosis can begin beforehand. This adds no second benchmark framework.
+
+### Ambition round 3 — reduce the concurrency problem to one publication point
+
+Use the existing composite-generation design as the common solution to watch
+availability, model identity, cache invalidation and recovery. Publication is
+the linearization point: a query retains either complete generation N or
+complete generation N+1, never independently chosen lexical/fast/quality
+components. Readers of N must remain valid through replacement and retention
+cleanup. The existing staging and production-migration tasks already own this
+architecture; do not create an intermediate v1 WAL redesign in this plan.
+
+Strengthen the watch regression with an observable event timeline: source
+event, durable publication, fresh cross-process read, and eventual reclamation
+after old readers release. Report event-to-visible lag separately from the
+existing event-to-applied receipt. Crash/cancellation at build, seal, publish
+and install must leave an admissible generation and a bounded reconciliation
+path. Raise the reproduced watch bug to P1 and connect its regression to the
+existing staging owner without making every small product correction wait for
+the entire generation migration.
+
+For speed work, use existing stage profiles to bound the recoverable end-to-end
+cost before choosing a kernel lever. Neither exotic algorithms nor a larger
+test framework compensate for unwired policy, mixed snapshots or an invalid
+measurement window. Existing frozen competitive gates remain unchanged.
+
+### Regenerated beads and refinement record
+
+Reapplied the unchanged Phase 3a prompt after the three ambition rounds.
+Created only `bd-fsfs-quality-weight-38u9y`,
+`bd-fsfs-quality-deadline-yrvjc`, and `bd-active-guidance-repair-4sdod`.
+Amended E6.7, `bd-z2nfa`, A5 and `bd-2g2l` in place. A5's current owner is the
+DSR driver; its positive, negative, provenance and resource checks remain
+required. Existing documented binary-override/artifact-retention options are
+supported functionality, not forbidden aliases. No implementation bead was
+closed and no existing assignee was replaced.
+
+Each following pass applies the skill's unchanged Phase 5 prompt to the new
+and amended tasks and their adjacent dependency/vision coverage.
+
+1. **Dependencies and ownership.** Inspected the actual upstream/downstream
+   records. Added only E6.7 → blend and E6.7 → deadline as blocking edges,
+   naming the corrected production implementations required for final serving
+   conformance. Kept the repairs independently executable; generation work,
+   doc repair and optional native embedding do not become artificial blockers.
+   Tests stay with implementation. `br dep cycles` found zero active cycles;
+   it separately reports two historical closed-only cycles, left untouched.
+2. **Semantic boundaries and falsifiable tests.** Re-read `blend.rs` and
+   config validation. Endpoint rank reversal requires shared candidate
+   coverage: missing-source documents keep their own normalized score even
+   at the opposite endpoint. Added that requirement, tier-local index/ID
+   safety, one effective f64-to-f32 policy, and separate semantic-score versus
+   final lexical-fusion assertions. Deadline tests preserve the existing
+   49 ms rejection/50 ms minimum and use deterministic boundary scheduling.
+   No-quality Initial-only behavior remains distinct from timeout failure.
+3. **Execution proof and bounded failure.** The daemon buffers phase payloads;
+   an Initial item inside its final response does not establish low time to
+   first result. Added actual transport timing, inference occupancy/join,
+   shared-lock backpressure and transient-failure cache checks. A5 now
+   distinguishes checker source from executable provenance and must reject
+   missing quality/phase while preserving its original twelve RED cases.
+   Clarified cached-model smoke, non-PTY status and synthetic pilot evidence
+   limits in the documentation task.
+4. **Completeness without scope inflation.** Checked all 24 goals against the
+   amended queue and retained the generation, installer, recovery, host and
+   performance owners. New bead descriptions already contain their full test
+   matrices; added explicit closure checklists that include those requirements
+   so a newly appended boundary checkbox cannot appear to be the whole task.
+   Kept all seven documentation corrections, all original A5 failure cases,
+   existing user-visible features, and experimental/future scope distinctions.
+   No new test-only bead, architecture program or disposal authorization.
+5. **Convergence review.** Rechecked the final seven changed/new issue records,
+   their concrete source evidence, all exact IDs in this assessment, retained
+   feature obligations and hard-edge direction. No further planning change
+   was identified. `bv --robot-triage` reports 97 open, 40 in progress,
+   6 blocked, 4 deferred and 1,138 closed; 147 not closed. Its 46 actionable
+   graph nodes are not the same as `br ready`'s eight ready items. All three
+   new beads are ready. `bv --robot-plan` produced 17 tracks; these are graph
+   suggestions, not ownership or authorization. The sole new hard edges are
+   the two corrected-policy inputs to E6.7, with no active dependency cycle.
+
+**Recommended next execution:** resolve the ready blend/deadline product bugs
+with coordinated file ownership, and advance the existing watch/composite
+publication path. Extend A5 and E6.7 through their existing drivers. The native
+embedding and dormant-source items remain legitimate backlog work, but graph
+centrality alone should not put them ahead of reproduced product failures.
+No calendar completion estimate is asserted: platform qualification, real
+model execution, upstream integration and competitive measurements require
+their own terminal evidence.
+
+The final upstream refresh added a cross-target compilation stage. It is a
+compile guard, not native Windows generation qualification or a Windows
+release asset. The pre-existing platform-delivery/qualification tasks retain
+that work; this does not create another uncovered vision goal.
+
+**Coordination:** the audit held exclusive leases on this document and
+`.beads/issues.jsonl`; source files were not edited. Agent Mail inbox reads
+succeeded, but both start/final-routing sends timed out, so message delivery
+is unconfirmed. The plan and Beads are the durable handoff. Pre-existing golden
+output and derived Beads database/certificate changes are excluded from the
+scoped audit commit.
+
+---
+
+## Historical September 2 assessment (superseded)
+
+The original baseline and gap numbers below are retained for traceability.
+They are not current shipping status, current priorities, or current estimates.
+
 **Reality check:** `docs/evidence/reality-check-20260901.md` (Phase 1, 2026-09-01) and its §10–§11
 landings the same night. **This document is Phase 2:** the plan that closes every remaining gap
 between what README, AGENTS.md, and `COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md` promise
