@@ -1,6 +1,6 @@
 # Indexing a Rust project
 
-This walkthrough indexes a Rust workspace with `fsfs`, then verifies search quality quickly.
+This walkthrough indexes a Rust workspace with `fsfs`, then checks retrieval on a few queries.
 
 ## 1) Install `fsfs`
 
@@ -8,6 +8,25 @@ This walkthrough indexes a Rust workspace with `fsfs`, then verifies search qual
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankensearch/main/install.sh | bash -s -- --easy-mode
 fsfs version
 ```
+
+The ordinary installer selects a full semantic artifact when available, otherwise
+a loader-capable source build on supported platforms. A loader-capable binary
+needs model files before indexing. Acquire and explicitly verify both tiers:
+
+```bash
+fsfs download-models potion-multilingual-128m
+fsfs download-models all-minilm-l6-v2
+fsfs download-models potion-multilingual-128m --verify
+fsfs download-models all-minilm-l6-v2 --verify
+fsfs doctor
+```
+
+The first download is roughly 621 MB; a verified cache can be reused. Embedded
+builds supply those same model bytes. The explicit `--lite` profile omits the
+semantic loaders, so downloading models cannot turn it into a semantic binary.
+Ordinary Intel macOS installation currently returns `unsupported_platform`;
+`--lite` is an explicit model-free choice, not completion of this semantic
+walkthrough. See the [installation profiles](../../README.md#installation).
 
 ## 2) Index your repository
 
@@ -53,3 +72,7 @@ If the repository changes constantly, switch to watch mode:
 ```bash
 fsfs watch .
 ```
+
+The current watcher prevents searches from other processes while it holds the
+vector writer lock. Follow the [watch-mode limitation and shutdown steps](watch-mode-for-a-monorepo.md)
+before querying from a separate terminal.

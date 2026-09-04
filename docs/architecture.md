@@ -13,7 +13,7 @@ This document is the contributor-facing map of the current `frankensearch` works
 | `frankensearch-lexical` | Tantivy-backed lexical implementation, retained as the pinned conformance oracle (`lexical-tantivy`) and for external CASS schema-v8 interop (`cass-compat`); not in default builds |
 | `frankensearch-quill-gauntlet` | Differential conformance / metamorphic / perf gauntlet certifying Quill against the Tantivy oracle (`publish = false`) |
 | `frankensearch-fusion` | RRF fusion, blending, progressive two-tier search orchestration (`TwoTierSearcher`) |
-| `frankensearch-rerank` | Optional cross-encoder reranking: pure-Rust frankentorch `native` backend, optional FastEmbed/ONNX alternative; library feature only |
+| `frankensearch-rerank` | Optional cross-encoder reranking: pure-Rust frankentorch `native` backend used by the library and `fsfs search --rerank`; FastEmbed/ONNX is a separate optional library backend |
 | `frankensearch-storage` | FrankenSQLite metadata, dedup/content-hash, persistent embedding queue |
 | `frankensearch-durability` | RaptorQ repair trailer and protect/verify/repair workflows for Quill segments and FSVI |
 | `frankensearch-fsfs` | Standalone CLI/TUI search product (`fsfs`) built on library crates |
@@ -38,7 +38,7 @@ frankensearch-core
 frankensearch-quill  -> (core, index formats; optional durability)
 frankensearch-fusion -> (embed, index, optional quill/lexical/rerank)
 frankensearch-quill-gauntlet -> (quill, lexical as the pinned Tantivy oracle, fusion)
-frankensearch-fsfs   -> (core, embed, index, quill, storage, durability, tui; lexical only behind `shadow-oracle`)
+frankensearch-fsfs   -> (core, embed, index, quill, storage, durability, tui, optional native rerank; lexical only behind `shadow-oracle`)
 frankensearch-ops    -> (core, tui)
 frankensearch facade -> (core, embed, index, fusion, quill by default for `lexical`; optional lexical-tantivy/rerank/storage/durability)
 ```
@@ -50,6 +50,7 @@ graph TD
   core[frankensearch-core]
   embed[frankensearch-embed]
   index[frankensearch-index]
+  quill[frankensearch-quill]
   lexical[frankensearch-lexical]
   fusion[frankensearch-fusion]
   rerank[frankensearch-rerank]
@@ -62,6 +63,7 @@ graph TD
 
   core --> embed
   core --> index
+  core --> quill
   core --> lexical
   core --> fusion
   core --> rerank
@@ -71,20 +73,26 @@ graph TD
 
   embed --> fusion
   index --> fusion
-  lexical --> fusion
+  quill --> fusion
+  lexical -. explicit oracle or interop .-> fusion
   rerank --> fusion
 
   core --> facade
   embed --> facade
   index --> facade
   fusion --> facade
-  lexical --> facade
+  quill --> facade
+  lexical -. lexical-tantivy or cass-compat .-> facade
   rerank --> facade
   storage --> facade
   durability --> facade
 
   tui --> fsfs
   core --> fsfs
+  embed --> fsfs
+  index --> fsfs
+  quill --> fsfs
+  rerank -. rerank feature .-> fsfs
   tui --> ops
   core --> ops
 ```
@@ -96,20 +104,25 @@ graph TD
 ```text
 document
   -> canonicalize (NFC/cleanup)
-  -> embed (fast tier)
-  -> persist vectors in FSVI
+  -> embed (fast tier; also quality tier in ordinary fsfs indexing)
+  -> persist vectors in FSVI generations
   -> persist metadata/queue state in FrankenSQLite
-  -> optional lexical indexing via Tantivy
+  -> lexical indexing via Quill (facade lexical feature; always in fsfs)
 ```
 
 ### Query path
+
+The following is the library's `TwoTierSearcher` pipeline. `fsfs` has a separate
+orchestrator in `crates/frankensearch-fsfs/src/runtime.rs`; its command, daemon,
+cache, streaming, and TUI paths must wire each policy explicitly. A library
+builder or default alone does not establish product behavior.
 
 ```text
 query
   -> parse + classify
   -> embed query (fast tier)
   -> search vector index (FSVI; optional ANN)
-  -> search lexical index (Tantivy)
+  -> search lexical index (Quill by default; explicit Tantivy interop supported)
   -> RRF fuse
   -> emit initial results
   -> embed/refine with quality model
@@ -124,7 +137,7 @@ Mermaid search flow:
 flowchart TD
   q[Query] --> c[Canonicalize + Classify]
   c --> fe[Fast Embed]
-  c --> lx[Tantivy Lexical Search]
+  c --> lx[Quill Lexical Search]
   fe --> vs[Vector Search FSVI]
   vs --> rrf[RRF Fusion K=60]
   lx --> rrf
@@ -145,7 +158,7 @@ The architecture intentionally separates speed and quality:
 Practical effect:
 
 - better perceived latency for users and agent workflows
-- better final ranking than fast-only approaches
+- an opportunity to improve final ranking, subject to corpus-specific quality evaluation
 - graceful degradation when quality models are missing or fail
 
 Progressive API contract:
@@ -154,14 +167,18 @@ Progressive API contract:
 - `SearchPhase::Refined`
 - `SearchPhase::RefinementFailed`
 
-This is implemented in the fusion/searcher lane and exposed to consumers through the facade and fsfs surfaces.
+The facade exposes the library phases. `fsfs` emits its own corresponding phase
+artifacts and `fsfs.stream.query.v1` events. Native cross-encoder support is
+compiled by its default `rerank` Cargo feature, but scoring is opt-in through
+`fsfs search --rerank` or `search.rerank`. Provision its model with
+`fsfs download-models ms-marco-minilm-l-6-v2`.
 
 ## 4) Storage Model
 
 Three storage concerns are explicitly separated:
 
 1. Vector storage: FSVI files (`frankensearch-index`)
-2. Lexical storage: Tantivy index (`frankensearch-lexical`)
+2. Lexical storage: Quill FSLX segments (`frankensearch-quill`); Tantivy layouts are confined to the explicit oracle/CASS interop lane
 3. Metadata/job state: FrankenSQLite (`frankensearch-storage`)
 
 Why split:
@@ -219,7 +236,8 @@ Start with these files:
 - `crates/frankensearch-core/src/lib.rs` (contracts/types)
 - `crates/frankensearch-fusion/src/searcher.rs` (progressive orchestration)
 - `crates/frankensearch-index/src/lib.rs` and `crates/frankensearch-index/src/two_tier.rs` (vector index/search)
-- `crates/frankensearch-lexical/src/lib.rs` (BM25 integration)
+- `crates/frankensearch-quill/src/index.rs` and `src/argus.rs` (default lexical storage and BM25 execution)
+- `crates/frankensearch-lexical/src/lib.rs` (explicit Tantivy oracle/CASS integration)
 - `crates/frankensearch-fsfs/src/main.rs` + `crates/frankensearch-fsfs/src/adapters/cli.rs` (standalone product surface)
 
 Then inspect:
