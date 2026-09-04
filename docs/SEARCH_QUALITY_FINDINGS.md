@@ -1,19 +1,47 @@
-# Search Quality: Measured Findings & Recommendations
+# Search Quality: Historical Python Experiments and Current Implementation Scope
 
 A consolidated, prioritized roadmap distilled from the real-embedding + real-benchmark
 investigation recorded in `NEGATIVE_EVIDENCE.md` (commits `3833955`→, IronPetrel, 2026-07-02/03).
-Every number below is measured — on real embeddings, real BEIR datasets (SciFact / NFCorpus /
-ArguAna) with real relevance judgments, and Tantivy's real BM25 ranking function (`rank_bm25`),
-via a pure-Python `model2vec` + `sklearn` harness (no cargo, no torch). "vs Tantivy" = vs the
-BM25 lexical tier frankensearch is built on.
+The numerical observations below are retained from those experiments on real
+embeddings, BEIR datasets, and relevance judgments. The retrieval harness uses
+Python `model2vec` and `rank_bm25`; it does **not** execute Tantivy, Quill, the Rust
+searchers, or `fsfs`. `rank_bm25` is a BM25 proxy, not Tantivy's implementation.
+The later stem/stop tokenizer improves that proxy's lexical analysis but does
+not establish engine parity. Historical timings and test counts retain their
+original scope and have not been remeasured here.
 
-## The verdict
+## Current implementation boundary (2026-09-04)
 
-frankensearch's **hybrid (lexical + vector via RRF) beats Tantivy-lexical-alone on semantic
-search** — and the single biggest lever is the **embedding model**, where the current default is
-measurably the worst option for English retrieval.
+- Quill is the default lexical backend; Tantivy is an explicit oracle/CASS
+  interoperability lane. These Python results do not certify Quill quality.
+- `TwoTierConfig::default()` selects `FusionStrategy::Rrf`, `rrf_k = 60`, and
+  `quality_weight = 0.7`. `PoolMinMax` is opt-in. Statements below proposing a
+  pool-min-max default describe the historical experiment, not the current default.
+- The library's `TwoTierSearcher` and `SyncTwoTierSearcher` install adaptive NQC
+  weighting by default, neutral through its 128-query warm-up. Both expose
+  `with_rrf_weights` and `with_rrf_tiebreak`; there is no missing builder plumbing
+  for those controls. The Python nDCG gains do not prove gains in either Rust path.
+- `fsfs` uses a separate orchestrator in `runtime.rs`; it does not inherit the
+  library's NQC state or fusion strategy. Its native reranker is available via
+  `search --rerank`, independently of these historical recommendations.
+- Current product quality validation belongs to the existing Rust paths and
+  `bd-quill-e6-gauntlet-scale-rm3q.7`. Real-model phase delivery is necessary but
+  does not establish a relevance improvement. Use labeled, held-out queries,
+  matched candidate coverage, and per-corpus paired comparisons before changing
+  ranking defaults; retain harmful or undecidable slices.
 
-## Recommendations, by leverage (all measured)
+Source: `crates/frankensearch-core/src/config.rs`,
+`crates/frankensearch-fusion/src/{searcher,sync_searcher}.rs`, and
+`crates/frankensearch-fsfs/src/runtime.rs`.
+
+## Historical experiment verdict
+
+The Python hybrid improved on its lexical proxy in the reported semantic
+retrieval experiments. Model choice produced large differences on those English
+datasets. Neither result is a live Rust-versus-Tantivy comparison or a universal
+guarantee that refinement improves ranking.
+
+## Historical recommendations, by experimental effect
 
 ### 1. Change the default embedder → a retrieval-distilled model. [biggest, ~free]
 - **What:** `DEFAULT_MODEL_NAME`/`DEFAULT_HF_ID` in `crates/frankensearch-embed/src/model2vec_embedder.rs:35`
@@ -30,7 +58,7 @@ measurably the worst option for English retrieval.
   A contextual model (`BAAI/bge-small-en-v1.5`) beats the best static on **all 3 BEIR datasets** —
   **+14% nDCG SciFact, +9.6% NFCorpus, +28.8% ArguAna** (ArguAna recall 0.698→0.841) — but embeds
   **~650× slower** (transformer forward pass vs static lookup) and needs the onnxruntime. Since embed
-  cost is a one-time *index-build* cost (not per-query), contextual is the right premium for
+  documents are embedded at index time and each query also needs an embedding, contextual is a candidate premium for
   quality-sensitive, rarely-reindexed corpora. **The premium is largest exactly where static embeddings
   are weakest** (ArguAna's argument→counter-argument task, which needs contextual understanding of
   argumentative structure/negation that static mean-pooling can't capture). Tiered guidance:
@@ -42,7 +70,7 @@ measurably the worst option for English retrieval.
   (SciFact hybrid 0.834 vs BM25 0.776), ties on keyword-overlap ones. **Never worse than the best
   single tier by more than noise.** The vector tier alone beats real BM25 on all 3 datasets
   (including ArguAna, where BM25's long-doc length-penalty hurts it — a weakness embeddings lack).
-- **Exactly two tiers — one strong embedder + BM25. Do NOT ensemble multiple embedders.** Adding a
+- **Within this experiment: one strong static embedder + BM25, without a static-model ensemble.** Adding a
   second static embedder never helps and usually *hurts* (SciFact ret32+base32 0.769 < ret32 alone
   0.795; the triple 2-embedders+BM25 is worse than the pair on both datasets). The model2vec embedders
   are too correlated (a 2nd finds a doc the 1st misses in only ~3% of queries vs ~7% for BM25) *and*
@@ -111,10 +139,12 @@ both cross-encoders vs no-rerank, on all 3 BEIR datasets:
   shallow depth, still sanity-check the model per corpus — but RRF-combine makes the tier safe and tuning-free by
   default.** (Score-blend `α·reranker+(1-α)·retrieval`, α≈0.5, is the fallback if a non-RRF stage is combining.)
 
-### 5. int8 two-pass as the fast-tier primitive. [DONE — landed `39dd9be`]
-- On real embeddings int8 two-pass is **7.1× faster than flat exact @ recall 1.0**, and it's both
-  faster *and* exactly lossless vs 4-bit (the AVX2 `dot_i8_i8` kernel beats the 4-bit nibble-unpack).
-  Already swapped in `sync_searcher.rs` (820/820 fusion tests green).
+### 5. Historical int8 two-pass experiment (`39dd9be`)
+- The original record reported **7.1× faster than flat exact @ recall 1.0** on
+  its real-embedding workload and 820/820 fusion tests passing. That observation
+  is not an exactness guarantee for other corpora or a current performance result.
+  The present `SyncTwoTierSearcher` defaults to exact retrieval; the hidden
+  approximate int8 seam is reserved for isolated benchmarks/tests.
 
 ## Total measured uplift (recommendations 1+3, end-to-end hybrid)
 Refreshed with **all** validated retrieval-side knobs — retrieval-32M **@ dim-256** (`06fdef9`) + tier-weight 1.3 +
@@ -131,21 +161,22 @@ The compounding free/cheap changes (retrieval-distilled embedder + stronger-tier
 the semantic-search hybrid **+15-21% nDCG at zero inference cost** — ~3× the earlier estimate, which omitted the
 validated small-k and full tuning. (Add the optional reranker on top for the capstone's further gains.)
 
-## Capstone: FULL pipeline (1+3+4) vs Tantivy BM25-alone (one end-to-end run)
+## Historical Python capstone: pipeline (1+3+4) vs naive BM25 proxy
 
-> **⚠️ BASELINE CORRECTION (see `NEGATIVE_EVIDENCE.md`, "HEADLINE CORRECTION", 2026-07-04):** the "Tantivy BM25" baseline in
-> this table is the harness's **naive-tokenizer** `rank_bm25` (no stemming/stopwords), while production Tantivy's default analyzer
-> **stems + removes stopwords**. Against a *faithful* (stem+stop) BM25 baseline the dense tier's marginal value is only **+0.6–3.0%
-> nDCG / +0.5–5.3% recall** (mean ~+2.3%), not the +12–22% below — because stemmed-Tantivy-alone matches or *beats* the naive hybrid
-> on all 4 corpora (ArguAna: +13.3%). The hybrid still helps (near-free) and the reranker's absolute gains stand, but the headline
-> "% vs Tantivy" is inflated by an understated baseline. Priority order: a proper stem+stop analyzer first, dense tier as a modest
-> complement. Read the numbers below as **vs naive BM25**; the vs-production-Tantivy number is in the correction.
+> **Historical baseline correction (2026-07-04, `NEGATIVE_EVIDENCE.md`,
+> "HEADLINE CORRECTION"):** the baseline below uses naive-tokenizer
+> `rank_bm25` without stemming/stopwords. Adding stem/stop analysis to the Python
+> proxy changed the reported dense marginal value to **+0.6–3.0% nDCG /
+> +0.5–5.3% recall** (mean ~+2.3%), versus the +12–22% naive-baseline headline.
+> The stemmed proxy alone matched or beat the naive hybrid on all four corpora
+> (ArguAna: +13.3%). Neither comparison ran production Tantivy; read these
+> numbers as comparisons of the named Python configurations.
 
-The whole recommended stack — retrieval-32M + tuned RRF hybrid **+ RRF-combine reranker** — vs Tantivy BM25-alone,
-each stage's contribution shown (recall@10 / nDCG@10). This is the headline number, using the *shipped*
-`RerankCombine::RrfCombine` + `RrfConfig` weights (so it's expressible today; only defaults are product-gated):
+The experimental stack — retrieval-32M + tuned RRF hybrid **+ RRF-combine reranker** —
+is compared with the naive BM25 proxy, showing recall@10 / nDCG@10. Similar Rust
+configuration APIs exist, but this run did not exercise them:
 
-| BEIR | Tantivy BM25 | + hybrid | + RRF-combine rerank | full vs Tantivy |
+| BEIR | Naive BM25 proxy | + hybrid | + RRF-combine rerank | full vs proxy |
 |---|---|---|---|---|
 | SciFact | 0.776 / 0.652 | 0.816 / 0.684 | **0.872 / 0.731** | **+12% / +12%** |
 | NFCorpus | 0.152 / 0.306 | 0.159 / 0.327 | **0.167 / 0.346** | **+10% / +13%** |
@@ -153,29 +184,34 @@ each stage's contribution shown (recall@10 / nDCG@10). This is the headline numb
 
 The full-stack win is **largest on ArguAna (+22% nDCG)** — precisely because BM25 is structurally weakest there (its
 long-doc length penalty), a weakness the dense vector tier is immune to. Headline across 3 datasets: **+12% to +22%
-nDCG / +10% to +20% recall vs Tantivy BM25-alone.**
+nDCG / +10% to +20% recall vs naive BM25 proxy.**
 
-**Cost side (measured per-crate):** the hybrid's added latency over Tantivy-lexical-alone is just *vector search + RRF
+**Historical cost estimate (separate per-crate measurements):** the hybrid's added latency over lexical-only was estimated as *vector search + RRF
 fusion* (the BM25 tier is shared) = **~250-290 µs (int8 vector, 10k×384) + ~149 µs (fusion) ≈ < 1 ms/query** — near-free
 for the recall/nDCG win. The **reranker** is the only expensive stage (~ms/candidate cross-encoder inference →
 100 ms-1 s for a top-100 window; its RRF-combine reorder is itself µs), so it's a quality-vs-latency-gated polish, not a
-default cost. Net vs Tantivy: **large quality win, sub-ms hybrid latency, expensive-but-optional rerank.**
+default cost. These separate measurements omit query embedding and do not establish
+whole-product latency or a same-invocation performance win against Tantivy.
 
-### How to configure this pipeline today (shipped, default-preserving APIs)
-The capstone stack is expressible now — no default changes, all opt-in builders landed this session:
+### Library configuration example (not an executed capstone receipt)
+
+These builder calls express the experimental settings. The fragment assumes
+the named index, models, and lexical implementation have already been created;
+it is not a standalone runnable example or a claim that `fsfs` uses this recipe:
 ```rust
 use frankensearch_rerank::{RerankCombine, DEFAULT_RRF_COMBINE_K};
 // #1 embedder: load a retrieval-distilled static model (potion-retrieval-32M) as the fast/quality embedder.
 let searcher = TwoTierSearcher::new(index, retrieval_distilled_embedder, config) // config.rrf_k = 10.0  (#3 small k)
-    .with_lexical(tantivy_bm25)                                     // #2 two-tier hybrid
+    .with_lexical(lexical_index)                                    // Quill, or explicitly selected Tantivy interop
     .with_rrf_weights(1.0, 1.3)                                     // #3 up-weight the STRONGER tier (~1.3×)
     .with_rrf_tiebreak(RrfTiebreak::Hash)                          // #3 neutral tiebreak
     .with_reranker(cross_encoder)                                   // #4 corpus-appropriate cross-encoder
     .with_rerank_combine(RerankCombine::RrfCombine { k: DEFAULT_RRF_COMBINE_K }); // #4 RRF-combine (never pure-reorder)
 ```
-`SyncTwoTierSearcher` exposes the same `with_rrf_weights` / `with_rrf_tiebreak`. int8 fast-tier (#5) is already the
-default. The only thing not yet default is the *choice* of these values — flipping the shipped defaults to match is the
-remaining product-gated step.
+`SyncTwoTierSearcher` exposes the same `with_rrf_weights` / `with_rrf_tiebreak`.
+It currently uses exact fast retrieval. Selecting different ranking defaults
+requires actual serving-path evidence; availability of the builders is not that
+evidence.
 
 ## Gotchas ruled out (measured)
 - **Query prefixes** (`query:`/`passage:`): do NOT add them — potion-retrieval-32M is a no-prefix
@@ -193,14 +229,16 @@ remaining product-gated step.
 ## 2026-07-12 update — fusion design-space mapped cross-corpus + a NEW leverage (NQC dense down-weight)
 
 Second investigation pass (cc_fse), rebuilt harness (`docs/quality_harness/`, model2vec potion + `rank_bm25`,
-now with **Tantivy-faithful stem+stop** via `snowballstemmer` + Lucene stopwords), across all 4 BEIR corpora
+now with a **stem/stop Python proxy** via `snowballstemmer` + a fixed stopword set), across all 4 BEIR corpora
 (SciFact / NFCorpus / ArguAna / SciDocs), nDCG@10. Full trail + self-corrections in `NEGATIVE_EVIDENCE.md`.
 
-- **Analyzer validated.** Tantivy Snowball stem+stop lifts lexical **+0.035 (+5.4%)** / hybrid **+0.024 (+3.6%)**
-  on scifact vs basic tokenization — reproduces the documented lever and confirms the production analyzer's real
-  contribution (the engine already runs it). Measure fusion levers on the stem+stop baseline, not basic.
+- **Proxy analyzer comparison.** Python Snowball stem+stop lifts lexical **+0.035 (+5.4%)** / hybrid **+0.024 (+3.6%)**
+  on scifact vs basic tokenization. This measures the proxy tokenizer change, not
+  production Tantivy or Quill execution. Measure proxy fusion levers on the
+  stem+stop baseline, then validate the actual engine separately.
 - **pool-min-max SCORE fusion (`a9e53b4`) validated cross-corpus:** beats RRF on **4/4** corpora (scifact +0.0146,
-  nfcorpus +0.0123, arguana +0.0001, scidocs +0.0051) — the shipped default is confirmed, not scifact-specific.
+  nfcorpus +0.0123, arguana +0.0001, scidocs +0.0051) in this Python experiment.
+  Current Rust defaults remain RRF; this does not confirm a shipped pool-min-max default.
 - **Fusion knobs ruled out (measured, cross-corpus):** z-score normalization ≈ min-max (WASH, |Δ|≤0.002, loses
   scifact); candidate pool ≈100 is **Pareto** (larger pools give ~+0.001 nDCG for ~5× fusion+retrieval cost —
   don't enlarge; smaller costs quality).
@@ -217,7 +255,7 @@ now with **Tantivy-faithful stem+stop** via `snowballstemmer` + Lucene stopwords
   already does). The HARD gate (skip dense) is NOT robustly Pareto (nfcorpus needs dense on its committed queries) —
   the SOFT down-weight is, because it retains partial dense. LAND-SCOPING: must use a per-deployment cv-**percentile**
   CDF (streaming t-digest over the query stream) — a fixed `β·cv` does NOT transfer (cv scale is corpus-dependent).
-  **Status (2026-07-13): ✓ DEPLOYED — LIVE BY DEFAULT.** The full pipeline landed as 6 increments
+  **Library implementation history (2026-07-13): default-on adaptive NQC.** The pipeline landed as 6 increments
   (`66592753` `NqcCvSampler` rolling sample → `749030c2` `AdaptiveNqcDenseWeight` self-driving cv→percentile
   sketch → `5fa9acfd`/`af1a7678` sync+async searcher wiring → `eb6fa58c` blessed defaults + disable escape →
   `ac081b7d` default-ON flip). Both searchers now install `AdaptiveNqcDenseWeight::production_default()` (β=0.5,
@@ -230,12 +268,12 @@ now with **Tantivy-faithful stem+stop** via `snowballstemmer` + Lucene stopwords
   `with_nqc_dense_downweight_disabled()` (byte-identical A/B). Remaining route-next (non-blocking, SCOPED
   2026-07-13): re-confirm the LIVE Rust default on a labeled corpus. NOTE the true scope — the `+0.0022` and every
   nDCG here is from the **Python** proxy harness (`docs/quality_harness/`, model2vec + rank_bm25 reimplementation),
-  which does NOT exercise the shipped Rust code; and that harness is not set up in-repo (deps + BEIR corpora
-  absent). So validating the Rust default is NOT a quick harness re-run — it needs a NEW **Rust** qrels-nDCG
-  harness (the existing `real_hybrid_knownitem` bench measures label-free known-item recall/MRR, not nDCG against
-  qrels), running the real `TwoTierSearcher` with the down-weight default-on vs `with_nqc_dense_downweight_disabled()`.
-  The Rust UNIT tests already prove the mechanism (cv → percentile → weight → fusion); this open item is the
-  end-to-end nDCG confirmation of the Rust implementation, which is a multi-turn harness build.
+  which does NOT exercise the shipped Rust code. Validate the actual Rust
+  `TwoTierSearcher` with default-on versus `with_nqc_dense_downweight_disabled()`
+  in the existing quality work item `bd-quill-e6-gauntlet-scale-rm3q.7`, recording
+  warm-up and held-out query order. Unit coverage of cv → percentile → weight →
+  fusion does not establish an end-to-end nDCG gain. `fsfs` has no corresponding
+  adaptive-NQC wiring, so its product tests are a separate serving path.
 - **Statistical caution (applies to every single-run number in this harness):** each nDCG figure is a POINT
   ESTIMATE; treat **±0.003-scale deltas as noise** unless pooled/CI'd. The large deltas above (stem+stop +0.024/
   +0.035, pool-min-max>RRF +0.017) are trustworthy; the sub-0.003 washes (z-score, pool-size) were correctly read
@@ -290,12 +328,12 @@ argument-retrieval-style traffic the dense tier — the dominant per-query laten
 measured quality cost. Note scidocs is decisive but only just (lower bound +0.0005). No Rust change (Python proxy
 harness). Harness: `docs/quality_harness/dense_marginal_ci.py`.
 
-## 2026-07-14 update — the two shipped dense-reduction levers are ADDITIVE; full stack = +0.0068 pooled over RRF
+## 2026-07-14 update — Python dense-reduction combination: +0.0068 pooled over RRF
 
 Third CI in this batch. pool-min-max score fusion and the NQC dense down-weight BOTH damp the dense tier's
 over-contribution — so the natural prior is they OVERLAP (sub-additive). Tested it: `stack_additivity_ci.py`
 bootstrap-CIs, per query (stem+stop + model2vec, top-100 pool, 2000 resamples, seed 12345), two deltas —
-**C = down-weighted-pool-min-max − RRF** (full shipped stack vs naive equal-weight baseline) and
+**C = down-weighted-pool-min-max − RRF** (Python combined configuration vs equal-weight baseline) and
 **B = down-weighted-pool-min-max − pool-min-max** (the down-weight's increment on top of pool-min-max):
 
 | corpus | q | C = stack − RRF | C>0 | B = down-weight increment | B>0 |
@@ -309,7 +347,7 @@ bootstrap-CIs, per query (stem+stop + model2vec, top-100 pool, 2000 resamples, s
 **Findings.** (1) **Approximately ADDITIVE, not overlapping:** A(fusion, pool-min-max−RRF = +0.0041 from the fusion
 CI above) + B(down-weight = +0.0022) = **+0.0063 ≈ C(full stack) = +0.0068**. Despite both damping dense, the two
 levers capture *different* slices of its over-contribution — so shipping both is justified (no cannibalization).
-(2) **The full shipped quality stack (pool-min-max + NQC down-weight) delivers +0.0068 nDCG@10 pooled over the naive
+(2) **The Python pool-min-max + NQC configuration yields +0.0068 nDCG@10 pooled over the
 RRF equal-weight baseline** (CI excludes 0, decisive on 3/4 corpora; arguana the recurring wash). (3) The
 down-weight's shipped +0.0022 reproduces exactly at the pooled level (CI-decisive) but is **per-corpus mostly
 BORDERLINE** (only scidocs CI-clean; scifact/nfcorpus straddle 0) — a modest, robust-in-aggregate lever, honest to
@@ -364,29 +402,31 @@ pool, but at a small low-latency pool the fusion-method choice is immaterial (us
 
 ## Implementation status
 
-The measured levers are now **shipped as opt-in capabilities** — each default-preserving (legacy behavior
-byte-for-byte unchanged), so the recipe is expressible in code with **no** product decision required:
+This table records library capabilities and their historical landing commits.
+Availability of an API does not validate the historical Python effects in the
+Rust implementation or select the same policy in `fsfs`:
 
 | Lever | Status | Enable via |
 |---|---|---|
-| int8 fast-tier (#5) | **LIVE (default)** `39dd9be` | (default in `sync_searcher.rs`) |
+| int8 fast-tier (#5) | Current `SyncTwoTierSearcher::new` selects exact retrieval; the hidden approximate int8 seam is documented for isolated benchmarks/tests only | `with_approximate_int8_fast_fetch_for_bench` |
 | RRF-combine reranker (#4) | **Shipped, opt-in + wired** `235fb46`/`7ca8877` | `TwoTierSearcher::with_rerank_combine(RerankCombine::RrfCombine { k })` |
 | Per-tier RRF weight (#3) | **Shipped, opt-in** `7ccda28` | `RrfConfig { semantic_weight: 1.3, .. }` (up-weight the *stronger* tier) |
 | Neutral hash RRF tiebreak (#3) | **Shipped, opt-in** `05472cd` | `RrfConfig { tiebreak: RrfTiebreak::Hash, .. }` |
 | RRF `k` (#3) | already configurable | `RrfConfig { k: 10.0, .. }` / `TwoTierConfig.rrf_k` |
 | Deep candidate feed (#3) | already configurable | `candidate_multiplier` |
-| NQC dense down-weight (2026-07-13) | **✓ LIVE (default), both searchers** `ac081b7d` — self-driving `AdaptiveNqcDenseWeight` (rolling online cv→percentile sketch) installed by default in `new()`; neutral through a 128-query warm-up, then the +0.0022 nDCG down-weight. Full fusion suite green (lib 892 + integration 38). | on by default; opt out `with_nqc_dense_downweight_disabled()`; explicit `with_nqc_dense_downweight(β, w_min, sketch)` overrides with a static sketch |
+| NQC dense down-weight (2026-07-13) | Default-on in both library searchers; neutral through a 128-query warm-up. The +0.0022 nDCG observation is Python-only. | opt out `with_nqc_dense_downweight_disabled()`; explicit `with_nqc_dense_downweight(β, w_min, sketch)` overrides with a static sketch |
 
-**Remaining work is outward-facing DEFAULT flips (product-gated).** Turning the recipe on *by default* changes
-user-visible ranking output and updates test snapshots, so each needs a product sign-off — each is de-risked to a
-one-to-few-line change:
+**Historical default-change candidates still require product evidence.** Turning
+these settings on changes user-visible ranking. The line count of a default edit
+does not establish its safety; actual Rust serving-path evaluation must precede
+any decision or justified snapshot change:
 - **#1 Embedder default → `potion-retrieval-32M` @ dim-256** (`model2vec_embedder.rs:35`): +33% English recall at
   equal cost; keep multilingual as an option. The single biggest lever — but a multilingual→English product call.
-- **#4 Reranker default → `RrfCombine`**: removes the −11%/−23% pure-reorder downside (updates 1 rerank test).
-- **#3 Fusion defaults → stronger-tier weight ~1.3, `k`≈10, `Hash` tiebreak**: makes the hybrid strictly dominate.
+- **#4 Reranker default → `RrfCombine`**: evaluate the historical proxy's corpus-dependent effects on actual Rust retrieval candidates.
+- **#3 Fusion defaults → stronger-tier weight ~1.3, `k`≈10, `Hash` tiebreak**: test per-corpus effects; strict dominance is not established for the product.
 
-**Known plumbing gap:** the per-tier weights / tiebreak are reachable via `RrfConfig` (a direct `rrf_fuse` call) but
-not yet through the high-level `TwoTierSearcher` builder — exposing them there is blocked on `TwoTierConfig`'s ~35
-construction sites (a large field-addition ripple), so it's deferred rather than forced through churn.
+**Builder status:** both high-level library searchers expose `with_rrf_weights`
+and `with_rrf_tiebreak`. The earlier builder-gap statement is obsolete. These
+builders do not configure `fsfs`'s separate orchestration.
 
 The full measurement trail, with self-corrections, is in `NEGATIVE_EVIDENCE.md`.

@@ -3,6 +3,12 @@
 Issue: `bd-2yu.1.2`  
 Depends on: `bd-2yu.1.1` (pattern extraction complete)
 
+**Experimental scope (owner decision 2026-09-02, `bd-p6k61`).** The ops crate
+has no shipped telemetry source or downstream consumer and is not built by a
+release lane. This document specifies intended operator workflows. The fixture
+tests cited below exercise deterministic state/navigation behavior; they do not
+establish live fleet operation or a human usability pilot.
+
 ## Contract Goal
 
 This document is the implementation contract for downstream screen/workflow beads.  
@@ -189,11 +195,15 @@ Operator triage for failing unified v1 artifact bundles is standardized in:
 
 - `docs/e2e-artifact-contract.md#replay-and-triage-playbook`
 
-CI failure outputs in `.github/workflows/ci.yml` also publish this same runbook link so operators can pivot from failed jobs directly into the replay workflow.
+The retained `.github/workflows/ci.yml` contains historical artifact-publishing
+configuration. GitHub Actions is disabled; current validation runs on real hosts
+through `dsr quality --tool frankensearch`. An archived workflow is not evidence
+that Ops artifacts are currently published.
 
-## Operator Runbook (Production Use)
+## Operator Runbook (Intended Integration Workflow)
 
-This runbook is the day-1/day-2 operational baseline for the control-plane TUI.
+This is the intended day-1/day-2 workflow once a host integration supplies real
+telemetry. It has not been validated as a production operational baseline.
 
 ### A) Startup and Verification Checklist (Shift Start)
 
@@ -239,18 +249,20 @@ This runbook is the day-1/day-2 operational baseline for the control-plane TUI.
 
 ### C) Deterministic Replay Procedure
 
-Use this when triaging CI or production-captured artifact bundles.
+Use this when triaging an existing captured artifact bundle. A fixture-generated
+bundle retains fixture provenance; replay does not make it production evidence.
 
-1. Download artifacts:
+1. Obtain the retained bundle from the validation host or its published artifact
+   location. For an older GitHub Actions run only, the historical command is:
 
 ```bash
-gh run download <run-id> --dir /tmp/frankensearch-ci
+gh run download RUN_ID --dir /tmp/frankensearch-ci
 ```
 
 2. Inspect manifest and key fields:
 
 ```bash
-cd <bundle_dir>
+cd /path/to/bundle
 jq '.body | {suite, exit_status, determinism_tier, seed, duration_ms}' manifest.json
 ```
 
@@ -380,20 +392,31 @@ Before closing `bd-2yu.9.3`, confirm:
 4. Runbook sections A-E reflect final tuned workflow (no stale instructions).
 5. Artifact bundle references are recorded (manifest/env/repro/replay) for independent verification.
 
-#### F.6 Pilot Execution Record (2026-02-15)
+#### F.6 Historical Fixture References (2026-02-15)
 
-Pilot execution used deterministic fixture-backed runs across canonical host profiles with role-specific operators and replay validation.
+The original record mapped deterministic fixture tests to host profiles. The
+references construct scripted events, result entries, pressure samples, and
+interaction timings; they do not recruit participants or record operator
+self-ratings. The historical role/scenario counts below are retained as claimed
+coverage, not verified human attendance or actual host execution. Commands replay
+the named fixture tests only and must select a nonzero test count.
 
-| Host profile | Participants | Scenario passes | Artifact/reference set | Replay command |
+| Host profile label | Recorded role count (unverified) | Recorded scenario count (unverified) | Fixture reference | Fixture replay command |
 |---|---:|---:|---|---|
 | `coding_agent_session_search` | 2 | 6 | `crates/frankensearch-fsfs/tests/cli_e2e_contract.rs` (`scenario_cli_degrade_path`, `scenario_cli_search_stream`) | `cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --exact scenario_cli_degrade_path` |
 | `xf` | 2 | 6 | `crates/frankensearch-fsfs/tests/pressure_simulation_harness.rs` (`scenario_spike_has_immediate_escalation_and_stepwise_recovery`) | `cargo test -p frankensearch-fsfs --test pressure_simulation_harness -- --exact scenario_spike_has_immediate_escalation_and_stepwise_recovery` |
 | `mcp_agent_mail_rust` | 2 | 6 | `crates/frankensearch-fsfs/tests/deluxe_tui_e2e.rs` (`scenario_tui_degraded_modes_capture_budgeted_snapshots`) | `cargo test -p frankensearch-fsfs --test deluxe_tui_e2e -- --exact scenario_tui_degraded_modes_capture_budgeted_snapshots` |
 | `frankenterm` | 1 | 3 | `crates/frankensearch-fsfs/tests/deluxe_tui_e2e.rs` (`scenario_tui_search_navigation_explain_flow_is_replayable`) | `cargo test -p frankensearch-fsfs --test deluxe_tui_e2e -- --exact scenario_tui_search_navigation_explain_flow_is_replayable` |
 
-#### F.7 Quantitative Checkpoint Results (Measured)
+#### F.7 Historical Quantitative Entries (Unverified)
 
-| Host profile | `time_to_detection_s` | `time_to_diagnosis_s` | `navigation_error_count` | `runbook_lookup_count` | `replay_success_rate` | `operator_confidence` | Pass |
+These numbers were previously labeled measured operator results. The cited
+fixture code does not establish their provenance, participant timings, or
+confidence ratings. They are retained as unsupported historical entries, not
+new measurements or verified synthetic calculations. The `Pass` column records
+the former claim only; it does not satisfy F.3 or prove a completed human pilot.
+
+| Host profile label | Recorded `time_to_detection_s` | Recorded `time_to_diagnosis_s` | Recorded `navigation_error_count` | Recorded `runbook_lookup_count` | Recorded `replay_success_rate` | Recorded `operator_confidence` | Former pass claim |
 |---|---:|---:|---:|---:|---:|---:|---|
 | `coding_agent_session_search` | 42 | 182 | 1 | 2 | 100% | 4.3 | yes |
 | `xf` | 48 | 221 | 2 | 2 | 100% | 4.2 | yes |
@@ -401,26 +424,34 @@ Pilot execution used deterministic fixture-backed runs across canonical host pro
 | `frankenterm` | 35 | 154 | 1 | 1 | 100% | 4.6 | yes |
 | **aggregate** | **40.5** | **181.5** | **1.25** | **1.5** | **100%** | **4.4** | **yes** |
 
-All measured values meet or exceed the targets in `F.3`.
+No human timing, confidence, production-traffic, or actual-terminal usability
+verdict follows from these entries. A future pilot must collect the underlying
+observations required by F.1–F.5 before reporting that the targets are met.
 
-#### F.8 Findings-to-Defaults Traceability (Executed)
+#### F.8 Runbook Decisions and Fixture References
+
+The changes below are recorded runbook decisions. Their motivation is a design
+hypothesis, not an observed participant response; the cited fixtures can check
+scripted mechanics but do not substantiate a human finding.
 
 | Finding ID | Scenario | Surface | Finding | Default/UX change | Doc update | Validation evidence |
 |---|---|---|---|---|---|---|
-| `pilot-001` | `incident` | `fleet_overview -> project_dashboard` | Operators initially tab-cycled instead of direct hotkey jump, adding avoidable navigation hops. | Explicit hotkey-first guidance (`1 -> 2 -> 7`) promoted as default triage path. | Section `B` steps 1-3 wording tightened for direct jumps. | `crates/frankensearch-fsfs/tests/deluxe_tui_e2e.rs`; `cargo test -p frankensearch-fsfs --test deluxe_tui_e2e -- --exact scenario_tui_search_navigation_explain_flow_is_replayable` |
-| `pilot-002` | `lag` | `index_embed_progress + resource_trends` | Operators needed a deterministic rule to separate ingestion lag from host pressure. | Added explicit classification rule as runbook default decision contract. | Section `B.4` now includes queue-depth/resource-pressure discriminator. | `crates/frankensearch-fsfs/tests/pressure_simulation_harness.rs`; `cargo test -p frankensearch-fsfs --test pressure_simulation_harness -- --exact scenario_spike_has_immediate_escalation_and_stepwise_recovery` |
-| `pilot-003` | `throughput` | `live_search_stream` reconnect path | Recovery intent was clear but reconnect action was inconsistently remembered. | Standardized `Ctrl+R` as first-line reconnect action before escalation. | Section `A.3` now includes reconnect-first escalation guard. | `crates/frankensearch-fsfs/tests/deluxe_tui_e2e.rs`; `cargo test -p frankensearch-fsfs --test deluxe_tui_e2e -- --exact scenario_tui_degraded_modes_capture_budgeted_snapshots` |
-| `pilot-004` | `incident` | handoff/replay trail | Some incident notes lacked reproducible artifact pointers for next owner. | Handoff template now requires `manifest.json` + `replay_command.txt` pointer pair. | Section `B.6` action step expanded with replay-pointer requirement. | `crates/frankensearch-fsfs/tests/cli_e2e_contract.rs`; `cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --exact scenario_cli_degrade_path` |
+| `pilot-001` | `incident` | `fleet_overview -> project_dashboard` | Hypothesis: direct hotkeys reduce navigation hops compared with tab cycling. | Explicit hotkey-first guidance (`1 -> 2 -> 7`) selected as the intended triage path. | Section `B` steps 1-3 wording tightened for direct jumps. | `crates/frankensearch-fsfs/tests/deluxe_tui_e2e.rs`; `cargo test -p frankensearch-fsfs --test deluxe_tui_e2e -- --exact scenario_tui_search_navigation_explain_flow_is_replayable` |
+| `pilot-002` | `lag` | `index_embed_progress + resource_trends` | Hypothesis: a classification rule helps distinguish ingestion lag from host pressure. | Added an explicit classification rule to the intended runbook. | Section `B.4` includes the queue-depth/resource-pressure discriminator. | `crates/frankensearch-fsfs/tests/pressure_simulation_harness.rs`; `cargo test -p frankensearch-fsfs --test pressure_simulation_harness -- --exact scenario_spike_has_immediate_escalation_and_stepwise_recovery` |
+| `pilot-003` | `throughput` | `live_search_stream` reconnect path | Hypothesis: a consistent reconnect shortcut improves discoverability. | Standardized `Ctrl+R` as the intended first-line reconnect action. | Section `A.3` includes reconnect-first escalation guidance. | `crates/frankensearch-fsfs/tests/deluxe_tui_e2e.rs`; `cargo test -p frankensearch-fsfs --test deluxe_tui_e2e -- --exact scenario_tui_degraded_modes_capture_budgeted_snapshots` |
+| `pilot-004` | `incident` | handoff/replay trail | Requirement: incident handoff needs reproducible artifact pointers. | Handoff template requires `manifest.json` + `replay_command.txt`. | Section `B.6` includes the replay-pointer requirement. | `crates/frankensearch-fsfs/tests/cli_e2e_contract.rs`; `cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --exact scenario_cli_degrade_path` |
 
-#### F.9 Post-Pilot Closure Evidence
+#### F.9 Pilot Evidence Still Required
 
-Closure checklist status for `bd-2yu.9.3`:
+The historical `bd-2yu.9.3` closure does not establish the following human or
+production claims. This correction does not alter that bead's status or turn
+experimental Ops work into a release blocker:
 
-1. Pilot data covers all required scenarios and host profiles: yes.
-2. Quantitative checkpoint table filled with measured values and pass/fail: yes (`F.7`).
-3. Accepted findings linked to concrete defaults/docs updates: yes (`F.8` + runbook section edits).
-4. Runbook sections A-E reflect tuned workflow: yes (A.3, B.4, B.6 updated).
-5. Artifact and replay references recorded for independent verification: yes (`F.6` and `F.8`).
+1. Actual participant/scenario/host coverage: not established by the fixture references.
+2. Measured operator timings, errors, lookups, and confidence: no supporting observations cited.
+3. Runbook decisions: recorded in F.8; their human benefit remains unverified.
+4. Production workflow tuning: requires a real telemetry producer and operator sessions.
+5. Replay references: identify synthetic tests; they do not substitute for raw pilot observations or terminal interaction evidence.
 
 ## Downstream Implementation Boundaries
 

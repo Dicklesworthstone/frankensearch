@@ -38,7 +38,7 @@ frankensearch-core
 frankensearch-quill  -> (core, index formats; optional durability)
 frankensearch-fusion -> (embed, index, optional quill/lexical/rerank)
 frankensearch-quill-gauntlet -> (quill, lexical as the pinned Tantivy oracle, fusion)
-frankensearch-fsfs   -> (core, embed, index, quill, storage, durability, tui, optional native rerank; lexical only behind `shadow-oracle`)
+frankensearch-fsfs   -> (core, embed, index, fusion, quill, storage, durability, tui, optional native rerank; lexical only behind `shadow-oracle`)
 frankensearch-ops    -> (core, tui)
 frankensearch facade -> (core, embed, index, fusion, quill by default for `lexical`; optional lexical-tantivy/rerank/storage/durability)
 ```
@@ -91,6 +91,7 @@ graph TD
   core --> fsfs
   embed --> fsfs
   index --> fsfs
+  fusion --> fsfs
   quill --> fsfs
   rerank -. rerank feature .-> fsfs
   tui --> ops
@@ -116,6 +117,17 @@ The following is the library's `TwoTierSearcher` pipeline. `fsfs` has a separate
 orchestrator in `crates/frankensearch-fsfs/src/runtime.rs`; its command, daemon,
 cache, streaming, and TUI paths must wire each policy explicitly. A library
 builder or default alone does not establish product behavior.
+
+The fsfs orchestrator retains independent fast and quality candidate pools and
+calls `frankensearch_fusion::blend_two_tier` with the effective
+`search.quality_weight` (default `0.7`, converted once to `f32`). The shared
+helper normalizes each pool and joins scores by document ID. A document present
+in both pools gets `weight * quality + (1 - weight) * fast`; a document present
+in only one keeps that source's normalized score. fsfs then RRF-fuses the blended
+semantic ranking with the lexical head and applies optional reranking. Daemon
+requests acknowledge the caller's policy; cache keys retain the effective
+weight, exact RRF configuration, and deadline. Explanation payloads retain the
+source scores, blend weights, and joint lexical/vector RRF contributions.
 
 ```text
 query
@@ -173,6 +185,15 @@ compiled by its default `rerank` Cargo feature, but scoring is opt-in through
 `fsfs search --rerank` or `search.rerank`. Provision its model with
 `fsfs download-models ms-marco-minilm-l-6-v2`.
 
+In fsfs, `search.quality_timeout_ms` starts after the Initial artifact is
+produced and its streaming phase sink returns. It covers cold quality-model
+initialization, waiting for model capacity, inference, and quality-index
+retrieval. Expiry yields `RefinementFailed` with the Initial hits and a typed
+timeout reason; caller cancellation propagates separately. Blending, lexical
+fusion, and optional reranking follow successful retrieval outside this window.
+This deadline does not bound total command duration or establish a measured
+latency or quality improvement.
+
 ## 4) Storage Model
 
 Three storage concerns are explicitly separated:
@@ -202,6 +223,15 @@ This layer is deliberately optional so lightweight deployments can skip its over
 ## 6) Async Runtime Model (asupersync, not tokio)
 
 The workspace uses `asupersync` for async/concurrency contracts.
+
+FastEmbed inference requires a blocking pool supplied by the caller's runtime
+through `Cx`. The fsfs main runtime and each socket request runtime configure
+that pool. Quality-model initialization and index scans also run on blocking
+workers so the executor can drive the deadline. A synchronous ONNX call already
+in progress cannot be preempted: it retains its model permit until completion,
+and the runtime joins its worker during shutdown. Process exit can therefore
+follow the timeout response later. The socket daemon flushes the response and
+closes its write side before dropping the request runtime and joining its pool.
 
 Operational implications:
 

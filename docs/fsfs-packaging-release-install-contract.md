@@ -19,16 +19,48 @@ Define a deterministic packaging/release/install workflow for `fsfs` that covers
 
 ## Target and Capability Matrices (Required)
 
-The release has two distinct profiles. Their names and capability metadata MUST
-make the distinction machine-readable; a lite artifact is never a substitute
-for a full embedded artifact.
+### Ownership and current delivery boundary (2026-09-04)
 
-The full embedded profile MUST be produced for exactly these targets:
+This contract defines required capabilities and install failure behavior.
+`scripts/quality-gate.sh`, run on real hosts through
+`dsr quality --tool frankensearch`, owns current source validation. GitHub
+Actions has been disabled by owner decision since 2026-09-01; the retained
+`.github/workflows/ci.yml` is historical configuration, not an executing lane.
+The host-managed DSR configuration describes intended builds, not evidence that
+an artifact was built, uploaded, installed, or exercised.
 
-- `aarch64-apple-darwin`
-- `x86_64-pc-windows-msvc`
+Crate publication is governed by
+[`crates-publishing-contract.md`](crates-publishing-contract.md) and
+`scripts/check_crates_publish_contract.sh`; its source-identity, version, and
+topological publication requirements supersede the old hard-coded crate list
+and generic "already published" success rule in this document.
 
-The explicit model-free lite profile MUST be produced for exactly these targets:
+The [v1.8.0 release](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.8.0)
+asset inventory checked on September 4 contains:
+
+| Profile | Targets with published archives | Evidence boundary |
+|---|---|---|
+| Full semantic | `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` | The Linux binary passed a cached-model index/Initial/Refined smoke test; this does not qualify a fresh install or the macOS binary. |
+| Explicit lite | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin` | Asset presence does not prove semantic capability; these binaries deliberately omit semantic loaders. |
+| Required delivery still absent | Full Windows; full Linux ARM | No corresponding full archive exists in that release. Delivery and actual platform qualification remain open under `bd-fsfs-cross-platform-semantic-installer-46z3u`. |
+
+The earlier exact-six matrix required full embedded Apple Silicon **and
+Windows**, plus the four lite targets below. Its Windows obligation is not
+satisfied by a Linux replacement, a cross-target `cargo check`, or a typed
+unsupported-platform response. The matrix/metadata migration needs the named
+delivery owner's implementation and evidence; this documentation correction
+does not lower that target or certify a release. The default semantic installer
+must also retain its full/source route and negative failure cases.
+
+### Capability profiles
+
+Release names and metadata MUST distinguish loader-capable full binaries,
+embedded full binaries, and explicit model-free lite binaries. A lite artifact
+is never a substitute for a full semantic artifact. A full binary need not
+contain embedded weights: the ordinary Cargo default uses external verified
+models, while `embedded-models` selects bundled weights explicitly.
+
+The required explicit model-free lite targets remain:
 
 - `x86_64-unknown-linux-musl`
 - `aarch64-unknown-linux-musl`
@@ -36,10 +68,11 @@ The explicit model-free lite profile MUST be produced for exactly these targets:
 - `aarch64-apple-darwin`
 
 Linux MUSL lite targets MUST be built with `cargo-zigbuild`; macOS and Windows
-targets MUST be built with Cargo target builds. Apple Silicon therefore has both
-a full artifact and a separately named lite artifact. Intel macOS and Linux MUSL
-have only explicit lite artifacts until a loader-capable backend is supported
-and exercised in CI.
+targets MUST be built with Cargo target builds. Apple Silicon has separately
+named full and lite artifacts. Linux GNU is a distinct semantic target from
+Linux MUSL. Intel macOS remains unsupported for the ordinary semantic installer
+until its backend passes actual host validation; the explicit lite option does
+not close that gap.
 
 ## Model Feature and Build-Input Boundary
 
@@ -106,22 +139,23 @@ lexical-only. `LexicalOnly` remains an explicit operator choice. A failure
 isolated to quality initialization or inference MUST preserve the admitted
 Initial payload and emit a sanitized, actionable `RefinementFailed` phase.
 
-The full GitHub release lane is the explicit exception:
+An embedded full release build is the explicit compile-time model exception:
 
-- `release-build` MUST provision the revision-pinned model inputs with
+- The release host MUST provision the revision-pinned model inputs with
   `scripts/rch-ensure-deps.sh --models-only`.
 - It MUST verify the provisioned byte lengths and SHA-256 digests with
   `scripts/rch-ensure-deps.sh --models-only --check` before compilation.
-- It MUST build with `--no-default-features --features embedded-models`.
+- It MUST build with `--no-default-features --features embedded-models,rerank`
+  to retain the normal CLI reranking capability as well as bundled embeddings.
 - Cargo build scripts MUST remain network-free; network admission belongs to
   the release provisioning step.
 
-The `release-build-lite` lane, including every Linux MUSL target, MUST retain
+The explicit lite build, including every Linux MUSL artifact, MUST retain
 `--no-default-features` and MUST NOT provision or enable semantic loaders or
 embedded models.
 
 The end-user installer's ordinary profile MUST NOT silently substitute one of
-those deliberately stripped lite artifacts. It MAY install a full embedded
+those deliberately stripped lite artifacts. It MAY install a full semantic
 release artifact. If no full artifact exists for the selected platform, it
 MUST build the loader-capable Cargo default from source. Only an explicit
 `install.sh --lite` request may select the model-free source profile.
@@ -129,22 +163,21 @@ MUST build the loader-capable Cargo default from source. Only an explicit
 Intel macOS (`x86_64-apple-darwin`) is a declared temporary exception to that
 source fallback: the pinned ONNX Runtime distribution has no supported Intel
 Darwin binary, so the default semantic source build is not routable. Until a
-loader-capable Intel backend is built and exercised in CI, ordinary installation
+loader-capable Intel backend is built and exercised on the actual host, ordinary installation
 MUST fail with the stable `unsupported_platform` outcome and actionable `--lite`
 guidance. It MUST NOT attempt the known-unbuildable default source command or
 silently install the lite artifact.
 
 ## Artifact Contract
 
-For a `v<version>` release tag, every full embedded target MUST publish:
+For a `v<version>` binary release tag, every declared full target MUST publish:
 
 - versioned archive: `fsfs-<version>-<target>.<ext>`
 - checksum: `fsfs-<version>-<target>.<ext>.sha256`
 - metadata: `fsfs-<version>-<target>.metadata.json`
 - installer alias: `fsfs-<target>.<ext>` plus its `.sha256` sidecar
 
-`<ext>` is `tar.xz` for `aarch64-apple-darwin` and `zip` for
-`x86_64-pc-windows-msvc`.
+`<ext>` is `tar.xz` for Linux and macOS, and `zip` for Windows.
 
 Every lite target MUST instead publish:
 
@@ -162,9 +195,17 @@ Metadata MUST include:
 - `binary`
 - `build_timestamp_utc`
 - `rustc`
-- `profile` (`embedded` or `lite`)
+- `profile` (`default` for external-model loaders, `embedded`, or `lite`)
 - `semantic_loaders` (boolean)
 - `embedded_models` (boolean)
+
+The capability truth tables are respectively `(true, false)`, `(true, true)`,
+and `(false, false)` for `(semantic_loaders, embedded_models)`. Older v1 schema
+fixtures and the retained workflow encode only the embedded/lite matrix. Their
+extension and terminal positive/negative release validation remain delivery
+work under `bd-fsfs-cross-platform-semantic-installer-46z3u`; do not bypass a
+validator to accept an undocumented profile. Metadata and installer aliases
+are requirements, not claims that every v1.8.0 asset satisfies them.
 
 ## Integrity and Signature Policy
 
@@ -564,16 +605,29 @@ Each rollout phase MUST publish:
 - `rollout_phase_replay_command.txt` (deterministic reproduction)
 - `rollout_phase_summary.md` (phase outcome + go/no-go decision)
 
-## CI Quality Gate Matrix Guidance (Pre-Merge vs Nightly)
+## Source Quality Gates and Remaining Release Validation
 
-CI validation operates in two profiles:
+Current source validation runs on real hosts:
+
+```bash
+dsr quality --tool frankensearch
+# Or, on the validation host:
+scripts/quality-gate.sh
+```
+
+The default script runs formatting, workspace check/clippy, the non-Unix index
+compile guard, library tests, fsfs tests, facade integration, real-model E2E,
+and executable quick-start stages. Its `examples` and `perf` stages are opt-in.
+The cross-target check establishes compilation, not Windows runtime support.
+
+The earlier hosted-CI design distinguished these profiles:
 
 1. `premerge` (pull_request, push, manual dispatch):
    - optimized for fast merge safety checks.
 2. `nightly` (scheduled):
    - full validation sweep for deeper drift detection.
 
-Required gate categories:
+Its required release-validation categories remain:
 
 - unit
 - integration
@@ -584,13 +638,16 @@ Required gate categories:
 - soak
 - contract/schema/conformance
 
-Artifact publishing requirements on every CI run:
+The older design's artifact names are retained below. Their existence or schema
+validity alone does not prove any named lane ran; categories not executed by
+the current script require separate populated evidence before their release
+requirements can be called satisfied:
 
 - `ci_artifacts/quality_gate_matrix.json`
 - `ci_artifacts/rollout_host_checklist.json`
 - existing e2e contract artifacts and retention policy outputs
 
-Failure runs MUST include deterministic replay pointers and gate metadata artifacts in summary output.
+Failure runs MUST include command output and deterministic replay pointers.
 
 ## Upgrade and Migration Compatibility Verification Strategy
 
@@ -615,8 +672,9 @@ This strategy is normative for all release candidates and required for `bd-2hz.1
    - run migrations on populated databases (not empty-only fixtures),
    - validate post-migration schema and data invariants,
    - verify repeated migration invocation is idempotent.
-3. Tantivy index compatibility:
-   - verify existing lexical index opens and query path remains functional,
+3. Lexical index compatibility:
+   - verify Quill generations open and the query path remains functional,
+   - exercise legacy Tantivy compatibility only through the explicit `lexical-tantivy` / `cass-compat` lane,
    - if incompatible, fail with deterministic reason code and explicit rebuild guidance.
 4. Configuration evolution:
    - old configs with deprecated keys MUST continue to work with warnings,
@@ -628,7 +686,7 @@ This strategy is normative for all release candidates and required for `bd-2hz.1
 - For each release, produce deterministic golden artifacts for a fixed-seed corpus:
   - FSVI index snapshot,
   - FrankenSQLite snapshot,
-  - Tantivy snapshot,
+  - Quill snapshot and, for the explicit interoperability lane, Tantivy snapshot,
   - effective config snapshot.
 - Golden snapshots MUST be replayable and checksum-protected.
 - Migration test runs MUST publish artifacts proving:
@@ -661,10 +719,10 @@ This strategy is normative for all release candidates and required for `bd-2hz.1
   - replay command and artifact manifest.
 - Soak failures MUST block rollout promotion until resolved or explicitly waived.
 
-### CI gate requirements (required)
+### Host gate requirements (required)
 
-- PRs that touch format-sensitive surfaces MUST run migration compatibility lanes in CI.
-- CI MUST block merge when any required migration lane fails.
+- Changes to format-sensitive surfaces MUST run migration compatibility lanes on the validation hosts.
+- A failed required migration lane MUST block promotion. Hosted CI being disabled does not waive the lane.
 - Required outputs:
   - migration matrix pass/fail summary,
   - per-path reason-code report,
@@ -680,41 +738,39 @@ Each migration compatibility run MUST publish:
 - `migration_soak_metrics.json` (when soak lane runs)
 - `migration_replay_command.txt`
 
-## CI Release Workflow Mapping
+## Release Workflow Ownership
 
-Workflow alignment MUST map to:
+DSR and its host configuration own current build/release execution. The retained
+workflow names `release-build`, `release-build-lite`, and `release-publish`
+describe the former hosted-CI arrangement. They are not instructions to enable
+GitHub Actions or proof that a corresponding DSR lane exists.
 
-- `release-build` (per-target archive/checksum/signature generation)
-- `release-publish` (GitHub release publishing)
-- `publish-crates` (optional crates.io publish gate)
-
-`release-publish` MUST require successful completion of both `release-build` and
-`release-build-lite`; an OR condition is forbidden. Before uploading, it MUST
-admit exactly the six profile/target pairs above, validate each metadata truth
-table (`profile`, `semantic_loaders`, and `embedded_models`), require the
-platform-correct `tar.xz` or `zip` archive and `.sha256` sidecar, and recompute
-every checksum. Missing, duplicate, or extra versioned pairs MUST fail closed.
+Before uploading, the release process MUST require successful full **and** lite
+builds for its declared profile/target matrix, validate capability metadata,
+require the platform-correct archive and `.sha256` sidecar, and recompute every
+checksum. Missing, duplicate, or unexpected pairs MUST fail closed. An extra
+Linux asset does not erase the unresolved Windows obligation from the original
+matrix. Reconciling the validator's old exact-six matrix with the actual DSR
+matrix belongs to the existing delivery task and must preserve positive
+capability probes and checksum/platform negative cases.
 
 ### Crates.io publish lane policy (required when enabled)
 
-When `publish-crates` is enabled in CI:
+Publication is a separately authorized, credentialed action following
+[`crates-publishing-contract.md`](crates-publishing-contract.md):
 
-- Trigger constraints:
-  - tag MUST match `v*`,
-  - prerelease tags containing `-` MUST be skipped,
-  - publishing MUST run only on the canonical repository owner.
-- Secrets/variables:
-  - `CARGO_REGISTRY_TOKEN` secret is required.
-  - `ENABLE_CRATES_PUBLISH=true` repository variable is required to opt into crates.io publishing.
-- Version alignment:
-  - the top-level `frankensearch` crate MUST match the tag version (`vX.Y.Z` -> crate version `X.Y.Z`).
-- Ordered publish behavior:
-  - publish order MUST be `frankensearch-core`, `frankensearch-embed`, `frankensearch-index`, `frankensearch-lexical`, `frankensearch-fusion`, `frankensearch-storage`, then `frankensearch`,
-  - for each crate in sequence:
-    - run `cargo publish --dry-run` and retry briefly to absorb crates.io index propagation lag,
-    - publish only after dry-run success,
-    - treat an already-published crate version as idempotent success,
-    - wait between publishes to reduce index race failures.
+- `v<fsfs-version>` tags identify binary releases; `crates-v<facade-version>`
+  tags identify crate bundles. Member crate versions need not equal the facade
+  or binary version.
+- The clean exact candidate must pass `check_crates_publish_contract.sh --mode
+  gate --scope workspace` with a live or injected registry census. Derive the
+  complete package order from Cargo metadata rather than a fixed crate list.
+- Package, dry-run, and clean-consumer checks must cover the declared feature
+  matrix before publication. A successful binary release is not crate evidence.
+- Never republish an occupied version. It is skippable only when the registry
+  archive identifies the clean exact candidate commit **and** its bytes match
+  the candidate archive. Generic `already uploaded` is not success; absent or
+  differing provenance requires a forward version/dependency bump.
 
 ## Required Reason Codes
 
@@ -746,7 +802,7 @@ When `publish-crates` is enabled in CI:
 scripts/check_fsfs_packaging_release_install_contract.sh --mode all
 ```
 
-CI can enforce only the dependency-free model boundary without installing the
+Host validation can check only the dependency-free model boundary without installing the
 JSON Schema CLI:
 
 ```bash

@@ -26,7 +26,7 @@ builds supply those same model bytes. The explicit `--lite` profile omits the
 semantic loaders, so downloading models cannot turn it into a semantic binary.
 Ordinary Intel macOS installation currently returns `unsupported_platform`;
 `--lite` is an explicit model-free choice, not completion of this semantic
-walkthrough. See the [installation profiles](../../README.md#installation).
+walkthrough. See the [installation profiles](../../README.md#cargo-install-developer-path).
 
 ## 2) Index your repository
 
@@ -38,11 +38,15 @@ fsfs index .
 This plain command performs one complete pass, seals the index, and exits. It
 does not silently enter watch mode.
 
-Use JSON when you want to capture machine-readable stats:
+After indexing, inspect machine-readable index and model status:
 
 ```bash
-fsfs index . --format json | jq
+fsfs status --format json | jq
 ```
+
+In v1.8.0 the one-shot index command still prints progress text even with
+`--format json`; do not pipe that output into a JSON parser. The status command
+provides a JSON envelope for automation.
 
 ## 3) Run a few targeted searches
 
