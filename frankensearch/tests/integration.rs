@@ -1050,7 +1050,14 @@ fn real_models_two_tier_search_yields_refined_through_the_public_api() {
     let fast_id = fast.id().to_owned();
     let quality_id = quality.id().to_owned();
 
-    asupersync::test_utils::run_test_with_cx(|cx| async move {
+    // Real model inference uses region-owned blocking work. Keep the caller's
+    // runtime alive and pass its task context, not an unregistered test Cx.
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(0, 2)
+        .build()
+        .expect("caller-owned model runtime");
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("runtime installs caller context");
         let dir = temp_dir("real-models-two-tier");
         let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
         for (id, text) in TEST_CORPUS {

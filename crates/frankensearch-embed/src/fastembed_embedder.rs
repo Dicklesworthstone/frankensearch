@@ -18,9 +18,10 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use asupersync::Cx;
-use asupersync::sync::{LockError, Mutex};
+use asupersync::sync::{LockError, Mutex, OwnedMutexGuard};
 use fastembed::{
     InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
@@ -167,7 +168,7 @@ const REQUIRED_NON_MODEL_FILES: [&str; 4] = [
 /// `TextEmbedding` is wrapped in a cancel-aware `asupersync::sync::Mutex`
 /// because ONNX sessions are not safe for concurrent mutable access.
 pub struct FastEmbedEmbedder {
-    model: Mutex<TextEmbedding>,
+    model: Arc<Mutex<TextEmbedding>>,
     name: String,
     dimension: usize,
     model_dir: PathBuf,
@@ -305,7 +306,7 @@ impl FastEmbedEmbedder {
         );
 
         Ok(Self {
-            model: Mutex::new(text_embedding),
+            model: Arc::new(Mutex::new(text_embedding)),
             name: config.embedder_id,
             dimension: expected_dim,
             model_dir,
@@ -315,19 +316,7 @@ impl FastEmbedEmbedder {
 
     /// Embed a single non-empty string.
     async fn embed_non_empty(&self, cx: &Cx, text: &str) -> SearchResult<Vec<f32>> {
-        let mut model = self
-            .model
-            .lock(cx)
-            .await
-            .map_err(|err| map_lock_error(&self.name, "fastembed.embed", err))?;
-
-        let mut embeddings =
-            model
-                .embed(vec![text], None)
-                .map_err(|e| SearchError::EmbeddingFailed {
-                    model: self.name.clone(),
-                    source: format!("fastembed inference failed: {e}").into(),
-                })?;
+        let mut embeddings = self.infer(cx, vec![text.to_owned()]).await?;
 
         let mut embedding = embeddings
             .pop()
@@ -354,19 +343,9 @@ impl FastEmbedEmbedder {
 
     /// Embed a batch of non-empty strings.
     async fn embed_batch_non_empty(&self, cx: &Cx, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
-        let mut model = self
-            .model
-            .lock(cx)
-            .await
-            .map_err(|err| map_lock_error(&self.name, "fastembed.embed_batch", err))?;
-
-        let mut embeddings =
-            model
-                .embed(texts, None)
-                .map_err(|e| SearchError::EmbeddingFailed {
-                    model: self.name.clone(),
-                    source: format!("fastembed batch inference failed: {e}").into(),
-                })?;
+        let mut embeddings = self
+            .infer(cx, texts.iter().map(|text| (*text).to_owned()).collect())
+            .await?;
 
         if embeddings.len() != texts.len() {
             return Err(SearchError::EmbeddingFailed {
@@ -395,6 +374,41 @@ impl FastEmbedEmbedder {
             normalize_in_place(embedding);
         }
         Ok(embeddings)
+    }
+
+    /// ONNX is synchronous and cannot be preempted mid-call. Keep its owned
+    /// model lock in a region-owned blocking worker: timeout can stop waiting
+    /// without blocking the executor or admitting another call on this model.
+    /// A running call is joined by the runtime's blocking pool at shutdown.
+    async fn infer(&self, cx: &Cx, texts: Vec<String>) -> SearchResult<Vec<Vec<f32>>> {
+        let mut model = OwnedMutexGuard::lock(Arc::clone(&self.model), cx)
+            .await
+            .map_err(|error| map_lock_error(&self.name, "fastembed.infer", error))?;
+        let name = self.name.clone();
+        let mut worker = cx
+            .spawn_blocking(move |child| {
+                embed_checkpoint(&child, "fastembed.infer")?;
+                model
+                    .embed(texts, None)
+                    .map_err(|error| SearchError::EmbeddingFailed {
+                        model: name,
+                        source: format!("fastembed inference failed: {error}").into(),
+                    })
+            })
+            .map_err(|error| SearchError::EmbeddingFailed {
+                model: self.name.clone(),
+                source: format!("cannot admit inference worker: {error}").into(),
+            })?;
+        worker.join(cx).await.map_err(|error| match error {
+            asupersync::runtime::JoinError::Cancelled(_) => SearchError::Cancelled {
+                phase: "fastembed.infer".to_owned(),
+                reason: "inference worker cancelled".to_owned(),
+            },
+            error => SearchError::EmbeddingFailed {
+                model: self.name.clone(),
+                source: format!("inference worker failed: {error}").into(),
+            },
+        })?
     }
 
     /// Directory containing model assets.
