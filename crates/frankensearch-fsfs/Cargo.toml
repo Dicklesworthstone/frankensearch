@@ -74,6 +74,7 @@ required-features = ["embedded-models"]
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "download"] }
+frankensearch-fusion = { workspace = true }
 frankensearch-index = { workspace = true }
 frankensearch-quill = { workspace = true, features = ["durability"] }
 rustix = { version = "1.1.4", features = ["fs"] }

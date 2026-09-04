@@ -27,7 +27,7 @@ use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
     HitExplanation, IndexableDocument, ModelCategory, RerankDocument, Reranker, ScoreComponent,
-    SearchError, SearchResult,
+    SearchError, SearchResult, VectorHit,
 };
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FileProtector, FsviProtector, FsviVerifyResult,
@@ -45,6 +45,7 @@ use frankensearch_embed::{DetectOptions, EmbedderStack};
 #[cfg(feature = "semantic-loaders")]
 use frankensearch_embed::{FastEmbedEmbedder, Model2VecEmbedder};
 use frankensearch_index::VectorIndex;
+use frankensearch_fusion::blend_two_tier;
 use frankensearch_quill::{
     BlueGreenEngine, CURRENT_FILE_NAME, CurrentPointer, DEFAULT_SCHEMA, FSLX_FORMAT_VERSION,
     KeeperError, KeeperSnapshot, QuillConfig, QuillIndex, QuillIndexError, QuillSearchIndex,
@@ -119,7 +120,7 @@ use crate::mount_info::{MountTable, read_system_mounts};
 use crate::output_schema::{
     IndexFreshnessPayload, OutputEnvelope, OutputError, OutputWarning, OutputWarningCode,
     RerankHitScore, RerankStagePayload, RerankStageStatus, SearchHitPayload, SearchOutputPhase,
-    SearchPayload, error_code_for,
+    SearchPayload, SemanticBlendHit, SemanticBlendPayload, SemanticTierScore, error_code_for,
 };
 use crate::pressure::{
     DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
@@ -478,7 +479,7 @@ const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
 const FSFS_SEARCH_SEMANTIC_HEAD_PROGRESSIVE_STEP: usize = 16;
 const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v1";
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v2";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v1";
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -890,6 +891,8 @@ struct SearchCacheKey {
     filter: Option<String>,
     fast_only: bool,
     rrf_k_milli: u64,
+    /// Exact bits of the f32 policy consumed by the shared blend kernel.
+    quality_weight_bits: u32,
     /// Reranked and un-reranked answers to the same query are different
     /// payloads; the key must not conflate them.
     #[serde(default)]
@@ -928,6 +931,9 @@ struct SearchServeRequest {
     /// Client's effective `search.rerank`; `None` keeps the daemon's own.
     #[serde(default)]
     rerank: Option<bool>,
+    /// Client's resolved blend policy; omission uses the server configuration.
+    #[serde(default)]
+    quality_weight: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2029,6 +2035,8 @@ struct ExplainSession {
     vector_generation_id: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     vector_generation_is_hash: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    semantic_blend: Option<SemanticBlendPayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2092,6 +2100,7 @@ impl ExplainSession {
             hits,
             vector_generation_id: None,
             vector_generation_is_hash: false,
+            semantic_blend: None,
         }
     }
 
@@ -6342,6 +6351,7 @@ impl FsfsRuntime {
                 mode: None,
                 filter: None,
                 rerank: None,
+                quality_weight: None,
             })
         }
     }
@@ -6386,6 +6396,16 @@ impl FsfsRuntime {
         // `fsfs search --rerank` means the same thing through the daemon; the
         // clone shares this process's loaded cross-encoder.
         runtime.config.search.rerank = request.rerank.unwrap_or(self.config.search.rerank);
+        if let Some(weight) = request.quality_weight {
+            if !(0.0..=1.0).contains(&weight) {
+                return Err(SearchError::InvalidConfig {
+                    field: "search.quality_weight".to_owned(),
+                    value: weight.to_string(),
+                    reason: "expected a finite value between 0 and 1".to_owned(),
+                });
+            }
+            runtime.config.search.quality_weight = weight;
+        }
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode);
 
         let (cached, payloads) = if hot_cache_enabled {
@@ -6624,6 +6644,7 @@ impl FsfsRuntime {
                 mode: Some("full".to_owned()),
                 filter: self.cli_input.filter.clone(),
                 rerank: Some(self.config.search.rerank),
+                quality_weight: Some(self.config.search.quality_weight),
             };
             let request_json =
                 serde_json::to_vec(&request).map_err(|source| SearchError::SubsystemError {
@@ -7190,6 +7211,7 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         let mut session = ExplainSession::from_fused(query, phase, self.config.search.rrf_k, fused);
         if let Some(payload) = payload {
+            session.semantic_blend.clone_from(&payload.semantic_blend);
             for (hit, source) in session.hits.iter_mut().zip(payload.hits.iter()) {
                 hit.semantic_rank = source.semantic_rank;
                 hit.hash_rank = source.hash_rank;
@@ -7688,6 +7710,7 @@ impl FsfsRuntime {
             filter: self.cli_input.filter.clone(),
             fast_only: self.config.search.fast_only,
             rrf_k_milli: u64::from(f64_to_per_mille(self.config.search.rrf_k)),
+            quality_weight_bits: self.effective_quality_weight().to_bits(),
             rerank: self.config.search.rerank,
             rerank_model: self
                 .prepared_reranker()
@@ -7704,6 +7727,9 @@ impl FsfsRuntime {
         hasher.update(key.filter.as_deref().unwrap_or("").as_bytes());
         hasher.update([u8::from(key.fast_only)]);
         hasher.update(key.rrf_k_milli.to_le_bytes());
+        hasher.update(key.quality_weight_bits.to_le_bytes());
+        hasher.update([u8::from(key.rerank)]);
+        hasher.update(key.rerank_model.as_deref().unwrap_or("").as_bytes());
         sha256_digest_hex(hasher.finalize())
     }
 

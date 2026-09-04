@@ -1780,6 +1780,7 @@ dependencies = [
  "frankensearch-core",
  "frankensearch-durability",
  "frankensearch-embed",
+ "frankensearch-fusion",
  "frankensearch-index",
  "frankensearch-lexical",
  "frankensearch-quill",

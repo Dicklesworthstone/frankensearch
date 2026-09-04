@@ -461,6 +461,38 @@ pub struct SearchPayload {
     /// `--rerank`), so consumers can tell "not requested" from "skipped".
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rerank: Option<RerankStagePayload>,
+    /// The semantic blend ranked by RRF in this refined phase. Carried through
+    /// caches and query serving so a later explain uses the policy that ran.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub semantic_blend: Option<SemanticBlendPayload>,
+}
+
+/// One present tier's input and normalized contribution to a semantic blend.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticTierScore {
+    /// Non-finite inputs have no representable raw score; normalization still
+    /// follows the library's finite fallback policy.
+    pub raw_score: Option<f32>,
+    pub normalized_score: f32,
+    pub weight: f32,
+}
+
+/// Semantic scores for a returned document, before lexical fusion/reranking.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticBlendHit {
+    pub path: String,
+    pub score: f32,
+    pub fast: Option<SemanticTierScore>,
+    pub quality: Option<SemanticTierScore>,
+}
+
+/// Effective policy and score inputs for the returned refined head.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticBlendPayload {
+    pub quality_weight: f32,
+    pub fast_embedder: String,
+    pub quality_embedder: String,
+    pub hits: Vec<SemanticBlendHit>,
 }
 
 /// Status of the cross-encoder rerank stage inside a [`SearchPayload`].
@@ -546,6 +578,7 @@ impl SearchPayload {
             vector_generation_id: None,
             vector_generation_is_hash: false,
             rerank: None,
+            semantic_blend: None,
         }
     }
 
