@@ -164,7 +164,7 @@ command that runs every gate this repository relies on (there is no GitHub Actio
 gate runs on real hosts through `dsr quality --tool frankensearch`) is:
 
 ```bash
-scripts/quality-gate.sh          # fmt, check, clippy -D warnings, lib tests, fsfs tests, real-model e2e, quick-start gate
+scripts/quality-gate.sh          # fmt, check, clippy -D warnings, cross-target check, lib tests, fsfs tests, real-model e2e, quick-start gate
 ```
 
 Its individual pieces, when you want just one:
@@ -178,7 +178,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # Verify formatting
 cargo fmt --check
+
+# Non-Unix compile guard (#42): catches a unix-only import or API used outside a cfg, and
+# a fallback `platform` module missing an entry point the portable code calls. Needs only
+# the target's std — no Windows host, no linker.
+rustup target add x86_64-pc-windows-msvc
+cargo check -p frankensearch-index --target x86_64-pc-windows-msvc
 ```
+
+**Platform rule.** `frankensearch-index`'s generation-root machinery is a Linux/macOS
+feature: on every other target the fallback `platform` module fails closed with
+`GenerationRootErrorKind::UnsupportedPlatform`. It must still *compile* everywhere, so
+unix-only imports and APIs belong behind `#[cfg(...)]`, portable spellings are preferred
+where one exists (`OsStr::as_encoded_bytes` over `OsStrExt::as_bytes`, say), and any new
+`platform::` entry point called from platform-independent code needs a matching stub in
+the fallback module.
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 

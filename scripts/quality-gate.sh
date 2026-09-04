@@ -10,6 +10,11 @@
 #   check      cargo check --workspace --all-targets
 #   clippy     cargo clippy --workspace --all-targets -- -D warnings (pedantic+nursery lints),
 #              then the facade crate again on --features hybrid (the product feature set)
+#   cross      cargo check -p frankensearch-index --target x86_64-pc-windows-msvc — the
+#              non-Unix compile guard for #42 (a unix-only import outside any cfg, and a
+#              fallback platform module missing entry points the portable code calls). Needs
+#              only the target's std, never a Windows host or a linker. Override the triple
+#              with QUALITY_GATE_CROSS_TARGET.
 #   tests      library unit tests for every crate except the gauntlet harness (its 894-test
 #              unit binary alone takes >50 min; it has its own lane in the perf ratchet)
 #   fsfs       every fsfs test binary buildable on the default feature set
@@ -35,6 +40,8 @@
 #   QUALITY_GATE_STAGES        comma list to run (default: all of the above)
 #   QUALITY_GATE_MODEL_DIR     registered model cache (default: ~/.local/share/frankensearch/models)
 #   QUALITY_GATE_ALLOW_MODEL_SKIP=1  let the e2e stage SKIP instead of FAIL when models are absent
+#   QUALITY_GATE_CROSS_TARGET  triple for the cross stage (default x86_64-pc-windows-msvc)
+#   QUALITY_GATE_ALLOW_CROSS_SKIP=1  let the cross stage SKIP when that target's std is absent
 #   CARGO_BUILD_JOBS           forwarded to cargo (default 16)
 #
 # The rch compile-offload hook on the dev fleet is bypassed here on purpose: a gate must run
@@ -51,7 +58,10 @@ unset RCH_REQUIRE_REMOTE || true
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}"
 MODEL_DIR="${QUALITY_GATE_MODEL_DIR:-$HOME/.local/share/frankensearch/models}"
-STAGES="${QUALITY_GATE_STAGES:-fmt,check,clippy,tests,fsfs,facade,e2e,quickstart}"
+STAGES="${QUALITY_GATE_STAGES:-fmt,check,clippy,cross,tests,fsfs,facade,e2e,quickstart}"
+# Non-Unix compile guard target (#42). Overridable so the same stage can prove
+# any other host triple the index crate claims to build for.
+CROSS_TARGET="${QUALITY_GATE_CROSS_TARGET:-x86_64-pc-windows-msvc}"
 
 # AF_UNIX socket paths are capped at ~107 bytes; the daemon tests need a short runtime dir.
 if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "${XDG_RUNTIME_DIR:-/nonexistent}" ]; then
@@ -81,6 +91,26 @@ want clippy    && run_stage clippy cargo clippy --locked --workspace --all-targe
 # The facade's product feature set (loaders + Quill) is what users build; it was never linted
 # until bd-fhy2j, and its future-Send analysis needs the crate's raised recursion limit.
 want clippy    && run_stage clippy-hybrid cargo clippy --locked -p frankensearch --features hybrid --all-targets -- -D warnings
+
+# Cross-target compile guard (#42). The generation-root work landed a
+# `use std::os::unix::…` outside any cfg and a fallback platform module missing
+# three entry points the platform-independent publisher calls, so v1.8.0 failed
+# to compile for x86_64-pc-windows-msvc with ten name/type-resolution errors.
+# Every one of them is caught by a plain `cargo check` against the target from
+# any host — no Windows machine, and no linker, required.
+if want cross; then
+  if ! rustup target list --installed 2>/dev/null | grep -qx "$CROSS_TARGET"; then
+    rustup target add "$CROSS_TARGET" >/dev/null 2>&1 || true
+  fi
+  if rustup target list --installed 2>/dev/null | grep -qx "$CROSS_TARGET"; then
+    run_stage cross cargo check --locked -p frankensearch-index --target "$CROSS_TARGET"
+  elif [ "${QUALITY_GATE_ALLOW_CROSS_SKIP:-0}" = "1" ]; then
+    skip cross "std for $CROSS_TARGET is not installed (allowed by QUALITY_GATE_ALLOW_CROSS_SKIP=1)"
+  else
+    fail cross "std for $CROSS_TARGET is not installed; run 'rustup target add $CROSS_TARGET' or set QUALITY_GATE_ALLOW_CROSS_SKIP=1"
+  fi
+fi
+
 want tests     && run_stage tests  cargo test --locked --workspace --lib --exclude frankensearch-quill-gauntlet
 want fsfs      && run_stage fsfs   cargo test --locked -p frankensearch-fsfs --tests
 

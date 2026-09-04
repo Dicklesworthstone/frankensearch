@@ -313,7 +313,9 @@ impl GenerationRootError {
         self
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Not gated to the native platforms: the platform-independent publisher
+    // records raw OS errors too, and `io::Error::raw_os_error` exists on every
+    // target.
     const fn with_raw_os_error(mut self, raw_os_error: i32) -> Self {
         self.raw_os_error = Some(raw_os_error);
         self
@@ -4268,10 +4270,14 @@ pub mod generation_reader {
         root_device: u64,
         declared: &[&str],
     ) -> Result<(), ClosureViolationV1> {
-        use std::os::unix::ffi::OsStrExt as _;
-
         for entry in inventory.entries() {
-            let name = entry.name().as_bytes();
+            // `as_encoded_bytes` is the portable spelling of the Unix
+            // `OsStrExt::as_bytes` view: byte-identical on Unix, and defined
+            // on every target, so this closure check compiles for Windows
+            // even though the inventory that feeds it is Unix-only. Every use
+            // below is a whole-string comparison or an ASCII suffix test, the
+            // operations `as_encoded_bytes` explicitly permits.
+            let name = entry.name().as_encoded_bytes();
             if name.ends_with(WRITE_AHEAD_LOG_SUFFIX_V1.as_bytes()) {
                 return Err(ClosureViolationV1::WriteAheadLog);
             }
@@ -4773,6 +4779,16 @@ pub mod generation_reader {
                     }
                 }
                 let mut files = files.into_iter();
+                // Off the native platforms `QualifiedGenerationFile` is
+                // uninhabited (the fallback handle types are empty enums), so
+                // rustc correctly reports every field after the first as
+                // unreachable. The path is genuinely unreachable there —
+                // `admit_component` cannot return a value — and this is the
+                // shape that keeps the code compiling on such a target.
+                #[cfg_attr(
+                    not(any(target_os = "linux", target_os = "macos")),
+                    allow(unreachable_code)
+                )]
                 let closure = GenerationClosureV1 {
                     vector: files.next().expect("four components admitted"),
                     lexical: files.next().expect("four components admitted"),
@@ -11536,9 +11552,9 @@ mod platform {
 #[allow(dead_code)] // Typed zero-I/O stubs intentionally have no native consumers yet.
 mod platform {
     use super::{
-        GenerationFileExpectation, GenerationRootError, GenerationRootErrorKind,
-        GenerationRootLockMode, GenerationRootObjectWitness, GenerationRootResult,
-        GenerationRootStage,
+        GenerationFileExpectation, GenerationRootEntry, GenerationRootError,
+        GenerationRootErrorKind, GenerationRootLockMode, GenerationRootObjectWitness,
+        GenerationRootResult, GenerationRootStage,
     };
     use std::path::Path;
 
@@ -11692,6 +11708,31 @@ mod platform {
     }
 
     pub(super) fn sync_lock_file(lock: &LockHandle) -> GenerationRootResult<()> {
+        match *lock {}
+    }
+
+    // The authority publisher is platform-independent code, so the fallback
+    // module must carry every entry point it names, not only the ones the
+    // root-admission path uses. Each is unreachable — a `RootHandle` can only
+    // come from `admit_root`, which fails closed with `UnsupportedPlatform` —
+    // and the uninhabited handle types prove it to the compiler.
+    pub(super) fn write_control_range(
+        control: &ControlHandle,
+        _offset: u64,
+        _bytes: &[u8],
+    ) -> GenerationRootResult<()> {
+        match *control {}
+    }
+
+    pub(super) fn write_lock_range(
+        lock: &mut LockHandle,
+        _offset: u64,
+        _bytes: &[u8],
+    ) -> GenerationRootResult<()> {
+        match *lock {}
+    }
+
+    pub(super) fn read_lock_image(lock: &LockHandle) -> GenerationRootResult<Vec<u8>> {
         match *lock {}
     }
 }

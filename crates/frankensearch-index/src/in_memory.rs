@@ -1849,6 +1849,11 @@ impl InMemoryVectorIndex {
         };
         let mut derived = None;
         for candidate in candidates {
+            // Every read of `candidate` below is behind the Linux descriptor
+            // API; off Linux the loop only re-derives, so name the deliberate
+            // non-use rather than emit an unused-variable warning there.
+            #[cfg(not(target_os = "linux"))]
+            let _ = &candidate;
             // Fail-cheap admission. Discovery filters on the header alone, so a
             // corrupt body would otherwise reach the byte-exact comparison and
             // force a full source derivation solely to learn the candidate was
@@ -2312,6 +2317,10 @@ impl InMemoryVectorIndex {
         let Some(source) = self.residual_source_binding.as_ref() else {
             return Ok(false);
         };
+        // Both are consumed only by the Linux descriptor path below; off Linux
+        // the header never matches, so name the deliberate non-use.
+        #[cfg(not(target_os = "linux"))]
+        let _ = (path, source);
         #[cfg(target_os = "linux")]
         let header_matches = exact_residual_sidecar_header_matches_source(
             path,
