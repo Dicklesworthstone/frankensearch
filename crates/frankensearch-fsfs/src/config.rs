@@ -3430,6 +3430,23 @@ mod tests {
     }
 
     #[test]
+    fn profile_resolution_strict_profile_honors_the_fast_only_override() {
+        // bd-k7x34, both directions: under `strict` the fast-only override is
+        // admitted — the resolved search mode carries fast_only and the
+        // profile reports no locked-field conflict.
+        let env = HashMap::from([("FRANKENSEARCH_PRESSURE_PROFILE".into(), "strict".into())]);
+        let cli = CliOverrides {
+            fast_only: Some(true),
+            ..CliOverrides::default()
+        };
+
+        let result = load_from_str(None, None, &env, &cli, home()).expect("load config");
+
+        assert!(result.config.search.fast_only);
+        assert!(!result.pressure_profile_resolution.conflict_detected);
+    }
+
+    #[test]
     fn profile_resolution_uses_cli_env_file_precedence_for_overridable_fields() {
         let file = "\
 [pressure]\nprofile = \"performance\"\n\
