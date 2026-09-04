@@ -4303,6 +4303,34 @@ struct RerankStageOutcome {
     payload: RerankStagePayload,
 }
 
+/// Caller-owned blocking capacity whose shutdown retains every admitted job.
+///
+/// The dependency's ordinary pool destructor only waits five seconds. Keep
+/// this owner outside the scheduler so long ONNX calls cannot escape shutdown.
+pub struct SearchBlockingPool(asupersync::runtime::blocking_pool::BlockingPool);
+
+impl Default for SearchBlockingPool {
+    fn default() -> Self {
+        Self(asupersync::runtime::blocking_pool::BlockingPool::new(0, 2))
+    }
+}
+
+impl SearchBlockingPool {
+    /// Attach this owner's bounded capacity to the caller's live context.
+    #[must_use]
+    pub fn context(&self, cx: Cx) -> Cx {
+        cx.with_blocking_pool_handle(Some(self.0.handle()))
+    }
+}
+
+impl Drop for SearchBlockingPool {
+    fn drop(&mut self) {
+        // A timed-out call cannot publish, but an already executing native
+        // call is not preemptible. Do not abandon it after a fixed grace period.
+        while !self.0.shutdown_and_wait(Duration::from_secs(1)) {}
+    }
+}
+
 /// Shared runtime entrypoint used by interface adapters.
 #[derive(Debug, Clone)]
 pub struct FsfsRuntime {
@@ -6339,6 +6367,7 @@ impl FsfsRuntime {
         // Keep the pool alive until the response is flushed and its write side
         // closes. Joining a timed-out backend before writing would hide the
         // deadline from clients which read the response through EOF.
+        let blocking_pool = Arc::new(SearchBlockingPool::default());
         let mut request_scheduler = None;
         let response = match Self::parse_search_serve_request(raw) {
             Ok(request) => {
@@ -6358,8 +6387,11 @@ impl FsfsRuntime {
                     }
                 };
                 let scheduler = request_scheduler.insert(scheduler);
+                let request_pool = Arc::clone(&blocking_pool);
                 let execute_task = scheduler.handle().spawn(async move {
-                    let cx = Cx::current().expect("asupersync runtime installs a request context");
+                    let cx = request_pool.context(
+                        Cx::current().expect("asupersync runtime installs a request context"),
+                    );
                     let mut guard =
                         asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), &cx)
                             .await
@@ -6400,8 +6432,10 @@ impl FsfsRuntime {
                 "fsfs daemon failed to write socket response"
             );
         }
-        // Runtime drop joins pool jobs after the client can receive its result.
+        // Stop scheduler admission, then fully drain the explicitly owned pool
+        // after the client can receive its result, even for calls over five seconds.
         drop(request_scheduler);
+        drop(blocking_pool);
     }
 
     fn parse_search_serve_request(raw: &str) -> SearchResult<SearchServeRequest> {
@@ -22486,9 +22520,8 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::test_utils::run_test_with_cx;
 
-    /// Drive a test on a live current-thread runtime so `Cx::spawn_local`
-    /// stays admitted. `run_test_with_cx` is not spawn-capable after the
-    /// helper's runtime is torn down (ASUP-E001).
+    /// Drive a test with a live runtime context. `run_test_with_cx` passes a
+    /// synthetic `Cx::for_testing`, which has no spawn gateway (ASUP-E001).
     fn run_on_runtime_task<F, Fut>(test: F)
     where
         F: FnOnce(Cx) -> Fut + Send + 'static,
@@ -23116,6 +23149,79 @@ mod tests {
             assert_eq!(refined.query, "replacement query after timeout");
             assert_eq!(completed.load(Ordering::SeqCst), 2);
         });
+    }
+
+    #[test]
+    fn quality_pool_shutdown_retains_work_beyond_dependency_grace_period() {
+        let pool = super::SearchBlockingPool::default();
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let _job = pool.0.spawn(move || {
+            started_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(5_500));
+            worker_completed.store(true, Ordering::SeqCst);
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(pool);
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "shutdown must retain work past the dependency's five-second grace period"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quality_socket_timeout_flushes_before_owned_backend_join() {
+        use std::io::Read as _;
+        let temp = tempfile::tempdir().unwrap();
+        let mut resources = disagreeing_blend_resources(temp.path());
+        let completed = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
+            gate: Arc::new(asupersync::sync::Mutex::new(())),
+            calls: Arc::clone(&calls),
+            completed: Arc::clone(&completed),
+        }));
+        let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let handler = thread::spawn(move || {
+            FsfsRuntime::handle_search_serve_socket_client(
+                runtime,
+                server,
+                shared,
+                Arc::new(AtomicBool::new(false)),
+                false,
+            );
+        });
+        client
+            .write_all(b"{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":50,\"limit\":10}\n")
+            .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        let response: super::SearchServeResponse = serde_json::from_str(&response).unwrap();
+        assert!(response.ok, "{response:?}");
+        assert_eq!(
+            response.payloads.last().unwrap().phase,
+            SearchOutputPhase::RefinementFailed
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            0,
+            "EOF must precede backend completion"
+        );
+        handler.join().unwrap();
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            1,
+            "handler owns the backend until it ends"
+        );
     }
 
     #[test]
@@ -24044,7 +24150,7 @@ mod tests {
                 "quality initialization and refinement",
                 source_region(
                     source,
-                    "let quality_initialization = if matches!(mode, SearchExecutionMode::Full)",
+                    "let quality_outcome = self",
                     "if flags.persist_explain_session",
                 ),
             ),
@@ -24889,7 +24995,7 @@ mod tests {
                 .collect()
         }
 
-        run_test_with_cx(|cx| async move {
+        run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let project = temp.path().join("project");
             fs::create_dir_all(project.join("docs")).expect("create project docs dir");

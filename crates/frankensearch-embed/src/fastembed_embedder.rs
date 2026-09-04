@@ -899,9 +899,10 @@ mod tests {
         assert_eq!(embedder.identity().unwrap(), &expected_identity);
         let texts = &crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
             .build()
             .expect("build current-thread conformance runtime");
-        let cx = Cx::for_testing();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
         let vectors = runtime
             .block_on(embedder.embed_batch(&cx, texts))
             .expect("embed bounded conformance corpus");

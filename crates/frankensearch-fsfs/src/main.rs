@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_fsfs::runtime::SearchBlockingPool;
 use frankensearch_fsfs::{
     CliCommand, CliInput, CliOverrides, ConfigAction, ConfigLoadResult, ConfigWarning, FsfsConfig,
     FsfsRuntime, InterfaceMode, OutputEnvelope, OutputFormat, ShutdownCoordinator, ShutdownReason,
@@ -244,6 +245,7 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         "fsfs command parsed and runtime wired"
     );
 
+    let blocking_pool = Arc::new(SearchBlockingPool::default());
     let scheduler = RuntimeBuilder::current_thread()
         // ONNX calls and quality index scans must not block the executor
         // that publishes Initial and drives the refinement deadline.
@@ -285,9 +287,11 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     // ─────────────────────────────────────────────────────────────────────
 
     let shutdown_for_run = Arc::clone(&shutdown);
+    let request_pool = Arc::clone(&blocking_pool);
 
     let run_task = scheduler.handle().spawn(async move {
-        let cx = Cx::current().expect("asupersync runtime installs a request context");
+        let cx = request_pool
+            .context(Cx::current().expect("asupersync runtime installs a request context"));
         let run_result = if run_with_shutdown {
             app_runtime
                 .run_mode_with_shutdown(&cx, interface_mode, shutdown_for_run.as_ref())
@@ -315,6 +319,8 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         info!(reason = ?reason, "fsfs shutdown completed at process boundary");
     }
 
+    drop(scheduler);
+    drop(blocking_pool);
     run_result
 }
 
