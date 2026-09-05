@@ -4966,6 +4966,112 @@ mod tests {
         });
     }
 
+    #[test]
+    fn reopened_v1_checks_both_producers_before_embedding_or_cache() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("v1-producer-reopen");
+            let identity = in_memory_identity("same-model-revision", 4);
+            let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
+            builder
+                .set_fast_embedder_id("same-id")
+                .set_quality_embedder_id("same-id");
+            builder.set_fast_identity(&identity).unwrap();
+            builder.set_quality_identity(&identity).unwrap();
+            builder
+                .add_record("doc-a", &[1.0, 0.0, 0.0, 0.0], Some(&[1.0, 0.0, 0.0, 0.0]))
+                .unwrap();
+            drop(builder.finish().unwrap());
+            let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap());
+            assert!(index.fast_admitted_binding().is_none());
+            assert!(index.quality_admitted_binding().is_none());
+            assert!(index.fast_declared_identity().is_none());
+            let matching = Arc::new(IdentityCountingEmbedder::new(
+                "same-id",
+                identity.clone(),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let searcher = TwoTierSearcher::new(
+                Arc::clone(&index),
+                matching.clone(),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(matching.clone())
+            .with_embedding_cache(8);
+            let mut phases = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "query",
+                    1,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. } => {
+                            phases.push("Initial");
+                            assert_eq!(results[0].doc_id.as_str(), "doc-a");
+                        }
+                        SearchPhase::Refined { results, .. } => {
+                            phases.push("Refined");
+                            assert_eq!(results[0].doc_id.as_str(), "doc-a");
+                        }
+                        phase => panic!("unexpected phase {phase:?}"),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(phases, ["Initial", "Refined"]);
+            assert_eq!(matching.embed_count(), 2);
+
+            let mut changed = identity.clone();
+            "different-execution-backend".clone_into(&mut changed.producer.backend);
+            assert_eq!(changed.space, identity.space);
+            for tier in ["fast", "quality"] {
+                let foreign = Arc::new(IdentityCountingEmbedder::new(
+                    "same-id",
+                    changed.clone(),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                ));
+                let fast: Arc<dyn Embedder> = if tier == "fast" {
+                    foreign.clone()
+                } else {
+                    matching.clone()
+                };
+                let quality: Arc<dyn Embedder> = if tier == "quality" {
+                    foreign.clone()
+                } else {
+                    matching.clone()
+                };
+                let searcher =
+                    TwoTierSearcher::new(Arc::clone(&index), fast, TwoTierConfig::default())
+                        .with_quality_embedder(quality)
+                        .with_embedding_cache(8);
+                let calls_before = matching.embed_count();
+                let mut phase_count = 0;
+                let error = searcher
+                    .search(&cx, "query", 1, |_| None, |_| phase_count += 1)
+                    .await
+                    .expect_err("same model and width do not admit another producer");
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { ref field, .. }
+                    if field == &format!("search_activation.{tier}.producer_revision")),
+                    "{error}"
+                );
+                assert_eq!(foreign.embed_count(), 0);
+                assert_eq!(matching.embed_count(), calls_before);
+                assert_eq!(phase_count, 0);
+            }
+            for revision in ["", identity.space.immutable_revision.as_str()] {
+                assert!(
+                    matches!(
+                        admit_legacy_tier_embedder(matching.as_ref(), revision, "fast"),
+                        Err(SearchError::InvalidConfig { field, .. })
+                            if field == "search_activation.fast.producer_revision"
+                    ),
+                    "an old header cannot prove this identified semantic producer"
+                );
+            }
+        });
+    }
+
     /// A two-tier index opened through exact FSVI v2 admission where the
     /// QUALITY tier holds a document the FAST tier does not contain at all.
     fn owner_backed_two_tier_index(
