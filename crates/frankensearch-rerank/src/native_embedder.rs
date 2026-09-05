@@ -315,6 +315,26 @@ impl NativeEmbedder {
     /// a waiting future cannot preempt an executing tensor kernel; its worker
     /// retains model admission until it finishes. No internal runtime is made.
     /// Without an attached pool, async inference returns an actionable error.
+    ///
+    /// ```no_run
+    /// use frankensearch_core::Embedder;
+    /// use frankensearch_rerank::{NativeEmbedder, NativeEmbeddingModel};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+    ///     .blocking_threads(0, 2)
+    ///     .build()?;
+    /// let quality = NativeEmbedder::load_model(
+    ///     "./models/all-MiniLM-L6-v2",
+    ///     NativeEmbeddingModel::AllMiniLmL6V2F32,
+    /// )?.with_blocking_pool(runtime.blocking_handle().expect("configured pool"));
+    /// let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+    /// let vector = runtime.block_on(quality.embed(&cx, "distributed consensus"))?;
+    /// assert_eq!(vector.len(), 384);
+    /// // The same quality model can be passed directly to EmbedderStack::from_parts.
+    /// assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(5)));
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
     pub fn with_blocking_pool(mut self, pool: BlockingPoolHandle) -> Self {
         self.blocking_pool = Some(pool);
@@ -400,7 +420,12 @@ impl NativeEmbedder {
         }
         let token_batches: Vec<Vec<i64>> = texts
             .iter()
-            .map(|t| self.tokenize(t))
+            .map(|t| {
+                if let Some(cx) = cx {
+                    native_checkpoint(cx)?;
+                }
+                self.tokenize(t)
+            })
             .collect::<SearchResult<_>>()?;
         let mut model = self.lock_model()?;
         let mut out = Vec::with_capacity(texts.len());
