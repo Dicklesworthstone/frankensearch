@@ -1755,6 +1755,169 @@ mod semantic {
         compare_native_minilm_to_onnx(frankensearch::NativeEmbeddingModel::AllMiniLmL6V2F32);
     }
 
+    /// Original bd-2ba5 latency gate, on loaded public producers. Each round
+    /// times two passes per producer over every passage and query, rotating
+    /// order to expose drift. A failed A/A control is NO_VERDICT, never a win.
+    /// This is an inference comparison, not whole-search or Quill promotion.
+    #[cfg(all(feature = "fastembed", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "requires optimized build, quiet host, and both real MiniLM fixtures"]
+    fn native_f32_minilm_live_onnx_latency() {
+        use sha2::{Digest as _, Sha256};
+        use std::time::Instant;
+
+        assert!(!cfg!(debug_assertions), "latency requires --release");
+        let executable = std::fs::read("/proc/self/exe").expect("read executing ELF");
+        let elf_sha: String = Sha256::digest(executable)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        eprintln!(
+            "[native-latency] provenance={}",
+            serde_json::json!({
+                "elf_sha256": elf_sha,
+                "host": std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap(),
+                "cpuinfo": std::fs::read_to_string("/proc/cpuinfo").unwrap(),
+                "status": std::fs::read_to_string("/proc/self/status").unwrap(),
+                "load_start": std::fs::read_to_string("/proc/loadavg").unwrap(),
+                "avx2": std::is_x86_feature_detected!("avx2"),
+                "fma": std::is_x86_feature_detected!("fma"),
+            })
+        );
+        let native = NativeEmbedder::load_model(
+            std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required"),
+            frankensearch::NativeEmbeddingModel::AllMiniLmL6V2F32,
+        )
+        .expect("load native producer");
+        let onnx = frankensearch::FastEmbedEmbedder::load(
+            std::env::var("FASTEMBED_MINILM_FIXTURE_DIR").expect("ONNX fixture required"),
+        )
+        .expect("load ONNX producer");
+        assert_ne!(native.identity().unwrap(), onnx.identity().unwrap());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .expect("comparison runtime");
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let passages = corpus();
+        let spec: serde_json::Value = serde_json::from_str(SEMANTIC_QUERIES).unwrap();
+        let queries = spec["queries"].as_array().unwrap();
+        let texts: Vec<&str> = passages
+            .iter()
+            .map(|p| p.text.as_str())
+            .chain(queries.iter().map(|q| q["query"].as_str().unwrap()))
+            .collect();
+        assert_eq!((passages.len(), queries.len()), (339, 16));
+        let infer = |arm: usize, text: &str| {
+            if arm < 2 {
+                native.embed_sync(text).expect("native inference")
+            } else {
+                runtime
+                    .block_on(onnx.embed(&cx, text))
+                    .expect("ONNX inference")
+            }
+        };
+        // Untimed full-corpus warmup and parity admission before any ratios.
+        let reference: Vec<Vec<f32>> = texts.iter().map(|text| infer(2, text)).collect();
+        let candidate: Vec<Vec<f32>> = texts.iter().map(|text| infer(0, text)).collect();
+        for (a, b) in candidate.iter().zip(&reference) {
+            assert_eq!((a.len(), b.len()), (384, 384));
+            assert!(paired_vector_cosine(a, b) > 0.999);
+        }
+        assert!(
+            chapter_ndcg(&passages, queries, candidate.clone())
+                >= chapter_ndcg(&passages, queries, reference.clone())
+        );
+        let mut samples: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
+        for round in 0..8 {
+            for position in 0..4 {
+                let arm = (position + round) % 4;
+                let before = cpu_thread_ticks();
+                let mut outputs = Vec::with_capacity(texts.len());
+                let mut latencies = Vec::with_capacity(texts.len());
+                let started = Instant::now();
+                for text in &texts {
+                    let start = Instant::now();
+                    outputs.push(infer(arm, text));
+                    latencies.push(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                let elapsed = started.elapsed().as_secs_f64();
+                let active_threads = cpu_thread_ticks()
+                    .iter()
+                    .filter(|(tid, ticks)| **ticks > *before.get(tid).unwrap_or(&0))
+                    .count();
+                let expected = if arm < 2 { &candidate } else { &reference };
+                assert_eq!(
+                    &outputs, expected,
+                    "each timed call preserves producer output"
+                );
+                samples[arm].push(elapsed);
+                let query_ms = latencies[passages.len()..].to_vec();
+                latencies.sort_by(f64::total_cmp);
+                eprintln!(
+                    "[native-latency] round={round} arm={arm} elapsed_s={elapsed:.9} active_cpu_threads={active_threads} p50_ms={:.6} p95_ms={:.6} p99_ms={:.6} query_ms={query_ms:?}",
+                    latencies[latencies.len() / 2],
+                    latencies[latencies.len() * 95 / 100],
+                    latencies[latencies.len() * 99 / 100],
+                );
+            }
+        }
+        let geometric = |ratios: Vec<f64>| (ratios.iter().map(|x| x.ln()).sum::<f64>() / 8.0).exp();
+        let native_null = geometric(
+            samples[0]
+                .iter()
+                .zip(&samples[1])
+                .map(|(a, b)| a / b)
+                .collect(),
+        );
+        let onnx_null = geometric(
+            samples[2]
+                .iter()
+                .zip(&samples[3])
+                .map(|(a, b)| a / b)
+                .collect(),
+        );
+        let native_over_onnx = geometric(
+            (0..8)
+                .map(|r| ((samples[0][r] * samples[1][r]) / (samples[2][r] * samples[3][r])).sqrt())
+                .collect(),
+        );
+        eprintln!(
+            "[native-latency] native_aa={native_null:.9} onnx_aa={onnx_null:.9} native_over_onnx={native_over_onnx:.9} load_end={}",
+            std::fs::read_to_string("/proc/loadavg").unwrap().trim()
+        );
+        assert!(
+            (0.97..=1.03).contains(&native_null),
+            "NO_VERDICT: native A/A failed"
+        );
+        assert!(
+            (0.97..=1.03).contains(&onnx_null),
+            "NO_VERDICT: ONNX A/A failed"
+        );
+        assert!(
+            native_over_onnx <= 2.0,
+            "original native <=2x latency admission failed"
+        );
+    }
+
+    #[cfg(all(feature = "fastembed", target_os = "linux", target_arch = "x86_64"))]
+    fn cpu_thread_ticks() -> std::collections::BTreeMap<String, u64> {
+        std::fs::read_dir("/proc/self/task")
+            .expect("observe actual worker threads")
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                // A worker may exit between enumeration and reading stat.
+                let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+                let (_, counters) = stat.rsplit_once(") ")?;
+                let fields: Vec<&str> = counters.split_whitespace().collect();
+                Some((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?,
+                ))
+            })
+            .collect()
+    }
+
     #[cfg(feature = "fastembed")]
     fn compare_native_minilm_to_onnx(profile: frankensearch::NativeEmbeddingModel) {
         use frankensearch::FastEmbedEmbedder;
