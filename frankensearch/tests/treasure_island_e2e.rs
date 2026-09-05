@@ -1757,21 +1757,24 @@ mod semantic {
 
     /// Original bd-2ba5 latency gate, on loaded public producers. Each round
     /// times two passes per producer over every passage and query, rotating
-    /// order to expose drift. A failed A/A control is NO_VERDICT, never a win.
+    /// order to expose drift. A failed A/A control is `NO_VERDICT`, never a win.
     /// This is an inference comparison, not whole-search or Quill promotion.
     #[cfg(all(feature = "fastembed", target_os = "linux", target_arch = "x86_64"))]
     #[test]
     #[ignore = "requires optimized build, quiet host, and both real MiniLM fixtures"]
-    fn native_f32_minilm_live_onnx_latency() {
+    fn native_f32_minilm_live_onnx_latency() -> Result<(), String> {
         use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
         use std::time::Instant;
 
-        assert!(!cfg!(debug_assertions), "latency requires --release");
+        if cfg!(debug_assertions) {
+            return Err("latency requires --release".to_owned());
+        }
         let executable = std::fs::read("/proc/self/exe").expect("read executing ELF");
-        let elf_sha: String = Sha256::digest(executable)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let mut elf_sha = String::with_capacity(64);
+        for byte in Sha256::digest(executable) {
+            write!(elf_sha, "{byte:02x}").unwrap();
+        }
         eprintln!(
             "[native-latency] provenance={}",
             serde_json::json!({
@@ -1794,6 +1797,22 @@ mod semantic {
         )
         .expect("load ONNX producer");
         assert_ne!(native.identity().unwrap(), onnx.identity().unwrap());
+        eprintln!(
+            "[native-latency] native_identity={} onnx_identity={}",
+            native.identity().unwrap().fingerprint(),
+            onnx.identity().unwrap().fingerprint()
+        );
+        let conformance_texts = &frankensearch::embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        native
+            .identity()
+            .unwrap()
+            .producer
+            .golden_vectors
+            .verify_exact_f32(
+                conformance_texts,
+                &native.embed_batch_sync(conformance_texts).unwrap(),
+            )
+            .expect("the timed native producer must pass its frozen certificate");
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .blocking_threads(0, 2)
             .build()
@@ -1844,7 +1863,7 @@ mod semantic {
                 let elapsed = started.elapsed().as_secs_f64();
                 let active_threads = cpu_thread_ticks()
                     .iter()
-                    .filter(|(tid, ticks)| **ticks > *before.get(tid).unwrap_or(&0))
+                    .filter(|(tid, ticks)| **ticks > *before.get(*tid).unwrap_or(&0))
                     .count();
                 let expected = if arm < 2 { &candidate } else { &reference };
                 assert_eq!(
@@ -1898,6 +1917,7 @@ mod semantic {
             native_over_onnx <= 2.0,
             "original native <=2x latency admission failed"
         );
+        Ok(())
     }
 
     #[cfg(all(feature = "fastembed", target_os = "linux", target_arch = "x86_64"))]
