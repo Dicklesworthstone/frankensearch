@@ -1755,6 +1755,195 @@ mod semantic {
         compare_native_minilm_to_onnx(frankensearch::NativeEmbeddingModel::AllMiniLmL6V2F32);
     }
 
+    #[cfg(feature = "model2vec")]
+    #[test]
+    #[ignore = "requires native MiniLM and Potion fixtures; real native progressive search"]
+    fn native_async_quality_yields_refined_and_rejects_foreign_producer() {
+        use frankensearch::{
+            EmbedderStack, IndexBuilder, Model2VecEmbedder, NativeEmbeddingModel, SearchPhase,
+            TwoTierConfig, TwoTierIndex, TwoTierSearcher,
+        };
+        use std::sync::Arc;
+
+        let native_dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
+        let potion_dir = std::env::var("POTION_FIXTURE_DIR").expect("Potion fixture required");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .expect("caller-owned runtime");
+        let pool = runtime.blocking_handle().unwrap();
+        let fast: Arc<dyn Embedder> = Arc::new(Model2VecEmbedder::load(potion_dir).unwrap());
+        let native =
+            NativeEmbedder::load_model(&native_dir, NativeEmbeddingModel::AllMiniLmL6V2F32)
+                .unwrap();
+        let unavailable: Arc<dyn Embedder> = Arc::new(native.clone());
+        let quality: Arc<dyn Embedder> = Arc::new(native.with_blocking_pool(pool.clone()));
+        let foreign: Arc<dyn Embedder> = Arc::new(
+            NativeEmbedder::load(&native_dir)
+                .unwrap()
+                .with_blocking_pool(pool),
+        );
+        assert!(fast.is_semantic() && quality.is_ready());
+        assert_ne!(quality.identity().unwrap(), foreign.identity().unwrap());
+        let stack = EmbedderStack::from_parts(Arc::clone(&fast), Some(Arc::clone(&quality)));
+        let passages = corpus();
+        let temp = tempfile::tempdir().unwrap();
+        eprintln!(
+            "loaded actual native/Potion producers; indexing {} passages",
+            passages.len()
+        );
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        runtime.block_on(async {
+            let mut builder = IndexBuilder::new(temp.path()).with_embedder_stack(stack);
+            for passage in &passages {
+                builder = builder.add_document(&passage.id, &passage.text);
+            }
+            let stats = builder
+                .build(&cx)
+                .await
+                .expect("build both real semantic tiers");
+            assert_eq!(stats.doc_count, passages.len());
+            assert_eq!(stats.quality_indexed, passages.len());
+            assert!(stats.has_quality_index);
+            eprintln!(
+                "persisted {} fast and {} quality vectors",
+                stats.doc_count, stats.quality_indexed
+            );
+            let index =
+                Arc::new(TwoTierIndex::open(temp.path(), TwoTierConfig::default()).unwrap());
+            let searcher = TwoTierSearcher::new(
+                Arc::clone(&index),
+                Arc::clone(&fast),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(quality);
+            let spec: serde_json::Value = serde_json::from_str(SEMANTIC_QUERIES).unwrap();
+            let query = spec["queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == "lone_castaway")
+                .unwrap()["query"]
+                .as_str()
+                .unwrap();
+            let mut phases = Vec::new();
+            let mut initial = Vec::new();
+            let mut refined = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    query,
+                    10,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. } => {
+                            phases.push("Initial");
+                            initial = results
+                                .iter()
+                                .map(|hit| hit.doc_id.to_string())
+                                .collect::<Vec<_>>();
+                        }
+                        SearchPhase::Refined { results, .. } => {
+                            phases.push("Refined");
+                            refined = results.iter().map(|hit| hit.doc_id.to_string()).collect();
+                        }
+                        SearchPhase::RefinementFailed { .. } => phases.push("RefinementFailed"),
+                        SearchPhase::Reranked { .. } => phases.push("Reranked"),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(phases, ["Initial", "Refined"], "{metrics:?}");
+            assert!(metrics.phase2_vectors_searched > 0);
+            assert_eq!(
+                metrics.quality_embedder_id.as_deref(),
+                Some("minilm-384-native-f32")
+            );
+            assert!(!refined.is_empty());
+            let chapters = chapters_of(&passages, &refined);
+            assert!(
+                chapters.contains(&15),
+                "castaway chapter absent: {chapters:?}"
+            );
+            eprintln!("matching producer phases={phases:?}, refined chapters={chapters:?}");
+
+            let degraded = TwoTierSearcher::new(
+                Arc::clone(&index),
+                Arc::clone(&fast),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(unavailable);
+            let mut degraded_phases = Vec::new();
+            let mut degraded_initial = Vec::new();
+            let degraded_metrics = degraded
+                .search(
+                    &cx,
+                    query,
+                    10,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. } => {
+                            degraded_phases.push("Initial");
+                            degraded_initial = results
+                                .iter()
+                                .map(|hit| hit.doc_id.to_string())
+                                .collect::<Vec<_>>();
+                        }
+                        SearchPhase::RefinementFailed { .. } => {
+                            degraded_phases.push("RefinementFailed");
+                        }
+                        SearchPhase::Refined { .. } => degraded_phases.push("Refined"),
+                        SearchPhase::Reranked { .. } => degraded_phases.push("Reranked"),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(degraded_phases, ["Initial", "RefinementFailed"]);
+            assert_eq!(
+                degraded_initial, initial,
+                "quality failure must preserve fast results"
+            );
+            assert!(
+                degraded_metrics
+                    .skip_reason
+                    .unwrap()
+                    .contains("caller-owned blocking pool")
+            );
+
+            let mismatched = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(foreign);
+            let mut foreign_phases = Vec::new();
+            let error = mismatched
+                .search(
+                    &cx,
+                    query,
+                    10,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => foreign_phases.push("Initial"),
+                        SearchPhase::RefinementFailed { .. } => {
+                            foreign_phases.push("RefinementFailed");
+                        }
+                        SearchPhase::Refined { .. } => foreign_phases.push("Refined"),
+                        SearchPhase::Reranked { .. } => foreign_phases.push("Reranked"),
+                    },
+                )
+                .await
+                .expect_err("a foreign native producer must fail before querying the F32 index");
+            assert!(
+                matches!(error, frankensearch::SearchError::InvalidConfig { ref field, .. }
+                if field == "search_activation.quality.producer_revision"),
+                "{error}"
+            );
+            assert!(
+                foreign_phases.is_empty(),
+                "identity admission precedes all search work"
+            );
+            eprintln!("unavailable quality preserved Initial; foreign producer refused: {error}");
+        });
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(5)));
+    }
+
     /// Original bd-2ba5 latency gate, on loaded public producers. Each round
     /// times two passes per producer over every passage and query, rotating
     /// order to expose drift. A failed A/A control is `NO_VERDICT`, never a win.
@@ -1796,15 +1985,17 @@ mod semantic {
             std::env::var("FASTEMBED_MINILM_FIXTURE_DIR").expect("ONNX fixture required"),
         )
         .expect("load ONNX producer");
-        assert_ne!(native.identity().unwrap(), onnx.identity().unwrap());
+        assert_ne!(
+            SyncEmbed::identity(&native).unwrap(),
+            onnx.identity().unwrap()
+        );
         eprintln!(
             "[native-latency] native_identity={} onnx_identity={}",
-            native.identity().unwrap().fingerprint(),
+            SyncEmbed::identity(&native).unwrap().fingerprint(),
             onnx.identity().unwrap().fingerprint()
         );
         let conformance_texts = &frankensearch::embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
-        native
-            .identity()
+        SyncEmbed::identity(&native)
             .unwrap()
             .producer
             .golden_vectors
@@ -1948,7 +2139,10 @@ mod semantic {
         let native =
             NativeEmbedder::load_model(native_dir, profile).expect("load verified native MiniLM");
         let onnx = FastEmbedEmbedder::load(onnx_dir).expect("load verified ONNX MiniLM");
-        assert_ne!(native.identity().unwrap(), onnx.identity().unwrap());
+        assert_ne!(
+            SyncEmbed::identity(&native).unwrap(),
+            onnx.identity().unwrap()
+        );
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .blocking_threads(0, 2)
             .build()
@@ -2147,18 +2341,18 @@ mod semantic {
 
         let semantic = NativeEmbedder::load(&model_dir).expect("load native MiniLM embedder");
         assert!(
-            semantic.is_semantic(),
+            SyncEmbed::is_semantic(&semantic),
             "NativeEmbedder must report itself semantic"
         );
 
-        let semantic_id = semantic.id().to_owned();
+        let semantic_id = SyncEmbed::id(&semantic).to_owned();
         eprintln!(
             "embedding {} passages with {semantic_id}...",
             passages.len()
         );
         let semantic_index = index_with(
             |texts| semantic.embed_batch_sync(texts).expect("embed corpus"),
-            semantic.dimension(),
+            SyncEmbed::dimension(&semantic),
             &passages,
         );
         let semantic_hits = hit_vector(
@@ -2173,7 +2367,7 @@ mod semantic {
         // when no model is installed, so it is the right thing to measure
         // against: if these two scores are close, semantic search is not
         // actually working, whatever the logs say.
-        let hash = HashEmbedder::new(semantic.dimension(), HashAlgorithm::FnvModular);
+        let hash = HashEmbedder::new(SyncEmbed::dimension(&semantic), HashAlgorithm::FnvModular);
         assert!(
             !hash.is_semantic(),
             "HashEmbedder must report itself non-semantic"
@@ -2254,9 +2448,9 @@ mod semantic {
             return;
         };
         let semantic = NativeEmbedder::load(&model_dir).expect("load native MiniLM embedder");
-        assert!(semantic.is_semantic());
-        assert_ne!(semantic.id(), hash.id());
-        assert_eq!(semantic.dimension(), 384);
+        assert!(SyncEmbed::is_semantic(&semantic));
+        assert_ne!(SyncEmbed::id(&semantic), hash.id());
+        assert_eq!(SyncEmbed::dimension(&semantic), 384);
     }
 
     #[test]
