@@ -1486,6 +1486,11 @@ mod loader_only {
         )
         .unwrap();
         fs::write(corpus.join("database.md"), "Newquartz restores database atomicity through transaction rollback and durable journals.").unwrap();
+        let after_writes = fs::read_to_string(&stderr_path).unwrap();
+        assert!(
+            !after_writes.contains("live ingest pipeline initialized for watch mode"),
+            "watcher initialization overlapped the fixture writes; no handoff claim is valid"
+        );
         wait_for_watch_output(
             &mut watch,
             &stderr_path,

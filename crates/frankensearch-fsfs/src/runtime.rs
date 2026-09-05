@@ -28385,93 +28385,98 @@ mod tests {
 
     // Explicit basis-vector embedders exercise storage and WAL failure/retry
     // mechanics. Real semantic parity is covered by default_build_quickstart.
-    async fn assert_live_ingest_recovers_blocked_vector_wal(cx: &Cx, block_quality: bool) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("project");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("doc.md"),
-            "replacement content after a transient write failure",
-        )
-        .unwrap();
-        let fast_path = temp.path().join("fast.fsvi");
-        let quality_path = temp.path().join("quality.fsvi");
-        for (path, id) in [(&fast_path, "retry-fast"), (&quality_path, "retry-quality")] {
-            let mut writer = VectorIndex::create(path, id, 2).unwrap();
-            writer.write_record("doc.md", &[0.0, 1.0]).unwrap();
-            writer.finish().unwrap();
-        }
-        let pipeline = LiveIngestPipeline::new(
-            root,
-            create_test_quill(cx, &temp.path().join("lexical")).await,
-            VectorIndex::open(&fast_path).unwrap(),
-            Arc::new(BlendQueryEmbedder("retry-fast")),
-        )
-        .with_storage_db_path(temp.path().join("catalog.db"))
-        .with_quality_tier(
-            VectorIndex::open(&quality_path).unwrap(),
-            Arc::new(BlendQueryEmbedder("retry-quality")),
-        );
-        let blocked = if block_quality {
-            &quality_path
-        } else {
-            &fast_path
-        };
-        let wal = frankensearch_index::wal_path_for(blocked);
-        fs::create_dir(&wal).expect("block actual WAL file creation");
-        let batch = [WatchIngestOp::Upsert {
-            file_key: "doc.md".to_owned(),
-            revision: 2,
-            ingestion_class: IngestionClass::FullSemanticLexical,
-        }];
-        pipeline
-            .apply_batch(cx, &batch)
-            .await
-            .expect_err("a failed vector write must not acknowledge the watch batch");
-        pipeline
-            .apply_batch(cx, &batch)
-            .await
-            .expect_err("unchanged catalog content or a delayed retry is not vector completion");
-        let blocked_handle = if block_quality {
-            &pipeline.quality_tier.as_ref().unwrap().vector_index
-        } else {
-            &pipeline.vector_index
-        };
-        {
-            let blocked = blocked_handle.lock().unwrap();
-            let hits = blocked.search_top_k(&[0.0, 1.0], 2, None).unwrap();
-            assert_eq!(hits.len(), 1);
-            assert!(
-                hits[0].score > 0.99,
-                "failed replacement must preserve the old vector"
+    fn assert_live_ingest_recovers_blocked_vector_wal(
+        cx: &Cx,
+        block_quality: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+        Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("project");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("doc.md"),
+                "replacement content after a transient write failure",
+            )
+            .unwrap();
+            let fast_path = temp.path().join("fast.fsvi");
+            let quality_path = temp.path().join("quality.fsvi");
+            for (path, id) in [(&fast_path, "retry-fast"), (&quality_path, "retry-quality")] {
+                let mut writer = VectorIndex::create(path, id, 2).unwrap();
+                writer.write_record("doc.md", &[0.0, 1.0]).unwrap();
+                writer.finish().unwrap();
+            }
+            let pipeline = LiveIngestPipeline::new(
+                root,
+                create_test_quill(cx, &temp.path().join("lexical")).await,
+                VectorIndex::open(&fast_path).unwrap(),
+                Arc::new(BlendQueryEmbedder("retry-fast")),
+            )
+            .with_storage_db_path(temp.path().join("catalog.db"))
+            .with_quality_tier(
+                VectorIndex::open(&quality_path).unwrap(),
+                Arc::new(BlendQueryEmbedder("retry-quality")),
             );
-        }
-        fs::rename(&wal, temp.path().join("preserved-wal-blocker"))
-            .expect("preserve and displace WAL blocker");
-        let started = Instant::now();
-        loop {
-            match pipeline.apply_batch(cx, &batch).await {
-                Ok(applied) => {
-                    assert_eq!(applied, 1);
-                    break;
-                }
-                Err(error) => {
-                    assert!(
-                        started.elapsed() < Duration::from_secs(5),
-                        "retry did not recover: {error}"
-                    );
-                    asupersync::time::sleep(cx.now(), Duration::from_millis(20)).await;
+            let blocked = if block_quality {
+                &quality_path
+            } else {
+                &fast_path
+            };
+            let wal = frankensearch_index::wal_path_for(blocked);
+            fs::create_dir(&wal).expect("block actual WAL file creation");
+            let batch = [WatchIngestOp::Upsert {
+                file_key: "doc.md".to_owned(),
+                revision: 2,
+                ingestion_class: IngestionClass::FullSemanticLexical,
+            }];
+            pipeline
+                .apply_batch(cx, &batch)
+                .await
+                .expect_err("a failed vector write must not acknowledge the watch batch");
+            pipeline.apply_batch(cx, &batch).await.expect_err(
+                "unchanged catalog content or a delayed retry is not vector completion",
+            );
+            let blocked_handle = if block_quality {
+                &pipeline.quality_tier.as_ref().unwrap().vector_index
+            } else {
+                &pipeline.vector_index
+            };
+            {
+                let blocked = blocked_handle.lock().unwrap();
+                let hits = blocked.search_top_k(&[0.0, 1.0], 2, None).unwrap();
+                drop(blocked);
+                assert_eq!(hits.len(), 1);
+                assert!(
+                    hits[0].score > 0.99,
+                    "failed replacement must preserve the old vector"
+                );
+            }
+            fs::rename(&wal, temp.path().join("preserved-wal-blocker"))
+                .expect("preserve and displace WAL blocker");
+            let started = Instant::now();
+            loop {
+                match pipeline.apply_batch(cx, &batch).await {
+                    Ok(applied) => {
+                        assert_eq!(applied, 1);
+                        break;
+                    }
+                    Err(error) => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(5),
+                            "retry did not recover: {error}"
+                        );
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(20)).await;
+                    }
                 }
             }
-        }
-        drop(pipeline);
-        for path in [&fast_path, &quality_path] {
-            let index = VectorIndex::open_read_only(path).unwrap();
-            let hits = index.search_top_k(&[1.0, 0.0], 2, None).unwrap();
-            assert_eq!(hits.len(), 1, "retry must supersede rather than duplicate");
-            assert_eq!(hits[0].doc_id, "doc.md");
-            assert!(hits[0].score > 0.99, "{path:?}: retry left the old vector");
-        }
+            drop(pipeline);
+            for path in [&fast_path, &quality_path] {
+                let index = VectorIndex::open_read_only(path).unwrap();
+                let hits = index.search_top_k(&[1.0, 0.0], 2, None).unwrap();
+                assert_eq!(hits.len(), 1, "retry must supersede rather than duplicate");
+                assert_eq!(hits[0].doc_id, "doc.md");
+                assert!(hits[0].score > 0.99, "{path:?}: retry left the old vector");
+            }
+        })
     }
 
     #[test]
@@ -28548,6 +28553,7 @@ mod tests {
     fn live_ingest_reclaims_expired_processing_jobs_without_stealing_live_claims() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("doc.md"), "interrupted worker content").unwrap();
             let vector_path = temp.path().join("fast.fsvi");
             VectorIndex::create(&vector_path, "retry-fast", 2)
                 .unwrap()
