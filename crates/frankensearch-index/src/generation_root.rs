@@ -3513,17 +3513,20 @@ pub mod authority_publisher {
         #[test]
         fn two_real_publishers_race_one_wins_and_the_loser_never_mutates() {
             let root_path = fixture_root("race");
+            // Qualify both independent descriptors before starting the race.
+            // A setup refusal must fail this test, not strand the other
+            // publisher at a barrier that its failed peer can never reach.
+            let root_a = admit(&root_path);
+            let root_b = admit(&root_path);
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-            let path_a = root_path.clone();
-            let path_b = root_path.clone();
             let barrier_a = std::sync::Arc::clone(&barrier);
             let barrier_b = std::sync::Arc::clone(&barrier);
-            let run = |path: std::path::PathBuf,
+            let run = |root: QualifiedGenerationRoot,
                        writer: [u8; 16],
                        key: u8,
                        barrier: std::sync::Arc<std::sync::Barrier>| {
                 move || {
-                    let root = admit(&path);
+                    barrier.wait();
                     let publisher = root
                         .authority_publisher(
                             ROOT_ID,
@@ -3531,7 +3534,6 @@ pub mod authority_publisher {
                             GenerationRootSecurityProfileV1::CooperativeLocal,
                         )
                         .expect("racing publisher binds");
-                    barrier.wait();
                     publisher.publish(
                         authority(1, None),
                         ExpectedAuthorityPairV1::default(),
@@ -3540,8 +3542,8 @@ pub mod authority_publisher {
                     )
                 }
             };
-            let thread_a = std::thread::spawn(run(path_a, WRITER_A, 0xA1, barrier_a));
-            let thread_b = std::thread::spawn(run(path_b, WRITER_B, 0xB1, barrier_b));
+            let thread_a = std::thread::spawn(run(root_a, WRITER_A, 0xA1, barrier_a));
+            let thread_b = std::thread::spawn(run(root_b, WRITER_B, 0xB1, barrier_b));
             let outcome_a = thread_a
                 .join()
                 .expect("publisher A thread")

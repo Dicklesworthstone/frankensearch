@@ -1229,6 +1229,7 @@ impl TwoTierSearcher {
                 &initial_hits,
                 refinement_pools.as_ref(),
                 &text_fn,
+                normalized_exclusions.as_ref(),
                 admission,
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
@@ -2164,7 +2165,8 @@ impl TwoTierSearcher {
         k: usize,
         initial_results: &[ScoredResult],
         pools: Option<&RefinementPools>,
-        _text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        exclusions: Option<&NormalizedExclusions>,
         admission: SemanticAdmission,
         metrics: &mut TwoTierMetrics,
         root_request_id: Option<&str>,
@@ -2350,6 +2352,27 @@ impl TwoTierSearcher {
                 metrics.coverage = Some(coverage);
                 QualityPool::Retrieved(hits)
             }
+            SemanticAdmission::LegacyUnidentified
+                if self
+                    .index
+                    .quality_embedder_revision()
+                    .is_some_and(|revision| !revision.is_empty()) =>
+            {
+                // Reopened v1 indexes now retain the complete producer fingerprint.
+                // Their quality tier can retrieve its own candidates after that join;
+                // rescoring only the fast pool would limit quality-tier recall.
+                // This is still a v1 read, with no fabricated v2 coverage witness.
+                let bound = BoundQueryEmbedding::new(
+                    quality_vec.clone(),
+                    quality_embedder.identity()?.clone(),
+                )?;
+                cancellation_checkpoint(cx, "quality_identity_to_search")?;
+                let hits = self
+                    .index
+                    .search_quality_with_producer(&bound, quality_budget)?;
+                cancellation_checkpoint(cx, "quality_search_to_calibration")?;
+                QualityPool::Retrieved(hits)
+            }
             SemanticAdmission::OwnerBacked { quality: false }
             | SemanticAdmission::LegacyUnidentified => QualityPool::RescoredFastPool(
                 self.index
@@ -2359,6 +2382,12 @@ impl TwoTierSearcher {
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         cancellation_checkpoint(cx, "quality_search_to_calibration")?;
+        let quality_pool = match (quality_pool, exclusions) {
+            (QualityPool::Retrieved(hits), Some(exclusions)) => QualityPool::Retrieved(
+                filter_vector_hits_by_negations(hits, exclusions, text_fn, "semantic_quality"),
+            ),
+            (pool, _) => pool,
+        };
 
         // Calibration is a pure per-element score transform, so it is applied
         // in whichever shape the pool arrived in — never by converting between
@@ -4980,6 +5009,9 @@ mod tests {
             builder
                 .add_record("doc-a", &[1.0, 0.0, 0.0, 0.0], Some(&[1.0, 0.0, 0.0, 0.0]))
                 .unwrap();
+            builder
+                .add_quality_record("doc-quality-only", &[0.0, 1.0, 0.0, 0.0])
+                .unwrap();
             drop(builder.finish().unwrap());
             let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap());
             assert!(index.fast_admitted_binding().is_none());
@@ -5002,7 +5034,7 @@ mod tests {
                 .search(
                     &cx,
                     "query",
-                    1,
+                    2,
                     |_| None,
                     |phase| match phase {
                         SearchPhase::Initial { results, .. } => {
@@ -5012,6 +5044,10 @@ mod tests {
                         SearchPhase::Refined { results, .. } => {
                             phases.push("Refined");
                             assert_eq!(results[0].doc_id.as_str(), "doc-a");
+                            assert!(
+                                results.iter().any(|hit| hit.doc_id == "doc-quality-only"),
+                                "quality retrieval must reach beyond the fast index"
+                            );
                         }
                         phase => panic!("unexpected phase {phase:?}"),
                     },
@@ -5020,6 +5056,40 @@ mod tests {
                 .unwrap();
             assert_eq!(phases, ["Initial", "Refined"]);
             assert_eq!(matching.embed_count(), 2);
+
+            let mut filtered_phases = 0;
+            searcher
+                .search(
+                    &cx,
+                    "query -excluded",
+                    2,
+                    |id| {
+                        Some(
+                            if id == "doc-quality-only" {
+                                "excluded"
+                            } else {
+                                "safe"
+                            }
+                            .to_owned(),
+                        )
+                    },
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. }
+                        | SearchPhase::Refined { results, .. } => {
+                            assert_eq!(
+                                results.len(),
+                                1,
+                                "quality must not reintroduce an excluded document"
+                            );
+                            assert_eq!(results[0].doc_id.as_str(), "doc-a");
+                            filtered_phases += 1;
+                        }
+                        phase => panic!("unexpected filtered phase {phase:?}"),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(filtered_phases, 2);
 
             let mut changed = identity.clone();
             "different-execution-backend".clone_into(&mut changed.producer.backend);

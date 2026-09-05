@@ -396,7 +396,7 @@ fn search_pipeline_works_without_daemon() {
         let mut writer = VectorIndex::create_with_revision(
             &path,
             hash.id(),
-            "v1",
+            &hash.identity().expect("actual hash producer").fingerprint(),
             hash.dimension(),
             Quantization::F16,
         )

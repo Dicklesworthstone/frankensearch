@@ -1552,6 +1552,40 @@ impl TwoTierIndex {
         Ok(hits)
     }
 
+    /// Retrieve quality candidates from a v1 index bound to its producer.
+    ///
+    /// The existing revision header must contain the query producer's complete
+    /// fingerprint, as written by [`TwoTierIndexBuilder::set_quality_identity`].
+    /// This compares provenance but does not mint an admitted v2 owner or coverage
+    /// witness. Admitted v2 callers use [`Self::activate_owner_backed_search`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when the quality tier is absent or
+    /// its stored producer differs. Propagates dimension and vector read errors.
+    pub fn search_quality_with_producer(
+        &self,
+        query: &BoundQueryEmbedding,
+        k: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let index = self
+            .quality_tier()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "search_activation.quality".to_owned(),
+                value: "absent".to_owned(),
+                reason: "quality retrieval requires a quality index".to_owned(),
+            })?;
+        if index.embedder_revision() != query.identity_fingerprint() {
+            return Err(SearchError::InvalidConfig {
+                field: "search_activation.quality.producer_revision".to_owned(),
+                value: index.embedder_revision().to_owned(),
+                reason: "rebuild the quality index with the query's complete producer identity"
+                    .to_owned(),
+            });
+        }
+        index.search_top_k(query.vector(), k, None)
+    }
+
     /// Compute quality-tier scores for fast-index document positions.
     ///
     /// Missing quality entries produce `None`, allowing downstream blending

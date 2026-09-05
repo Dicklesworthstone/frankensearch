@@ -52,9 +52,17 @@ fn build_hash_index(name: &str, docs: &[(&str, &str)]) -> (PathBuf, usize) {
     let embedder = HashEmbedder::default_256();
     let dim = embedder.dimension();
     let path = dir.join(VECTOR_INDEX_FAST_FILENAME);
-    let mut writer =
-        VectorIndex::create_with_revision(&path, embedder.id(), "v1", dim, Quantization::F16)
-            .expect("create writer");
+    let mut writer = VectorIndex::create_with_revision(
+        &path,
+        embedder.id(),
+        &embedder
+            .identity()
+            .expect("actual hash producer")
+            .fingerprint(),
+        dim,
+        Quantization::F16,
+    )
+    .expect("create writer");
     for (id, text) in docs {
         let vec = embedder.embed_sync(text);
         writer.write_record(id, &vec).expect("write");
@@ -144,7 +152,7 @@ fn build_two_tier_hash_index(name: &str, docs: &[(&str, &str)]) -> PathBuf {
     let mut fw = VectorIndex::create_with_revision(
         &fast_path,
         fast.id(),
-        "v1",
+        &fast.identity().expect("actual fast producer").fingerprint(),
         fast.dimension(),
         Quantization::F16,
     )
@@ -160,7 +168,10 @@ fn build_two_tier_hash_index(name: &str, docs: &[(&str, &str)]) -> PathBuf {
     let mut qw = VectorIndex::create_with_revision(
         &quality_path,
         quality.id(),
-        "v1",
+        &quality
+            .identity()
+            .expect("actual quality producer")
+            .fingerprint(),
         quality.dimension(),
         Quantization::F16,
     )
