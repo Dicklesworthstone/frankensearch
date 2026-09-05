@@ -1738,6 +1738,27 @@ mod semantic {
         Embedder, HashAlgorithm, HashEmbedder, InMemoryVectorIndex, NativeEmbedder, SyncEmbed,
     };
 
+    #[cfg(feature = "model2vec")]
+    fn stage_verified_model_fixture(
+        source: &std::path::Path,
+        destination: &std::path::Path,
+        manifest: &frankensearch_embed::model_manifest::ModelArtifactManifestV1,
+    ) {
+        for artifact in &manifest.artifacts {
+            let from = source.join(&artifact.relative_path);
+            let to = destination.join(&artifact.relative_path);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            // These fixture files are only read; corrupt inputs below are
+            // created separately so they can never mutate a source hard link.
+            std::fs::hard_link(&from, &to)
+                .or_else(|_| std::fs::copy(&from, &to).map(|_| ()))
+                .unwrap();
+        }
+        manifest
+            .verify_dir(destination)
+            .expect("stage actual verified artifacts");
+    }
+
     /// Original bd-2ba5 admission: compare both real producers on the whole book
     /// and its fixed queries, without changing their frozen execution contracts.
     /// An opt-in failure is a migration blocker, not permission to loosen parity.
@@ -1760,8 +1781,8 @@ mod semantic {
     #[ignore = "requires native MiniLM and Potion fixtures; real native progressive search"]
     fn native_async_quality_yields_refined_and_rejects_foreign_producer() {
         use frankensearch::{
-            EmbedderStack, IndexBuilder, Model2VecEmbedder, NativeEmbeddingModel, SearchPhase,
-            TwoTierConfig, TwoTierIndex, TwoTierSearcher,
+            IndexBuilder, Model2VecEmbedder, NativeEmbeddingModel, SearchPhase, TwoTierConfig,
+            TwoTierIndex, TwoTierSearcher, detect_embedder_stack_with_pool,
         };
         use std::sync::Arc;
 
@@ -1772,29 +1793,64 @@ mod semantic {
             .build()
             .expect("caller-owned runtime");
         let pool = runtime.blocking_handle().unwrap();
-        let fast: Arc<dyn Embedder> = Arc::new(Model2VecEmbedder::load(potion_dir).unwrap());
+        let expected_fast = Model2VecEmbedder::load(&potion_dir).unwrap();
+        let model_root = tempfile::tempdir().unwrap();
+        stage_verified_model_fixture(
+            std::path::Path::new(&potion_dir),
+            &model_root.path().join("potion-multilingual-128M"),
+            &frankensearch_embed::model_manifest::ModelArtifactManifestV1::potion_128m_native()
+                .unwrap(),
+        );
+        stage_verified_model_fixture(
+            std::path::Path::new(&native_dir),
+            &model_root.path().join("all-MiniLM-L6-v2-native"),
+            &frankensearch_embed::model_manifest::ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap(),
+        );
+        #[cfg(feature = "fastembed")]
+        stage_verified_model_fixture(
+            std::path::Path::new(
+                &std::env::var("FASTEMBED_MINILM_FIXTURE_DIR")
+                    .expect("ONNX fixture required to prove native preference"),
+            ),
+            &model_root.path().join("all-MiniLM-L6-v2"),
+            &frankensearch_embed::model_manifest::ModelArtifactManifestV1::minilm_fastembed()
+                .unwrap(),
+        );
         let native =
             NativeEmbedder::load_model(&native_dir, NativeEmbeddingModel::AllMiniLmL6V2F32)
                 .unwrap();
         let unavailable: Arc<dyn Embedder> = Arc::new(native.clone());
-        let quality: Arc<dyn Embedder> = Arc::new(native.with_blocking_pool(pool.clone()));
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let stack = runtime
+            .block_on(detect_embedder_stack_with_pool(
+                &cx,
+                Some(model_root.path()),
+                &frankensearch_embed::DetectOptions {
+                    offline: Some(true),
+                },
+                pool.clone(),
+            ))
+            .expect("detect native quality from actual artifacts");
+        let fast = stack.fast_arc();
+        let quality = stack.quality_arc().expect("detected native quality");
+        assert_eq!(fast.identity().unwrap(), expected_fast.identity().unwrap());
+        assert_eq!(quality.identity().unwrap(), unavailable.identity().unwrap());
         let foreign: Arc<dyn Embedder> = Arc::new(
             NativeEmbedder::load(&native_dir)
                 .unwrap()
-                .with_blocking_pool(pool),
+                .with_blocking_pool(pool.clone()),
         );
         assert!(fast.is_semantic() && quality.is_ready());
         assert_ne!(quality.identity().unwrap(), foreign.identity().unwrap());
-        let stack = EmbedderStack::from_parts(Arc::clone(&fast), Some(Arc::clone(&quality)));
         let passages = corpus();
         let temp = tempfile::tempdir().unwrap();
         eprintln!(
             "loaded actual native/Potion producers; indexing {} passages",
             passages.len()
         );
-        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
         runtime.block_on(async {
-            let mut builder = IndexBuilder::new(temp.path()).with_embedder_stack(stack);
+            let mut builder =
+                IndexBuilder::new(temp.path()).with_native_quality(model_root.path(), pool.clone());
             for passage in &passages {
                 builder = builder.add_document(&passage.id, &passage.text);
             }
@@ -1940,6 +1996,132 @@ mod semantic {
                 "identity admission precedes all search work"
             );
             eprintln!("unavailable quality preserved Initial; foreign producer refused: {error}");
+        });
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(5)));
+    }
+
+    #[cfg(all(feature = "fastembed", feature = "model2vec"))]
+    #[test]
+    #[ignore = "requires real native, Potion and ONNX fixtures; native load fallback"]
+    fn native_detection_load_failure_keeps_the_real_onnx_producer() {
+        use frankensearch::{
+            FastEmbedEmbedder, IndexBuilder, SearchPhase, TwoTierConfig, TwoTierIndex,
+            TwoTierSearcher, detect_embedder_stack_with_pool,
+        };
+        use std::sync::Arc;
+
+        let onnx_dir =
+            std::env::var("FASTEMBED_MINILM_FIXTURE_DIR").expect("actual ONNX fixture required");
+        let expected = FastEmbedEmbedder::load(&onnx_dir).expect("actual ONNX producer");
+        let native_dir = std::path::PathBuf::from(
+            std::env::var("MINILM_FIXTURE_DIR").expect("actual native artifact fixture"),
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        let pool = runtime.blocking_handle().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let model_root = tempfile::tempdir().unwrap();
+        stage_verified_model_fixture(
+            std::path::Path::new(
+                &std::env::var("POTION_FIXTURE_DIR").expect("actual Potion fixture"),
+            ),
+            &model_root.path().join("potion-multilingual-128M"),
+            &frankensearch_embed::model_manifest::ModelArtifactManifestV1::potion_128m_native()
+                .unwrap(),
+        );
+        stage_verified_model_fixture(
+            std::path::Path::new(&onnx_dir),
+            &model_root.path().join("all-MiniLM-L6-v2"),
+            &frankensearch_embed::model_manifest::ModelArtifactManifestV1::minilm_fastembed()
+                .unwrap(),
+        );
+        let native_root = model_root.path().join("all-MiniLM-L6-v2-native");
+        let text = "The lone castaway Ben Gunn was marooned on Treasure Island.";
+        runtime.block_on(async {
+            for corrupt in [false, true] {
+                if corrupt {
+                    std::fs::create_dir(&native_root).unwrap();
+                    for name in [
+                        "config.json",
+                        "tokenizer.json",
+                        "tokenizer_config.json",
+                        "special_tokens_map.json",
+                    ] {
+                        std::fs::copy(native_dir.join(name), native_root.join(name))
+                            .expect("retain real verified native metadata");
+                    }
+                    std::fs::write(native_root.join("model.safetensors"), b"corrupt")
+                        .expect("plant an invalid native artifact");
+                    let error = NativeEmbedder::load_model(
+                        &native_root,
+                        frankensearch::NativeEmbeddingModel::AllMiniLmL6V2F32,
+                    )
+                    .expect_err("corrupt native weights must fail verification");
+                    assert!(error.to_string().contains("model.safetensors"), "{error}");
+                }
+                let stack = detect_embedder_stack_with_pool(
+                    &cx,
+                    Some(model_root.path()),
+                    &frankensearch_embed::DetectOptions {
+                        offline: Some(true),
+                    },
+                    pool.clone(),
+                )
+                .await
+                .expect("real ONNX is still available after native load refusal");
+                let quality = stack.quality_arc().expect("ONNX quality loaded");
+                assert_eq!(quality.identity().unwrap(), expected.identity().unwrap());
+                assert_eq!(
+                    quality.embed(&cx, text).await.unwrap(),
+                    expected.embed(&cx, text).await.unwrap(),
+                    "fallback output must belong to the reported ONNX producer"
+                );
+                let index_dir = tempfile::tempdir().unwrap();
+                let stats = IndexBuilder::new(index_dir.path())
+                    .with_embedder_stack(stack.clone())
+                    .add_document("castaway", text)
+                    .build(&cx)
+                    .await
+                    .expect("persist actual fallback vectors");
+                assert_eq!(stats.quality_indexed, 1);
+                let index = Arc::new(
+                    TwoTierIndex::open(index_dir.path(), TwoTierConfig::default()).unwrap(),
+                );
+                assert_eq!(
+                    index.quality_embedder_revision(),
+                    Some(expected.identity().unwrap().fingerprint().as_str())
+                );
+                let searcher =
+                    TwoTierSearcher::new(index, stack.fast_arc(), TwoTierConfig::default())
+                        .with_quality_embedder(quality);
+                let mut phases = Vec::new();
+                searcher
+                    .search(
+                        &cx,
+                        "a castaway stranded on an island",
+                        1,
+                        |_| Some(text.to_owned()),
+                        |phase| match phase {
+                            SearchPhase::Initial { results, .. } => {
+                                assert_eq!(results[0].doc_id, "castaway");
+                                phases.push("Initial");
+                            }
+                            SearchPhase::Refined { results, .. } => {
+                                assert_eq!(results[0].doc_id, "castaway");
+                                phases.push("Refined");
+                            }
+                            phase => panic!("unexpected fallback phase: {phase:?}"),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(phases, ["Initial", "Refined"]);
+                eprintln!(
+                    "native_corrupt={corrupt}: actual ONNX identity, vectors, and phases verified"
+                );
+            }
         });
         assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(5)));
     }

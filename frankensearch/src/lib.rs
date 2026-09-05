@@ -399,6 +399,8 @@ pub use frankensearch_rerank::FastEmbedReranker;
 // ─── IndexBuilder convenience API ────────────────────────────────────────────
 
 mod index_builder;
+#[cfg(any(feature = "native", feature = "rerank"))]
+pub use index_builder::detect_embedder_stack_with_pool;
 pub use index_builder::{
     HybridIndexParts, IndexBuildStats, IndexBuilder, IndexProgress, IndexSizeBreakdown,
     LexicalArmReceipt, LexicalReaderBackend, open_admitted_v2_sync_with_residual_sidecar_cache,

@@ -22,6 +22,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use asupersync::Cx;
+#[cfg(any(feature = "native", feature = "rerank"))]
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use tracing::{instrument, warn};
 
 use frankensearch_core::config::TwoTierConfig;
@@ -33,6 +35,8 @@ use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, IndexableDocumen
 use frankensearch_durability::FileProtector;
 #[cfg(feature = "durability")]
 use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviProtector};
+#[cfg(any(feature = "native", feature = "rerank"))]
+use frankensearch_embed::DetectOptions;
 use frankensearch_embed::auto_detect::{EmbedderStack, TwoTierAvailability};
 use frankensearch_fusion::SyncTwoTierSearcher;
 use frankensearch_index::{
@@ -161,6 +165,100 @@ pub struct IndexProgress {
     pub phase: &'static str,
 }
 
+/// Detect a semantic stack, preferring verified native F32 `MiniLM` quality.
+///
+/// Detection and eager model loading run on the caller's blocking pool.
+/// Native artifacts live in `all-MiniLM-L6-v2-native` below the supplied model
+/// root, or below the normal model cache when no root is supplied. Potion and
+/// ONNX keep their standard sibling directories: their frozen artifact sets
+/// must not be mixed into the native directory. If native loading fails, the
+/// existing quality detector selects an available ONNX/remote model under
+/// `options`. No model is downloaded by the native detector.
+///
+/// The returned stack keeps the selected backend's complete identity. Use that
+/// same stack to build and search an index; selecting another backend does not
+/// make an existing index compatible. This is load-time selection, not an
+/// inference-time backend switch. The caller must drain the pool at shutdown.
+///
+/// # Errors
+///
+/// Returns policy, semantic-fast-model, cancellation, or worker errors. Missing
+/// quality models retain the existing fast-only behavior.
+#[cfg(any(feature = "native", feature = "rerank"))]
+pub async fn detect_embedder_stack_with_pool(
+    cx: &Cx,
+    model_root: Option<&Path>,
+    options: &DetectOptions,
+    pool: BlockingPoolHandle,
+) -> SearchResult<EmbedderStack> {
+    build_checkpoint(cx, "embedder detection start")?;
+    let model_root = model_root.map(Path::to_path_buf);
+    let options = *options;
+    let worker_cx = cx.clone().with_blocking_pool_handle(Some(pool.clone()));
+    let mut worker = worker_cx
+        .spawn_blocking(move |child: Cx| -> SearchResult<EmbedderStack> {
+            build_checkpoint(&child, "fast model detection")?;
+            // Resolve caller policy before considering the local native model.
+            // Detecting only fast avoids loading an ONNX session we would discard.
+            let fast = EmbedderStack::auto_detect_fast_semantic_with_options(
+                model_root.as_deref(),
+                &options,
+            )?;
+            build_checkpoint(&child, "native model detection")?;
+            let path = model_root
+                .clone()
+                .unwrap_or_else(frankensearch_embed::model_cache::resolve_cache_root)
+                .join("all-MiniLM-L6-v2-native");
+            if path.join("model.safetensors").is_file() {
+                match frankensearch_rerank::NativeEmbedder::load_model(
+                    &path,
+                    frankensearch_rerank::NativeEmbeddingModel::AllMiniLmL6V2F32,
+                ) {
+                    Ok(native) => {
+                        build_checkpoint(&child, "native model loaded")?;
+                        let quality: Arc<dyn Embedder> =
+                            Arc::new(native.with_blocking_pool(pool));
+                        tracing::info!(
+                            quality_embedder = quality.id(),
+                            "selected verified native F32 quality model"
+                        );
+                        return Ok(EmbedderStack::from_parts(fast.fast_arc(), Some(quality)));
+                    }
+                    Err(error) => {
+                        warn!(%error, "native quality model did not load; checking the existing quality backend");
+                    }
+                }
+            }
+            build_checkpoint(&child, "fallback quality detection")?;
+            let quality = EmbedderStack::auto_detect_quality_with_options(
+                model_root.as_deref(),
+                &options,
+            )?;
+            build_checkpoint(&child, "fallback quality loaded")?;
+            tracing::info!(
+                quality_embedder = quality.as_ref().map(|embedder| embedder.id()),
+                "native quality unavailable; selected existing quality backend"
+            );
+            Ok(EmbedderStack::from_parts(fast.fast_arc(), quality))
+        })
+        .map_err(|error| SearchError::EmbeddingFailed {
+            model: "stack-detection".to_owned(),
+            source: format!("cannot admit model loading worker: {error}").into(),
+        })?;
+    let stack = worker.join(cx).await.map_err(|error| match error {
+        asupersync::runtime::JoinError::Cancelled(_) => SearchError::Cancelled {
+            phase: "embedder detection".to_owned(),
+            reason: "model loading worker cancelled".to_owned(),
+        },
+        error => SearchError::EmbeddingFailed {
+            model: "stack-detection".to_owned(),
+            source: format!("model loading worker failed: {error}").into(),
+        },
+    })??;
+    build_checkpoint(cx, "embedder detection complete")?;
+    Ok(stack)
+}
+
 /// Fluent builder for creating frankensearch indexes.
 ///
 /// Handles embedder auto-detection, vector index creation, batch embedding,
@@ -170,6 +268,8 @@ pub struct IndexBuilder {
     config: TwoTierConfig,
     documents: Vec<IndexableDocument>,
     embedder_stack: Option<EmbedderStack>,
+    #[cfg(any(feature = "native", feature = "rerank"))]
+    native_quality: Option<(PathBuf, BlockingPoolHandle)>,
     batch_size: usize,
     on_progress: Option<Box<dyn FnMut(IndexProgress) + Send>>,
     #[cfg(all(
@@ -188,6 +288,8 @@ impl IndexBuilder {
             config: TwoTierConfig::default(),
             documents: Vec::new(),
             embedder_stack: None,
+            #[cfg(any(feature = "native", feature = "rerank"))]
+            native_quality: None,
             batch_size: 32,
             on_progress: None,
             #[cfg(all(
@@ -209,6 +311,24 @@ impl IndexBuilder {
     #[must_use]
     pub fn with_embedder_stack(mut self, stack: EmbedderStack) -> Self {
         self.embedder_stack = Some(stack);
+        self
+    }
+
+    /// Prefer verified native F32 quality when auto-detecting this build's stack.
+    ///
+    /// Model loading runs on `pool`; an absent or invalid native installation
+    /// uses the existing quality detector. An explicit [`Self::with_embedder_stack`]
+    /// takes precedence. Reuse the selected stack from
+    /// [`detect_embedder_stack_with_pool`] when the same host also searches the
+    /// index. The caller owns and drains the pool.
+    #[cfg(any(feature = "native", feature = "rerank"))]
+    #[must_use]
+    pub fn with_native_quality(
+        mut self,
+        model_root: impl Into<PathBuf>,
+        pool: BlockingPoolHandle,
+    ) -> Self {
+        self.native_quality = Some((model_root.into(), pool));
         self
     }
 
@@ -298,6 +418,27 @@ impl IndexBuilder {
         // Resolve embedder stack.
         let stack = match self.embedder_stack.take() {
             Some(stack) => stack,
+            #[cfg(any(feature = "native", feature = "rerank"))]
+            None if self.native_quality.is_some() => {
+                let (root, pool) = self
+                    .native_quality
+                    .take()
+                    .expect("native quality configured");
+                match detect_embedder_stack_with_pool(
+                    cx,
+                    Some(&root),
+                    &DetectOptions::default(),
+                    pool,
+                )
+                .await
+                {
+                    Ok(stack) => stack,
+                    Err(error) => {
+                        export_error(metrics_exporter.as_ref(), &error);
+                        return Err(error);
+                    }
+                }
+            }
             None => match EmbedderStack::auto_detect_semantic_with(Some(&self.data_dir)) {
                 Ok(stack) => stack,
                 Err(error) => {
@@ -1314,6 +1455,53 @@ mod tests {
     use frankensearch_quill::{BlueGreenEngine, CurrentPointer, publish_current};
 
     use super::*;
+
+    #[cfg(any(feature = "native", feature = "rerank"))]
+    #[test]
+    fn native_detection_requires_a_live_worker_and_preserves_cancellation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let pool = runtime.blocking_handle().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        cx.cancel_fast(asupersync::CancelKind::User);
+        let error = runtime
+            .block_on(detect_embedder_stack_with_pool(
+                &cx,
+                None,
+                &DetectOptions {
+                    offline: Some(true),
+                },
+                pool.clone(),
+            ))
+            .expect_err("pre-cancelled detection must not load a model");
+        assert!(matches!(error, SearchError::Cancelled { .. }));
+        let uncancelled = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(5)));
+        let driver = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let error = driver
+            .block_on(detect_embedder_stack_with_pool(
+                &uncancelled,
+                None,
+                &DetectOptions {
+                    offline: Some(true),
+                },
+                pool,
+            ))
+            .expect_err("a closed pool must not run detection inline");
+        assert!(
+            matches!(error, SearchError::EmbeddingFailed { .. }),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("cannot admit model loading worker")
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn owned_admitted_v2_sync_dir() -> std::path::PathBuf {
