@@ -16,13 +16,17 @@
 //! substituted for the default int8 producer or an existing index's producer.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use asupersync::Cx;
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+use asupersync::sync::{LockError, Mutex as AsyncMutex, OwnedMutexGuard};
 
 use tokenizers::Tokenizer;
 
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
-use frankensearch_core::traits::{ModelCategory, SyncEmbed};
+use frankensearch_core::traits::{ModelCategory, SearchFuture, SyncEmbed};
 use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
 
 use crate::native::{
@@ -96,12 +100,19 @@ impl NativeEmbeddingModel {
 }
 
 /// Pure-Rust frankentorch `MiniLM` sentence-embedder.
+///
+/// Clones share the loaded model and serialize inference. For async [`Embedder`](
+/// frankensearch_core::traits::Embedder) use, attach a caller-owned pool with
+/// [`Self::with_blocking_pool`]; synchronous [`SyncEmbed`] use needs no runtime.
+#[derive(Clone)]
 pub struct NativeEmbedder {
     /// One frankentorch session behind a `Mutex` (each forward parallelizes internally
     /// across cores; calls are serialized, so no nested-rayon-under-lock hazard) — same
     /// pattern as [`crate::native::NativeReranker`].
-    inner: Mutex<Model>,
-    tokenizer: Tokenizer,
+    inner: Arc<Mutex<Model>>,
+    tokenizer: Arc<Tokenizer>,
+    admission: Arc<AsyncMutex<()>>,
+    blocking_pool: Option<BlockingPoolHandle>,
     max_length: usize,
     name: String,
     id: String,
@@ -253,8 +264,10 @@ impl NativeEmbedder {
         }
 
         let embedder = Self {
-            inner: Mutex::new(model),
-            tokenizer,
+            inner: Arc::new(Mutex::new(model)),
+            tokenizer: Arc::new(tokenizer),
+            admission: Arc::new(AsyncMutex::new(())),
+            blocking_pool: None,
             max_length: DEFAULT_MAX_LENGTH,
             name: model_name.to_owned(),
             id: profile.embedder_id().to_owned(),
@@ -296,6 +309,66 @@ impl NativeEmbedder {
         Ok(embedder)
     }
 
+    /// Attach the caller's bounded blocking pool for async inference.
+    ///
+    /// The caller must retain and fully drain the pool at shutdown. Cancelling
+    /// a waiting future cannot preempt an executing tensor kernel; its worker
+    /// retains model admission until it finishes. No internal runtime is made.
+    /// Without an attached pool, async inference returns an actionable error.
+    #[must_use]
+    pub fn with_blocking_pool(mut self, pool: BlockingPoolHandle) -> Self {
+        self.blocking_pool = Some(pool);
+        self
+    }
+
+    async fn infer(&self, cx: &Cx, texts: Vec<String>) -> SearchResult<Vec<Vec<f32>>> {
+        native_checkpoint(cx)?;
+        let pool = self
+            .blocking_pool
+            .clone()
+            .ok_or_else(|| SearchError::EmbeddingFailed {
+                model: self.name.clone(),
+                source: "native async inference requires a caller-owned blocking pool; attach it with NativeEmbedder::with_blocking_pool"
+                    .into(),
+            })?;
+        // Obtain admission before spawning, so cancelled waiters cannot fill
+        // the blocking pool with workers waiting on this model's sync mutex.
+        let admission = OwnedMutexGuard::lock(Arc::clone(&self.admission), cx)
+            .await
+            .map_err(|error| match error {
+                LockError::Cancelled => SearchError::Cancelled {
+                    phase: "native.infer".to_owned(),
+                    reason: "native model admission cancelled".to_owned(),
+                },
+                error => SearchError::EmbeddingFailed {
+                    model: self.name.clone(),
+                    source: format!("native model admission failed: {error}").into(),
+                },
+            })?;
+        let owner = self.clone();
+        let worker_cx = cx.clone().with_blocking_pool_handle(Some(pool));
+        let mut worker = worker_cx
+            .spawn_blocking(move |child| {
+                let _admission = admission;
+                let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+                owner.embed_batch_checked(&texts, Some(&child))
+            })
+            .map_err(|error| SearchError::EmbeddingFailed {
+                model: self.name.clone(),
+                source: format!("cannot admit native inference worker: {error}").into(),
+            })?;
+        worker.join(cx).await.map_err(|error| match error {
+            asupersync::runtime::JoinError::Cancelled(_) => SearchError::Cancelled {
+                phase: "native.infer".to_owned(),
+                reason: "native inference worker cancelled".to_owned(),
+            },
+            error => SearchError::EmbeddingFailed {
+                model: self.name.clone(),
+                source: format!("native inference worker failed: {error}").into(),
+            },
+        })?
+    }
+
     /// Tokenize one text to token ids (with `[CLS]`/`[SEP]`), truncated to `max_length`.
     fn tokenize(&self, text: &str) -> SearchResult<Vec<i64>> {
         let encoding =
@@ -316,6 +389,121 @@ impl NativeEmbedder {
             model: self.name.clone(),
             source: format!("embedder mutex poisoned: {e}").into(),
         })
+    }
+
+    fn embed_batch_checked(&self, texts: &[&str], cx: Option<&Cx>) -> SearchResult<Vec<Vec<f32>>> {
+        if let Some(cx) = cx {
+            native_checkpoint(cx)?;
+        }
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let token_batches: Vec<Vec<i64>> = texts
+            .iter()
+            .map(|t| self.tokenize(t))
+            .collect::<SearchResult<_>>()?;
+        let mut model = self.lock_model()?;
+        let mut out = Vec::with_capacity(texts.len());
+        // Chunk inputs by total token budget so each forward's intermediates stay
+        // bounded; a single over-budget input is still run alone.
+        let mut start = 0usize;
+        while start < token_batches.len() {
+            if let Some(cx) = cx {
+                native_checkpoint(cx)?;
+            }
+            let mut end = start;
+            let mut tok = 0usize;
+            while end < token_batches.len() {
+                let len = token_batches[end].len().max(1);
+                if end > start && tok + len > MAX_BATCH_TOKENS {
+                    break;
+                }
+                tok += len;
+                end += 1;
+            }
+            out.extend(model.embed_forward(&token_batches[start..end])?);
+            start = end;
+        }
+        drop(model);
+        if let Some(cx) = cx {
+            native_checkpoint(cx)?;
+        }
+        if out.len() != texts.len() || out.iter().any(|vector| vector.len() != DIM) {
+            return Err(SearchError::EmbeddingFailed {
+                model: self.name.clone(),
+                source:
+                    "native backend returned a batch shape inconsistent with its attested identity"
+                        .into(),
+            });
+        }
+        Ok(out)
+    }
+}
+
+fn native_checkpoint(cx: &Cx) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: "native.infer".to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
+}
+
+impl frankensearch_core::traits::Embedder for NativeEmbedder {
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            native_checkpoint(cx)?;
+            self.infer(cx, vec![text.to_owned()])
+                .await?
+                .pop()
+                .ok_or_else(|| SearchError::EmbeddingFailed {
+                    model: self.name.clone(),
+                    source: "native backend returned no embedding".into(),
+                })
+        })
+    }
+
+    fn embed_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+        Box::pin(async move {
+            native_checkpoint(cx)?;
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            self.infer(cx, texts.iter().map(|text| (*text).to_owned()).collect())
+                .await
+        })
+    }
+
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        SyncEmbed::identity(self)
+    }
+
+    fn dimension(&self) -> usize {
+        DIM
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn model_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_ready(&self) -> bool {
+        self.blocking_pool.is_some()
+    }
+
+    fn is_semantic(&self) -> bool {
+        true
+    }
+
+    fn category(&self) -> ModelCategory {
+        ModelCategory::TransformerEmbedder
     }
 }
 
@@ -343,42 +531,7 @@ impl SyncEmbed for NativeEmbedder {
     }
 
     fn embed_batch_sync(&self, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let token_batches: Vec<Vec<i64>> = texts
-            .iter()
-            .map(|t| self.tokenize(t))
-            .collect::<SearchResult<_>>()?;
-        let mut model = self.lock_model()?;
-        let mut out = Vec::with_capacity(texts.len());
-        // Chunk inputs by total token budget so each forward's intermediates stay
-        // bounded; a single over-budget input is still run alone.
-        let mut start = 0usize;
-        while start < token_batches.len() {
-            let mut end = start;
-            let mut tok = 0usize;
-            while end < token_batches.len() {
-                let len = token_batches[end].len().max(1);
-                if end > start && tok + len > MAX_BATCH_TOKENS {
-                    break;
-                }
-                tok += len;
-                end += 1;
-            }
-            out.extend(model.embed_forward(&token_batches[start..end])?);
-            start = end;
-        }
-        drop(model);
-        if out.len() != texts.len() || out.iter().any(|vector| vector.len() != DIM) {
-            return Err(SearchError::EmbeddingFailed {
-                model: self.name.clone(),
-                source:
-                    "native backend returned a batch shape inconsistent with its attested identity"
-                        .into(),
-            });
-        }
-        Ok(out)
+        self.embed_batch_checked(texts, None)
     }
 
     fn dimension(&self) -> usize {
@@ -413,6 +566,170 @@ mod tests {
     // Compile-level proof that NativeEmbedder satisfies the embedder contract.
     const fn assert_sync_embed<T: SyncEmbed>() {}
     const _: () = assert_sync_embed::<NativeEmbedder>();
+    const fn assert_async_embed<T: frankensearch_core::traits::Embedder>() {}
+    const _: () = assert_async_embed::<NativeEmbedder>();
+
+    #[test]
+    #[ignore = "requires verified native MiniLM assets via MINILM_FIXTURE_DIR"]
+    fn async_fixture_preserves_vectors_and_requires_explicit_pool() {
+        use frankensearch_core::traits::Embedder;
+        use frankensearch_embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+
+        let dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
+        let native = NativeEmbedder::load_model(dir, NativeEmbeddingModel::AllMiniLmL6V2F32)
+            .expect("load actual F32 producer");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        assert!(!Embedder::is_ready(&native));
+        let error = runtime
+            .block_on(Embedder::embed(&native, &cx, "hello world"))
+            .expect_err("a missing pool must never silently run inline");
+        assert!(error.to_string().contains("caller-owned blocking pool"));
+
+        let native = native.with_blocking_pool(runtime.blocking_handle().unwrap());
+        assert!(Embedder::is_ready(&native));
+        assert_eq!(
+            Embedder::identity(&native).unwrap(),
+            SyncEmbed::identity(&native).unwrap()
+        );
+        let expected = native
+            .embed_batch_sync(&MODEL_CONFORMANCE_TEXTS_V1)
+            .unwrap();
+        let actual = runtime
+            .block_on(Embedder::embed_batch(
+                &native,
+                &cx,
+                &MODEL_CONFORMANCE_TEXTS_V1,
+            ))
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "async batching must preserve exact producer bits"
+        );
+        for text in ["", "hello world", "identifier fsvi_v2"] {
+            assert_eq!(
+                runtime
+                    .block_on(Embedder::embed(&native, &cx, text))
+                    .unwrap(),
+                native.embed_sync(text).unwrap(),
+                "async single inference must preserve exact producer bits"
+            );
+        }
+        let cancelled = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        cancelled.cancel_fast(asupersync::CancelKind::User);
+        for result in [
+            runtime
+                .block_on(Embedder::embed(&native, &cancelled, "cancelled"))
+                .map(|_| ()),
+            runtime
+                .block_on(Embedder::embed_batch(&native, &cancelled, &[]))
+                .map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+        }
+        assert!(native.admission.try_lock().is_ok());
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[ignore = "requires verified native MiniLM assets via MINILM_FIXTURE_DIR"]
+    fn async_fixture_timeout_retains_worker_admission_until_drain() {
+        use frankensearch_core::traits::Embedder;
+        use std::future::poll_fn;
+        use std::task::Poll;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        let pool = runtime.blocking_handle().unwrap();
+        let native = NativeEmbedder::load_model(dir, NativeEmbeddingModel::AllMiniLmL6V2F32)
+            .unwrap()
+            .with_blocking_pool(pool.clone());
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let waiting_cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            // Hold the real model, not a mock inference callback. A finite
+            // release fuse makes an inline-execution regression fail, not hang.
+            let model = Arc::clone(&native.inner);
+            scope.spawn(move || {
+                let _model = model.lock().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            runtime.block_on(async {
+                let mut running = Embedder::embed(&native, &cx, "hello world");
+                poll_fn(|task_cx| {
+                    assert!(running.as_mut().poll(task_cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let started = Instant::now();
+                while pool.busy_threads() != 1 {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(2),
+                        "worker did not start"
+                    );
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                assert!(native.admission.try_lock().is_err());
+                assert!(
+                    asupersync::time::timeout(cx.now(), Duration::from_millis(20), running)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "executor was blocked"
+                );
+                assert_eq!(pool.busy_threads(), 1);
+                assert!(
+                    native.admission.try_lock().is_err(),
+                    "a timed-out waiter must not release its worker's admission"
+                );
+
+                let mut waiting = Embedder::embed(&native, &waiting_cx, "second query");
+                poll_fn(|task_cx| {
+                    assert!(waiting.as_mut().poll(task_cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                waiting_cx.cancel_fast(asupersync::CancelKind::User);
+                assert!(matches!(waiting.await, Err(SearchError::Cancelled { .. })));
+                assert_eq!(
+                    pool.busy_threads(),
+                    1,
+                    "cancelled admission must not occupy another worker"
+                );
+                assert_eq!(pool.pending_count(), 0);
+                release_tx.send(()).unwrap();
+                let drain_started = Instant::now();
+                while pool.busy_threads() != 0 {
+                    assert!(
+                        drain_started.elapsed() < Duration::from_secs(2),
+                        "worker did not drain"
+                    );
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                assert!(native.admission.try_lock().is_ok());
+                assert_eq!(
+                    Embedder::embed(&native, &cx, "healthy query")
+                        .await
+                        .unwrap(),
+                    native.embed_sync("healthy query").unwrap()
+                );
+            });
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(5)));
+    }
 
     #[test]
     fn registered_identity_matches_native_backend_contract() {
