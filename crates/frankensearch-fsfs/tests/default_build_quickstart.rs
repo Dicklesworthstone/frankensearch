@@ -775,7 +775,25 @@ mod loader_only {
                     let mut raw = String::new();
                     socket.read_to_string(&mut raw).unwrap();
                     let response: Value = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(response["schema_version"], "fsfs.search.serve.v2");
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v3");
+                    use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
+                    let mut contracts = sha2::Sha256::new();
+                    for manifest in [
+                        ModelArtifactManifestV1::potion_128m_native().unwrap(),
+                        ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+                        ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+                        ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+                    ] {
+                        contracts.update(manifest.freeze().unwrap().fingerprint.as_bytes());
+                    }
+                    let mut expected_contracts = String::with_capacity(64);
+                    for byte in contracts.finalize() {
+                        write!(expected_contracts, "{byte:02x}").unwrap();
+                    }
+                    assert_eq!(
+                        response["policy"]["embedding_contracts"], expected_contracts,
+                        "the actual serving binary acknowledges its registered producers"
+                    );
                     assert_eq!(response["policy"]["quality_weight_bits"], weight.to_bits());
                     assert_eq!(response["policy"]["quality_timeout_ms"], 5000);
                     assert_eq!(
