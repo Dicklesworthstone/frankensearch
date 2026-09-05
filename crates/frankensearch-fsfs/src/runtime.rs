@@ -479,9 +479,9 @@ const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
 const FSFS_SEARCH_SEMANTIC_HEAD_PROGRESSIVE_STEP: usize = 16;
 const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v3";
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v4";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v2";
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v3";
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 const FSFS_DAEMON_REQUEST_MAX_BYTES: usize = 1 << 20; // 1 MiB
 const FSFS_DAEMON_RESPONSE_MAX_BYTES: usize = 4 << 20; // 4 MiB
@@ -885,6 +885,9 @@ struct SearchExecutionFlags {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 struct SearchCacheKey {
+    /// Bind persisted answers to the registered local producers without
+    /// loading the quality model before Initial. Old keys fail deserialization.
+    embedding_contracts: String,
     query: String,
     requested_limit: usize,
     mode: String,
@@ -945,6 +948,7 @@ struct SearchServeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SearchServePolicy {
+    embedding_contracts: String,
     quality_weight_bits: u32,
     quality_timeout_ms: u64,
     rrf_k_bits: u64,
@@ -6649,7 +6653,7 @@ impl FsfsRuntime {
             runtime.config.search.rrf_k = k;
         }
         runtime.config.search.fast_only = request.fast_only.unwrap_or(self.config.search.fast_only);
-        let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode);
+        let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 
         let (cached, payloads) = if hot_cache_enabled {
             if let Some(cached_payloads) = hot_cache.get(&cache_key) {
@@ -6693,7 +6697,7 @@ impl FsfsRuntime {
 
         Ok(SearchServeResponse {
             schema_version: FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
-            policy: Some(runtime.search_serve_policy()),
+            policy: Some(runtime.search_serve_policy()?),
             ok: true,
             query: request.query,
             mode: mode.label().to_owned(),
@@ -7687,7 +7691,7 @@ impl FsfsRuntime {
         Self::validate_search_generation_at_root(&index_root, mode)?;
         let lookup_fingerprint = Self::search_index_fingerprint_at_root(&index_root)?;
         Self::validate_search_generation_fingerprint(&index_root, &lookup_fingerprint, mode)?;
-        let key = self.search_cache_key(query, limit, mode);
+        let key = self.search_cache_key(query, limit, mode)?;
         match self.try_load_search_payload_cache(&key, &lookup_fingerprint) {
             Ok(Some(payloads)) => {
                 if let Some(sink) = phase_sink.as_deref_mut() {
@@ -8064,14 +8068,32 @@ impl FsfsRuntime {
         (candidates, details)
     }
 
-    #[must_use]
+    fn registered_embedding_contracts() -> SearchResult<String> {
+        use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
+
+        // Conservative invalidation across the local automatic detection
+        // registry. This hashes contracts, not model bytes, and performs no
+        // I/O or inference. A manifest error cannot yield a cache hit.
+        let mut contracts = Sha256::new();
+        for manifest in [
+            ModelArtifactManifestV1::potion_128m_native()?,
+            ModelArtifactManifestV1::minilm_fastembed()?,
+            ModelArtifactManifestV1::snowflake_fastembed()?,
+            ModelArtifactManifestV1::nomic_fastembed()?,
+        ] {
+            contracts.update(manifest.freeze()?.fingerprint.as_bytes());
+        }
+        Ok(sha256_digest_hex(contracts.finalize()))
+    }
+
     fn search_cache_key(
         &self,
         query: &str,
         requested_limit: usize,
         mode: SearchExecutionMode,
-    ) -> SearchCacheKey {
-        SearchCacheKey {
+    ) -> SearchResult<SearchCacheKey> {
+        Ok(SearchCacheKey {
+            embedding_contracts: Self::registered_embedding_contracts()?,
             query: Self::normalize_search_query(query),
             requested_limit,
             mode: mode.label().to_owned(),
@@ -8084,12 +8106,13 @@ impl FsfsRuntime {
             rerank_model: self
                 .prepared_reranker()
                 .map(|reranker| reranker.id().to_owned()),
-        }
+        })
     }
 
     #[must_use]
     fn search_cache_key_hash(key: &SearchCacheKey) -> String {
         let mut hasher = Sha256::new();
+        hasher.update(key.embedding_contracts.as_bytes());
         hasher.update(key.query.as_bytes());
         hasher.update(key.requested_limit.to_le_bytes());
         hasher.update(key.mode.as_bytes());
@@ -8109,18 +8132,19 @@ impl FsfsRuntime {
         Ok(index_root.join(FSFS_SEARCH_CACHE_DIR_NAME).join(file_name))
     }
 
-    fn search_serve_policy(&self) -> SearchServePolicy {
-        SearchServePolicy {
+    fn search_serve_policy(&self) -> SearchResult<SearchServePolicy> {
+        Ok(SearchServePolicy {
+            embedding_contracts: Self::registered_embedding_contracts()?,
             quality_weight_bits: self.effective_quality_weight().to_bits(),
             quality_timeout_ms: self.config.search.quality_timeout_ms,
             rrf_k_bits: self.config.search.rrf_k.to_bits(),
             fast_only: self.config.search.fast_only,
-        }
+        })
     }
 
     fn validate_search_serve_policy(&self, response: &SearchServeResponse) -> SearchResult<()> {
         if response.schema_version != FSFS_SEARCH_SERVE_SCHEMA_VERSION
-            || response.policy.as_ref() != Some(&self.search_serve_policy())
+            || response.policy.as_ref() != Some(&self.search_serve_policy()?)
         {
             return Err(SearchError::InvalidConfig {
                 field: "cli.daemon".to_owned(), value: "search_policy".to_owned(),
@@ -13027,10 +13051,7 @@ impl FsfsRuntime {
         )?;
 
         let mut vector_generation_compatible = false;
-        let embedder_revision = embedder
-            .identity()
-            .map(frankensearch_core::EmbeddingIdentityBundleV1::fingerprint)
-            .unwrap_or_default();
+        let embedder_revision = embedder.identity()?.fingerprint();
         let mut vector_index = if checkpoint_manifests.is_some() && vector_path.exists() {
             match VectorIndex::open(&vector_path) {
                 Ok(index)
@@ -13089,10 +13110,7 @@ impl FsfsRuntime {
         let mut quality_vector_index: Option<VectorIndex> = None;
         let mut initial_live_quality_ids: HashSet<String> = HashSet::new();
         if let Some(quality_embedder) = quality_embedder.as_ref() {
-            let quality_revision = quality_embedder
-                .identity()
-                .map(frankensearch_core::EmbeddingIdentityBundleV1::fingerprint)
-                .unwrap_or_default();
+            let quality_revision = quality_embedder.identity()?.fingerprint();
             let reusable = if vector_generation_compatible && quality_vector_path.exists() {
                 match VectorIndex::open(&quality_vector_path) {
                     Ok(index)
@@ -14406,6 +14424,22 @@ impl FsfsRuntime {
                 found: embedder.dimension(),
             });
         }
+        Self::validate_vector_producer_revision(index, embedder)
+    }
+
+    fn validate_vector_producer_revision(
+        index: &VectorIndex,
+        embedder: &dyn Embedder,
+    ) -> SearchResult<()> {
+        let identity = embedder.identity()?;
+        identity.validate()?;
+        if index.embedder_revision() != identity.fingerprint() {
+            return Err(SearchError::UnverifiableRemoteSpace {
+                producer: "fsfs.vector_generation".to_owned(),
+                reason: "the stored vector producer revision does not match the active embedder; re-run `fsfs index` with the verified model before search or watch"
+                    .to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -14454,7 +14488,7 @@ impl FsfsRuntime {
                 found: embedder.dimension(),
             });
         }
-        Ok(())
+        Self::validate_vector_producer_revision(index, embedder)
     }
 
     /// Observational identity of the published FSVI, if it can be opened.
@@ -15808,24 +15842,7 @@ impl FsfsRuntime {
                 // width, else fail closed. Vectors from two spaces are never
                 // scored against each other.
                 if let Some(index) = resources.quality_vector_index.as_ref() {
-                    let index_embedder_id = index.embedder_id();
-                    if !index_embedder_id.eq_ignore_ascii_case(embedder.id()) {
-                        return Err(SearchError::UnverifiableRemoteSpace {
-                            producer: "fsfs.quality_vector_generation".to_owned(),
-                            reason: format!(
-                                "the quality embedder identity `{}` does not match the stored quality-tier generation `{index_embedder_id}`; re-run `fsfs index` with the active model",
-                                embedder.id()
-                            ),
-                        });
-                    }
-                    let index_dimension = index.dimension();
-                    let embedder_dimension = embedder.dimension();
-                    if embedder_dimension != index_dimension {
-                        return Err(SearchError::DimensionMismatch {
-                            expected: index_dimension,
-                            found: embedder_dimension,
-                        });
-                    }
+                    Self::admit_quality_generation_for_embedder(index, embedder.as_ref())?;
                 }
                 resources.quality_embedder = Some(embedder);
                 Ok(())
@@ -22872,10 +22889,14 @@ mod tests {
         let mut config = FsfsConfig::default();
         config.search.quality_weight = 0.7;
         let runtime = FsfsRuntime::new(config);
-        let key = runtime.search_cache_key("query", 10, SearchExecutionMode::Full);
+        let key = runtime
+            .search_cache_key("query", 10, SearchExecutionMode::Full)
+            .unwrap();
         let mut changed = runtime.clone();
         changed.config.search.quality_weight = f64::from(f32::from_bits(0.7_f32.to_bits() + 1));
-        let other = changed.search_cache_key("query", 10, SearchExecutionMode::Full);
+        let other = changed
+            .search_cache_key("query", 10, SearchExecutionMode::Full)
+            .unwrap();
         assert_ne!(key, other);
         assert_ne!(
             FsfsRuntime::search_cache_key_hash(&key),
@@ -22884,19 +22905,29 @@ mod tests {
         changed.config.search.quality_weight = 0.7 + f64::EPSILON;
         assert_eq!(
             key,
-            changed.search_cache_key("query", 10, SearchExecutionMode::Full)
+            changed
+                .search_cache_key("query", 10, SearchExecutionMode::Full)
+                .unwrap()
         );
         changed.config.search.quality_weight = -0.0;
-        let negative_zero = changed.search_cache_key("query", 10, SearchExecutionMode::Full);
+        let negative_zero = changed
+            .search_cache_key("query", 10, SearchExecutionMode::Full)
+            .unwrap();
         changed.config.search.quality_weight = 0.0;
         assert_eq!(
             negative_zero,
-            changed.search_cache_key("query", 10, SearchExecutionMode::Full)
+            changed
+                .search_cache_key("query", 10, SearchExecutionMode::Full)
+                .unwrap()
         );
         changed.config.search.rrf_k = 70.0;
-        let seventy = changed.search_cache_key("query", 10, SearchExecutionMode::Full);
+        let seventy = changed
+            .search_cache_key("query", 10, SearchExecutionMode::Full)
+            .unwrap();
         changed.config.search.rrf_k = 100.0;
-        let hundred = changed.search_cache_key("query", 10, SearchExecutionMode::Full);
+        let hundred = changed
+            .search_cache_key("query", 10, SearchExecutionMode::Full)
+            .unwrap();
         assert_ne!(
             seventy, hundred,
             "large valid RRF k values must not saturate"
@@ -22904,7 +22935,9 @@ mod tests {
         changed.config.search.rrf_k = 100.000_01;
         assert_ne!(
             hundred,
-            changed.search_cache_key("query", 10, SearchExecutionMode::Full)
+            changed
+                .search_cache_key("query", 10, SearchExecutionMode::Full)
+                .unwrap()
         );
     }
 
@@ -23037,7 +23070,9 @@ mod tests {
                 assert_eq!(warm.payloads, cold.payloads);
                 let mut effective = runtime.clone();
                 effective.config.search.quality_weight = f64::from(weight);
-                let key = effective.search_cache_key(query, 10, SearchExecutionMode::Full);
+                let key = effective
+                    .search_cache_key(query, 10, SearchExecutionMode::Full)
+                    .unwrap();
                 effective
                     .write_search_payload_cache(
                         &key,
@@ -23278,7 +23313,9 @@ mod tests {
                 cold.hits[0].rrf_contributions(cold.rrf_k).is_some(),
                 "actual fused head still reports RRF"
             );
-            let key = runtime.search_cache_key(query, 2_000, SearchExecutionMode::LexicalOnly);
+            let key = runtime
+                .search_cache_key(query, 2_000, SearchExecutionMode::LexicalOnly)
+                .unwrap();
             runtime
                 .write_search_payload_cache(&key, &phases, &resources.generation_fingerprint)
                 .unwrap();
@@ -23339,7 +23376,7 @@ mod tests {
         let runtime = FsfsRuntime::new(FsfsConfig::default());
         let mut response = super::SearchServeResponse {
             schema_version: super::FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
-            policy: Some(runtime.search_serve_policy()),
+            policy: Some(runtime.search_serve_policy().unwrap()),
             ok: true,
             query: "query".to_owned(),
             mode: "full".to_owned(),
@@ -23350,7 +23387,12 @@ mod tests {
         runtime.validate_search_serve_policy(&response).unwrap();
         response.policy.as_mut().unwrap().quality_weight_bits = 0.0_f32.to_bits();
         assert!(runtime.validate_search_serve_policy(&response).is_err());
-        response.policy = Some(runtime.search_serve_policy());
+        response.policy = Some(runtime.search_serve_policy().unwrap());
+        "previous-producer".clone_into(&mut response.policy.as_mut().unwrap().embedding_contracts);
+        assert!(runtime.validate_search_serve_policy(&response).is_err());
+        response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v2".to_owned();
+        assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.schema_version = "fsfs.search.serve.v1".to_owned();
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         let legacy = r#"{"ok":true,"query":"query","mode":"full","cached":false,"payloads":[]}"#;
@@ -23457,7 +23499,9 @@ mod tests {
                 assert_eq!(failed.quality_timeout.as_ref().unwrap().budget_ms, 50);
                 assert_eq!(failed.skip_reason.as_deref(), Some("quality_timeout"));
                 assert!(cache.is_empty());
-                let key = runtime.search_cache_key(&response.query, 10, SearchExecutionMode::Full);
+                let key = runtime
+                    .search_cache_key(&response.query, 10, SearchExecutionMode::Full)
+                    .unwrap();
                 runtime
                     .write_search_payload_cache(
                         &key,
@@ -25835,8 +25879,17 @@ mod tests {
             // cfg(test) resolves the fast embedder to HashEmbedder::default_256
             // (id fnv1a-256), so the stored generation must carry that identity.
             let vector = vec![0.125_f32; 256];
-            let mut vector_writer = VectorIndex::create(&vector_path, "fnv1a-256", vector.len())
-                .expect("create expansion vector index");
+            let mut vector_writer = VectorIndex::create_with_revision(
+                &vector_path,
+                "fnv1a-256",
+                &HashEmbedder::default_256()
+                    .identity()
+                    .unwrap()
+                    .fingerprint(),
+                vector.len(),
+                frankensearch_index::Quantization::F16,
+            )
+            .expect("create expansion vector index");
             vector_writer
                 .write_record("alpha.md", &vector)
                 .expect("write expansion vector");
@@ -28642,8 +28695,17 @@ mod tests {
                 .await
                 .expect("commit empty lexical");
             drop(lexical_seed);
-            let vector_writer =
-                VectorIndex::create(&vector_path, "fnv1a-256", 256).expect("create vector index");
+            let vector_writer = VectorIndex::create_with_revision(
+                &vector_path,
+                "fnv1a-256",
+                &HashEmbedder::default_256()
+                    .identity()
+                    .unwrap()
+                    .fingerprint(),
+                256,
+                frankensearch_index::Quantization::F16,
+            )
+            .expect("create vector index");
             vector_writer.finish().expect("finish vector index");
 
             let db_path = temp.path().join("fsfs-watch-storage.db");
@@ -30818,6 +30880,20 @@ mod tests {
     }
 
     impl Embedder for BatchProbeEmbedder {
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            static IDENTITY: std::sync::OnceLock<frankensearch_core::EmbeddingIdentityBundleV1> =
+                std::sync::OnceLock::new();
+            Ok(IDENTITY.get_or_init(|| {
+                frankensearch_core::EmbeddingIdentityBundleV1::explicit_test_model(
+                    "batch-probe-4",
+                    4,
+                )
+            }))
+        }
+
         fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             if matches!(self.behavior, BatchProbeBehavior::ProbeReadyBatchTransient) {
                 return Box::pin(async { Ok(vec![1.0, 0.0, 0.0, 0.0]) });
@@ -30973,6 +31049,75 @@ mod tests {
 
         fn category(&self) -> ModelCategory {
             ModelCategory::StaticEmbedder
+        }
+    }
+
+    #[test]
+    fn vector_admission_requires_complete_matching_producer_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        for embedder in [&SemanticFastEmbedder as &dyn Embedder, &SemanticQualityStub] {
+            let current = embedder.identity().unwrap().fingerprint();
+            for (label, revision, admitted) in [
+                ("current", current.as_str(), true),
+                (
+                    "historical",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    false,
+                ),
+                ("missing", "", false),
+            ] {
+                let path = temp.path().join(format!("{}-{label}.fsvi", embedder.id()));
+                let mut writer = VectorIndex::create_with_revision(
+                    &path,
+                    embedder.id(),
+                    revision,
+                    embedder.dimension(),
+                    frankensearch_index::Quantization::F16,
+                )
+                .unwrap();
+                writer
+                    .write_record("doc", &SemanticFastEmbedder::embed_sync("content"))
+                    .unwrap();
+                writer.finish().unwrap();
+                let before = fs::read(&path).unwrap();
+                let index = VectorIndex::open_read_only(&path).unwrap();
+                for result in [
+                    FsfsRuntime::validate_fast_embedder_for_vector_index(&index, embedder, false),
+                    FsfsRuntime::admit_vector_generation_for_embedder(&index, embedder),
+                    FsfsRuntime::admit_quality_generation_for_embedder(&index, embedder),
+                ] {
+                    if admitted {
+                        result.expect("exact producer remains usable");
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(SearchError::UnverifiableRemoteSpace { .. })
+                        ));
+                    }
+                }
+                let unidentified = FixedSemanticEmbedder {
+                    id: if embedder.id() == "stub-384" {
+                        "stub-384"
+                    } else {
+                        "stub-quality-384"
+                    },
+                    dimension: 384,
+                };
+                assert!(
+                    FsfsRuntime::admit_vector_generation_for_embedder(&index, &unidentified)
+                        .is_err()
+                );
+                assert!(
+                    FsfsRuntime::admit_quality_generation_for_embedder(&index, &unidentified)
+                        .is_err()
+                );
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    before,
+                    "admission never changes the generation"
+                );
+                assert_eq!(index.wal_record_count(), 0);
+            }
         }
     }
 
@@ -31589,6 +31734,17 @@ mod tests {
     }
 
     impl Embedder for SemanticFastEmbedder {
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            static IDENTITY: std::sync::OnceLock<frankensearch_core::EmbeddingIdentityBundleV1> =
+                std::sync::OnceLock::new();
+            Ok(IDENTITY.get_or_init(|| {
+                frankensearch_core::EmbeddingIdentityBundleV1::explicit_test_model("stub-384", 384)
+            }))
+        }
+
         fn embed<'a>(
             &'a self,
             _cx: &'a asupersync::Cx,
@@ -31626,6 +31782,20 @@ mod tests {
     struct SemanticQualityStub;
 
     impl Embedder for SemanticQualityStub {
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            static IDENTITY: std::sync::OnceLock<frankensearch_core::EmbeddingIdentityBundleV1> =
+                std::sync::OnceLock::new();
+            Ok(IDENTITY.get_or_init(|| {
+                frankensearch_core::EmbeddingIdentityBundleV1::explicit_test_model(
+                    "stub-quality-384",
+                    384,
+                )
+            }))
+        }
+
         fn embed<'a>(
             &'a self,
             _cx: &'a asupersync::Cx,
@@ -35782,7 +35952,9 @@ mod tests {
                 filter: Some("ext:rs".to_owned()),
                 ..CliInput::default()
             });
-            let key = runtime.search_cache_key("cache me", 25, super::SearchExecutionMode::Full);
+            let key = runtime
+                .search_cache_key("cache me", 25, super::SearchExecutionMode::Full)
+                .unwrap();
             let initial = SearchPayload::new(
                 "cache me",
                 SearchOutputPhase::Initial,
@@ -35814,6 +35986,33 @@ mod tests {
                 .expect("read cache")
                 .expect("cache hit");
             assert_eq!(cached, payloads);
+
+            let mut previous_producer = key.clone();
+            "prior-producer-contracts".clone_into(&mut previous_producer.embedding_contracts);
+            assert_ne!(
+                FsfsRuntime::search_cache_key_hash(&previous_producer),
+                FsfsRuntime::search_cache_key_hash(&key),
+            );
+            assert!(
+                runtime
+                    .try_load_search_payload_cache(&previous_producer, &cache_fingerprint)
+                    .unwrap()
+                    .is_none()
+            );
+            let cache_path = runtime.search_cache_path(&key).unwrap();
+            let mut old_record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+            old_record["schema_version"] = "fsfs.search.cache.v3".into();
+            fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
+            assert!(
+                runtime
+                    .try_load_search_payload_cache(&key, &cache_fingerprint)
+                    .unwrap()
+                    .is_none()
+            );
+            runtime
+                .write_search_payload_cache(&key, &payloads, &cache_fingerprint)
+                .unwrap();
 
             let mut replayed = Vec::new();
             let replayed_payloads = {
@@ -35861,7 +36060,9 @@ mod tests {
                 index_dir: Some(index_root.clone()),
                 ..CliInput::default()
             });
-            let key = runtime.search_cache_key("stale computation", 10, SearchExecutionMode::Full);
+            let key = runtime
+                .search_cache_key("stale computation", 10, SearchExecutionMode::Full)
+                .unwrap();
             let stale_payloads = vec![SearchPayload::new(
                 "stale computation",
                 SearchOutputPhase::Refined,
@@ -35979,7 +36180,9 @@ mod tests {
                 index_dir: Some(index_root),
                 ..CliInput::default()
             });
-            let key = runtime.search_cache_key("cached semantic", 10, SearchExecutionMode::Full);
+            let key = runtime
+                .search_cache_key("cached semantic", 10, SearchExecutionMode::Full)
+                .unwrap();
             let cached_payloads = vec![SearchPayload::new(
                 "cached semantic",
                 SearchOutputPhase::Refined,
@@ -36078,11 +36281,15 @@ mod tests {
                     in_both_sources: false,
                 }],
             )];
-            let lexical_key =
-                runtime.search_cache_key(lexical_query, 10, SearchExecutionMode::LexicalOnly);
-            let full_key = runtime.search_cache_key(semantic_query, 10, SearchExecutionMode::Full);
-            let fast_key =
-                runtime.search_cache_key(semantic_query, 10, SearchExecutionMode::FastOnly);
+            let lexical_key = runtime
+                .search_cache_key(lexical_query, 10, SearchExecutionMode::LexicalOnly)
+                .unwrap();
+            let full_key = runtime
+                .search_cache_key(semantic_query, 10, SearchExecutionMode::Full)
+                .unwrap();
+            let fast_key = runtime
+                .search_cache_key(semantic_query, 10, SearchExecutionMode::FastOnly)
+                .unwrap();
             let mut hot_cache = HashMap::from([
                 (lexical_key.clone(), cached_payloads.clone()),
                 (full_key.clone(), cached_payloads.clone()),
@@ -36152,9 +36359,14 @@ mod tests {
                     .expect("FSFS vector artifact has a parent directory"),
             )
             .expect("create repaired vector directory");
-            let mut vector_writer =
-                VectorIndex::create(&vector_path, embedder.id(), embedder.dimension())
-                    .expect("create repaired vector generation");
+            let mut vector_writer = VectorIndex::create_with_revision(
+                &vector_path,
+                embedder.id(),
+                &embedder.identity().unwrap().fingerprint(),
+                embedder.dimension(),
+                frankensearch_index::Quantization::F16,
+            )
+            .expect("create repaired vector generation");
             vector_writer
                 .write_record(document_id, &document_embedding)
                 .expect("append repaired semantic witness");
