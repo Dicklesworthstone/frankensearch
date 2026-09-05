@@ -146,27 +146,9 @@ mod loader_only {
             self.run_with_env(cwd, label, args, timeout, &[])
         }
 
-        fn run_with_env<I, S>(
-            &self,
-            cwd: &Path,
-            label: &str,
-            args: I,
-            timeout: Duration,
-            extra_env: &[(&str, &str)],
-        ) -> CommandOutcome
-        where
-            I: IntoIterator<Item = S>,
-            S: AsRef<OsStr>,
-        {
-            let verified_executable = fsfs_binary();
-            let stdout_path = self.log_root.join(format!("{label}.stdout.log"));
-            let stderr_path = self.log_root.join(format!("{label}.stderr.log"));
-            let stdout_file = File::create(&stdout_path).expect("create subprocess stdout log");
-            let stderr_file = File::create(&stderr_path).expect("create subprocess stderr log");
-
-            let mut command = Command::new(&verified_executable);
+        fn command(&self, cwd: &Path) -> Command {
+            let mut command = Command::new(fsfs_binary());
             command
-                .args(args)
                 .current_dir(cwd)
                 .env("HOME", &self.home)
                 .env("XDG_CONFIG_HOME", &self.xdg_config)
@@ -185,7 +167,31 @@ mod loader_only {
                 .env_remove("FSFS_STORAGE_INDEX_DIR")
                 .env_remove("FRANKENSEARCH_STORAGE_INDEX_DIR")
                 .env_remove("HF_HOME")
-                .env_remove("HUGGINGFACE_HUB_CACHE")
+                .env_remove("HUGGINGFACE_HUB_CACHE");
+            command
+        }
+
+        fn run_with_env<I, S>(
+            &self,
+            cwd: &Path,
+            label: &str,
+            args: I,
+            timeout: Duration,
+            extra_env: &[(&str, &str)],
+        ) -> CommandOutcome
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let verified_executable = fsfs_binary();
+            let stdout_path = self.log_root.join(format!("{label}.stdout.log"));
+            let stderr_path = self.log_root.join(format!("{label}.stderr.log"));
+            let stdout_file = File::create(&stdout_path).expect("create subprocess stdout log");
+            let stderr_file = File::create(&stderr_path).expect("create subprocess stderr log");
+
+            let mut command = self.command(cwd);
+            command
+                .args(args)
                 .stdout(Stdio::from(stdout_file))
                 .stderr(Stdio::from(stderr_file));
             for (key, value) in extra_env {
@@ -1354,6 +1360,335 @@ mod loader_only {
         eprintln!(
             "[default-build-e2e] stage=doctor-failure event=verified exit=1 ok=false code=subsystem_error check=model.fast stale_same_id_receipt_rejected=true"
         );
+    }
+
+    #[cfg(unix)]
+    struct WatchChild(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for WatchChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_watch_output(
+        child: &mut WatchChild,
+        path: &Path,
+        needle: &str,
+        count: usize,
+        timeout: Duration,
+    ) -> String {
+        let started = Instant::now();
+        loop {
+            let output = fs::read_to_string(path).expect("read watch output");
+            if output.matches(needle).count() >= count {
+                return output;
+            }
+            assert!(
+                child.0.try_wait().expect("poll watcher").is_none(),
+                "watcher exited before {needle}; output:\n{output}"
+            );
+            assert!(
+                started.elapsed() < timeout,
+                "watcher did not emit {needle} {count} times in {timeout:?}; output:\n{output}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "real-model watch handoff; requires the pinned model cache and semantic E2E opt-in"]
+    fn default_build_watch_reconciles_handoff_and_persists_live_updates() -> Result<(), String> {
+        log_binary_profile("real-model-watch");
+        if std::env::var("FRANKENSEARCH_REQUIRE_SEMANTIC_E2E").as_deref() != Ok("1") {
+            return Err(
+                "set FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 for real-model watch validation"
+                    .to_owned(),
+            );
+        }
+        let model_root = configured_model_root();
+        verify_pinned_model_cache(&model_root)?;
+        let temp = tempfile::tempdir().expect("watch fixture");
+        let fsfs = IsolatedFsfs::new(temp.path(), model_root);
+        let corpus = temp.path().join("corpus");
+        let index = temp.path().join("index");
+        fs::create_dir_all(&corpus).expect("watch corpus");
+        fs::write(corpus.join("database.md"), "Oldquartz database transactions preserve atomicity using rollback and durable journals.").unwrap();
+        fs::write(
+            corpus.join("astronomy.md"),
+            "Astronomers measure starlight to classify distant galaxies and planets.",
+        )
+        .unwrap();
+        let corpus_arg = corpus.to_str().unwrap();
+        let index_arg = index.to_str().unwrap();
+        let initial = fsfs.run(
+            temp.path(),
+            "watch-initial-index",
+            [
+                "index",
+                corpus_arg,
+                "--index-dir",
+                index_arg,
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        let envelope = parse_success_envelope("watch initial index", &initial);
+        assert_eq!(envelope["data"]["indexed_files"], 2);
+        assert_eq!(envelope["data"]["quality_generation"]["dimension"], 384);
+
+        let stdout_path = fsfs.log_root.join("watch.stdout.log");
+        let stderr_path = fsfs.log_root.join("watch.stderr.log");
+        let mut watch = WatchChild(
+            fsfs.command(temp.path())
+                .args([
+                    "index",
+                    corpus_arg,
+                    "--watch",
+                    "--index-dir",
+                    index_arg,
+                    "--format",
+                    "jsonl",
+                ])
+                .env("RUST_LOG", "info")
+                .stdout(File::create(&stdout_path).unwrap())
+                .stderr(File::create(&stderr_path).unwrap())
+                .spawn()
+                .expect("spawn real watcher"),
+        );
+        let publication = wait_for_watch_output(
+            &mut watch,
+            &stdout_path,
+            "\"generation_complete\":true",
+            1,
+            QUICKSTART_TIMEOUT,
+        );
+        let publication: Value =
+            serde_json::from_str(publication.trim()).expect("watch index completion envelope");
+        assert_eq!(publication["data"]["indexed_files"], 2);
+        // No watcher callback can observe these edits: model initialization
+        // still separates the completed one-shot pass from notify registration.
+        let before = fs::read_to_string(&stderr_path).unwrap();
+        assert!(
+            !before.contains("live ingest pipeline initialized for watch mode"),
+            "the test missed the startup handoff window; no handoff claim is valid"
+        );
+        fs::write(
+            corpus.join("handoff.md"),
+            "Handoffquartz database recovery uses transaction rollback to preserve atomicity.",
+        )
+        .unwrap();
+        fs::write(corpus.join("database.md"), "Newquartz restores database atomicity through transaction rollback and durable journals.").unwrap();
+        wait_for_watch_output(
+            &mut watch,
+            &stderr_path,
+            "fsfs watch reconciliation completed",
+            1,
+            QUICKSTART_TIMEOUT,
+        );
+
+        // These are ordinary notify events, after the initial scan was applied.
+        let before = fs::read_to_string(&stderr_path)
+            .unwrap()
+            .matches("fsfs watch batch applied")
+            .count();
+        fs::write(
+            corpus.join("live.md"),
+            "Liveamber handles transient failures with bounded retries and exponential backoff.",
+        )
+        .unwrap();
+        wait_for_watch_output(
+            &mut watch,
+            &stderr_path,
+            "fsfs watch batch applied",
+            before + 1,
+            FAILURE_TIMEOUT,
+        );
+        let before = fs::read_to_string(&stderr_path)
+            .unwrap()
+            .matches("fsfs watch batch applied")
+            .count();
+        fs::write(corpus.join("live.md"), "Livemalachite restores service after failures using bounded retries and exponential backoff.").unwrap();
+        wait_for_watch_output(
+            &mut watch,
+            &stderr_path,
+            "fsfs watch batch applied",
+            before + 1,
+            FAILURE_TIMEOUT,
+        );
+
+        let signal = Command::new("kill")
+            .args(["-TERM", &watch.0.id().to_string()])
+            .status()
+            .expect("signal own watcher");
+        assert!(signal.success());
+        let stop_started = Instant::now();
+        let status = loop {
+            if let Some(status) = watch.0.try_wait().expect("poll graceful shutdown") {
+                break status;
+            }
+            assert!(
+                stop_started.elapsed() < FAILURE_TIMEOUT,
+                "watch shutdown timed out"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let stderr = fs::read_to_string(&stderr_path).unwrap();
+        eprintln!("[default-build-e2e] stage=watch-shutdown status={status} stderr:\n{stderr}");
+        assert!(status.success(), "graceful watcher shutdown failed");
+        drop(watch);
+
+        // Fresh handles must contain exactly one live row per file in BOTH
+        // vector spaces. Query execution below verifies the lexical arm too.
+        let stack = frankensearch_embed::EmbedderStack::auto_detect_with_options(
+            Some(&fsfs.model_root),
+            &frankensearch_embed::DetectOptions {
+                offline: Some(true),
+            },
+        )
+        .expect("load verified models for durable vector comparison");
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        for (file, embedder) in [
+            ("vector/index.fsvi", stack.fast_arc()),
+            (
+                "vector/quality.fsvi",
+                stack.quality_arc().expect("quality comparison model"),
+            ),
+        ] {
+            let vectors =
+                VectorIndex::open_read_only(&index.join(file)).expect("reopen watched vector tier");
+            let hits = vectors
+                .search_top_k(&vec![1.0; vectors.dimension()], 10, None)
+                .expect("enumerate live tier");
+            let mut ids = hits
+                .iter()
+                .map(|hit| hit.doc_id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            assert_eq!(
+                ids,
+                ["astronomy.md", "database.md", "handoff.md", "live.md"],
+                "{file}"
+            );
+            assert_eq!(
+                vectors.wal_record_count(),
+                0,
+                "{file}: graceful shutdown must compact"
+            );
+            let corpus = corpus.clone();
+            let expected = scheduler.block_on(scheduler.handle().spawn(async move {
+                use frankensearch_core::Canonicalizer as _;
+                let cx = asupersync::Cx::current().expect("owned comparison context");
+                let mut expected = Vec::new();
+                for id in ids {
+                    let text = frankensearch_core::DefaultCanonicalizer::default()
+                        .canonicalize(&fs::read_to_string(corpus.join(&id)).unwrap());
+                    expected.push((id, embedder.embed(&cx, &text).await.unwrap()));
+                }
+                expected
+            }));
+            for (id, expected) in expected {
+                let hit = hits.iter().find(|hit| hit.doc_id == id).unwrap();
+                let stored = vectors.vector_at_f32(hit.index as usize).unwrap();
+                assert_eq!(stored.len(), expected.len());
+                assert!(
+                    stored
+                        .iter()
+                        .zip(expected)
+                        .all(|(a, b)| (a - b).abs() < 0.001),
+                    "{file}: {id} does not encode the current file after f16 quantization"
+                );
+            }
+        }
+        let config = temp.path().join("watch-search.toml");
+        // Functional coverage uses an explicit budget, not a latency claim.
+        fs::write(&config, "[search]\nquality_timeout_ms = 5000\n").unwrap();
+        for (label, query, expected) in [
+            (
+                "handoff",
+                "how handoffquartz database recovery preserves atomicity",
+                "handoff.md",
+            ),
+            (
+                "handoff-modify",
+                "how newquartz restores database atomicity",
+                "database.md",
+            ),
+            (
+                "live-modify",
+                "how livemalachite restores service after failures",
+                "live.md",
+            ),
+        ] {
+            let outcome = fsfs.run(
+                temp.path(),
+                label,
+                [
+                    "search",
+                    query,
+                    "--no-daemon",
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index_arg,
+                    "--format",
+                    "json",
+                    "--limit",
+                    "10",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let result = parse_success_envelope(label, &outcome);
+            assert_eq!(result["data"]["phase"], "refined", "{label}: {result}");
+            let hit = result["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|hit| hit["path"] == expected)
+                .expect("watched document in actual search results");
+            assert!(hit["lexical_rank"].is_number(), "{label}: {hit}");
+            assert!(hit["semantic_rank"].is_number(), "{label}: {hit}");
+        }
+        for old in ["Oldquartz", "Liveamber"] {
+            let outcome = fsfs.run(
+                temp.path(),
+                old,
+                [
+                    "search",
+                    old,
+                    "--fast-only",
+                    "--no-daemon",
+                    "--index-dir",
+                    index_arg,
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let result = parse_success_envelope(old, &outcome);
+            assert!(
+                result["data"]["hits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|hit| hit["lexical_rank"].is_null()),
+                "superseded lexical text remains: {result}"
+            );
+        }
+        eprintln!(
+            "[default-build-e2e] stage=watch-handoff event=verified startup_create=true startup_modify=true live_create=true live_modify=true lexical=true fast=true quality=true post_exit=true"
+        );
+        Ok(())
     }
 
     #[test]

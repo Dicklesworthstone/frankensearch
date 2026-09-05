@@ -54,9 +54,8 @@ use frankensearch_quill::{
     resolve_current,
 };
 use frankensearch_storage::{
-    EmbeddingVectorSink, IngestAction, IngestRequest, IngestResult, JobQueueConfig,
-    PersistentJobQueue, PipelineConfig, Storage, StorageBackedJobRunner,
-    StorageConfig as PipelineStorageConfig,
+    EmbeddingVectorSink, IngestRequest, IngestResult, JobQueueConfig, PersistentJobQueue,
+    PipelineConfig, Storage, StorageBackedJobRunner, StorageConfig as PipelineStorageConfig,
 };
 use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
 use ftui_core::event::{Event, KeyCode, Modifiers};
@@ -2347,6 +2346,7 @@ impl EmbeddingVectorSink for LiveVectorSink {
 #[derive(Debug)]
 struct StorageBatchContext {
     storage: Arc<Storage>,
+    queue: Arc<PersistentJobQueue>,
     runner: StorageBackedJobRunner,
 }
 
@@ -2640,7 +2640,7 @@ impl LiveIngestPipeline {
 
         let runner = StorageBackedJobRunner::new(
             Arc::clone(&storage),
-            queue,
+            Arc::clone(&queue),
             Arc::new(DefaultCanonicalizer::default()),
             Arc::clone(&self.embedder),
             sink,
@@ -2650,7 +2650,11 @@ impl LiveIngestPipeline {
             ..PipelineConfig::default()
         });
 
-        Ok(Some(StorageBatchContext { storage, runner }))
+        Ok(Some(StorageBatchContext {
+            storage,
+            queue,
+            runner,
+        }))
     }
 
     fn enqueue_storage_upsert(
@@ -2671,13 +2675,50 @@ impl LiveIngestPipeline {
         cx: &Cx,
         storage_ctx: &StorageBatchContext,
     ) -> frankensearch_core::SearchResult<()> {
+        // A cancelled/dead worker may have left claimed rows in `processing`.
+        // Reuse the queue's visibility lease rules; never steal a live claim.
+        storage_ctx.queue.reclaim_stale_jobs()?;
+        let mut idle_since = None;
         loop {
             let batch = storage_ctx
                 .runner
                 .process_batch(cx, "fsfs-watch-live")
                 .await?;
+            if batch.jobs_failed > 0 {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "fsfs.watch.vector_jobs",
+                    source: Box::new(std::io::Error::other(format!(
+                        "{} vector job(s) failed ({} terminal); watch reconciliation remains pending",
+                        batch.jobs_failed, batch.terminal_failures
+                    ))),
+                });
+            }
             if batch.jobs_claimed == 0 {
-                break;
+                let depth = storage_ctx.queue.queue_depth()?;
+                if depth.pending == 0 && depth.processing == 0 {
+                    break;
+                }
+                // A retry scheduled in the future is not an empty queue. Give
+                // the persisted backoff a bounded, cancel-aware opportunity to
+                // expire instead of acknowledging stale fast vectors, or
+                // exhausting the watcher's shorter retry loop immediately.
+                let started = idle_since.get_or_insert_with(Instant::now);
+                if started.elapsed() >= Duration::from_secs(1) {
+                    return Err(SearchError::SubsystemError {
+                        subsystem: "fsfs.watch.vector_jobs",
+                        source: Box::new(std::io::Error::other(format!(
+                            "vector jobs remain pending: {} queued, {} processing",
+                            depth.pending, depth.processing
+                        ))),
+                    });
+                }
+                cx.checkpoint().map_err(|error| SearchError::Cancelled {
+                    phase: "watch.vector_jobs".to_owned(),
+                    reason: error.to_string(),
+                })?;
+                asupersync::time::sleep(cx.now(), Duration::from_millis(10)).await;
+            } else {
+                idle_since = None;
             }
         }
         Ok(())
@@ -2736,9 +2777,8 @@ impl LiveIngestPipeline {
 
     /// Embed `canonical` in the quality space and append it to the quality
     /// tier. `append` is the atomic replacement primitive, so an updated file
-    /// supersedes its older quality vector. A quality embedding failure
-    /// tombstones the stale quality vector instead of leaving one that would
-    /// make REFINED rank the old content.
+    /// supersedes its older quality vector. A failed embedding or append
+    /// retains the old vector and returns failure so reconciliation retries.
     async fn append_quality_vector(
         &self,
         cx: &Cx,
@@ -2761,13 +2801,9 @@ impl LiveIngestPipeline {
                     error_code = error_code_for(&error),
                     reason = FsfsRuntime::semantic_runtime_failure_summary(&error),
                     reason_code,
-                    "watcher ingest: quality embedding failed; fast tier only for this file"
+                    "watcher ingest: quality embedding failed; update remains pending"
                 );
-                let mut quality = tier
-                    .vector_index
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _was_present = quality.soft_delete(rel_key)?;
+                return Err(error);
             }
         }
         Ok(())
@@ -2813,8 +2849,9 @@ impl LiveIngestPipeline {
                                 error_code = error_code_for(&error),
                                 reason = FsfsRuntime::semantic_runtime_failure_summary(&error),
                                 reason_code = %vector_plan.reason_code,
-                                "watcher ingest: embedding failed; lexical-only for this file"
+                                "watcher ingest: embedding failed; update remains pending"
                             );
+                            return Err(error);
                         }
                     }
                 }
@@ -2939,17 +2976,12 @@ impl LiveIngestPipeline {
 
         if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
             if let Some(storage_ctx) = storage_ctx {
-                let ingest_result =
-                    Self::enqueue_storage_upsert(storage_ctx, &rel_key, &canonical, &abs_path)?;
+                Self::enqueue_storage_upsert(storage_ctx, &rel_key, &canonical, &abs_path)?;
                 // Storage pipeline intentionally skips hash-tier queued jobs because hash
                 // vectors are expected to be computed inline. Preserve live watcher behavior by
-                // writing those vectors directly for newly inserted/updated content.
-                if !self.embedder.is_semantic()
-                    && matches!(
-                        ingest_result.action,
-                        IngestAction::New | IngestAction::Updated
-                    )
-                {
+                // writing those vectors directly. Catalog dedup is not evidence
+                // that a previous inline vector append succeeded.
+                if !self.embedder.is_semantic() {
                     let content_len_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
                     let vector_plan = Self::plan_live_vector_upsert(
                         self.quality_tier.is_some(),
@@ -2974,10 +3006,6 @@ impl LiveIngestPipeline {
                 // (bd-orb50). Write the quality vector inline, as the direct
                 // path does.
                 if self.embedder.is_semantic()
-                    && matches!(
-                        ingest_result.action,
-                        IngestAction::New | IngestAction::Updated
-                    )
                     && let Some(tier) = self.quality_tier.as_ref()
                 {
                     self.append_quality_vector(
@@ -3105,6 +3133,13 @@ impl LiveIngestPipeline {
         cx: &Cx,
         batch: &[WatchIngestOp],
     ) -> frankensearch_core::SearchResult<usize> {
+        // A prior attempt can stage a new lexical ID before its vector append
+        // fails. Publish that prefix before replay so Quill treats the same ID
+        // as a replacement, not a second uncommitted insertion. This does not
+        // acknowledge the vector work: every operation still runs below.
+        if self.lexical_index.has_uncommitted_changes() {
+            self.lexical_index.commit(cx).await?;
+        }
         let storage_ctx = self.build_storage_batch_context()?;
         let mut count = 0_usize;
 
@@ -28346,6 +28381,236 @@ mod tests {
             }
             other => panic!("unknown runtime publication-lease helper operation {other}"),
         }
+    }
+
+    // Explicit basis-vector embedders exercise storage and WAL failure/retry
+    // mechanics. Real semantic parity is covered by default_build_quickstart.
+    async fn assert_live_ingest_recovers_blocked_vector_wal(cx: &Cx, block_quality: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("doc.md"),
+            "replacement content after a transient write failure",
+        )
+        .unwrap();
+        let fast_path = temp.path().join("fast.fsvi");
+        let quality_path = temp.path().join("quality.fsvi");
+        for (path, id) in [(&fast_path, "retry-fast"), (&quality_path, "retry-quality")] {
+            let mut writer = VectorIndex::create(path, id, 2).unwrap();
+            writer.write_record("doc.md", &[0.0, 1.0]).unwrap();
+            writer.finish().unwrap();
+        }
+        let pipeline = LiveIngestPipeline::new(
+            root,
+            create_test_quill(cx, &temp.path().join("lexical")).await,
+            VectorIndex::open(&fast_path).unwrap(),
+            Arc::new(BlendQueryEmbedder("retry-fast")),
+        )
+        .with_storage_db_path(temp.path().join("catalog.db"))
+        .with_quality_tier(
+            VectorIndex::open(&quality_path).unwrap(),
+            Arc::new(BlendQueryEmbedder("retry-quality")),
+        );
+        let blocked = if block_quality {
+            &quality_path
+        } else {
+            &fast_path
+        };
+        let wal = frankensearch_index::wal_path_for(blocked);
+        fs::create_dir(&wal).expect("block actual WAL file creation");
+        let batch = [WatchIngestOp::Upsert {
+            file_key: "doc.md".to_owned(),
+            revision: 2,
+            ingestion_class: IngestionClass::FullSemanticLexical,
+        }];
+        pipeline
+            .apply_batch(cx, &batch)
+            .await
+            .expect_err("a failed vector write must not acknowledge the watch batch");
+        pipeline
+            .apply_batch(cx, &batch)
+            .await
+            .expect_err("unchanged catalog content or a delayed retry is not vector completion");
+        let blocked_handle = if block_quality {
+            &pipeline.quality_tier.as_ref().unwrap().vector_index
+        } else {
+            &pipeline.vector_index
+        };
+        {
+            let blocked = blocked_handle.lock().unwrap();
+            let hits = blocked.search_top_k(&[0.0, 1.0], 2, None).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert!(
+                hits[0].score > 0.99,
+                "failed replacement must preserve the old vector"
+            );
+        }
+        fs::rename(&wal, temp.path().join("preserved-wal-blocker"))
+            .expect("preserve and displace WAL blocker");
+        let started = Instant::now();
+        loop {
+            match pipeline.apply_batch(cx, &batch).await {
+                Ok(applied) => {
+                    assert_eq!(applied, 1);
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "retry did not recover: {error}"
+                    );
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(20)).await;
+                }
+            }
+        }
+        drop(pipeline);
+        for path in [&fast_path, &quality_path] {
+            let index = VectorIndex::open_read_only(path).unwrap();
+            let hits = index.search_top_k(&[1.0, 0.0], 2, None).unwrap();
+            assert_eq!(hits.len(), 1, "retry must supersede rather than duplicate");
+            assert_eq!(hits[0].doc_id, "doc.md");
+            assert!(hits[0].score > 0.99, "{path:?}: retry left the old vector");
+        }
+    }
+
+    #[test]
+    fn live_ingest_fast_wal_failure_retains_retry_until_persisted() {
+        run_test_with_cx(|cx| async move {
+            assert_live_ingest_recovers_blocked_vector_wal(&cx, false).await;
+        });
+    }
+
+    #[test]
+    fn live_ingest_quality_wal_failure_retries_unchanged_catalog_content() {
+        run_test_with_cx(|cx| async move {
+            assert_live_ingest_recovers_blocked_vector_wal(&cx, true).await;
+        });
+    }
+
+    #[test]
+    fn live_ingest_inline_embedding_cancellation_preserves_vectors() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let old = vec![0.5; 384];
+            let fast_path = temp.path().join("fast.fsvi");
+            let quality_path = temp.path().join("quality.fsvi");
+            for path in [&fast_path, &quality_path] {
+                let mut writer = VectorIndex::create(path, "cancelled-embedder", 384).unwrap();
+                writer.write_record("doc.md", &old).unwrap();
+                writer.finish().unwrap();
+            }
+            let pipeline = LiveIngestPipeline::new(
+                temp.path().to_path_buf(),
+                create_test_quill(&cx, &temp.path().join("lexical")).await,
+                VectorIndex::open(&fast_path).unwrap(),
+                Arc::new(CancelledEmbedder),
+            )
+            .with_quality_tier(
+                VectorIndex::open(&quality_path).unwrap(),
+                Arc::new(CancelledEmbedder),
+            );
+            let plan = LiveIngestPipeline::plan_live_vector_upsert(
+                false,
+                "doc.md",
+                2,
+                IngestionClass::FullSemanticLexical,
+                12,
+            );
+            let error = pipeline
+                .apply_live_vector_actions(&cx, "doc.md", 2, "new contents", &plan)
+                .await
+                .expect_err("fast cancellation must escape");
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            let error = pipeline
+                .append_quality_vector(
+                    &cx,
+                    pipeline.quality_tier.as_ref().unwrap(),
+                    "doc.md",
+                    "new contents",
+                    "test.cancel",
+                )
+                .await
+                .expect_err("quality cancellation must escape");
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            drop(pipeline);
+            for path in [&fast_path, &quality_path] {
+                let index = VectorIndex::open_read_only(path).unwrap();
+                let hits = index.search_top_k(&old, 2, None).unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].doc_id, "doc.md");
+                assert_eq!(index.vector_at_f32(hits[0].index as usize).unwrap(), old);
+            }
+        });
+    }
+
+    #[test]
+    fn live_ingest_reclaims_expired_processing_jobs_without_stealing_live_claims() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let vector_path = temp.path().join("fast.fsvi");
+            VectorIndex::create(&vector_path, "retry-fast", 2)
+                .unwrap()
+                .finish()
+                .unwrap();
+            let pipeline = LiveIngestPipeline::new(
+                temp.path().to_path_buf(),
+                create_test_quill(&cx, &temp.path().join("lexical")).await,
+                VectorIndex::open(&vector_path).unwrap(),
+                Arc::new(BlendQueryEmbedder("retry-fast")),
+            )
+            .with_storage_db_path(temp.path().join("catalog.db"));
+            let context = pipeline.build_storage_batch_context().unwrap().unwrap();
+            LiveIngestPipeline::enqueue_storage_upsert(
+                &context,
+                "doc.md",
+                "interrupted worker content",
+                &temp.path().join("doc.md"),
+            )
+            .unwrap();
+            let claims = context.queue.claim_batch("interrupted-worker", 1).unwrap();
+            assert_eq!(claims.len(), 1);
+            pipeline.drain_storage_jobs(&cx, &context).await.expect_err(
+                "an unexpired claim must remain pending rather than be stolen or acknowledged",
+            );
+            assert_eq!(context.queue.queue_depth().unwrap().processing, 1);
+            assert!(
+                pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap()
+                    .is_empty()
+            );
+
+            // Expire this exact fixture claim without changing production lease
+            // duration or sleeping through it. The normal queue reclaim path
+            // below must own the transition back to pending and then complete.
+            context
+                .storage
+                .connection()
+                .execute_with_params_sync(
+                    "UPDATE embedding_jobs SET started_at = 0 WHERE job_id = ?1;",
+                    &[SqliteValue::Integer(claims[0].job_id)],
+                )
+                .unwrap();
+            pipeline
+                .drain_storage_jobs(&cx, &context)
+                .await
+                .expect("reclaim and execute expired job");
+            let depth = context.queue.queue_depth().unwrap();
+            assert_eq!(depth.processing, 0);
+            assert_eq!(depth.pending, 0);
+            assert_eq!(depth.completed, 1);
+            drop(context);
+            drop(pipeline);
+            let vector = VectorIndex::open_read_only(&vector_path).unwrap();
+            let hits = vector.search_top_k(&[1.0, 0.0], 2, None).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc.md");
+            assert!(hits[0].score > 0.99);
+        });
     }
 
     #[test]

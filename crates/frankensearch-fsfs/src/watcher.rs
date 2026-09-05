@@ -21,7 +21,7 @@ use asupersync::types::CancelReason;
 use frankensearch_core::{SearchError, SearchResult};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{
     DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision, FsfsConfig, IngestionClass,
@@ -1647,6 +1647,7 @@ impl FsWatcher {
         let ingest_reconciliation = Arc::clone(&self.reconciliation);
         let ingest_roots = self.roots.clone();
         let ingest_batch_size = self.base_batch_size;
+        let ingest_pressure = Arc::clone(&self.pressure_state);
         let ingest_task = match cx.spawn_local(move |child_cx| async move {
             admitted_for_task.store(true, Ordering::Release);
             let _stop_producer_on_exit = IngestTaskStopGuard {
@@ -1664,6 +1665,14 @@ impl FsWatcher {
                 ingest_batch_size,
                 &producer_done_for_task,
                 &collect_snapshot_from_roots,
+                &|| {
+                    WatcherExecutionPolicy::for_pressure(
+                        pressure_state_from_code(ingest_pressure.load(Ordering::Acquire)),
+                        DEFAULT_DEBOUNCE_MS,
+                        ingest_batch_size,
+                    )
+                    .watching_enabled
+                },
             )
             .await
         }) {
@@ -2387,13 +2396,10 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         // promoted only by a pass that can actually apply the deletes it
         // derives. A restart is not evidence that those files came back.
         if baseline_completeness.is_complete() && baseline_completeness.identity_is_trustworthy() {
-            let seeded = reconciliation.seed_initial_authority(
+            reconciliation.seed_initial_authority(
                 baseline,
                 baseline_completeness.root_identities().clone(),
             )?;
-            if !seeded {
-                reconciliation.require_full_scan()?;
-            }
         } else {
             // A short startup scan is not deletion authority. Take it as a
             // working set only if nothing better exists, leave the authority
@@ -2403,8 +2409,12 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
                 reconciliation.indexed_snapshot = baseline;
                 reconciliation.baseline_initialized = true;
             }
-            reconciliation.require_full_scan()?;
         }
+        // The one-shot index may predate notify registration. Observing a file
+        // here proves its presence, not that its current contents were indexed.
+        // Replay a complete pass with ingress live, including on the first
+        // start. The existing authority checks still decide every deletion.
+        reconciliation.require_full_scan()?;
     }
 
     #[cfg(test)]
@@ -2683,6 +2693,7 @@ fn run_ingest_loop<'a>(
     batch_size: usize,
     producer_done: &'a AtomicBool,
     snapshot_collector: &'a SnapshotCollector,
+    watching_enabled: &'a dyn Fn() -> bool,
 ) -> WatchIngestFuture<'a, ()> {
     Box::pin(async move {
         const IDLE_POLL: Duration = Duration::from_millis(10);
@@ -2718,7 +2729,7 @@ fn run_ingest_loop<'a>(
                 )
                 .await;
             }
-            if lock_or_recover(reconciliation).required {
+            if watching_enabled() && lock_or_recover(reconciliation).required {
                 match run_authoritative_reconciliation(
                     cx,
                     roots,
@@ -2784,6 +2795,13 @@ fn run_ingest_loop<'a>(
                         return Err(error);
                     }
                 }
+            }
+
+            if !watching_enabled() {
+                // Keep startup/retry debt intact while pressure pauses indexing.
+                // Flush requests above still acknowledge already staged work.
+                asupersync::time::sleep(cx.now(), IDLE_POLL).await;
+                continue;
             }
 
             let Some(mut lease) = PendingBatchLease::acquire(ready_batches, reconciliation) else {
@@ -3385,6 +3403,11 @@ fn run_authoritative_reconciliation<'a>(
         drop(reconciliation_state);
         stats.add_reindexed(staged_reindexed);
         stats.add_skipped(staged_skipped);
+        info!(
+            reindexed = staged_reindexed,
+            skipped = staged_skipped,
+            "fsfs watch reconciliation completed"
+        );
         Ok(())
     })
 }
@@ -4593,6 +4616,24 @@ mod tests {
         }
     }
 
+    async fn await_startup_reconciliation(cx: &Cx, watcher: &FsWatcher) {
+        for _ in 0..5_000 {
+            let settled = {
+                let state = lock_or_recover(&watcher.reconciliation);
+                state.baseline_initialized && !state.required
+            };
+            if settled {
+                return;
+            }
+            assert!(
+                !watcher.has_terminal_task_outcome(),
+                "startup ingest failed"
+            );
+            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+        }
+        panic!("startup reconciliation did not complete");
+    }
+
     impl WatchIngestPipeline for RecordingPipeline {
         fn apply_batch<'a>(
             &'a self,
@@ -5545,6 +5586,7 @@ mod tests {
                         100,
                         &producer_done,
                         &collect_snapshot_from_roots,
+                        &|| true,
                     )
                     .await
                 })
@@ -5722,6 +5764,7 @@ mod tests {
                         100,
                         &producer_done,
                         &collector,
+                        &|| true,
                     )
                     .await
                 })
@@ -7458,16 +7501,8 @@ mod tests {
                 Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
             ));
             watcher.start(&cx).await.expect("start watcher");
-            for _ in 0..1_000 {
-                if lock_or_recover(&watcher.reconciliation)
-                    .authority
-                    .established()
-                    .is_some()
-                {
-                    break;
-                }
-                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-            }
+            await_startup_reconciliation(&cx, &watcher).await;
+            let startup_ops = pipeline.all_ops().len();
             let (before_snapshot, before_generation) = {
                 let state = lock_or_recover(&watcher.reconciliation);
                 let authority = state.authority.established().expect("startup authority");
@@ -7489,7 +7524,9 @@ mod tests {
                 drop(control);
                 stop
             };
-            *lock_or_recover(&pipeline.stop_after_success) = Some((Arc::clone(&stop), 1));
+            let startup_batches = lock_or_recover(&pipeline.batches).len();
+            *lock_or_recover(&pipeline.stop_after_success) =
+                Some((Arc::clone(&stop), startup_batches + 1));
 
             let collector_probes = Arc::new(AtomicUsize::new(0));
             let _probe = {
@@ -7526,7 +7563,7 @@ mod tests {
 
             assert_eq!(
                 pipeline.all_ops().len(),
-                1,
+                startup_ops + 1,
                 "the sink still applied the event"
             );
             assert_eq!(
@@ -7576,17 +7613,8 @@ mod tests {
                 Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
             ));
             watcher.start(&cx).await.expect("start watcher");
-
-            for _ in 0..1_000 {
-                if lock_or_recover(&watcher.reconciliation)
-                    .authority
-                    .established()
-                    .is_some()
-                {
-                    break;
-                }
-                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-            }
+            await_startup_reconciliation(&cx, &watcher).await;
+            let startup_ops = pipeline.all_ops().len();
             let (before_snapshot, before_generation) = {
                 let state = lock_or_recover(&watcher.reconciliation);
                 let authority = state.authority.established().expect("startup authority");
@@ -7702,7 +7730,11 @@ mod tests {
                 .await
                 .expect("post-apply stop is an ordinary typed shutdown");
 
-            assert_eq!(pipeline.all_ops().len(), 1, "the event crossed apply once");
+            assert_eq!(
+                pipeline.all_ops().len(),
+                startup_ops + 1,
+                "the event crossed apply once"
+            );
             let state = lock_or_recover(&watcher.reconciliation);
             let authority = state.authority.established().expect("retained authority");
             assert_eq!(authority.snapshot, before_snapshot);
@@ -7748,16 +7780,7 @@ mod tests {
                 Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
             ));
             watcher.start(&cx).await.expect("start watcher");
-            for _ in 0..1_000 {
-                if lock_or_recover(&watcher.reconciliation)
-                    .authority
-                    .established()
-                    .is_some()
-                {
-                    break;
-                }
-                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-            }
+            await_startup_reconciliation(&cx, &watcher).await;
             let (before_snapshot, before_generation) = {
                 let state = lock_or_recover(&watcher.reconciliation);
                 let authority = state.authority.established().expect("startup authority");
@@ -7889,6 +7912,7 @@ mod tests {
                         100,
                         &producer_done_for_task,
                         &collect_snapshot_from_roots,
+                        &|| true,
                     )
                     .await
                 })
@@ -7979,6 +8003,7 @@ mod tests {
                         100,
                         &producer_done_for_task,
                         &collect_snapshot_from_roots,
+                        &|| true,
                     )
                     .await
                 })
@@ -8063,6 +8088,7 @@ mod tests {
                         100,
                         &producer_done_for_task,
                         &collect_snapshot_from_roots,
+                        &|| true,
                     )
                     .await
                 })
@@ -8270,6 +8296,7 @@ mod tests {
                         100,
                         &producer_done,
                         &snapshot_collector,
+                        &|| true,
                     )
                     .await
                 })
@@ -8580,6 +8607,7 @@ mod tests {
                 pipeline.clone(),
             );
             watcher.start(&cx).await.expect("start watcher");
+            await_startup_reconciliation(&cx, &watcher).await;
             let batch = vec![WatchEvent::deleted(temp.path().join("cancel.rs"), 400)];
             lock_or_recover(&watcher.ready_batches).push_back(batch.clone());
 
@@ -8791,11 +8819,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn initial_start_reconciles_files_created_before_notify_registration() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("startup-handoff");
+            fs::create_dir_all(&root).expect("create watched root");
+            let missed = root.join("created-before-start.rs");
+            fs::write(&missed, "fn reconcile_the_handoff() {}\n")
+                .expect("write file before notify can observe it");
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root],
+                DiscoveryConfig::default(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
+            watcher.start(&cx).await.expect("start watcher");
+
+            let missed_key = normalize_file_key(&missed);
+            let mut applied = false;
+            for _ in 0..5_000 {
+                applied = pipeline.all_ops().iter().any(|op| {
+                    matches!(op, WatchIngestOp::Upsert { file_key, .. } if file_key == &missed_key)
+                });
+                if applied || watcher.has_terminal_task_outcome() {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            watcher.stop_checked(&cx).await.expect("stop watcher");
+            assert!(
+                applied,
+                "startup observation must not silently certify unindexed content"
+            );
+        });
+    }
+
+    #[test]
+    fn startup_reconciliation_stays_owed_while_pressure_pauses_watching() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            fs::write(temp.path().join("paused.rs"), "fn paused() {}\n").unwrap();
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![temp.path().to_path_buf()],
+                DiscoveryConfig::default(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
+            watcher.apply_pressure_state(PressureState::Emergency);
+            watcher.start(&cx).await.expect("start paused watcher");
+            for _ in 0..5_000 {
+                if lock_or_recover(&watcher.reconciliation).baseline_initialized {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            asupersync::time::sleep(cx.now(), Duration::from_millis(50)).await;
+            assert!(
+                pipeline.all_ops().is_empty(),
+                "paused startup performed ingestion"
+            );
+            assert!(lock_or_recover(&watcher.reconciliation).required);
+            watcher.apply_pressure_state(PressureState::Normal);
+            await_startup_reconciliation(&cx, &watcher).await;
+            watcher
+                .stop_checked(&cx)
+                .await
+                .expect("stop resumed watcher");
+            assert_eq!(
+                pipeline.all_ops().len(),
+                1,
+                "resume must ingest the owed file"
+            );
+        });
+    }
+
     /// The replacement producer is held behind a test-only handshake, so the
     /// only mechanism capable of observing `missed` is the supervisor's
-    /// reconciliation debt. This uses the public watcher lifecycle; no event is
-    /// inserted into the ready queue and no replacement notify callback exists
-    /// until after the recovery assertion.
+    /// reconciliation debt. No replacement notify callback exists until recovery.
     #[test]
     fn public_producer_outage_recovers_a_file_created_before_restart() {
         run_on_runtime_task(|cx| async move {
