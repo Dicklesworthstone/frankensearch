@@ -69,7 +69,7 @@ pub const MODEL_CONFORMANCE_TEXTS_V1: [&str; 4] = [
     "naive cafe Tokyo",
 ];
 
-/// Pinned adapter-level token budget passed to `FastEmbed` 5.17.2.
+/// Pinned adapter-level token budget passed to `FastEmbed` 6.0.0.
 #[cfg(feature = "fastembed")]
 pub(crate) const FASTEMBED_MAX_LENGTH_V1: usize = 512;
 /// Exact truncation and padding policy imposed by the pinned `FastEmbed` adapter.
@@ -289,12 +289,11 @@ impl ModelArtifactManifestV1 {
         let execution = ModelExecutionContractV1 {
             backend: "fastembed-onnx".to_owned(),
             implementation_revision: format!(
-                "frankensearch-embed-{}+fastembed-5.17.2",
+                "frankensearch-embed-{}+fastembed-6.0.0",
                 env!("CARGO_PKG_VERSION")
             ),
-            protocol_revision: "fastembed-5.17.2+ort-2.0.0-rc.12-user-defined-onnx-v1".to_owned(),
-            numeric_profile: "onnxruntime-2.0.0-rc.12-cpu-f32-host-default-intra-threads-v1"
-                .to_owned(),
+            protocol_revision: "fastembed-6.0.0+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
+            numeric_profile: "ort-2.0.0-rc.13-cpu-f32-host-default-intra-threads-v1".to_owned(),
             weights_format: "onnx-opset-pinned-v1".to_owned(),
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
             model_preprocessing: "bert-tokenizer-special-tokens=true;empty-input=zero-vector"
@@ -379,6 +378,30 @@ impl ModelArtifactManifestV1 {
             "sentence-transformers-huggingface",
             execution,
         )
+    }
+
+    /// Explicit full-F32 native `MiniLM` producer. Its artifact bytes, tokenizer
+    /// and pooling match the int8 model, but its numeric execution and output
+    /// certificate identify a separate producer. Existing int8 indexes cannot
+    /// silently accept these vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the pinned artifact or execution metadata is invalid.
+    pub fn minilm_native_frankentorch_f32() -> SearchResult<Self> {
+        let mut manifest = Self::minilm_native_frankentorch()?;
+        "frankentorch-native-minilm-f32".clone_into(&mut manifest.execution.backend);
+        "frankensearch-rerank-native-embedder-f32-v1+frankentorch-0.1.0"
+            .clone_into(&mut manifest.execution.implementation_revision);
+        "f32-weights-f32-linear-f32-accumulate-v1"
+            .clone_into(&mut manifest.execution.numeric_profile);
+        "safetensors-f32-runtime-f32-linear-v1".clone_into(&mut manifest.execution.weights_format);
+        // GOLDEN-CHANGE bd-2ba5: new explicit precision profile, measured from
+        // the same four conformance texts. The int8 certificate above is retained.
+        "aa230ec70ebb5c43bb0e08751c57e6f5bb6ccf9b314c292daf1bd979370fc2f1"
+            .clone_into(&mut manifest.execution.golden_vectors.vectors_sha256);
+        manifest.validate()?;
+        Ok(manifest)
     }
 
     /// Frozen pure-Rust Frankentorch contract for the opt-in multilingual
@@ -1115,11 +1138,11 @@ fn fastembed_execution_contract(
     Ok(ModelExecutionContractV1 {
         backend: "fastembed-onnx".to_owned(),
         implementation_revision: format!(
-            "frankensearch-embed-{}+fastembed-5.17.2:{model_id}",
+            "frankensearch-embed-{}+fastembed-6.0.0:{model_id}",
             env!("CARGO_PKG_VERSION")
         ),
-        protocol_revision: "fastembed-5.17.2+ort-2.0.0-rc.12-user-defined-onnx-v1".to_owned(),
-        numeric_profile: "onnxruntime-2.0.0-rc.12-cpu-f32-host-default-intra-threads-v1".to_owned(),
+        protocol_revision: "fastembed-6.0.0+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
+        numeric_profile: "ort-2.0.0-rc.13-cpu-f32-host-default-intra-threads-v1".to_owned(),
         weights_format: "onnx-opset-pinned-v1".to_owned(),
         tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
         model_preprocessing: "model-tokenizer-special-tokens=true;empty-input=zero-vector"
@@ -4029,6 +4052,7 @@ mod tests {
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
             ModelArtifactManifestV1::minilm_native_frankentorch().unwrap(),
+            ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap(),
             ModelArtifactManifestV1::multilingual_minilm_native_frankentorch().unwrap(),
             ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
             ModelArtifactManifestV1::nomic_fastembed().unwrap(),
@@ -4062,10 +4086,15 @@ mod tests {
 
     #[test]
     fn registered_manifest_fingerprints_are_exact_fixtures() {
+        // GOLDEN-CHANGE bd-2ba5: register the explicit F32 producer and correct
+        // FastEmbed/ORT binding versions to the locked dependencies. Existing
+        // output-vector certificates are unchanged; only their manifest metadata
+        // fingerprints change. Exact ONNX output conformance remains a separate test.
         let observed = [
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
             ModelArtifactManifestV1::minilm_native_frankentorch().unwrap(),
+            ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap(),
             ModelArtifactManifestV1::multilingual_minilm_native_frankentorch().unwrap(),
             ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
             ModelArtifactManifestV1::nomic_fastembed().unwrap(),
@@ -4081,11 +4110,15 @@ mod tests {
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "bad3145f51094f257ed565fa02a6c4c2de9e9294b2e154d6c6086693ac42cfd2".to_owned(),
+                "f4422df6fdff409a5eb916314ea8e6a2a0b88377b1e4e3cad80b77c3d19acf08".to_owned(),
             ),
             (
                 "frankentorch-native-minilm".to_owned(),
                 "726d6dde1d25946d1c7287a26f92518c158ee6d009b8a76f52748275f063e72c".to_owned(),
+            ),
+            (
+                "frankentorch-native-minilm-f32".to_owned(),
+                "6fc7b062661b115c8f82f323f9db5802cab96e93a80d3adfe6c5a5c008c1af87".to_owned(),
             ),
             (
                 "frankentorch-native-multilingual-minilm".to_owned(),
@@ -4093,11 +4126,11 @@ mod tests {
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "ea886582d1908a21790748d3ef9cabfa4992a30889b1736f21dae7b79b3d0463".to_owned(),
+                "9179ab9a767f0c7a15b42e3bb427cea50aeb0e5f07c216a839cf8c6e46c7a099".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "b08612d52b1dea243aa4c9abcd65e156fc411813220a2280d1bf4ac45ef7027e".to_owned(),
+                "79882126878654776eec8c64961f6dada37ddf11ac73c4a07cd48d78598f9020".to_owned(),
             ),
         ];
         assert_eq!(observed, expected);

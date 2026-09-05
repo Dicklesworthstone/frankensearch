@@ -1738,6 +1738,148 @@ mod semantic {
         Embedder, HashAlgorithm, HashEmbedder, InMemoryVectorIndex, NativeEmbedder, SyncEmbed,
     };
 
+    /// Original bd-2ba5 admission: compare both real producers on the whole book
+    /// and its fixed queries, without changing their frozen execution contracts.
+    /// An opt-in failure is a migration blocker, not permission to loosen parity.
+    #[cfg(feature = "fastembed")]
+    #[test]
+    #[ignore = "requires native and ONNX MiniLM fixtures; original bd-2ba5 migration admission"]
+    fn native_minilm_matches_live_onnx_accuracy_and_ranking() {
+        compare_native_minilm_to_onnx(frankensearch::NativeEmbeddingModel::AllMiniLmL6V2);
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    #[ignore = "requires native and ONNX MiniLM fixtures; full-F32 bd-2ba5 migration admission"]
+    fn native_f32_minilm_matches_live_onnx_accuracy_and_ranking() {
+        compare_native_minilm_to_onnx(frankensearch::NativeEmbeddingModel::AllMiniLmL6V2F32);
+    }
+
+    #[cfg(feature = "fastembed")]
+    fn compare_native_minilm_to_onnx(profile: frankensearch::NativeEmbeddingModel) {
+        use frankensearch::FastEmbedEmbedder;
+
+        let native_dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
+        let onnx_dir = std::env::var("FASTEMBED_MINILM_FIXTURE_DIR")
+            .expect("ONNX fixture required; never substitute the native producer");
+        let native =
+            NativeEmbedder::load_model(native_dir, profile).expect("load verified native MiniLM");
+        let onnx = FastEmbedEmbedder::load(onnx_dir).expect("load verified ONNX MiniLM");
+        assert_ne!(native.identity().unwrap(), onnx.identity().unwrap());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .expect("build comparison runtime");
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let passages = corpus();
+        let spec: serde_json::Value = serde_json::from_str(SEMANTIC_QUERIES).unwrap();
+        let queries = spec["queries"].as_array().unwrap();
+        assert_eq!(passages.len(), 339);
+        assert_eq!(queries.len(), 16);
+        let mut native_vectors = Vec::new();
+        let mut onnx_vectors = Vec::new();
+        let mut below_threshold = 0;
+        let mut minimum_cosine = 1.0_f64;
+        for (row, text) in passages
+            .iter()
+            .map(|p| p.text.as_str())
+            .chain(queries.iter().map(|q| q["query"].as_str().unwrap()))
+            .enumerate()
+        {
+            let a = native.embed_sync(text).expect("native inference");
+            let b = runtime
+                .block_on(onnx.embed(&cx, text))
+                .expect("ONNX inference");
+            assert_eq!(a.len(), 384);
+            assert_eq!(b.len(), 384);
+            let cosine = paired_vector_cosine(&a, &b);
+            minimum_cosine = minimum_cosine.min(cosine);
+            if cosine <= 0.999 {
+                below_threshold += 1;
+                eprintln!("[native-onnx] below_threshold row={row} cosine={cosine:.9}");
+            }
+            if row % 32 == 0 {
+                eprintln!("[native-onnx] progress row={row} cosine={cosine:.9}");
+            }
+            native_vectors.push(a);
+            onnx_vectors.push(b);
+        }
+        let native_ndcg = chapter_ndcg(&passages, queries, native_vectors);
+        let onnx_ndcg = chapter_ndcg(&passages, queries, onnx_vectors);
+        eprintln!(
+            "[native-onnx] profile={profile:?} compared=355 minimum_cosine={minimum_cosine:.9} below_threshold={below_threshold} native_ndcg10={native_ndcg:.9} onnx_ndcg10={onnx_ndcg:.9}"
+        );
+        assert_eq!(
+            below_threshold, 0,
+            "original cosine > 0.999 admission failed"
+        );
+        assert!(
+            native_ndcg >= onnx_ndcg,
+            "original nDCG@10 admission failed"
+        );
+    }
+
+    #[cfg(feature = "fastembed")]
+    fn paired_vector_cosine(left: &[f32], right: &[f32]) -> f64 {
+        let mut dot = 0.0;
+        let mut left_norm = 0.0;
+        let mut right_norm = 0.0;
+        for (&a, &b) in left.iter().zip(right) {
+            assert!(a.is_finite() && b.is_finite());
+            let a = f64::from(a);
+            let b = f64::from(b);
+            dot += a * b;
+            left_norm += a * a;
+            right_norm += b * b;
+        }
+        assert!(left_norm > 0.0 && right_norm > 0.0);
+        dot / (left_norm * right_norm).sqrt()
+    }
+
+    #[cfg(feature = "fastembed")]
+    fn chapter_ndcg(
+        passages: &[Passage],
+        queries: &[serde_json::Value],
+        mut vectors: Vec<Vec<f32>>,
+    ) -> f64 {
+        let query_vectors = vectors.split_off(passages.len());
+        assert_eq!(query_vectors.len(), queries.len());
+        let index = InMemoryVectorIndex::from_vectors(
+            passages.iter().map(|p| p.id.clone()).collect(),
+            vectors,
+            384,
+        )
+        .expect("build one producer's own corpus index");
+        let discount =
+            |rank: usize| 1.0 / f64::from(u32::try_from(rank + 2).expect("bounded rank")).log2();
+        let mut total = 0.0;
+        for (query, vector) in queries.iter().zip(query_vectors) {
+            let relevant = |p: &&Passage| {
+                query["expect_chapters"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|chapter| chapter.as_u64() == Some(u64::from(p.chapter)))
+            };
+            let ideal: f64 = (0..passages.iter().filter(relevant).count().min(10))
+                .map(discount)
+                .sum();
+            assert!(ideal > 0.0);
+            let hits = index
+                .search_top_k(&vector, 10, None)
+                .expect("search own space");
+            let mut dcg = 0.0;
+            for (rank, hit) in hits.iter().enumerate() {
+                let passage = passages.iter().find(|p| p.id == hit.doc_id).unwrap();
+                if relevant(&passage) {
+                    dcg += discount(rank);
+                }
+            }
+            total += dcg / ideal;
+        }
+        total / f64::from(u32::try_from(queries.len()).expect("bounded query count"))
+    }
+
     /// Embed every passage and build a brute-force vector index over it.
     ///
     /// Takes the embedding step as a closure rather than a trait bound: the

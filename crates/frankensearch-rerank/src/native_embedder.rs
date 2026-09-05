@@ -11,6 +11,9 @@
 //! NEON (aarch64 SDOT / NR=4 packing) or x86 SIMD at runtime.
 //!
 //! Feature-gated behind `native`.
+//! `NativeEmbeddingModel::AllMiniLmL6V2F32` explicitly retains F32 Linear weights
+//! for higher numerical fidelity. It has its own producer identity; it is not
+//! substituted for the default int8 producer or an existing index's producer.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -23,7 +26,8 @@ use frankensearch_core::traits::{ModelCategory, SyncEmbed};
 use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
 
 use crate::native::{
-    DEFAULT_MAX_LENGTH, Model, SAFETENSORS_FALLBACK, TOKENIZER_JSON, build_model, parse_weights,
+    DEFAULT_MAX_LENGTH, LinearPrecision, Model, SAFETENSORS_FALLBACK, TOKENIZER_JSON, build_model,
+    parse_weights,
 };
 
 const DEFAULT_MODEL_NAME: &str = "all-minilm-l6-v2";
@@ -42,8 +46,10 @@ const MAX_BATCH_TOKENS: usize = 2048;
 /// Manifest-registered pure-Rust sentence-embedding models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeEmbeddingModel {
-    /// English-centric `all-MiniLM-L6-v2` baseline.
+    /// English-centric `all-MiniLM-L6-v2` baseline with int8 linears.
     AllMiniLmL6V2,
+    /// Explicit full-F32 English `MiniLM` producer; requires its own index identity.
+    AllMiniLmL6V2F32,
     /// Opt-in XLM-R/SentencePiece multilingual `MiniLM` L12 model.
     ParaphraseMultilingualMiniLmL12V2,
 }
@@ -51,7 +57,7 @@ pub enum NativeEmbeddingModel {
 impl NativeEmbeddingModel {
     const fn model_name(self) -> &'static str {
         match self {
-            Self::AllMiniLmL6V2 => DEFAULT_MODEL_NAME,
+            Self::AllMiniLmL6V2 | Self::AllMiniLmL6V2F32 => DEFAULT_MODEL_NAME,
             Self::ParaphraseMultilingualMiniLmL12V2 => MULTILINGUAL_MODEL_NAME,
         }
     }
@@ -59,20 +65,29 @@ impl NativeEmbeddingModel {
     const fn embedder_id(self) -> &'static str {
         match self {
             Self::AllMiniLmL6V2 => DEFAULT_EMBEDDER_ID,
+            Self::AllMiniLmL6V2F32 => "minilm-384-native-f32",
             Self::ParaphraseMultilingualMiniLmL12V2 => MULTILINGUAL_EMBEDDER_ID,
         }
     }
 
     const fn encoder_layers(self) -> usize {
         match self {
-            Self::AllMiniLmL6V2 => 6,
+            Self::AllMiniLmL6V2 | Self::AllMiniLmL6V2F32 => 6,
             Self::ParaphraseMultilingualMiniLmL12V2 => 12,
+        }
+    }
+
+    const fn linear_precision(self) -> LinearPrecision {
+        match self {
+            Self::AllMiniLmL6V2F32 => LinearPrecision::F32,
+            Self::AllMiniLmL6V2 | Self::ParaphraseMultilingualMiniLmL12V2 => LinearPrecision::Int8,
         }
     }
 
     fn manifest(self) -> SearchResult<ModelArtifactManifestV1> {
         match self {
             Self::AllMiniLmL6V2 => ModelArtifactManifestV1::minilm_native_frankentorch(),
+            Self::AllMiniLmL6V2F32 => ModelArtifactManifestV1::minilm_native_frankentorch_f32(),
             Self::ParaphraseMultilingualMiniLmL12V2 => {
                 ModelArtifactManifestV1::multilingual_minilm_native_frankentorch()
             }
@@ -215,7 +230,7 @@ impl NativeEmbedder {
             });
         }
 
-        let shared = parse_weights(&weights_path)?;
+        let shared = parse_weights(&weights_path, profile.linear_precision())?;
         let model = build_model(shared)?;
         if model.encoder_layers() != profile.encoder_layers() {
             return Err(SearchError::ModelLoadFailed {
@@ -236,7 +251,8 @@ impl NativeEmbedder {
             max_length = DEFAULT_MAX_LENGTH,
             manifest = %verified.frozen().fingerprint,
             identity = %identity.fingerprint(),
-            "native frankentorch MiniLM embedder loaded (int8 linear, mean-pool + L2)"
+            precision = ?profile.linear_precision(),
+            "native frankentorch MiniLM embedder loaded (mean-pool + L2)"
         );
 
         Ok(Self {
@@ -402,6 +418,79 @@ mod tests {
             baseline.verify_exact_producer_with(&multilingual).is_err(),
             "same dimensionality must not admit vectors from a different model space"
         );
+    }
+
+    #[test]
+    fn f32_identity_cannot_substitute_for_int8_or_onnx() {
+        let f32 = NativeEmbeddingModel::AllMiniLmL6V2F32
+            .manifest()
+            .unwrap()
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        for manifest in [
+            NativeEmbeddingModel::AllMiniLmL6V2.manifest().unwrap(),
+            ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+        ] {
+            let other = manifest
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            assert_eq!(f32.space.dimension, other.space.dimension);
+            assert!(
+                f32.verify_exact_producer_with(&other).is_err(),
+                "same dimensions and close output must not admit a foreign producer"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires verified native MiniLM assets via MINILM_FIXTURE_DIR"]
+    fn f32_fixture_proves_certificate_batching_and_repeatability() {
+        use frankensearch_core::generation::GoldenVectorCertificateV1;
+        use frankensearch_embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        let dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
+        let profile = NativeEmbeddingModel::AllMiniLmL6V2F32;
+        let manifest = profile.manifest().unwrap();
+        let embedder =
+            NativeEmbedder::load_model(&dir, profile).expect("load verified F32 producer");
+        assert_eq!(embedder.id(), "minilm-384-native-f32");
+        assert_eq!(
+            embedder.identity().unwrap(),
+            &manifest
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap()
+        );
+        let vectors = embedder
+            .embed_batch_sync(&MODEL_CONFORMANCE_TEXTS_V1)
+            .unwrap();
+        assert_eq!(
+            GoldenVectorCertificateV1::from_exact_f32(&MODEL_CONFORMANCE_TEXTS_V1, &vectors)
+                .unwrap(),
+            manifest.execution.golden_vectors,
+            "F32 producer output bits drifted"
+        );
+        let long = "Search finds related documents across the library. ".repeat(100);
+        let texts = ["", "hello world", "identifier fsvi_v2", long.as_str()];
+        assert_eq!(embedder.tokenize(&long).unwrap().len(), DEFAULT_MAX_LENGTH);
+        let batch = embedder.embed_batch_sync(&texts).unwrap();
+        let repeated = embedder.embed_batch_sync(&texts).unwrap();
+        assert_eq!(
+            batch, repeated,
+            "repeated F32 batches must be deterministic"
+        );
+        assert_eq!(batch.len(), texts.len());
+        assert!(embedder.embed_batch_sync(&[]).unwrap().is_empty());
+        for (text, vector) in texts.iter().zip(&batch) {
+            let single = embedder.embed_sync(text).unwrap();
+            assert_eq!(vector.len(), DIM);
+            let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-5);
+            for (&a, b) in vector.iter().zip(single) {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "single vs batch F32 drift: {a} vs {b}"
+                );
+            }
+        }
     }
 
     /// Smoke test against a real `all-MiniLM-L6-v2` directory. Ignored by default

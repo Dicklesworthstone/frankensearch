@@ -499,6 +499,127 @@ struct QLinear {
     packed: bool,
 }
 
+/// Precision is selected at load time and belongs to the embedding producer's
+/// identity. Reranking and the original native embedder keep their int8 path.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LinearPrecision {
+    Int8,
+    F32,
+}
+
+#[derive(Clone)]
+enum LinearWeights {
+    Int8(QLinear),
+    F32 {
+        /// Transposed once at load: contiguous `[in, out]` for the raw BMM kernel.
+        transposed: Arc<Vec<f32>>,
+        bias: Arc<Vec<f32>>,
+        out: usize,
+        in_: usize,
+    },
+}
+
+impl LinearWeights {
+    fn from_f32(
+        values: &[f32],
+        bias: Vec<f32>,
+        out: usize,
+        in_: usize,
+        precision: LinearPrecision,
+    ) -> SearchResult<Self> {
+        if out == 0 || in_ == 0 || in_.checked_mul(out) != Some(values.len()) || bias.len() != out {
+            return Err(rerank_err(
+                "linear.load",
+                "invalid weight or bias dimensions",
+            ));
+        }
+        match precision {
+            LinearPrecision::Int8 => {
+                let (w_i8, w_scales) = quantize_per_output_channel_i8(values, out, in_);
+                let packed = cfg!(target_arch = "aarch64") && out % 4 == 0 && in_ % 16 == 0;
+                let w_i8 = if packed {
+                    ft_api::pack_int8_weights_nr4(&w_i8, out, in_)
+                } else {
+                    w_i8
+                };
+                Ok(Self::Int8(QLinear {
+                    w_i8: Arc::new(w_i8),
+                    w_scales: Arc::new(w_scales),
+                    bias: Arc::new(bias),
+                    out,
+                    in_,
+                    packed,
+                }))
+            }
+            LinearPrecision::F32 => {
+                let mut transposed = vec![0.0; values.len()];
+                for row in 0..out {
+                    for col in 0..in_ {
+                        transposed[col * out + row] = values[row * in_ + col];
+                    }
+                }
+                Ok(Self::F32 {
+                    transposed: Arc::new(transposed),
+                    bias: Arc::new(bias),
+                    out,
+                    in_,
+                })
+            }
+        }
+    }
+
+    fn forward(&self, x: &[f32], m: usize) -> SearchResult<Vec<f32>> {
+        match self {
+            Self::Int8(q) => {
+                if m.checked_mul(q.in_) != Some(x.len()) {
+                    return Err(rerank_err("linear.int8", "input dimensions disagree"));
+                }
+                Ok(if q.packed {
+                    ft_api::linear_int8_dynamic_prepacked_f32(
+                        x,
+                        m,
+                        q.in_,
+                        &q.w_i8,
+                        &q.w_scales,
+                        q.out,
+                        Some(&q.bias),
+                    )
+                } else {
+                    ft_api::linear_int8_dynamic_f32(
+                        x,
+                        m,
+                        q.in_,
+                        &q.w_i8,
+                        &q.w_scales,
+                        q.out,
+                        Some(&q.bias),
+                    )
+                })
+            }
+            Self::F32 {
+                transposed,
+                bias,
+                out,
+                in_,
+            } => {
+                if m.checked_mul(*in_) != Some(x.len()) {
+                    return Err(rerank_err("linear.f32", "input dimensions disagree"));
+                }
+                let input = TensorMeta::from_shape(vec![1, m, *in_], DType::F32, Device::Cpu);
+                let weights = TensorMeta::from_shape(vec![1, *in_, *out], DType::F32, Device::Cpu);
+                let mut y = ft_api::bmm_tensor_contiguous_f32(x, transposed, &input, &weights)
+                    .map_err(|e| rerank_err("linear.f32", e))?;
+                for row in y.chunks_exact_mut(*out) {
+                    for (value, offset) in row.iter_mut().zip(bias.iter()) {
+                        *value += offset;
+                    }
+                }
+                Ok(y)
+            }
+        }
+    }
+}
+
 /// Owns the frankentorch session and the loaded weight tensors. Mutated during the
 /// forward pass, so it lives behind a `Mutex` in `NativeReranker`.
 pub(crate) struct Model {
@@ -506,9 +627,9 @@ pub(crate) struct Model {
     /// f32 leaf nodes for the non-Linear parameters (`word/position/token_type`
     /// embeddings and every `LayerNorm` weight/bias) — these stay in f32.
     w: HashMap<String, TensorNodeId>,
-    /// int8-quantized Linear weights (attention QKV/output, FFN, pooler,
+    /// Precision-selected Linear weights (attention QKV/output, FFN, pooler,
     /// classifier), keyed by the layer prefix (the weight name minus `.weight`).
-    qw: HashMap<String, QLinear>,
+    qw: HashMap<String, LinearWeights>,
     /// Raw f32 values for the `LayerNorm` weight/bias parameters (same data as the
     /// `w` leaves, shared via `Arc`), so the tape-free fused-layer path can call the
     /// `add_layer_norm` kernel directly without round-tripping through the session.
@@ -536,29 +657,14 @@ impl Model {
             .ok_or_else(|| rerank_err("weights", format!("missing weight tensor {name}")))
     }
 
-    /// `y = layer(x)` via the int8 kernel directly on raw f32 buffers (no tape
-    /// node) — the tape-free counterpart of [`Self::linear`]. Output width is the
-    /// `QLinear`'s `out`; input width is its `in_`.
+    /// `y = layer(x)` directly on raw f32 buffers (no tape node), using the
+    /// precision selected by the producer at load time.
     fn linear_raw(&self, x: &[f32], m: usize, prefix: &str) -> SearchResult<Vec<f32>> {
         let q = self
             .qw
             .get(prefix)
             .ok_or_else(|| rerank_err("linear_raw", format!("missing linear weights {prefix}")))?;
-        debug_assert_eq!(x.len(), m * q.in_);
-        let y = if q.packed {
-            ft_api::linear_int8_dynamic_prepacked_f32(
-                x,
-                m,
-                q.in_,
-                &q.w_i8,
-                &q.w_scales,
-                q.out,
-                Some(&q.bias),
-            )
-        } else {
-            ft_api::linear_int8_dynamic_f32(x, m, q.in_, &q.w_i8, &q.w_scales, q.out, Some(&q.bias))
-        };
-        Ok(y)
+        q.forward(x, m)
     }
 
     /// `layer_norm(a + b)` on raw f32 buffers (no tape node) — the tape-free
@@ -583,10 +689,9 @@ impl Model {
         ))
     }
 
-    /// One encoder layer entirely on raw f32 buffers — no tape nodes, no session
-    /// round-trips. Calls the SAME optimized kernels the tape path uses (int8 GEMM,
-    /// fused attention, add+LN, vectorized GELU), so the result is bit-identical,
-    /// but the per-op tape-node creation / leaf allocation / truncation are gone.
+    /// One encoder layer entirely on raw f32 buffers — no tape nodes or session
+    /// round-trips. The loaded precision selects int8 or F32 linears; attention,
+    /// add+LN and vectorized GELU use the same kernels as the tape path.
     /// Self-attention is per document (each `[lenₙ, H]` slice) via
     /// [`fused_attention`], so this path is for chunks where every doc is short. The
     /// `scratch` is reused across documents and layers to avoid per-call allocation.
@@ -682,15 +787,30 @@ impl Model {
         self.add_ln_raw(&emb_cls, &ffn, n_docs, &format!("{p}.output.LayerNorm"))
     }
 
-    /// y = x @ Wᵀ + b via the int8 dynamic-quant kernel (weight stored row-major
-    /// [out, in], `PyTorch` convention). The f32 activation `x` is dynamically
-    /// quantized per-row; the weight is statically int8-quantized per-output-channel;
-    /// the result is dequantized back to an f32 node.
+    /// `y = x @ Wᵀ + b` for a matrix node, using the loaded linear precision.
+    /// Reranking retains dynamic int8 activation quantization and static int8
+    /// weight quantization. Either path returns a detached f32 node.
     fn linear(&mut self, x: TensorNodeId, prefix: &str) -> SearchResult<TensorNodeId> {
         let q = self
             .qw
             .get(prefix)
-            .ok_or_else(|| rerank_err("linear", format!("missing int8 linear weights {prefix}")))?;
+            .ok_or_else(|| rerank_err("linear", format!("missing linear weights {prefix}")))?;
+        let q = match q {
+            LinearWeights::Int8(q) => q,
+            LinearWeights::F32 { out, in_, .. } => {
+                let values = self
+                    .s
+                    .tensor_values_f32_borrowed(x)
+                    .map_err(|e| rerank_err("linear.f32.input", e))?;
+                let rows = values.len() / in_;
+                let shape = vec![rows, *out];
+                let result = q.forward(values, rows)?;
+                return self
+                    .s
+                    .tensor_variable_f32(result, shape, false)
+                    .map_err(|e| rerank_err("linear.f32.output", e));
+            }
+        };
         // Clone the Arcs + copy the dims so the `&self.qw` borrow ends before the
         // `&mut self.s` borrow below.
         let w_i8 = Arc::clone(&q.w_i8);
@@ -1323,7 +1443,7 @@ impl NativeReranker {
         // are reranked sequentially; each forward parallelizes internally across
         // cores. No pool is needed (and one session keeps the f32 embedding table
         // resident only once, ~47 MB instead of per-slot copies).
-        let shared = parse_weights(&weights_path)?;
+        let shared = parse_weights(&weights_path, LinearPrecision::Int8)?;
         if shared.encoder_layers != RERANKER_LAYERS {
             return Err(SearchError::ModelLoadFailed {
                 path: weights_path,
@@ -1357,26 +1477,29 @@ impl NativeReranker {
     }
 }
 
-/// A weight tensor is a Linear weight (to be int8-quantized) iff it is a `.weight`
+/// A weight tensor is a Linear weight iff it is a `.weight`
 /// that is neither a `LayerNorm` gain nor an embedding table.
 fn is_linear_weight(name: &str) -> bool {
     name.ends_with(".weight") && !name.contains("LayerNorm") && !name.contains("embeddings")
 }
 
-/// Parsed weight data: int8 Linear weights keyed by layer prefix, plus the f32
+/// Parsed weight data: precision-selected Linear weights keyed by layer prefix, plus the f32
 /// `embedding/LayerNorm` parameter values. [`build_model`] consumes this staging
 /// representation so large embedding tables move into the session without a
 /// second resident copy.
 pub(crate) struct SharedWeights {
-    qw: HashMap<String, QLinear>,
+    qw: HashMap<String, LinearWeights>,
     f32_params: HashMap<String, (Arc<Vec<f32>>, Vec<usize>)>,
     encoder_layers: usize,
 }
 
-/// Parse a safetensors file: int8-quantize the Linear weights (per output channel)
-/// and keep the embeddings + `LayerNorm` parameters as f32. Non-F32 tensors (e.g. the
+/// Parse a safetensors file: retain or quantize the Linear weights according to
+/// the explicit precision, and keep embeddings + `LayerNorm` as f32. Non-F32 tensors (e.g. the
 /// I64 `position_ids` buffer) are skipped — those indices are regenerated at forward.
-pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
+pub(crate) fn parse_weights(
+    path: &Path,
+    precision: LinearPrecision,
+) -> SearchResult<SharedWeights> {
     let bytes = fs::read(path).map_err(|e| SearchError::ModelLoadFailed {
         path: path.to_path_buf(),
         source: format!("read safetensors: {e}").into(),
@@ -1537,9 +1660,9 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
     // Second pass, part one: fuse each layer's Q/K/V projections while the raw
     // tensors are still present. Missing or malformed projections are a hard
     // topology failure: every attested BERT encoder layer must be executable.
-    let mut qw: HashMap<String, QLinear> = HashMap::new();
+    let mut qw: HashMap<String, LinearWeights> = HashMap::new();
     // Fuse each layer's Q/K/V projections into one `[3H, H]` linear
-    // (key `…attention.self.qkv`). The forward then quantizes `emb` once and runs a
+    // (key `…attention.self.qkv`). In int8 mode the forward quantizes `emb` once and runs a
     // single int8 GEMM instead of three — cutting the per-call quant / rayon-launch
     // / dequant / tape-node overhead that is a real fraction of the short-sequence
     // forward (the SDOT math itself is at its M4 throughput ceiling). The stacked
@@ -1573,27 +1696,13 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
             }
         }
         let (out, in_) = (3 * H, H);
-        let (w_i8, w_scales) = quantize_per_output_channel_i8(&stacked, out, in_);
-        let packed = cfg!(target_arch = "aarch64") && out % 4 == 0 && in_ % 16 == 0;
-        let w_i8 = if packed {
-            ft_api::pack_int8_weights_nr4(&w_i8, out, in_)
-        } else {
-            w_i8
-        };
         qw.insert(
             format!("{p}.attention.self.qkv"),
-            QLinear {
-                w_i8: Arc::new(w_i8),
-                w_scales: Arc::new(w_scales),
-                bias: Arc::new(bias),
-                out,
-                in_,
-                packed,
-            },
+            LinearWeights::from_f32(&stacked, bias, out, in_, precision)?,
         );
     }
 
-    // Second pass, part two: remove and quantize each Linear weight together
+    // Second pass, part two: remove and prepare each Linear weight together
     // with its bias. Removing entries lets the large f32 vectors move into their
     // final owners instead of being cloned from the staging map.
     let linear_weight_names = raw
@@ -1621,34 +1730,17 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
         let bias = raw
             .remove(&format!("{prefix}.bias"))
             .map_or_else(|| vec![0.0f32; out], |(bias, _)| bias);
-        let (w_i8, w_scales) = quantize_per_output_channel_i8(&vals, out, in_);
-        // Pre-pack the static weights into the NR=4 SDOT tile layout once at
-        // load (the zero-per-forward weight-packing win) on aarch64, where the
-        // packed micro-kernel runs and `out % 4 == 0 && in % 16 == 0` holds for
-        // every linear except the 1-row classifier. Other targets / the
-        // classifier keep row-major + the portable kernel.
-        let packed = cfg!(target_arch = "aarch64") && out % 4 == 0 && in_ % 16 == 0;
-        let w_i8 = if packed {
-            ft_api::pack_int8_weights_nr4(&w_i8, out, in_)
-        } else {
-            w_i8
-        };
+        // The int8 mode pre-packs eligible aarch64 weights once; the F32 mode
+        // transposes once. Neither layout is rebuilt during inference.
         qw.insert(
             prefix.to_string(),
-            QLinear {
-                w_i8: Arc::new(w_i8),
-                w_scales: Arc::new(w_scales),
-                bias: Arc::new(bias),
-                out,
-                in_,
-                packed,
-            },
+            LinearWeights::from_f32(&vals, bias, out, in_, precision)?,
         );
     }
     if qw.is_empty() {
         return Err(SearchError::ModelLoadFailed {
             path: path.to_path_buf(),
-            source: "no Linear weights found to quantize".into(),
+            source: "no Linear weights found".into(),
         });
     }
 
@@ -1807,6 +1899,34 @@ impl SyncRerank for NativeReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f32_linear_matches_nonsquare_scalar_oracle_and_rejects_bad_storage() {
+        let weights = [1.0, -2.0, 0.5, 3.0, 4.0, -1.0];
+        let bias = [0.25, -0.75];
+        let input = [2.0, 3.0, -1.0, -4.0, 0.5, 2.0];
+        let layer = LinearWeights::from_f32(&weights, bias.to_vec(), 2, 3, LinearPrecision::F32)
+            .expect("load 2x3 weight matrix");
+        let actual = layer.forward(&input, 2).expect("two rows");
+        let mut expected = Vec::new();
+        for row in input.as_chunks::<3>().0 {
+            for (output, &offset) in weights.as_chunks::<3>().0.iter().zip(&bias) {
+                expected.push(row.iter().zip(output).map(|(a, b)| a * b).sum::<f32>() + offset);
+            }
+        }
+        assert_eq!(actual, expected);
+        assert!(layer.forward(&[], 0).expect("empty batch").is_empty());
+        assert!(layer.forward(&input[..5], 2).is_err());
+        assert!(
+            layer.forward(&input, 1).is_err(),
+            "extra rows must not be ignored"
+        );
+        assert!(LinearWeights::from_f32(&weights, vec![0.0], 2, 3, LinearPrecision::F32).is_err());
+        assert!(
+            LinearWeights::from_f32(&weights[..5], bias.to_vec(), 2, 3, LinearPrecision::F32)
+                .is_err()
+        );
+    }
 
     /// Legacy hand-ported fixture location (the macOS port that produced the
     /// parity reference). Kept last in the search order so a registered cache
