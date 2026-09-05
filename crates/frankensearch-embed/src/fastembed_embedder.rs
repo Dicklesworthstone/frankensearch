@@ -236,10 +236,18 @@ impl FastEmbedEmbedder {
         model_dir: impl AsRef<Path>,
         config: OnnxEmbedderConfig,
     ) -> SearchResult<Self> {
+        let frozen_manifest = frozen_manifest_for_config(&config)?;
+        Self::load_from_manifest(model_dir.as_ref(), config, &frozen_manifest)
+    }
+
+    fn load_from_manifest(
+        model_dir: &Path,
+        config: OnnxEmbedderConfig,
+        frozen_manifest: &ModelArtifactManifestV1,
+    ) -> SearchResult<Self> {
         let name = &config.model_id;
         let expected_dim = config.dimension;
-        let frozen_manifest = frozen_manifest_for_config(&config)?;
-        let model_dir = resolve_model_dir(model_dir.as_ref(), name)?;
+        let model_dir = resolve_model_dir(model_dir, name)?;
         let verified = frozen_manifest.verify_dir(&model_dir)?;
         let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
         let model_file =
@@ -279,23 +287,30 @@ impl FastEmbedEmbedder {
                 source: format!("failed to initialize FastEmbed model: {e}").into(),
             })?;
 
-        // Fail fast on model/schema mismatch rather than deferring to first query.
-        let probe = text_embedding
-            .embed(vec!["dimension probe"], None)
-            .map_err(|e| SearchError::ModelLoadFailed {
-                path: model_dir.clone(),
-                source: format!("failed to run embedding probe: {e}").into(),
-            })?;
-        let probe_dim = probe.first().map_or(0, Vec::len);
-        if probe_dim != expected_dim {
-            return Err(SearchError::ModelLoadFailed {
-                path: model_dir,
-                source: format!(
-                    "dimension mismatch for {name}: expected {expected_dim}, got {probe_dim}"
-                )
-                .into(),
-            });
+        // Artifact hashes and output width alone cannot attest the executing
+        // producer: an ORT binary upgrade can change its exact output bits.
+        // Use the same ordered batch and adapter normalization as real calls,
+        // before exposing this session's declared identity to any consumer.
+        let texts = &crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        let mut probe =
+            text_embedding
+                .embed(texts, None)
+                .map_err(|e| SearchError::ModelLoadFailed {
+                    path: model_dir.clone(),
+                    source: format!("failed to run producer conformance probe: {e}").into(),
+                })?;
+        for vector in &mut probe {
+            normalize_in_place(vector);
         }
+        identity
+            .producer
+            .golden_vectors
+            .verify_exact_f32(texts, &probe)
+            .map_err(|_| SearchError::ModelLoadFailed {
+                path: model_dir.clone(),
+                source: "ONNX execution does not match the registered producer certificate; use a qualified runtime build before rebuilding the index (model files already verified)"
+                    .into(),
+            })?;
 
         tracing::info!(
             model = %name,
@@ -917,6 +932,35 @@ mod tests {
         );
     }
 
+    fn assert_historical_certificate_refused(
+        environment_variable: &str,
+        config: OnnxEmbedderConfig,
+        manifest: &ModelArtifactManifestV1,
+        historical_hash: &str,
+    ) {
+        let dir = std::env::var(environment_variable).expect("verified fixture dir");
+        let mut historical = manifest.clone();
+        historical_hash.clone_into(&mut historical.execution.golden_vectors.vectors_sha256);
+        let identity = |manifest: &ModelArtifactManifestV1| {
+            manifest
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap()
+        };
+        assert_ne!(
+            identity(&historical).fingerprint(),
+            identity(manifest).fingerprint()
+        );
+        // Exercise the same owning constructor as the public loader. All
+        // artifact bytes, model name and dimensions match; only the historical
+        // producer's exact output certificate differs. No Self may escape.
+        let error = FastEmbedEmbedder::load_from_manifest(Path::new(&dir), config, &historical)
+            .expect_err("an upgraded runtime must not attest the historical producer");
+        let SearchError::ModelLoadFailed { source, .. } = error else {
+            panic!("expected execution conformance refusal, got {error}");
+        };
+        assert!(source.to_string().contains("producer certificate"));
+    }
+
     #[test]
     #[ignore = "requires verified MiniLM ONNX assets via FASTEMBED_MINILM_FIXTURE_DIR"]
     fn minilm_conformance_certificate_matches_fixture() {
@@ -924,6 +968,12 @@ mod tests {
             "FASTEMBED_MINILM_FIXTURE_DIR",
             OnnxEmbedderConfig::for_name("minilm").unwrap(),
             &ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+        );
+        assert_historical_certificate_refused(
+            "FASTEMBED_MINILM_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("minilm").unwrap(),
+            &ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+            "11620592994a30c5df2ec108983c8a5ce304760f78666c42f56db285a7f3d948",
         );
     }
 
@@ -934,6 +984,12 @@ mod tests {
             "FASTEMBED_SNOWFLAKE_FIXTURE_DIR",
             OnnxEmbedderConfig::for_name("snowflake-arctic-s").unwrap(),
             &ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+        );
+        assert_historical_certificate_refused(
+            "FASTEMBED_SNOWFLAKE_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("snowflake-arctic-s").unwrap(),
+            &ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+            "fb999e00707c8f3709844de704529c29c1f87b540311c05ee211aa93d0dad3a6",
         );
     }
 

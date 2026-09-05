@@ -306,7 +306,11 @@ impl ModelArtifactManifestV1 {
             input_contract: default_plain_text_input_contract(),
             golden_vectors: GoldenVectorCertificateV1 {
                 corpus_sha256: conformance_corpus_fingerprint()?,
-                vectors_sha256: "11620592994a30c5df2ec108983c8a5ce304760f78666c42f56db285a7f3d948"
+                // GOLDEN-CHANGE bd-2ba5: ORT 1.28.0 (da9b5e3) replaces
+                // 1.24.2 (058787c). Relinking the latter with the current Rust
+                // adapter reproduces the historical certificate exactly.
+                // The loader now verifies this certificate before attesting it.
+                vectors_sha256: "67cec04aef931fb5b5db8be074e92370c4f62e6f89ec45bec5ecd52a2444d6c3"
                     .to_owned(),
                 vector_count: 4,
                 dimension: 384,
@@ -452,7 +456,10 @@ impl ModelArtifactManifestV1 {
         let execution = fastembed_execution_contract(
             384,
             "snowflake-arctic-embed-s",
-            "fb999e00707c8f3709844de704529c29c1f87b540311c05ee211aa93d0dad3a6",
+            // GOLDEN-CHANGE bd-2ba5: separately measured Snowflake output
+            // under ORT 1.28.0; the historical 1.24.2 certificate is retained
+            // as a real loader-refusal regression alongside MiniLM's.
+            "8ab295190de5eb629ef7920e3aec6d989c1b7f695b4f75baebfb716fb81b7f6c",
         )?;
         Self::from_download_manifest(
             &ModelManifest::snowflake_arctic_s(),
@@ -4086,10 +4093,11 @@ mod tests {
 
     #[test]
     fn registered_manifest_fingerprints_are_exact_fixtures() {
-        // GOLDEN-CHANGE bd-2ba5: register the explicit F32 producer and correct
-        // FastEmbed/ORT binding versions to the locked dependencies. Existing
-        // output-vector certificates are unchanged; only their manifest metadata
-        // fingerprints change. Exact ONNX output conformance remains a separate test.
+        // GOLDEN-CHANGE bd-2ba5: the explicit F32 producer and dependency
+        // metadata correction are followed by the measured ORT 1.24.2 ->
+        // 1.28.0 MiniLM/Snowflake certificate change. Nomic's output is unchanged.
+        // Historical certificates must fail the actual loader; exact current
+        // conformance is checked both at load and in the real-model fixtures.
         let observed = [
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
@@ -4110,7 +4118,7 @@ mod tests {
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "f4422df6fdff409a5eb916314ea8e6a2a0b88377b1e4e3cad80b77c3d19acf08".to_owned(),
+                "6d5cf6dd6bb8dc9de621b03c53248796dddb054b93ae829b98aa7dbf2552cf76".to_owned(),
             ),
             (
                 "frankentorch-native-minilm".to_owned(),
@@ -4126,7 +4134,7 @@ mod tests {
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "9179ab9a767f0c7a15b42e3bb427cea50aeb0e5f07c216a839cf8c6e46c7a099".to_owned(),
+                "ae11db9eda424707fb89a0c70daae5e5a559521d8d1edb45ead90a6344eca247".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
