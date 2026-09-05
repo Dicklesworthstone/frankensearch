@@ -146,14 +146,22 @@ impl NativeEmbedder {
     ///
     /// # Errors
     /// [`SearchError::ModelNotFound`] when required files are missing;
-    /// [`SearchError::ModelLoadFailed`] when the tokenizer, topology, or weights fail.
+    /// [`SearchError::ModelLoadFailed`] when the tokenizer, topology, weights, or
+    /// executing producer's registered output certificate fails verification.
     pub fn load_model(
         model_dir: impl AsRef<Path>,
         profile: NativeEmbeddingModel,
     ) -> SearchResult<Self> {
-        let dir = model_dir.as_ref();
+        Self::load_from_manifest(model_dir.as_ref(), profile, &profile.manifest()?)
+    }
+
+    fn load_from_manifest(
+        dir: &Path,
+        profile: NativeEmbeddingModel,
+        manifest: &ModelArtifactManifestV1,
+    ) -> SearchResult<Self> {
         let model_name = profile.model_name();
-        let verified = profile.manifest()?.verify_dir(dir)?;
+        let verified = manifest.verify_dir(dir)?;
         let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
         if identity.space.dimension != IDENTITY_DIMENSION {
             return Err(SearchError::ModelLoadFailed {
@@ -244,25 +252,48 @@ impl NativeEmbedder {
             });
         }
 
-        tracing::info!(
-            model = model_name,
-            dimension = DIM,
-            encoder_layers = model.encoder_layers(),
-            max_length = DEFAULT_MAX_LENGTH,
-            manifest = %verified.frozen().fingerprint,
-            identity = %identity.fingerprint(),
-            precision = ?profile.linear_precision(),
-            "native frankentorch MiniLM embedder loaded (mean-pool + L2)"
-        );
-
-        Ok(Self {
+        let embedder = Self {
             inner: Mutex::new(model),
             tokenizer,
             max_length: DEFAULT_MAX_LENGTH,
             name: model_name.to_owned(),
             id: profile.embedder_id().to_owned(),
             identity,
-        })
+        };
+        // Verified artifacts alone cannot attest the executing kernels. Exercise
+        // the same public batch path before any caller can obtain this identity.
+        let texts = &frankensearch_embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        let probe =
+            embedder
+                .embed_batch_sync(texts)
+                .map_err(|error| SearchError::ModelLoadFailed {
+                    path: dir.to_path_buf(),
+                    source: format!("failed to run native producer conformance probe: {error}")
+                        .into(),
+                })?;
+        embedder
+            .identity
+            .producer
+            .golden_vectors
+            .verify_exact_f32(texts, &probe)
+            .map_err(|_| SearchError::ModelLoadFailed {
+                path: dir.to_path_buf(),
+                source: "native execution does not match the registered producer certificate; use a qualified runtime build before rebuilding the index (model files already verified)"
+                    .into(),
+            })?;
+
+        tracing::info!(
+            model = model_name,
+            dimension = DIM,
+            encoder_layers = profile.encoder_layers(),
+            max_length = DEFAULT_MAX_LENGTH,
+            manifest = %verified.frozen().fingerprint,
+            identity = %embedder.identity.fingerprint(),
+            precision = ?profile.linear_precision(),
+            "native frankentorch MiniLM embedder loaded (mean-pool + L2)"
+        );
+
+        Ok(embedder)
     }
 
     /// Tokenize one text to token ids (with `[CLS]`/`[SEP]`), truncated to `max_length`.
@@ -491,6 +522,21 @@ mod tests {
                 );
             }
         }
+
+        // Valid, identical model bytes must not let F32 execution attest int8
+        // output. Exercise the owning constructor, not just the verifier alone.
+        let mut nonconformant = manifest;
+        nonconformant.execution.golden_vectors = NativeEmbeddingModel::AllMiniLmL6V2
+            .manifest()
+            .unwrap()
+            .execution
+            .golden_vectors;
+        let error = NativeEmbedder::load_from_manifest(Path::new(&dir), profile, &nonconformant)
+            .expect_err("F32 execution must not attest the original int8 producer");
+        let SearchError::ModelLoadFailed { source, .. } = error else {
+            panic!("expected execution conformance refusal, got {error}");
+        };
+        assert!(source.to_string().contains("producer certificate"));
     }
 
     /// Smoke test against a real `all-MiniLM-L6-v2` directory. Ignored by default
