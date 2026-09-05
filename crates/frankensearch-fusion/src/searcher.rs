@@ -138,6 +138,42 @@ fn cancellation_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
     })
 }
 
+/// Compare a v1 producer fingerprint without manufacturing an admitted owner.
+/// Empty, identity-less indexes retain their explicit legacy/control behavior;
+/// an identified semantic model needs an index built with its whole identity.
+fn admit_legacy_tier_embedder(
+    embedder: &dyn Embedder,
+    revision: &str,
+    tier: &str,
+) -> SearchResult<()> {
+    if revision.is_empty() && !embedder.is_semantic() {
+        return Ok(());
+    }
+    let identity = match embedder.identity() {
+        Ok(identity) => identity,
+        Err(_) if revision.is_empty() => return Ok(()),
+        Err(error) => {
+            return Err(SearchError::InvalidConfig {
+                field: format!("search_activation.{tier}.producer_revision"),
+                value: embedder.id().to_owned(),
+                reason: format!("the stored {tier} producer cannot be verified: {error}"),
+            });
+        }
+    };
+    identity.validate()?;
+    if revision != identity.fingerprint() {
+        return Err(SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.producer_revision"),
+            value: revision.to_owned(),
+            reason: format!(
+                "the stored {tier} vectors do not bind this embedder's complete producer \
+                 identity; rebuild the index with this embedder before searching"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Join one configured embedder against the identity its tier was admitted
 /// under, with no vector in hand (bd-ctzo C1).
 ///
@@ -827,8 +863,9 @@ impl TwoTierSearcher {
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] naming the tier and contract
-    /// field when a tier is owner-backed and its embedder is not identity-
-    /// aware, produces a different embedding space, or is a different
+    /// field when a stored v1 producer fingerprint differs, or when an
+    /// owner-backed tier's embedder is not identity-aware, produces a different
+    /// embedding space, or is a different
     /// producer than the one that wrote the index — including the
     /// certified-compatible case, which is comparison-grade telemetry and
     /// never an admission basis.
@@ -843,6 +880,17 @@ impl TwoTierSearcher {
                              under and requires a reindex"
                         .to_owned(),
                 });
+            }
+            admit_legacy_tier_embedder(
+                self.fast_embedder.as_ref(),
+                self.index.fast_embedder_revision(),
+                "fast",
+            )?;
+            if let (Some(embedder), Some(revision)) = (
+                self.quality_embedder.as_ref(),
+                self.index.quality_embedder_revision(),
+            ) {
+                admit_legacy_tier_embedder(embedder.as_ref(), revision, "quality")?;
             }
             return Ok(SemanticAdmission::LegacyUnidentified);
         };

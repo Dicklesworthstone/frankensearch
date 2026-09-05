@@ -1759,18 +1759,17 @@ mod tests {
 
     /// bd-9xuj T2-C2: `build` must thread the embedders' REAL identities into
     /// the built index, not just their id strings. Observable through the
-    /// persisted v1 headers: the id string AND the space's immutable revision
-    /// survive a reopen — while the space fingerprint does not (v1 persists
-    /// no identity), and that absence must stay typed, never re-fabricated
-    /// from the surviving strings.
+    /// persisted v1 headers: the id string AND the whole producer fingerprint
+    /// survive a reopen. The typed bundle and admitted v2 owner do not, and
+    /// their absence must never be filled in from the surviving strings.
     #[test]
     fn build_threads_typed_identity_into_persisted_headers() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let fast = IdentityStubEmbedder::new("identity-fast", 4);
             let quality = IdentityStubEmbedder::new("identity-quality", 4);
-            let fast_revision = fast.identity.space.immutable_revision.clone();
-            let quality_revision = quality.identity.space.immutable_revision.clone();
+            let fast_revision = fast.identity.fingerprint();
+            let quality_revision = quality.identity.fingerprint();
             let stack = EmbedderStack::from_parts(Arc::new(fast), Some(Arc::new(quality)));
 
             let stats = IndexBuilder::new(dir.path())
@@ -1787,8 +1786,8 @@ mod tests {
             assert_eq!(
                 reopened.fast_embedder_revision(),
                 fast_revision.as_str(),
-                "the fast header must carry the identity's immutable revision, \
-                 which only exists if build threaded the typed identity through"
+                "the fast header must bind the complete producing identity, \
+                 including execution precision and conformance certificate"
             );
             assert_eq!(reopened.quality_embedder_id(), Some("identity-quality"));
             assert_eq!(

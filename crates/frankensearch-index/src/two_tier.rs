@@ -2057,9 +2057,8 @@ impl TwoTierIndexBuilder {
     /// additionally rejects it when its space dimension does not describe the
     /// vectors actually written. On success:
     ///
-    /// - the fast-tier header's revision string is set to the space's
-    ///   `immutable_revision` (the same rule `VectorIndex::create_v2` uses),
-    ///   so the persisted v1 header finally carries a real revision;
+    /// - the v1 header's revision string stores the complete bundle fingerprint,
+    ///   so reopening can reject another producer of the same model revision;
     /// - the finished [`TwoTierIndex`] retains the bundle
     ///   ([`TwoTierIndex::fast_declared_identity`]) and exposes the space
     ///   join key ([`TwoTierIndex::fast_space_fingerprint_hex`]).
@@ -2067,8 +2066,8 @@ impl TwoTierIndexBuilder {
     /// The operational id string ([`Self::set_fast_embedder_id`]) is left
     /// untouched: id strings are diagnostics, and this typed bundle — never
     /// a string — is the compatibility authority. Retention is process-local
-    /// for the v1 artifacts this builder writes: a later reopen from disk is
-    /// legacy-unidentified until an identity-persisting writer exists.
+    /// for the v1 artifacts this builder writes: a later reopen can compare
+    /// the fingerprint but still retains no admitted v2 owner or typed bundle.
     ///
     /// # Errors
     ///
@@ -2079,8 +2078,7 @@ impl TwoTierIndexBuilder {
         identity: &EmbeddingIdentityBundleV1,
     ) -> SearchResult<&mut Self> {
         identity.validate()?;
-        self.fast_embedder_revision
-            .clone_from(&identity.space.immutable_revision);
+        self.fast_embedder_revision = identity.fingerprint();
         self.fast_identity = Some(identity.clone());
         Ok(self)
     }
@@ -2096,8 +2094,7 @@ impl TwoTierIndexBuilder {
         identity: &EmbeddingIdentityBundleV1,
     ) -> SearchResult<&mut Self> {
         identity.validate()?;
-        self.quality_embedder_revision
-            .clone_from(&identity.space.immutable_revision);
+        self.quality_embedder_revision = identity.fingerprint();
         self.quality_identity = Some(identity.clone());
         Ok(self)
     }
@@ -5740,16 +5737,13 @@ mod tests {
         );
 
         // The operational id string is untouched by the typed declaration;
-        // the header revision now carries the space's immutable revision.
+        // the v1 header revision carries the complete producer bundle fingerprint.
         assert_eq!(index.fast_embedder_id(), "op-fast-id");
         assert_eq!(index.quality_embedder_id(), Some("op-quality-id"));
-        assert_eq!(
-            index.fast_embedder_revision(),
-            fast_bundle.space.immutable_revision.as_str()
-        );
+        assert_eq!(index.fast_embedder_revision(), fast_bundle.fingerprint());
         assert_eq!(
             index.quality_embedder_revision(),
-            Some(quality_bundle.space.immutable_revision.as_str())
+            Some(quality_bundle.fingerprint().as_str())
         );
         drop(index);
 
@@ -5760,7 +5754,7 @@ mod tests {
         assert_eq!(reopened.fast_embedder_id(), "op-fast-id");
         assert_eq!(
             reopened.fast_embedder_revision(),
-            fast_bundle.space.immutable_revision.as_str(),
+            fast_bundle.fingerprint(),
             "the declared revision must survive persistence in the v1 header"
         );
         assert_eq!(reopened.fast_space_fingerprint_hex(), None);
