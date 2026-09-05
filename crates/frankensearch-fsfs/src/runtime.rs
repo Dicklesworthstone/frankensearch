@@ -1505,6 +1505,73 @@ struct IndexSentinel {
     source_hash_hex: String,
 }
 
+/// Completion is emitted only after publishing the sentinel and transitioning
+/// the checkpoint. A successful command can still leave semantic rows deferred;
+/// consumers must inspect `generation_complete` before admitting that generation.
+#[derive(Debug, Serialize)]
+struct FsfsIndexPayload {
+    #[serde(flatten)]
+    generation: IndexSentinel,
+    index_size_bytes: u64,
+    semantic_indexed_files: usize,
+    semantic_deferred_files: usize,
+    embedding_retries: usize,
+    embedding_failures: usize,
+    vector_generation: PublishedVectorGeneration,
+    quality_generation: Option<PublishedVectorGeneration>,
+}
+
+impl FsfsIndexPayload {
+    fn emit<W: Write>(
+        &self,
+        format: OutputFormat,
+        elapsed_ms: u64,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let mut warnings = Vec::new();
+        if self.vector_generation.is_hash_control {
+            warnings.push(OutputWarning::new(
+                OutputWarningCode::HASH_FALLBACK,
+                "A legacy hash control generation was detected; semantic results were not admitted. Rebuild with a verified semantic embedder.",
+            ));
+        }
+        if self.semantic_deferred_files > 0 {
+            warnings.push(OutputWarning::new(
+                OutputWarningCode::SEMANTIC_INDEX_DEFERRED,
+                format!(
+                    "{} file(s) have deferred semantic embeddings. Durable lexical artifacts were preserved, but this generation is not admitted for semantic search; rerun `fsfs index {}`.",
+                    self.semantic_deferred_files, self.generation.target_root,
+                ),
+            ));
+        }
+        if format == OutputFormat::Table {
+            writeln!(
+                writer,
+                "Indexed {} file(s) (discovered {}, skipped {}) into {} in {} ms (index size {} bytes)",
+                self.generation.indexed_files,
+                self.generation.discovered_files,
+                self.generation.skipped_files,
+                self.generation.index_root,
+                elapsed_ms,
+                self.index_size_bytes,
+            )?;
+            for warning in warnings {
+                writeln!(writer, "WARNING: {}", warning.message)?;
+            }
+        } else {
+            let meta =
+                meta_for_format(&self.generation.command, format).with_duration_ms(elapsed_ms);
+            let envelope =
+                OutputEnvelope::success(self, meta, iso_timestamp_now()).with_warnings(warnings);
+            emit_envelope(&envelope, format, writer)?;
+            if matches!(format, OutputFormat::Json | OutputFormat::Toon) {
+                writeln!(writer)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 const FSFS_QUILL_ENGINE_DIR: &str = "quill-v1";
 
 fn fsfs_quill_protector() -> SearchResult<FileProtector> {
@@ -3086,7 +3153,7 @@ impl LiveIngestPipeline {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct PublishedVectorGeneration {
     id: String,
     dimension: usize,
@@ -12640,7 +12707,9 @@ impl FsfsRuntime {
         // Boxed: the one-shot index future carries both tiers' embedding
         // state and would otherwise inflate every caller's future past the
         // `large_futures` budget.
-        Box::pin(self.run_one_shot_index_scaffold_internal(cx, command, on_progress, true)).await
+        Box::pin(self.run_one_shot_index_scaffold_internal(cx, command, on_progress, true))
+            .await
+            .map(|_| ())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -12650,7 +12719,7 @@ impl FsfsRuntime {
         command: CliCommand,
         mut on_progress: F,
         emit_user_output: bool,
-    ) -> SearchResult<()>
+    ) -> SearchResult<FsfsIndexPayload>
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
     {
@@ -12689,7 +12758,8 @@ impl FsfsRuntime {
             elapsed_ms = discovery_elapsed_ms,
             "fsfs file discovery completed"
         );
-        if emit_user_output {
+        if emit_user_output && self.cli_input.format == OutputFormat::Table && !self.cli_input.quiet
+        {
             println!(
                 "Discovered {} file(s) under {} ({} skipped by policy)",
                 stats.discovered_files,
@@ -13857,6 +13927,19 @@ impl FsfsRuntime {
         // Both generations are final: drop the writer handles (the protector
         // takes the reader side of the map lock) and write their RaptorQ
         // sidecars under the same lease, like Quill's segments.
+        let published_vector = PublishedVectorGeneration {
+            id: vector_index.embedder_id().to_owned(),
+            dimension: vector_index.dimension(),
+            is_hash_control: Self::is_legacy_hash_vector_generation(vector_index.embedder_id()),
+        };
+        let published_quality =
+            quality_vector_index
+                .as_ref()
+                .map(|index| PublishedVectorGeneration {
+                    id: index.embedder_id().to_owned(),
+                    dimension: index.dimension(),
+                    is_hash_control: Self::is_legacy_hash_vector_generation(index.embedder_id()),
+                });
         drop(vector_index);
         drop(quality_vector_index);
         publication_lease.fence("vector generation durability sidecars")?;
@@ -13991,29 +14074,29 @@ impl FsfsRuntime {
             "fsfs index pipeline completed"
         );
 
+        let payload = FsfsIndexPayload {
+            generation: sentinel,
+            index_size_bytes: storage_usage.total_bytes(),
+            semantic_indexed_files: checkpoint
+                .files
+                .values()
+                .filter(|entry| entry.semantic_indexed)
+                .count(),
+            semantic_deferred_files,
+            embedding_retries,
+            embedding_failures,
+            vector_generation: published_vector,
+            quality_generation: published_quality,
+        };
         if emit_user_output {
-            println!(
-                "Indexed {} file(s) (discovered {}, skipped {}) into {} in {} ms (index size {} bytes)",
-                indexed_files,
-                stats.discovered_files,
-                skipped_files,
-                index_root.display(),
-                elapsed_ms,
-                storage_usage.total_bytes()
-            );
-            if embedder_degraded {
-                println!(
-                    "WARNING: A legacy hash control generation was detected; semantic results were not admitted. Rebuild with a verified semantic embedder."
-                );
-            } else if semantic_deferred_files > 0 {
-                println!(
-                    "WARNING: {semantic_deferred_files} file(s) have deferred semantic embeddings. Durable lexical artifacts were preserved, but this generation is not admitted for semantic search; rerun `fsfs index {}`.",
-                    target_root.display(),
-                );
-            }
+            payload.emit(
+                self.cli_input.format,
+                u64::try_from(total_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                &mut std::io::stdout().lock(),
+            )?;
         }
 
-        Ok(())
+        Ok(payload)
     }
 
     fn resolve_target_root(&self) -> SearchResult<PathBuf> {
@@ -30437,6 +30520,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum BatchProbeBehavior {
         Transient,
+        ProbeReadyBatchTransient,
         Permanent,
         Cancelled,
         Valid,
@@ -30464,6 +30548,9 @@ mod tests {
 
     impl Embedder for BatchProbeEmbedder {
         fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            if matches!(self.behavior, BatchProbeBehavior::ProbeReadyBatchTransient) {
+                return Box::pin(async { Ok(vec![1.0, 0.0, 0.0, 0.0]) });
+            }
             Box::pin(async {
                 Err(SearchError::SubsystemError {
                     subsystem: "test.batch_probe.single_embed",
@@ -30484,10 +30571,13 @@ mod tests {
             let behavior = self.behavior;
             Box::pin(async move {
                 match behavior {
-                    BatchProbeBehavior::Transient => Err(SearchError::EmbeddingFailed {
-                        model: "batch-probe-4".to_owned(),
-                        source: std::io::Error::other("typed transient batch failure").into(),
-                    }),
+                    BatchProbeBehavior::Transient
+                    | BatchProbeBehavior::ProbeReadyBatchTransient => {
+                        Err(SearchError::EmbeddingFailed {
+                            model: "batch-probe-4".to_owned(),
+                            source: std::io::Error::other("typed transient batch failure").into(),
+                        })
+                    }
                     BatchProbeBehavior::Permanent => Err(SearchError::UnverifiableRemoteSpace {
                         producer: "typed-batch-provider".to_owned(),
                         reason: "typed-batch-reason".to_owned(),
@@ -35963,6 +36053,93 @@ mod tests {
         assert_eq!(decoded.files["src/main.rs"].canonical_bytes, 1024);
         assert!(!decoded.files["src/main.rs"].semantic_indexed);
         assert!(!decoded.files["src/lib.rs"].semantic_indexed);
+    }
+
+    #[test]
+    fn index_completion_reports_durable_success_and_deferred_semantic_rows() {
+        run_test_with_cx(|cx| async move {
+            struct RestoreFastEmbedder(Option<Arc<dyn Embedder>>);
+            impl Drop for RestoreFastEmbedder {
+                fn drop(&mut self) {
+                    super::set_test_fast_embedder(self.0.take());
+                }
+            }
+            let _restore = RestoreFastEmbedder(super::test_fast_embedder_override());
+            for deferred in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let corpus = temp.path().join("corpus");
+                let index_root = temp.path().join("index");
+                fs::create_dir_all(&corpus).unwrap();
+                fs::write(corpus.join("retry.md"), "Network clients recover transient failures using bounded retries and exponential backoff.").unwrap();
+                let mut config = FsfsConfig::default();
+                config.search.fast_only = true;
+                config.storage.index_dir = index_root.display().to_string();
+                config.storage.db_path = temp.path().join("catalog.sqlite").display().to_string();
+                let embedder: Arc<dyn Embedder> = if deferred {
+                    Arc::new(BatchProbeEmbedder::new(
+                        BatchProbeBehavior::ProbeReadyBatchTransient,
+                    ))
+                } else {
+                    Arc::new(SemanticFastEmbedder)
+                };
+                super::set_test_fast_embedder(Some(embedder));
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(corpus),
+                    index_dir: Some(index_root.clone()),
+                    format: OutputFormat::Jsonl,
+                    ..CliInput::default()
+                });
+                let payload = runtime
+                    .run_one_shot_index_scaffold_internal(&cx, CliCommand::Index, |_| Ok(()), false)
+                    .await
+                    .expect("real publication path with a test-only embedder fault");
+                let sentinel = FsfsRuntime::read_index_sentinel(&index_root)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(payload.generation, sentinel);
+                assert_eq!(sentinel.generation_complete, !deferred);
+                assert_eq!(payload.generation.indexed_files, 1);
+                assert_eq!(payload.semantic_deferred_files, usize::from(deferred));
+                assert_eq!(payload.semantic_indexed_files, usize::from(!deferred));
+                assert_eq!(payload.embedding_failures, usize::from(deferred));
+                assert_eq!(payload.embedding_retries, if deferred { 2 } else { 0 });
+                let checkpoint = super::read_indexing_checkpoint(&index_root).unwrap();
+                assert_eq!(checkpoint.is_some(), deferred);
+                if let Some(checkpoint) = checkpoint {
+                    assert!(checkpoint.artifacts_durable);
+                    assert!(!checkpoint.files["retry.md"].semantic_indexed);
+                }
+                let vectors =
+                    VectorIndex::open_read_only(&index_root.join("vector/index.fsvi")).unwrap();
+                assert_eq!(
+                    vectors.live_doc_ids().unwrap().len(),
+                    usize::from(!deferred)
+                );
+                for format in [OutputFormat::Json, OutputFormat::Jsonl] {
+                    let mut bytes = Vec::new();
+                    payload.emit(format, 42, &mut bytes).unwrap();
+                    let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(envelope["ok"], true);
+                    assert_eq!(envelope["data"]["generation_complete"], !deferred);
+                    assert_eq!(
+                        envelope["data"]["semantic_deferred_files"],
+                        usize::from(deferred)
+                    );
+                    if deferred {
+                        assert_eq!(envelope["warnings"][0]["code"], "semantic_index_deferred");
+                        assert!(
+                            envelope["warnings"][0]["message"]
+                                .as_str()
+                                .unwrap()
+                                .contains("not admitted")
+                        );
+                    } else {
+                        assert!(envelope.get("warnings").is_none());
+                    }
+                }
+            }
+        });
     }
 
     #[test]

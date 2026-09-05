@@ -205,6 +205,12 @@ Result: responsive first answers plus better final ranking without blocking the 
 
 ## CLI At A Glance
 
+`fsfs index <dir> --format json` emits one completion envelope after durable
+publication; `--format jsonl` emits it as one line. The payload includes actual
+file counts, vector model identities, and `generation_complete`. If embedding
+retries are exhausted, `semantic_deferred_files` and a warning explain why the
+published artifacts still need indexing resumed before semantic search.
+
 ```bash
 # Basic search
 fsfs search "structured concurrency" --limit 10
@@ -257,6 +263,13 @@ Configuration precedence (highest first; `fsfs config` prints the resolved
 3. config files (project `fsfs.toml` over user `~/.config/fsfs/config.toml`)
 4. built-in defaults
 
+`--fast-only`, `FRANKENSEARCH_FAST_ONLY=true`, and `[search] fast_only = true`
+disable quality work under the default `performance` pressure profile. The
+highest-precedence value wins, including an explicit `false`. The `strict`
+and `degraded` profiles keep quality disabled: a winning `fast_only=false`
+returns a configuration error naming the profile. A hard pause disables quality
+after source precedence and records the safety clamp in profile diagnostics.
+
 Common environment variables:
 
 | Variable | Purpose | Example |
@@ -264,7 +277,7 @@ Common environment variables:
 | `FRANKENSEARCH_INDEX_DIR` | Override index/data directory | `~/.local/share/frankensearch` |
 | `FRANKENSEARCH_MODEL_DIR` | Override model location | `~/.cache/frankensearch/models` |
 | `FRANKENSEARCH_RERANK` | Re-score the refined head with the cross-encoder (same as `--rerank`); needs `fsfs download-models ms-marco-minilm-l-6-v2` once | `1` |
-| `FRANKENSEARCH_FAST_ONLY` | Skip quality refinement. Rejected with a warning under the default `performance` pressure profile, which locks the quality stage on; use `FRANKENSEARCH_PRESSURE_PROFILE=strict` for fast-only | `true` |
+| `FRANKENSEARCH_FAST_ONLY` | Disable quality work; follows CLI > environment > config precedence. `false` requires a profile that permits quality | `true` |
 | `FRANKENSEARCH_QUALITY_WEIGHT` | Blend quality vs fast tier | `0.7` |
 | `FRANKENSEARCH_RRF_K` | RRF constant | `60` |
 | `FRANKENSEARCH_LOG` | Tracing filter | `info` |
@@ -450,7 +463,7 @@ without forcing you into remote services or heavyweight distributed systems.
 Common tuning patterns:
 
 - Need lower tail latency:
-  - run fast-only: `FRANKENSEARCH_PRESSURE_PROFILE=strict` (the default `performance` profile locks the quality stage on and rejects `FRANKENSEARCH_FAST_ONLY=true` / `--fast-only` with a warning)
+  - run fast-only: `FRANKENSEARCH_FAST_ONLY=true` or `--fast-only`; both work with the default `performance` profile
   - reduce candidate budget and rerank depth
   - keep lexical enabled for exact-match recovery
 
@@ -791,7 +804,6 @@ cargo build -p frankensearch --features full-fts5
 Best for interactive UX where fast first answer matters most.
 
 ```bash
-export FRANKENSEARCH_PRESSURE_PROFILE=strict
 export FRANKENSEARCH_FAST_ONLY=true
 export FRANKENSEARCH_QUALITY_WEIGHT=0.7
 export FRANKENSEARCH_RRF_K=60
@@ -807,6 +819,7 @@ Operational effect:
 Best for offline analysis, report generation, or high-precision ranking.
 
 ```bash
+export FRANKENSEARCH_PRESSURE_PROFILE=performance
 export FRANKENSEARCH_FAST_ONLY=false
 export FRANKENSEARCH_QUALITY_WEIGHT=0.85
 export FRANKENSEARCH_RRF_K=40

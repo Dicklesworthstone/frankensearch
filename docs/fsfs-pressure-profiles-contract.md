@@ -1,4 +1,4 @@
-# fsfs Pressure Profile and Override Contract v1
+# fsfs Pressure Profile Contract: Schema v1, Profile Revision 2
 
 Issue: `bd-2hz.4.5`  
 Parent: `bd-2hz.4`
@@ -51,6 +51,7 @@ Each profile MUST define:
 - balanced throughput/latency
 - moderate concurrency and quality access
 - controlled fallback behavior
+- quality is permitted by default; explicit fast-only requests can disable it
 
 ## degraded
 
@@ -68,7 +69,21 @@ Resolution MUST apply in this exact order:
 4. config-file overrides
 5. selected profile defaults
 
-If an override targets a locked field, the override MUST be rejected with deterministic reason code and no partial application.
+For quality work, resolve the highest-precedence explicit `search.fast_only`
+request before applying the selected profile's capability ceiling. Project
+config overrides user config within the file layer. Superseded quality requests
+are recorded as `override.superseded.higher_precedence`; they MUST NOT cause a
+rejection or change the effective request.
+
+The `performance` profile allows either `fast_only` value. The `strict` and
+`degraded` profiles disable quality: `fast_only=true` is accepted, while a winning
+`fast_only=false` MUST return `SearchError::InvalidConfig` with field
+`search.fast_only`, value `false`, and a reason naming the profile. No quality
+request overrides a hard pause; its existing safety-clamp diagnostics explain
+the effective disabled state.
+
+Other locked profile fields retain their deterministic
+`override.rejected.locked_field` diagnostics and cannot be partially applied.
 
 ## Conflict and Safety Semantics
 
@@ -167,6 +182,12 @@ This metadata is mandatory for operator timeline/audit surfaces and post-inciden
 4. Removing or repurposing profile fields MUST NOT happen without explicit migration metadata.
 5. Existing profile IDs (`strict|performance|degraded`) MUST remain stable across minor revisions.
 
+Profile revision 2 makes `performance.quality_enabled` overridable and applies
+source precedence before checking quality capability. Current defaults and
+resolution diagnostics emit revision 2. The JSON schema envelope remains v1;
+the named v1 fixtures below preserve historical revision 1 serialization and
+do not establish current runtime behavior.
+
 ## Validation Artifacts
 
 - `schemas/fsfs-pressure-profiles-v1.schema.json`
@@ -176,6 +197,10 @@ This metadata is mandatory for operator timeline/audit surfaces and post-inciden
 - `scripts/check_fsfs_pressure_profiles_contract.sh`
 
 ## Validation Command
+
+This command validates the historical JSON fixtures. Current profile policy is
+covered by the inline configuration and pressure-profile contract tests, plus
+the real-model CLI fast-only checks in the executable quickstart test.
 
 ```bash
 scripts/check_fsfs_pressure_profiles_contract.sh --mode all

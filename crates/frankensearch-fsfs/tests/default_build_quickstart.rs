@@ -282,6 +282,217 @@ mod loader_only {
             })
     }
 
+    fn assert_index_completion(envelope: &Value, sentinel: &Value, count: usize, format: &str) {
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["meta"]["command"], "index");
+        assert_eq!(envelope["meta"]["format"], format);
+        assert!(envelope["meta"]["duration_ms"].is_u64());
+        assert_index_data(&envelope["data"], sentinel, count);
+    }
+
+    fn assert_index_data(data: &Value, sentinel: &Value, count: usize) {
+        for (field, value) in sentinel.as_object().expect("sentinel object") {
+            assert_eq!(&data[field], value, "published field {field}");
+        }
+        assert_eq!(data["indexed_files"], count);
+        assert_eq!(data["semantic_indexed_files"], count);
+        assert_eq!(data["generation_complete"], true);
+        assert_eq!(data["semantic_deferred_files"], 0);
+        assert_eq!(data["embedding_failures"], 0);
+        assert_eq!(data["vector_generation"]["is_hash_control"], false);
+        assert!(
+            data["index_size_bytes"]
+                .as_u64()
+                .is_some_and(|size| size > 0)
+        );
+    }
+
+    fn verify_index_output_formats(fsfs: &IsolatedFsfs, root: &Path, corpus: &Path, index: &Path) {
+        for format in ["jsonl", "table", "toon", "csv"] {
+            let outcome = fsfs.run(
+                root,
+                &format!("index-format-{format}"),
+                [
+                    "index",
+                    corpus.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--format",
+                    format,
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            assert_finished_successfully(format, &outcome);
+            let sentinel: Value =
+                serde_json::from_slice(&fs::read(index.join("index_sentinel.json")).unwrap())
+                    .unwrap();
+            if format == "table" {
+                assert!(outcome.stdout.starts_with("Discovered 10 file(s)"));
+                assert!(
+                    outcome
+                        .stdout
+                        .contains("Indexed 10 file(s) (discovered 10, skipped 0)")
+                );
+                continue;
+            }
+            let envelope = match format {
+                "jsonl" => {
+                    assert_eq!(
+                        outcome.stdout.lines().count(),
+                        1,
+                        "one completed generation"
+                    );
+                    assert!(outcome.stdout.ends_with('\n'));
+                    parse_success_envelope(format, &outcome)
+                }
+                "toon" => serde_json::to_value(
+                    frankensearch_fsfs::output_schema::decode_envelope_toon::<Value>(
+                        &outcome.stdout,
+                    )
+                    .expect("all stdout must be valid TOON"),
+                )
+                .unwrap(),
+                "csv" => {
+                    let mut lines = outcome.stdout.lines();
+                    assert_eq!(lines.next(), Some("data_json"));
+                    let cell = lines.next().expect("single CSV data row");
+                    assert_eq!(lines.next(), None, "no trailing empty records");
+                    // A single quoted CSV field; JSON string newlines remain
+                    // escaped inside that field. Check its actual data against
+                    // disk, rather than accepting an arbitrary nonempty row.
+                    let json = cell
+                        .strip_prefix('"')
+                        .unwrap()
+                        .strip_suffix('"')
+                        .unwrap()
+                        .replace("\"\"", "\"");
+                    let data: Value = serde_json::from_str(&json).unwrap();
+                    assert_index_data(&data, &sentinel, QUICKSTART_DOCUMENT_COUNT);
+                    continue;
+                }
+                _ => unreachable!(),
+            };
+            assert_index_completion(&envelope, &sentinel, QUICKSTART_DOCUMENT_COUNT, format);
+            let quality = VectorIndex::open_read_only(&index.join("vector/quality.fsvi")).unwrap();
+            assert_eq!(
+                envelope["data"]["quality_generation"]["id"],
+                quality.embedder_id()
+            );
+            assert_eq!(
+                envelope["data"]["quality_generation"]["dimension"],
+                quality.dimension()
+            );
+        }
+        let empty = root.join("empty-corpus");
+        let empty_index = root.join("empty-index");
+        fs::create_dir_all(&empty).unwrap();
+        for format in ["json", "jsonl"] {
+            let outcome = fsfs.run(
+                root,
+                &format!("index-empty-{format}"),
+                [
+                    "index",
+                    empty.to_str().unwrap(),
+                    "--index-dir",
+                    empty_index.to_str().unwrap(),
+                    "--format",
+                    format,
+                    "--quiet",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let envelope = parse_success_envelope("empty index", &outcome);
+            let sentinel: Value =
+                serde_json::from_slice(&fs::read(empty_index.join("index_sentinel.json")).unwrap())
+                    .unwrap();
+            assert_index_completion(&envelope, &sentinel, 0, format);
+        }
+        eprintln!(
+            "[default-build-e2e] stage=index-formats json=jsonl=toon=csv=table:verified nonempty=10 empty=0 counts=published-sentinel"
+        );
+    }
+
+    fn verify_fast_only_policy(fsfs: &IsolatedFsfs, root: &Path, corpus: &Path, full_index: &Path) {
+        let fast_index = root.join("fast-only-index");
+        let config = root.join("quality-requested.toml");
+        fs::write(&config, "[search]\nfast_only = false\n").unwrap();
+        let outcome = fsfs.run_with_env(
+            root,
+            "index-fast-only-cli",
+            [
+                "index",
+                corpus.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--index-dir",
+                fast_index.to_str().unwrap(),
+                "--fast-only",
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[("FRANKENSEARCH_FAST_ONLY", "false")],
+        );
+        let envelope = parse_success_envelope("CLI fast-only indexing", &outcome);
+        assert_eq!(envelope["data"]["quality_generation"], Value::Null);
+        assert_eq!(
+            envelope["data"]["semantic_indexed_files"],
+            QUICKSTART_DOCUMENT_COUNT
+        );
+        assert!(
+            !fast_index.join("vector/quality.fsvi").exists(),
+            "CLI must prevent quality generation even with both models installed"
+        );
+        for (label, extra_args, env) in [
+            (
+                "cli",
+                vec!["--fast-only"],
+                vec![("FRANKENSEARCH_FAST_ONLY", "false")],
+            ),
+            ("env", vec![], vec![("FRANKENSEARCH_FAST_ONLY", "true")]),
+        ] {
+            let mut args = vec![
+                "search",
+                "network retry",
+                "--index-dir",
+                full_index.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--no-daemon",
+                "--format",
+                "jsonl",
+            ];
+            args.extend(extra_args);
+            let outcome = fsfs.run_with_env(
+                root,
+                &format!("search-fast-only-{label}"),
+                args,
+                QUICKSTART_TIMEOUT,
+                &env,
+            );
+            assert_finished_successfully(label, &outcome);
+            let envelopes = outcome
+                .stdout
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                envelopes.len(),
+                1,
+                "{label} must skip quality on an existing two-tier index"
+            );
+            assert_eq!(envelopes[0]["data"]["phase"], "initial");
+            assert!(
+                envelopes[0]["data"]["hits"]
+                    .as_array()
+                    .is_some_and(|hits| !hits.is_empty())
+            );
+        }
+        eprintln!(
+            "[default-build-e2e] stage=fast-only cli-over-env-over-file=true default-profile=performance actual-quality-file=absent search-cli=initial-only search-env=initial-only"
+        );
+    }
+
     fn write_quickstart_corpus(corpus: &Path) {
         fs::create_dir_all(corpus).expect("create quickstart corpus");
         fs::write(corpus.join("retry.md"), RETRY_DOCUMENT).expect("write retry document");
@@ -798,6 +1009,114 @@ mod loader_only {
     }
 
     #[test]
+    fn config_inspection_honors_valid_overrides_of_incomplete_source_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let fsfs = IsolatedFsfs::new(temp.path(), temp.path().join("models"));
+        let config = temp.path().join("strict-quality.toml");
+        fs::write(&config, "[pressure]\nprofile = \"strict\"\n[search]\nfast_only = false\nquality_timeout_ms = 250\n").unwrap();
+        for (key, expected, source) in [
+            ("search.fast_only", serde_json::json!(true), "cli"),
+            (
+                "search.quality_timeout_ms",
+                serde_json::json!(250),
+                "config",
+            ),
+        ] {
+            let outcome = fsfs.run(
+                temp.path(),
+                key,
+                [
+                    "config",
+                    "get",
+                    key,
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--fast-only",
+                    "--format",
+                    "json",
+                ],
+                FAILURE_TIMEOUT,
+            );
+            let envelope = parse_success_envelope("inspect accepted CLI override", &outcome);
+            assert_eq!(envelope["data"]["value"], expected);
+            assert_eq!(envelope["data"]["source"], source);
+        }
+        for overrides in [vec!["--fast-only"], vec!["--profile", "performance"]] {
+            let mut args = vec![
+                "config",
+                "--config",
+                config.to_str().unwrap(),
+                "--format",
+                "table",
+            ];
+            args.extend(overrides);
+            let outcome = fsfs.run(temp.path(), "config-table", args, FAILURE_TIMEOUT);
+            assert_finished_successfully("table inspection of valid final configuration", &outcome);
+            assert!(outcome.stdout.contains("search.fast_only"));
+        }
+        let rejected = fsfs.run(
+            temp.path(),
+            "winning-strict-false",
+            [
+                "config",
+                "get",
+                "search.fast_only",
+                "--config",
+                config.to_str().unwrap(),
+                "--no-fast-only",
+                "--format",
+                "json",
+            ],
+            FAILURE_TIMEOUT,
+        );
+        assert!(!rejected.timed_out);
+        assert_eq!(rejected.status.code(), Some(2));
+        let envelope: Value = serde_json::from_str(&rejected.stdout).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "invalid_config");
+        assert_eq!(envelope["error"]["field"], "search.fast_only");
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("strict")
+        );
+    }
+
+    #[test]
+    fn index_rejected_target_emits_only_the_requested_error_envelope() {
+        let temp = tempfile::tempdir().unwrap();
+        let fsfs = IsolatedFsfs::new(temp.path(), temp.path().join("models"));
+        let missing = temp.path().join("missing-source");
+        for format in ["json", "jsonl"] {
+            let outcome = fsfs.run(
+                temp.path(),
+                &format!("missing-target-{format}"),
+                ["index", missing.to_str().unwrap(), "--format", format],
+                FAILURE_TIMEOUT,
+            );
+            assert!(!outcome.timed_out);
+            assert_eq!(outcome.status.code(), Some(2));
+            let envelope: Value = serde_json::from_str(&outcome.stdout).unwrap();
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error"]["code"], "invalid_config");
+            assert_eq!(envelope["error"]["exit_code"], 2);
+            assert_eq!(envelope["meta"]["command"], "index");
+            assert_eq!(envelope["meta"]["format"], format);
+            assert!(envelope.get("data").is_none());
+            assert!(
+                envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("target path does not exist")
+            );
+            if format == "jsonl" {
+                assert_eq!(outcome.stdout.lines().count(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn default_build_without_models_fails_closed_with_actionable_guidance() {
         log_binary_profile("missing-model");
         let temp = tempfile::tempdir().expect("create default-build failure fixture");
@@ -858,6 +1177,10 @@ mod loader_only {
             "missing semantic models are an EX_CONFIG failure; output:\n{}",
             outcome.combined_output()
         );
+        let missing_model_error: Value = serde_json::from_str(&outcome.stdout)
+            .expect("all missing-model stdout must be one error envelope, without discovery prose");
+        assert_eq!(missing_model_error["ok"], false);
+        assert_eq!(missing_model_error["error"]["code"], "embedder_unavailable");
         let rendered = outcome.combined_output().to_ascii_lowercase();
         assert!(
             rendered.contains("embedder_unavailable"),
@@ -1131,7 +1454,7 @@ mod loader_only {
             ],
             QUICKSTART_TIMEOUT,
         );
-        assert_finished_successfully("default-build index", &index_outcome);
+        let index_envelope = parse_success_envelope("default-build index", &index_outcome);
         eprintln!(
             "[default-build-e2e] stage=index-one-shot event=verified timed_out=false exit=0 elapsed_ms={} watch_requested=false",
             index_outcome.elapsed.as_millis()
@@ -1142,6 +1465,12 @@ mod loader_only {
             &fs::read(&sentinel_path).expect("read durable index completion sentinel"),
         )
         .expect("parse durable index completion sentinel");
+        assert_index_completion(
+            &index_envelope,
+            &sentinel,
+            QUICKSTART_DOCUMENT_COUNT,
+            "json",
+        );
         assert_eq!(
             sentinel.get("generation_complete").and_then(Value::as_bool),
             Some(true),
@@ -1159,6 +1488,8 @@ mod loader_only {
             index.join("CURRENT").is_file() || index.join("lexical/CURRENT").is_file(),
             "the Quill lexical generation must publish a CURRENT pointer"
         );
+        verify_index_output_formats(&fsfs, temp.path(), &corpus, &index);
+        verify_fast_only_policy(&fsfs, temp.path(), &corpus, &index);
 
         let vector_path = index.join("vector/index.fsvi");
         let vector_index =

@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_fsfs::config::project_layered_sources_for_inspection;
 use frankensearch_fsfs::runtime::SearchBlockingPool;
 use frankensearch_fsfs::{
     CliCommand, CliInput, CliOverrides, ConfigAction, ConfigLoadResult, ConfigWarning, FsfsConfig,
@@ -19,7 +20,7 @@ use frankensearch_fsfs::{
     Verbosity, current_unicode_environment, default_project_config_file_path,
     default_user_config_file_path, detect_auto_mode, emit_config_loaded, emit_envelope, exit_code,
     exit_code_for, init_subscriber, is_cache_valid, load_from_layered_sources, load_from_sources,
-    load_from_str, maybe_print_update_notice, meta_for_format, output_error_from, parse_cli_args,
+    maybe_print_update_notice, meta_for_format, output_error_from, parse_cli_args,
     read_version_cache, resolve_output_format, spawn_version_cache_refresh,
 };
 use serde::Serialize;
@@ -183,10 +184,8 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     let event = loaded.to_loaded_event();
     emit_config_loaded(&event);
 
-    // An override the active pressure profile locks (`--fast-only` or
-    // `FRANKENSEARCH_FAST_ONLY=true` under the default `performance`
-    // profile) used to be dropped with no trace outside the config command's
-    // warnings table; say so at the command that asked for it (bd-k7x34).
+    // Keep rejected overrides visible at the command that requested them,
+    // including profile limits on background indexing (bd-k7x34).
     if !cli_input.quiet {
         for warning in loaded
             .warnings
@@ -194,7 +193,7 @@ fn run(args: Vec<String>) -> SearchResult<()> {
             .filter(|warning| warning.reason_code == "override.rejected.locked_field")
         {
             eprintln!(
-                "warning: [{}] {} ({}); select FRANKENSEARCH_PRESSURE_PROFILE=strict for fast-only",
+                "warning: [{}] {} ({})",
                 warning.reason_code, warning.field, warning.message
             );
         }
@@ -761,31 +760,30 @@ fn build_stage_snapshots(
 ) -> SearchResult<Vec<ConfigStageSnapshot>> {
     let empty_env = HashMap::new();
     let empty_cli = CliOverrides::default();
-    let defaults = load_from_str(None, None, &empty_env, &empty_cli, home_dir)?;
+    // The caller has already validated the final operational config. Earlier
+    // stages preserve requested values, even when a later overlay is needed to
+    // make them valid; resolving policy here would lose their provenance.
+    let defaults =
+        project_layered_sources_for_inspection(None, None, &empty_env, &empty_cli, home_dir)?;
 
-    let mut named_results: Vec<(&'static str, ConfigLoadResult)> = vec![("defaults", defaults)];
-    if let Some(path) = explicit_config_path {
+    let mut named_results: Vec<(&'static str, FsfsConfig)> = vec![("defaults", defaults)];
+    let (active_project, active_user) = if let Some(path) = explicit_config_path {
         named_results.push((
             "config",
-            load_from_sources(Some(path), &empty_env, &empty_cli, home_dir)?,
+            project_layered_sources_for_inspection(
+                None,
+                Some(path),
+                &empty_env,
+                &empty_cli,
+                home_dir,
+            )?,
         ));
-        named_results.push((
-            "env",
-            load_from_sources(Some(path), env_map, &empty_cli, home_dir)?,
-        ));
-        named_results.push((
-            "cli",
-            load_from_sources(Some(path), env_map, cli_overrides, home_dir)?,
-        ));
+        (None, Some(path))
     } else {
         named_results.push((
             "user",
-            load_from_sources(user_config_path, &empty_env, &empty_cli, home_dir)?,
-        ));
-        named_results.push((
-            "project",
-            load_from_layered_sources(
-                project_config_path,
+            project_layered_sources_for_inspection(
+                None,
                 user_config_path,
                 &empty_env,
                 &empty_cli,
@@ -793,22 +791,25 @@ fn build_stage_snapshots(
             )?,
         ));
         named_results.push((
-            "env",
-            load_from_layered_sources(
+            "project",
+            project_layered_sources_for_inspection(
                 project_config_path,
                 user_config_path,
-                env_map,
+                &empty_env,
                 &empty_cli,
                 home_dir,
             )?,
         ));
+        (project_config_path, user_config_path)
+    };
+    for (name, cli) in [("env", &empty_cli), ("cli", cli_overrides)] {
         named_results.push((
-            "cli",
-            load_from_layered_sources(
-                project_config_path,
-                user_config_path,
+            name,
+            project_layered_sources_for_inspection(
+                active_project,
+                active_user,
                 env_map,
-                cli_overrides,
+                cli,
                 home_dir,
             )?,
         ));
@@ -816,7 +817,7 @@ fn build_stage_snapshots(
 
     let mut snapshots: Vec<ConfigStageSnapshot> = Vec::with_capacity(named_results.len());
     for (idx, (name, result)) in named_results.into_iter().enumerate() {
-        let values = flatten_config_values(&result.config)?;
+        let values = flatten_config_values(&result)?;
         let changed_keys = if idx == 0 {
             values.keys().cloned().collect()
         } else {
@@ -886,6 +887,15 @@ fn source_for_key<'a>(
     final_value: &Value,
     snapshots: &'a [ConfigStageSnapshot],
 ) -> &'a str {
+    if snapshots
+        .last()
+        .and_then(|snapshot| snapshot.values.get(key))
+        .is_some_and(|requested_value| requested_value != final_value)
+    {
+        // Only the completed load applies profile defaults and safety clamps.
+        // Do not credit an earlier matching source for a later policy change.
+        return "pressure_profile";
+    }
     for snapshot in snapshots.iter().rev() {
         if snapshot.changed_keys.contains(key)
             && snapshot
@@ -1158,10 +1168,15 @@ const fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
 mod tests {
     use super::{
         CliCommand, ConfigAction, ProcessErrorContext, SearchError, allow_missing_explicit_config,
-        apply_cli_env_overrides, expand_cli_config_path, parse_bool_token, report_process_error,
+        apply_cli_env_overrides, build_stage_snapshots, expand_cli_config_path,
+        flatten_config_values, parse_bool_token, report_process_error, run_config_get_command,
         run_config_init_command, run_config_reset_command, run_config_set_command,
+        run_config_show_command, source_for_key,
     };
-    use frankensearch_fsfs::{CliInput, OutputFormat};
+    use frankensearch_fsfs::config::PressureProfile;
+    use frankensearch_fsfs::{
+        CliInput, CliOverrides, OutputFormat, load_from_layered_sources, load_from_sources,
+    };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
@@ -1315,6 +1330,187 @@ mod tests {
         let rendered = String::from_utf8(stderr).expect("human error is utf-8");
         assert!(rendered.contains("error: [embedder_unavailable]"));
         assert!(rendered.contains("Fix:"));
+    }
+
+    #[test]
+    fn config_inspection_preserves_winning_cli_and_untouched_file_origin() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fsfs.toml");
+        std::fs::write(
+            &path,
+            "[pressure]\nprofile = 'strict'\n[search]\nfast_only = false\nquality_timeout_ms = 250\n",
+        )
+        .expect("write config");
+        let env = HashMap::new();
+        let cli = CliInput {
+            format: OutputFormat::Json,
+            overrides: CliOverrides {
+                fast_only: Some(true),
+                ..CliOverrides::default()
+            },
+            ..CliInput::default()
+        };
+        let loaded = load_from_sources(Some(&path), &env, &cli.overrides, dir.path())
+            .expect("winning CLI request makes final config valid");
+        let snapshots =
+            build_stage_snapshots(&env, &cli.overrides, dir.path(), Some(&path), None, None)
+                .expect("inspect raw intermediate stages");
+        let file_stage = snapshots
+            .iter()
+            .find(|stage| stage.name == "config")
+            .unwrap();
+        assert_eq!(file_stage.values["search.fast_only"], false);
+        assert_eq!(file_stage.values["pressure.profile"], "strict");
+        let final_values = flatten_config_values(&loaded.config).expect("project final config");
+        assert_eq!(final_values["search.fast_only"], true);
+        assert_eq!(
+            source_for_key(
+                "search.fast_only",
+                &final_values["search.fast_only"],
+                &snapshots
+            ),
+            "cli"
+        );
+        assert_eq!(final_values["search.quality_timeout_ms"], 250);
+        assert_eq!(
+            source_for_key(
+                "search.quality_timeout_ms",
+                &final_values["search.quality_timeout_ms"],
+                &snapshots,
+            ),
+            "config"
+        );
+        run_config_get_command(
+            &loaded,
+            &cli,
+            &env,
+            dir.path(),
+            Some(&path),
+            None,
+            None,
+            "search.fast_only",
+        )
+        .expect("config get accepts valid complete overrides");
+        let table_cli = CliInput {
+            format: OutputFormat::Table,
+            ..cli
+        };
+        run_config_show_command(
+            &loaded,
+            &table_cli,
+            &env,
+            dir.path(),
+            Some(&path),
+            None,
+            None,
+        )
+        .expect("config show accepts valid complete overrides");
+    }
+
+    #[test]
+    fn config_inspection_preserves_user_values_until_project_override() {
+        let dir = tempdir().expect("tempdir");
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        std::fs::write(
+            &user,
+            "[pressure]\nprofile = 'strict'\n[search]\nfast_only = false\nquality_timeout_ms = 250\n",
+        )
+        .expect("write user config");
+        std::fs::write(&project, "[search]\nfast_only = true\n").expect("write project config");
+        let env = HashMap::new();
+        let cli = CliOverrides::default();
+        let loaded = load_from_layered_sources(Some(&project), Some(&user), &env, &cli, dir.path())
+            .expect("winning project request makes final config valid");
+        let snapshots =
+            build_stage_snapshots(&env, &cli, dir.path(), None, Some(&project), Some(&user))
+                .expect("inspect layered stages");
+        let user_stage = snapshots.iter().find(|stage| stage.name == "user").unwrap();
+        assert_eq!(user_stage.values["search.fast_only"], false);
+        let final_values = flatten_config_values(&loaded.config).expect("project final config");
+        assert_eq!(final_values["search.fast_only"], true);
+        assert_eq!(
+            source_for_key(
+                "search.fast_only",
+                &final_values["search.fast_only"],
+                &snapshots
+            ),
+            "project"
+        );
+        assert_eq!(final_values["search.quality_timeout_ms"], 250);
+        assert_eq!(
+            source_for_key(
+                "search.quality_timeout_ms",
+                &final_values["search.quality_timeout_ms"],
+                &snapshots,
+            ),
+            "user"
+        );
+    }
+
+    #[test]
+    fn config_inspection_attributes_profile_defaults_and_safety_clamps_to_policy() {
+        let dir = tempdir().expect("tempdir");
+        let env = HashMap::new();
+        for cli in [
+            CliOverrides {
+                profile: Some(PressureProfile::Strict),
+                ..CliOverrides::default()
+            },
+            CliOverrides {
+                profile: Some(PressureProfile::Performance),
+                fast_only: Some(false),
+                hard_pause_requested: Some(true),
+                ..CliOverrides::default()
+            },
+        ] {
+            let loaded = load_from_sources(None, &env, &cli, dir.path())
+                .expect("load profile-derived config");
+            let snapshots = build_stage_snapshots(&env, &cli, dir.path(), None, None, None)
+                .expect("inspect pre-policy values");
+            assert_eq!(snapshots.last().unwrap().values["search.fast_only"], false);
+            let final_values = flatten_config_values(&loaded.config).expect("project final config");
+            assert_eq!(final_values["search.fast_only"], true);
+            assert_eq!(
+                source_for_key(
+                    "search.fast_only",
+                    &final_values["search.fast_only"],
+                    &snapshots
+                ),
+                "pressure_profile"
+            );
+            assert_eq!(
+                source_for_key(
+                    "search.quality_timeout_ms",
+                    &final_values["search.quality_timeout_ms"],
+                    &snapshots,
+                ),
+                "defaults"
+            );
+        }
+    }
+
+    #[test]
+    fn config_inspection_does_not_bypass_winning_strict_false_rejection() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fsfs.toml");
+        std::fs::write(
+            &path,
+            "[pressure]\nprofile = 'strict'\n[search]\nfast_only = false\n",
+        )
+        .expect("write config");
+        let error = load_from_sources(
+            Some(&path),
+            &HashMap::<String, String>::new(),
+            &CliOverrides::default(),
+            dir.path(),
+        )
+        .expect_err("a winning forbidden request still rejects the command before inspection");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, value, reason }
+                if field == "search.fast_only" && value == "false" && reason.contains("strict")
+        ));
     }
 
     #[test]

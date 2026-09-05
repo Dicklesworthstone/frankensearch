@@ -38,7 +38,7 @@ pub const STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER: &str = "{index_dir}";
 pub const DEFAULT_STORAGE_DB_PATH: &str = "{index_dir}/catalog.db";
 
 /// Versioned profile contract revision for pressure-profile policy resolution.
-pub const PRESSURE_PROFILE_VERSION: u16 = 1;
+pub const PRESSURE_PROFILE_VERSION: u16 = 2;
 
 /// Deterministic precedence chain for profile-managed fields.
 pub const PROFILE_PRECEDENCE_CHAIN: [&str; 5] = [
@@ -275,9 +275,10 @@ const PERFORMANCE_OVERRIDABLE_FIELDS: &[PressureProfileField] = &[
     PressureProfileField::SchedulerMode,
     PressureProfileField::MaxEmbedConcurrency,
     PressureProfileField::MaxIndexConcurrency,
+    PressureProfileField::QualityEnabled,
     PressureProfileField::AllowBackgroundIndexing,
 ];
-const PERFORMANCE_LOCKED_FIELDS: &[PressureProfileField] = &[PressureProfileField::QualityEnabled];
+const PERFORMANCE_LOCKED_FIELDS: &[PressureProfileField] = &[];
 const DEGRADED_LOCKED_FIELDS: &[PressureProfileField] = &[
     PressureProfileField::SchedulerMode,
     PressureProfileField::MaxEmbedConcurrency,
@@ -1583,11 +1584,7 @@ pub fn load_from_sources<S>(
 where
     S: BuildHasher,
 {
-    let expanded_config_file = config_file.map(|path| expand_home_prefix(path, home_dir));
-    let (toml_contents, config_file_used) = match expanded_config_file {
-        Some(path) if path.exists() => (Some(fs::read_to_string(&path)?), Some(path)),
-        Some(_) | None => (None, None),
-    };
+    let (toml_contents, config_file_used) = read_config_source(config_file, home_dir)?;
 
     load_from_str(
         toml_contents.as_deref(),
@@ -1615,18 +1612,8 @@ pub fn load_from_layered_sources<S>(
 where
     S: BuildHasher,
 {
-    let expanded_user_config = user_config_file.map(|path| expand_home_prefix(path, home_dir));
-    let expanded_project_config =
-        project_config_file.map(|path| expand_home_prefix(path, home_dir));
-
-    let (user_toml, user_config_used) = match expanded_user_config {
-        Some(path) if path.exists() => (Some(fs::read_to_string(&path)?), Some(path)),
-        Some(_) | None => (None, None),
-    };
-    let (project_toml, project_config_used) = match expanded_project_config {
-        Some(path) if path.exists() => (Some(fs::read_to_string(&path)?), Some(path)),
-        Some(_) | None => (None, None),
-    };
+    let (user_toml, user_config_used) = read_config_source(user_config_file, home_dir)?;
+    let (project_toml, project_config_used) = read_config_source(project_config_file, home_dir)?;
 
     load_from_str_layers(
         user_toml.as_deref(),
@@ -1637,6 +1624,52 @@ where
         cli,
         home_dir,
     )
+}
+
+/// Project layered source values for config inspection, without validating
+/// intermediate values or applying pressure-profile resolution.
+///
+/// Use only to inspect provenance after the complete operational config has
+/// loaded successfully. A lower-precedence stage can contain an invalid request
+/// that a later overlay replaces; this projection is not a runnable config.
+/// Parsing, relative paths, and overlay precedence match the normal loader.
+///
+/// # Errors
+///
+/// Returns `SearchError::InvalidConfig` for parse failures and `SearchError::Io`
+/// if reading a present file fails.
+pub fn project_layered_sources_for_inspection<S>(
+    project_config_file: Option<&Path>,
+    user_config_file: Option<&Path>,
+    env: &HashMap<String, String, S>,
+    cli: &CliOverrides,
+    home_dir: &Path,
+) -> SearchResult<FsfsConfig>
+where
+    S: BuildHasher,
+{
+    let (user_toml, user_config_used) = read_config_source(user_config_file, home_dir)?;
+    let (project_toml, project_config_used) = read_config_source(project_config_file, home_dir)?;
+    let projection = project_from_str_layers(
+        user_toml.as_deref(),
+        user_config_used.as_deref(),
+        project_toml.as_deref(),
+        project_config_used.as_deref(),
+        env,
+        cli,
+        home_dir,
+    )?;
+    Ok(projection.config)
+}
+
+fn read_config_source(
+    config_file: Option<&Path>,
+    home_dir: &Path,
+) -> SearchResult<(Option<String>, Option<PathBuf>)> {
+    match config_file.map(|path| expand_home_prefix(path, home_dir)) {
+        Some(path) if path.exists() => Ok((Some(fs::read_to_string(&path)?), Some(path))),
+        Some(_) | None => Ok((None, None)),
+    }
 }
 
 /// Load config from raw TOML/env/CLI overlays using the fsfs precedence
@@ -1745,6 +1778,67 @@ fn load_from_str_layers<S>(
 where
     S: BuildHasher,
 {
+    let ConfigSourceProjection {
+        mut config,
+        mut warnings,
+        file_profile_overrides,
+        env_report,
+        cli_profile_overrides,
+        path_expansions,
+    } = project_from_str_layers(
+        user_config_toml,
+        user_config_path,
+        project_config_toml,
+        project_config_path,
+        env,
+        cli,
+        home_dir,
+    )?;
+    validate_config(&config, &mut warnings)?;
+
+    let pressure_profile_resolution = resolve_pressure_profile(
+        &mut config,
+        file_profile_overrides,
+        env_report.profile_overrides,
+        cli_profile_overrides,
+        &mut warnings,
+    )?;
+
+    Ok(ConfigLoadResult {
+        config,
+        source_precedence: PRECEDENCE,
+        config_file_used: project_config_path
+            .or(user_config_path)
+            .map(Path::to_path_buf),
+        cli_flags_used: cli.used_flags(),
+        env_keys_used: env_report.keys_used,
+        pressure_profile_resolution,
+        warnings,
+        path_expansions,
+    })
+}
+
+struct ConfigSourceProjection {
+    config: FsfsConfig,
+    warnings: Vec<ConfigWarning>,
+    file_profile_overrides: ProfileSourceOverrides,
+    env_report: EnvOverrideReport,
+    cli_profile_overrides: ProfileSourceOverrides,
+    path_expansions: Vec<PathExpansion>,
+}
+
+fn project_from_str_layers<S>(
+    user_config_toml: Option<&str>,
+    user_config_path: Option<&Path>,
+    project_config_toml: Option<&str>,
+    project_config_path: Option<&Path>,
+    env: &HashMap<String, String, S>,
+    cli: &CliOverrides,
+    home_dir: &Path,
+) -> SearchResult<ConfigSourceProjection>
+where
+    S: BuildHasher,
+{
     let mut config = FsfsConfig::default();
     let mut warnings = Vec::new();
     let mut file_profile_overrides = ProfileSourceOverrides::default();
@@ -1776,26 +1870,12 @@ where
     let env_report = apply_env_overrides(&mut config, env)?;
     let cli_profile_overrides = apply_cli_overrides(&mut config, cli);
     let path_expansions = expand_tilde_paths(&mut config, home_dir);
-    validate_config(&config, &mut warnings)?;
-
-    let pressure_profile_resolution = resolve_pressure_profile(
-        &mut config,
-        file_profile_overrides,
-        env_report.profile_overrides,
-        cli_profile_overrides,
-        &mut warnings,
-    );
-
-    Ok(ConfigLoadResult {
+    Ok(ConfigSourceProjection {
         config,
-        source_precedence: PRECEDENCE,
-        config_file_used: project_config_path
-            .or(user_config_path)
-            .map(Path::to_path_buf),
-        cli_flags_used: cli.used_flags(),
-        env_keys_used: env_report.keys_used,
-        pressure_profile_resolution,
         warnings,
+        file_profile_overrides,
+        env_report,
+        cli_profile_overrides,
         path_expansions,
     })
 }
@@ -1852,7 +1932,7 @@ fn resolve_pressure_profile(
     env_overrides: ProfileSourceOverrides,
     cli_overrides: ProfileSourceOverrides,
     warnings: &mut Vec<ConfigWarning>,
-) -> PressureProfileResolution {
+) -> SearchResult<PressureProfileResolution> {
     // A pressure profile grants or denies the capability to run background
     // indexing; it does not itself request a long-lived watcher. Preserve the
     // command/config intent that was resolved before applying the capability
@@ -1865,39 +1945,52 @@ fn resolve_pressure_profile(
     let mut safety_clamps = Vec::new();
     let mut conflict_detected = false;
 
-    apply_profile_bool_override(
-        config.pressure.profile,
-        PressureProfileField::QualityEnabled,
-        ProfileOverrideSource::Config,
-        file_overrides.quality_enabled,
-        &mut effective.quality_enabled,
-        contract,
-        &mut overrides,
-        &mut conflict_detected,
-        warnings,
-    );
-    apply_profile_bool_override(
-        config.pressure.profile,
-        PressureProfileField::QualityEnabled,
-        ProfileOverrideSource::Env,
-        env_overrides.quality_enabled,
-        &mut effective.quality_enabled,
-        contract,
-        &mut overrides,
-        &mut conflict_detected,
-        warnings,
-    );
-    apply_profile_bool_override(
-        config.pressure.profile,
-        PressureProfileField::QualityEnabled,
-        ProfileOverrideSource::Cli,
-        cli_overrides.quality_enabled,
-        &mut effective.quality_enabled,
-        contract,
-        &mut overrides,
-        &mut conflict_detected,
-        warnings,
-    );
+    // Resolve requested work before enforcing the profile's capability ceiling.
+    // A superseded request must neither enable quality nor reject a valid
+    // higher-precedence fast-only request.
+    let quality_requests = [
+        (
+            ProfileOverrideSource::Config,
+            file_overrides.quality_enabled,
+        ),
+        (ProfileOverrideSource::Env, env_overrides.quality_enabled),
+        (ProfileOverrideSource::Cli, cli_overrides.quality_enabled),
+    ];
+    let winning_quality_request = quality_requests
+        .iter()
+        .rposition(|(_, requested)| requested.is_some());
+    for (position, (source, requested)) in quality_requests.into_iter().enumerate() {
+        let Some(requested) = requested else { continue };
+        let applied = Some(position) == winning_quality_request;
+        if applied {
+            if requested && !contract.quality_enabled {
+                let profile = match config.pressure.profile {
+                    PressureProfile::Strict => "strict",
+                    PressureProfile::Performance => "performance",
+                    PressureProfile::Degraded => "degraded",
+                };
+                return Err(SearchError::InvalidConfig {
+                    field: "search.fast_only".into(),
+                    value: "false".into(),
+                    reason: format!(
+                        "pressure profile {profile} disables quality; search.fast_only=false from {source:?} cannot enable it; use fast_only=true or select the performance profile"
+                    ),
+                });
+            }
+            effective.quality_enabled = requested;
+        }
+        overrides.push(PressureProfileOverrideDecision {
+            field: PressureProfileField::QualityEnabled,
+            source,
+            requested_value: requested.to_string(),
+            applied,
+            reason_code: if applied {
+                format!("override.applied.{}_field", override_source_label(source))
+            } else {
+                "override.superseded.higher_precedence".into()
+            },
+        });
+    }
 
     apply_profile_bool_override(
         config.pressure.profile,
@@ -1961,7 +2054,7 @@ fn resolve_pressure_profile(
         "profile.resolution.ok"
     };
 
-    PressureProfileResolution {
+    Ok(PressureProfileResolution {
         selected_profile: config.pressure.profile,
         overrides,
         effective,
@@ -1976,7 +2069,7 @@ fn resolve_pressure_profile(
             reason_code: diagnostics_reason_code.into(),
             effective_profile_version: PRESSURE_PROFILE_VERSION,
         },
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3397,20 +3490,56 @@ mod tests {
     #[test]
     fn profile_resolution_rejects_locked_quality_override() {
         let file = "\
-[pressure]\nprofile = \"performance\"\n\
-[search]\nfast_only = true\n";
+[pressure]\nprofile = \"strict\"\n\
+[search]\nfast_only = false\n";
 
-        let result = load_from_str(
+        let error = load_from_str(
             Some(file),
             None,
             &HashMap::new(),
             &CliOverrides::default(),
             home(),
         )
-        .expect("load config");
+        .expect_err("strict profile cannot enable quality");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, value, reason }
+                if field == "search.fast_only" && value == "false" && reason.contains("strict")
+        ));
+    }
 
-        assert!(!result.config.search.fast_only);
-        assert!(result.pressure_profile_resolution.conflict_detected);
+    #[test]
+    fn fast_only_performance_honors_file_env_aliases_and_cli() {
+        let file = "[search]\nfast_only = true\n";
+        let configured = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .unwrap();
+        assert!(configured.config.search.fast_only);
+        for key in [
+            "FRANKENSEARCH_FAST_ONLY",
+            "FRANKENSEARCH_SEARCH_FAST_ONLY",
+            "FSFS_FAST_ONLY",
+            "FSFS_SEARCH_FAST_ONLY",
+        ] {
+            let env = HashMap::from([(key.to_owned(), "true".to_owned())]);
+            let result = load_from_str(None, None, &env, &CliOverrides::default(), home()).unwrap();
+            assert!(result.config.search.fast_only, "environment source {key}");
+            assert!(result.env_keys_used.iter().any(|used| used == key));
+            assert!(!result.pressure_profile_resolution.conflict_detected);
+        }
+        let cli = CliOverrides {
+            fast_only: Some(true),
+            ..CliOverrides::default()
+        };
+        let result = load_from_str(None, None, &HashMap::new(), &cli, home()).unwrap();
+        assert!(result.config.search.fast_only);
+        assert!(!result.pressure_profile_resolution.effective.quality_enabled);
+        assert!(!result.pressure_profile_resolution.conflict_detected);
         assert_eq!(
             result
                 .pressure_profile_resolution
@@ -3418,18 +3547,179 @@ mod tests {
                 .effective_profile_version,
             PRESSURE_PROFILE_VERSION
         );
-        assert!(
-            result
-                .pressure_profile_resolution
-                .overrides
-                .iter()
-                .any(|decision| {
-                    decision.field == PressureProfileField::QualityEnabled
-                        && decision.source == ProfileOverrideSource::Config
-                        && !decision.applied
-                        && decision.reason_code == "override.rejected.locked_field"
-                })
-        );
+    }
+
+    #[test]
+    fn fast_only_cli_env_file_precedence_works_in_both_directions() {
+        for (file_value, env_value, cli_value, expected) in [
+            (false, None, None, false),
+            (true, None, None, true),
+            (false, Some(true), None, true),
+            (true, Some(false), None, false),
+            (false, Some(false), Some(true), true),
+            (true, Some(true), Some(false), false),
+            (true, Some(false), Some(true), true),
+            (false, Some(true), Some(false), false),
+        ] {
+            let file = format!("[search]\nfast_only = {file_value}\n");
+            let env = env_value.map_or_else(HashMap::new, |value: bool| {
+                HashMap::from([("FRANKENSEARCH_FAST_ONLY".to_owned(), value.to_string())])
+            });
+            let cli = CliOverrides {
+                fast_only: cli_value,
+                ..CliOverrides::default()
+            };
+            let result = load_from_str(Some(&file), None, &env, &cli, home()).unwrap();
+            assert_eq!(result.config.search.fast_only, expected);
+            assert_eq!(
+                result.pressure_profile_resolution.effective.quality_enabled,
+                !expected
+            );
+            assert!(!result.pressure_profile_resolution.conflict_detected);
+            assert_eq!(
+                result
+                    .pressure_profile_resolution
+                    .overrides
+                    .iter()
+                    .filter(|decision| {
+                        decision.field == PressureProfileField::QualityEnabled && decision.applied
+                    })
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn fast_only_project_over_user_and_canonical_over_legacy_env() {
+        for (user_value, project_value) in [(false, true), (true, false)] {
+            let user = format!("[search]\nfast_only = {user_value}\n");
+            let project = format!("[search]\nfast_only = {project_value}\n");
+            let result = super::load_from_str_layers(
+                Some(&user),
+                None,
+                Some(&project),
+                None,
+                &HashMap::new(),
+                &CliOverrides::default(),
+                home(),
+            )
+            .unwrap();
+            assert_eq!(result.config.search.fast_only, project_value);
+            let env = HashMap::from([
+                ("FRANKENSEARCH_FAST_ONLY".into(), project_value.to_string()),
+                (
+                    "FRANKENSEARCH_SEARCH_FAST_ONLY".into(),
+                    user_value.to_string(),
+                ),
+                ("FSFS_FAST_ONLY".into(), user_value.to_string()),
+                ("FSFS_SEARCH_FAST_ONLY".into(), user_value.to_string()),
+            ]);
+            let result = load_from_str(None, None, &env, &CliOverrides::default(), home()).unwrap();
+            assert_eq!(result.config.search.fast_only, project_value);
+        }
+    }
+
+    #[test]
+    fn fast_only_profile_defaults_respect_quality_capability() {
+        for (profile, expected_fast_only) in [
+            (super::PressureProfile::Performance, false),
+            (super::PressureProfile::Strict, true),
+            (super::PressureProfile::Degraded, true),
+        ] {
+            let cli = CliOverrides {
+                profile: Some(profile),
+                ..CliOverrides::default()
+            };
+            let result = load_from_str(None, None, &HashMap::new(), &cli, home()).unwrap();
+            assert_eq!(result.config.search.fast_only, expected_fast_only);
+        }
+    }
+
+    #[test]
+    fn fast_only_strict_and_degraded_reject_winning_false_from_each_source() {
+        for profile in ["strict", "degraded"] {
+            for source in [
+                ProfileOverrideSource::Config,
+                ProfileOverrideSource::Env,
+                ProfileOverrideSource::Cli,
+            ] {
+                let mut file = format!("[pressure]\nprofile = \"{profile}\"\n");
+                let mut env = HashMap::new();
+                let mut cli = CliOverrides::default();
+                match source {
+                    ProfileOverrideSource::Config => {
+                        file.push_str("[search]\nfast_only = false\n");
+                    }
+                    ProfileOverrideSource::Env => {
+                        env.insert("FRANKENSEARCH_FAST_ONLY".into(), "false".into());
+                    }
+                    ProfileOverrideSource::Cli => cli.fast_only = Some(false),
+                }
+                let error = load_from_str(Some(&file), None, &env, &cli, home()).unwrap_err();
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field, value, reason }
+                        if field == "search.fast_only" && value == "false"
+                            && reason.contains(profile) && reason.contains(&format!("{source:?}"))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn fast_only_strict_and_degraded_accept_true_over_superseded_false() {
+        for profile in ["strict", "degraded"] {
+            let file =
+                format!("[pressure]\nprofile = \"{profile}\"\n[search]\nfast_only = false\n");
+            let env = HashMap::from([("FRANKENSEARCH_FAST_ONLY".into(), "false".into())]);
+            let cli = CliOverrides {
+                fast_only: Some(true),
+                ..CliOverrides::default()
+            };
+            let result = load_from_str(Some(&file), None, &env, &cli, home()).unwrap();
+            assert!(result.config.search.fast_only);
+            assert!(!result.pressure_profile_resolution.conflict_detected);
+            let decisions = &result.pressure_profile_resolution.overrides;
+            assert!(decisions.iter().any(|decision| {
+                decision.source == ProfileOverrideSource::Cli && decision.applied
+            }));
+            assert_eq!(
+                decisions
+                    .iter()
+                    .filter(|decision| {
+                        decision.reason_code == "override.superseded.higher_precedence"
+                    })
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn fast_only_hard_pause_cannot_be_overridden_by_either_request() {
+        for fast_only in [false, true] {
+            let cli = CliOverrides {
+                fast_only: Some(fast_only),
+                hard_pause_requested: Some(true),
+                ..CliOverrides::default()
+            };
+            let result = load_from_str(None, None, &HashMap::new(), &cli, home()).unwrap();
+            assert!(result.config.search.fast_only);
+            assert!(!result.pressure_profile_resolution.effective.quality_enabled);
+            if !fast_only {
+                assert!(
+                    result
+                        .pressure_profile_resolution
+                        .safety_clamps
+                        .iter()
+                        .any(|clamp| {
+                            clamp.field == PressureProfileField::QualityEnabled
+                                && clamp.reason_code == "safety.clamp.hard_pause.quality_enabled"
+                        })
+                );
+            }
+        }
     }
 
     #[test]
@@ -4555,7 +4845,12 @@ mod tests {
     #[test]
     fn performance_contract_locked_fields() {
         let contract = super::PressureProfile::Performance.contract();
-        assert!(contract.is_locked_field(PressureProfileField::QualityEnabled));
+        assert!(!contract.is_locked_field(PressureProfileField::QualityEnabled));
+        assert!(
+            contract
+                .overridable_fields
+                .contains(&PressureProfileField::QualityEnabled)
+        );
         assert!(!contract.is_locked_field(PressureProfileField::AllowBackgroundIndexing));
         assert!(!contract.is_locked_field(PressureProfileField::MaxEmbedConcurrency));
         assert!(!contract.is_locked_field(PressureProfileField::SchedulerMode));
@@ -5478,7 +5773,8 @@ shadow_score_epsilon = 0.0002
     #[test]
     fn contract_payloads_filter_non_config_reason_codes() {
         let file = "\
-[pressure]\nprofile = \"performance\"\n\
+[pressure]\nprofile = \"strict\"\n\
+[indexing]\nwatch_mode = true\n\
 [search]\nfast_only = true\n\
 [fantasy]\nfoo = 42\n";
 
@@ -5502,7 +5798,7 @@ shadow_score_epsilon = 0.0002
         assert_eq!(effective.kind, "fsfs_config_effective");
         assert_eq!(effective.v, super::CONFIG_SCHEMA_VERSION);
         assert_eq!(effective.resolved_at_ts, "2026-02-14T03:30:00Z");
-        assert!(!effective.values.search.fast_only);
+        assert!(effective.values.search.fast_only);
         assert!(
             effective
                 .diagnostics
@@ -5515,7 +5811,10 @@ shadow_score_epsilon = 0.0002
                 .iter()
                 .any(|warning| warning.reason_code == "override.rejected.locked_field")
         );
-        assert!(effective.conflict_warnings.is_empty());
+        assert_eq!(
+            effective.conflict_warnings,
+            vec!["config.search.fast_only_with_quality_model".to_owned()]
+        );
     }
 
     // ── Shadow-oracle contract fields (bd-95mp) ──

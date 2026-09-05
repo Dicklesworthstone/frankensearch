@@ -2574,8 +2574,11 @@ impl std::error::Error for PublicationLeaseBusy {}
 ///
 /// The authority is an exclusive non-blocking `flock(2)` on
 /// `<index_root>/fsfs.publication.lock` — the same primitive the Quill keeper
-/// uses one layer down for its engine directory. The kernel releases the lock
-/// when the holder dies, so there is no stale-lease recovery protocol.
+/// uses one layer down for its engine directory. Owner drop explicitly releases
+/// the lock even if an incidental duplicate descriptor survives. On abrupt
+/// termination, the kernel releases it when the last descriptor closes, so
+/// there is no stale-lease recovery protocol. An inherited child lease cannot
+/// publish or release the creator's authority.
 /// Non-flock platforms fail closed rather than pretending exclusion.
 ///
 /// Holders must call [`Self::fence`] immediately before each publication
@@ -2585,7 +2588,10 @@ impl std::error::Error for PublicationLeaseBusy {}
 #[derive(Debug)]
 pub struct PublicationLease {
     lock_path: PathBuf,
+    #[cfg(unix)]
     lock_file: std::fs::File,
+    #[cfg(unix)]
+    creator_pid: u32,
     #[cfg(unix)]
     lock_device: u64,
     #[cfg(unix)]
@@ -2606,7 +2612,7 @@ impl PublicationLease {
     pub fn acquire(index_root: &Path) -> frankensearch_core::SearchResult<Self> {
         use rustix::fs::{FlockOperation, OFlags, flock};
         use std::io::{Read, Seek, SeekFrom, Write};
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         std::fs::create_dir_all(index_root)?;
         let lock_path = index_root.join(PUBLICATION_LOCK_FILE_NAME);
@@ -2623,7 +2629,8 @@ impl PublicationLease {
             .truncate(false)
             .custom_flags(no_follow)
             .open(&lock_path)?;
-        if !lock_file.metadata()?.file_type().is_file() {
+        let lock_metadata = lock_file.metadata()?;
+        if !lock_metadata.file_type().is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("{} must be a regular file", lock_path.display()),
@@ -2657,22 +2664,20 @@ impl PublicationLease {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs())
         );
-        lock_file.set_len(0)?;
-        lock_file.seek(SeekFrom::Start(0))?;
-        lock_file.write_all(record.as_bytes())?;
-        lock_file.sync_all()?;
-        let lock_metadata = {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = lock_file.metadata()?;
-            (metadata.dev(), metadata.ino())
-        };
-        let lease = Self {
+        // Own the lock before any fallible record initialization. Error exits
+        // must release it even if another thread forked with the descriptor.
+        let mut lease = Self {
             lock_path,
             lock_file,
-            lock_device: lock_metadata.0,
-            lock_inode: lock_metadata.1,
+            creator_pid: std::process::id(),
+            lock_device: lock_metadata.dev(),
+            lock_inode: lock_metadata.ino(),
             owner_record: record,
         };
+        lease.lock_file.set_len(0)?;
+        lease.lock_file.seek(SeekFrom::Start(0))?;
+        lease.lock_file.write_all(lease.owner_record.as_bytes())?;
+        lease.lock_file.sync_all()?;
         lease.fence("publication-lease admission")?;
         Ok(lease)
     }
@@ -2696,7 +2701,8 @@ impl PublicationLease {
 
     /// Revalidate the held lock immediately before a publication boundary.
     ///
-    /// Confirms that the still-open descriptor and the lock pathname both
+    /// Confirms that this process acquired the lease and that the still-open
+    /// descriptor and the lock pathname both
     /// resolve to the inode observed at acquisition and that the sealed owner
     /// record is unchanged. A deleted/recreated (or symlink-substituted) lock
     /// file fails the check, so a holder racing a second acquirer aborts its
@@ -2705,7 +2711,7 @@ impl PublicationLease {
     /// # Errors
     ///
     /// Returns `SearchError::SubsystemError` (subsystem `publication-lease`)
-    /// when the lock identity or owner record changed, and `SearchError::Io`
+    /// when the process, lock identity or owner record changed, and `SearchError::Io`
     /// for filesystem failures (including a lock file that no longer exists).
     #[cfg(unix)]
     pub fn fence(&self, boundary: &'static str) -> frankensearch_core::SearchResult<()> {
@@ -2715,6 +2721,13 @@ impl PublicationLease {
             subsystem: "publication-lease",
             source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, detail)),
         };
+
+        if self.creator_pid != std::process::id() {
+            return Err(fenced(format!(
+                "{boundary}: publication lease belongs to creator pid {}, not this process",
+                self.creator_pid
+            )));
+        }
 
         let descriptor = self.lock_file.metadata()?;
         if !descriptor.file_type().is_file()
@@ -2783,9 +2796,19 @@ impl PublicationLease {
 
 impl Drop for PublicationLease {
     fn drop(&mut self) {
-        // Clear the diagnostic record; closing the descriptor releases the
-        // flock itself.
-        let _ = self.lock_file.set_len(0);
+        #[cfg(unix)]
+        if self.creator_pid == std::process::id() {
+            // Clear while still exclusive, then release the shared open file
+            // description even if an incidental duplicate outlives this owner.
+            // A child only closes its copy: truncation or unlock there would
+            // invalidate the creator's live lease.
+            let _ = self.lock_file.set_len(0);
+            if let Err(error) =
+                rustix::fs::flock(&self.lock_file, rustix::fs::FlockOperation::Unlock)
+            {
+                warn!(%error, "publication lease explicit unlock failed; closing its descriptor");
+            }
+        }
     }
 }
 
@@ -2820,6 +2843,60 @@ mod tests {
         let reacquired = PublicationLease::acquire(root.path())
             .expect("lease must be reacquirable after the holder releases");
         drop(reacquired);
+    }
+
+    /// A real duplicate shares the open file description, as an incidental
+    /// fork/exec inheritance would. This test does not execute a fork.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn publication_lease_owner_release_survives_a_retained_duplicate() {
+        let root = tempfile::tempdir().expect("index root");
+        let owner = PublicationLease::acquire(root.path()).expect("owner acquires");
+        let retained = owner.lock_file.try_clone().expect("retain descriptor");
+
+        PublicationLease::acquire(root.path()).expect_err("live owner excludes contenders");
+        owner.fence("before owner release").expect("owner intact");
+        drop(owner);
+
+        let next = PublicationLease::acquire(root.path())
+            .expect("owner release admits next holder despite the retained descriptor");
+        next.fence("after owner release")
+            .expect("next owner intact");
+        drop(retained);
+        PublicationLease::acquire(root.path())
+            .expect_err("closing an old duplicate must not release the next holder");
+        next.fence("after duplicate close")
+            .expect("next owner intact");
+    }
+
+    /// Exercise the noncreator branch using a real duplicate and a substituted
+    /// creator PID. No fork or child-process execution is claimed by this test.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn publication_lease_noncreator_cannot_publish_clear_or_unlock() {
+        let root = tempfile::tempdir().expect("index root");
+        let owner = PublicationLease::acquire(root.path()).expect("owner acquires");
+        let inherited = PublicationLease {
+            lock_path: owner.lock_path.clone(),
+            lock_file: owner.lock_file.try_clone().expect("retain descriptor"),
+            creator_pid: std::process::id().wrapping_add(1),
+            lock_device: owner.lock_device,
+            lock_inode: owner.lock_inode,
+            owner_record: owner.owner_record.clone(),
+        };
+        let error = inherited
+            .fence("child publication")
+            .expect_err("creator only");
+        assert!(error.to_string().contains("belongs to creator pid"));
+        drop(inherited);
+
+        owner
+            .fence("after child drop")
+            .expect("record and inode intact");
+        PublicationLease::acquire(root.path()).expect_err("creator still excludes contenders");
+        drop(owner);
+        let next = PublicationLease::acquire(root.path()).expect("creator released");
+        next.fence("next publication").expect("next owner intact");
     }
 
     #[test]

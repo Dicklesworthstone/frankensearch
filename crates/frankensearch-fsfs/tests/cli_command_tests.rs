@@ -1023,12 +1023,30 @@ fn explain_accepts_the_rank_and_path_that_search_prints() {
     assert!(!unknown.status.success(), "rank 999 must not resolve");
 }
 
-/// bd-k7x34: the default `performance` profile locks the quality stage on,
-/// so `--fast-only` is rejected; that rejection must be visible at the
-/// command that asked for it, not only under `fsfs config`.
+/// bd-k7x34: performance permits an explicit fast-only request. This legacy
+/// fixture checks resolved policy and returned results; actual model coverage
+/// lives in the default-build quickstart test.
 #[test]
-fn fast_only_under_performance_profile_warns_on_stderr() {
+fn fast_only_under_performance_profile_is_applied_without_rejection() {
     let (temp, ctx, index_arg) = indexed_fixture();
+
+    let configured = ctx.run(
+        temp.path(),
+        &[
+            "config",
+            "--profile",
+            "performance",
+            "--fast-only",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("config --fast-only", &configured);
+    let config = parse_json("effective fast-only policy", &configured);
+    assert_eq!(
+        config.pointer("/data/values/search/fast_only"),
+        Some(&Value::Bool(true))
+    );
 
     let output = ctx.run(
         temp.path(),
@@ -1038,17 +1056,29 @@ fn fast_only_under_performance_profile_warns_on_stderr() {
             "--index-dir",
             &index_arg,
             "--no-watch-mode",
+            "--profile",
+            "performance",
             "--fast-only",
             "--format",
             "json",
         ],
     );
     assert_success("search --fast-only", &output);
+    let payload = parse_json("fast-only search", &output);
+    assert_eq!(
+        payload.pointer("/data/phase").and_then(Value::as_str),
+        Some("initial")
+    );
+    assert!(
+        payload
+            .pointer("/data/hits")
+            .and_then(Value::as_array)
+            .is_some_and(|hits| !hits.is_empty())
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("override.rejected.locked_field")
-            && stderr.contains("FRANKENSEARCH_PRESSURE_PROFILE=strict"),
-        "the rejected --fast-only override must be reported on stderr: {stderr}"
+        !stderr.contains("override.rejected.locked_field"),
+        "an admitted fast-only request must not report rejection: {stderr}"
     );
 }
 

@@ -1,7 +1,7 @@
 //! Pressure profile contract types for fsfs.
 //!
 //! This module defines the data structures for the fsfs pressure profiles
-//! contract v1, which specifies:
+//! schema v1 and profile revision 2, which specify:
 //! - Profile configurations (strict, performance, degraded)
 //! - Override policies and field locking
 //! - Resolution decisions with safety clamps
@@ -174,9 +174,10 @@ impl Default for ProfileSet {
                         ProfileField::SchedulerMode,
                         ProfileField::MaxEmbedConcurrency,
                         ProfileField::MaxIndexConcurrency,
+                        ProfileField::QualityEnabled,
                         ProfileField::AllowBackgroundIndexing,
                     ],
-                    locked_fields: vec![ProfileField::QualityEnabled],
+                    locked_fields: Vec::new(),
                 },
             },
             degraded: ProfileConfig {
@@ -217,7 +218,7 @@ pub struct MigrationPolicy {
 impl Default for MigrationPolicy {
     fn default() -> Self {
         Self {
-            profile_version: 1,
+            profile_version: u32::from(crate::config::PRESSURE_PROFILE_VERSION),
             requires_revision_bump_on_semantic_change: true,
             drift_protection: DriftProtection::ExplicitMigrationRequired,
             deprecated_fields: Vec::new(),
@@ -409,7 +410,7 @@ impl Default for ResolutionDiagnostics {
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),
-            effective_profile_version: CONTRACT_VERSION,
+            effective_profile_version: u32::from(crate::config::PRESSURE_PROFILE_VERSION),
         }
     }
 }
@@ -498,6 +499,59 @@ mod tests {
         let contract = PressureProfilesContractDefinition::default();
         assert_eq!(contract.kind, KIND_CONTRACT_DEFINITION);
         assert_eq!(contract.v, CONTRACT_VERSION);
+        assert_eq!(contract.migration_policy.profile_version, 2);
+    }
+
+    #[test]
+    fn current_profile_contract_matches_runtime_capabilities_and_revision() {
+        let contract = PressureProfilesContractDefinition::default();
+        for (profile_id, profile) in [
+            (ProfileId::Strict, crate::config::PressureProfile::Strict),
+            (
+                ProfileId::Performance,
+                crate::config::PressureProfile::Performance,
+            ),
+            (
+                ProfileId::Degraded,
+                crate::config::PressureProfile::Degraded,
+            ),
+        ] {
+            let cli = crate::config::CliOverrides {
+                profile: Some(profile),
+                ..crate::config::CliOverrides::default()
+            };
+            let loaded = crate::config::load_from_str(
+                None,
+                None,
+                &std::collections::HashMap::new(),
+                &cli,
+                std::path::Path::new("/home/tester"),
+            )
+            .unwrap();
+            let resolved = loaded.pressure_profile_resolution;
+            let declared = contract.get_profile(profile_id);
+            assert_eq!(declared.quality_enabled, resolved.effective.quality_enabled);
+            assert_eq!(
+                declared.max_embed_concurrency,
+                resolved.effective.max_embed_concurrency
+            );
+            assert_eq!(
+                declared.max_index_concurrency,
+                resolved.effective.max_index_concurrency
+            );
+            assert_eq!(
+                serde_json::to_value(&declared.override_policy).unwrap(),
+                serde_json::to_value(&resolved.effective.override_policy).unwrap()
+            );
+            assert_eq!(
+                contract.migration_policy.profile_version,
+                u32::from(resolved.diagnostics.effective_profile_version)
+            );
+            assert_eq!(
+                ResolutionDiagnostics::default().effective_profile_version,
+                contract.migration_policy.profile_version
+            );
+        }
     }
 
     #[test]
@@ -533,8 +587,8 @@ mod tests {
         assert!(contract.is_field_locked(ProfileId::Strict, ProfileField::QualityEnabled));
         assert!(!contract.is_field_locked(ProfileId::Strict, ProfileField::SchedulerMode));
 
-        // Performance profile has quality_enabled locked
-        assert!(contract.is_field_locked(ProfileId::Performance, ProfileField::QualityEnabled));
+        // Performance permits callers to restrict quality work.
+        assert!(!contract.is_field_locked(ProfileId::Performance, ProfileField::QualityEnabled));
         assert!(
             !contract.is_field_locked(ProfileId::Performance, ProfileField::MaxEmbedConcurrency)
         );
@@ -551,6 +605,9 @@ mod tests {
         // Strict profile allows scheduler_mode override
         assert!(contract.is_field_overridable(ProfileId::Strict, ProfileField::SchedulerMode));
         assert!(!contract.is_field_overridable(ProfileId::Strict, ProfileField::QualityEnabled));
+        assert!(
+            contract.is_field_overridable(ProfileId::Performance, ProfileField::QualityEnabled)
+        );
 
         // Degraded profile allows nothing
         assert!(!contract.is_field_overridable(ProfileId::Degraded, ProfileField::SchedulerMode));
@@ -651,7 +708,8 @@ mod tests {
 
     #[test]
     fn golden_contract_roundtrip() {
-        // Verify we can parse the golden contract definition
+        // Historical profile revision 1 remains a serialization example;
+        // it does not define the current runtime capability policy.
         let golden = r#"{
           "kind": "fsfs_pressure_profiles_contract_definition",
           "v": 1,
@@ -718,7 +776,7 @@ mod tests {
 
     #[test]
     fn golden_resolution_roundtrip() {
-        // Verify we can parse the golden resolution
+        // Historical profile revision 1 resolution, not current runtime policy.
         let golden = r#"{
           "kind": "fsfs_pressure_profile_resolution",
           "v": 1,
