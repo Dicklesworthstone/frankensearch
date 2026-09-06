@@ -330,28 +330,7 @@ impl ModelArtifactManifestV1 {
     /// Returns `InvalidConfig` if the immutable upstream artifact metadata or
     /// native execution contract is incomplete.
     pub fn minilm_native_frankentorch() -> SearchResult<Self> {
-        let mut download_manifest = ModelManifest::minilm_v2();
-        let weights = download_manifest
-            .files
-            .iter_mut()
-            .find(|file| file.name == "onnx/model.onnx")
-            .ok_or_else(|| {
-                invalid_manifest_field(
-                    "artifacts[].role",
-                    "weights",
-                    "MiniLM download manifest is missing its registered weights artifact",
-                )
-            })?;
-        "model.safetensors".clone_into(&mut weights.name);
-        weights.url = Some(
-            "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/model.safetensors"
-                .to_owned(),
-        );
-        "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db"
-            .clone_into(&mut weights.sha256);
-        weights.size = 90_868_376;
-        download_manifest.download_size_bytes =
-            download_manifest.files.iter().map(|file| file.size).sum();
+        let download_manifest = ModelManifest::minilm_v2_native_weights()?;
         let execution = ModelExecutionContractV1 {
             backend: "frankentorch-native-minilm".to_owned(),
             implementation_revision:
@@ -1504,6 +1483,47 @@ impl ModelManifest {
         }
     }
 
+    /// The native artifacts retain the original model id when constructing
+    /// producer identities. Only the installation catalog uses a separate id.
+    fn minilm_v2_native_weights() -> SearchResult<Self> {
+        let mut manifest = Self::minilm_v2();
+        let weights = manifest
+            .files
+            .iter_mut()
+            .find(|file| file.name == "onnx/model.onnx")
+            .ok_or_else(|| {
+                invalid_manifest_field(
+                    "artifacts[].role",
+                    "weights",
+                    "MiniLM download manifest is missing its registered weights artifact",
+                )
+            })?;
+        "model.safetensors".clone_into(&mut weights.name);
+        weights.url = Some(
+            "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/model.safetensors"
+                .to_owned(),
+        );
+        "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db"
+            .clone_into(&mut weights.sha256);
+        weights.size = 90_868_376;
+        manifest.download_size_bytes = manifest.files.iter().map(|file| file.size).sum();
+        Ok(manifest)
+    }
+
+    /// Opt-in native `MiniLM` installation, separate from the ONNX directory.
+    /// The files also back the existing frozen int8 and F32 producer contracts.
+    #[must_use]
+    pub fn minilm_v2_native() -> Self {
+        let mut manifest = Self::minilm_v2_native_weights()
+            .expect("built-in MiniLM manifest contains its registered weights");
+        "all-minilm-l6-v2-native".clone_into(&mut manifest.id);
+        manifest.display_name = Some("All MiniLM L6 v2 native (quality tier)".to_owned());
+        manifest.description = Some(
+            "MiniLM-L6-v2 safetensors for explicit pure-Rust quality-tier inference".to_owned(),
+        );
+        manifest
+    }
+
     /// Opt-in manifest for multilingual `MiniLM` L12 sentence embeddings.
     ///
     /// This model is deliberately absent from [`Self::builtin_catalog`]: its
@@ -1986,7 +2006,7 @@ impl ModelManifest {
     pub fn opt_in_catalog() -> ModelManifestCatalog {
         ModelManifestCatalog {
             schema_version: MANIFEST_SCHEMA_VERSION,
-            models: vec![Self::multilingual_minilm_l12_v2()],
+            models: vec![Self::multilingual_minilm_l12_v2(), Self::minilm_v2_native()],
         }
     }
 
@@ -5333,7 +5353,10 @@ mod tests {
                 .any(|candidate| candidate.id == manifest.id)
         );
         let opt_in = ModelManifest::opt_in_catalog();
-        assert_eq!(opt_in.models, vec![manifest]);
+        assert_eq!(
+            opt_in.models,
+            vec![manifest, ModelManifest::minilm_v2_native()]
+        );
         opt_in.validate().unwrap();
     }
 

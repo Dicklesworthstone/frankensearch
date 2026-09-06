@@ -245,6 +245,8 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     );
 
     let blocking_pool = Arc::new(SearchBlockingPool::default());
+    #[cfg(feature = "rerank")]
+    let app_runtime = app_runtime.with_native_blocking_pool(blocking_pool.handle());
     let scheduler = RuntimeBuilder::current_thread()
         // ONNX calls and quality index scans must not block the executor
         // that publishes Initial and drives the refinement deadline.

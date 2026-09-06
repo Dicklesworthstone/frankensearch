@@ -888,6 +888,7 @@ struct SearchCacheKey {
     /// Bind persisted answers to the registered local producers without
     /// loading the quality model before Initial. Old keys fail deserialization.
     embedding_contracts: String,
+    quality_model: String,
     query: String,
     requested_limit: usize,
     mode: String,
@@ -4391,6 +4392,7 @@ struct DoctorCheck {
 /// Manifest id of the cross-encoder the rerank stage loads
 /// (`fsfs download-models ms-marco-minilm-l-6-v2`).
 const FSFS_RERANKER_MODEL_ID: &str = "ms-marco-minilm-l-6-v2";
+const FSFS_NATIVE_QUALITY_MODEL_ID: &str = "all-minilm-l6-v2-native";
 /// Runtime reason codes for the rerank stage; the planner's own
 /// `query.stage.rerank.*` codes cover the plan-level skips.
 const REASON_RERANK_NOT_REQUESTED: &str = "query.stage.rerank.disabled.not_requested";
@@ -4436,6 +4438,12 @@ impl Default for SearchBlockingPool {
 }
 
 impl SearchBlockingPool {
+    /// Capacity for models that require an explicit caller-owned worker pool.
+    #[must_use]
+    pub fn handle(&self) -> asupersync::runtime::blocking_pool::BlockingPoolHandle {
+        self.0.handle()
+    }
+
     /// Attach this owner's bounded capacity to the caller's live context.
     #[must_use]
     pub fn context(&self, cx: Cx) -> Cx {
@@ -4460,6 +4468,8 @@ pub struct FsfsRuntime {
     /// Retained across daemon/TUI clones. A timed-out model initialization
     /// keeps its permit until the actual blocking call ends.
     quality_load_gate: Arc<asupersync::sync::Mutex<()>>,
+    #[cfg(feature = "rerank")]
+    native_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
 }
 
 impl FsfsRuntime {
@@ -4470,7 +4480,21 @@ impl FsfsRuntime {
             cli_input: CliInput::default(),
             reranker: Arc::new(std::sync::OnceLock::new()),
             quality_load_gate: Arc::new(asupersync::sync::Mutex::new(())),
+            #[cfg(feature = "rerank")]
+            native_blocking_pool: None,
         }
+    }
+
+    /// Attach the caller's existing pool for explicitly selected native quality.
+    /// The caller retains the owner and drains it after all runtime clones exit.
+    #[cfg(feature = "rerank")]
+    #[must_use]
+    pub fn with_native_blocking_pool(
+        mut self,
+        pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+    ) -> Self {
+        self.native_blocking_pool = Some(pool);
+        self
     }
 
     #[must_use]
@@ -8080,6 +8104,7 @@ impl FsfsRuntime {
             ModelArtifactManifestV1::minilm_fastembed()?,
             ModelArtifactManifestV1::snowflake_fastembed()?,
             ModelArtifactManifestV1::nomic_fastembed()?,
+            ModelArtifactManifestV1::minilm_native_frankentorch_f32()?,
         ] {
             contracts.update(manifest.freeze()?.fingerprint.as_bytes());
         }
@@ -8094,6 +8119,7 @@ impl FsfsRuntime {
     ) -> SearchResult<SearchCacheKey> {
         Ok(SearchCacheKey {
             embedding_contracts: Self::registered_embedding_contracts()?,
+            quality_model: normalize_model_key(&self.config.indexing.quality_model),
             query: Self::normalize_search_query(query),
             requested_limit,
             mode: mode.label().to_owned(),
@@ -8113,6 +8139,7 @@ impl FsfsRuntime {
     fn search_cache_key_hash(key: &SearchCacheKey) -> String {
         let mut hasher = Sha256::new();
         hasher.update(key.embedding_contracts.as_bytes());
+        hasher.update(key.quality_model.as_bytes());
         hasher.update(key.query.as_bytes());
         hasher.update(key.requested_limit.to_le_bytes());
         hasher.update(key.mode.as_bytes());
@@ -12092,6 +12119,7 @@ impl FsfsRuntime {
         match manifest.id.as_str() {
             "potion-multilingual-128m" => "potion-multilingual-128M".to_owned(),
             "all-minilm-l6-v2" => "all-MiniLM-L6-v2".to_owned(),
+            FSFS_NATIVE_QUALITY_MODEL_ID => "all-MiniLM-L6-v2-native".to_owned(),
             "paraphrase-multilingual-minilm-l12-v2" => {
                 "paraphrase-multilingual-MiniLM-L12-v2".to_owned()
             }
@@ -14924,6 +14952,34 @@ impl FsfsRuntime {
     fn resolve_quality_embedder(&self) -> SearchResult<Option<Arc<dyn Embedder>>> {
         #[cfg(feature = "embedded-models")]
         self.prepare_bundled_semantic_models_for_execution()?;
+
+        if normalize_model_key(&self.config.indexing.quality_model) == FSFS_NATIVE_QUALITY_MODEL_ID
+        {
+            #[cfg(feature = "rerank")]
+            {
+                let pool = self.native_blocking_pool.clone().ok_or_else(|| {
+                    SearchError::EmbedderUnavailable {
+                        model: FSFS_NATIVE_QUALITY_MODEL_ID.to_owned(),
+                        reason: "native quality requires a caller-owned blocking pool; use FsfsRuntime::with_native_blocking_pool".to_owned(),
+                    }
+                })?;
+                let native = frankensearch_rerank::NativeEmbedder::load_model(
+                    PathBuf::from(&self.config.indexing.model_dir).join("all-MiniLM-L6-v2-native"),
+                    frankensearch_rerank::NativeEmbeddingModel::AllMiniLmL6V2F32,
+                )?
+                .with_blocking_pool(pool);
+                info!(
+                    quality_embedder = native.id(),
+                    "fsfs selected verified native F32 quality model"
+                );
+                return Ok(Some(Arc::new(native)));
+            }
+            #[cfg(not(feature = "rerank"))]
+            return Err(SearchError::EmbedderUnavailable {
+                model: FSFS_NATIVE_QUALITY_MODEL_ID.to_owned(),
+                reason: "this fsfs build has no native backend; rebuild with the rerank feature (enabled by default)".to_owned(),
+            });
+        }
 
         #[cfg(test)]
         {

@@ -837,6 +837,8 @@ impl Default for DiscoveryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexingConfig {
     pub fast_model: String,
+    /// Default quality detection, or `all-MiniLM-L6-v2-native` to select
+    /// verified native F32 inference. Empty disables the quality tier.
     pub quality_model: String,
     pub model_dir: String,
     /// Forbid all model-network acquisition while still permitting verified
