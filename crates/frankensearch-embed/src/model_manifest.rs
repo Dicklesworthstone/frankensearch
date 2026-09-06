@@ -5339,6 +5339,21 @@ mod tests {
     }
 
     #[test]
+    fn native_minilm_download_preserves_frozen_producer_artifacts() {
+        let download = ModelManifest::minilm_v2_native();
+        download.validate().unwrap();
+        assert!(download.is_production_ready());
+        assert!(!ModelManifest::builtin_catalog().models.iter().any(|m| m.id == download.id));
+        let frozen = ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap();
+        assert_eq!(download.files.len(), frozen.artifacts.len());
+        for artifact in &frozen.artifacts {
+            let file = download.files.iter().find(|file| file.name == artifact.relative_path).unwrap();
+            assert_eq!(file.sha256, artifact.sha256);
+            assert_eq!(file.size, artifact.size);
+        }
+    }
+
+    #[test]
     fn multilingual_minilm_is_production_ready_but_not_in_default_catalog() {
         let manifest = ModelManifest::multilingual_minilm_l12_v2();
         manifest.validate().unwrap();
