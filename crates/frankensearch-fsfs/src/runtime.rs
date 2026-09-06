@@ -950,6 +950,7 @@ struct SearchServeRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SearchServePolicy {
     embedding_contracts: String,
+    quality_model: String,
     quality_weight_bits: u32,
     quality_timeout_ms: u64,
     rrf_k_bits: u64,
@@ -7124,6 +7125,8 @@ impl FsfsRuntime {
             .or_else(|_| std::env::current_dir().map_err(SearchError::Io))?;
         let mut hasher = Sha256::new();
         hasher.update(index_root.display().to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(normalize_model_key(&self.config.indexing.quality_model).as_bytes());
         let digest = sha256_digest_hex(hasher.finalize());
         let prefix_len = FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN.min(digest.len());
         let runtime_base = frankensearch_core::platform_dirs::runtime_dir()
@@ -8163,6 +8166,7 @@ impl FsfsRuntime {
     fn search_serve_policy(&self) -> SearchResult<SearchServePolicy> {
         Ok(SearchServePolicy {
             embedding_contracts: Self::registered_embedding_contracts()?,
+            quality_model: normalize_model_key(&self.config.indexing.quality_model),
             quality_weight_bits: self.effective_quality_weight().to_bits(),
             quality_timeout_ms: self.config.search.quality_timeout_ms,
             rrf_k_bits: self.config.search.rrf_k.to_bits(),
@@ -23471,6 +23475,10 @@ mod tests {
         "previous-producer".clone_into(&mut response.policy.as_mut().unwrap().embedding_contracts);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.policy.as_mut().unwrap().quality_model =
+            super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
+        assert!(runtime.validate_search_serve_policy(&response).is_err());
+        response.policy = Some(runtime.search_serve_policy().unwrap());
         response.schema_version = "fsfs.search.serve.v2".to_owned();
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.schema_version = "fsfs.search.serve.v1".to_owned();
@@ -32792,7 +32800,13 @@ mod tests {
                 .await
                 .expect("list payload");
             assert_eq!(payload.operation, "list");
-            assert_eq!(payload.models.len(), 8);
+            assert_eq!(payload.models.len(), 9);
+            assert!(
+                payload
+                    .models
+                    .iter()
+                    .any(|entry| entry.id == "all-minilm-l6-v2-native")
+            );
             let flashrank = payload
                 .models
                 .iter()
@@ -32872,6 +32886,11 @@ mod tests {
         assert_ne!(
             FsfsRuntime::search_cache_key_hash(&native_key),
             FsfsRuntime::search_cache_key_hash(&default_key)
+        );
+        #[cfg(unix)]
+        assert_ne!(
+            native.default_daemon_socket_path().unwrap(),
+            default.default_daemon_socket_path().unwrap()
         );
         let Err(error) = native.resolve_quality_embedder() else {
             panic!("native selection must not silently choose the test/default backend");

@@ -96,6 +96,10 @@ Indexing, search, append and watch use the selected native producer;
 The CLI supplies and drains its existing blocking pool. Library users of
 `FsfsRuntime` attach their pool with `with_native_blocking_pool`.
 
+Use an optimized (`--release`) executable for native inference. An unoptimized
+build can exceed the default 500 ms quality deadline during cold model loading
+and return Initial results with a refinement-timeout explanation.
+
 Native and ONNX models have separate installation directories and producer
 identities. Changing this setting requires re-embedding the corpus. A missing
 or invalid native quality model leaves a new index fast-only; an existing
@@ -1003,6 +1007,16 @@ cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --lib --exclude frankensearch-quill-gauntlet
 ```
+
+The real-model CLI lane also checks explicit native quality selection. Provision
+`all-MiniLM-L6-v2-native` alongside the standard Potion and ONNX models before
+running the gate. Its native test accepts `MINILM_FIXTURE_DIR`,
+`POTION_FIXTURE_DIR`, and `FASTEMBED_MINILM_FIXTURE_DIR` for separate verified
+fixture directories; absent or invalid fixtures fail the test.
+To exercise an optimized executable through this lane, set `FSFS_E2E_BINARY`
+to the absolute path of the release `fsfs` built from the source being checked.
+The gate still builds and checks the workspace; its executable tests log the
+selected binary explicitly.
 
 Useful docs:
 - `AGENTS.md`

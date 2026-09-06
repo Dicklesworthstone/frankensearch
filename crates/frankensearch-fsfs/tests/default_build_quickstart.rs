@@ -783,6 +783,7 @@ mod loader_only {
                         ModelArtifactManifestV1::minilm_fastembed().unwrap(),
                         ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
                         ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+                        ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap(),
                     ] {
                         contracts.update(manifest.freeze().unwrap().fingerprint.as_bytes());
                     }
@@ -795,6 +796,7 @@ mod loader_only {
                         "the actual serving binary acknowledges its registered producers"
                     );
                     assert_eq!(response["policy"]["quality_weight_bits"], weight.to_bits());
+                    assert_eq!(response["policy"]["quality_model"], "allminilml6v2");
                     assert_eq!(response["policy"]["quality_timeout_ms"], 5000);
                     assert_eq!(
                         response["cached"], true,
@@ -1060,17 +1062,18 @@ mod loader_only {
                 ModelManifest::minilm_v2(),
             ),
         ] {
-            let source =
-                PathBuf::from(std::env::var(variable).expect("actual model fixture required"));
+            let source = std::env::var_os(variable)
+                .map_or_else(|| configured_model_root().join(directory), PathBuf::from);
+            manifest.verify_dir(&source).unwrap_or_else(|error| {
+                panic!("native CLI fixture {directory} at {} is unavailable: {error}; install it with fsfs download-models {} or set {variable}", source.display(), manifest.id)
+            });
             let destination = models.join(directory);
             for file in &manifest.files {
                 let target = destination.join(&file.name);
                 fs::create_dir_all(target.parent().unwrap()).unwrap();
-                // All linked artifacts stay read-only. Corruption below uses a
-                // separate directory and new weights, never a source hard link.
-                fs::hard_link(source.join(&file.name), &target)
-                    .or_else(|_| fs::copy(source.join(&file.name), &target).map(|_| ()))
-                    .unwrap();
+                // Linking/unlinking changes the source inode's ctime and races
+                // other real-model verification tests. Use independent files.
+                fs::copy(source.join(&file.name), &target).unwrap();
             }
             manifest.verify_dir(&destination).unwrap();
         }
@@ -1243,6 +1246,99 @@ mod loader_only {
                 .any(|phase| phase == "query.stream.refined_ready")
         );
 
+        #[cfg(unix)]
+        {
+            use std::io::{Read as _, Write as _};
+            use std::os::unix::net::UnixStream;
+
+            struct NativeDaemon(PathBuf);
+            impl Drop for NativeDaemon {
+                fn drop(&mut self) {
+                    if let Ok(mut socket) = UnixStream::connect(&self.0) {
+                        let _ = socket.set_read_timeout(Some(FAILURE_TIMEOUT));
+                        let _ = socket.write_all(b"quit\n");
+                        let _ = socket.shutdown(std::net::Shutdown::Write);
+                        let _ = socket.read_to_end(&mut Vec::new());
+                    }
+                }
+            }
+            let daemon_path = temp.path().join("native.sock");
+            let daemon = NativeDaemon(daemon_path.clone());
+            let args = [
+                "search",
+                query,
+                "--config",
+                config_arg,
+                "--index-dir",
+                index_arg,
+                "--daemon",
+                "--daemon-socket",
+                daemon_path.to_str().unwrap(),
+                "--format",
+                "json",
+            ];
+            let served = fsfs.run(temp.path(), "native-daemon", args, QUICKSTART_TIMEOUT);
+            let result = parse_success_envelope("native daemon", &served);
+            assert_eq!(result["data"]["phase"], "refined", "{result}");
+            assert!(
+                !served
+                    .stderr
+                    .contains("falling back to in-process retrieval"),
+                "{served:?}"
+            );
+            let mut socket = UnixStream::connect(&daemon_path).unwrap();
+            socket.set_read_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();
+            writeln!(
+                socket,
+                "{}",
+                serde_json::json!({"query": query, "limit": 10})
+            )
+            .unwrap();
+            socket.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut raw = String::new();
+            socket.read_to_string(&mut raw).unwrap();
+            let response: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["policy"]["quality_model"], "allminilml6v2native");
+            assert_eq!(
+                response["payloads"].as_array().unwrap().last().unwrap()["phase"],
+                "refined",
+                "{response}"
+            );
+            let wrong = fsfs.run(
+                temp.path(),
+                "onnx-cannot-reuse-native-daemon",
+                [
+                    "search",
+                    query,
+                    "--index-dir",
+                    index_arg,
+                    "--daemon",
+                    "--daemon-socket",
+                    daemon_path.to_str().unwrap(),
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let rejected = parse_success_envelope("wrong daemon producer", &wrong);
+            assert_ne!(rejected["data"]["phase"], "refined", "{rejected}");
+            assert!(
+                wrong
+                    .stderr
+                    .contains("falling back to in-process retrieval"),
+                "{wrong:?}"
+            );
+            drop(daemon);
+            let deadline = Instant::now() + FAILURE_TIMEOUT;
+            while daemon_path.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !daemon_path.exists(),
+                "owned daemon must release its index before append"
+            );
+        }
+
         let append_path = temp.path().join("append.jsonl");
         let appended_id = corpus.join("second-castaway.md").display().to_string();
         fs::write(&append_path, format!("{}\n", serde_json::json!({"id": appended_id, "text": "A second marooned sailor survives alone on a remote island."}))).unwrap();
@@ -1322,6 +1418,15 @@ mod loader_only {
             assert!(
                 !refused.timed_out && !refused.status.success(),
                 "{refused:?}"
+            );
+            let error: Value = serde_json::from_str(&refused.stdout).unwrap();
+            assert_eq!(
+                error["error"]["code"],
+                if corrupt {
+                    "model_load_failed"
+                } else {
+                    "model_not_found"
+                }
             );
             assert_eq!(
                 [
