@@ -81,6 +81,27 @@ substitutes hash control embeddings for semantic results. Use
 `--no-default-features` only when you intentionally want the model-free lite
 binary.
 
+### Native quality embeddings in fsfs
+
+The default fsfs build can use pure-Rust F32 MiniLM for its quality tier:
+
+```bash
+fsfs download-models all-MiniLM-L6-v2-native
+```
+
+Set `quality_model = "all-MiniLM-L6-v2-native"` in the `[indexing]` section of
+your fsfs configuration, then rebuild the index with that configuration.
+Indexing, search, append and watch use the selected native producer;
+`fsfs status` verifies its artifacts and `fsfs doctor` loads the native model.
+The CLI supplies and drains its existing blocking pool. Library users of
+`FsfsRuntime` attach their pool with `with_native_blocking_pool`.
+
+Native and ONNX models have separate installation directories and producer
+identities. Changing this setting requires re-embedding the corpus. A missing
+or invalid native quality model leaves a new index fast-only; an existing
+native quality generation rejects incompatible models and preserves Initial
+results when refinement fails. The default quality model remains ONNX.
+
 ### Opt-in multilingual native embeddings
 
 The pure-Rust `native` feature also supports the 384-dimensional
