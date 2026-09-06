@@ -11321,7 +11321,8 @@ impl FsfsRuntime {
     fn probe_model_loader(status: &FsfsModelStatus) -> SearchResult<()> {
         let model_path = Path::new(&status.cache_path);
         if status.tier == "quality"
-            && normalize_model_key(&status.name) == normalize_model_key(FSFS_NATIVE_QUALITY_MODEL_ID)
+            && normalize_model_key(&status.name)
+                == normalize_model_key(FSFS_NATIVE_QUALITY_MODEL_ID)
         {
             #[cfg(feature = "rerank")]
             return frankensearch_rerank::NativeEmbedder::load_model(
@@ -11332,7 +11333,8 @@ impl FsfsRuntime {
             #[cfg(not(feature = "rerank"))]
             return Err(SearchError::EmbedderUnavailable {
                 model: status.name.clone(),
-                reason: "this fsfs build has no native backend; rebuild with the rerank feature".to_owned(),
+                reason: "this fsfs build has no native backend; rebuild with the rerank feature"
+                    .to_owned(),
             });
         }
         match status.tier.as_str() {
@@ -32842,9 +32844,13 @@ mod tests {
     #[test]
     fn native_quality_selection_binds_downloads_pool_and_cached_answers() {
         let default = FsfsRuntime::new(FsfsConfig::default());
-        assert!(default.resolve_download_manifests().unwrap().iter().all(
-            |manifest| manifest.id != super::FSFS_NATIVE_QUALITY_MODEL_ID
-        ));
+        assert!(
+            default
+                .resolve_download_manifests()
+                .unwrap()
+                .iter()
+                .all(|manifest| manifest.id != super::FSFS_NATIVE_QUALITY_MODEL_ID)
+        );
         let mut config = FsfsConfig::default();
         config.indexing.quality_model = "all-MiniLM-L6-v2-native".to_owned();
         let native = FsfsRuntime::new(config).with_cli_input(CliInput {
@@ -32852,14 +32858,29 @@ mod tests {
             model_name: Some("all-MiniLM-L6-v2-native".to_owned()),
             ..CliInput::default()
         });
-        assert_eq!(native.resolve_download_manifests().unwrap(), vec![ModelManifest::minilm_v2_native()]);
-        let native_key = native.search_cache_key("castaway", 10, SearchExecutionMode::Full).unwrap();
-        let default_key = default.search_cache_key("castaway", 10, SearchExecutionMode::Full).unwrap();
+        assert_eq!(
+            native.resolve_download_manifests().unwrap(),
+            vec![ModelManifest::minilm_v2_native()]
+        );
+        let native_key = native
+            .search_cache_key("castaway", 10, SearchExecutionMode::Full)
+            .unwrap();
+        let default_key = default
+            .search_cache_key("castaway", 10, SearchExecutionMode::Full)
+            .unwrap();
         assert_ne!(native_key, default_key);
-        assert_ne!(FsfsRuntime::search_cache_key_hash(&native_key), FsfsRuntime::search_cache_key_hash(&default_key));
-        let error = native.resolve_quality_embedder().expect_err("native selection must not silently choose the test/default backend");
+        assert_ne!(
+            FsfsRuntime::search_cache_key_hash(&native_key),
+            FsfsRuntime::search_cache_key_hash(&default_key)
+        );
+        let Err(error) = native.resolve_quality_embedder() else {
+            panic!("native selection must not silently choose the test/default backend");
+        };
         #[cfg(feature = "rerank")]
-        assert!(error.to_string().contains("caller-owned blocking pool"), "{error}");
+        assert!(
+            error.to_string().contains("caller-owned blocking pool"),
+            "{error}"
+        );
         #[cfg(not(feature = "rerank"))]
         assert!(error.to_string().contains("no native backend"), "{error}");
     }

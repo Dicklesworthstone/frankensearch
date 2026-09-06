@@ -1032,6 +1032,310 @@ mod loader_only {
         Ok(())
     }
 
+    #[cfg(feature = "rerank")]
+    #[test]
+    #[ignore = "requires real native MiniLM, Potion and ONNX fixtures; explicit native CLI integration"]
+    fn native_quality_model_runs_the_production_cli() {
+        use frankensearch_core::Embedder;
+        use frankensearch_rerank::{NativeEmbedder, NativeEmbeddingModel};
+
+        log_binary_profile("native-quality");
+        let temp = tempfile::tempdir().unwrap();
+        let models = temp.path().join("models");
+        let fsfs = IsolatedFsfs::new(temp.path(), models.clone());
+        for (variable, directory, manifest) in [
+            (
+                "POTION_FIXTURE_DIR",
+                "potion-multilingual-128M",
+                ModelManifest::potion_128m(),
+            ),
+            (
+                "MINILM_FIXTURE_DIR",
+                "all-MiniLM-L6-v2-native",
+                ModelManifest::minilm_v2_native(),
+            ),
+            (
+                "FASTEMBED_MINILM_FIXTURE_DIR",
+                "all-MiniLM-L6-v2",
+                ModelManifest::minilm_v2(),
+            ),
+        ] {
+            let source =
+                PathBuf::from(std::env::var(variable).expect("actual model fixture required"));
+            let destination = models.join(directory);
+            for file in &manifest.files {
+                let target = destination.join(&file.name);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                // All linked artifacts stay read-only. Corruption below uses a
+                // separate directory and new weights, never a source hard link.
+                fs::hard_link(source.join(&file.name), &target)
+                    .or_else(|_| fs::copy(source.join(&file.name), &target).map(|_| ()))
+                    .unwrap();
+            }
+            manifest.verify_dir(&destination).unwrap();
+        }
+        let native_directory = models.join("all-MiniLM-L6-v2-native");
+        let native =
+            NativeEmbedder::load_model(&native_directory, NativeEmbeddingModel::AllMiniLmL6V2F32)
+                .unwrap();
+        let fingerprint = native.identity().unwrap().fingerprint();
+        assert_eq!(
+            fingerprint, "35d0a014b4ec6224eb42552ea1099b24bead0c9c51906b6035207b6105e8af01",
+            "existing native producer must stay unchanged"
+        );
+        let config = temp.path().join("native.toml");
+        fs::write(
+            &config,
+            "[indexing]\nquality_model = \"all-MiniLM-L6-v2-native\"\n",
+        )
+        .unwrap();
+        let corpus = temp.path().join("corpus");
+        fs::create_dir(&corpus).unwrap();
+        fs::write(
+            corpus.join("castaway.md"),
+            "Ben Gunn is a marooned sailor, a lone castaway stranded on Treasure Island.",
+        )
+        .unwrap();
+        fs::write(
+            corpus.join("cook.md"),
+            "Long John Silver is the ship cook with a wooden leg and a talking parrot.",
+        )
+        .unwrap();
+        let index = temp.path().join("index");
+        let config_arg = config.to_str().unwrap();
+        let index_arg = index.to_str().unwrap();
+        let verify = fsfs.run(
+            temp.path(),
+            "native-explicit-verify",
+            [
+                "download-models",
+                "all-MiniLM-L6-v2-native",
+                "--verify",
+                "--format",
+                "json",
+            ],
+            FAILURE_TIMEOUT,
+        );
+        let verified = parse_success_envelope("native explicit verify", &verify);
+        assert!(verified.to_string().contains("verified"));
+        let build = fsfs.run(
+            temp.path(),
+            "native-index",
+            [
+                "index",
+                corpus.to_str().unwrap(),
+                "--config",
+                config_arg,
+                "--index-dir",
+                index_arg,
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        parse_success_envelope("native index", &build);
+        let quality_path = index.join("vector/quality.fsvi");
+        {
+            let quality = VectorIndex::open_read_only(&quality_path).unwrap();
+            assert_eq!(quality.embedder_id(), "minilm-384-native-f32");
+            assert_eq!(quality.embedder_revision(), fingerprint);
+            assert_eq!(quality.record_count(), 2);
+        }
+        let status = fsfs.run(
+            temp.path(),
+            "native-status",
+            [
+                "status",
+                "--config",
+                config_arg,
+                "--index-dir",
+                index_arg,
+                "--format",
+                "json",
+            ],
+            FAILURE_TIMEOUT,
+        );
+        let status = parse_success_envelope("native status", &status);
+        assert_eq!(
+            model_status(&status, "quality")["verification_state"],
+            "verified"
+        );
+        let doctor = fsfs.run(
+            temp.path(),
+            "native-doctor",
+            [
+                "doctor",
+                "--config",
+                config_arg,
+                "--index-dir",
+                index_arg,
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        parse_success_envelope("native doctor", &doctor);
+
+        let query = "a lone sailor stranded on an island";
+        let search = |label: &str, native_config: bool, stream: bool, bypass_cache: bool| {
+            let mut args = vec![
+                "search",
+                query,
+                "--index-dir",
+                index_arg,
+                "--no-daemon",
+                "--format",
+                if stream { "jsonl" } else { "json" },
+            ];
+            if native_config {
+                args.extend(["--config", config_arg]);
+            }
+            if stream {
+                args.push("--stream");
+            }
+            let cache_env = if bypass_cache {
+                &[("FSFS_DISABLE_QUERY_CACHE", "1")][..]
+            } else {
+                &[]
+            };
+            fsfs.run_with_env(temp.path(), label, args, QUICKSTART_TIMEOUT, cache_env)
+        };
+        let initial_search = search("native-search", true, false, false);
+        let result = parse_success_envelope("native search", &initial_search);
+        assert_eq!(result["data"]["phase"], "refined", "{result}");
+        let phases = |outcome: &CommandOutcome| {
+            assert_finished_successfully("stream search", outcome);
+            outcome
+                .stdout
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter_map(|frame| {
+                    frame
+                        .pointer("/payload/reason_code")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        };
+        let native_stream = search("native-stream", true, true, false);
+        let native_phases = phases(&native_stream);
+        assert!(
+            native_phases
+                .iter()
+                .any(|phase| phase == "query.stream.initial_ready")
+        );
+        assert!(
+            native_phases
+                .iter()
+                .any(|phase| phase == "query.stream.refined_ready")
+        );
+        let wrong_backend = search("onnx-cannot-reuse-native-cache", false, true, false);
+        let wrong_phases = phases(&wrong_backend);
+        assert!(
+            wrong_phases
+                .iter()
+                .any(|phase| phase == "query.stream.refinement_failed"),
+            "{wrong_backend:?}"
+        );
+        assert!(
+            !wrong_phases
+                .iter()
+                .any(|phase| phase == "query.stream.refined_ready")
+        );
+
+        let append_path = temp.path().join("append.jsonl");
+        let appended_id = corpus.join("second-castaway.md").display().to_string();
+        fs::write(&append_path, format!("{}\n", serde_json::json!({"id": appended_id, "text": "A second marooned sailor survives alone on a remote island."}))).unwrap();
+        let append_args = [
+            "append-batch",
+            "--file",
+            append_path.to_str().unwrap(),
+            "--config",
+            config_arg,
+            "--index-dir",
+            index_arg,
+            "--format",
+            "json",
+        ];
+        let append = fsfs.run(
+            temp.path(),
+            "native-append",
+            append_args,
+            QUICKSTART_TIMEOUT,
+        );
+        assert_finished_successfully("native append", &append);
+        let after_append = parse_success_envelope(
+            "native after append",
+            &search("native-search-appended", true, false, false),
+        );
+        assert_eq!(after_append["data"]["phase"], "refined");
+        assert!(after_append.to_string().contains("second-castaway.md"));
+
+        let before = [
+            fs::read(index.join("vector/index.fsvi")).unwrap(),
+            fs::read(&quality_path).unwrap(),
+        ];
+        fs::rename(&native_directory, models.join("native-fixture-preserved")).unwrap();
+        for corrupt in [false, true] {
+            if corrupt {
+                fs::create_dir(&native_directory).unwrap();
+                for name in [
+                    "config.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "special_tokens_map.json",
+                ] {
+                    fs::copy(
+                        models.join("native-fixture-preserved").join(name),
+                        native_directory.join(name),
+                    )
+                    .unwrap();
+                }
+                fs::write(native_directory.join("model.safetensors"), b"corrupt").unwrap();
+            }
+            let label = if corrupt {
+                "native-corrupt"
+            } else {
+                "native-missing"
+            };
+            // Force actual backend loading: a previously computed result from
+            // this same producer can remain valid when model files disappear.
+            let unavailable = search(label, true, true, true);
+            let unavailable_phases = phases(&unavailable);
+            assert!(
+                unavailable_phases
+                    .iter()
+                    .any(|phase| phase == "query.stream.refinement_failed"),
+                "{unavailable:?}"
+            );
+            assert!(
+                !unavailable_phases
+                    .iter()
+                    .any(|phase| phase == "query.stream.refined_ready")
+            );
+            let refused = fsfs.run(
+                temp.path(),
+                &format!("{label}-append"),
+                append_args,
+                QUICKSTART_TIMEOUT,
+            );
+            assert!(
+                !refused.timed_out && !refused.status.success(),
+                "{refused:?}"
+            );
+            assert_eq!(
+                [
+                    fs::read(index.join("vector/index.fsvi")).unwrap(),
+                    fs::read(&quality_path).unwrap()
+                ],
+                before
+            );
+        }
+        eprintln!(
+            "[native-cli] actual native index/search/append, producer refusal, missing/corrupt model and vector preservation verified"
+        );
+    }
+
     #[test]
     fn config_inspection_honors_valid_overrides_of_incomplete_source_layers() {
         let temp = tempfile::tempdir().unwrap();

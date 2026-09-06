@@ -5343,11 +5343,20 @@ mod tests {
         let download = ModelManifest::minilm_v2_native();
         download.validate().unwrap();
         assert!(download.is_production_ready());
-        assert!(!ModelManifest::builtin_catalog().models.iter().any(|m| m.id == download.id));
+        assert!(
+            !ModelManifest::builtin_catalog()
+                .models
+                .iter()
+                .any(|m| m.id == download.id)
+        );
         let frozen = ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap();
         assert_eq!(download.files.len(), frozen.artifacts.len());
         for artifact in &frozen.artifacts {
-            let file = download.files.iter().find(|file| file.name == artifact.relative_path).unwrap();
+            let file = download
+                .files
+                .iter()
+                .find(|file| file.name == artifact.relative_path)
+                .unwrap();
             assert_eq!(file.sha256, artifact.sha256);
             assert_eq!(file.size, artifact.size);
         }
