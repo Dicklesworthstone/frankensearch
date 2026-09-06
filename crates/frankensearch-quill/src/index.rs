@@ -79,11 +79,11 @@ use crate::keeper::BenchmarkQuillDirectorySyncState;
 use crate::keeper::UnrepairableSegmentPolicy;
 use crate::keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, CurrentPointer,
-    CurrentPointerError, KeeperError, KeeperSnapshot, KeeperWriter, LexicalLayout,
-    MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats, ManifestSegment,
-    PublicationAuthorityPhase, PublicationAuthorityState, PublicationReadState, RecoveredSegment,
-    TierMergePolicy, TierPolicyError, TombstoneSet, inspect_lexical_layout, plan_tier_merge,
-    validate_manifest_successor,
+    CurrentPointerError, GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter,
+    LexicalLayout, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats,
+    ManifestSegment, PublicationAuthorityPhase, PublicationAuthorityState, PublicationReadState,
+    RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet, inspect_lexical_layout,
+    plan_tier_merge, validate_manifest_successor,
 };
 use crate::query::{
     BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError, QueryDiagnostic,
@@ -8353,6 +8353,43 @@ impl QuillWriterState {
         Ok(report)
     }
 
+    /// Reclaim segment files no durable MANIFEST slot references.
+    ///
+    /// Runs the Keeper's writer-owned garbage sweep under the held admission.
+    /// A file is unlinked only when neither `MANIFEST` nor `MANIFEST.prev`
+    /// references it and a full grace period has elapsed since the
+    /// publication that retired it (its durable retirement receipt), so a
+    /// reader still holding the previous generation keeps working: it had the
+    /// whole grace period to open its segments, and a segment it has already
+    /// mapped survives the unlink. The same sweep runs once at writer open;
+    /// this entry point lets a long-lived or frequently publishing writer
+    /// reclaim without reopening, since a merge's folded inputs become
+    /// collectable only after later publications age them out.
+    ///
+    /// # Errors
+    ///
+    /// Rejects uncommitted state (a staged-but-unpublished segment is
+    /// indistinguishable from an orphan on disk) and cancellation, and
+    /// returns the Keeper's typed recovery, identity, metadata, or unlink
+    /// failure otherwise. Nothing is removed on any error path.
+    pub async fn collect_garbage(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<GarbageCollectionReport, QuillIndexError> {
+        check_cancel(cx, "garbage collection")?;
+        if self.has_uncommitted_changes() {
+            return Err(invalid_state(
+                "garbage collection requires a fully committed index",
+            ));
+        }
+        match &mut self.backend {
+            IndexBackend::Durable(writer) => Ok(writer.collect_garbage(cx).await?),
+            IndexBackend::Memory(_) => Ok(GarbageCollectionReport {
+                removed: Vec::new(),
+            }),
+        }
+    }
+
     async fn upsert_documents_batch(
         &mut self,
         cx: &Cx,
@@ -12103,6 +12140,34 @@ impl QuillIndex {
     ) -> Result<CompactionReport, QuillIndexError> {
         let mut writer = self.lock_writer(cx, "compaction writer lock").await?;
         writer.compact(cx, policy).await
+    }
+
+    /// Reclaim segment files no durable MANIFEST slot references.
+    ///
+    /// Runs the Keeper's writer-owned garbage sweep under the held admission.
+    /// A file is unlinked only when neither `MANIFEST` nor `MANIFEST.prev`
+    /// references it and a full grace period has elapsed since the
+    /// publication that retired it (its durable retirement receipt), so a
+    /// reader still holding the previous generation keeps working: it had the
+    /// whole grace period to open its segments, and a segment it has already
+    /// mapped survives the unlink. The same sweep runs once at open; this
+    /// entry point lets a long-lived or frequently publishing index reclaim
+    /// without reopening, since a merge's folded inputs become collectable
+    /// only after later publications age them out. An in-memory index has
+    /// nothing on disk to reclaim and reports an empty sweep.
+    ///
+    /// # Errors
+    ///
+    /// Rejects writer-lock failure, uncommitted state, cancellation, or the
+    /// Keeper's typed sweep failure.
+    pub async fn collect_garbage(
+        &self,
+        cx: &Cx,
+    ) -> Result<GarbageCollectionReport, QuillIndexError> {
+        let mut writer = self
+            .lock_writer(cx, "garbage collection writer lock")
+            .await?;
+        writer.collect_garbage(cx).await
     }
 
     /// Delete one live document id and publish the successor snapshot.
@@ -19867,6 +19932,355 @@ mod tests {
                 .checked_add(1)
                 .expect("concat-merge test segment-id space exhausted");
         }
+    }
+
+    /// Names of the `seg-*.fslx` files and `*.retired` receipts in an index
+    /// directory, sorted, so a test can compare the on-disk population with
+    /// the manifest's live set.
+    fn segment_files_and_receipts(directory: &Path) -> (Vec<String>, Vec<String>) {
+        let mut segments = Vec::new();
+        let mut receipts = Vec::new();
+        for entry in std::fs::read_dir(directory).expect("read index directory") {
+            let name = entry
+                .expect("index directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            let extension = Path::new(&name).extension().and_then(|ext| ext.to_str());
+            if name.starts_with("seg-") && extension == Some("fslx") {
+                segments.push(name);
+            } else if extension == Some("retired") {
+                receipts.push(name);
+            }
+        }
+        segments.sort();
+        receipts.sort();
+        (segments, receipts)
+    }
+
+    fn live_segment_files(index: &QuillIndex) -> Vec<String> {
+        let mut names = committed_segment_ids(index)
+            .into_iter()
+            .map(|segment_id| format!("seg-{segment_id:016x}.fslx"))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// cass#453: the inputs a concat merge folds away must leave the disk
+    /// once every durable slot has dropped them and their retirement receipts
+    /// have aged, however many further publications happen in between -- and
+    /// a reader that opened the pre-merge generation keeps answering from its
+    /// mapped segments after they are unlinked.
+    #[cfg(unix)]
+    #[test]
+    fn retired_merge_inputs_are_reclaimed_while_an_older_reader_keeps_working() {
+        use crate::keeper::{
+            DEFAULT_GARBAGE_GRACE, GarbageCollectionOptions, KeeperSnapshot,
+            collect_writer_garbage_at,
+        };
+        use crate::segment::SectionKind;
+
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("index directory");
+            let index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create on-disk index");
+            for (document_id, content) in [("one", "alpha shared"), ("two", "beta shared")] {
+                LexicalWrite::index_document(
+                    &index,
+                    &cx,
+                    &IndexableDocument::new(document_id, content),
+                )
+                .await
+                .expect("stage document");
+                LexicalWrite::commit(&index, &cx)
+                    .await
+                    .expect("publish one segment per round");
+            }
+            let inputs = committed_segment_ids(&index);
+            assert_eq!(inputs.len(), 2, "each round sealed exactly one segment");
+            let input_files = live_segment_files(&index);
+
+            // A reader on the pre-merge generation, plus a raw snapshot that
+            // pins the input segments' mappings.
+            let older_reader =
+                QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                    .await
+                    .expect("open pre-merge reader");
+            let older_generation = older_reader.keeper_generation();
+            let older_snapshot =
+                KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA).expect("pin inputs");
+            assert_eq!(older_snapshot.segments().len(), 2);
+
+            let output_segment_id = fresh_merge_segment_id(&index, 0x0453_0001);
+            index
+                .concat_merge(&cx, &inputs, output_segment_id, 1_700_000_000)
+                .await
+                .expect("fold both rounds into one segment");
+            assert_eq!(committed_segment_ids(&index), vec![output_segment_id]);
+            let (on_disk, receipts) = segment_files_and_receipts(directory.path());
+            assert_eq!(
+                on_disk.len(),
+                3,
+                "folded inputs stay on disk after the merge"
+            );
+            assert!(
+                receipts.is_empty(),
+                "MANIFEST.prev still references the inputs, so nothing is retired yet"
+            );
+
+            // Two further back-to-back publications: the first retires the
+            // inputs (they drop out of MANIFEST.prev), the second is the kind
+            // of publication that used to restart their grace.
+            for (document_id, content) in [("three", "gamma shared"), ("four", "delta shared")] {
+                LexicalWrite::index_document(
+                    &index,
+                    &cx,
+                    &IndexableDocument::new(document_id, content),
+                )
+                .await
+                .expect("stage later document");
+                LexicalWrite::commit(&index, &cx)
+                    .await
+                    .expect("publish later generation");
+            }
+            let (on_disk, receipts) = segment_files_and_receipts(directory.path());
+            assert_eq!(
+                receipts,
+                input_files
+                    .iter()
+                    .map(|name| format!("{name}.retired"))
+                    .collect::<Vec<_>>(),
+                "the retiring publication stamped one receipt per folded input"
+            );
+            assert_eq!(
+                on_disk.len(),
+                5,
+                "inputs are still within their grace period"
+            );
+
+            // Inside the grace period the public sweep is a no-op, both
+            // through the index and at the Keeper seam.
+            let report = index
+                .collect_garbage(&cx)
+                .await
+                .expect("sweep inside the grace period");
+            assert!(report.is_empty(), "nothing is old enough yet: {report:?}");
+            assert_eq!(segment_files_and_receipts(directory.path()).0.len(), 5);
+
+            // Once the receipts have aged, the sweep reclaims exactly the
+            // folded inputs and their receipts, even though the two later
+            // publications are far younger than the grace period.
+            let after_grace = SystemTime::now()
+                .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+                .expect("test clock remains representable");
+            let report = collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                after_grace,
+            )
+            .expect("sweep after the grace period");
+            let mut removed = report
+                .removed
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            removed.sort();
+            let mut expected_removed = input_files.clone();
+            expected_removed.extend(input_files.iter().map(|name| format!("{name}.retired")));
+            expected_removed.sort();
+            assert_eq!(removed, expected_removed);
+            let (on_disk, receipts) = segment_files_and_receipts(directory.path());
+            assert_eq!(on_disk, live_segment_files(&index));
+            assert!(receipts.is_empty());
+
+            // The pre-merge reader still answers, and the raw snapshot still
+            // reads the unlinked inputs through its mappings.
+            for segment in older_snapshot.segments() {
+                segment
+                    .section(SectionKind::TERMDICT)
+                    .expect("unlinked input segment stays readable through its mapping");
+            }
+            assert_eq!(older_reader.keeper_generation(), older_generation);
+            let hits = LexicalRead::search(&older_reader, &cx, "shared", 10)
+                .await
+                .expect("pre-merge reader searches after the sweep");
+            assert!(
+                hits.len() >= 2,
+                "pre-merge reader still sees both folded documents: {hits:?}"
+            );
+
+            // A fresh reader and a reopened writer see the consolidated index.
+            let fresh = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open post-sweep reader");
+            assert_eq!(fresh.segment_count().expect("segment count"), 3);
+            assert_eq!(
+                LexicalRead::search(&fresh, &cx, "shared", 10)
+                    .await
+                    .expect("post-sweep search")
+                    .len(),
+                4
+            );
+            drop(index);
+            let reopened = QuillIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("reopen writer after the sweep");
+            assert_eq!(committed_segment_ids(&reopened).len(), 3);
+        });
+    }
+
+    /// A sweep interrupted after unlinking a segment but before its receipt
+    /// (the receipt sorts after its segment) leaves a receipt with no segment.
+    /// The next open recovers: the stale receipt is reclaimed once it is old
+    /// enough, and it never blocks readers or writers meanwhile.
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_sweep_leaves_only_a_stale_receipt_that_the_next_sweep_reclaims() {
+        use crate::keeper::{
+            DEFAULT_GARBAGE_GRACE, GarbageCollectionOptions, collect_writer_garbage_at,
+        };
+
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("index directory");
+            let index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create on-disk index");
+            for (document_id, content) in [("one", "alpha"), ("two", "beta")] {
+                LexicalWrite::index_document(
+                    &index,
+                    &cx,
+                    &IndexableDocument::new(document_id, content),
+                )
+                .await
+                .expect("stage document");
+                LexicalWrite::commit(&index, &cx)
+                    .await
+                    .expect("publish one segment per round");
+            }
+            let inputs = committed_segment_ids(&index);
+            let input_files = live_segment_files(&index);
+            let output_segment_id = fresh_merge_segment_id(&index, 0x0453_0002);
+            index
+                .concat_merge(&cx, &inputs, output_segment_id, 1_700_000_000)
+                .await
+                .expect("fold both rounds");
+            LexicalWrite::index_document(&index, &cx, &IndexableDocument::new("three", "gamma"))
+                .await
+                .expect("stage retiring document");
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("retiring publication");
+            drop(index);
+
+            // Simulate the crash: the first input's segment is gone, its
+            // receipt survived.
+            std::fs::remove_file(directory.path().join(&input_files[0]))
+                .expect("simulate an unlink that completed before the crash");
+            let (on_disk, receipts) = segment_files_and_receipts(directory.path());
+            assert_eq!(
+                on_disk.len(),
+                3,
+                "merged output, the third round, one input"
+            );
+            assert_eq!(receipts.len(), 2);
+
+            // Readers and writers open normally over the partial sweep.
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("reader opens over a partially swept directory");
+            assert_eq!(
+                LexicalRead::search(&reader, &cx, "alpha OR beta OR gamma", 10)
+                    .await
+                    .expect("search over a partially swept directory")
+                    .len(),
+                3
+            );
+            let reopened = QuillIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("writer reopens (and sweeps) over a partially swept directory");
+            drop(reopened);
+
+            // The aged sweep finishes the job: the surviving input goes with
+            // its receipt, and the orphaned receipt goes on its own.
+            let after_grace = SystemTime::now()
+                .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+                .expect("test clock remains representable");
+            let report = collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                after_grace,
+            )
+            .expect("sweep after the grace period");
+            let mut removed = report
+                .removed
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            removed.sort();
+            let mut expected_removed = vec![
+                format!("{}.retired", input_files[0]),
+                input_files[1].clone(),
+                format!("{}.retired", input_files[1]),
+            ];
+            expected_removed.sort();
+            assert_eq!(removed, expected_removed);
+            let (on_disk, receipts) = segment_files_and_receipts(directory.path());
+            assert_eq!(on_disk.len(), 2);
+            assert!(receipts.is_empty());
+            assert!(
+                collect_writer_garbage_at(
+                    directory.path(),
+                    DEFAULT_SCHEMA,
+                    GarbageCollectionOptions::default(),
+                    after_grace,
+                )
+                .expect("idempotent sweep")
+                .is_empty()
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_garbage_refuses_uncommitted_state_and_is_a_no_op_in_memory() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("index directory");
+            let index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create on-disk index");
+            LexicalWrite::index_document(&index, &cx, &IndexableDocument::new("one", "alpha"))
+                .await
+                .expect("stage document");
+            let error = index
+                .collect_garbage(&cx)
+                .await
+                .expect_err("a staged document blocks the sweep");
+            assert!(
+                matches!(error, QuillIndexError::InvalidState { ref detail } if detail.contains("committed")),
+                "{error}"
+            );
+            LexicalWrite::commit(&index, &cx).await.expect("publish");
+            assert!(
+                index
+                    .collect_garbage(&cx)
+                    .await
+                    .expect("sweep a committed index")
+                    .is_empty()
+            );
+
+            let memory = QuillIndex::in_memory(deterministic_config()).expect("in-memory index");
+            assert!(
+                memory
+                    .collect_garbage(&cx)
+                    .await
+                    .expect("in-memory sweep")
+                    .is_empty()
+            );
+        });
     }
 
     fn concat_merge_query_results(index: &QuillIndex, cx: &Cx) -> Vec<QuillSearchResult> {

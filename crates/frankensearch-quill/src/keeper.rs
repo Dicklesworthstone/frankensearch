@@ -97,7 +97,7 @@ pub const WRITER_LOCK_RECORD_BYTES: usize = 36;
 ///
 /// The build-time assertion in this module's tests intentionally forces this
 /// value to change when `Cargo.toml` changes.
-pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 2, 2);
+pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 2, 3);
 
 const MANIFEST_MIN_BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 /// v2 images carry the additional `last_publish_unix_s` word after `flags`.
@@ -11009,7 +11009,9 @@ pub(crate) fn collect_writer_garbage_under_lock(
     collect_writer_garbage_at(directory.as_ref(), schema, options, SystemTime::now())
 }
 
-fn collect_writer_garbage_at(
+/// [`collect_writer_garbage_under_lock`] with an injectable observation
+/// clock, so crate tests can prove grace behaviour without waiting it out.
+pub(crate) fn collect_writer_garbage_at(
     directory: &Path,
     schema: SchemaDescriptor,
     options: GarbageCollectionOptions,
@@ -11328,7 +11330,6 @@ fn sweep_garbage_directory(
     use std::os::unix::ffi::OsStringExt;
 
     let live_segments = &reachability.live;
-    let segment_unreachable_since = reachability.unreachable_since;
     let mut receipts = BTreeMap::<u64, SegmentRetirementReceipt>::new();
     let mut present_segments = HashSet::<OsString>::new();
     let mut candidates = Vec::<(OsString, GarbageCandidate, rustix::fs::Stat)>::new();
@@ -11421,10 +11422,10 @@ fn sweep_garbage_directory(
     for (name, candidate, stat) in &candidates {
         if matches!(candidate, GarbageCandidate::Segment)
             && !live_segments.contains(name)
-            && segment_old_enough(stat, now, options.grace_period, segment_unreachable_since)
-            && retirement_provenance_admits(
+            && segment_grace_served(
                 reachability,
                 name,
+                stat,
                 &receipts,
                 now,
                 options.grace_period,
@@ -11659,7 +11660,15 @@ struct SegmentReachability {
     /// Canonical names referenced by any individually valid slot.
     live: HashSet<OsString>,
     /// Conservative manifest-level floor for the recovery window, when the
-    /// selected slot supplies one.
+    /// selected slot supplies one: the latest durable slot mutation, which
+    /// dates every unreachability transition from above.
+    ///
+    /// It gates only segments below the supersession threshold, where no
+    /// retirement receipt can exist. Once `retirement_provenance_required`
+    /// holds, each segment's receipt is the exact witness of its own
+    /// transition and the floor is not consulted: a later publication cannot
+    /// re-reference a retired segment, so it must not restart the segment's
+    /// grace (see [`segment_grace_served`]).
     unreachable_since: Option<SystemTime>,
     /// Whether any generation could already have been superseded, and with it
     /// whether an unreferenced segment may be a *retired* segment rather than
@@ -11816,40 +11825,54 @@ fn sidecar_is_orphan_at(
     }
 }
 
-#[cfg(unix)]
-#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
-fn segment_old_enough(
-    stat: &rustix::fs::Stat,
-    now: SystemTime,
-    grace_period: Duration,
-    unreachable_since: Option<SystemTime>,
-) -> bool {
-    stat_old_enough(stat, now, grace_period)
-        && unreachable_since.is_none_or(|unreachable_since| {
-            now.duration_since(unreachable_since)
-                .is_ok_and(|age| age >= grace_period)
-        })
-}
-
-/// Whether first-unreachable provenance permits collecting `name`.
+/// Whether an unreferenced segment has served its full grace period.
 ///
-/// Once any generation may have been superseded, an unreferenced segment is
-/// only collectable through the durable receipt its retiring publication
-/// wrote, aged by the full grace period from the witnessed transition. A
-/// missing, unreadable, or foreign-bound receipt proves nothing, and proving
-/// nothing fails closed -- inferring the transition from the segment's own
-/// mtime is exactly the fail-open this gate exists to remove.
+/// Reader-safety rule: a reader can hold a MANIFEST that references `name`
+/// only if it read that MANIFEST before the slot pair stopped referencing the
+/// segment. Unlinking the file no earlier than one grace period after that
+/// transition therefore leaves every such reader the whole grace period to
+/// finish opening its segments, and a segment a reader has already mapped
+/// survives its unlink. Which durable witness dates the transition depends on
+/// whether any generation may already have been superseded:
+///
+/// * Past the supersession threshold the retiring publication's receipt is
+///   the witness, and the only admissible one: a missing, unreadable, or
+///   foreign-bound receipt proves nothing, and proving nothing fails closed
+///   (inferring the transition from the segment's own mtime is exactly the
+///   fail-open this gate exists to remove). The receipt is made durable
+///   *before* the slot renames that complete the retirement, so it strictly
+///   precedes the last instant a reader could have obtained a referencing
+///   MANIFEST through either slot. Grace runs from the receipt alone. A later
+///   publication never references a retired segment, so it must not postpone
+///   that segment's reclamation: measuring from the latest publication
+///   instead would mean an embedder that publishes more often than the grace
+///   period never reclaims anything (cass#453).
+/// * Below the threshold nothing was ever retired, so no receipt can exist and
+///   the manifest-level floor -- the latest durable slot mutation -- dates the
+///   transition conservatively.
+///
+/// In both cases the file's own mtime must also predate the grace window: a
+/// segment rewritten after its witness is not the segment the witness dated.
 #[cfg(unix)]
 #[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
-fn retirement_provenance_admits(
+fn segment_grace_served(
     reachability: &SegmentReachability,
     name: &OsStr,
+    stat: &rustix::fs::Stat,
     receipts: &BTreeMap<u64, SegmentRetirementReceipt>,
     now: SystemTime,
     grace_period: Duration,
 ) -> bool {
+    if !stat_old_enough(stat, now, grace_period) {
+        return false;
+    }
     if !reachability.retirement_provenance_required {
-        return true;
+        return reachability
+            .unreachable_since
+            .is_none_or(|unreachable_since| {
+                now.duration_since(unreachable_since)
+                    .is_ok_and(|age| age >= grace_period)
+            });
     }
     let Some(segment_id) = name.to_str().and_then(parse_segment_name) else {
         return false;
@@ -17289,11 +17312,11 @@ mod tests {
     fn empty_manifest_has_stable_wire_golden() -> TestResult {
         let manifest = Manifest::empty(1, 0x1122_3344_5566_7788, 0);
         let bytes = manifest.to_bytes()?;
-        // Bytes 36..40 are `CURRENT_ENGINE_VERSION` (0.2.2 => `02 00 02 00`);
+        // Bytes 36..40 are `CURRENT_ENGINE_VERSION` (0.2.3 => `03 00 02 00`);
         // the trailing CRC32 covers everything before it.
         let expected = hex_bytes(
             "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
-             020002000000000000000000000000000000000000000000af477d78",
+             030002000000000000000000000000000000000000000000882258f9",
         );
         assert_eq!(bytes, expected);
         assert_eq!(Manifest::from_bytes(&bytes)?, manifest);
@@ -21138,12 +21161,17 @@ mod tests {
         // the generation-3 publication would have stamped is part of the
         // fixture, and without it the sweep correctly refuses to act (see
         // gc_refuses_a_backdated_unreferenced_segment_without_a_retirement_receipt).
-        write_test_retirement_receipt(
-            directory.path(),
-            unreachable.segment_id,
-            3,
-            SystemTime::now(),
-        )?;
+        // The receipt carries whole seconds, so date the fixture's transition
+        // at a whole second: the sweep measures grace from exactly this
+        // instant.
+        let retired_at = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs(),
+            ))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        write_test_retirement_receipt(directory.path(), unreachable.segment_id, 3, retired_at)?;
         write_manifest(
             &directory.path().join("MANIFEST.prev"),
             &durable_test_manifest(2, Vec::new()),
@@ -21152,16 +21180,7 @@ mod tests {
             &directory.path().join("MANIFEST"),
             &durable_test_manifest(3, Vec::new()),
         )?;
-        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
-        let directory_file = open_gc_directory(directory.path())?;
-        let observed = SystemTime::now();
-        let unreachable_since = segment_unreachability_floor_at(
-            &directory_file,
-            directory.path(),
-            &snapshot,
-            observed,
-        )?
-        .ok_or_else(|| io::Error::other("current MANIFEST supplies a GC floor"))?;
+        let unreachable_since = retired_at;
         let options = GarbageCollectionOptions {
             grace_period: Duration::from_secs(60),
         };
@@ -21373,7 +21392,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_publication_resets_unreachable_segment_grace() -> TestResult {
+    fn later_publications_do_not_postpone_a_receipted_retirement() -> TestResult {
         fn valid_manifest(path: &Path) -> Result<Manifest, String> {
             match read_manifest_slot(path).map_err(|error| error.to_string())? {
                 ManifestSlot::Valid(manifest) => Ok(manifest),
@@ -21485,17 +21504,22 @@ mod tests {
                 return Err("generation 3 did not make the segment unreachable".to_owned());
             }
 
-            let directory_file =
-                open_gc_directory(&directory).map_err(|error| error.to_string())?;
-            let third_publish_floor = segment_unreachability_floor_at(
-                &directory_file,
-                &directory,
-                writer.retained_snapshot_for_bookkeeping(),
-                SystemTime::now(),
-            )
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "generation 3 did not supply an unreachability floor".to_owned())?;
-            let before_first_grace = third_publish_floor
+            // The generation-3 publication is the one that retired the
+            // segment, so its receipt is the durable witness of the
+            // transition and the clock the grace period runs on.
+            let receipt_bytes = std::fs::read(directory.join(retirement_receipt_name(segment_id)))
+                .map_err(|error| error.to_string())?;
+            let receipt = SegmentRetirementReceipt::decode(&receipt_bytes)
+                .ok_or_else(|| "generation 3 did not stamp a decodable receipt".to_owned())?;
+            if receipt.retired_generation != 3
+                || receipt.witness != UnreachabilityWitness::RetiredByPublication
+            {
+                return Err(format!("unexpected retirement receipt: {receipt:?}"));
+            }
+            let retired_at = receipt
+                .retired_at()
+                .ok_or_else(|| "receipt instant is representable".to_owned())?;
+            let before_first_grace = retired_at
                 .checked_add(Duration::from_secs(59))
                 .ok_or_else(|| "test clock remains representable".to_owned())?;
             if !collect_writer_garbage_at(&directory, DEFAULT_SCHEMA, options, before_first_grace)
@@ -21506,54 +21530,80 @@ mod tests {
                 return Err("newly unreachable segment did not receive its full grace".to_owned());
             }
 
-            std::thread::sleep(Duration::from_millis(10));
-            let mut publish_four = writer
-                .retained_snapshot_for_bookkeeping()
-                .next_manifest()
-                .map_err(|error| error.to_string())?;
-            publish_four.last_publish_unix_s = 0;
-            writer
-                .publish(&cx, &publish_four)
-                .await
-                .map_err(|error| error.to_string())?;
+            // Two more back-to-back publications, the shape of an embedder
+            // that runs incremental passes more often than the grace period
+            // (cass#453). Each advances the manifest-level floor, but neither
+            // references the retired segment, so neither may restart its
+            // grace.
             let directory_file =
                 open_gc_directory(&directory).map_err(|error| error.to_string())?;
-            let fourth_publish_floor = segment_unreachability_floor_at(
+            let third_publish_floor = segment_unreachability_floor_at(
                 &directory_file,
                 &directory,
                 writer.retained_snapshot_for_bookkeeping(),
                 SystemTime::now(),
             )
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "generation 4 did not supply an unreachability floor".to_owned())?;
-            if fourth_publish_floor <= third_publish_floor {
-                return Err("later publication did not advance the conservative floor".to_owned());
-            }
-
-            let old_grace_deadline = third_publish_floor
-                .checked_add(options.grace_period)
-                .ok_or_else(|| "test clock remains representable".to_owned())?;
-            if !collect_writer_garbage_at(&directory, DEFAULT_SCHEMA, options, old_grace_deadline)
+            .ok_or_else(|| "generation 3 did not supply an unreachability floor".to_owned())?;
+            let mut latest_floor = third_publish_floor;
+            for generation in 4..=5_u64 {
+                std::thread::sleep(Duration::from_millis(10));
+                let mut publish = writer
+                    .retained_snapshot_for_bookkeeping()
+                    .next_manifest()
+                    .map_err(|error| error.to_string())?;
+                publish.last_publish_unix_s = 0;
+                writer
+                    .publish(&cx, &publish)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let directory_file =
+                    open_gc_directory(&directory).map_err(|error| error.to_string())?;
+                let floor = segment_unreachability_floor_at(
+                    &directory_file,
+                    &directory,
+                    writer.retained_snapshot_for_bookkeeping(),
+                    SystemTime::now(),
+                )
                 .map_err(|error| error.to_string())?
-                .is_empty()
-                || !segment_path.exists()
-            {
-                return Err("later publication did not reset the conservative floor".to_owned());
+                .ok_or_else(|| {
+                    format!("generation {generation} did not supply an unreachability floor")
+                })?;
+                if floor <= latest_floor {
+                    return Err(format!(
+                        "generation {generation} did not advance the manifest-level floor"
+                    ));
+                }
+                latest_floor = floor;
+            }
+            let receipt_after = std::fs::read(directory.join(retirement_receipt_name(segment_id)))
+                .map_err(|error| error.to_string())?;
+            if receipt_after != receipt_bytes {
+                return Err("later publications rewrote a receipt they did not stamp".to_owned());
             }
 
-            let reset_grace_deadline = fourth_publish_floor
+            // The receipt's own deadline is strictly earlier than the deadline
+            // the reset floor would impose, which is what makes this assertion
+            // discriminate: under a floor-reset rule the segment would survive
+            // here.
+            let receipt_grace_deadline = retired_at
                 .checked_add(options.grace_period)
                 .ok_or_else(|| "test clock remains representable".to_owned())?;
+            let floor_grace_deadline = latest_floor
+                .checked_add(options.grace_period)
+                .ok_or_else(|| "test clock remains representable".to_owned())?;
+            if receipt_grace_deadline >= floor_grace_deadline {
+                return Err("fixture did not separate the receipt clock from the floor".to_owned());
+            }
             let report = collect_writer_garbage_at(
                 &directory,
                 DEFAULT_SCHEMA,
                 options,
-                reset_grace_deadline,
+                receipt_grace_deadline,
             )
             .map_err(|error| error.to_string())?;
-            // The generation-3 publication stamped the first-unreachable
-            // receipt that authorizes this deletion, so the receipt is
-            // reclaimed with the segment it authorized.
+            // The receipt authorized this deletion, so it is reclaimed with
+            // the segment it authorized.
             if report.removed
                 != vec![
                     PathBuf::from(canonical_segment_name(segment_id)),
@@ -21562,10 +21612,14 @@ mod tests {
                 || segment_path.exists()
             {
                 return Err(format!(
-                    "segment was not reclaimed at the reset grace deadline: {:?}",
+                    "segment was not reclaimed at its receipt's grace deadline: {:?}",
                     report.removed
                 ));
             }
+
+            // Every segment the later publications still reference is intact
+            // and the writer's own view reopens cleanly after the sweep.
+            KeeperSnapshot::open(&directory, DEFAULT_SCHEMA).map_err(|error| error.to_string())?;
             Ok(())
         });
         outcome.map_err(io::Error::other)?;

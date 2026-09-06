@@ -99,6 +99,13 @@ const BUILT_IN_PROFILE_V3_LEXICAL_CRATE_VERSION: &str = "0.2.2";
 // no longer create runs, exactly like v1 and v2 before them.
 const BUILT_IN_PROFILE_V4_QUILL_CRATE_VERSION: &str = "0.2.2";
 const BUILT_IN_PROFILE_V4_LEXICAL_CRATE_VERSION: &str = "0.2.3";
+// v5 (cass#453 segment-reclamation release): the semantic contract is still
+// IDENTICAL to v2; only the quill crate version moved (0.2.2 -> 0.2.3, the
+// receipt-clocked garbage sweep) under the same lexical 0.2.3 / registry
+// tantivy 0.26.1 oracle. Historical v4 receipts stay archive-valid and can no
+// longer create runs, exactly like v1, v2 and v3 before them.
+const BUILT_IN_PROFILE_V5_QUILL_CRATE_VERSION: &str = "0.2.3";
+const BUILT_IN_PROFILE_V5_LEXICAL_CRATE_VERSION: &str = "0.2.3";
 
 /// Closed engine family used by the cross-engine false-green guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +420,7 @@ impl BuiltInEngineProfileReceipt {
     const V2_SCHEMA_VERSION: u32 = 2;
     const V3_SCHEMA_VERSION: u32 = 3;
     const V4_SCHEMA_VERSION: u32 = 4;
+    const V5_SCHEMA_VERSION: u32 = 5;
     #[cfg_attr(
         not(any(test, feature = "tantivy-oracle")),
         expect(
@@ -420,7 +428,7 @@ impl BuiltInEngineProfileReceipt {
             reason = "typed built-in receipts are constructed only by oracle-backed or test lanes"
         )
     )]
-    const CURRENT_SCHEMA_VERSION: u32 = Self::V4_SCHEMA_VERSION;
+    const CURRENT_SCHEMA_VERSION: u32 = Self::V5_SCHEMA_VERSION;
 
     #[cfg_attr(
         not(any(test, feature = "tantivy-oracle")),
@@ -453,6 +461,7 @@ impl BuiltInEngineProfileReceipt {
             2 => self.validate_stored_v2(engines),
             3 => self.validate_stored_v3(engines),
             4 => self.validate_stored_v4(engines),
+            5 => self.validate_stored_v5(engines),
             _ => Err(GauntletError::InvalidContract {
                 reason: "built-in engine profile receipt schema is unsupported".to_owned(),
             }),
@@ -666,6 +675,51 @@ impl BuiltInEngineProfileReceipt {
         {
             return Err(GauntletError::InvalidContract {
                 reason: "built-in engine profile receipt v4 does not match its stored adapter identities and semantic contract"
+                    .to_owned(),
+            });
+        }
+        validate_recorded_producer_source(
+            &engines.subject.source_revision,
+            engines.subject.source_dirty,
+        )?;
+        Ok(())
+    }
+
+    /// v5 differs from v4 only in the pinned quill crate version (0.2.3, the
+    /// cass#453 segment-reclamation line; lexical stays at 0.2.3); the
+    /// analyzer/schema semantic contract is still byte-identical to v2, so
+    /// v2's is reused.
+    fn validate_stored_v5(&self, engines: &EnginePairIdentity) -> Result<(), GauntletError> {
+        self.subject_config.validate_stored_v1()?;
+        let (subject_implementation, subject_hash, oracle_hash) = match self.profile {
+            BuiltInEngineProfile::ScalarShipping | BuiltInEngineProfile::ScalarG1a => (
+                "frankensearch-quill/scalar-index",
+                self.subject_config.descriptor_hash_v1(),
+                BUILT_IN_PROFILE_V2_SCALAR_ORACLE_CONFIG_HASH,
+            ),
+            BuiltInEngineProfile::Cass => (
+                "frankensearch-quill/cass-index",
+                format!(
+                    "cass-semantic-v1:{}",
+                    self.subject_config.descriptor_hash_v1()
+                ),
+                BUILT_IN_PROFILE_V2_CASS_ORACLE_CONFIG_HASH,
+            ),
+        };
+        if self.schema_version != Self::V5_SCHEMA_VERSION
+            || engines.comparison_mode != ComparisonMode::CrossEngine
+            || engines.subject.implementation != subject_implementation
+            || engines.subject.crate_version != BUILT_IN_PROFILE_V5_QUILL_CRATE_VERSION
+            || engines.subject.config_hash != subject_hash
+            || engines.oracle.implementation != "frankensearch-lexical/tantivy-index"
+            || engines.oracle.crate_version != BUILT_IN_PROFILE_V5_LEXICAL_CRATE_VERSION
+            || engines.oracle.config_hash != oracle_hash
+            || engines.semantic_contract.as_ref() != Some(&self.stored_semantic_contract_v2())
+            || engines.subject.source_revision != engines.oracle.source_revision
+            || engines.subject.source_dirty != engines.oracle.source_dirty
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "built-in engine profile receipt v5 does not match its stored adapter identities and semantic contract"
                     .to_owned(),
             });
         }
@@ -4570,22 +4624,24 @@ mod tests {
         let receipt = match schema_version {
             BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION
             | BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION
-            | BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION => BuiltInEngineProfileReceipt {
+            | BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION
+            | BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION => BuiltInEngineProfileReceipt {
                 schema_version,
                 profile,
                 subject_config: QuillConfigReceipt::from_config(config),
             },
-            BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION => {
+            BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION => {
                 BuiltInEngineProfileReceipt::new(profile, config)
             }
             _ => panic!("unsupported test profile schema {schema_version}"),
         };
         let semantic_contract = match schema_version {
             BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION => receipt.stored_semantic_contract_v1(),
-            // v3 and v4 kept v2's semantic contract byte-identical.
+            // v3, v4 and v5 kept v2's semantic contract byte-identical.
             BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION
             | BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION
-            | BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION => {
+            | BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION
+            | BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION => {
                 receipt.stored_semantic_contract_v2()
             }
             _ => unreachable!("validated above"),
@@ -4598,6 +4654,10 @@ mod tests {
             BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION => (
                 BUILT_IN_PROFILE_V4_QUILL_CRATE_VERSION,
                 BUILT_IN_PROFILE_V4_LEXICAL_CRATE_VERSION,
+            ),
+            BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION => (
+                BUILT_IN_PROFILE_V5_QUILL_CRATE_VERSION,
+                BUILT_IN_PROFILE_V5_LEXICAL_CRATE_VERSION,
             ),
             _ => (
                 BUILT_IN_PROFILE_V1_QUILL_CRATE_VERSION,
@@ -7004,7 +7064,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_profile_v4_is_current_while_v1_v2_and_v3_remain_archive_only() {
+    fn built_in_profile_v5_is_current_while_v1_to_v4_remain_archive_only() {
         for profile in [
             BuiltInEngineProfile::ScalarShipping,
             BuiltInEngineProfile::ScalarG1a,
@@ -7014,6 +7074,7 @@ mod tests {
                 BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION,
                 BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION,
                 BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION,
+                BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION,
             ] {
                 let archived =
                     stored_profile_pair(profile, &QuillConfig::default(), archived_schema);
@@ -7022,22 +7083,22 @@ mod tests {
                     .expect("frozen receipt remains archive-valid");
                 assert!(
                     archived.validate_builtin_contract().is_err(),
-                    "schema v{archived_schema} cannot create a run under the gh-39 facade \
-                     dependency contract (quill 0.2.2, lexical 0.2.3)"
+                    "schema v{archived_schema} cannot create a run under the cass#453 \
+                     segment-reclamation dependency contract (quill 0.2.3, lexical 0.2.3)"
                 );
             }
 
             let current = stored_profile_pair(
                 profile,
                 &QuillConfig::default(),
-                BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION,
+                BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION,
             );
             current
                 .validate_stored_contract()
-                .expect("v4 receipt remains independently replay-valid");
+                .expect("v5 receipt remains independently replay-valid");
             current
                 .validate_builtin_contract()
-                .expect("v4 receipt must match the current adapters");
+                .expect("v5 receipt must match the current adapters");
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-quill"
-version = "0.2.2"
+version = "0.2.3"
 description = "Quill native lexical search engine for frankensearch"
 edition.workspace = true
 license-file.workspace = true
