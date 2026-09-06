@@ -1,5 +1,52 @@
 # Dependency Upgrade Log
 
+## 2026-09-06 — FrankenSQLite 0.3.17
+
+**Scope:** owner-directed FrankenSQLite update from 0.3.8 to the latest
+published stable release, 0.3.17. All 20 `fsqlite*` packages in `Cargo.lock`
+move together; the storage, durability, fsfs, and ops manifests require
+0.3.17. Existing feature selections and Rust call sites are unchanged.
+
+- **Upstream fixes:** the releases since 0.3.8 address prepared-read
+  transaction release, cross-process WAL visibility/checkpoint horizons,
+  FTS5 visibility and maintenance, and savepoint allocation ownership.
+  See the [tagged changelog](https://github.com/Dicklesworthstone/frankensqlite/blob/v0.3.17/CHANGELOG.md).
+  These are upstream changes, not claims that every corresponding failure
+  has been reproduced and fixed in FrankenSearch.
+- **Dependency changes:** one Asupersync 0.4.10 identity remains. New
+  transitive packages are `stacker` 0.1.25, `psm` 0.1.32, `object` 0.39.1,
+  and `ar_archive_writer` 0.5.3. Cargo also consolidates existing-version
+  dependency edges to `windows-sys` 0.61.2, `itertools` 0.14.0, and
+  `getrandom` 0.4.3; no unrelated package versions were upgraded.
+- **Native build requirement:** upstream `fsqlite-core` now includes
+  `stacker` on non-wasm32 targets. Its `psm` build uses a C/assembler
+  driver. This update does not meet the no-C-toolchain acceptance criterion
+  of the still-open native migration, bd-2ba5. The gate's Windows check
+  covers the index crate, not this new database build dependency.
+- **Validation:** 551 focused tests passed (155 durability, 386 storage,
+  and 10 pipeline integrations), with the storage `fts5` feature enabled;
+  one storage test remained ignored. Formatting, workspace check, both
+  Clippy lanes, the index cross-target check, workspace library tests,
+  fsfs tests, and facade hybrid integrations passed in the full gate.
+  The real-model CLI stage had five passes and one failure: the existing
+  stock-debug native-quality test returned `refinement_failed` at its
+  unchanged 500 ms budget, matching bd-2ba5's earlier failure. The executable
+  quick-start stage passed. Overall: nine gate checks passed and the e2e
+  check failed; the full gate exited 1. The timeout remains unresolved.
+- **Audit:** `cargo audit` reports zero vulnerability advisories, with the
+  same four unmaintained, one unsoundness, and one yanked-package warning
+  as the previous lockfile. UBS scanned zero Rust source files for this
+  manifest-only change and supplies no additional code-scan evidence.
+
+Validation used source base `13585b29a3e867b0221146f2926a091a2bba893f` and
+lockfile SHA256 `6b0663501ab0ff9aeed97f483a4d897877f1a26a2726f1498ae1490fb29b8d82`.
+The candidate was first tested through `CARGO_RESOLVER_LOCKFILE_PATH`;
+the applied workspace lockfile is byte-identical. Terminal logs and the
+before/after audit reports are under
+`/tmp/frankensearch-fsqlite-0.3.17.lrSs6X/` on `thinkstation1`.
+The gate ran from 19:12:23Z to 19:42:30Z. Its final stock-debug quick-start
+binary SHA256 was `53267a580cdcea946ba6d732b7054da7a67ca66a03af67422d5906ae37ade4d8`.
+
 ## 2026-08-21/23 — Registry refresh: FrankenSQLite 0.3.8, Asupersync 0.4.9, fastembed 6, jsonschema 0.50
 
 **Scope:** owner-directed refresh of every direct dependency to its crates.io
