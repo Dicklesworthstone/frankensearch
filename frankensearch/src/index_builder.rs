@@ -1503,6 +1503,195 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "native", feature = "rerank"))]
+    #[test]
+    fn native_detection_stopped_pool_on_live_runtime_never_loads_inline() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+        let handle = pool.handle();
+        assert!(pool.shutdown_and_wait(std::time::Duration::from_secs(2)));
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let model_root = tempfile::tempdir().unwrap();
+        let result = runtime.block_on(detect_embedder_stack_with_pool(
+            &cx,
+            Some(model_root.path()),
+            &DetectOptions {
+                offline: Some(true),
+            },
+            handle,
+        ));
+        eprintln!("stopped pool detection: {result:?}");
+        let error = result.expect_err("stopped pool must reject model loading");
+        assert!(
+            matches!(error, SearchError::EmbeddingFailed { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("blocking pool is shut down"),
+            "{error}"
+        );
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(2)));
+    }
+
+    #[cfg(any(feature = "native", feature = "rerank"))]
+    #[test]
+    fn native_detection_shutdown_after_spawn_never_loads_inline() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let model_root = tempfile::tempdir().unwrap();
+        runtime.block_on(async {
+            let options = DetectOptions {
+                offline: Some(true),
+            };
+            let mut detection = Box::pin(detect_embedder_stack_with_pool(
+                &cx,
+                Some(model_root.path()),
+                &options,
+                pool.handle(),
+            ));
+            std::future::poll_fn(|task_cx| {
+                assert!(detection.as_mut().poll(task_cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            // The first poll admitted the wrapper; the current-thread runtime
+            // has not polled it yet, so shutdown races the actual pool dispatch.
+            assert!(pool.shutdown_and_wait(std::time::Duration::from_secs(2)));
+            let result = detection.await;
+            eprintln!("pool shutdown after spawn: {result:?}");
+            let error = result.expect_err("rejected dispatch must not start a model loader");
+            assert!(
+                matches!(error, SearchError::EmbeddingFailed { .. }),
+                "{error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("dispatch fell back to an async executor"),
+                "{error}"
+            );
+        });
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(2)));
+    }
+
+    #[cfg(any(feature = "native", feature = "rerank"))]
+    #[test]
+    fn native_detection_request_cancellation_wins_over_model_error() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let model_root = tempfile::tempdir().unwrap();
+        runtime.block_on(async {
+            let options = DetectOptions {
+                offline: Some(true),
+            };
+            let mut detection = Box::pin(detect_embedder_stack_with_pool(
+                &cx,
+                Some(model_root.path()),
+                &options,
+                runtime.blocking_handle().unwrap(),
+            ));
+            std::future::poll_fn(|task_cx| {
+                assert!(detection.as_mut().poll(task_cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            cx.cancel_fast(asupersync::CancelKind::User);
+            let result = detection.await;
+            eprintln!("cancelled request detection: {result:?}");
+            assert!(
+                matches!(result, Err(SearchError::Cancelled { .. })),
+                "request cancellation after spawn must take precedence over model failure"
+            );
+        });
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(2)));
+    }
+
+    #[cfg(any(feature = "native", feature = "rerank"))]
+    #[test]
+    fn native_detection_cancellation_wins_over_completed_model_error() {
+        use std::time::{Duration, Instant};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let pool = runtime.blocking_handle().unwrap();
+        let model_root = tempfile::tempdir().unwrap();
+        let options = DetectOptions {
+            offline: Some(true),
+        };
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        // The uncancelled control proves that this root produces a real loader
+        // error. No fake embedder or substituted worker result is involved.
+        let control = runtime.block_on(detect_embedder_stack_with_pool(
+            &cx,
+            Some(model_root.path()),
+            &options,
+            pool.clone(),
+        ));
+        assert!(
+            matches!(control, Err(SearchError::EmbedderUnavailable { .. })),
+            "{control:?}"
+        );
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let _blocker = pool.spawn(move || {
+            started_tx.send(()).unwrap();
+            // Disconnect or the fuse releases the worker even if an assertion
+            // unwinds before the explicit release below.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        runtime.block_on(async {
+            let mut detection = Box::pin(detect_embedder_stack_with_pool(
+                &cx,
+                Some(model_root.path()),
+                &options,
+                pool.clone(),
+            ));
+            std::future::poll_fn(|task_cx| {
+                assert!(detection.as_mut().poll(task_cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let started = Instant::now();
+            while pool.pending_count() != 1 {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "loader not queued"
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            release_tx.send(()).unwrap();
+            // Do not poll detection: let its actual worker finish while the
+            // original request is still live, then cancel before consuming it.
+            while pool.pending_count() != 0 || pool.busy_threads() != 0 {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "loader did not drain"
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            cx.cancel_fast(asupersync::CancelKind::User);
+            let result = detection.await;
+            eprintln!("cancelled request with completed loader error: {result:?}");
+            assert!(
+                matches!(result, Err(SearchError::Cancelled { .. })),
+                "caller cancellation must precede unwrapping a completed model error"
+            );
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
     #[cfg(target_os = "linux")]
     fn owned_admitted_v2_sync_dir() -> std::path::PathBuf {
         static NONCE: AtomicU64 = AtomicU64::new(0);
