@@ -4133,6 +4133,10 @@ mod tests {
         // 1.28.0 MiniLM/Snowflake certificate change. Nomic's output is unchanged.
         // Historical certificates must fail the actual loader; exact current
         // conformance is checked both at load and in the real-model fixtures.
+        // GOLDEN-CHANGE release 0.2.5: four adapter manifests include the crate
+        // version in implementation_revision. Only that provenance field moves
+        // from 0.2.4 to 0.2.5; the reconstruction below retains the old hashes
+        // and proves that no other manifest field or output certificate drifted.
         let observed = [
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
@@ -4149,11 +4153,11 @@ mod tests {
         let expected = [
             (
                 "model2vec-native".to_owned(),
-                "860061ab2a8de3ad3a36a235ebf856eec6bb3d952840be655b0670595882d3cb".to_owned(),
+                "3783488bae83c3fd07e9913df11430f6be4e7c70da94f7c5d75ee78dc0ebfadf".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "6d5cf6dd6bb8dc9de621b03c53248796dddb054b93ae829b98aa7dbf2552cf76".to_owned(),
+                "7c2debb9bf81b9d6f37a4cab092af12a74fdc563d9ffab9cfa20af7ecb8302ca".to_owned(),
             ),
             (
                 "frankentorch-native-minilm".to_owned(),
@@ -4169,14 +4173,46 @@ mod tests {
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "ae11db9eda424707fb89a0c70daae5e5a559521d8d1edb45ead90a6344eca247".to_owned(),
+                "07436d59a036ba2917bd6fa3a6e859101fcd9d91a706f39dd723df0daa15b008".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "79882126878654776eec8c64961f6dada37ddf11ac73c4a07cd48d78598f9020".to_owned(),
+                "f20cac45eb8310e793362e25fa3bcbe943dc2af78536840d93da58a1d31fa40a".to_owned(),
             ),
         ];
         assert_eq!(observed, expected);
+
+        for (mut manifest, previous_fingerprint) in [
+            (
+                ModelArtifactManifestV1::potion_128m_native().unwrap(),
+                "860061ab2a8de3ad3a36a235ebf856eec6bb3d952840be655b0670595882d3cb",
+            ),
+            (
+                ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+                "6d5cf6dd6bb8dc9de621b03c53248796dddb054b93ae829b98aa7dbf2552cf76",
+            ),
+            (
+                ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+                "ae11db9eda424707fb89a0c70daae5e5a559521d8d1edb45ead90a6344eca247",
+            ),
+            (
+                ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+                "79882126878654776eec8c64961f6dada37ddf11ac73c4a07cd48d78598f9020",
+            ),
+        ] {
+            let adapter = manifest
+                .execution
+                .implementation_revision
+                .strip_prefix("frankensearch-embed-0.2.5+")
+                .expect("release fixture must name the actual 0.2.5 adapter");
+            manifest.execution.implementation_revision =
+                format!("frankensearch-embed-0.2.4+{adapter}");
+            assert_eq!(
+                manifest.freeze().unwrap().fingerprint,
+                previous_fingerprint,
+                "the release bump must change only adapter version provenance"
+            );
+        }
     }
 
     #[test]
