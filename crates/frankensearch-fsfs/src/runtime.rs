@@ -4560,7 +4560,7 @@ impl FsfsRuntime {
         }
     }
 
-    /// Attach the caller's existing pool for explicitly selected native quality.
+    /// Attach the caller's existing pool for native quality and reranking.
     /// The caller retains the owner and drains it after all runtime clones exit.
     #[cfg(feature = "rerank")]
     #[must_use]
@@ -4573,6 +4573,7 @@ impl FsfsRuntime {
         // Runtime clones using the previous pool keep their own shared slot.
         self.quality_load_gate =
             Arc::new(asupersync::sync::Mutex::new(QualityEmbedderSlot::default()));
+        self.reranker = Arc::new(std::sync::OnceLock::new());
         self
     }
 
@@ -15252,10 +15253,15 @@ impl FsfsRuntime {
             );
             return Ok(None);
         }
-        let reranker = frankensearch_rerank::NativeReranker::load(&inspection.path)?;
-        Ok(Some(Arc::new(frankensearch_core::SyncRerankerAdapter(
-            reranker,
-        ))))
+        let pool = self.native_blocking_pool.clone().ok_or_else(|| {
+            SearchError::RerankFailed {
+                model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                source: "native reranking requires a caller-owned blocking pool; use FsfsRuntime::with_native_blocking_pool".into(),
+            }
+        })?;
+        let reranker =
+            frankensearch_rerank::NativeReranker::load(&inspection.path)?.with_blocking_pool(pool);
+        Ok(Some(Arc::new(reranker)))
     }
 
     #[cfg(not(feature = "rerank"))]
@@ -23898,7 +23904,13 @@ mod tests {
             #[cfg(feature = "rerank")]
             {
                 let pool = super::SearchBlockingPool::default();
+                // A cached unavailable reranker must also be retried with the
+                // new owner; clones retaining the old owner keep their slot.
+                runtime.reranker.get_or_init(|| super::RerankerSlot(None));
                 let rebound = runtime.clone().with_native_blocking_pool(pool.handle());
+                assert!(runtime.reranker.get().is_some());
+                assert!(rebound.reranker.get().is_none());
+                assert!(!Arc::ptr_eq(&runtime.reranker, &rebound.reranker));
                 resources.quality_embedder = None;
                 resources.quality_embedder_attempted = false;
                 rebound

@@ -24,6 +24,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use asupersync::Cx;
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+use asupersync::sync::{LockError, Mutex as AsyncMutex, OwnedMutexGuard};
 use ft_api::{FrankenTorchSession, quantize_per_output_channel_i8};
 use ft_autograd::TensorNodeId;
 use ft_core::{DType, Device, ExecutionMode, TensorMeta};
@@ -1363,6 +1366,11 @@ impl Model {
 }
 
 /// Pure-Rust frankentorch cross-encoder reranker.
+///
+/// Clones share the loaded model and serialize inference. For async
+/// [`Reranker`](frankensearch_core::traits::Reranker) use, attach a caller-owned
+/// pool with [`Self::with_blocking_pool`]. Synchronous use needs no runtime.
+#[derive(Clone)]
 pub struct NativeReranker {
     /// A single frankentorch session behind a `Mutex`. Documents are reranked in
     /// a SEQUENTIAL loop, and each forward parallelizes internally across cores
@@ -1372,8 +1380,10 @@ pub struct NativeReranker {
     /// nested-rayon + `Mutex` deadlock is impossible by construction. Per-forward
     /// parallelism makes the common few-doc rerank fast (each forward uses all
     /// cores); a batched forward is the deferred next step for large-N throughput.
-    inner: Mutex<Model>,
-    tokenizer: Tokenizer,
+    inner: Arc<Mutex<Model>>,
+    tokenizer: Arc<Tokenizer>,
+    admission: Arc<AsyncMutex<()>>,
+    blocking_pool: Option<BlockingPoolHandle>,
     max_length: usize,
     name: String,
     id: String,
@@ -1468,12 +1478,103 @@ impl NativeReranker {
         );
 
         Ok(Self {
-            inner: Mutex::new(model),
-            tokenizer,
+            inner: Arc::new(Mutex::new(model)),
+            tokenizer: Arc::new(tokenizer),
+            admission: Arc::new(AsyncMutex::new(())),
+            blocking_pool: None,
             max_length: DEFAULT_MAX_LENGTH,
             name: MODEL_NAME.to_owned(),
             id: MODEL_NAME.to_owned(),
         })
+    }
+
+    /// Attach the caller's bounded blocking pool for async reranking.
+    ///
+    /// The caller retains and drains the pool at shutdown. Cancellation cannot
+    /// preempt a tensor kernel: the worker keeps model admission until it exits,
+    /// checking cancellation between tokenizations and inference chunks. No
+    /// runtime or pool is created internally; without a pool async calls fail.
+    #[must_use]
+    pub fn with_blocking_pool(mut self, pool: BlockingPoolHandle) -> Self {
+        self.blocking_pool = Some(pool);
+        self
+    }
+
+    async fn infer(
+        &self,
+        cx: &Cx,
+        query: &str,
+        documents: &[RerankDocument],
+    ) -> SearchResult<Vec<RerankScore>> {
+        rerank_checkpoint(cx)?;
+        let pool = self.blocking_pool.clone().ok_or_else(|| {
+            rerank_err(
+                "async inference",
+                "requires a caller-owned blocking pool; attach it with NativeReranker::with_blocking_pool",
+            )
+        })?;
+        if pool.is_shutdown() {
+            return Err(rerank_err(
+                "async inference",
+                "caller-owned blocking pool is shut down",
+            ));
+        }
+        if documents.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Cancelled waiters must not occupy pool workers waiting for the model.
+        let admission = OwnedMutexGuard::lock(Arc::clone(&self.admission), cx)
+            .await
+            .map_err(|error| match error {
+                LockError::Cancelled => SearchError::Cancelled {
+                    phase: "native.rerank".to_owned(),
+                    reason: "native reranker admission cancelled".to_owned(),
+                },
+                error => rerank_err("model admission", error),
+            })?;
+        let owner = self.clone();
+        let query = query.to_owned();
+        let documents = documents.to_vec();
+        let request_cx = cx.clone();
+        let worker_cx = cx.clone().with_blocking_pool_handle(Some(pool));
+        let mut worker = worker_cx
+            .spawn_blocking(move |child| {
+                let _admission = admission;
+                // asupersync can recover a rejected pool submission by calling
+                // it inline on its wrapper task. Refuse that fallback before
+                // touching the model, including shutdown racing admission.
+                if Cx::is_active() {
+                    return Err(rerank_err(
+                        "inference worker",
+                        "blocking pool dispatch fell back to an async executor",
+                    ));
+                }
+                let mut scores = owner.rerank_checked(&query, &documents, || {
+                    rerank_checkpoint(&request_cx)?;
+                    rerank_checkpoint(&child)
+                })?;
+                scores.sort_by(|lhs, rhs| {
+                    rhs.score
+                        .total_cmp(&lhs.score)
+                        .then_with(|| lhs.original_rank.cmp(&rhs.original_rank))
+                        .then_with(|| lhs.doc_id.cmp(&rhs.doc_id))
+                });
+                rerank_checkpoint(&child)?;
+                rerank_checkpoint(&request_cx)?;
+                Ok(scores)
+            })
+            .map_err(|error| rerank_err("cannot admit inference worker", error))?;
+        let result = worker.join(cx).await.map_err(|error| match error {
+            asupersync::runtime::JoinError::Cancelled(_) => SearchError::Cancelled {
+                phase: "native.rerank".to_owned(),
+                reason: "native reranker worker cancelled".to_owned(),
+            },
+            error => rerank_err("inference worker", error),
+        });
+        // TaskHandle::join is uninterruptible; it does not inspect its Cx.
+        // A request cancelled during the last chunk must never publish scores.
+        rerank_checkpoint(cx)?;
+        result?
     }
 }
 
@@ -1814,12 +1915,23 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-impl SyncRerank for NativeReranker {
-    fn rerank_sync(
+fn rerank_checkpoint(cx: &Cx) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: "native.rerank".to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
+}
+
+impl NativeReranker {
+    fn rerank_checked(
         &self,
         query: &str,
         documents: &[RerankDocument],
+        checkpoint: impl Fn() -> SearchResult<()>,
     ) -> SearchResult<Vec<RerankScore>> {
+        checkpoint()?;
         if documents.is_empty() {
             return Ok(Vec::new());
         }
@@ -1833,6 +1945,7 @@ impl SyncRerank for NativeReranker {
         // `original_rank`) follows the input and the logits are deterministic.
         let mut encoded: Vec<(Vec<i64>, Vec<i64>)> = Vec::with_capacity(documents.len());
         for doc in documents {
+            checkpoint()?;
             let encoding = self
                 .tokenizer
                 .encode((query, doc.text.as_str()), true)
@@ -1854,6 +1967,7 @@ impl SyncRerank for NativeReranker {
         let mut logits: Vec<f32> = Vec::with_capacity(documents.len());
         let mut chunk_start = 0usize;
         while chunk_start < encoded.len() {
+            checkpoint()?;
             // Grow the chunk until adding the next doc would exceed the token
             // budget; always take at least one doc (a single over-budget doc runs
             // alone).
@@ -1869,6 +1983,8 @@ impl SyncRerank for NativeReranker {
             chunk_start = chunk_end;
         }
         drop(model);
+
+        checkpoint()?;
 
         let out = documents
             .iter()
@@ -1890,6 +2006,16 @@ impl SyncRerank for NativeReranker {
             .collect();
         Ok(out)
     }
+}
+
+impl SyncRerank for NativeReranker {
+    fn rerank_sync(
+        &self,
+        query: &str,
+        documents: &[RerankDocument],
+    ) -> SearchResult<Vec<RerankScore>> {
+        self.rerank_checked(query, documents, || Ok(()))
+    }
 
     fn id(&self) -> &str {
         &self.id
@@ -1908,9 +2034,334 @@ impl SyncRerank for NativeReranker {
     }
 }
 
+impl frankensearch_core::traits::Reranker for NativeReranker {
+    fn rerank<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        documents: &'a [RerankDocument],
+    ) -> frankensearch_core::traits::SearchFuture<'a, Vec<RerankScore>> {
+        Box::pin(self.infer(cx, query, documents))
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn model_name(&self) -> &str {
+        &self.name
+    }
+
+    fn max_length(&self) -> usize {
+        self.max_length
+    }
+
+    fn is_available(&self) -> bool {
+        self.blocking_pool
+            .as_ref()
+            .is_some_and(|pool| !pool.is_shutdown())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verified_async_fixture() -> NativeReranker {
+        let dir = std::path::PathBuf::from(
+            std::env::var("FRANKENSEARCH_RERANK_MODEL_DIR").expect("reranker fixture required"),
+        );
+        frankensearch_embed::model_manifest::ModelManifest::ms_marco_reranker()
+            .verify_dir(&dir)
+            .expect("registered cross-encoder artifacts");
+        assert!(
+            !dir.join(SAFETENSORS_PRIMARY).exists(),
+            "unregistered preferred weights must not replace the verified fixture"
+        );
+        NativeReranker::load(dir).expect("actual native reranker")
+    }
+
+    #[test]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn async_fixture_preserves_scores_and_requires_explicit_pool() {
+        use frankensearch_core::traits::Reranker;
+
+        let native = verified_async_fixture();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let query = "how to retry failed requests";
+        let documents = [
+            doc("bread", "A recipe for baking sourdough bread."),
+            doc(
+                "retry",
+                "Retry failed network requests with exponential backoff and jitter.",
+            ),
+            doc(
+                "duplicate",
+                "Retry failed network requests with exponential backoff and jitter.",
+            ),
+        ];
+        assert!(!Reranker::is_available(&native));
+        let error = runtime
+            .block_on(native.rerank(&cx, query, &documents))
+            .expect_err("no inline inference without a pool");
+        assert!(matches!(error, SearchError::RerankFailed { .. }));
+        assert!(error.to_string().contains("caller-owned blocking pool"));
+        assert!(matches!(
+            runtime.block_on(native.rerank(&cx, query, &[])),
+            Err(SearchError::RerankFailed { .. })
+        ));
+
+        let expected = native.rerank_sync(query, &documents).unwrap();
+        let native = native.with_blocking_pool(runtime.blocking_handle().unwrap());
+        let cloned = native.clone();
+        assert!(Reranker::is_available(&cloned));
+        assert_eq!(Reranker::id(&cloned), SyncRerank::id(&native));
+        assert_eq!(
+            Reranker::model_name(&cloned),
+            SyncRerank::model_name(&native)
+        );
+        assert_eq!(
+            Reranker::max_length(&cloned),
+            SyncRerank::max_length(&native)
+        );
+        let actual = runtime
+            .block_on(cloned.rerank(&cx, query, &documents))
+            .unwrap();
+        assert_eq!(actual.len(), documents.len());
+        assert_eq!(
+            actual
+                .iter()
+                .map(|score| score.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["retry", "duplicate", "bread"]
+        );
+        assert!(actual[0].score > actual[2].score);
+        assert_eq!(actual[0].score, actual[1].score);
+        for score in &actual {
+            let reference = &expected[score.original_rank];
+            assert_eq!(score.doc_id, reference.doc_id);
+            assert_eq!(score.score.to_bits(), reference.score.to_bits());
+            assert_eq!(
+                score.raw_logit.map(f32::to_bits),
+                reference.raw_logit.map(f32::to_bits)
+            );
+        }
+        assert!(
+            runtime
+                .block_on(native.rerank(&cx, query, &[]))
+                .unwrap()
+                .is_empty()
+        );
+        let cancelled = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        cancelled.cancel_fast(asupersync::CancelKind::User);
+        for input in [documents.as_slice(), &[]] {
+            assert!(matches!(
+                runtime.block_on(native.rerank(&cancelled, query, input)),
+                Err(SearchError::Cancelled { .. })
+            ));
+        }
+        assert!(native.admission.try_lock().is_ok());
+        let stopped_pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+        let stopped = native.clone().with_blocking_pool(stopped_pool.handle());
+        assert!(stopped_pool.shutdown_and_wait(std::time::Duration::from_secs(2)));
+        assert!(!Reranker::is_available(&stopped));
+        let error = runtime
+            .block_on(stopped.rerank(&cx, query, &documents))
+            .unwrap_err();
+        assert!(matches!(error, SearchError::RerankFailed { .. }));
+        assert!(error.to_string().contains("blocking pool is shut down"));
+        assert!(native.admission.try_lock().is_ok());
+
+        // Shutdown after the initial pool check but before admission tests the
+        // runtime's inline recovery path with an otherwise live scheduler.
+        let racing_pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+        let racing = native.clone().with_blocking_pool(racing_pool.handle());
+        runtime.block_on(async {
+            let admission = OwnedMutexGuard::lock(Arc::clone(&native.admission), &cx)
+                .await
+                .unwrap();
+            let mut pending = racing.rerank(&cx, query, &documents);
+            std::future::poll_fn(|task_cx| {
+                assert!(pending.as_mut().poll(task_cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(racing_pool.shutdown_and_wait(std::time::Duration::from_secs(2)));
+            drop(admission);
+            let error = pending.await.unwrap_err();
+            assert!(matches!(error, SearchError::RerankFailed { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("dispatch fell back to an async executor")
+            );
+        });
+        assert!(native.admission.try_lock().is_ok());
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn async_fixture_request_cancellation_after_admission_never_publishes_scores() {
+        use frankensearch_core::traits::Reranker;
+        use std::time::{Duration, Instant};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let pool = runtime.blocking_handle().unwrap();
+        let native = verified_async_fixture().with_blocking_pool(pool.clone());
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let documents = [doc(
+            "retry",
+            "Retry failed requests with exponential backoff.",
+        )];
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let model = Arc::clone(&native.inner);
+            scope.spawn(move || {
+                let _model = model.lock().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            runtime.block_on(async {
+                let mut running = native.rerank(&cx, "retry", &documents);
+                std::future::poll_fn(|task_cx| {
+                    assert!(running.as_mut().poll(task_cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                let started = Instant::now();
+                while pool.busy_threads() != 1 {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(2),
+                        "worker did not start"
+                    );
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                cx.cancel_fast(asupersync::CancelKind::User);
+                release_tx.send(()).unwrap();
+                assert!(
+                    matches!(running.await, Err(SearchError::Cancelled { .. })),
+                    "request cancellation after admission must not return successful scores"
+                );
+            });
+        });
+        assert!(native.admission.try_lock().is_ok());
+        let fresh = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let scores = runtime
+            .block_on(native.rerank(&fresh, "retry", &documents))
+            .unwrap();
+        assert_eq!(scores.len(), 1);
+        assert!(scores[0].score.is_finite());
+        assert!(runtime.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn async_fixture_timeout_retains_admission_and_cancels_queued_waiter() {
+        use frankensearch_core::traits::Reranker;
+        use std::future::poll_fn;
+        use std::task::Poll;
+        use std::time::{Duration, Instant};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        let pool = runtime.blocking_handle().unwrap();
+        let native = verified_async_fixture().with_blocking_pool(pool.clone());
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let waiting_cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let documents = [doc(
+            "retry",
+            "Retry failed requests with exponential backoff.",
+        )];
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            // Hold the actual model. The fuse turns accidental inline execution
+            // into a failed responsiveness assertion rather than a test hang.
+            let model = Arc::clone(&native.inner);
+            scope.spawn(move || {
+                let _model = model.lock().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            runtime.block_on(async {
+                let started = Instant::now();
+                let mut running = native.rerank(&cx, "retry", &documents);
+                poll_fn(|task_cx| {
+                    assert!(running.as_mut().poll(task_cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                while pool.busy_threads() != 1 {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(2),
+                        "worker did not start"
+                    );
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                assert!(native.admission.try_lock().is_err());
+                assert!(
+                    asupersync::time::timeout(cx.now(), Duration::from_millis(20), running)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "executor was blocked"
+                );
+                assert_eq!(pool.busy_threads(), 1);
+                assert!(
+                    native.admission.try_lock().is_err(),
+                    "dropped future must leave admission with its worker"
+                );
+
+                let cloned = native.clone();
+                let mut waiting = cloned.rerank(&waiting_cx, "retry", &documents);
+                poll_fn(|task_cx| {
+                    assert!(waiting.as_mut().poll(task_cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                waiting_cx.cancel_fast(asupersync::CancelKind::User);
+                assert!(matches!(waiting.await, Err(SearchError::Cancelled { .. })));
+                assert_eq!(
+                    pool.busy_threads(),
+                    1,
+                    "cancelled admission used another worker"
+                );
+                assert_eq!(pool.pending_count(), 0);
+                release_tx.send(()).unwrap();
+                let drain_started = Instant::now();
+                while pool.busy_threads() != 0 {
+                    assert!(
+                        drain_started.elapsed() < Duration::from_secs(2),
+                        "worker did not drain"
+                    );
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                assert!(native.admission.try_lock().is_ok());
+                let healthy = cloned.rerank(&cx, "retry", &documents).await.unwrap();
+                let sync = native.rerank_sync("retry", &documents).unwrap();
+                assert_eq!(healthy.len(), 1);
+                assert_eq!(healthy[0].doc_id, "retry");
+                assert_eq!(healthy[0].raw_logit, sync[0].raw_logit);
+                assert_eq!(healthy[0].score, sync[0].score);
+            });
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(5)));
+    }
 
     #[test]
     fn f32_weight_decode_preserves_bits_for_aligned_and_unaligned_storage() {

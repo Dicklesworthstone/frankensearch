@@ -571,7 +571,12 @@ mod tests {
         );
         let reranker: rerank::NativeReranker = NativeReranker::load(&reranker_dir)
             .expect("load actual native reranker through the facade");
-        let reranker = SyncRerankerAdapter(reranker);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .expect("caller-owned runtime");
+        let reranker = reranker.with_blocking_pool(runtime.blocking_handle().unwrap());
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
         let mut candidates: Vec<ScoredResult> = ["bread", "retry"]
             .into_iter()
             .map(|id| ScoredResult {
@@ -587,9 +592,7 @@ mod tests {
                 metadata: None,
             })
             .collect();
-        // This dedicated test thread is the blocking inference context for the
-        // synchronous adapter. No async application worker is occupied by it.
-        asupersync::test_utils::run_test_with_cx(|cx| async move {
+        runtime.block_on(async {
             rerank_step(
                 &cx,
                 &reranker,
@@ -617,6 +620,7 @@ mod tests {
             );
             assert!(candidates[0].rerank_score > candidates[1].rerank_score);
         });
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(5)));
     }
 
     #[cfg(feature = "hash")]
