@@ -4458,6 +4458,7 @@ const REASON_RERANK_UNAVAILABLE: &str = "query.stage.rerank.disabled.unavailable
 const REASON_RERANK_NO_TEXT: &str = "query.stage.rerank.disabled.no_document_text";
 const REASON_RERANK_APPLIED: &str = "query.stage.rerank.applied";
 const REASON_RERANK_FAILED: &str = "query.stage.rerank.failed";
+const REASON_RERANK_TIMEOUT: &str = "query.stage.rerank.timeout";
 /// Bytes read from a candidate file for reranking. The cross-encoder
 /// truncates at 512 tokens, so this head already covers what it can see.
 const FSFS_RERANK_DOCUMENT_READ_LIMIT: u64 = 16 * 1024;
@@ -8324,9 +8325,13 @@ impl FsfsRuntime {
     }
 
     fn search_payloads_cacheable(payloads: &[SearchPayload]) -> bool {
-        !payloads
-            .iter()
-            .any(|payload| payload.phase == SearchOutputPhase::RefinementFailed)
+        !payloads.iter().any(|payload| {
+            payload.phase == SearchOutputPhase::RefinementFailed
+                || payload
+                    .rerank
+                    .as_ref()
+                    .is_some_and(|stage| stage.reason_code == REASON_RERANK_TIMEOUT)
+        })
     }
 
     #[cfg(test)]
@@ -15386,8 +15391,12 @@ impl FsfsRuntime {
     /// The plan's `candidate_budget` bounds the head. Scored hits are ordered
     /// by descending cross-encoder score; head hits whose text could not be
     /// read keep their fused order after them; the tail is untouched. A model
-    /// failure keeps the fused order and reports `query.stage.rerank.failed`;
-    /// cancellation propagates.
+    /// failure keeps the fused order and reports `query.stage.rerank.failed`.
+    /// The stage deadline includes document loading, admission and inference;
+    /// cold model selection precedes this stage. Expiry keeps the fused order
+    /// with `query.stage.rerank.timeout`; cancellation propagates. Running
+    /// blocking work retains its owner until it finishes, without publishing
+    /// late scores.
     async fn apply_rerank_stage(
         &self,
         cx: &Cx,
@@ -15397,6 +15406,7 @@ impl FsfsRuntime {
         query: &str,
         fused: Vec<FusedCandidate>,
     ) -> SearchResult<RerankStageOutcome> {
+        Self::semantic_retry_checkpoint(cx, "rerank")?;
         let budget = stage.candidate_budget;
         let skipped = |fused: Vec<FusedCandidate>, reason_code: &str| RerankStageOutcome {
             fused,
@@ -15417,51 +15427,54 @@ impl FsfsRuntime {
         }
 
         let started = Instant::now();
-        let sentinel = match Self::read_index_sentinel(index_root) {
-            Ok(sentinel) => sentinel,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "fsfs rerank stage: index sentinel unreadable; resolving candidate paths against the index root"
-                );
-                None
-            }
-        };
-        let canonicalizer = DefaultCanonicalizer::default();
-        let documents = fused[..depth]
-            .iter()
-            .filter_map(|candidate| {
-                let path =
-                    resolve_manifest_file_path(&candidate.doc_id, sentinel.as_ref(), index_root);
-                read_rerank_document_text(&path, &canonicalizer).map(|text| RerankDocument {
-                    doc_id: candidate.doc_id.clone(),
-                    text,
+        let deadline = cx.now() + Duration::from_millis(stage.timeout_ms);
+        let score_result = {
+            let work = async {
+                let documents = self
+                    .rerank_documents(cx, index_root, &fused[..depth])
+                    .await?;
+                if documents.is_empty() {
+                    return Ok(None);
+                }
+                reranker.rerank(cx, query, &documents).await.map(Some)
+            };
+            let mut timed = std::pin::pin!(asupersync::time::timeout_at(deadline, work));
+            std::future::poll_fn(|task_cx| {
+                if let Err(error) =
+                    Self::rerank_deadline_checkpoint(cx, deadline, started, stage.timeout_ms)
+                {
+                    return Poll::Ready(Err(error));
+                }
+                let result = timed.as_mut().poll(task_cx);
+                // A ready future can cross its deadline during a single poll.
+                // Cancellation and expiry both beat such a late success.
+                if let Err(error) =
+                    Self::rerank_deadline_checkpoint(cx, deadline, started, stage.timeout_ms)
+                {
+                    return Poll::Ready(Err(error));
+                }
+                result.map(|result| {
+                    result.unwrap_or_else(|_| {
+                        Err(SearchError::SearchTimeout {
+                            elapsed_ms: u64::try_from(started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                            budget_ms: stage.timeout_ms,
+                        })
+                    })
                 })
             })
-            .collect::<Vec<_>>();
-        if documents.is_empty() {
-            warn!(
-                head = depth,
-                "fsfs rerank stage skipped: no candidate text could be read from the target root"
-            );
-            return Ok(skipped(fused, REASON_RERANK_NO_TEXT));
-        }
-
-        let mut scores = match reranker.rerank(cx, query, &documents).await {
-            Ok(scores) => scores,
-            Err(error) if matches!(error, SearchError::Cancelled { .. }) => return Err(error),
-            Err(error) => {
+            .await
+        };
+        let mut scores = match score_result {
+            Ok(Some(scores)) => scores,
+            Ok(None) => {
                 warn!(
-                    error_code = error_code_for(&error),
-                    error = %error,
-                    "fsfs rerank stage failed; keeping the fused order"
+                    head = depth,
+                    "fsfs rerank stage skipped: no candidate text could be read from the target root"
                 );
-                let mut payload = RerankStagePayload::skipped(REASON_RERANK_FAILED, budget);
-                payload.status = RerankStageStatus::Failed;
-                payload.elapsed_ms =
-                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                return Ok(RerankStageOutcome { fused, payload });
+                return Ok(skipped(fused, REASON_RERANK_NO_TEXT));
             }
+            Err(error) => return Self::rerank_stage_failure(fused, budget, started, error),
         };
         scores.sort_by(|left, right| right.score.total_cmp(&left.score));
 
@@ -15499,6 +15512,11 @@ impl FsfsRuntime {
         }
         reordered.extend(fused[depth..].iter().cloned());
 
+        if let Err(error) =
+            Self::rerank_deadline_checkpoint(cx, deadline, started, stage.timeout_ms)
+        {
+            return Self::rerank_stage_failure(fused, budget, started, error);
+        }
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
             phase = "rerank",
@@ -15522,6 +15540,116 @@ impl FsfsRuntime {
                 scores: hit_scores,
             },
         })
+    }
+
+    fn rerank_deadline_checkpoint(
+        cx: &Cx,
+        deadline: asupersync::types::Time,
+        started: Instant,
+        budget_ms: u64,
+    ) -> SearchResult<()> {
+        Self::semantic_retry_checkpoint(cx, "rerank")?;
+        // At the boundary the stage has exhausted its budget, including zero.
+        // Use the same caller clock as the timer; Instant is telemetry only.
+        if cx.now() >= deadline {
+            return Err(SearchError::SearchTimeout {
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                budget_ms,
+            });
+        }
+        Ok(())
+    }
+
+    fn rerank_stage_failure(
+        fused: Vec<FusedCandidate>,
+        budget: usize,
+        started: Instant,
+        error: SearchError,
+    ) -> SearchResult<RerankStageOutcome> {
+        if matches!(error, SearchError::Cancelled { .. }) {
+            return Err(error);
+        }
+        warn!(error_code = error_code_for(&error), error = %error, "fsfs rerank stage failed; keeping the fused order");
+        let reason = if matches!(error, SearchError::SearchTimeout { .. }) {
+            REASON_RERANK_TIMEOUT
+        } else {
+            REASON_RERANK_FAILED
+        };
+        let mut payload = RerankStagePayload::skipped(reason, budget);
+        payload.status = RerankStageStatus::Failed;
+        payload.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(RerankStageOutcome { fused, payload })
+    }
+
+    #[cfg_attr(not(feature = "rerank"), allow(clippy::unused_self))]
+    async fn rerank_documents(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+        candidates: &[FusedCandidate],
+    ) -> SearchResult<Vec<RerankDocument>> {
+        let worker_cx = cx.clone();
+        #[cfg(feature = "rerank")]
+        let worker_cx = if let Some(pool) = &self.native_blocking_pool {
+            if pool.is_shutdown() {
+                return Err(SearchError::RerankFailed {
+                    model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                    source: "document loading pool is shut down".into(),
+                });
+            }
+            cx.clone().with_blocking_pool_handle(Some(pool.clone()))
+        } else {
+            worker_cx
+        };
+        let index_root = index_root.to_path_buf();
+        let doc_ids = candidates
+            .iter()
+            .map(|candidate| candidate.doc_id.clone())
+            .collect::<Vec<_>>();
+        let request_cx = cx.clone();
+        let mut worker = worker_cx.spawn_blocking(move |child| {
+            if Cx::is_active() {
+                return Err(SearchError::RerankFailed {
+                    model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                    source: "document loading dispatch fell back to an async executor".into(),
+                });
+            }
+            Self::semantic_retry_checkpoint(&child, "rerank_documents")?;
+            Self::semantic_retry_checkpoint(&request_cx, "rerank_documents")?;
+            let sentinel = match Self::read_index_sentinel(&index_root) {
+                Ok(sentinel) => sentinel,
+                Err(error) => {
+                    warn!(error = %error, "fsfs rerank stage: index sentinel unreadable; resolving candidate paths against the index root");
+                    None
+                }
+            };
+            let canonicalizer = DefaultCanonicalizer::default();
+            let mut documents = Vec::with_capacity(doc_ids.len());
+            for doc_id in doc_ids {
+                Self::semantic_retry_checkpoint(&child, "rerank_documents")?;
+                Self::semantic_retry_checkpoint(&request_cx, "rerank_documents")?;
+                let path = resolve_manifest_file_path(&doc_id, sentinel.as_ref(), &index_root);
+                if let Some(text) = read_rerank_document_text(&path, &canonicalizer) {
+                    documents.push(RerankDocument { doc_id, text });
+                }
+            }
+            Ok(documents)
+        }).map_err(|error| SearchError::RerankFailed {
+            model: FSFS_RERANKER_MODEL_ID.to_owned(),
+            source: format!("cannot admit rerank document worker: {error}").into(),
+        })?;
+        let result = worker.join(cx).await.map_err(|error| match error {
+            asupersync::runtime::JoinError::Cancelled(_) => SearchError::Cancelled {
+                phase: "rerank_documents".to_owned(),
+                reason: "rerank document worker cancelled".to_owned(),
+            },
+            error => SearchError::RerankFailed {
+                model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                source: format!("rerank document worker failed: {error}").into(),
+            },
+        });
+        Self::semantic_retry_checkpoint(cx, "rerank_documents")?;
+        result?
     }
 
     /// Decide whether this index run builds the quality tier, and with which
@@ -26420,6 +26548,437 @@ mod tests {
             );
         });
         assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[cfg(feature = "rerank")]
+    fn rerank_deadline_documents(root: &Path) -> Vec<FusedCandidate> {
+        [
+            (
+                "bread.md",
+                "Mix flour and water, knead dough, then bake bread.",
+            ),
+            (
+                "retry.md",
+                "Recover network failures with bounded retries and exponential backoff.",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (name, text))| {
+            fs::write(root.join(name), text).unwrap();
+            FusedCandidate {
+                doc_id: name.to_owned(),
+                fused_score: 1.0 / f64::from(u32::try_from(rank + 1).unwrap()),
+                prior_boost: 0.0,
+                lexical_rank: Some(rank + 1),
+                semantic_rank: None,
+                hash_rank: None,
+                lexical_score: Some(1.0),
+                semantic_score: None,
+                hash_score: None,
+                in_both_sources: false,
+            }
+        })
+        .collect()
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn rerank_deadline_fixture_zero_budget_keeps_fused_order() {
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, _) = cold_reranker_fixture(scheduler.blocking_handle().unwrap(), temp.path());
+        let fused = rerank_deadline_documents(temp.path());
+        scheduler.block_on(async {
+            let model = runtime.prepared_reranker(&cx).await.unwrap().unwrap();
+            let stage = super::StageDirective {
+                enabled: true,
+                candidate_budget: 2,
+                timeout_ms: 0,
+                reason_code: "query.stage.rerank.enabled",
+            };
+            let outcome = runtime
+                .apply_rerank_stage(
+                    &cx,
+                    Some(model.as_ref()),
+                    &stage,
+                    temp.path(),
+                    "How do I recover from a network failure?",
+                    fused.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.payload.reason_code, "query.stage.rerank.timeout");
+            assert_eq!(
+                outcome.payload.status,
+                crate::output_schema::RerankStageStatus::Failed
+            );
+            assert_eq!(outcome.fused, fused);
+            assert!(outcome.payload.scores.is_empty());
+            assert_eq!(outcome.payload.reranked_hits, 0);
+        });
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn rerank_deadline_fixture_cancelled_missing_text_does_not_report_success() {
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, _) = cold_reranker_fixture(scheduler.blocking_handle().unwrap(), temp.path());
+        let mut fused = rerank_deadline_documents(temp.path());
+        for candidate in &mut fused {
+            candidate.doc_id = format!("missing/{}", candidate.doc_id);
+        }
+        scheduler.block_on(async {
+            let model = runtime.prepared_reranker(&cx).await.unwrap().unwrap();
+            cx.cancel_fast(asupersync::CancelKind::User);
+            let stage = super::StageDirective {
+                enabled: true,
+                candidate_budget: 2,
+                timeout_ms: 0,
+                reason_code: "query.stage.rerank.enabled",
+            };
+            let result = runtime
+                .apply_rerank_stage(
+                    &cx,
+                    Some(model.as_ref()),
+                    &stage,
+                    temp.path(),
+                    "recover network",
+                    fused,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(SearchError::Cancelled { .. })),
+                "caller cancellation must beat missing text and timeout"
+            );
+        });
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn rerank_deadline_fixture_busy_pool_times_out_then_retries_real_ranking() {
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let pool = scheduler.blocking_handle().unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, _) = cold_reranker_fixture(pool.clone(), temp.path());
+        let fused = rerank_deadline_documents(temp.path());
+        scheduler.block_on(async {
+            let model = runtime.prepared_reranker(&cx).await.unwrap().unwrap();
+            let occupied = Arc::new(AtomicBool::new(false));
+            let worker_occupied = Arc::clone(&occupied);
+            let completed = Arc::new(AtomicBool::new(false));
+            let worker_completed = Arc::clone(&completed);
+            // Actual pool contention, not a fake reranker. The bounded sleeper
+            // also guarantees the failing baseline drains instead of hanging.
+            let mut blocker = cx
+                .spawn_blocking(move |_| {
+                    worker_occupied.store(true, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(600));
+                    worker_completed.store(true, Ordering::SeqCst);
+                })
+                .unwrap();
+            let waiting = Instant::now();
+            while !occupied.load(Ordering::SeqCst) {
+                assert!(waiting.elapsed() < Duration::from_secs(5));
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            let mut stage = super::StageDirective {
+                enabled: true,
+                candidate_budget: 2,
+                timeout_ms: 50,
+                reason_code: "query.stage.rerank.enabled",
+            };
+            let outcome = runtime
+                .apply_rerank_stage(
+                    &cx,
+                    Some(model.as_ref()),
+                    &stage,
+                    temp.path(),
+                    "How do I recover from a network failure?",
+                    fused.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.payload.reason_code, "query.stage.rerank.timeout");
+            assert_eq!(
+                outcome.payload.status,
+                crate::output_schema::RerankStageStatus::Failed
+            );
+            assert_eq!(outcome.payload.reranked_hits, 0);
+            assert_eq!(outcome.fused, fused);
+            assert!(outcome.payload.scores.is_empty());
+            assert!(
+                !completed.load(Ordering::SeqCst),
+                "the original pool blocker must still be running"
+            );
+            assert_eq!(
+                pool.busy_threads(),
+                1,
+                "timeout must return before the occupied worker drains"
+            );
+            blocker.join(&cx).await.unwrap();
+            stage.timeout_ms = 300;
+            let recovered = runtime
+                .apply_rerank_stage(
+                    &cx,
+                    Some(model.as_ref()),
+                    &stage,
+                    temp.path(),
+                    "How do I recover from a network failure?",
+                    fused,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                recovered.payload.status,
+                crate::output_schema::RerankStageStatus::Applied
+            );
+            assert_eq!(recovered.payload.reranked_hits, 2);
+            assert_eq!(recovered.fused[0].doc_id, "retry.md");
+            assert_eq!(recovered.payload.scores[0].original_rank, 2);
+            assert!(
+                recovered
+                    .payload
+                    .scores
+                    .iter()
+                    .all(|score| score.score.is_finite())
+            );
+            assert!(recovered.payload.scores[0].score > recovered.payload.scores[1].score);
+        });
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[cfg(all(feature = "rerank", target_os = "linux"))]
+    fn rerank_deadline_blocked_file(cancel: bool) {
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let pool = scheduler.blocking_handle().unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let fresh = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, _) = cold_reranker_fixture(pool.clone(), temp.path());
+        let fused = rerank_deadline_documents(temp.path());
+        let fifo = temp.path().join("delayed.fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        // Linux opens RDWR without waiting for another endpoint. Keeping this
+        // descriptor alive makes the actual candidate read block until EOF.
+        let mut writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let watcher = rustix::fs::inotify::init(
+            rustix::fs::inotify::CreateFlags::NONBLOCK | rustix::fs::inotify::CreateFlags::CLOEXEC,
+        )
+        .unwrap();
+        let watch =
+            rustix::fs::inotify::add_watch(&watcher, &fifo, rustix::fs::inotify::WatchFlags::OPEN)
+                .unwrap();
+        let mut events = [std::mem::MaybeUninit::uninit(); 512];
+        let mut reader = rustix::fs::inotify::Reader::new(&watcher, &mut events);
+        thread::scope(|scope| {
+            scheduler.block_on(async {
+                let model = runtime.prepared_reranker(&cx).await.unwrap().unwrap();
+                let drained = Instant::now();
+                while pool.busy_threads() != 0 {
+                    assert!(drained.elapsed() < Duration::from_secs(5));
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                let released = Arc::new(AtomicBool::new(false));
+                let writer_released = Arc::clone(&released);
+                let release = scope.spawn(move || {
+                    thread::sleep(Duration::from_millis(600));
+                    writer_released.store(true, Ordering::SeqCst);
+                    std::io::Write::write_all(&mut writer, b"Mix flour and bake bread.").unwrap();
+                    drop(writer);
+                });
+                let mut delayed = fused.clone();
+                delayed[0].doc_id = "delayed.fifo".to_owned();
+                let stage = super::StageDirective {
+                    enabled: true,
+                    candidate_budget: 2,
+                    timeout_ms: if cancel { 300 } else { 50 },
+                    reason_code: "query.stage.rerank.enabled",
+                };
+                let mut pending = Box::pin(runtime.apply_rerank_stage(
+                    &cx,
+                    Some(model.as_ref()),
+                    &stage,
+                    temp.path(),
+                    "How do I recover from a network failure?",
+                    delayed.clone(),
+                ));
+                let admitted = Instant::now();
+                loop {
+                    std::future::poll_fn(|task_cx| {
+                        assert!(pending.as_mut().poll(task_cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    assert!(
+                        !released.load(Ordering::SeqCst),
+                        "candidate reads must yield before the blocked file is released"
+                    );
+                    match reader.next() {
+                        Ok(event) => {
+                            assert_eq!(event.wd(), watch);
+                            assert!(
+                                event
+                                    .events()
+                                    .contains(rustix::fs::inotify::ReadFlags::OPEN)
+                            );
+                            break;
+                        }
+                        Err(rustix::io::Errno::AGAIN) => {}
+                        Err(error) => panic!("observe actual candidate reader opening: {error}"),
+                    }
+                    assert!(admitted.elapsed() < Duration::from_secs(5));
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                if cancel {
+                    cx.cancel_fast(asupersync::CancelKind::User);
+                }
+                let result = pending.await;
+                if cancel {
+                    assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                } else {
+                    let outcome = result.unwrap();
+                    assert_eq!(outcome.payload.reason_code, "query.stage.rerank.timeout");
+                    assert_eq!(
+                        outcome.payload.status,
+                        crate::output_schema::RerankStageStatus::Failed
+                    );
+                    assert_eq!(outcome.payload.reranked_hits, 0);
+                    assert_eq!(outcome.fused, delayed);
+                    assert!(outcome.payload.scores.is_empty());
+                }
+                assert!(!released.load(Ordering::SeqCst));
+                assert_eq!(
+                    pool.busy_threads(),
+                    1,
+                    "notification must precede completion of the real blocked read"
+                );
+                let drained = Instant::now();
+                while !released.load(Ordering::SeqCst)
+                    || pool.busy_threads() != 0
+                    || pool.pending_count() != 0
+                {
+                    assert!(drained.elapsed() < Duration::from_secs(5));
+                    asupersync::time::sleep(fresh.now(), Duration::from_millis(1)).await;
+                }
+                release.join().unwrap();
+                let stage = super::StageDirective {
+                    timeout_ms: 300,
+                    ..stage
+                };
+                let recovered = runtime
+                    .apply_rerank_stage(
+                        &fresh,
+                        Some(model.as_ref()),
+                        &stage,
+                        temp.path(),
+                        "How do I recover from a network failure?",
+                        fused,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    recovered.payload.status,
+                    crate::output_schema::RerankStageStatus::Applied
+                );
+                assert_eq!(recovered.payload.reranked_hits, 2);
+                assert_eq!(recovered.fused[0].doc_id, "retry.md");
+                assert!(
+                    recovered
+                        .payload
+                        .scores
+                        .iter()
+                        .all(|score| score.score.is_finite())
+                );
+            });
+        });
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[cfg(all(feature = "rerank", target_os = "linux"))]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn rerank_deadline_fixture_blocked_file_times_out_and_drains() {
+        rerank_deadline_blocked_file(false);
+    }
+
+    #[test]
+    #[cfg(all(feature = "rerank", target_os = "linux"))]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn rerank_deadline_fixture_cancelled_file_read_drains_and_retries() {
+        rerank_deadline_blocked_file(true);
+    }
+
+    #[test]
+    fn rerank_deadline_timeout_payload_is_not_cached() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = temp.path().display().to_string();
+        let runtime = FsfsRuntime::new(config);
+        let key = runtime
+            .search_cache_key("recover network", 2, SearchExecutionMode::Full)
+            .unwrap();
+        let mut payload = crate::output_schema::SearchPayload::new(
+            "recover network",
+            SearchOutputPhase::Refined,
+            2,
+            Vec::new(),
+        );
+        let mut stage =
+            crate::output_schema::RerankStagePayload::skipped("query.stage.rerank.timeout", 2);
+        stage.status = crate::output_schema::RerankStageStatus::Failed;
+        payload.rerank = Some(stage);
+        assert!(
+            !FsfsRuntime::search_payloads_cacheable(std::slice::from_ref(&payload)),
+            "daemon memory cache must reject timed-out reranking"
+        );
+        runtime
+            .write_search_payload_cache(
+                &key,
+                std::slice::from_ref(&payload),
+                "deadline-test-generation",
+            )
+            .unwrap();
+        assert!(
+            !runtime.search_cache_path(&key).unwrap().exists(),
+            "disk cache must reject timed-out reranking"
+        );
+        payload.rerank.as_mut().unwrap().status = crate::output_schema::RerankStageStatus::Applied;
+        payload.rerank.as_mut().unwrap().reason_code = super::REASON_RERANK_APPLIED.to_owned();
+        assert!(
+            FsfsRuntime::search_payloads_cacheable(&[payload]),
+            "successful reranking remains cacheable"
+        );
     }
 
     /// A cross-encoder that scores a document by its input position, so the
