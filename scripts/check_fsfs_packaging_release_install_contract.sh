@@ -923,8 +923,16 @@ def require(condition: bool, message: str) -> None:
 
 features = manifest.get("features", {})
 require(
-    features.get("default") == ["semantic-loaders"],
-    "frankensearch-fsfs default must select semantic-loaders",
+    features.get("default") == ["semantic-loaders", "rerank"],
+    "frankensearch-fsfs default must select semantic-loaders and native reranking",
+)
+rerank_dependency = manifest.get("dependencies", {}).get("frankensearch-rerank", {})
+require(
+    features.get("rerank") == ["dep:frankensearch-rerank"]
+    and rerank_dependency.get("optional") is True
+    and rerank_dependency.get("default-features") is False
+    and rerank_dependency.get("features") == ["native"],
+    "rerank must retain the explicit optional native backend",
 )
 require(
     features.get("semantic-loaders")
@@ -1335,12 +1343,19 @@ require(
     and "no Cargo feature flag or rebuild is permitted" in contract,
     "release contract must require a no-hidden-feature default semantic path",
 )
+contract_words = " ".join(contract.split())
 require(
-    "The full embedded profile MUST be produced for exactly these targets" in contract
-    and "The explicit model-free lite profile MUST be produced for exactly these targets"
-    in contract
-    and "`profile` (`embedded` or `lite`)" in contract,
-    "release contract must publish truthful full/lite target and capability matrices",
+    all(
+        marker in contract_words
+        for marker in (
+            "The earlier exact-six matrix required full embedded Apple Silicon **and Windows**",
+            "does not lower that target or certify a release",
+            "The required explicit model-free lite targets remain:",
+            "`profile` (`default` for external-model loaders, `embedded`, or `lite`)",
+            "Intel macOS remains unsupported for the ordinary semantic installer",
+        )
+    ),
+    "release contract must distinguish current capability profiles from outstanding platform obligations",
 )
 require(
     "typed nonzero error" in contract

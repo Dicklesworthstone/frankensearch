@@ -929,7 +929,7 @@ impl ModelArtifactManifestV1 {
     }
 
     /// Bind the separate native installation catalog entry to the two already
-    /// registered MiniLM producers. Arbitrary logical-id aliases, modified
+    /// registered `MiniLM` producers. Arbitrary logical-id aliases, modified
     /// artifacts, and modified execution contracts cannot borrow this receipt.
     fn matches_registered_native_installation(&self, download_manifest: &ModelManifest) -> bool {
         if download_manifest != &ModelManifest::minilm_v2_native() {
