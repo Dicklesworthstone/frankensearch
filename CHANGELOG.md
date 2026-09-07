@@ -10,7 +10,7 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.8.0...main) | HEAD | 2026-09-02 | nothing yet |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.8.0...main) | 1.9.0 candidate | 2026-09-07 | Native quality selection, verified producer identities, bounded refinement, reranking, watcher recovery, FrankenSQLite 0.3.17, and Quill garbage collection |
 | [v1.8.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.8.0) | Release | 2026-09-02 | Two-tier fsfs delivered end to end (quality generation at index time, REFINED phase); daemon lifetime and stop verb; append/delete/watch reach every arm; RaptorQ sidecars for both vector generations; dsr quality gate; crates.io 0.4.x patches (gh#416, gh#39, gh#40) |
 | [v1.7.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.7.0) | Release | 2026-08-23 | Registry refresh (FrankenSQLite 0.3.8, Asupersync 0.4.9, fastembed 6), hash-control fuse follow-through, Quill CASS ingest |
 | [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) | Release | 2026-08-14 | Hash control no longer presented as semantic search |
@@ -25,6 +25,37 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 ## [Unreleased] -- development on `main` since [v1.8.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.8.0)
 
 Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.8.0...main>
+
+- **FrankenSQLite 0.3.17.** All 20 database packages move together from 0.3.8;
+  storage, durability, fsfs, and ops require the updated family. The release
+  includes upstream fixes for prepared-read transaction release, cross-process
+  WAL visibility, FTS5 maintenance, and savepoints. Native builds now require
+  the C/assembler driver used by the upstream `stacker` / `psm` dependency.
+- **Native quality inference is available explicitly.** Install
+  `all-minilm-l6-v2-native` with `fsfs download-models`, then select
+  `indexing.quality_model = "all-MiniLM-L6-v2-native"`. Its F32 producer runs on
+  a caller-owned blocking pool, checks its output certificate before exposing
+  an identity, and uses that identity for index, cache, and daemon admission.
+  Native artifact loads now reuse an unchanged verified installation receipt
+  for the exact registered producer. Missing, stale, foreign, and malformed
+  receipts still require full artifact verification. The existing 500 ms
+  native refinement test still times out with the stock debug binary; release
+  executables have a separate documented validation lane. ONNX remains the
+  default quality backend; the complete native migration is still open.
+- **Search policies reach the product.** Quality weighting and bounded
+  refinement apply to in-process and daemon searches. Timeout preserves Initial
+  results while the owned worker finishes. Native cross-encoder reranking is
+  wired through `fsfs search --rerank`, with cache keys bound to the selected
+  reranker. Quality retrieval can discover candidates outside the fast pool.
+- **Watch recovery retains work.** Failed vector jobs remain queued, and a
+  restart replays the startup scan. JSON output and explicit fast-only requests
+  follow the effective search policy; default document catalogs are scoped to
+  the index root.
+- **Crate bundle candidate:** facade 0.4.3; core/index/lexical/fusion 0.2.4;
+  embed 0.2.5; rerank 0.2.6; storage/durability/quill 0.2.3; tui/ops 0.2.0;
+  fsfs 1.9.0. Publication is pending validation. The publish contract and
+  fresh-process logging receipts bind the audited Asupersync 0.4.10 identity
+  and FrankenSQLite 0.3.17 family.
 
 - **Quill reclaims merge-retired segment files under a busy writer; `QuillIndex::collect_garbage`; frankensearch 0.4.3 / frankensearch-quill 0.2.3** ([cass#453](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/453)). A folded segment became collectable only after *three* clocks had run: its own mtime, its retirement receipt (`seg-<id>.fslx.retired`, stamped by the publication that dropped it from both MANIFEST slots), and a manifest-level floor measured from the **latest** publication. That third clock reset on every publish, so an embedder that publishes more often than the 300 s grace never reclaimed anything: a cass archive accumulated 1,642 folded inputs (4.2 GB) behind one live segment across back-to-back incremental runs, and only a run that happened to start >300 s after the previous publish ever swept them. The floor was redundant for receipted segments: the receipt is made durable *before* the slot renames that complete the retirement, so it strictly precedes the last instant any reader could have obtained a referencing MANIFEST through either slot, and grace measured from it already gives every such reader the full window (a segment a reader has mapped survives its unlink). `sweep_garbage_directory` now ages a receipted segment from its receipt alone; the manifest-level floor still gates the pre-supersession case where no receipt can exist. `KeeperWriter::collect_garbage` is exposed through `QuillIndex::collect_garbage` so a long-lived or frequently publishing writer can sweep without reopening. Tests: `later_publications_do_not_postpone_a_receipted_retirement` (replaces the test that pinned the reset), `retired_merge_inputs_are_reclaimed_while_an_older_reader_keeps_working` (a reader on the pre-merge generation keeps answering from its mapped inputs after the sweep unlinks them), `interrupted_sweep_leaves_only_a_stale_receipt_that_the_next_sweep_reclaims`. The gauntlet's built-in engine profile receipt moves to v5 for the quill 0.2.3 pin (v4 stays archive-valid).
 
