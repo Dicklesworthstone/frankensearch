@@ -226,8 +226,8 @@ pub use frankensearch_lexical as lexical_tantivy;
 /// Native Quill lexical backend.
 pub use frankensearch_quill as quill;
 
-#[cfg(feature = "rerank")]
-/// `FlashRank` cross-encoder reranking.
+#[cfg(any(feature = "native", feature = "rerank"))]
+/// Native cross-encoder reranking and optional `FastEmbed` backend.
 pub use frankensearch_rerank as rerank;
 
 #[cfg(feature = "storage")]
@@ -384,13 +384,13 @@ pub use frankensearch_fusion::QuillSyncLexicalSearch;
 
 // ─── Feature-gated reranker re-exports ──────────────────────────────────────
 
-#[cfg(feature = "rerank")]
+#[cfg(any(feature = "native", feature = "rerank"))]
 pub use frankensearch_rerank::rerank_step;
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "rerank"))]
 pub use frankensearch_rerank::NativeReranker;
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "rerank"))]
 pub use frankensearch_rerank::{NativeEmbedder, NativeEmbeddingModel};
 
 #[cfg(feature = "fastembed-reranker")]
@@ -522,6 +522,103 @@ mod tests {
         let _ = fusion::rrf::RrfConfig::default();
     }
 
+    #[cfg(any(feature = "native", feature = "rerank"))]
+    #[test]
+    fn native_facade_loaders_reject_missing_models() {
+        let dir = tempfile::tempdir().expect("empty model directory");
+        assert!(matches!(
+            NativeEmbedder::load_model(dir.path(), NativeEmbeddingModel::AllMiniLmL6V2F32),
+            Err(SearchError::ModelNotFound { .. })
+        ));
+        assert!(matches!(
+            NativeReranker::load(dir.path()),
+            Err(SearchError::ModelNotFound { .. })
+        ));
+    }
+
+    /// Exercise the same public API with either feature alias, including `full`
+    /// (which enables `rerank` without enabling the `native` facade feature).
+    #[cfg(any(feature = "native", feature = "rerank"))]
+    #[test]
+    #[ignore = "requires MINILM_FIXTURE_DIR and FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn native_facade_embeds_and_reranks_with_real_models() {
+        let embedder: rerank::NativeEmbedder = NativeEmbedder::load_model(
+            std::env::var("MINILM_FIXTURE_DIR").expect("verified native F32 model directory"),
+            NativeEmbeddingModel::AllMiniLmL6V2F32,
+        )
+        .expect("load actual native embedding model through the facade");
+        let texts = &embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        let vectors = embedder.embed_batch_sync(texts).expect("native inference");
+        SyncEmbed::identity(&embedder)
+            .expect("attested producer")
+            .producer
+            .golden_vectors
+            .verify_exact_f32(texts, &vectors)
+            .expect("frozen native producer output");
+        assert_eq!(vectors.len(), texts.len());
+        assert!(vectors.iter().all(|vector| vector.len() == 384));
+
+        let reranker_dir = std::path::PathBuf::from(
+            std::env::var("FRANKENSEARCH_RERANK_MODEL_DIR")
+                .expect("verified native reranker directory"),
+        );
+        embed::model_manifest::ModelManifest::ms_marco_reranker()
+            .verify_dir(&reranker_dir)
+            .expect("registered cross-encoder weights and tokenizer");
+        assert!(
+            !reranker_dir.join("model_f32.safetensors").exists(),
+            "an unregistered preferred weights file must not replace the verified fixture"
+        );
+        let reranker: rerank::NativeReranker = NativeReranker::load(&reranker_dir)
+            .expect("load actual native reranker through the facade");
+        let reranker = SyncRerankerAdapter(reranker);
+        let mut candidates: Vec<ScoredResult> = ["bread", "retry"]
+            .into_iter()
+            .map(|id| ScoredResult {
+                doc_id: id.into(),
+                score: 0.5,
+                source: ScoreSource::Hybrid,
+                index: None,
+                fast_score: None,
+                quality_score: None,
+                lexical_score: None,
+                rerank_score: None,
+                explanation: None,
+                metadata: None,
+            })
+            .collect();
+        // This dedicated test thread is the blocking inference context for the
+        // synchronous adapter. No async application worker is occupied by it.
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            rerank_step(
+                &cx,
+                &reranker,
+                "how to retry failed requests",
+                &mut candidates,
+                |id| match id {
+                    "bread" => Some("A recipe for baking sourdough bread.".to_owned()),
+                    "retry" => Some(
+                        "Retry failed network requests with exponential backoff and jitter."
+                            .to_owned(),
+                    ),
+                    _ => None,
+                },
+                2,
+                2,
+            )
+            .await
+            .expect("public reranking pipeline");
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates[0].doc_id.as_str(), "retry");
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| { candidate.rerank_score.is_some_and(f32::is_finite) })
+            );
+            assert!(candidates[0].rerank_score > candidates[1].rerank_score);
+        });
+    }
+
     #[cfg(feature = "hash")]
     #[test]
     fn hash_embedder_accessible() {
@@ -556,7 +653,17 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "hash",
+        feature = "storage",
+        feature = "durability",
+        feature = "ann",
+        feature = "quill",
+        feature = "lexical-tantivy"
+    )
+))]
 mod feature_matrix_smoke {
     #[cfg(feature = "durability")]
     use std::sync::Arc;
