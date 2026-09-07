@@ -21,23 +21,62 @@ use crate::file_protector::{FileProtector, FileRepairOutcome};
 use crate::metrics::DurabilityMetrics;
 use crate::repair_trailer::deserialize_repair_trailer;
 
-fn acquire_shared_fsvi_map_lock(file: &fs::File, path: &Path) -> SearchResult<()> {
+/// Owns the operation's lock independently of duplicated file descriptors.
+/// Declare after the file and before any mapping, so mappings drop first.
+#[derive(Debug)]
+#[must_use = "retain the guard until the protected operation has completed"]
+struct FsviOperationLock<'a> {
+    file: &'a fs::File,
+    path: &'a Path,
+    creator_pid: u32,
+}
+
+impl Drop for FsviOperationLock<'_> {
+    fn drop(&mut self) {
+        // An inherited descriptor shares the creator's lock. A child must not
+        // unlock the still-live operation when it drops its inherited guard.
+        if self.creator_pid != std::process::id() {
+            return;
+        }
+        if let Err(error) = self.file.unlock() {
+            warn!(path = %self.path.display(), %error, "FSVI operation unlock failed; closing its descriptor");
+        }
+    }
+}
+
+fn acquire_shared_fsvi_map_lock<'a>(
+    file: &'a fs::File,
+    path: &'a Path,
+) -> SearchResult<FsviOperationLock<'a>> {
     file.try_lock_shared().map_err(|error| SearchError::InvalidConfig {
         field: "fsvi.map_lock".to_owned(),
         value: path.display().to_string(),
         reason: format!(
             "cannot acquire shared reader lock before mapping this published FSVI: {error}; a writer may be active"
         ),
+    })?;
+    Ok(FsviOperationLock {
+        file,
+        path,
+        creator_pid: std::process::id(),
     })
 }
 
-fn acquire_exclusive_fsvi_writer_lock(file: &fs::File, path: &Path) -> SearchResult<()> {
+fn acquire_exclusive_fsvi_writer_lock<'a>(
+    file: &'a fs::File,
+    path: &'a Path,
+) -> SearchResult<FsviOperationLock<'a>> {
     file.try_lock().map_err(|error| SearchError::InvalidConfig {
         field: "fsvi.map_lock".to_owned(),
         value: path.display().to_string(),
         reason: format!(
             "cannot acquire exclusive writer lock before repairing this published FSVI: {error}; drop live readers/writers before retrying"
         ),
+    })?;
+    Ok(FsviOperationLock {
+        file,
+        path,
+        creator_pid: std::process::id(),
     })
 }
 
@@ -123,7 +162,7 @@ impl FsviProtector {
         let start = Instant::now();
 
         let source_lock = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
-        acquire_shared_fsvi_map_lock(&source_lock, fsvi_path)?;
+        let _source_guard = acquire_shared_fsvi_map_lock(&source_lock, fsvi_path)?;
 
         // Generate repair symbols via the inner protector.
         // FileProtector::protect_file now handles atomic write (temp + rename) internally.
@@ -201,11 +240,16 @@ impl FsviProtector {
 
         // Fast path: xxh3 hash check
         let len = file.metadata().map_err(SearchError::Io)?.len();
+        // Retain ownership through all sidecar/CRC reads as well as the map.
+        let _map_guard = if len == 0 {
+            None
+        } else {
+            Some(acquire_shared_fsvi_map_lock(&file, fsvi_path)?)
+        };
         let actual_hash = if len == 0 {
             xxh3_64(&[])
         } else {
-            acquire_shared_fsvi_map_lock(&file, fsvi_path)?;
-            // SAFETY: the shared lock is retained by `file` for the mapping's
+            // SAFETY: `_map_guard` retains the shared lock for the mapping's
             // lifetime, and every FSVI writer acquires the exclusive version
             // before making a writable map.
             let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
@@ -269,13 +313,14 @@ impl FsviProtector {
             .write(true)
             .open(fsvi_path)
         {
-            Ok(file) => {
-                acquire_exclusive_fsvi_writer_lock(&file, fsvi_path)?;
-                Some(file)
-            }
+            Ok(file) => Some(file),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => return Err(SearchError::Io(err)),
         };
+        let source_guard = source_lock
+            .as_ref()
+            .map(|file| acquire_exclusive_fsvi_writer_lock(file, fsvi_path))
+            .transpose()?;
         let (hash_before, len, had_source) = match source_lock.as_ref() {
             Some(file) => {
                 let len = file.metadata().map_err(SearchError::Io)?.len();
@@ -283,7 +328,7 @@ impl FsviProtector {
                     xxh3_64(&[])
                 } else {
                     // SAFETY: the exclusive writer lock is retained by
-                    // `source_lock` until repair completes.
+                    // `source_guard` until repair completes.
                     let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
                     xxh3_64(&mmap)
                 };
@@ -330,15 +375,20 @@ impl FsviProtector {
                 // `repair_file` atomically replaces recovered artifacts, so
                 // the exclusive source handle can refer to the old inode.
                 // Drop it before locking the artifact that was published.
+                drop(source_guard);
                 drop(source_lock);
                 // Verify hash after repair
                 let repaired_file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
                 let repaired_len = repaired_file.metadata().map_err(SearchError::Io)?.len();
+                let _repaired_guard = if repaired_len == 0 {
+                    None
+                } else {
+                    Some(acquire_shared_fsvi_map_lock(&repaired_file, fsvi_path)?)
+                };
                 let hash_after = if repaired_len == 0 {
                     xxh3_64(&[])
                 } else {
-                    acquire_shared_fsvi_map_lock(&repaired_file, fsvi_path)?;
-                    // SAFETY: the shared lock is retained by `repaired_file`
+                    // SAFETY: the shared lock is retained by `_repaired_guard`
                     // for the mapping lifetime and protects the inode repair
                     // actually published.
                     let mmap = unsafe { Mmap::map(&repaired_file).map_err(SearchError::Io)? };
@@ -597,6 +647,191 @@ mod tests {
         assert_eq!(sidecar, PathBuf::from("/tmp/index.fast.fsvi.fec"));
     }
 
+    /// A real duplicated descriptor retains the open-file description used by
+    /// flock. This exercises that lifetime, without claiming to execute fork.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn operation_lock_shared_release_preserves_another_live_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.fsvi");
+        std::fs::write(&path, b"protected payload").unwrap();
+        let first = std::fs::File::open(&path).unwrap();
+        let second = std::fs::File::open(&path).unwrap();
+        let first_guard = acquire_shared_fsvi_map_lock(&first, &path).unwrap();
+        let second_guard = acquire_shared_fsvi_map_lock(&second, &path).unwrap();
+        let retained = first.try_clone().unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(super::acquire_exclusive_fsvi_writer_lock(&writer, &path).is_err());
+        drop(first_guard);
+        drop(first);
+        assert!(
+            super::acquire_exclusive_fsvi_writer_lock(&writer, &path).is_err(),
+            "a separate live reader must still exclude repair"
+        );
+        drop(second_guard);
+        drop(second);
+        let _writer_guard = super::acquire_exclusive_fsvi_writer_lock(&writer, &path)
+            .expect("completed readers must release even while a descriptor duplicate survives");
+        assert_eq!(retained.metadata().unwrap().len(), 17);
+        assert_eq!(std::fs::read(&path).unwrap(), b"protected payload");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn operation_lock_exclusive_release_admits_readers_with_duplicate_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.fsvi");
+        std::fs::write(&path, b"repaired payload").unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let guard = super::acquire_exclusive_fsvi_writer_lock(&writer, &path).unwrap();
+        let retained = writer.try_clone().unwrap();
+        let reader = std::fs::File::open(&path).unwrap();
+        assert!(
+            acquire_shared_fsvi_map_lock(&reader, &path).is_err(),
+            "a live repair owner must exclude a mapping"
+        );
+        drop(guard);
+        drop(writer);
+        let _reader_guard = acquire_shared_fsvi_map_lock(&reader, &path)
+            .expect("completed repair must release while its duplicate remains open");
+        assert_eq!(retained.metadata().unwrap().len(), 16);
+        assert_eq!(std::fs::read(&path).unwrap(), b"repaired payload");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn operation_lock_noncreator_drop_preserves_the_live_owner() {
+        for exclusive in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("index.fsvi");
+            std::fs::write(&path, b"live owner payload").unwrap();
+            let owner = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let guard = if exclusive {
+                super::acquire_exclusive_fsvi_writer_lock(&owner, &path).unwrap()
+            } else {
+                acquire_shared_fsvi_map_lock(&owner, &path).unwrap()
+            };
+            let duplicate = owner.try_clone().unwrap();
+            // Simulate the noncreator PID branch with a genuine descriptor
+            // duplicate. This does not claim to execute fork in the test.
+            let inherited = super::FsviOperationLock {
+                file: &duplicate,
+                path: &path,
+                creator_pid: std::process::id().wrapping_add(1),
+            };
+            drop(inherited);
+            let contender = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            assert!(
+                super::acquire_exclusive_fsvi_writer_lock(&contender, &path).is_err(),
+                "noncreator cleanup must not unlock the creator's live operation"
+            );
+            drop(guard);
+            let _contender_guard = super::acquire_exclusive_fsvi_writer_lock(&contender, &path)
+                .expect("the creator can finish while the duplicate remains open");
+            assert!(duplicate.metadata().is_ok());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn operation_lock_error_return_releases_with_duplicate_open() {
+        for exclusive in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("index.fsvi");
+            std::fs::write(&path, b"payload before failed operation").unwrap();
+            let retained = std::cell::RefCell::new(None);
+            let operation = || -> frankensearch_core::SearchResult<()> {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)?;
+                let _guard = if exclusive {
+                    super::acquire_exclusive_fsvi_writer_lock(&file, &path)?
+                } else {
+                    acquire_shared_fsvi_map_lock(&file, &path)?
+                };
+                *retained.borrow_mut() = Some(file.try_clone()?);
+                // A real I/O failure propagates through the owning scope.
+                std::fs::read(temp.path().join("missing.fec"))?;
+                Ok(())
+            };
+            assert!(
+                matches!(operation(), Err(frankensearch_core::SearchError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound)
+            );
+            let writer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let _guard = super::acquire_exclusive_fsvi_writer_lock(&writer, &path)
+                .expect("an error return must release operation ownership despite a duplicate");
+            assert!(retained.borrow().as_ref().unwrap().metadata().is_ok());
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"payload before failed operation"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_lock_real_codec_roundtrip_repairs_exact_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.fsvi");
+        let payload: Vec<u8> = (0..2048).map(|n| u8::try_from(n % 251).unwrap()).collect();
+        std::fs::write(&path, &payload).unwrap();
+        let protector = FsviProtector::new(
+            Arc::new(crate::DefaultSymbolCodec),
+            DurabilityConfig {
+                symbol_size: 256,
+                repair_overhead: 2.0,
+                ..DurabilityConfig::default()
+            },
+        )
+        .unwrap();
+        protector
+            .protect_atomic(&path)
+            .expect("protect with actual RaptorQ codec");
+        assert!(matches!(
+            protector.verify(&path).unwrap(),
+            FsviVerifyResult::Intact
+        ));
+        let mut corrupted = payload.clone();
+        corrupted[512] ^= 0xff;
+        std::fs::write(&path, corrupted).unwrap();
+        assert!(matches!(
+            protector.verify(&path).unwrap(),
+            FsviVerifyResult::Corrupted { repairable: true }
+        ));
+        protector
+            .repair(&path)
+            .expect("repair from actual RaptorQ symbols");
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        assert!(matches!(
+            protector.verify(&path).unwrap(),
+            FsviVerifyResult::Intact
+        ));
+        protector
+            .protect_atomic(&path)
+            .expect("a completed repair admits another protection operation");
+    }
+
     #[test]
     fn shared_mapping_refuses_a_published_fsvi_held_by_a_writer() {
         let path = temp_path("shared-map-writer-contention");
@@ -618,7 +853,7 @@ mod tests {
         ));
 
         drop(writer);
-        acquire_shared_fsvi_map_lock(&reader, &path)
+        let _reader_guard = acquire_shared_fsvi_map_lock(&reader, &path)
             .expect("reader maps only after the writer lock is released");
     }
 
