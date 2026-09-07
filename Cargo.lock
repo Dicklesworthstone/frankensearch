@@ -1987,6 +1987,7 @@ name = "frankensearch-rerank"
 version = "0.2.6"
 dependencies = [
  "asupersync",
+ "bytemuck",
  "criterion",
  "fastembed",
  "frankensearch-core",

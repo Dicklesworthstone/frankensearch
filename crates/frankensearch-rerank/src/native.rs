@@ -1483,6 +1483,22 @@ fn is_linear_weight(name: &str) -> bool {
     name.ends_with(".weight") && !name.contains("LayerNorm") && !name.contains("embeddings")
 }
 
+/// Decode complete little-endian F32 values without per-element work when the
+/// host byte order and input alignment already match. The checked cast never
+/// assumes that a byte buffer or a safetensors data offset is F32-aligned.
+fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
+    let (chunks, _) = bytes.as_chunks::<4>();
+    if cfg!(target_endian = "little")
+        && let Ok(values) = bytemuck::try_cast_slice::<[u8; 4], f32>(chunks)
+    {
+        return values.to_vec();
+    }
+    chunks
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect()
+}
+
 /// Parsed weight data: precision-selected Linear weights keyed by layer prefix, plus the f32
 /// `embedding/LayerNorm` parameter values. [`build_model`] consumes this staging
 /// representation so large embedding tables move into the session without a
@@ -1601,11 +1617,7 @@ pub(crate) fn parse_weights(
                 source: format!("safetensors tensor {name} has out-of-range offsets").into(),
             });
         }
-        let (chunks, _) = data[start..end].as_chunks::<4>();
-        let vals: Vec<f32> = chunks
-            .iter()
-            .map(|bytes| f32::from_le_bytes(*bytes))
-            .collect();
+        let vals = decode_f32_le(&data[start..end]);
         // Normalize HuggingFace BERT key conventions to the `bert.`-prefixed scheme
         // the shared encoder/`build_model` use. sentence-transformers all-MiniLM-L6-v2
         // ships bare `embeddings.*` / `encoder.*` keys; cross-encoder/ms-marco ships
@@ -1899,6 +1911,53 @@ impl SyncRerank for NativeReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f32_weight_decode_preserves_bits_for_aligned_and_unaligned_storage() {
+        // Signed zero, subnormals, finite extremes, infinities, and NaN payloads
+        // must survive loading without any floating-point arithmetic.
+        let bits = [
+            0_u32,
+            0x8000_0000,
+            1,
+            0x8000_0001,
+            0x007f_ffff,
+            0x0080_0000,
+            0x7f7f_ffff,
+            0xff7f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_1234,
+            0x7f80_0001,
+            0xffc0_4321,
+        ];
+        let bytes = bits
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        // u32 storage supplies a known aligned base; the offsets exercise every
+        // possible alignment, including the scalar fallback, on either endian.
+        let mut storage = vec![0_u32; bits.len() + 1];
+        for offset in 0..4 {
+            let storage_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut storage);
+            storage_bytes[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            let input = &storage_bytes[offset..offset + bytes.len()];
+            assert_eq!(
+                decode_f32_le(input)
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                bits,
+                "byte offset {offset}"
+            );
+        }
+        assert!(decode_f32_le(&[]).is_empty());
+        for len in 1..4 {
+            assert!(decode_f32_le(&bytes[..len]).is_empty());
+            assert_eq!(decode_f32_le(&bytes[..4 + len])[0].to_bits(), bits[0]);
+            assert_eq!(decode_f32_le(&bytes[..4 + len]).len(), 1);
+        }
+    }
 
     #[test]
     fn f32_linear_matches_nonsquare_scalar_oracle_and_rejects_bad_storage() {

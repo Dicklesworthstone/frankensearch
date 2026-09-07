@@ -11,6 +11,7 @@ default = []
 fastembed-reranker = ["dep:fastembed"]
 # Pure-Rust frankentorch cross-encoder reranker backend (no ONNX/ort).
 native = [
+    "dep:bytemuck",
     "dep:frankensearch-embed",
     "dep:ft-api",
     "dep:ft-autograd",
@@ -23,6 +24,7 @@ native = [
 frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true, default-features = false, optional = true }
 asupersync = { workspace = true }
+bytemuck = { workspace = true, optional = true }
 tokenizers = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
