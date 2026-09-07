@@ -16,7 +16,12 @@ default = ["semantic-loaders", "rerank"]
 rerank = ["dep:frankensearch-rerank"]
 # Loader-capable source/crates.io profile: model bytes stay outside the crate,
 # while explicit `fsfs download-models` installs pinned, verified artifacts.
-semantic-loaders = ["frankensearch-embed/model2vec", "frankensearch-embed/fastembed"]
+semantic-loaders = ["semantic-support", "frankensearch-embed/fastembed"]
+# Shared fast-tier loader and semantic CLI surfaces, independent of quality backend.
+semantic-support = ["frankensearch-embed/model2vec"]
+# ONNX-free source profile: Model2Vec fast tier and native English MiniLM quality.
+# Use --no-default-features to exclude the standard ONNX quality loader.
+semantic-native = ["semantic-support", "rerank"]
 # Full release profile: retain the same loaders and additionally embed the two
 # pinned defaults for a zero-download first run.
 embedded-models = ["semantic-loaders", "frankensearch-embed/bundled-default-models"]
@@ -44,7 +49,7 @@ required-features = ["embedded-models"]
 [[test]]
 name = "default_build_quickstart"
 path = "tests/default_build_quickstart.rs"
-required-features = ["semantic-loaders"]
+required-features = ["semantic-support"]
 
 [[test]]
 name = "cli_e2e_contract"

@@ -837,8 +837,8 @@ impl Default for DiscoveryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexingConfig {
     pub fast_model: String,
-    /// Default quality detection, or `all-MiniLM-L6-v2-native` to select
-    /// verified native F32 inference. Empty disables the quality tier.
+    /// Quality model selection. Native-only builds default to verified English
+    /// F32 inference; standard builds use ONNX `MiniLM`. Empty disables quality.
     pub quality_model: String,
     pub model_dir: String,
     /// Forbid all model-network acquisition while still permitting verified
@@ -854,7 +854,15 @@ impl Default for IndexingConfig {
     fn default() -> Self {
         Self {
             fast_model: "potion-multilingual-128M".into(),
-            quality_model: "all-MiniLM-L6-v2".into(),
+            quality_model: if cfg!(all(
+                feature = "semantic-native",
+                not(feature = "semantic-loaders")
+            )) {
+                "all-MiniLM-L6-v2-native"
+            } else {
+                "all-MiniLM-L6-v2"
+            }
+            .into(),
             model_dir: "~/.local/share/frankensearch/models".into(),
             offline: false,
             embedding_batch_size: 64,
@@ -5183,6 +5191,9 @@ mod tests {
     fn indexing_config_default_values() {
         let cfg = super::IndexingConfig::default();
         assert_eq!(cfg.fast_model, "potion-multilingual-128M");
+        #[cfg(all(feature = "semantic-native", not(feature = "semantic-loaders")))]
+        assert_eq!(cfg.quality_model, "all-MiniLM-L6-v2-native");
+        #[cfg(not(all(feature = "semantic-native", not(feature = "semantic-loaders"))))]
         assert_eq!(cfg.quality_model, "all-MiniLM-L6-v2");
         assert!(!cfg.offline);
         assert_eq!(cfg.embedding_batch_size, 64);

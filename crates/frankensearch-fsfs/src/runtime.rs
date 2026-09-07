@@ -33,8 +33,12 @@ use frankensearch_core::{
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FileProtector, FsviProtector, FsviVerifyResult,
 };
+#[cfg(feature = "semantic-loaders")]
+use frankensearch_embed::FastEmbedEmbedder;
 #[cfg(test)]
 use frankensearch_embed::HashEmbedder;
+#[cfg(feature = "semantic-support")]
+use frankensearch_embed::Model2VecEmbedder;
 #[cfg(feature = "embedded-models")]
 use frankensearch_embed::ensure_default_semantic_models;
 use frankensearch_embed::{
@@ -43,8 +47,6 @@ use frankensearch_embed::{
 };
 #[cfg(not(test))]
 use frankensearch_embed::{DetectOptions, EmbedderStack};
-#[cfg(feature = "semantic-loaders")]
-use frankensearch_embed::{FastEmbedEmbedder, Model2VecEmbedder};
 use frankensearch_fusion::blend_two_tier;
 use frankensearch_index::VectorIndex;
 use frankensearch_quill::{
@@ -4098,6 +4100,8 @@ pub fn spawn_version_cache_refresh() {
 /// Maximum number of backup versions to keep.
 const MAX_BACKUP_VERSIONS: usize = 3;
 
+const NATIVE_PROFILE_UPDATE_GUIDANCE: &str = "update this native-only source build with `cargo install --path crates/frankensearch-fsfs --locked --no-default-features --features semantic-native --force` from the desired frankensearch checkout; published standard/lite archives and unclassified rollback backups do not preserve this profile";
+
 /// Metadata for a single backup entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupEntry {
@@ -5221,6 +5225,20 @@ impl FsfsRuntime {
         let channel = "stable".to_owned();
         let mut notes = Vec::new();
 
+        // Published archives currently carry standard or lite profiles only.
+        // A source native build must never replace itself with either one.
+        let native_only = cfg!(all(
+            feature = "semantic-native",
+            not(feature = "semantic-loaders")
+        ));
+        if native_only && !check_only {
+            return Err(SearchError::InvalidConfig {
+                field: "update.profile".to_owned(),
+                value: "semantic-native".to_owned(),
+                reason: NATIVE_PROFILE_UPDATE_GUIDANCE.to_owned(),
+            });
+        }
+
         let current = SemVer::parse(current_str).ok_or_else(|| SearchError::InvalidConfig {
             field: "update.current_version".into(),
             value: current_str.to_owned(),
@@ -5261,6 +5279,20 @@ impl FsfsRuntime {
                 latest_version: latest.to_string(),
                 update_available: false,
                 check_only,
+                applied: false,
+                channel,
+                release_url: Some(html_url),
+                notes,
+            });
+        }
+
+        if native_only {
+            notes.push(NATIVE_PROFILE_UPDATE_GUIDANCE.to_owned());
+            return Ok(FsfsUpdatePayload {
+                current_version: current_str.to_owned(),
+                latest_version: latest.to_string(),
+                update_available: true,
+                check_only: true,
                 applied: false,
                 channel,
                 release_url: Some(html_url),
@@ -5523,6 +5555,16 @@ impl FsfsRuntime {
             return Ok(());
         }
 
+        if cfg!(all(
+            feature = "semantic-native",
+            not(feature = "semantic-loaders")
+        )) {
+            return Err(SearchError::InvalidConfig {
+                field: "update.profile".to_owned(),
+                value: "semantic-native".to_owned(),
+                reason: NATIVE_PROFILE_UPDATE_GUIDANCE.to_owned(),
+            });
+        }
         let entry = restore_backup(version)?;
 
         let mut notes = Vec::new();
@@ -6144,7 +6186,7 @@ impl FsfsRuntime {
     }
 
     #[cfg_attr(
-        not(feature = "semantic-loaders"),
+        not(feature = "semantic-support"),
         allow(clippy::unnecessary_wraps, clippy::unused_self)
     )]
     fn search_mode_hint(&self) -> SearchResult<Option<String>> {
@@ -6152,12 +6194,12 @@ impl FsfsRuntime {
             return Ok(Some(hint));
         }
 
-        #[cfg(not(feature = "semantic-loaders"))]
+        #[cfg(not(feature = "semantic-support"))]
         {
             Ok(Some(model_free_semantic_recovery_guidance().to_owned()))
         }
 
-        #[cfg(feature = "semantic-loaders")]
+        #[cfg(feature = "semantic-support")]
         {
             let models = self.collect_model_statuses()?;
             let fast_cached = models
@@ -11318,7 +11360,7 @@ impl FsfsRuntime {
         let name = format!("model.{}", status.tier);
         match status.verification_state.as_str() {
             "verified" => {
-                #[cfg(feature = "semantic-loaders")]
+                #[cfg(feature = "semantic-support")]
                 {
                     match Self::probe_model_loader(status) {
                         Ok(()) => DoctorCheck {
@@ -11337,14 +11379,14 @@ impl FsfsRuntime {
                                 "{} passed manifest verification at {}, but its compiled loader rejected it: {error}",
                                 status.name, status.cache_path
                             ),
-                            suggestion: Some(
-                                "reinstall the selected model with `fsfs download-models --model MODEL_ID --force`, then run `fsfs download-models --model MODEL_ID --verify`"
-                                    .to_owned(),
-                            ),
+                            suggestion: Some(match error {
+                                SearchError::EmbedderUnavailable { reason, .. } => reason,
+                                _ => "reinstall the selected model with `fsfs download-models --model MODEL_ID --force`, then run `fsfs download-models --model MODEL_ID --verify`".to_owned(),
+                            }),
                         },
                     }
                 }
-                #[cfg(not(feature = "semantic-loaders"))]
+                #[cfg(not(feature = "semantic-support"))]
                 {
                     DoctorCheck {
                         name,
@@ -11402,7 +11444,7 @@ impl FsfsRuntime {
         }
     }
 
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(feature = "semantic-support")]
     fn probe_model_loader(status: &FsfsModelStatus) -> SearchResult<()> {
         let model_path = Path::new(&status.cache_path);
         if status.tier == "quality"
@@ -11419,7 +11461,13 @@ impl FsfsRuntime {
         }
         match status.tier.as_str() {
             "fast" => Model2VecEmbedder::load_with_name(model_path, &status.name).map(|_| ()),
+            #[cfg(feature = "semantic-loaders")]
             "quality" => FastEmbedEmbedder::load_with_name(model_path, &status.name).map(|_| ()),
+            #[cfg(not(feature = "semantic-loaders"))]
+            "quality" => Err(SearchError::EmbedderUnavailable {
+                model: status.name.clone(),
+                reason: "this fsfs build has no ONNX quality loader; select all-MiniLM-L6-v2-native or paraphrase-multilingual-MiniLM-L12-v2, then run fsfs download-models and rebuild the index with that producer".to_owned(),
+            }),
             other => Err(SearchError::InvalidConfig {
                 field: "model.tier".to_owned(),
                 value: other.to_owned(),
@@ -12107,6 +12155,33 @@ impl FsfsRuntime {
     }
 
     fn resolve_download_manifests(&self) -> SearchResult<Vec<ModelManifest>> {
+        #[cfg(all(feature = "semantic-native", not(feature = "semantic-loaders")))]
+        if !self.cli_input.download_list && self.cli_input.model_name.is_none() {
+            let mut selected = Vec::new();
+            for (tier, name) in [
+                ("fast", self.config.indexing.fast_model.as_str()),
+                ("quality", self.config.indexing.quality_model.as_str()),
+            ] {
+                if tier == "quality" && (self.config.search.fast_only || name.trim().is_empty()) {
+                    continue;
+                }
+                if tier == "quality" && NativeQualityModel::from_name(name).is_none() {
+                    return Err(SearchError::EmbedderUnavailable {
+                        model: name.to_owned(),
+                        reason: "this native-only fsfs build cannot load ONNX quality models; select all-MiniLM-L6-v2-native or paraphrase-multilingual-MiniLM-L12-v2 before provisioning".to_owned(),
+                    });
+                }
+                selected.push(Self::registered_manifest_for_model(tier, name).ok_or_else(
+                    || SearchError::InvalidConfig {
+                        field: format!("indexing.{tier}_model"),
+                        value: name.to_owned(),
+                        reason:
+                            "select a registered model from fsfs download-models --list".to_owned(),
+                    },
+                )?);
+            }
+            return Ok(selected);
+        }
         let mut manifests = ModelManifest::builtin_catalog().models;
         if self.cli_input.download_list || self.cli_input.model_name.is_some() {
             manifests.extend(ModelManifest::opt_in_catalog().models);
@@ -15027,7 +15102,7 @@ impl FsfsRuntime {
                 Ok(embedder)
             });
 
-            #[cfg(not(feature = "semantic-loaders"))]
+            #[cfg(not(feature = "semantic-support"))]
             let embedder = embedder.inspect_err(|_| {
                 emit_model_free_build_hint();
             });
@@ -15096,6 +15171,13 @@ impl FsfsRuntime {
 
         #[cfg(not(test))]
         {
+            #[cfg(all(feature = "semantic-native", not(feature = "semantic-loaders")))]
+            if !self.config.indexing.quality_model.trim().is_empty() {
+                return Err(SearchError::EmbedderUnavailable {
+                    model: self.config.indexing.quality_model.clone(),
+                    reason: "this native-only fsfs build cannot load ONNX quality models; select all-MiniLM-L6-v2-native or paraphrase-multilingual-MiniLM-L12-v2, then run fsfs download-models and rebuild the index with that producer".to_owned(),
+                });
+            }
             let configured_root = PathBuf::from(&self.config.indexing.model_dir);
             let options = DetectOptions {
                 offline: Some(self.config.indexing.offline),
@@ -15103,7 +15185,7 @@ impl FsfsRuntime {
             let quality =
                 EmbedderStack::auto_detect_quality_with_options(Some(&configured_root), &options);
 
-            #[cfg(not(feature = "semantic-loaders"))]
+            #[cfg(not(feature = "semantic-support"))]
             let quality = quality.inspect_err(|_| {
                 emit_model_free_build_hint();
             });
@@ -16966,25 +17048,25 @@ impl FsfsRuntime {
         } else {
             payload.index.size_bytes / u64::try_from(indexed_files).unwrap_or(1)
         };
-        #[cfg(feature = "semantic-loaders")]
+        #[cfg(feature = "semantic-support")]
         let fast_cached = payload
             .models
             .iter()
             .find(|model| model.tier == "fast")
             .is_some_and(|model| model.cached);
-        #[cfg(feature = "semantic-loaders")]
+        #[cfg(feature = "semantic-support")]
         let quality_cached = payload
             .models
             .iter()
             .find(|model| model.tier == "quality")
             .is_some_and(|model| model.cached);
-        #[cfg(not(feature = "semantic-loaders"))]
+        #[cfg(not(feature = "semantic-support"))]
         let mode_summary = paint(
             "lexical only (binary lacks semantic model loaders)",
             "38;5;214",
             no_color,
         );
-        #[cfg(feature = "semantic-loaders")]
+        #[cfg(feature = "semantic-support")]
         let mode_summary = if fast_cached && quality_cached && !self.config.search.fast_only {
             paint(
                 "fast + quality manifest-verified (doctor probes loaders)",
@@ -19440,7 +19522,7 @@ fn render_existing_index_dashboard_frame(
     fast_only: bool,
     no_color: bool,
 ) {
-    #[cfg(not(feature = "semantic-loaders"))]
+    #[cfg(not(feature = "semantic-support"))]
     let _ = fast_only;
 
     let area = frame.bounds();
@@ -19479,21 +19561,21 @@ fn render_existing_index_dashboard_frame(
     } else {
         payload.index.lexical_index_bytes as f64 / payload.index.size_bytes as f64
     };
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(feature = "semantic-support")]
     let fast_cached = payload
         .models
         .iter()
         .find(|model| model.tier == "fast")
         .is_some_and(|model| model.cached);
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(feature = "semantic-support")]
     let quality_cached = payload
         .models
         .iter()
         .find(|model| model.tier == "quality")
         .is_some_and(|model| model.cached);
-    #[cfg(not(feature = "semantic-loaders"))]
+    #[cfg(not(feature = "semantic-support"))]
     let mode_label = "loader unavailable (explicit lite binary)";
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(feature = "semantic-support")]
     let mode_label = if fast_cached && quality_cached && !fast_only {
         "fast + quality caches manifest-verified; doctor probes loaders"
     } else if fast_cached {
@@ -19501,9 +19583,9 @@ fn render_existing_index_dashboard_frame(
     } else {
         "no manifest-verified semantic cache"
     };
-    #[cfg(not(feature = "semantic-loaders"))]
+    #[cfg(not(feature = "semantic-support"))]
     let mode_style = ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold();
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(feature = "semantic-support")]
     let mode_style = if fast_cached && quality_cached && !fast_only {
         ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold()
     } else if fast_cached {
@@ -19686,10 +19768,10 @@ fn render_existing_index_dashboard_frame(
     #[cfg(feature = "embedded-models")]
     let capability_footer =
         "Bundled semantic defaults are materialized and verified at first semantic execution.";
-    #[cfg(all(feature = "semantic-loaders", not(feature = "embedded-models")))]
+    #[cfg(all(feature = "semantic-support", not(feature = "embedded-models")))]
     let capability_footer =
-        "Stock defaults include semantic loaders; provision models, then run fsfs doctor.";
-    #[cfg(not(feature = "semantic-loaders"))]
+        "Semantic loaders available; provision configured models, then run fsfs doctor.";
+    #[cfg(not(feature = "semantic-support"))]
     let capability_footer =
         "Explicit lite build: install a standard fsfs build to enable semantic loaders.";
     Paragraph::new(Text::from_lines(vec![
@@ -21740,25 +21822,25 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     } else {
         status.index.size_bytes / u64::try_from(indexed_files).unwrap_or(1)
     };
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(feature = "semantic-support")]
     let fast_cached = status
         .models
         .iter()
         .find(|model| model.tier == "fast")
         .is_some_and(|model| model.cached);
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(feature = "semantic-support")]
     let quality_cached = status
         .models
         .iter()
         .find(|model| model.tier == "quality")
         .is_some_and(|model| model.cached);
-    #[cfg(not(feature = "semantic-loaders"))]
+    #[cfg(not(feature = "semantic-support"))]
     let search_mode_line = paint(
         "  semantic readiness: loader unavailable (explicit lite binary)",
         "38;5;214",
         no_color,
     );
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(feature = "semantic-support")]
     let search_mode_line = if fast_cached && quality_cached && !status.config.fast_only {
         paint(
             "  semantic readiness: fast + quality caches manifest-verified; run `fsfs doctor` to probe loaders",
@@ -22771,7 +22853,7 @@ fn remove_indexing_checkpoint(index_root: &Path) -> SearchResult<()> {
     }
 }
 
-#[cfg(not(feature = "semantic-loaders"))]
+#[cfg(not(feature = "semantic-support"))]
 const fn model_free_semantic_recovery_guidance() -> &'static str {
     "Search mode: lexical-only. This explicit lite binary has download support but no Model2Vec/FastEmbed loaders, so downloaded model files alone cannot activate semantic retrieval. Install a standard fsfs build, or rebuild with `cargo build --release -p frankensearch-fsfs`; then provision verified models with `fsfs download-models`. Hash control embeddings are never admitted as semantic results."
 }
@@ -22819,29 +22901,29 @@ const fn interactive_model_provisioning_decision(
     }
 }
 
-#[cfg(feature = "semantic-loaders")]
+#[cfg(feature = "semantic-support")]
 const fn semantic_model_doctor_recovery_guidance() -> &'static str {
     "provision the configured model with `fsfs download-models`, verify it with `fsfs download-models --verify`, or point FRANKENSEARCH_MODEL_DIR at a verified cache"
 }
 
-#[cfg(not(feature = "semantic-loaders"))]
+#[cfg(not(feature = "semantic-support"))]
 const fn semantic_model_doctor_recovery_guidance() -> &'static str {
     "install a standard fsfs build, or rebuild with `cargo build --release -p frankensearch-fsfs`; downloaded files alone cannot activate this explicit lite binary"
 }
 
-#[cfg(feature = "semantic-loaders")]
+#[cfg(feature = "semantic-support")]
 const fn semantic_model_directory_guidance() -> &'static str {
     "create a verified model cache with `fsfs download-models`, or set FRANKENSEARCH_MODEL_DIR to an existing verified cache"
 }
 
-#[cfg(not(feature = "semantic-loaders"))]
+#[cfg(not(feature = "semantic-support"))]
 const fn semantic_model_directory_guidance() -> &'static str {
     "a model directory alone cannot activate this explicit lite binary; install a standard fsfs build, or rebuild without `--no-default-features`"
 }
 
 /// Explain why a model-free binary cannot activate semantic retrieval even
 /// when verified model files are already present.
-#[cfg(not(feature = "semantic-loaders"))]
+#[cfg(all(not(feature = "semantic-support"), not(test)))]
 fn emit_model_free_build_hint() {
     eprintln!();
     eprintln!("--- fsfs model-free build: semantic loaders unavailable ---");
@@ -23576,7 +23658,9 @@ mod tests {
 
     #[test]
     fn quality_blend_daemon_requires_exact_applied_policy_acknowledgement() {
-        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let mut config = FsfsConfig::default();
+        config.indexing.quality_model = "all-MiniLM-L6-v2".to_owned();
+        let runtime = FsfsRuntime::new(config);
         let mut response = super::SearchServeResponse {
             schema_version: super::FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
             policy: Some(runtime.search_serve_policy().unwrap()),
@@ -23690,9 +23774,9 @@ mod tests {
                     Some(NativeQualityModel::Multilingual),
                 ] {
                     let mut config = FsfsConfig::default();
-                    if let Some(model) = selected {
-                        config.indexing.quality_model = model.manifest_id().to_owned();
-                    }
+                    config.indexing.quality_model = selected
+                        .map_or("all-MiniLM-L6-v2", |model| model.manifest_id())
+                        .to_owned();
                     let runtime = FsfsRuntime::new(config);
                     let mut resources = disagreeing_blend_resources(temp.path());
                     resources.quality_vector_index = Some(Arc::clone(&index));
@@ -23763,7 +23847,9 @@ mod tests {
             resources.quality_vector_index = Some(Arc::clone(&current));
             resources.quality_embedder = None;
             resources.quality_embedder_attempted = false;
-            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let mut config = FsfsConfig::default();
+            config.indexing.quality_model = embedder.id().to_owned();
+            let runtime = FsfsRuntime::new(config);
             super::set_test_quality_embedder(None);
             runtime
                 .maybe_prepare_quality_embedder(&cx, &mut resources)
@@ -25800,6 +25886,7 @@ mod tests {
             // No registered cache is reachable from here, so the planted
             // negative below finds no cross-encoder at all.
             config.indexing.model_dir = temp.path().join("no-models").display().to_string();
+            config.indexing.quality_model = SemanticQualityStub.id().to_owned();
 
             super::set_test_fast_embedder(Some(Arc::new(SemanticFastEmbedder)));
             super::set_test_quality_embedder(Some(Arc::new(SemanticQualityStub)));
@@ -25964,6 +26051,7 @@ mod tests {
             // Positive: a semantic fast double (the planner refuses to refine
             // over hash-control ranks) plus a distinct semantic quality double
             // resolve -> both tiers built in two different spaces.
+            config.indexing.quality_model = SemanticQualityStub.id().to_owned();
             super::set_test_fast_embedder(Some(Arc::new(SemanticFastEmbedder)));
             super::set_test_quality_embedder(Some(Arc::new(SemanticQualityStub)));
             let index_runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
@@ -33148,13 +33236,15 @@ mod tests {
 
     #[test]
     fn native_quality_selection_binds_downloads_pool_and_cached_answers() {
-        let default = FsfsRuntime::new(FsfsConfig::default());
-        let default_key = default
+        let mut onnx_config = FsfsConfig::default();
+        onnx_config.indexing.quality_model = "all-MiniLM-L6-v2".to_owned();
+        let onnx = FsfsRuntime::new(onnx_config);
+        let default_key = onnx
             .search_cache_key("castaway", 10, SearchExecutionMode::Full)
             .unwrap();
         let mut cache_keys = vec![FsfsRuntime::search_cache_key_hash(&default_key)];
         #[cfg(unix)]
-        let mut socket_paths = vec![default.default_daemon_socket_path().unwrap()];
+        let mut socket_paths = vec![onnx.default_daemon_socket_path().unwrap()];
         for (name, manifest) in [
             ("all-MiniLM-L6-v2-native", ModelManifest::minilm_v2_native()),
             (
@@ -33162,9 +33252,9 @@ mod tests {
                 ModelManifest::multilingual_minilm_l12_v2(),
             ),
         ] {
+            #[cfg(not(all(feature = "semantic-native", not(feature = "semantic-loaders"))))]
             assert!(
-                default
-                    .resolve_download_manifests()
+                onnx.resolve_download_manifests()
                     .unwrap()
                     .iter()
                     .all(|entry| entry.id != manifest.id)
@@ -33203,6 +33293,51 @@ mod tests {
             #[cfg(not(feature = "rerank"))]
             assert!(error.to_string().contains("no native backend"), "{error}");
         }
+    }
+
+    #[cfg(all(feature = "semantic-native", not(feature = "semantic-loaders")))]
+    #[test]
+    fn native_only_profile_provisions_selected_models_and_preserves_updates() {
+        let mut config = FsfsConfig::default();
+        let runtime = FsfsRuntime::new(config.clone());
+        assert_eq!(
+            runtime.resolve_download_manifests().unwrap(),
+            vec![
+                ModelManifest::potion_128m(),
+                ModelManifest::minilm_v2_native()
+            ]
+        );
+        let error = runtime.collect_update_payload().unwrap_err();
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { field, value, .. } if field == "update.profile" && value == "semantic-native")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("--no-default-features --features semantic-native")
+        );
+        config.indexing.quality_model = "paraphrase-multilingual-MiniLM-L12-v2".to_owned();
+        assert_eq!(
+            FsfsRuntime::new(config.clone())
+                .resolve_download_manifests()
+                .unwrap(),
+            vec![
+                ModelManifest::potion_128m(),
+                ModelManifest::multilingual_minilm_l12_v2()
+            ]
+        );
+        config.indexing.quality_model = "all-MiniLM-L6-v2".to_owned();
+        assert!(matches!(
+            FsfsRuntime::new(config.clone()).resolve_download_manifests(),
+            Err(SearchError::EmbedderUnavailable { .. })
+        ));
+        config.search.fast_only = true;
+        assert_eq!(
+            FsfsRuntime::new(config)
+                .resolve_download_manifests()
+                .unwrap(),
+            vec![ModelManifest::potion_128m()]
+        );
     }
 
     #[test]
@@ -36284,7 +36419,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "semantic-loaders"))]
+    #[cfg(not(feature = "semantic-support"))]
     #[test]
     fn model_free_guidance_requires_a_loader_capable_build() {
         let runtime = FsfsRuntime::new(FsfsConfig::default());
@@ -36342,7 +36477,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "semantic-loaders", not(feature = "embedded-models")))]
+    #[cfg(all(feature = "semantic-support", not(feature = "embedded-models")))]
     #[test]
     fn default_loader_guidance_provisions_models_without_a_rebuild() {
         let temp = tempfile::tempdir().expect("tempdir");

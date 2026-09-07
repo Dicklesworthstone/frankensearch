@@ -92,8 +92,8 @@ compiled Model2Vec/FastEmbed loader. A hard doctor verdict exits nonzero with
 one stable `subsystem_error` report with the failing checks in its context. If the cache is absent or offline mode
 forbids acquisition, indexing fails with an actionable typed error; it never
 substitutes hash control embeddings for semantic results. Use
-`--no-default-features` only when you intentionally want the model-free lite
-binary.
+`--no-default-features` alone produces the model-free lite binary. Add
+`--features semantic-native` for the native semantic profile described below.
 
 ### Native quality embeddings in fsfs
 
@@ -121,7 +121,29 @@ Native and ONNX models have separate installation directories and producer
 identities. Changing this setting requires re-embedding the corpus. A missing
 or invalid native quality model leaves a new index fast-only; an existing
 native quality generation rejects incompatible models and preserves Initial
-results when refinement fails. The default quality model remains ONNX.
+results when refinement fails. The standard build's default quality model remains ONNX.
+
+For an ONNX-free source build, use the explicit native profile:
+
+```bash
+cargo build --release -p frankensearch-fsfs --locked --no-default-features --features semantic-native
+target/release/fsfs download-models
+target/release/fsfs doctor
+target/release/fsfs index ./documents
+target/release/fsfs search "your query"
+```
+
+This profile includes Model2Vec, native quality inference and native reranking,
+without the `fastembed` or `ort` dependency. It defaults to English native F32
+MiniLM; bare `download-models` provisions the configured fast and quality models.
+The optional reranker still needs `fsfs download-models ms-marco-minilm-l-6-v2`.
+Existing ONNX quality generations need re-embedding with the native producer.
+Enabling both `semantic-native` and `semantic-loaders` keeps the standard ONNX
+default. Native-only builds update from source; `fsfs update` refuses to replace
+them with a standard/lite release archive or an unclassified rollback backup.
+`fsfs update --check` and rollback listing remain available. The profile cannot
+initialize ONNX models; existing valid cached answers or an explicitly selected
+daemon can still serve results from their attested producer.
 
 ### Opt-in multilingual native embeddings
 

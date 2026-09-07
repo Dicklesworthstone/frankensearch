@@ -16,18 +16,23 @@ mod loader_only {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use frankensearch_embed::model_manifest::{ModelManifest, is_verification_cached};
+    use frankensearch_embed::model_manifest::ModelManifest;
+    #[cfg(feature = "semantic-loaders")]
+    use frankensearch_embed::model_manifest::is_verification_cached;
     use frankensearch_index::VectorIndex;
     use serde_json::Value;
 
     const FAILURE_TIMEOUT: Duration = Duration::from_secs(30);
     const QUICKSTART_TIMEOUT: Duration = Duration::from_secs(240);
+    #[cfg(feature = "semantic-loaders")]
     const QUICKSTART_DOCUMENT_COUNT: usize = 10;
     const RETRY_DOCUMENT: &str = "Recover transient network failures with exponential backoff, bounded retries, and random jitter.";
+    #[cfg(feature = "semantic-loaders")]
     const SEMANTIC_PARAPHRASES: [&str; 2] = [
         "staggered reconnects after brief outages",
         "delayed reattempts following temporary disruptions",
     ];
+    #[cfg(feature = "semantic-loaders")]
     const SEARCH_LIMIT: &str = "3";
 
     #[derive(Debug)]
@@ -93,15 +98,17 @@ mod loader_only {
             "cargo-test-target"
         };
         eprintln!(
-            "[default-build-e2e] stage=stock-default-contract event=start lane={lane} binary={} binary_origin={binary_origin} harness_profile={harness_profile} semantic_loaders={} embedded_models={}",
+            "[default-build-e2e] stage=stock-default-contract event=start lane={lane} binary={} binary_origin={binary_origin} harness_profile={harness_profile} semantic_loaders={} semantic_native={} embedded_models={}",
             verified_executable.display(),
             cfg!(feature = "semantic-loaders"),
+            cfg!(feature = "semantic-native"),
             cfg!(feature = "embedded-models")
         );
     }
 
     #[derive(Debug)]
     struct IsolatedFsfs {
+        binary: PathBuf,
         home: PathBuf,
         xdg_config: PathBuf,
         xdg_cache: PathBuf,
@@ -129,6 +136,7 @@ mod loader_only {
             }
 
             Self {
+                binary: fsfs_binary(),
                 home,
                 xdg_config,
                 xdg_cache,
@@ -147,7 +155,7 @@ mod loader_only {
         }
 
         fn command(&self, cwd: &Path) -> Command {
-            let mut command = Command::new(fsfs_binary());
+            let mut command = Command::new(&self.binary);
             command
                 .current_dir(cwd)
                 .env("HOME", &self.home)
@@ -183,7 +191,7 @@ mod loader_only {
             I: IntoIterator<Item = S>,
             S: AsRef<OsStr>,
         {
-            let verified_executable = fsfs_binary();
+            let verified_executable = &self.binary;
             let stdout_path = self.log_root.join(format!("{label}.stdout.log"));
             let stderr_path = self.log_root.join(format!("{label}.stderr.log"));
             let stdout_file = File::create(&stdout_path).expect("create subprocess stdout log");
@@ -288,6 +296,7 @@ mod loader_only {
             })
     }
 
+    #[cfg(feature = "semantic-loaders")]
     fn assert_index_completion(envelope: &Value, sentinel: &Value, count: usize, format: &str) {
         assert_eq!(envelope["ok"], true);
         assert_eq!(envelope["meta"]["command"], "index");
@@ -296,6 +305,7 @@ mod loader_only {
         assert_index_data(&envelope["data"], sentinel, count);
     }
 
+    #[cfg(feature = "semantic-loaders")]
     fn assert_index_data(data: &Value, sentinel: &Value, count: usize) {
         for (field, value) in sentinel.as_object().expect("sentinel object") {
             assert_eq!(&data[field], value, "published field {field}");
@@ -313,6 +323,7 @@ mod loader_only {
         );
     }
 
+    #[cfg(feature = "semantic-loaders")]
     fn verify_index_output_formats(fsfs: &IsolatedFsfs, root: &Path, corpus: &Path, index: &Path) {
         for format in ["jsonl", "table", "toon", "csv"] {
             let outcome = fsfs.run(
@@ -418,6 +429,7 @@ mod loader_only {
         );
     }
 
+    #[cfg(feature = "semantic-loaders")]
     fn verify_fast_only_policy(fsfs: &IsolatedFsfs, root: &Path, corpus: &Path, full_index: &Path) {
         let fast_index = root.join("fast-only-index");
         let config = root.join("quality-requested.toml");
@@ -1008,6 +1020,7 @@ mod loader_only {
         );
     }
 
+    #[cfg(feature = "semantic-loaders")]
     fn verify_pinned_model_cache(model_root: &Path) -> Result<(), String> {
         let potion_dir = model_root.join("potion-multilingual-128M");
         let minilm_dir = model_root.join("all-MiniLM-L6-v2");
@@ -1033,6 +1046,82 @@ mod loader_only {
             })?;
         eprintln!("[default-build-e2e] stage=model-verification event=verified");
         Ok(())
+    }
+
+    #[cfg(all(feature = "semantic-native", not(feature = "semantic-loaders"), unix))]
+    #[test]
+    fn native_only_rollback_preserves_the_executable_and_unclassified_backup() {
+        use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut fsfs = IsolatedFsfs::new(temp.path(), temp.path().join("models"));
+        let executable = temp.path().join("fsfs-private-copy");
+        fs::copy(&fsfs.binary, &executable).unwrap();
+        fsfs.binary = executable.clone();
+        let executable_before = fs::read(&executable).unwrap();
+        let backup_dir = fsfs.xdg_data.join("frankensearch/backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let backup = b"unclassified historical executable bytes";
+        let backup_path = backup_dir.join("fsfs-1.0.0");
+        fs::write(&backup_path, backup).unwrap();
+        let mut backup_sha256 = String::new();
+        for byte in Sha256::digest(backup) {
+            write!(backup_sha256, "{byte:02x}").unwrap();
+        }
+        let manifest_path = backup_dir.join("rollback-manifest.json");
+        let manifest = serde_json::to_vec(&serde_json::json!({"entries": [{
+            "version": "1.0.0", "backed_up_at_epoch": 1,
+            "original_path": executable, "binary_filename": "fsfs-1.0.0",
+            "sha256": backup_sha256,
+        }]}))
+        .unwrap();
+        fs::write(&manifest_path, &manifest).unwrap();
+        for (label, args) in [
+            (
+                "rollback-latest",
+                vec!["update", "--rollback", "--format", "json"],
+            ),
+            (
+                "rollback-selected",
+                vec!["update", "--rollback", "1.0.0", "--format", "json"],
+            ),
+            (
+                "rollback-selected-check",
+                vec![
+                    "update",
+                    "--rollback",
+                    "1.0.0",
+                    "--check",
+                    "--format",
+                    "json",
+                ],
+            ),
+        ] {
+            let outcome = fsfs.run(temp.path(), label, args, FAILURE_TIMEOUT);
+            assert!(
+                !outcome.timed_out && !outcome.status.success(),
+                "{outcome:?}"
+            );
+            let error: Value = serde_json::from_str(&outcome.stdout).unwrap();
+            assert_eq!(error["error"]["code"], "invalid_config", "{error}");
+            assert!(
+                outcome.combined_output().contains("update.profile"),
+                "{outcome:?}"
+            );
+            assert_eq!(fs::read(&executable).unwrap(), executable_before);
+            assert_eq!(fs::read(&backup_path).unwrap(), backup);
+            assert_eq!(fs::read(&manifest_path).unwrap(), manifest);
+        }
+        let listing = fsfs.run(
+            temp.path(),
+            "rollback-list",
+            ["update", "--rollback", "--check"],
+            FAILURE_TIMEOUT,
+        );
+        assert_finished_successfully("rollback list", &listing);
+        assert!(listing.stdout.contains("v1.0.0"), "{listing:?}");
+        assert_eq!(fs::read(&executable).unwrap(), executable_before);
     }
 
     #[cfg(feature = "rerank")]
@@ -1090,7 +1179,21 @@ mod loader_only {
         let config = temp.path().join("native.toml");
         fs::write(
             &config,
-            "[indexing]\nquality_model = \"all-MiniLM-L6-v2-native\"\n",
+            if cfg!(all(
+                feature = "semantic-native",
+                not(feature = "semantic-loaders")
+            )) {
+                // Exercise the profile's actual default without a quality override.
+                ""
+            } else {
+                "[indexing]\nquality_model = \"all-MiniLM-L6-v2-native\"\n"
+            },
+        )
+        .unwrap();
+        let onnx_config = temp.path().join("onnx.toml");
+        fs::write(
+            &onnx_config,
+            "[indexing]\nquality_model = \"all-MiniLM-L6-v2\"\n",
         )
         .unwrap();
         let corpus = temp.path().join("corpus");
@@ -1108,6 +1211,72 @@ mod loader_only {
         let index = temp.path().join("index");
         let config_arg = config.to_str().unwrap();
         let index_arg = index.to_str().unwrap();
+        #[cfg(all(feature = "semantic-native", not(feature = "semantic-loaders")))]
+        {
+            let verify = fsfs.run(
+                temp.path(),
+                "native-profile-default-verify",
+                ["download-models", "--verify", "--format", "json"],
+                QUICKSTART_TIMEOUT,
+            );
+            let verified = parse_success_envelope("native profile default verify", &verify);
+            let entries = verified["data"]["models"].as_array().unwrap();
+            assert_eq!(entries.len(), 2, "{verified}");
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["id"] == "all-minilm-l6-v2-native"
+                        && entry["verified"] == true),
+                "{verified}"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry["id"] != "all-minilm-l6-v2"),
+                "{verified}"
+            );
+            let unavailable = fsfs.run(
+                temp.path(),
+                "native-profile-onnx-doctor",
+                [
+                    "doctor",
+                    "--config",
+                    onnx_config.to_str().unwrap(),
+                    "--index-dir",
+                    index_arg,
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            assert!(!unavailable.timed_out, "{unavailable:?}");
+            let doctor: Value = serde_json::from_str(&unavailable.stdout).unwrap();
+            assert_eq!(unavailable.status.code(), Some(1), "{unavailable:?}");
+            assert_eq!(doctor["ok"], false, "{doctor}");
+            assert_eq!(doctor["error"]["code"], "subsystem_error", "{doctor}");
+            let context = doctor["error"]["context"].as_str().unwrap();
+            assert!(
+                context.contains("model.quality") && context.contains("no ONNX quality loader"),
+                "{doctor}"
+            );
+            let update = fsfs.run(
+                temp.path(),
+                "native-profile-update-refusal",
+                ["update", "--format", "json"],
+                FAILURE_TIMEOUT,
+            );
+            assert!(!update.timed_out && !update.status.success(), "{update:?}");
+            assert!(
+                update.combined_output().contains("update.profile"),
+                "{update:?}"
+            );
+            assert!(
+                update
+                    .combined_output()
+                    .contains("--features semantic-native"),
+                "{update:?}"
+            );
+        }
         let verify = fsfs.run(
             temp.path(),
             "native-explicit-verify",
@@ -1193,6 +1362,8 @@ mod loader_only {
             ];
             if native_config {
                 args.extend(["--config", config_arg]);
+            } else {
+                args.extend(["--config", onnx_config.to_str().unwrap()]);
             }
             if stream {
                 args.push("--stream");
@@ -1311,6 +1482,8 @@ mod loader_only {
                 [
                     "search",
                     query,
+                    "--config",
+                    onnx_config.to_str().unwrap(),
                     "--index-dir",
                     index_arg,
                     "--daemon",
@@ -1804,12 +1977,20 @@ mod loader_only {
                 .count(),
             1
         );
+        let onnx_config = temp.path().join("onnx.toml");
+        fs::write(
+            &onnx_config,
+            "[indexing]\nquality_model = \"all-MiniLM-L6-v2\"\n",
+        )
+        .unwrap();
         let wrong = fsfs.run(
             temp.path(),
             "onnx-cannot-reuse-multilingual-daemon",
             [
                 "search",
                 queries[0].0,
+                "--config",
+                onnx_config.to_str().unwrap(),
                 "--index-dir",
                 index_arg,
                 "--daemon",
@@ -2236,10 +2417,10 @@ mod loader_only {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "semantic-loaders"))]
     struct WatchChild(std::process::Child);
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "semantic-loaders"))]
     impl Drop for WatchChild {
         fn drop(&mut self) {
             if self.0.try_wait().ok().flatten().is_none() {
@@ -2249,7 +2430,7 @@ mod loader_only {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "semantic-loaders"))]
     fn wait_for_watch_output(
         child: &mut WatchChild,
         path: &Path,
@@ -2275,7 +2456,7 @@ mod loader_only {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "semantic-loaders"))]
     #[test]
     #[ignore = "real-model watch handoff; requires the pinned model cache and semantic E2E opt-in"]
     fn default_build_watch_reconciles_handoff_and_persists_live_updates() -> Result<(), String> {
@@ -2570,6 +2751,7 @@ mod loader_only {
         Ok(())
     }
 
+    #[cfg(feature = "semantic-loaders")]
     #[test]
     #[ignore = "mock-free model-backed quickstart; provision the pinned cache, then run with --ignored --nocapture"]
     fn default_build_indexes_and_returns_a_real_hybrid_result() -> Result<(), String> {
