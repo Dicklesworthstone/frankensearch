@@ -4462,9 +4462,9 @@ const REASON_RERANK_FAILED: &str = "query.stage.rerank.failed";
 /// truncates at 512 tokens, so this head already covers what it can see.
 const FSFS_RERANK_DOCUMENT_READ_LIMIT: u64 = 16 * 1024;
 
-/// Process-wide cross-encoder handle for the opt-in rerank stage. Clones of
-/// the runtime share the cell, so a daemon loads the model once and serves it
-/// to every request that asks for the stage.
+/// The process cache retains successful cross-encoder initialization. A query
+/// freezes its own slot, including absence, before cache lookup so a concurrent
+/// successful retry cannot change that query's model selection midway through.
 #[derive(Clone, Default)]
 struct RerankerSlot(Option<Arc<dyn Reranker>>);
 
@@ -4537,6 +4537,9 @@ pub struct FsfsRuntime {
     config: FsfsConfig,
     cli_input: CliInput,
     reranker: Arc<std::sync::OnceLock<RerankerSlot>>,
+    /// A running worker retains this permit after its caller times out;
+    /// a cancelled queued job releases it when the pool discards that job.
+    reranker_load_gate: Arc<asupersync::sync::Mutex<()>>,
     /// Shared by daemon/TUI clones with the same immutable model configuration.
     /// A timed-out initialization retains its permit and successful model, so
     /// the next query can refine without repeating the cold load.
@@ -4552,6 +4555,7 @@ impl FsfsRuntime {
             config,
             cli_input: CliInput::default(),
             reranker: Arc::new(std::sync::OnceLock::new()),
+            reranker_load_gate: Arc::new(asupersync::sync::Mutex::new(())),
             quality_load_gate: Arc::new(asupersync::sync::Mutex::new(
                 QualityEmbedderSlot::default(),
             )),
@@ -4574,6 +4578,7 @@ impl FsfsRuntime {
         self.quality_load_gate =
             Arc::new(asupersync::sync::Mutex::new(QualityEmbedderSlot::default()));
         self.reranker = Arc::new(std::sync::OnceLock::new());
+        self.reranker_load_gate = Arc::new(asupersync::sync::Mutex::new(()));
         self
     }
 
@@ -6801,6 +6806,7 @@ impl FsfsRuntime {
             runtime.config.search.rrf_k = k;
         }
         runtime.config.search.fast_only = request.fast_only.unwrap_or(self.config.search.fast_only);
+        runtime.prepare_search_reranker(cx).await?;
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 
         let (cached, payloads) = if hot_cache_enabled {
@@ -7841,7 +7847,9 @@ impl FsfsRuntime {
         Self::validate_search_generation_at_root(&index_root, mode)?;
         let lookup_fingerprint = Self::search_index_fingerprint_at_root(&index_root)?;
         Self::validate_search_generation_fingerprint(&index_root, &lookup_fingerprint, mode)?;
-        let key = self.search_cache_key(query, limit, mode)?;
+        let mut prepared = self.clone();
+        prepared.prepare_search_reranker(cx).await?;
+        let key = prepared.search_cache_key(query, limit, mode)?;
         match self.try_load_search_payload_cache(&key, &lookup_fingerprint) {
             Ok(Some(payloads)) => {
                 if let Some(sink) = phase_sink.as_deref_mut() {
@@ -7882,7 +7890,7 @@ impl FsfsRuntime {
             .prepare_search_execution_resources_at_root_with_modes(cx, &index_root, mode, mode)
             .await?;
         let execution_fingerprint = resources.generation_fingerprint.clone();
-        let artifacts = self
+        let artifacts = prepared
             .execute_search_phase_artifacts_with_mode_using_resources(
                 cx,
                 query,
@@ -8256,9 +8264,14 @@ impl FsfsRuntime {
             quality_weight_bits: self.effective_quality_weight().to_bits(),
             quality_timeout_ms: self.config.search.quality_timeout_ms,
             rerank: self.config.search.rerank,
-            rerank_model: self
-                .prepared_reranker()
-                .map(|reranker| reranker.id().to_owned()),
+            rerank_model: if self.config.search.rerank {
+                self.reranker
+                    .get()
+                    .and_then(|slot| slot.0.as_ref())
+                    .map(|reranker| reranker.id().to_owned())
+            } else {
+                None
+            },
         })
     }
 
@@ -9056,7 +9069,8 @@ impl FsfsRuntime {
         // The cross-encoder is a process resource, not an index resource: the
         // runtime owns it, so its capability is decided here. Nothing is
         // loaded unless the caller asked for the stage.
-        capabilities.rerank = if self.prepared_reranker().is_some() {
+        let reranker = self.prepared_reranker(cx).await?;
+        capabilities.rerank = if reranker.is_some() {
             CapabilityState::Enabled
         } else {
             CapabilityState::Disabled
@@ -9539,6 +9553,7 @@ impl FsfsRuntime {
                     } = self
                         .apply_rerank_stage(
                             cx,
+                            reranker.as_deref(),
                             &plan.rerank_stage,
                             &resources.index_root,
                             &normalized_query,
@@ -15195,25 +15210,127 @@ impl FsfsRuntime {
         }
     }
 
-    /// The cross-encoder for the opt-in rerank stage, resolved once per
-    /// runtime family (clones share the cell). `None` when `search.rerank`
-    /// is off (nothing is loaded) or when no verified model is installed;
-    /// the reason is logged once, on the first search that asked.
-    fn prepared_reranker(&self) -> Option<Arc<dyn Reranker>> {
-        if !self.config.search.rerank {
-            return None;
-        }
-        self.reranker
-            .get_or_init(|| RerankerSlot(self.resolve_reranker()))
-            .0
-            .clone()
+    /// Freeze a query's selection before its cache key is built. Only the
+    /// successful process-wide model is shared with subsequent queries; an
+    /// unavailable result stays local so the next query can retry provisioning.
+    async fn prepare_search_reranker(&mut self, cx: &Cx) -> SearchResult<()> {
+        let selected = self.prepared_reranker(cx).await?;
+        self.reranker = Arc::new(std::sync::OnceLock::from(RerankerSlot(selected)));
+        Ok(())
     }
 
-    fn resolve_reranker(&self) -> Option<Arc<dyn Reranker>> {
-        #[cfg(test)]
-        if let Some(reranker) = test_reranker_override() {
-            return Some(reranker);
+    /// Resolve on the caller's pool, sharing successful initialization across
+    /// runtime clones. A running worker keeps admission and publishes a
+    /// successfully initialized model even if its caller drops the request.
+    /// A queued job can instead be cancelled, allowing the next query to retry.
+    async fn prepared_reranker(&self, cx: &Cx) -> SearchResult<Option<Arc<dyn Reranker>>> {
+        Self::semantic_retry_checkpoint(cx, "reranker_initialization")?;
+        if !self.config.search.rerank {
+            return Ok(None);
         }
+        #[cfg(feature = "rerank")]
+        if self
+            .native_blocking_pool
+            .as_ref()
+            .is_some_and(|pool| pool.is_shutdown())
+        {
+            return Err(SearchError::RerankFailed {
+                model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                source: "caller-owned blocking pool is shut down".into(),
+            });
+        }
+        if let Some(slot) = self.reranker.get() {
+            return Ok(slot.0.clone());
+        }
+        // Capture only an explicitly injected test object here. With no override,
+        // tests execute the same real inspection and constructor on the worker.
+        #[cfg(test)]
+        let selected_test_provider = test_reranker_override();
+        let permit =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.reranker_load_gate), cx)
+                .await
+                .map_err(|error| match error {
+                    asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
+                        phase: "reranker_initialization".to_owned(),
+                        reason: "reranker initialization admission cancelled".to_owned(),
+                    },
+                    error => SearchError::RerankFailed {
+                        model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                        source: format!("reranker initialization admission failed: {error}").into(),
+                    },
+                })?;
+        Self::semantic_retry_checkpoint(cx, "reranker_initialization")?;
+        if let Some(slot) = self.reranker.get() {
+            return Ok(slot.0.clone());
+        }
+        #[cfg(test)]
+        if let Some(reranker) = selected_test_provider {
+            let slot = self.reranker.get_or_init(|| RerankerSlot(Some(reranker)));
+            return Ok(slot.0.clone());
+        }
+        #[cfg(not(feature = "rerank"))]
+        {
+            drop(permit);
+            warn!("fsfs rerank stage disabled: this build omits the `rerank` feature");
+            Ok(None)
+        }
+        #[cfg(feature = "rerank")]
+        {
+            let Some(pool) = self.native_blocking_pool.clone() else {
+                warn!(
+                    model = FSFS_RERANKER_MODEL_ID,
+                    "native rerank initialization requires a caller-owned blocking pool; use FsfsRuntime::with_native_blocking_pool"
+                );
+                return Ok(None);
+            };
+            let runtime = self.clone();
+            let worker_cx = cx.clone().with_blocking_pool_handle(Some(pool));
+            let mut worker = worker_cx
+                .spawn_blocking(move |child| {
+                    let _permit = permit;
+                    // asupersync can execute a rejected pool submission inline on
+                    // its async wrapper. This also guards shutdown racing admission.
+                    if Cx::is_active() {
+                        return Err(SearchError::RerankFailed {
+                            model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                            source: "blocking pool dispatch fell back to an async executor".into(),
+                        });
+                    }
+                    Self::semantic_retry_checkpoint(&child, "reranker_initialization")?;
+                    let resolved = runtime.resolve_reranker();
+                    if let Some(reranker) = resolved {
+                        let slot = runtime
+                            .reranker
+                            .get_or_init(|| RerankerSlot(Some(reranker)));
+                        // Publish the process resource even if the originating
+                        // request has expired. Its query result is checked separately.
+                        Ok(slot.0.clone())
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .map_err(|error| SearchError::RerankFailed {
+                    model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                    source: format!("cannot admit reranker initialization worker: {error}").into(),
+                })?;
+            let result = worker.join(cx).await.map_err(|error| match error {
+                asupersync::runtime::JoinError::Cancelled(_) => SearchError::Cancelled {
+                    phase: "reranker_initialization".to_owned(),
+                    reason: "reranker initialization worker cancelled".to_owned(),
+                },
+                error => SearchError::RerankFailed {
+                    model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                    source: format!("reranker initialization worker failed: {error}").into(),
+                },
+            });
+            // Joining ignores its Cx; cancellation must beat late query success.
+            Self::semantic_retry_checkpoint(cx, "reranker_initialization")?;
+            result?
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    fn resolve_reranker(&self) -> Option<Arc<dyn Reranker>> {
         match self.load_registered_reranker() {
             Ok(Some(reranker)) => {
                 info!(
@@ -15264,12 +15381,6 @@ impl FsfsRuntime {
         Ok(Some(Arc::new(reranker)))
     }
 
-    #[cfg(not(feature = "rerank"))]
-    fn load_registered_reranker(&self) -> SearchResult<Option<Arc<dyn Reranker>>> {
-        warn!("fsfs rerank stage disabled: this build omits the `rerank` feature");
-        Ok(None)
-    }
-
     /// Re-score the head of a fused ranking with the cross-encoder.
     ///
     /// The plan's `candidate_budget` bounds the head. Scored hits are ordered
@@ -15280,6 +15391,7 @@ impl FsfsRuntime {
     async fn apply_rerank_stage(
         &self,
         cx: &Cx,
+        reranker: Option<&dyn Reranker>,
         stage: &StageDirective,
         index_root: &Path,
         query: &str,
@@ -15296,7 +15408,7 @@ impl FsfsRuntime {
         if !stage.enabled {
             return Ok(skipped(fused, stage.reason_code));
         }
-        let Some(reranker) = self.prepared_reranker() else {
+        let Some(reranker) = reranker else {
             return Ok(skipped(fused, REASON_RERANK_UNAVAILABLE));
         };
         let depth = budget.min(fused.len());
@@ -25779,6 +25891,535 @@ mod tests {
                 "documents outside the prefix must survive: {after:?}"
             );
         });
+    }
+
+    #[cfg(feature = "rerank")]
+    fn cold_reranker_fixture(
+        pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+        root: &Path,
+    ) -> (FsfsRuntime, SearchExecutionResources) {
+        let model_dir = PathBuf::from(
+            std::env::var("FRANKENSEARCH_RERANK_MODEL_DIR")
+                .expect("verified real cross-encoder fixture required"),
+        );
+        ModelManifest::ms_marco_reranker()
+            .verify_dir(&model_dir)
+            .expect("verify actual registered model bytes");
+        assert!(!model_dir.join("model_f32.safetensors").exists());
+        let mut config = FsfsConfig::default();
+        config.search.rerank = true;
+        config.indexing.model_dir = model_dir.parent().unwrap().display().to_string();
+        config.storage.index_dir = root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_native_blocking_pool(pool);
+        // An empty generation isolates the daemon's cache/preparation boundary.
+        // Ranking below calls the actual retained model, not a test provider.
+        let resources = SearchExecutionResources {
+            index_root: root.to_path_buf(),
+            generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(root).unwrap(),
+            lexical_index: None,
+            shadow_observer: None,
+            shadow_pressure_sampler: None,
+            vector_index: None,
+            quality_vector_index: None,
+            fast_embedder: None,
+            quality_embedder: None,
+            fast_embedder_attempted: false,
+            quality_embedder_attempted: false,
+            degradation_advice: Vec::new(),
+        };
+        (runtime, resources)
+    }
+
+    #[cfg(feature = "rerank")]
+    fn cold_reranker_request() -> SearchServeRequest {
+        SearchServeRequest {
+            query: String::new(),
+            limit: Some(10),
+            mode: Some("full".to_owned()),
+            filter: None,
+            rerank: Some(true),
+            quality_weight: None,
+            quality_timeout_ms: None,
+            rrf_k: None,
+            fast_only: None,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn cold_reranker_fixture_yields_during_real_loading_and_reuses_owner() {
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let pool = scheduler.blocking_handle().unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, mut resources) = cold_reranker_fixture(pool.clone(), temp.path());
+        let mut cache = HashMap::new();
+        scheduler.block_on(async {
+            let mut request = Box::pin(runtime.execute_search_serve_request(
+                &cx, cold_reranker_request(), &mut resources, &mut cache, true,
+            ));
+            let started = Instant::now();
+            let first = std::future::poll_fn(|task_cx| {
+                Poll::Ready(request.as_mut().poll(task_cx))
+            }).await;
+            eprintln!("cold reranker first poll pending={} elapsed_ms={}", first.is_pending(), started.elapsed().as_millis());
+            assert!(first.is_pending(), "cold model initialization must yield to the caller's scheduler");
+            let mut active_load_heartbeats = 0;
+            let response = loop {
+                assert!(started.elapsed() < Duration::from_secs(10), "actual model initialization did not finish");
+                if let Poll::Ready(result) = std::future::poll_fn(|task_cx| {
+                    Poll::Ready(request.as_mut().poll(task_cx))
+                }).await {
+                    break result.unwrap();
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                if pool.busy_threads() > 0 && runtime.reranker.get().is_none() {
+                    active_load_heartbeats += 1;
+                }
+            };
+            drop(request);
+            eprintln!("scheduler heartbeats during actual cold load={active_load_heartbeats}");
+            assert!(active_load_heartbeats > 0, "the scheduler must progress while the real worker initializes the model");
+            assert!(!response.cached);
+            let model = runtime.reranker.get().unwrap().0.as_ref().unwrap().clone();
+            let documents = [
+                frankensearch_core::RerankDocument { doc_id: "bread".into(), text: "Mix flour and water, knead the dough, then bake bread in an oven.".into() },
+                frankensearch_core::RerankDocument { doc_id: "retry".into(), text: "Recover transient network failures with bounded retries and exponential backoff.".into() },
+            ];
+            let scores = model.rerank(&cx, "How do I recover from a temporary network failure?", &documents).await.unwrap();
+            assert_eq!(scores.len(), 2);
+            assert_eq!(scores[0].doc_id, "retry");
+            assert!(scores.iter().all(|score| score.score.is_finite()));
+            assert!(scores[0].score > scores[1].score);
+            let cloned = runtime.clone();
+            let warm = cloned.execute_search_serve_request(
+                &cx, cold_reranker_request(), &mut resources, &mut cache, true,
+            ).await.unwrap();
+            assert!(warm.cached);
+            assert!(Arc::ptr_eq(&model, cloned.reranker.get().unwrap().0.as_ref().unwrap()));
+        });
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn cold_reranker_fixture_cancelled_request_never_initializes_or_caches() {
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, mut resources) =
+            cold_reranker_fixture(scheduler.blocking_handle().unwrap(), temp.path());
+        let mut cache = HashMap::new();
+        cx.cancel_fast(asupersync::CancelKind::User);
+        let result = scheduler.block_on(runtime.execute_search_serve_request(
+            &cx,
+            cold_reranker_request(),
+            &mut resources,
+            &mut cache,
+            true,
+        ));
+        eprintln!("cancelled cold request returned success={}", result.is_ok());
+        assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+        assert!(runtime.reranker.get().is_none());
+        assert!(cache.is_empty());
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn cold_reranker_fixture_stopped_pool_never_initializes_inline() {
+        let scheduler = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+        let (runtime, mut resources) = cold_reranker_fixture(pool.handle(), temp.path());
+        assert!(pool.shutdown_and_wait(Duration::from_secs(2)));
+        let mut cache = HashMap::new();
+        let result = scheduler.block_on(runtime.execute_search_serve_request(
+            &cx,
+            cold_reranker_request(),
+            &mut resources,
+            &mut cache,
+            true,
+        ));
+        eprintln!(
+            "stopped pool cold request returned success={}",
+            result.is_ok()
+        );
+        assert!(matches!(result, Err(SearchError::RerankFailed { .. })));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("blocking pool is shut down")
+        );
+        assert!(runtime.reranker.get().is_none());
+        assert!(cache.is_empty());
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[cfg(feature = "rerank")]
+    fn cold_reranker_interrupted_load_retains_owner(cancel: bool) {
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let pool = scheduler.blocking_handle().unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let fresh = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, mut resources) = cold_reranker_fixture(pool.clone(), temp.path());
+        let mut cache = HashMap::new();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // Occupy the real caller pool so timeout/cancellation is deterministic.
+        // Dropping the join cancels queued work; cancelling only the request Cx
+        // is checked after the admitted worker returns.
+        let _blocker = pool.spawn(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        scheduler.block_on(async {
+            let mut pending = Box::pin(runtime.execute_search_serve_request(
+                &cx,
+                cold_reranker_request(),
+                &mut resources,
+                &mut cache,
+                true,
+            ));
+            std::future::poll_fn(|task_cx| {
+                assert!(pending.as_mut().poll(task_cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            let started = Instant::now();
+            while pool.pending_count() != 1 {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "loader was not queued on caller pool"
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            assert!(runtime.reranker_load_gate.try_lock().is_err());
+            if cancel {
+                cx.cancel_fast(asupersync::CancelKind::User);
+                release_tx.send(()).unwrap();
+                assert!(matches!(pending.await, Err(SearchError::Cancelled { .. })));
+            } else {
+                let result =
+                    asupersync::time::timeout(cx.now(), Duration::from_millis(10), pending).await;
+                assert!(
+                    result.is_err(),
+                    "caller timeout must fire while loader waits for capacity"
+                );
+                assert!(runtime.reranker_load_gate.try_lock().is_err());
+                let waiter = asupersync::time::timeout(
+                    fresh.now(),
+                    Duration::from_millis(10),
+                    runtime.prepared_reranker(&fresh),
+                )
+                .await;
+                assert!(waiter.is_err());
+                assert_eq!(
+                    pool.pending_count(),
+                    1,
+                    "retry must not queue a duplicate constructor"
+                );
+                release_tx.send(()).unwrap();
+            }
+            assert!(
+                cache.is_empty(),
+                "interrupted request must not publish a cached payload"
+            );
+            let started = Instant::now();
+            while runtime.reranker_load_gate.try_lock().is_err()
+                || pool.pending_count() != 0
+                || pool.busy_threads() != 0
+            {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "interrupted initialization did not release caller capacity"
+                );
+                asupersync::time::sleep(fresh.now(), Duration::from_millis(1)).await;
+            }
+            let retained = runtime.reranker.get().and_then(|slot| slot.0.clone());
+            assert_eq!(
+                retained.is_some(),
+                cancel,
+                "a dropped join cancels queued loading; a joined worker retains its model"
+            );
+            let warm = runtime
+                .execute_search_serve_request(
+                    &fresh,
+                    cold_reranker_request(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(!warm.cached);
+            let loaded = runtime.reranker.get().unwrap().0.as_ref().unwrap();
+            if let Some(retained) = retained {
+                assert!(Arc::ptr_eq(&retained, loaded));
+            }
+            assert!(runtime.reranker_load_gate.try_lock().is_ok());
+        });
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn cold_reranker_fixture_queued_timeout_releases_admission_and_retries() {
+        cold_reranker_interrupted_load_retains_owner(false);
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn cold_reranker_fixture_admitted_cancellation_retains_model_without_payload() {
+        cold_reranker_interrupted_load_retains_owner(true);
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn cold_reranker_fixture_running_load_survives_caller_drop() {
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let pool = scheduler.blocking_handle().unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let fresh = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, mut resources) = cold_reranker_fixture(pool.clone(), temp.path());
+        let mut cache = HashMap::new();
+        scheduler.block_on(async {
+            let mut pending = Box::pin(runtime.execute_search_serve_request(
+                &cx,
+                cold_reranker_request(),
+                &mut resources,
+                &mut cache,
+                true,
+            ));
+            let started = Instant::now();
+            loop {
+                std::future::poll_fn(|task_cx| {
+                    assert!(pending.as_mut().poll(task_cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(runtime.reranker.get().is_none());
+                if pool.busy_threads() > 0 {
+                    break;
+                }
+                assert!(started.elapsed() < Duration::from_secs(10));
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            assert!(runtime.reranker_load_gate.try_lock().is_err());
+            drop(pending);
+            assert!(
+                runtime.reranker.get().is_none(),
+                "the model must still be loading after caller abandonment"
+            );
+            assert!(runtime.reranker_load_gate.try_lock().is_err());
+            assert!(cache.is_empty());
+            let started = Instant::now();
+            while runtime.reranker_load_gate.try_lock().is_err()
+                || pool.pending_count() != 0
+                || pool.busy_threads() != 0
+            {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "running constructor did not drain after caller drop"
+                );
+                asupersync::time::sleep(fresh.now(), Duration::from_millis(1)).await;
+            }
+            // This must exist before a new query can initialize anything. Pool
+            // activity alone is not proof that a real model survived the drop.
+            let retained = runtime.reranker.get().unwrap().0.as_ref().unwrap().clone();
+            let documents = [
+                frankensearch_core::RerankDocument {
+                    doc_id: "bread".into(),
+                    text: "Mix flour and water, knead dough, then bake bread.".into(),
+                },
+                frankensearch_core::RerankDocument {
+                    doc_id: "retry".into(),
+                    text: "Recover network failures with bounded retries and exponential backoff."
+                        .into(),
+                },
+            ];
+            let scores = retained
+                .rerank(
+                    &fresh,
+                    "How do I recover from a network failure?",
+                    &documents,
+                )
+                .await
+                .unwrap();
+            assert_eq!(scores.len(), 2);
+            assert!(scores.iter().all(|score| score.score.is_finite()));
+            assert_eq!(scores[0].doc_id, "retry");
+            assert!(scores[0].score > scores[1].score);
+            let warm = runtime
+                .execute_search_serve_request(
+                    &fresh,
+                    cold_reranker_request(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(!warm.cached);
+            assert!(Arc::ptr_eq(
+                &retained,
+                runtime.reranker.get().unwrap().0.as_ref().unwrap()
+            ));
+        });
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn cold_reranker_fixture_shutdown_race_refuses_inline_then_rebinds() {
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let racing = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+        let (runtime, mut resources) = cold_reranker_fixture(racing.handle(), temp.path());
+        let mut cache = HashMap::new();
+        scheduler.block_on(async {
+            let permit = asupersync::sync::OwnedMutexGuard::lock(
+                Arc::clone(&runtime.reranker_load_gate),
+                &cx,
+            )
+            .await
+            .unwrap();
+            let mut pending = Box::pin(runtime.execute_search_serve_request(
+                &cx,
+                cold_reranker_request(),
+                &mut resources,
+                &mut cache,
+                true,
+            ));
+            std::future::poll_fn(|task_cx| {
+                assert!(pending.as_mut().poll(task_cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(racing.shutdown_and_wait(Duration::from_secs(2)));
+            drop(permit);
+            let result = pending.await;
+            assert!(matches!(result, Err(SearchError::RerankFailed { .. })));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("dispatch fell back to an async executor")
+            );
+            assert!(runtime.reranker.get().is_none());
+            assert!(cache.is_empty());
+            let rebound = runtime
+                .clone()
+                .with_native_blocking_pool(scheduler.blocking_handle().unwrap());
+            assert!(!Arc::ptr_eq(
+                &runtime.reranker_load_gate,
+                &rebound.reranker_load_gate
+            ));
+            assert!(!Arc::ptr_eq(&runtime.reranker, &rebound.reranker));
+            rebound
+                .execute_search_serve_request(
+                    &cx,
+                    cold_reranker_request(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(rebound.reranker.get().unwrap().0.is_some());
+            assert!(runtime.reranker.get().is_none());
+        });
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn cold_reranker_fixture_retry_preserves_each_query_model_and_cache_key() {
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runtime, _) =
+            cold_reranker_fixture(scheduler.blocking_handle().unwrap(), temp.path());
+        let private_cache = temp.path().join("models");
+        runtime.config.indexing.model_dir = private_cache.display().to_string();
+        scheduler.block_on(async {
+            let mut absent = runtime.clone();
+            absent.prepare_search_reranker(&cx).await.unwrap();
+            assert!(absent.reranker.get().unwrap().0.is_none());
+            assert!(
+                runtime.reranker.get().is_none(),
+                "absence must not poison shared initialization"
+            );
+            let absent_key = absent
+                .search_cache_key("recover network", 10, SearchExecutionMode::Full)
+                .unwrap();
+            assert!(absent_key.rerank_model.is_none());
+
+            // Provision actual registered bytes into this test's private cache.
+            let source = PathBuf::from(std::env::var("FRANKENSEARCH_RERANK_MODEL_DIR").unwrap());
+            let installed = private_cache.join(source.file_name().unwrap());
+            fs::create_dir_all(&installed).unwrap();
+            for file in ModelManifest::ms_marco_reranker().files {
+                let destination = installed.join(&file.name);
+                fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                fs::copy(source.join(&file.name), destination).unwrap();
+            }
+            let mut available = runtime.clone();
+            available.prepare_search_reranker(&cx).await.unwrap();
+            let retained = runtime.reranker.get().unwrap().0.as_ref().unwrap();
+            assert!(Arc::ptr_eq(
+                retained,
+                available.reranker.get().unwrap().0.as_ref().unwrap()
+            ));
+            let available_key = available
+                .search_cache_key("recover network", 10, SearchExecutionMode::Full)
+                .unwrap();
+            assert_eq!(available_key.rerank_model.as_deref(), Some(retained.id()));
+            assert_ne!(available_key, absent_key);
+            assert!(
+                absent.prepared_reranker(&cx).await.unwrap().is_none(),
+                "in-flight absence must stay pinned after another query loads the model"
+            );
+            assert_eq!(
+                absent
+                    .search_cache_key("recover network", 10, SearchExecutionMode::Full)
+                    .unwrap(),
+                absent_key
+            );
+        });
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
     }
 
     /// A cross-encoder that scores a document by its input position, so the
