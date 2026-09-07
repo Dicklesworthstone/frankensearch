@@ -1,5 +1,62 @@
 # Dependency Upgrade Log
 
+## 2026-09-07 — FrankenSQLite 0.3.18 source follow-through
+
+The storage, durability, fsfs, and ops manifests now require FrankenSQLite
+0.3.18. All 20 registry family members move together in `Cargo.lock`; no other
+package version changes. Asupersync remains a single registry identity at
+0.4.10, with the existing feature selections and registry renames preserved.
+
+The [upstream release](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.18)
+fixes WAL journal-switch sequence handling, read-only WAL reader registration,
+Linux I/O cancellation safety, and mount namespace permissions. Its parameterized
+rowid-IN optimization is not a demonstrated FrankenSearch speedup. The used
+public APIs require no caller migration; the FTS5, value, error, context, and
+RaptorQ source files are byte-identical to 0.3.17. Published source provenance
+is `1600766ca698dae99b6018474bc8c150ece4a82d`.
+
+The publish contract's audited family pin moves with the actual lock. Its
+positive and negative self-tests pass, including mixed-family, foreign-source,
+duplicate-runtime, and source-cleanliness cases. The live audit accepts these
+dependency identities while retaining dirty-source and occupied-version
+blockers. `cargo audit` reports zero vulnerability advisories and the unchanged
+four unmaintained, one unsoundness, and one yanked-package warnings.
+
+FTS5-enabled storage validation passes 386 library tests and 10 pipeline
+integration tests; the existing scaling probe remains ignored. Commit/reopen,
+rollback, concurrent-reader isolation, and repeated schema-open read-only
+checks all pass. The first full gate has nine passing checks and one failed
+check: its real-model CLI stage has five passes and one fixture failure because
+the selected cache lacks native MiniLM `model.safetensors`. That test stops
+before native indexing or search, so it establishes no native deadline result.
+The candidate's ordinary registered downloader then downloaded and verified
+91,337,345 bytes into a private native cache; the failed run remains retained.
+
+The complete unchanged rerun passes all ten default checks, including real-model
+CLI E2E 6/6, from 06:32:03Z to 06:36:58Z on `thinkstation1`. It uses the existing
+`MINILM_FIXTURE_DIR` override for that verified native directory and
+`FSFS_E2E_BINARY` for the freshly built optimized default-profile executable,
+SHA256 `9c9eccb905933c6d9ddecd405c115c44c25b0deae3059a8b50ec4aefe84bf8d0`.
+The final quick-start stage independently builds and runs the stock debug
+executable, SHA256
+`53651ebb8d082e396b681a4c5c9e3bed6fd243a311a90f4d1b764b01e3f7c84d`.
+No stage, assertion, timeout, feature, model checksum, or producer identity was
+changed. Native E2E qualifies the optimized executable; it does not resolve the
+previously observed stock-debug native cold-load deadline failure.
+
+Candidate source base is
+`798a933743f2d87802b0faa75947497af94d5bfa`; the new lockfile SHA256 is
+`daaba04e7e3858b13309f7bdc99458af8205abcd60c168744f5af47447374704`.
+Terminal evidence is retained under
+`/data/tmp/frankensearch-fsqlite-0.3.18-20260907/` on `thinkstation1`.
+
+This source follow-through does not replace the published `v1.9.1` or
+`crates-v0.4.3` artifacts, which retain their validated 0.3.17 lock. The
+stock-debug native deadline, native-default, and no-C-toolchain criteria of
+bd-2ba5 remain open; upstream `stacker`/`psm` still needs an assembler driver.
+Watcher reader exclusion, bd-z2nfa, also remains open and depends on unfinished
+composite-generation publication and retention work owned elsewhere.
+
 ## 2026-09-07 — Published fsfs 1.9.1 and the 0.4.3 crate bundle
 
 Both annotated tags bind `9d132a0315e12da0442aa7a943852091fe043037`.
