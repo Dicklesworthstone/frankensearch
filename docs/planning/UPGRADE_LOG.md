@@ -7,6 +7,16 @@ published stable release, 0.3.17. All 20 `fsqlite*` packages in `Cargo.lock`
 move together; the storage, durability, fsfs, and ops manifests require
 0.3.17. Existing feature selections and Rust call sites are unchanged.
 
+Release preparation also updates the publish contract's audited identity pins
+to FrankenSQLite 0.3.17 and Asupersync 0.4.10, and the fresh-process logging
+receipt's Asupersync pin to 0.4.10. These had remained at 0.3.8 / 0.4.9 after
+the lockfile moved. Before/after live census receipts remove exactly the two
+dependency-version blockers; occupied versions, dirty tracked source, and
+untracked package inputs remain blocked. The planner's positive and negative
+self-tests pass, including mixed-family and non-registry rejection; all eight
+fresh-process logging tests pass with the new identity. No source, checksum,
+single-runtime, package-provenance, or cleanliness check was removed.
+
 - **Upstream fixes:** the releases since 0.3.8 address prepared-read
   transaction release, cross-process WAL visibility/checkpoint horizons,
   FTS5 visibility and maintenance, and savepoint allocation ownership.
