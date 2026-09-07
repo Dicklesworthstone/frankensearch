@@ -784,6 +784,7 @@ mod loader_only {
                         ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
                         ModelArtifactManifestV1::nomic_fastembed().unwrap(),
                         ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap(),
+                        ModelArtifactManifestV1::multilingual_minilm_native_frankentorch().unwrap(),
                     ] {
                         contracts.update(manifest.freeze().unwrap().fingerprint.as_bytes());
                     }
@@ -1522,6 +1523,368 @@ mod loader_only {
         }
         eprintln!(
             "[native-cli] actual native index/search/append, producer refusal, missing/corrupt model and vector preservation verified"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "rerank", unix))]
+    #[ignore = "requires real multilingual MiniLM, Potion and ONNX fixtures"]
+    fn multilingual_quality_model_runs_cross_language_cli_search() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+
+        use frankensearch_core::Embedder;
+        use frankensearch_rerank::NativeEmbedder;
+
+        log_binary_profile("multilingual-quality");
+        let temp = tempfile::tempdir().unwrap();
+        let models = temp.path().join("models");
+        let fsfs = IsolatedFsfs::new(temp.path(), models.clone());
+        let model_id = "paraphrase-multilingual-minilm-l12-v2";
+        let model_directory = "paraphrase-multilingual-MiniLM-L12-v2";
+        for (variable, directory, manifest) in [
+            (
+                "POTION_FIXTURE_DIR",
+                "potion-multilingual-128M",
+                ModelManifest::potion_128m(),
+            ),
+            (
+                "MULTILINGUAL_MINILM_FIXTURE_DIR",
+                model_directory,
+                ModelManifest::multilingual_minilm_l12_v2(),
+            ),
+            (
+                "FASTEMBED_MINILM_FIXTURE_DIR",
+                "all-MiniLM-L6-v2",
+                ModelManifest::minilm_v2(),
+            ),
+        ] {
+            let source = std::env::var_os(variable)
+                .map_or_else(|| configured_model_root().join(directory), PathBuf::from);
+            manifest.verify_dir(&source).unwrap_or_else(|error| {
+                panic!(
+                    "multilingual CLI fixture {} at {} is unavailable: {error}; set {variable}",
+                    manifest.id,
+                    source.display()
+                )
+            });
+            let destination = models.join(directory);
+            for file in &manifest.files {
+                let target = destination.join(&file.name);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::copy(source.join(&file.name), target).unwrap();
+            }
+            manifest.verify_dir(&destination).unwrap();
+        }
+        let native = NativeEmbedder::load_multilingual(models.join(model_directory)).unwrap();
+        let fingerprint = native.identity().unwrap().fingerprint();
+        let config = temp.path().join("multilingual.toml");
+        fs::write(
+            &config,
+            format!("[indexing]\nquality_model = \"{model_id}\"\n"),
+        )
+        .unwrap();
+        let corpus = temp.path().join("corpus");
+        fs::create_dir(&corpus).unwrap();
+        for (name, content) in [
+            (
+                "concurrency.md",
+                "In Rust, structured concurrency keeps child tasks scoped and propagates cancellation safely.",
+            ),
+            (
+                "bread.md",
+                "A sourdough starter needs flour, water, and a warm kitchen.",
+            ),
+            (
+                "deadlock.md",
+                "数据库事务发生死锁时，应回滚其中一个事务，并按固定顺序重试锁操作。",
+            ),
+            ("pie.md", "这份食谱介绍如何烤制苹果派和准备奶油馅料。"),
+            (
+                "worker.md",
+                "worker_queue.rs 必须在 async 任务取消时归还 reservation，避免消息丢失。",
+            ),
+            (
+                "painting.md",
+                "The watercolor landscape uses blue pigment and cold-press paper.",
+            ),
+        ] {
+            fs::write(corpus.join(name), content).unwrap();
+        }
+        let index = temp.path().join("index");
+        let config_arg = config.to_str().unwrap();
+        let index_arg = index.to_str().unwrap();
+        let build = fsfs.run(
+            temp.path(),
+            "multilingual-index",
+            [
+                "index",
+                corpus.to_str().unwrap(),
+                "--config",
+                config_arg,
+                "--index-dir",
+                index_arg,
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        parse_success_envelope("multilingual index", &build);
+        let quality_path = index.join("vector/quality.fsvi");
+        {
+            let quality = VectorIndex::open_read_only(&quality_path).unwrap();
+            assert_eq!(
+                quality.embedder_id(),
+                native.id(),
+                "explicit multilingual selection must not fall back to the installed ONNX model"
+            );
+            assert_eq!(quality.embedder_revision(), fingerprint);
+            assert_eq!(quality.record_count(), 6);
+        }
+        for command in ["status", "doctor"] {
+            let outcome = fsfs.run(
+                temp.path(),
+                &format!("multilingual-{command}"),
+                [
+                    command,
+                    "--config",
+                    config_arg,
+                    "--index-dir",
+                    index_arg,
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let envelope = parse_success_envelope(command, &outcome);
+            if command == "status" {
+                assert_eq!(
+                    model_status(&envelope, "quality")["verification_state"],
+                    "verified"
+                );
+            }
+        }
+
+        struct Daemon {
+            socket: PathBuf,
+            child: std::process::Child,
+        }
+        impl Drop for Daemon {
+            fn drop(&mut self) {
+                if let Ok(mut socket) = UnixStream::connect(&self.socket) {
+                    let _ = socket.set_read_timeout(Some(FAILURE_TIMEOUT));
+                    let _ = socket.set_write_timeout(Some(FAILURE_TIMEOUT));
+                    let _ = socket.write_all(b"quit\n");
+                    let _ = socket.shutdown(std::net::Shutdown::Write);
+                    let _ = socket.read_to_end(&mut Vec::new());
+                }
+                let deadline = Instant::now() + FAILURE_TIMEOUT;
+                while Instant::now() < deadline {
+                    if let Ok(Some(status)) = self.child.try_wait() {
+                        if !thread::panicking() {
+                            assert!(status.success(), "multilingual daemon exited {status}");
+                        }
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                eprintln!(
+                    "multilingual test daemon failed to stop; terminating owned child {}",
+                    self.child.id()
+                );
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                assert!(
+                    thread::panicking(),
+                    "multilingual daemon failed graceful shutdown"
+                );
+            }
+        }
+        let socket_path = temp.path().join("multilingual.sock");
+        let log_path = fsfs.log_root.join("multilingual-daemon.stderr.log");
+        let child = fsfs
+            .command(temp.path())
+            .args([
+                "serve",
+                "--daemon",
+                "--daemon-socket",
+                socket_path.to_str().unwrap(),
+                "--config",
+                config_arg,
+                "--index-dir",
+                index_arg,
+            ])
+            .env("RUST_LOG", "info")
+            .stdout(File::create(fsfs.log_root.join("multilingual-daemon.stdout.log")).unwrap())
+            .stderr(File::create(&log_path).unwrap())
+            .spawn()
+            .unwrap();
+        let mut daemon = Daemon {
+            socket: socket_path.clone(),
+            child,
+        };
+        let deadline = Instant::now() + FAILURE_TIMEOUT;
+        while !socket_path.exists() && Instant::now() < deadline {
+            assert!(daemon.child.try_wait().unwrap().is_none());
+            thread::sleep(Duration::from_millis(10));
+        }
+        let request = |query: &str| {
+            let mut socket = UnixStream::connect(&socket_path).unwrap();
+            socket.set_read_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();
+            writeln!(socket, "{}", serde_json::json!({"query": query, "limit": 10, "mode": "full", "quality_timeout_ms": 500})).unwrap();
+            socket.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut raw = String::new();
+            socket.read_to_string(&mut raw).unwrap();
+            serde_json::from_str::<Value>(&raw).unwrap()
+        };
+        let cold = request("How can structured concurrency handle cancellation safely?");
+        assert_eq!(cold["ok"], true, "{cold}");
+        assert_eq!(cold["payloads"][0]["phase"], "initial", "{cold}");
+        let cold_last = cold["payloads"].as_array().unwrap().last().unwrap();
+        if cold_last["phase"] != "refined" {
+            assert_eq!(cold_last["phase"], "refinement_failed", "{cold}");
+            assert_eq!(cold_last["skip_reason"], "quality_timeout", "{cold}");
+            assert_eq!(cold_last["quality_timeout"]["budget_ms"], 500);
+            assert_eq!(cold_last["hits"], cold["payloads"][0]["hits"]);
+        }
+        eprintln!(
+            "[multilingual-cli] cold_default_budget_phase={}",
+            cold_last["phase"]
+        );
+        let loaded = "fsfs selected verified multilingual native quality model";
+        let deadline = Instant::now() + FAILURE_TIMEOUT;
+        while !fs::read_to_string(&log_path).unwrap().contains(loaded) {
+            assert!(
+                Instant::now() < deadline,
+                "multilingual model did not finish loading"
+            );
+            assert!(daemon.child.try_wait().unwrap().is_none());
+            thread::sleep(Duration::from_millis(10));
+        }
+        let queries = [
+            ("如何在 Rust 中处理任务取消和结构化并发？", "concurrency.md"),
+            (
+                "How should a database transaction deadlock be resolved?",
+                "deadlock.md",
+            ),
+            (
+                "修复 Rust async cancellation bug in worker_queue.rs",
+                "worker.md",
+            ),
+        ];
+        for (query, expected) in queries {
+            let response = request(query);
+            assert_eq!(response["ok"], true, "{response}");
+            assert_eq!(
+                response["cached"], false,
+                "new multilingual query must execute"
+            );
+            assert_eq!(
+                response["policy"]["quality_model"],
+                "paraphrasemultilingualminilml12v2"
+            );
+            let refined = response["payloads"].as_array().unwrap().last().unwrap();
+            assert_eq!(refined["phase"], "refined", "{response}");
+            assert_eq!(refined["semantic_blend"]["quality_embedder"], native.id());
+            assert!(
+                refined["hits"][0]["path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(expected),
+                "{response}"
+            );
+            let repeat = request(query);
+            assert_eq!(repeat["cached"], true, "{repeat}");
+            assert_eq!(repeat["payloads"], response["payloads"]);
+        }
+        assert_eq!(
+            fs::read_to_string(&log_path)
+                .unwrap()
+                .matches(loaded)
+                .count(),
+            1
+        );
+        let wrong = fsfs.run(
+            temp.path(),
+            "onnx-cannot-reuse-multilingual-daemon",
+            [
+                "search",
+                queries[0].0,
+                "--index-dir",
+                index_arg,
+                "--daemon",
+                "--daemon-socket",
+                socket_path.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        let refused = parse_success_envelope("wrong multilingual producer", &wrong);
+        assert_eq!(refused["data"]["phase"], "refinement_failed", "{refused}");
+        assert_eq!(
+            refused["data"]["degradation_advice"]["degrade.advice.embedding_space_unverifiable"]["failure"],
+            "unverifiable_embedding_space",
+            "{refused}"
+        );
+        assert!(
+            wrong
+                .stderr
+                .contains("falling back to in-process retrieval"),
+            "{wrong:?}"
+        );
+        drop(daemon);
+
+        let appended_name = "retry-locks.md";
+        let append_path = temp.path().join("append.jsonl");
+        let content = "数据库事务发生死锁后，回滚事务并按固定顺序重试锁操作。";
+        fs::write(&append_path, format!("{}\n", serde_json::json!({"id": corpus.join(appended_name).display().to_string(), "text": content}))).unwrap();
+        let append = fsfs.run(
+            temp.path(),
+            "multilingual-append",
+            [
+                "append-batch",
+                "--file",
+                append_path.to_str().unwrap(),
+                "--config",
+                config_arg,
+                "--index-dir",
+                index_arg,
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        parse_success_envelope("multilingual append", &append);
+        let quality = VectorIndex::open_read_only(&quality_path).unwrap();
+        assert_eq!(quality.embedder_revision(), fingerprint);
+        assert_eq!(
+            quality.quantization(),
+            frankensearch_index::Quantization::F16
+        );
+        let expected_vector = frankensearch_core::SyncEmbed::embed_sync(&native, content).unwrap();
+        let expected_path = temp.path().join("expected-native.fsvi");
+        let mut expected_writer =
+            VectorIndex::create(&expected_path, native.id(), native.dimension()).unwrap();
+        expected_writer
+            .write_record("expected", &expected_vector)
+            .unwrap();
+        expected_writer.finish().unwrap();
+        let expected_index = VectorIndex::open_read_only(&expected_path).unwrap();
+        let expected_persisted = expected_index.vector_at_f32(0).unwrap();
+        let (_, persisted) = quality
+            .wal_records()
+            .find(|(id, _)| id.ends_with(appended_name))
+            .expect("the acknowledged append must persist a quality vector");
+        assert_eq!(
+            persisted,
+            expected_persisted.as_slice(),
+            "append must embed content with the selected native producer, including F16 persistence"
+        );
+        let hits = quality.search_top_k(&expected_vector, 10, None).unwrap();
+        assert!(hits.iter().any(|hit| hit.doc_id.ends_with(appended_name)));
+        eprintln!(
+            "[multilingual-cli] real cross-language search/cache/daemon/append and incompatible producer refusal verified"
         );
     }
 

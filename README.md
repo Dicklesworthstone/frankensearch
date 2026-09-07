@@ -135,6 +135,18 @@ fsfs download-models paraphrase-multilingual-minilm-l12-v2
 fsfs download-models paraphrase-multilingual-minilm-l12-v2 --verify
 ```
 
+For fsfs, select it in your configuration and build a fresh index:
+
+```toml
+[indexing]
+quality_model = "paraphrase-multilingual-minilm-l12-v2"
+```
+
+The default fsfs build uses the native multilingual loader for indexing, search,
+append, watch and doctor with this selection. Use an optimized executable and
+daemon-backed search: cold initialization can exceed the 500 ms quality budget,
+while the daemon retains the completed model for subsequent queries.
+
 Library callers compiled with `--features native` load the verified model
 directory with `NativeEmbedder::load_multilingual(...)` (or the corresponding
 `NativeEmbeddingModel` variant). This producer has a distinct frozen identity

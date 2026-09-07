@@ -4395,6 +4395,58 @@ struct DoctorCheck {
 /// (`fsfs download-models ms-marco-minilm-l-6-v2`).
 const FSFS_RERANKER_MODEL_ID: &str = "ms-marco-minilm-l-6-v2";
 const FSFS_NATIVE_QUALITY_MODEL_ID: &str = "all-minilm-l6-v2-native";
+const FSFS_MULTILINGUAL_QUALITY_MODEL_ID: &str = "paraphrase-multilingual-minilm-l12-v2";
+
+/// Explicit CLI choices backed by the native embedding implementation. Keep
+/// selection available in lite builds so an unavailable backend fails closed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeQualityModel {
+    EnglishF32,
+    Multilingual,
+}
+
+impl NativeQualityModel {
+    fn from_name(name: &str) -> Option<Self> {
+        let normalized = normalize_model_key(name);
+        if normalized == normalize_model_key(FSFS_NATIVE_QUALITY_MODEL_ID) {
+            Some(Self::EnglishF32)
+        } else if normalized == normalize_model_key(FSFS_MULTILINGUAL_QUALITY_MODEL_ID) {
+            Some(Self::Multilingual)
+        } else {
+            None
+        }
+    }
+
+    const fn manifest_id(self) -> &'static str {
+        match self {
+            Self::EnglishF32 => FSFS_NATIVE_QUALITY_MODEL_ID,
+            Self::Multilingual => FSFS_MULTILINGUAL_QUALITY_MODEL_ID,
+        }
+    }
+
+    fn artifact_manifest(
+        self,
+    ) -> SearchResult<frankensearch_embed::model_manifest::ModelArtifactManifestV1> {
+        use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
+        match self {
+            Self::EnglishF32 => ModelArtifactManifestV1::minilm_native_frankentorch_f32(),
+            Self::Multilingual => {
+                ModelArtifactManifestV1::multilingual_minilm_native_frankentorch()
+            }
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    fn load(self, path: &Path) -> SearchResult<frankensearch_rerank::NativeEmbedder> {
+        use frankensearch_rerank::{NativeEmbedder, NativeEmbeddingModel};
+        let profile = match self {
+            Self::EnglishF32 => NativeEmbeddingModel::AllMiniLmL6V2F32,
+            Self::Multilingual => NativeEmbeddingModel::ParaphraseMultilingualMiniLmL12V2,
+        };
+        NativeEmbedder::load_model(path, profile)
+    }
+}
+
 /// Runtime reason codes for the rerank stage; the planner's own
 /// `query.stage.rerank.*` codes cover the plan-level skips.
 const REASON_RERANK_NOT_REQUESTED: &str = "query.stage.rerank.disabled.not_requested";
@@ -8126,8 +8178,8 @@ impl FsfsRuntime {
     fn registered_embedding_contracts() -> SearchResult<String> {
         use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
 
-        // Conservative invalidation across the local automatic detection
-        // registry. This hashes contracts, not model bytes, and performs no
+        // Conservative invalidation across the local embedding registry,
+        // including explicit native choices. This hashes contracts and performs no
         // I/O or inference. A manifest error cannot yield a cache hit.
         let mut contracts = Sha256::new();
         for manifest in [
@@ -8136,6 +8188,7 @@ impl FsfsRuntime {
             ModelArtifactManifestV1::snowflake_fastembed()?,
             ModelArtifactManifestV1::nomic_fastembed()?,
             ModelArtifactManifestV1::minilm_native_frankentorch_f32()?,
+            ModelArtifactManifestV1::multilingual_minilm_native_frankentorch()?,
         ] {
             contracts.update(manifest.freeze()?.fingerprint.as_bytes());
         }
@@ -11353,18 +11406,13 @@ impl FsfsRuntime {
     fn probe_model_loader(status: &FsfsModelStatus) -> SearchResult<()> {
         let model_path = Path::new(&status.cache_path);
         if status.tier == "quality"
-            && normalize_model_key(&status.name)
-                == normalize_model_key(FSFS_NATIVE_QUALITY_MODEL_ID)
+            && let Some(native_model) = NativeQualityModel::from_name(&status.name)
         {
             #[cfg(feature = "rerank")]
-            return frankensearch_rerank::NativeEmbedder::load_model(
-                model_path,
-                frankensearch_rerank::NativeEmbeddingModel::AllMiniLmL6V2F32,
-            )
-            .map(|_| ());
+            return native_model.load(model_path).map(|_| ());
             #[cfg(not(feature = "rerank"))]
             return Err(SearchError::EmbedderUnavailable {
-                model: status.name.clone(),
+                model: native_model.manifest_id().to_owned(),
                 reason: "this fsfs build has no native backend; rebuild with the rerank feature"
                     .to_owned(),
             });
@@ -15000,36 +15048,40 @@ impl FsfsRuntime {
         )
     )]
     fn resolve_quality_embedder(&self) -> SearchResult<Option<Arc<dyn Embedder>>> {
-        if normalize_model_key(&self.config.indexing.quality_model)
-            == normalize_model_key(FSFS_NATIVE_QUALITY_MODEL_ID)
+        if let Some(native_model) =
+            NativeQualityModel::from_name(&self.config.indexing.quality_model)
         {
             #[cfg(feature = "rerank")]
             {
                 let pool = self.native_blocking_pool.clone().ok_or_else(|| {
                     SearchError::EmbedderUnavailable {
-                        model: FSFS_NATIVE_QUALITY_MODEL_ID.to_owned(),
+                        model: native_model.manifest_id().to_owned(),
                         reason: "native quality requires a caller-owned blocking pool; use FsfsRuntime::with_native_blocking_pool".to_owned(),
                     }
                 })?;
                 let inspection = Self::inspect_registered_model_cache(
                     "quality",
-                    FSFS_NATIVE_QUALITY_MODEL_ID,
+                    native_model.manifest_id(),
                     Path::new(&self.config.indexing.model_dir),
                 )?;
-                let native = frankensearch_rerank::NativeEmbedder::load_model(
-                    &inspection.path,
-                    frankensearch_rerank::NativeEmbeddingModel::AllMiniLmL6V2F32,
-                )?
-                .with_blocking_pool(pool);
-                info!(
-                    quality_embedder = native.id(),
-                    "fsfs selected verified native F32 quality model"
-                );
+                let native = native_model
+                    .load(&inspection.path)?
+                    .with_blocking_pool(pool);
+                match native_model {
+                    NativeQualityModel::EnglishF32 => info!(
+                        quality_embedder = native.id(),
+                        "fsfs selected verified native F32 quality model"
+                    ),
+                    NativeQualityModel::Multilingual => info!(
+                        quality_embedder = native.id(),
+                        "fsfs selected verified multilingual native quality model"
+                    ),
+                }
                 return Ok(Some(Arc::new(native)));
             }
             #[cfg(not(feature = "rerank"))]
             return Err(SearchError::EmbedderUnavailable {
-                model: FSFS_NATIVE_QUALITY_MODEL_ID.to_owned(),
+                model: native_model.manifest_id().to_owned(),
                 reason: "this fsfs build has no native backend; rebuild with the rerank feature (enabled by default)".to_owned(),
             });
         }
@@ -15921,6 +15973,9 @@ impl FsfsRuntime {
         if resources.quality_embedder.is_some() || resources.quality_embedder_attempted {
             return Ok(());
         }
+        if let Some(index) = resources.quality_vector_index.as_ref() {
+            self.preflight_native_quality_generation(index)?;
+        }
         let permit =
             asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.quality_load_gate), cx)
                 .await
@@ -15967,6 +16022,37 @@ impl FsfsRuntime {
             Ok(None) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    /// A registered native generation requires its explicit CLI selection.
+    /// Reject known conflicts before cold model loading can mask the actionable
+    /// error with a timeout. This metadata check grants no admission: the loaded
+    /// embedder's identity, width and producer revision are still checked above.
+    fn preflight_native_quality_generation(&self, index: &VectorIndex) -> SearchResult<()> {
+        let selected = NativeQualityModel::from_name(&self.config.indexing.quality_model);
+        for model in [
+            NativeQualityModel::EnglishF32,
+            NativeQualityModel::Multilingual,
+        ] {
+            if selected == Some(model) {
+                continue;
+            }
+            let identity = model.artifact_manifest()?.declared_identity_bundle(
+                frankensearch_core::QuantizationFormat::F32,
+                "in-memory-f32-v1",
+            )?;
+            if index.embedder_revision() == identity.fingerprint() {
+                return Err(SearchError::UnverifiableRemoteSpace {
+                    producer: "fsfs.quality_vector_generation".to_owned(),
+                    reason: format!(
+                        "the stored quality producer requires indexing.quality_model = `{}`, but the configured model is `{}`; select the matching model or rebuild the index",
+                        model.manifest_id(),
+                        self.config.indexing.quality_model,
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Build a live ingest pipeline for the watcher by opening existing indexes.
@@ -23567,6 +23653,85 @@ mod tests {
         fn category(&self) -> ModelCategory {
             ModelCategory::TransformerEmbedder
         }
+    }
+
+    #[test]
+    fn native_quality_conflicts_are_rejected_before_model_initialization() {
+        use super::NativeQualityModel;
+        use frankensearch_core::QuantizationFormat;
+
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            super::set_test_quality_embedder(None);
+            for stored in [
+                NativeQualityModel::EnglishF32,
+                NativeQualityModel::Multilingual,
+            ] {
+                let identity = stored
+                    .artifact_manifest()
+                    .unwrap()
+                    .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                    .unwrap();
+                let path = temp.path().join(stored.manifest_id());
+                VectorIndex::create_with_revision(
+                    &path,
+                    "registered-quality-producer",
+                    &identity.fingerprint(),
+                    384,
+                    frankensearch_index::Quantization::F16,
+                )
+                .unwrap()
+                .finish()
+                .unwrap();
+                let index = Arc::new(VectorIndex::open_read_only(&path).unwrap());
+                for selected in [
+                    None,
+                    Some(NativeQualityModel::EnglishF32),
+                    Some(NativeQualityModel::Multilingual),
+                ] {
+                    let mut config = FsfsConfig::default();
+                    if let Some(model) = selected {
+                        config.indexing.quality_model = model.manifest_id().to_owned();
+                    }
+                    let runtime = FsfsRuntime::new(config);
+                    let mut resources = disagreeing_blend_resources(temp.path());
+                    resources.quality_vector_index = Some(Arc::clone(&index));
+                    resources.quality_embedder = None;
+                    resources.quality_embedder_attempted = false;
+                    if selected == Some(stored) {
+                        runtime.preflight_native_quality_generation(&index).unwrap();
+                        let error = runtime
+                            .maybe_prepare_quality_embedder(&cx, &mut resources)
+                            .await
+                            .unwrap_err();
+                        assert!(matches!(error, SearchError::EmbedderUnavailable { .. }));
+                        #[cfg(feature = "rerank")]
+                        assert!(error.to_string().contains("caller-owned blocking pool"));
+                        #[cfg(not(feature = "rerank"))]
+                        assert!(error.to_string().contains("no native backend"));
+                        assert!(resources.quality_embedder.is_none());
+                        continue;
+                    }
+                    // No native pool, model files or injected quality provider:
+                    // only pre-load conflict rejection can produce this error.
+                    assert!(matches!(
+                        runtime
+                            .maybe_prepare_quality_embedder(&cx, &mut resources)
+                            .await,
+                        Err(SearchError::UnverifiableRemoteSpace { .. })
+                    ));
+                    assert!(!resources.quality_embedder_attempted);
+                    assert!(resources.quality_embedder.is_none());
+                }
+            }
+            // Other producers are left to normal loaded-model admission.
+            let resources = disagreeing_blend_resources(temp.path());
+            FsfsRuntime::new(FsfsConfig::default())
+                .preflight_native_quality_generation(
+                    resources.quality_vector_index.as_ref().unwrap(),
+                )
+                .unwrap();
+        });
     }
 
     #[test]
@@ -32984,50 +33149,60 @@ mod tests {
     #[test]
     fn native_quality_selection_binds_downloads_pool_and_cached_answers() {
         let default = FsfsRuntime::new(FsfsConfig::default());
-        assert!(
-            default
-                .resolve_download_manifests()
-                .unwrap()
-                .iter()
-                .all(|manifest| manifest.id != super::FSFS_NATIVE_QUALITY_MODEL_ID)
-        );
-        let mut config = FsfsConfig::default();
-        config.indexing.quality_model = "all-MiniLM-L6-v2-native".to_owned();
-        let native = FsfsRuntime::new(config).with_cli_input(CliInput {
-            command: CliCommand::Download,
-            model_name: Some("all-MiniLM-L6-v2-native".to_owned()),
-            ..CliInput::default()
-        });
-        assert_eq!(
-            native.resolve_download_manifests().unwrap(),
-            vec![ModelManifest::minilm_v2_native()]
-        );
-        let native_key = native
-            .search_cache_key("castaway", 10, SearchExecutionMode::Full)
-            .unwrap();
         let default_key = default
             .search_cache_key("castaway", 10, SearchExecutionMode::Full)
             .unwrap();
-        assert_ne!(native_key, default_key);
-        assert_ne!(
-            FsfsRuntime::search_cache_key_hash(&native_key),
-            FsfsRuntime::search_cache_key_hash(&default_key)
-        );
+        let mut cache_keys = vec![FsfsRuntime::search_cache_key_hash(&default_key)];
         #[cfg(unix)]
-        assert_ne!(
-            native.default_daemon_socket_path().unwrap(),
-            default.default_daemon_socket_path().unwrap()
-        );
-        let Err(error) = native.resolve_quality_embedder() else {
-            panic!("native selection must not silently choose the test/default backend");
-        };
-        #[cfg(feature = "rerank")]
-        assert!(
-            error.to_string().contains("caller-owned blocking pool"),
-            "{error}"
-        );
-        #[cfg(not(feature = "rerank"))]
-        assert!(error.to_string().contains("no native backend"), "{error}");
+        let mut socket_paths = vec![default.default_daemon_socket_path().unwrap()];
+        for (name, manifest) in [
+            ("all-MiniLM-L6-v2-native", ModelManifest::minilm_v2_native()),
+            (
+                "paraphrase-multilingual-MiniLM-L12-v2",
+                ModelManifest::multilingual_minilm_l12_v2(),
+            ),
+        ] {
+            assert!(
+                default
+                    .resolve_download_manifests()
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry.id != manifest.id)
+            );
+            let mut config = FsfsConfig::default();
+            config.indexing.quality_model = name.to_owned();
+            let native = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Download,
+                model_name: Some(name.to_owned()),
+                ..CliInput::default()
+            });
+            assert_eq!(native.resolve_download_manifests().unwrap(), vec![manifest]);
+            let key = native
+                .search_cache_key("castaway", 10, SearchExecutionMode::Full)
+                .unwrap();
+            let hash = FsfsRuntime::search_cache_key_hash(&key);
+            assert!(!cache_keys.contains(&hash), "distinct producer: {name}");
+            cache_keys.push(hash);
+            #[cfg(unix)]
+            {
+                let socket_path = native.default_daemon_socket_path().unwrap();
+                assert!(
+                    !socket_paths.contains(&socket_path),
+                    "distinct daemon: {name}"
+                );
+                socket_paths.push(socket_path);
+            }
+            let Err(error) = native.resolve_quality_embedder() else {
+                panic!("{name} must not silently choose the test/default backend");
+            };
+            #[cfg(feature = "rerank")]
+            assert!(
+                error.to_string().contains("caller-owned blocking pool"),
+                "{error}"
+            );
+            #[cfg(not(feature = "rerank"))]
+            assert!(error.to_string().contains("no native backend"), "{error}");
+        }
     }
 
     #[test]
