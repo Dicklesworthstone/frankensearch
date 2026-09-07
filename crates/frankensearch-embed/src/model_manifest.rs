@@ -319,7 +319,10 @@ impl ModelArtifactManifestV1 {
         Self::from_download_manifest(
             &ModelManifest::minilm_v2(),
             "sentence-transformers-huggingface",
-            execution,
+            qualify_fastembed_platform(
+                execution,
+                "5693dd454b03d7c4ae3a96ea429eddbbaf60519e11ded361a26a1f221f996843",
+            ),
         )
     }
 
@@ -443,7 +446,10 @@ impl ModelArtifactManifestV1 {
         Self::from_download_manifest(
             &ModelManifest::snowflake_arctic_s(),
             "snowflake-huggingface",
-            execution,
+            qualify_fastembed_platform(
+                execution,
+                "f9f9b1071d82dd22614086a7a0e05bcdc785ca3b04158c4f914e678c75fd6c8d",
+            ),
         )
     }
 
@@ -461,7 +467,10 @@ impl ModelArtifactManifestV1 {
         Self::from_download_manifest(
             &ModelManifest::nomic_embed(),
             "nomic-ai-huggingface",
-            execution,
+            qualify_fastembed_platform(
+                execution,
+                "7041b782516edfb91097d668443130d098bca7a035c8a85024150b5a09aebc67",
+            ),
         )
     }
 
@@ -1129,6 +1138,24 @@ fn storage_endianness(storage_format: &str) -> &'static str {
     } else {
         "little-endian"
     }
+}
+
+// GOLDEN-CHANGE bd-2ba5: the macOS ARM64 ORT 1.28.0 build (da9b5e3)
+// produces different f32 bits from the Linux build of that same revision.
+// Each certificate was measured in fresh processes using the production
+// adapter's ordered first batch. The qualified platform has its own identity;
+// load_from_manifest still executes and checks the exact certificate before
+// returning an embedder. Other platforms retain the existing contract.
+fn qualify_fastembed_platform(
+    mut execution: ModelExecutionContractV1,
+    macos_arm64_vectors_sha256: &str,
+) -> ModelExecutionContractV1 {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "ort-1.28.0-da9b5e3-macos-aarch64-cpu-f32-host-default-intra-threads-v1"
+            .clone_into(&mut execution.numeric_profile);
+        macos_arm64_vectors_sha256.clone_into(&mut execution.golden_vectors.vectors_sha256);
+    }
+    execution
 }
 
 fn fastembed_execution_contract(
@@ -4137,6 +4164,10 @@ mod tests {
         // version in implementation_revision. Only that provenance field moves
         // from 0.2.4 to 0.2.5; the reconstruction below retains the old hashes
         // and proves that no other manifest field or output certificate drifted.
+        // GOLDEN-CHANGE macOS ARM64 qualification: only the three ONNX
+        // numeric profiles and output certificates differ on that platform.
+        // Retain exact Linux fixtures and reconstruct them below before the
+        // previous-version check; all artifact and input fields stay frozen.
         let observed = [
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
@@ -4157,7 +4188,12 @@ mod tests {
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "7c2debb9bf81b9d6f37a4cab092af12a74fdc563d9ffab9cfa20af7ecb8302ca".to_owned(),
+                if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    "2abdd494c4f0b55df508de43a3b780b1cc8c86c849dfbae6173f74ef051bd59d"
+                } else {
+                    "7c2debb9bf81b9d6f37a4cab092af12a74fdc563d9ffab9cfa20af7ecb8302ca"
+                }
+                .to_owned(),
             ),
             (
                 "frankentorch-native-minilm".to_owned(),
@@ -4173,33 +4209,54 @@ mod tests {
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "07436d59a036ba2917bd6fa3a6e859101fcd9d91a706f39dd723df0daa15b008".to_owned(),
+                if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    "d0902c28ca154e1d6021768bfa28d3677d56c587cdad67f066e9fc5a490288e5"
+                } else {
+                    "07436d59a036ba2917bd6fa3a6e859101fcd9d91a706f39dd723df0daa15b008"
+                }
+                .to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
-                "f20cac45eb8310e793362e25fa3bcbe943dc2af78536840d93da58a1d31fa40a".to_owned(),
+                if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    "37749da1ec0fe6b80770fa0524270de0a97f82c7a9dfe9392f09fbfe5cb5637b"
+                } else {
+                    "f20cac45eb8310e793362e25fa3bcbe943dc2af78536840d93da58a1d31fa40a"
+                }
+                .to_owned(),
             ),
         ];
         assert_eq!(observed, expected);
 
-        for (mut manifest, previous_fingerprint) in [
+        for (mut manifest, previous_fingerprint, linux_certificate) in [
             (
                 ModelArtifactManifestV1::potion_128m_native().unwrap(),
                 "860061ab2a8de3ad3a36a235ebf856eec6bb3d952840be655b0670595882d3cb",
+                None,
             ),
             (
                 ModelArtifactManifestV1::minilm_fastembed().unwrap(),
                 "6d5cf6dd6bb8dc9de621b03c53248796dddb054b93ae829b98aa7dbf2552cf76",
+                Some("67cec04aef931fb5b5db8be074e92370c4f62e6f89ec45bec5ecd52a2444d6c3"),
             ),
             (
                 ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
                 "ae11db9eda424707fb89a0c70daae5e5a559521d8d1edb45ead90a6344eca247",
+                Some("8ab295190de5eb629ef7920e3aec6d989c1b7f695b4f75baebfb716fb81b7f6c"),
             ),
             (
                 ModelArtifactManifestV1::nomic_fastembed().unwrap(),
                 "79882126878654776eec8c64961f6dada37ddf11ac73c4a07cd48d78598f9020",
+                Some("dbb7e33fdb5ccb4864faf9ff425b35a83a2d9dcd4f8d736033d7f819e0c1e851"),
             ),
         ] {
+            if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                && let Some(certificate) = linux_certificate
+            {
+                "ort-2.0.0-rc.13-cpu-f32-host-default-intra-threads-v1"
+                    .clone_into(&mut manifest.execution.numeric_profile);
+                certificate.clone_into(&mut manifest.execution.golden_vectors.vectors_sha256);
+            }
             let adapter = manifest
                 .execution
                 .implementation_revision

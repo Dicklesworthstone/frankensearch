@@ -1,5 +1,52 @@
 # Dependency Upgrade Log
 
+## 2026-09-07 — macOS ARM64 ONNX producer qualification
+
+The fsfs 1.9.0 candidate built on Apple Silicon but its real index/search/doctor
+probe rejected MiniLM's executing output certificate. Model artifact checksums
+passed. Both `thinkstation1` and `mmini` report ORT 1.28.0, revision `da9b5e3`,
+but the platform builds produce different f32 bits. Independent fresh Mac
+processes reproduced the same four-text batch certificates for all three models.
+
+**GOLDEN-CHANGE bd-2ba5:** qualify those Mac ARM64 outputs as separate producers.
+Their numeric profile is
+`ort-1.28.0-da9b5e3-macos-aarch64-cpu-f32-host-default-intra-threads-v1`.
+The existing Linux profile and certificates remain unchanged. Model files,
+tokenization, pooling, normalization, corpus bytes, and the owning loader's
+bit-exact admission check are unchanged. A platform certificate cannot authorize
+the other platform's output or silently reuse its vector generation.
+
+| Model | Mac ARM64 four-text normalized batch SHA256 |
+|---|---|
+| MiniLM | `5693dd454b03d7c4ae3a96ea429eddbbaf60519e11ded361a26a1f221f996843` |
+| Snowflake Arctic S | `f9f9b1071d82dd22614086a7a0e05bcdc785ca3b04158c4f914e678c75fd6c8d` |
+| Nomic v1.5 | `7041b782516edfb91097d668443130d098bca7a035c8a85024150b5a09aebc67` |
+
+Semantic review used 339 Treasure Island passages plus 16 queries on both hosts.
+Corpus metadata SHA256:
+`ba9534014a619e27b349385122418194c3835e4fe0d0be76bfb6eb8ba2d72e54`.
+The minimum paired cosines are 0.9999999999992835 (MiniLM),
+0.9999999999996847 (Snowflake), and 0.9999999999980949 (Nomic); maximum absolute
+component differences are respectively 2.5332e-7, 1.3411e-7, and 2.6823e-7.
+The production `InMemoryVectorIndex` f16 path returns identical ordered top-10
+lists for all 16 queries under each model. Mean nDCG@10 on both platforms is
+0.267848928855, 0.221664612396, and 0.453100816876 respectively. This certifies
+bounded correctness parity, not performance, all-corpus equivalence, or identical
+bits across batching shapes.
+
+The gate's admission rule is unchanged: the newly registered Mac producer must
+match its exact output; historical and foreign-platform certificates must fail
+the actual owning constructor. No previously rejected Linux output is admitted
+by this change, and no native producer or auto-detection preference changes.
+The three real-model owning-loader tests pass on both hosts, including the
+historical MiniLM/Snowflake and opposite-platform rejection cases. Linux's
+exact manifest fixture, formatting, and strict fastembed Clippy checks pass.
+Probe source, Cargo lock, vectors, checksums, and comparison receipts are under
+`/data/tmp/frankensearch-release-1.9.0-20260907/onnx-platform-probe/` on
+`thinkstation1`; production-index replay source is in the sibling
+`platform-ranking/` directory. Mac originals are under
+`~/release-work/frankensearch-1.9.0-20260907/onnx-platform-probe/` on `mmini`.
+
 ## 2026-09-06 — FrankenSQLite 0.3.17
 
 **Scope:** owner-directed FrankenSQLite update from 0.3.8 to the latest

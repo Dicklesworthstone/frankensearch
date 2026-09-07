@@ -975,6 +975,16 @@ mod tests {
             &ModelArtifactManifestV1::minilm_fastembed().unwrap(),
             "11620592994a30c5df2ec108983c8a5ce304760f78666c42f56db285a7f3d948",
         );
+        assert_historical_certificate_refused(
+            "FASTEMBED_MINILM_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("minilm").unwrap(),
+            &ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                "67cec04aef931fb5b5db8be074e92370c4f62e6f89ec45bec5ecd52a2444d6c3"
+            } else {
+                "5693dd454b03d7c4ae3a96ea429eddbbaf60519e11ded361a26a1f221f996843"
+            },
+        );
     }
 
     #[test]
@@ -991,6 +1001,16 @@ mod tests {
             &ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
             "fb999e00707c8f3709844de704529c29c1f87b540311c05ee211aa93d0dad3a6",
         );
+        assert_historical_certificate_refused(
+            "FASTEMBED_SNOWFLAKE_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("snowflake-arctic-s").unwrap(),
+            &ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                "8ab295190de5eb629ef7920e3aec6d989c1b7f695b4f75baebfb716fb81b7f6c"
+            } else {
+                "f9f9b1071d82dd22614086a7a0e05bcdc785ca3b04158c4f914e678c75fd6c8d"
+            },
+        );
     }
 
     #[test]
@@ -1000,6 +1020,16 @@ mod tests {
             "FASTEMBED_NOMIC_FIXTURE_DIR",
             OnnxEmbedderConfig::for_name("nomic-embed").unwrap(),
             &ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+        );
+        assert_historical_certificate_refused(
+            "FASTEMBED_NOMIC_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("nomic-embed").unwrap(),
+            &ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                "dbb7e33fdb5ccb4864faf9ff425b35a83a2d9dcd4f8d736033d7f819e0c1e851"
+            } else {
+                "7041b782516edfb91097d668443130d098bca7a035c8a85024150b5a09aebc67"
+            },
         );
     }
 }
