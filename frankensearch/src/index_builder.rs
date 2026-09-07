@@ -192,30 +192,53 @@ pub async fn detect_embedder_stack_with_pool(
     pool: BlockingPoolHandle,
 ) -> SearchResult<EmbedderStack> {
     build_checkpoint(cx, "embedder detection start")?;
+    if pool.is_shutdown() {
+        return Err(SearchError::EmbeddingFailed {
+            model: "stack-detection".to_owned(),
+            source: "cannot admit model loading worker: caller-owned blocking pool is shut down"
+                .into(),
+        });
+    }
     let model_root = model_root.map(Path::to_path_buf);
     let options = *options;
+    let request_cx = cx.clone();
     let worker_cx = cx.clone().with_blocking_pool_handle(Some(pool.clone()));
     let mut worker = worker_cx
         .spawn_blocking(move |child: Cx| -> SearchResult<EmbedderStack> {
-            build_checkpoint(&child, "fast model detection")?;
+            let checkpoint = |phase| {
+                build_checkpoint(&request_cx, phase)?;
+                build_checkpoint(&child, phase)
+            };
+            checkpoint("fast model detection")?;
+            // Pool shutdown can race the check above. The runtime recovers a
+            // rejected submission by executing it on its async wrapper task.
+            // Refuse that fallback before any model discovery or file access.
+            if Cx::is_active() {
+                return Err(SearchError::EmbeddingFailed {
+                    model: "stack-detection".to_owned(),
+                    source: "blocking pool dispatch fell back to an async executor".into(),
+                });
+            }
             // Resolve caller policy before considering the local native model.
             // Detecting only fast avoids loading an ONNX session we would discard.
             let fast = EmbedderStack::auto_detect_fast_semantic_with_options(
                 model_root.as_deref(),
                 &options,
-            )?;
-            build_checkpoint(&child, "native model detection")?;
+            );
+            checkpoint("native model detection")?;
+            let fast = fast?;
             let path = model_root
                 .clone()
                 .unwrap_or_else(frankensearch_embed::model_cache::resolve_cache_root)
                 .join("all-MiniLM-L6-v2-native");
             if path.join("model.safetensors").is_file() {
-                match frankensearch_rerank::NativeEmbedder::load_model(
+                let native = frankensearch_rerank::NativeEmbedder::load_model(
                     &path,
                     frankensearch_rerank::NativeEmbeddingModel::AllMiniLmL6V2F32,
-                ) {
+                );
+                checkpoint("native model loaded")?;
+                match native {
                     Ok(native) => {
-                        build_checkpoint(&child, "native model loaded")?;
                         let quality: Arc<dyn Embedder> =
                             Arc::new(native.with_blocking_pool(pool));
                         tracing::info!(
@@ -229,12 +252,13 @@ pub async fn detect_embedder_stack_with_pool(
                     }
                 }
             }
-            build_checkpoint(&child, "fallback quality detection")?;
+            checkpoint("fallback quality detection")?;
             let quality = EmbedderStack::auto_detect_quality_with_options(
                 model_root.as_deref(),
                 &options,
-            )?;
-            build_checkpoint(&child, "fallback quality loaded")?;
+            );
+            checkpoint("fallback quality loaded")?;
+            let quality = quality?;
             tracing::info!(
                 quality_embedder = quality.as_ref().map(|embedder| embedder.id()),
                 "native quality unavailable; selected existing quality backend"
@@ -245,7 +269,11 @@ pub async fn detect_embedder_stack_with_pool(
             model: "stack-detection".to_owned(),
             source: format!("cannot admit model loading worker: {error}").into(),
         })?;
-    let stack = worker.join(cx).await.map_err(|error| match error {
+    let result = worker.join(cx).await;
+    // Joining does not inspect its Cx. Cancellation must take precedence over
+    // both a successful stack and a backend/worker error already produced.
+    build_checkpoint(cx, "embedder detection complete")?;
+    result.map_err(|error| match error {
         asupersync::runtime::JoinError::Cancelled(_) => SearchError::Cancelled {
             phase: "embedder detection".to_owned(),
             reason: "model loading worker cancelled".to_owned(),
@@ -254,9 +282,7 @@ pub async fn detect_embedder_stack_with_pool(
             model: "stack-detection".to_owned(),
             source: format!("model loading worker failed: {error}").into(),
         },
-    })??;
-    build_checkpoint(cx, "embedder detection complete")?;
-    Ok(stack)
+    })?
 }
 
 /// Fluent builder for creating frankensearch indexes.
@@ -1620,10 +1646,10 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(0, 1)
             .build()
             .unwrap();
-        let pool = runtime.blocking_handle().unwrap();
+        let external_pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+        let pool = external_pool.handle();
         let model_root = tempfile::tempdir().unwrap();
         let options = DetectOptions {
             offline: Some(true),
@@ -1674,13 +1700,9 @@ mod tests {
             release_tx.send(()).unwrap();
             // Do not poll detection: let its actual worker finish while the
             // original request is still live, then cancel before consuming it.
-            while pool.pending_count() != 0 || pool.busy_threads() != 0 {
-                assert!(
-                    started.elapsed() < Duration::from_secs(2),
-                    "loader did not drain"
-                );
-                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-            }
+            // Joining the external pool proves completion; separate relaxed
+            // pending/busy counters can transiently both read zero at dequeue.
+            assert!(external_pool.shutdown_and_wait(Duration::from_secs(2)));
             cx.cancel_fast(asupersync::CancelKind::User);
             let result = detection.await;
             eprintln!("cancelled request with completed loader error: {result:?}");
