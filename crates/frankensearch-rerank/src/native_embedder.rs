@@ -27,7 +27,7 @@ use tokenizers::Tokenizer;
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
 use frankensearch_core::traits::{ModelCategory, SearchFuture, SyncEmbed};
-use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
+use frankensearch_embed::model_manifest::{ModelArtifactManifestV1, ModelManifest};
 
 use crate::native::{
     DEFAULT_MAX_LENGTH, LinearPrecision, Model, SAFETENSORS_FALLBACK, TOKENIZER_JSON, build_model,
@@ -172,7 +172,15 @@ impl NativeEmbedder {
         manifest: &ModelArtifactManifestV1,
     ) -> SearchResult<Self> {
         let model_name = profile.model_name();
-        let verified = manifest.verify_dir(dir)?;
+        let download_manifest = match profile {
+            NativeEmbeddingModel::AllMiniLmL6V2 | NativeEmbeddingModel::AllMiniLmL6V2F32 => {
+                ModelManifest::minilm_v2_native()
+            }
+            NativeEmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
+                ModelManifest::multilingual_minilm_l12_v2()
+            }
+        };
+        let verified = manifest.verify_dir_cached(&download_manifest, dir)?;
         let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
         if identity.space.dimension != IDENTITY_DIMENSION {
             return Err(SearchError::ModelLoadFailed {

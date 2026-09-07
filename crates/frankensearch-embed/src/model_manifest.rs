@@ -905,6 +905,9 @@ impl ModelArtifactManifestV1 {
     /// keeps a 512 MB model from being re-hashed on every process start. Any
     /// mismatch, missing receipt, or stale receipt falls back to
     /// [`Self::verify_dir`]; nothing is minted here.
+    /// The registered native `MiniLM` installation alias is also accepted,
+    /// but only for its exact built-in download and producer manifests.
+    /// Its distinct catalog id never changes the frozen producer identity.
     ///
     /// # Errors
     ///
@@ -914,7 +917,8 @@ impl ModelArtifactManifestV1 {
         download_manifest: &ModelManifest,
         model_dir: &Path,
     ) -> SearchResult<VerifiedModelArtifactsV1> {
-        if self.artifacts_match_download_manifest(download_manifest)
+        if (self.artifacts_match_download_manifest(download_manifest)
+            || self.matches_registered_native_installation(download_manifest))
             && is_verification_cached(download_manifest, model_dir)
         {
             let frozen = self.freeze()?;
@@ -922,6 +926,17 @@ impl ModelArtifactManifestV1 {
             return Ok(VerifiedModelArtifactsV1 { frozen });
         }
         self.verify_dir(model_dir)
+    }
+
+    /// Bind the separate native installation catalog entry to the two already
+    /// registered MiniLM producers. Arbitrary logical-id aliases, modified
+    /// artifacts, and modified execution contracts cannot borrow this receipt.
+    fn matches_registered_native_installation(&self, download_manifest: &ModelManifest) -> bool {
+        if download_manifest != &ModelManifest::minilm_v2_native() {
+            return false;
+        }
+        Self::minilm_native_frankentorch().is_ok_and(|registered| self == &registered)
+            || Self::minilm_native_frankentorch_f32().is_ok_and(|registered| self == &registered)
     }
 
     /// True when every artifact here is byte-for-byte the same file entry
@@ -5360,6 +5375,129 @@ mod tests {
             assert_eq!(file.sha256, artifact.sha256);
             assert_eq!(file.size, artifact.size);
         }
+    }
+
+    #[test]
+    fn native_installation_receipt_requires_the_exact_registered_pair() {
+        let download = ModelManifest::minilm_v2_native();
+        for native in [
+            ModelArtifactManifestV1::minilm_native_frankentorch().unwrap(),
+            ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap(),
+        ] {
+            assert!(native.matches_registered_native_installation(&download));
+            assert!(
+                !native.artifacts_match_download_manifest(&download),
+                "the generic logical-id boundary must remain strict"
+            );
+            let mut foreign_download = download.clone();
+            foreign_download.id.push_str("-foreign");
+            assert!(!native.matches_registered_native_installation(&foreign_download));
+            foreign_download = download.clone();
+            foreign_download.revision = "a".repeat(40);
+            assert!(!native.matches_registered_native_installation(&foreign_download));
+            foreign_download = download.clone();
+            foreign_download.files[0].sha256 = "0".repeat(64);
+            assert!(!native.matches_registered_native_installation(&foreign_download));
+            foreign_download = download.clone();
+            foreign_download.files[0].url = Some("https://example.invalid/model".to_owned());
+            assert!(!native.matches_registered_native_installation(&foreign_download));
+
+            let mut foreign_producer = native.clone();
+            foreign_producer.logical_model_id.push_str("-foreign");
+            assert!(!foreign_producer.matches_registered_native_installation(&download));
+            foreign_producer = native.clone();
+            foreign_producer.execution.golden_vectors.vectors_sha256 = "0".repeat(64);
+            assert!(!foreign_producer.matches_registered_native_installation(&download));
+            foreign_producer = native.clone();
+            foreign_producer.artifacts[0].sha256 = "0".repeat(64);
+            assert!(!foreign_producer.matches_registered_native_installation(&download));
+            assert!(!native.matches_registered_native_installation(&ModelManifest::minilm_v2()));
+        }
+        assert!(
+            !ModelArtifactManifestV1::multilingual_minilm_native_frankentorch()
+                .unwrap()
+                .matches_registered_native_installation(&download)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires real native MiniLM files via MINILM_FIXTURE_DIR"]
+    fn native_installation_receipt_verifies_real_files_and_preserves_identity() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let source = PathBuf::from(std::env::var_os("MINILM_FIXTURE_DIR").unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("installed");
+        fs::create_dir(&dir).unwrap();
+        let download = ModelManifest::minilm_v2_native();
+        let native = ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap();
+        for file in &download.files {
+            let destination = dir.join(&file.name);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(source.join(&file.name), destination).unwrap();
+        }
+        let verify = || {
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| count.set(0));
+            let verified = native.verify_dir_cached(&download, &dir).unwrap();
+            assert_eq!(
+                verified
+                    .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                    .unwrap()
+                    .fingerprint(),
+                "35d0a014b4ec6224eb42552ea1099b24bead0c9c51906b6035207b6105e8af01"
+            );
+            TEST_VERIFY_FILE_HASH_CALLS.with(std::cell::Cell::get)
+        };
+
+        assert_eq!(
+            verify(),
+            download.files.len(),
+            "absent receipt hashes all files"
+        );
+        assert!(!dir.join(VERIFIED_MARKER_FILE).exists());
+        verify_dir_and_record(&download, &dir).unwrap();
+        assert_eq!(verify(), 0, "a current registered receipt avoids rehashing");
+        fs::write(dir.join(VERIFIED_MARKER_FILE), b"malformed receipt").unwrap();
+        assert_eq!(verify(), download.files.len(), "malformed receipt rehashes");
+        verify_dir_and_record(&download, &dir).unwrap();
+
+        let mut foreign = native.clone();
+        foreign.artifacts[0].sha256 = "0".repeat(64);
+        assert!(foreign.verify_dir_cached(&download, &dir).is_err());
+
+        let weights_path = dir.join("model.safetensors");
+        let mut weights = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&weights_path)
+            .unwrap();
+        #[cfg(unix)]
+        let original_modified = weights.metadata().unwrap().modified().unwrap();
+        weights.seek(SeekFrom::End(-1)).unwrap();
+        let mut byte = [0];
+        weights.read_exact(&mut byte).unwrap();
+        weights.seek(SeekFrom::End(-1)).unwrap();
+        weights.write_all(&[byte[0] ^ 1]).unwrap();
+        weights.sync_all().unwrap();
+        // Restoring mtime cannot hide a same-size Unix mutation from the bound ctime.
+        #[cfg(unix)]
+        weights.set_modified(original_modified).unwrap();
+        drop(weights);
+        assert!(!is_verification_cached(&download, &dir));
+        assert!(native.verify_dir_cached(&download, &dir).is_err());
+
+        // Preserve the changed inode outside the model directory, then replace
+        // it with correct bytes. The old receipt must still miss on replacement.
+        fs::rename(&weights_path, tmp.path().join("changed-weights")).unwrap();
+        fs::copy(source.join("model.safetensors"), &weights_path).unwrap();
+        assert!(!is_verification_cached(&download, &dir));
+        assert_eq!(
+            verify(),
+            download.files.len(),
+            "replacement requires rehashing"
+        );
+        verify_dir_and_record(&download, &dir).unwrap();
+        assert_eq!(verify(), 0);
     }
 
     #[test]
