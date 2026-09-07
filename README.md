@@ -113,6 +113,9 @@ The CLI supplies and drains its existing blocking pool. Library users of
 Use an optimized (`--release`) executable for native inference. An unoptimized
 build can exceed the default 500 ms quality deadline during cold model loading
 and return Initial results with a refinement-timeout explanation.
+In a daemon or TUI, successful initialization is retained even if that first
+query times out, so later queries can reuse the loaded model. Each query still
+has its own deadline and must match the index's producer identity.
 
 Native and ONNX models have separate installation directories and producer
 identities. Changing this setting requires re-embedding the corpus. A missing

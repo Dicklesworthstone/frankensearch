@@ -4421,6 +4421,20 @@ impl std::fmt::Debug for RerankerSlot {
     }
 }
 
+/// Successful initialization survives the query that admitted it. Query results
+/// and generation admission remain local to each search resource set.
+#[derive(Default)]
+struct QualityEmbedderSlot(Option<Arc<dyn Embedder>>);
+
+impl std::fmt::Debug for QualityEmbedderSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QualityEmbedderSlot")
+            .field("loaded", &self.0.is_some())
+            .finish()
+    }
+}
+
 /// Fused ranking after the rerank stage, with the evidence the payload carries.
 struct RerankStageOutcome {
     fused: Vec<FusedCandidate>,
@@ -4467,9 +4481,10 @@ pub struct FsfsRuntime {
     config: FsfsConfig,
     cli_input: CliInput,
     reranker: Arc<std::sync::OnceLock<RerankerSlot>>,
-    /// Retained across daemon/TUI clones. A timed-out model initialization
-    /// keeps its permit until the actual blocking call ends.
-    quality_load_gate: Arc<asupersync::sync::Mutex<()>>,
+    /// Shared by daemon/TUI clones with the same immutable model configuration.
+    /// A timed-out initialization retains its permit and successful model, so
+    /// the next query can refine without repeating the cold load.
+    quality_load_gate: Arc<asupersync::sync::Mutex<QualityEmbedderSlot>>,
     #[cfg(feature = "rerank")]
     native_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
 }
@@ -4481,7 +4496,9 @@ impl FsfsRuntime {
             config,
             cli_input: CliInput::default(),
             reranker: Arc::new(std::sync::OnceLock::new()),
-            quality_load_gate: Arc::new(asupersync::sync::Mutex::new(())),
+            quality_load_gate: Arc::new(asupersync::sync::Mutex::new(
+                QualityEmbedderSlot::default(),
+            )),
             #[cfg(feature = "rerank")]
             native_blocking_pool: None,
         }
@@ -4496,6 +4513,10 @@ impl FsfsRuntime {
         pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
     ) -> Self {
         self.native_blocking_pool = Some(pool);
+        // A retained native model belongs to the pool supplied when it loaded.
+        // Runtime clones using the previous pool keep their own shared slot.
+        self.quality_load_gate =
+            Arc::new(asupersync::sync::Mutex::new(QualityEmbedderSlot::default()));
         self
     }
 
@@ -15907,25 +15928,30 @@ impl FsfsRuntime {
                     phase: "quality_initialization".to_owned(),
                     reason: error.to_string(),
                 })?;
-        let runtime = self.clone();
-        // Test providers are thread-local fixtures. Capture their selection on
-        // the owning test thread, while still executing the initialization job
-        // through the same permit and worker boundary as production.
-        #[cfg(test)]
-        let selected_test_provider = runtime.resolve_quality_embedder();
-        let resolved = Self::quality_blocking(cx, move || {
-            // The permit belongs to the actual job, including after timeout.
-            let _permit = permit;
-            #[cfg(not(test))]
-            {
-                runtime.resolve_quality_embedder()
-            }
+        let resolved = if let Some(embedder) = permit.0.as_ref().map(Arc::clone) {
+            drop(permit);
+            Ok(Some(embedder))
+        } else {
+            let runtime = self.clone();
+            // Test providers are thread-local fixtures. Capture their selection
+            // on the owning test thread; production loads on the actual worker.
             #[cfg(test)]
-            {
-                selected_test_provider
-            }
-        })
-        .await?;
+            let selected_test_provider = runtime.resolve_quality_embedder();
+            Self::quality_blocking(cx, move || {
+                // The actual job owns both the permit and successful model,
+                // including when its original query has already timed out.
+                let mut slot = permit;
+                #[cfg(not(test))]
+                let resolved = runtime.resolve_quality_embedder();
+                #[cfg(test)]
+                let resolved = selected_test_provider;
+                if let Ok(Some(embedder)) = &resolved {
+                    slot.0 = Some(Arc::clone(embedder));
+                }
+                resolved
+            })
+            .await?
+        };
         resources.quality_embedder_attempted = true;
         match resolved {
             Ok(Some(embedder)) => {
@@ -23541,6 +23567,99 @@ mod tests {
         fn category(&self) -> ModelCategory {
             ModelCategory::TransformerEmbedder
         }
+    }
+
+    #[test]
+    fn quality_preparation_reuses_model_but_rechecks_each_generation() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let embedder: Arc<dyn Embedder> = Arc::new(SemanticQualityStub);
+            let revision = embedder.identity().unwrap().fingerprint();
+            let write_generation = |name: &str, revision: &str| {
+                let path = temp.path().join(name);
+                VectorIndex::create_with_revision(
+                    &path,
+                    embedder.id(),
+                    revision,
+                    embedder.dimension(),
+                    frankensearch_index::Quantization::F16,
+                )
+                .unwrap()
+                .finish()
+                .unwrap();
+                Arc::new(VectorIndex::open_read_only(&path).unwrap())
+            };
+            let current = write_generation("current.fsvi", &revision);
+            let foreign = write_generation(
+                "foreign.fsvi",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            );
+            resources.quality_vector_index = Some(Arc::clone(&current));
+            resources.quality_embedder = None;
+            resources.quality_embedder_attempted = false;
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            super::set_test_quality_embedder(None);
+            runtime
+                .maybe_prepare_quality_embedder(&cx, &mut resources)
+                .await
+                .unwrap();
+            assert!(resources.quality_embedder.is_none());
+
+            // An unavailable provider is not retained: a later resource set
+            // can initialize it once provisioning succeeds.
+            resources.quality_embedder_attempted = false;
+            super::set_test_quality_embedder(Some(Arc::clone(&embedder)));
+            runtime
+                .maybe_prepare_quality_embedder(&cx, &mut resources)
+                .await
+                .unwrap();
+            super::set_test_quality_embedder(None);
+            assert!(Arc::ptr_eq(
+                resources.quality_embedder.as_ref().unwrap(),
+                &embedder
+            ));
+
+            // Reopening a generation cannot bypass its producer certificate
+            // merely because the runtime already owns a quality model.
+            resources.quality_embedder = None;
+            resources.quality_embedder_attempted = false;
+            resources.quality_vector_index = Some(foreign);
+            assert!(matches!(
+                runtime
+                    .clone()
+                    .maybe_prepare_quality_embedder(&cx, &mut resources)
+                    .await,
+                Err(SearchError::UnverifiableRemoteSpace { .. })
+            ));
+            assert!(resources.quality_embedder.is_none());
+            resources.quality_embedder_attempted = false;
+            resources.quality_vector_index = Some(current);
+            runtime
+                .maybe_prepare_quality_embedder(&cx, &mut resources)
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                resources.quality_embedder.as_ref().unwrap(),
+                &embedder
+            ));
+
+            #[cfg(feature = "rerank")]
+            {
+                let pool = super::SearchBlockingPool::default();
+                let rebound = runtime.clone().with_native_blocking_pool(pool.handle());
+                resources.quality_embedder = None;
+                resources.quality_embedder_attempted = false;
+                rebound
+                    .maybe_prepare_quality_embedder(&cx, &mut resources)
+                    .await
+                    .unwrap();
+                assert!(
+                    resources.quality_embedder.is_none(),
+                    "a new pool must not inherit a model bound to the old pool"
+                );
+            }
+        });
     }
 
     #[test]

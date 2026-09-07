@@ -1337,6 +1337,90 @@ mod loader_only {
                 !daemon_path.exists(),
                 "owned daemon must release its index before append"
             );
+
+            // A cold query may time out while its admitted constructor still
+            // runs. Its successful model must remain usable by the next query.
+            let cold_path = temp.path().join("native-cold.sock");
+            let cold_log_path = fsfs.log_root.join("native-cold-daemon.stderr.log");
+            let mut child = fsfs
+                .command(temp.path())
+                .args([
+                    "serve",
+                    "--daemon",
+                    "--daemon-socket",
+                    cold_path.to_str().unwrap(),
+                    "--config",
+                    config_arg,
+                    "--index-dir",
+                    index_arg,
+                ])
+                .env("RUST_LOG", "info")
+                .stdout(File::create(fsfs.log_root.join("native-cold-daemon.stdout.log")).unwrap())
+                .stderr(File::create(&cold_log_path).unwrap())
+                .spawn()
+                .unwrap();
+            let cold_daemon = NativeDaemon(cold_path.clone());
+            let deadline = Instant::now() + FAILURE_TIMEOUT;
+            while !cold_path.exists() && Instant::now() < deadline {
+                assert!(child.try_wait().unwrap().is_none(), "cold daemon exited");
+                thread::sleep(Duration::from_millis(10));
+            }
+            let request = |budget_ms: u64| {
+                let mut socket = UnixStream::connect(&cold_path).unwrap();
+                socket.set_read_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();
+                writeln!(
+                    socket,
+                    "{}",
+                    serde_json::json!({
+                        "query": query, "limit": 10, "quality_timeout_ms": budget_ms
+                    })
+                )
+                .unwrap();
+                socket.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut raw = String::new();
+                socket.read_to_string(&mut raw).unwrap();
+                serde_json::from_str::<Value>(&raw).unwrap()
+            };
+            let cold = request(50);
+            assert_eq!(cold["cached"], false, "{cold}");
+            assert_eq!(cold["payloads"][0]["phase"], "initial", "{cold}");
+            assert_eq!(cold["payloads"][1]["phase"], "refinement_failed", "{cold}");
+            assert_eq!(cold["payloads"][1]["quality_timeout"]["budget_ms"], 50);
+            assert_eq!(cold["payloads"][1]["hits"], cold["payloads"][0]["hits"]);
+
+            // Observe the real loader finishing, not a guessed sleep interval.
+            let loaded_message = "fsfs selected verified native F32 quality model";
+            let deadline = Instant::now() + FAILURE_TIMEOUT;
+            loop {
+                let log = fs::read_to_string(&cold_log_path).unwrap();
+                if log.contains(loaded_message) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native load did not finish: {log}"
+                );
+                assert!(child.try_wait().unwrap().is_none(), "cold daemon exited");
+                thread::sleep(Duration::from_millis(10));
+            }
+            let warm = request(500);
+            assert_eq!(
+                warm["cached"], false,
+                "the warm query must execute under its 500ms policy: {warm}"
+            );
+            assert_eq!(
+                warm["payloads"].as_array().unwrap().last().unwrap()["phase"],
+                "refined",
+                "completed initialization must serve the next query: {warm}"
+            );
+            let log = fs::read_to_string(&cold_log_path).unwrap();
+            assert_eq!(
+                log.matches(loaded_message).count(),
+                1,
+                "a timeout must not force another model initialization: {log}"
+            );
+            drop(cold_daemon);
+            assert!(child.wait().unwrap().success());
         }
 
         let append_path = temp.path().join("append.jsonl");
