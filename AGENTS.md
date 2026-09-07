@@ -389,8 +389,8 @@ be git-sourced and are now registry renames — keep the rename form, never the 
 | `ann` | `hnsw_rs = { package = "frankenhnsw", version = "=0.3.5" }` | The published fork carries the layer-invariant/search-correctness fixes; registry `hnsw_rs` 0.3.4 is upstream and would silently drop them. |
 
 `rerank` and `native` are exact aliases — there is no ONNX-only rerank lane, and
-`fastembed-reranker` also enables `native`. Published line as of 2026-08-28: facade
-`frankensearch 0.4.2`, members `0.2.x` (see CHANGELOG). Never republish a version that
+`fastembed-reranker` also enables `native`. Published line as of 2026-09-07: facade
+`frankensearch 0.4.3`, members `0.2.x`, fsfs `1.9.1` (see CHANGELOG). Never republish a version that
 exists on the registry; bumps go forward only.
 
 Do **not** "fix" a registry rename by adding a bare `version` to a git-style dependency:

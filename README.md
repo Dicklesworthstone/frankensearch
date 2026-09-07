@@ -45,6 +45,20 @@ no supported x86_64 Darwin distribution, so ordinary semantic installation
 fails with `unsupported_platform` and points to `--lite` instead of attempting
 a source build that cannot succeed.
 
+The Linux x86-64 full archive requires glibc 2.43. The standard installer
+provisions and verifies the six registered production models separately; their
+download is roughly 1.64 GB. The two search tiers alone require roughly 621 MB.
+
+When upgrading a Linux full installation from 1.9.0 or earlier, use the installer
+above: those executables' `fsfs update` selects the MUSL lite archive and loses
+semantic support. Older Apple Silicon lite installations should use
+`install.sh --lite` to retain their profile. The 1.9.1 updater preserves both
+the compiled ABI and the full/lite profile for subsequent updates.
+
+Semantic indexes written by 1.7/1.8 require an explicit rebuild with the original
+configuration: `fsfs index /original/source --index-dir /existing/index`.
+Indexes written by 1.9.0 can be opened directly by 1.9.1.
+
 Installer goals:
 - zero-friction first run
 - auto-configured model cache path
@@ -144,8 +158,9 @@ identities as the default source build.
 
 ## Quick Start
 
-The first semantic setup downloads and verifies roughly 621 MB of pinned model
-artifacts, so its duration depends on network speed. Later starts reuse the
+The two semantic search tiers use roughly 621 MB of pinned model artifacts;
+the standard installer also provisions the other registered production models.
+First setup time depends on network speed. Later starts reuse the
 verification receipt while the exact manifest and file states remain unchanged.
 
 ```bash
@@ -689,25 +704,36 @@ Use this as a pragmatic hardening pass before rollout:
 8. For large corpora, evaluate ANN thresholding and memory budget explicitly.
 9. Keep reproducible artifacts for before/after tuning comparisons.
 
-## Crates.io Publishing (CI)
+## Crates.io Publishing
 
-The `publish-crates` lane in `.github/workflows/ci.yml` is intentionally gated and opt-in.
+Publication runs on a real host with configured Cargo registry credentials.
+GitHub Actions does not publish this repository. The two release lines are
+versioned independently: `v*` tags identify fsfs binary releases and `crates-v*`
+tags identify library bundles. The current bundle contains `fsfs 1.9.1` and
+`frankensearch 0.4.3`.
 
-Required setup:
-- Repository variable: `ENABLE_CRATES_PUBLISH=true`
-- Repository secret: `CARGO_REGISTRY_TOKEN` (crates.io publish token)
+Run `scripts/check_crates_publish_contract.sh --mode gate --scope workspace`
+against the clean intended revision and the live registry. Build-verify every
+package archive and complete the workspace publish dry run before uploading:
 
-Behavior:
-- Runs only on `crates-v*` tags (the `v*` tags cut `fsfs` binary releases; the two lines are versioned independently: `fsfs 1.8.0` ships `frankensearch 0.4.2`).
-- Derives the publish sequence from `scripts/check_crates_publish_contract.sh --mode gate --scope workspace`: every workspace member without `publish = false` (`frankensearch-quill-gauntlet` and `tools/optimize_params` are excluded), in dependency order, `frankensearch-quill` before `frankensearch-fusion` and the facade.
-- Runs per-crate `cargo publish --dry-run` checks before real publish.
-- Publishes crates sequentially to reduce crates.io index race failures and treats already-published crate versions as idempotent success.
+```bash
+cargo publish --locked --workspace --dry-run \
+  --exclude optimize-params --exclude frankensearch-quill-gauntlet
+cargo publish --locked --workspace \
+  --exclude optimize-params --exclude frankensearch-quill-gauntlet
+```
+
+Cargo publishes in dependency order and waits for registry availability. Verify
+the public archive checksums and source revisions, then run consumers without
+workspace paths or source replacement. An occupied version is not evidence
+that the intended source was published; verify it before reusing it. Crate-bundle
+GitHub releases must not replace the binary release as GitHub's latest release,
+because the installer and updater use that endpoint.
 
 ## Quality Gate (dsr, not GitHub Actions)
 
 GitHub Actions is not used for this repository: every workflow under
-`.github/workflows/` is disabled (owner decision 2026-09-01), and the lanes
-above describe automation that no longer runs there. The gate that must pass
+`.github/workflows/` is disabled (owner decision 2026-09-01). The gate that must pass
 before any release lives in the repository and runs on a real host:
 
 ```bash
@@ -721,8 +747,9 @@ dsr quality --tool frankensearch            # the same gate plus the packaging/i
 Stages can be selected with `QUALITY_GATE_STAGES=fmt,check,clippy,tests` and
 the registered model cache with `QUALITY_GATE_MODEL_DIR`. The end-to-end stage
 fails closed when the two registered models are absent unless
-`QUALITY_GATE_ALLOW_MODEL_SKIP=1` is set. Releases (`fsfs` binaries and the
-`frankensearch` crates) are built and published through `dsr`;
+`QUALITY_GATE_ALLOW_MODEL_SKIP=1` is set. Release validation requires the real
+models and does not use that skip. Releases use `dsr` or the documented real-host
+build and publication commands with the same gates;
 `docs/fsfs-packaging-release-install-contract.md` and
 `docs/crates-publishing-contract.md` are the authoritative recipes.
 

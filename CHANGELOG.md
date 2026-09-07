@@ -4,13 +4,14 @@ All notable changes to [frankensearch](https://github.com/Dicklesworthstone/fran
 
 Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/frankensearch/releases) unless noted otherwise. Tags that share a commit with another release are called out explicitly. Each entry links to representative commits using full commit URLs.
 
-Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) (2026-08-14) through [v1.7.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.7.0) (2026-08-23), plus missing version rows for the 1.4.x / 1.5.0 spine that shipped after the old "proposed v1.4.0" draft. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.** v1.4.0, v1.4.3, v1.5.0, v1.6.0, and v1.7.0 are published Releases.
+Release history through [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) and the [0.4.3 crate bundle](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.4.3), published 2026-09-07. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.**
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.9.0...main) | 1.9.1 candidate | 2026-09-07 | Self-update preserves Linux ABI and full/lite semantic capability |
+| [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) | Release | 2026-09-07 | Self-update preserves Linux ABI and full/lite semantic capability |
+| [crates-v0.4.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.4.3) | Library bundle | 2026-09-07 | All 13 publishable workspace members released to crates.io; same source commit as v1.9.1 |
 | [v1.9.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.0) | Release | 2026-09-07 | Native quality selection, verified producer identities, bounded refinement, reranking, watcher recovery, FrankenSQLite 0.3.17, and Quill garbage collection |
 | [v1.8.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.8.0) | Release | 2026-09-02 | Two-tier fsfs delivered end to end (quality generation at index time, REFINED phase); daemon lifetime and stop verb; append/delete/watch reach every arm; RaptorQ sidecars for both vector generations; dsr quality gate; crates.io 0.4.x patches (gh#416, gh#39, gh#40) |
 | [v1.7.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.7.0) | Release | 2026-08-23 | Registry refresh (FrankenSQLite 0.3.8, Asupersync 0.4.9, fastembed 6), hash-control fuse follow-through, Quill CASS ingest |
@@ -23,7 +24,9 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 ---
 
-## [Unreleased] -- fsfs 1.9.1
+## [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) -- 2026-09-07
+
+Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.9.0...v1.9.1>
 
 Self-update now preserves the compiled Linux ABI and the full/lite capability
 profile. Previously a Linux GNU binary selected the MUSL lite archive, removing
@@ -33,8 +36,31 @@ profile; an unavailable semantic build cannot silently become lite.
 
 When upgrading an older Linux full binary, use the standard installer: the
 artifact choice is made by the old executable, which this patch cannot change.
+Older Apple Silicon lite installations should use `install.sh --lite` to retain
+their profile.
 The fix is covered against the six published 1.9.0 archives, including the
 same-platform full/lite distinction and refusal of a missing semantic profile.
+
+Six binary variants and two full installer aliases were published from
+[`9d132a03`](https://github.com/Dicklesworthstone/frankensearch/commit/9d132a0315e12da0442aa7a943852091fe043037).
+The unchanged quality gate passed all 10 stages. Linux and Apple Silicon full
+binaries passed fresh indexing, refined search, applied native reranking, and
+doctor. Direct 1.9.0 index opening and rollback preserved both vector files.
+The 1.7/1.8 rebuild requirement and large-corpus refinement timeouts documented
+under 1.9.0 remain; this patch does not change search performance or model identity.
+
+## [crates-v0.4.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.4.3) -- 2026-09-07
+
+The crate bundle shares the v1.9.1 source commit. All 13 publishable members,
+including facade `frankensearch 0.4.3` and `frankensearch-fsfs 1.9.1`, passed
+package build verification and dry runs before publication. Every downloaded
+public archive matches its registry checksum and the verified source revision.
+The external public-registry consumer passed nine feature configurations,
+including Quill, Tantivy interoperability, full, and the combined feature set.
+
+The binary lock retains FrankenSQLite 0.3.17. Upstream published compatible
+0.3.18 after the dependency freeze; the fresh public consumer resolves and
+passes with that patch and Asupersync 0.4.10. The ops crate remains experimental.
 
 ## [v1.9.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.0) -- 2026-09-07
 

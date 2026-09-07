@@ -1,5 +1,49 @@
 # Dependency Upgrade Log
 
+## 2026-09-07 — Published fsfs 1.9.1 and the 0.4.3 crate bundle
+
+Both annotated tags bind `9d132a0315e12da0442aa7a943852091fe043037`.
+The [binary release](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1)
+contains six variants, two installer aliases, source/profile metadata, checksums,
+and terminal verification evidence. The [crate bundle](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.4.3)
+contains all 13 published registry archives and their provenance checks.
+
+- The unchanged quality gate passed 10/10 stages, including real-model E2E 6/6.
+  All 13 Cargo archives passed build verification and publication dry runs.
+  Their public downloads match both registry checksums and the verified archives;
+  all VCS records identify the clean tagged source.
+- The actual public-registry consumer passed nine feature configurations without
+  source replacement: minimal, lexical, hybrid, persistent, durable, full,
+  lexical-tantivy, cass-compat, and all. Quill and Tantivy consumers index two
+  documents and check matching and empty results. This is feature compilation
+  and lexical correctness coverage; model execution is checked separately.
+- Linux and Apple Silicon full executables passed new-corpus indexing, refined
+  search, native ms-marco reranking with three actual scores, and doctor.
+  The first Mac rerank check failed because its older cache lacked native
+  `model.safetensors`; the ordinary registered download to a private cache and
+  a new-index repeat passed. The initial failed receipt remains in the release
+  evidence. ARM Linux and Intel Mac version execution used QEMU and Rosetta.
+- Public 1.9.0 testing exposed an updater wiring bug: Linux GNU full selected
+  MUSL lite, while Mac ARM lite selected full. The 1.9.1 fix carries the compiled
+  ABI and semantic-loader profile through exact asset lookup, with a missing-full
+  negative. Old clients still need the installer route documented in the README.
+  Direct 1.9.0 index opening and rollback both returned refined results without
+  changing either of the two vector files.
+
+The release lock is the fully validated FrankenSQLite 0.3.17 family. Upstream
+published 0.3.18 at 2026-09-07T04:20:02Z, after this dependency freeze. Fresh
+consumer resolution uses that compatible patch and a single Asupersync 0.4.10,
+with no git dependency or forbidden runtime. No released tag was moved to chase
+the new patch, and no 0.3.18 binary claim is made.
+
+The earlier 4096-document/2.4576 GB run retains the automatic 1.8 migration
+failure and seven candidate refinement timeouts at the unchanged 500 ms budget.
+Explicit rebuilding and rollback preserve relevance, but do not qualify refined
+search at that scale. The user's explicit instruction that backwards compatibility
+is not required authorizes the documented rebuild requirement for this release;
+it does not turn the automatic migration failure into a pass. Native-default,
+stock-debug deadline, and no-C-toolchain work remains open in bd-2ba5.
+
 ## 2026-09-07 — macOS ARM64 ONNX producer qualification
 
 The fsfs 1.9.0 candidate built on Apple Silicon but its real index/search/doctor
