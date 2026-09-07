@@ -3788,13 +3788,15 @@ fn validate_archive_paths(archive_path: &Path, is_zip: bool) -> SearchResult<()>
     Ok(())
 }
 
-/// Detect the platform target triple for asset naming.
+/// Preserve the running binary's ABI when selecting an update artifact.
 fn detect_target_triple() -> String {
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
     match (arch, os) {
+        ("x86_64", "linux") if cfg!(target_env = "gnu") => "x86_64-unknown-linux-gnu".into(),
         ("x86_64", "linux") => "x86_64-unknown-linux-musl".into(),
         ("x86_64", "macos") => "x86_64-apple-darwin".into(),
+        ("aarch64", "linux") if cfg!(target_env = "gnu") => "aarch64-unknown-linux-gnu".into(),
         ("aarch64", "linux") => "aarch64-unknown-linux-musl".into(),
         ("aarch64", "macos") => "aarch64-apple-darwin".into(),
         ("x86_64", "windows") => "x86_64-pc-windows-msvc".into(),
@@ -3804,8 +3806,8 @@ fn detect_target_triple() -> String {
 }
 
 /// Build the download URL for a release asset.
-fn release_asset_url(tag: &str, triple: &str) -> String {
-    let filename = release_asset_filename(tag, triple);
+fn release_asset_url(tag: &str, triple: &str, semantic_loaders: bool) -> String {
+    let filename = release_asset_filename(tag, triple, semantic_loaders);
     format!("https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/{filename}")
 }
 
@@ -3814,28 +3816,22 @@ fn release_checksum_url(tag: &str) -> String {
     format!("https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/SHA256SUMS")
 }
 
-/// Construct the asset filename for a given version and target triple.
+/// Select the same semantic capability profile as the running binary.
 ///
-/// The release pipeline ships two archive families: full builds (embedded
-/// models; aarch64 macOS and Windows) named `fsfs-VERSION-TRIPLE`, and lite
-/// builds (loader-capable, no embedded models; both musl Linux targets and
-/// Intel macOS) named `fsfs-lite-VERSION-TRIPLE`. This constructor previously
-/// always produced the full-build name, so Linux self-update requested an
-/// asset that no release has ever contained and 404ed unconditionally.
-fn release_asset_filename(tag: &str, triple: &str) -> String {
+/// Platform alone cannot identify the profile: Apple Silicon ships both,
+/// while Linux GNU full builds must never become model-free MUSL builds.
+/// A missing exact-profile asset is refused by the caller, never substituted.
+fn release_asset_filename(tag: &str, triple: &str, semantic_loaders: bool) -> String {
     let version = tag.strip_prefix('v').unwrap_or(tag);
     let ext = if triple.contains("windows") {
         "zip"
     } else {
         "tar.xz"
     };
-    let family = if matches!(
-        triple,
-        "x86_64-unknown-linux-musl" | "aarch64-unknown-linux-musl" | "x86_64-apple-darwin"
-    ) {
-        "fsfs-lite"
-    } else {
+    let family = if semantic_loaders {
         "fsfs"
+    } else {
+        "fsfs-lite"
     };
     format!("{family}-{version}-{triple}.{ext}")
 }
@@ -3855,13 +3851,18 @@ fn release_has_asset(asset_names: &[String], asset_filename: &str) -> bool {
 /// Used both as a note on `fsfs update --check` and as the error reason when
 /// applying an update whose release lacks a build for the current platform
 /// (issue #31: constructing the URL anyway produced a raw curl 404).
-fn missing_asset_reason(tag: &str, triple: &str, asset_names: &[String]) -> String {
+fn missing_asset_reason(
+    tag: &str,
+    triple: &str,
+    asset_names: &[String],
+    semantic_loaders: bool,
+) -> String {
     let available = if asset_names.is_empty() {
         "none".to_owned()
     } else {
         asset_names.join(", ")
     };
-    let requested = release_asset_filename(tag, triple);
+    let requested = release_asset_filename(tag, triple, semantic_loaders);
     let version = tag.strip_prefix('v').unwrap_or(tag);
     let ext = if triple.contains("windows") {
         "zip"
@@ -3871,8 +3872,8 @@ fn missing_asset_reason(tag: &str, triple: &str, asset_names: &[String]) -> Stri
     let lite_sibling = format!("fsfs-lite-{version}-{triple}.{ext}");
     if !requested.starts_with("fsfs-lite-") && release_has_asset(asset_names, &lite_sibling) {
         format!(
-            "release {tag} has no full (embedded-model) binary for {triple}; \
-             lite archive `{lite_sibling}` is present but has no semantic models \
+            "release {tag} has no semantic-capable binary for {triple}; \
+             lite archive `{lite_sibling}` is present but has no semantic loaders \
              and is not a substitute. Build from source \
              (git clone https://github.com/{GITHUB_OWNER}/{GITHUB_REPO} && \
              cargo build --release -p frankensearch-fsfs) or wait for a full \
@@ -5201,7 +5202,8 @@ impl FsfsRuntime {
         // musl since v1.2.5) is detected here instead of via a curl 404 on a
         // constructed URL.
         let triple = detect_target_triple();
-        let asset_filename = release_asset_filename(&tag, &triple);
+        let semantic_loaders = cfg!(feature = "semantic-loaders");
+        let asset_filename = release_asset_filename(&tag, &triple, semantic_loaders);
         let target_asset_available = release_has_asset(&asset_names, &asset_filename);
 
         if check_only {
@@ -5209,7 +5211,12 @@ impl FsfsRuntime {
                 "update available: v{current} -> v{latest} (run `fsfs update` to apply)"
             ));
             if !target_asset_available {
-                notes.push(missing_asset_reason(&tag, &triple, &asset_names));
+                notes.push(missing_asset_reason(
+                    &tag,
+                    &triple,
+                    &asset_names,
+                    semantic_loaders,
+                ));
             }
             return Ok(FsfsUpdatePayload {
                 current_version: current_str.to_owned(),
@@ -5228,10 +5235,10 @@ impl FsfsRuntime {
             return Err(SearchError::InvalidConfig {
                 field: "update.asset".into(),
                 value: asset_filename,
-                reason: missing_asset_reason(&tag, &triple, &asset_names),
+                reason: missing_asset_reason(&tag, &triple, &asset_names, semantic_loaders),
             });
         }
-        let asset_url = release_asset_url(&tag, &triple);
+        let asset_url = release_asset_url(&tag, &triple, semantic_loaders);
         let checksum_url = release_checksum_url(&tag);
         let is_zip = triple.contains("windows");
 
@@ -35077,14 +35084,55 @@ mod tests {
         let triple = super::detect_target_triple();
         assert!(!triple.is_empty());
         assert!(triple.contains('-'));
+        if cfg!(all(target_os = "linux", target_env = "gnu")) {
+            assert!(
+                triple.ends_with("-linux-gnu"),
+                "GNU binaries must preserve their ABI: {triple}"
+            );
+        } else if cfg!(all(target_os = "linux", target_env = "musl")) {
+            assert!(
+                triple.ends_with("-linux-musl"),
+                "MUSL binaries must preserve their ABI: {triple}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_update_preserves_profiles_in_the_published_1_9_0_inventory() {
+        let inventory = [
+            "fsfs-1.9.0-x86_64-unknown-linux-gnu.tar.xz",
+            "fsfs-1.9.0-aarch64-apple-darwin.tar.xz",
+            "fsfs-lite-1.9.0-x86_64-unknown-linux-musl.tar.xz",
+            "fsfs-lite-1.9.0-aarch64-unknown-linux-musl.tar.xz",
+            "fsfs-lite-1.9.0-x86_64-apple-darwin.tar.xz",
+            "fsfs-lite-1.9.0-aarch64-apple-darwin.tar.xz",
+        ]
+        .map(str::to_owned);
+        for (triple, semantic_loaders, expected) in [
+            ("x86_64-unknown-linux-gnu", true, &inventory[0]),
+            ("aarch64-apple-darwin", true, &inventory[1]),
+            ("x86_64-unknown-linux-musl", false, &inventory[2]),
+            ("aarch64-unknown-linux-musl", false, &inventory[3]),
+            ("x86_64-apple-darwin", false, &inventory[4]),
+            ("aarch64-apple-darwin", false, &inventory[5]),
+        ] {
+            let selected = super::release_asset_filename("v1.9.0", triple, semantic_loaders);
+            assert_eq!(&selected, expected);
+            assert!(super::release_has_asset(&inventory, &selected));
+        }
+        // A full Intel Mac source build cannot silently lose semantic loaders
+        // merely because the release contains a lite archive for its ABI.
+        let unavailable = super::release_asset_filename("v1.9.0", "x86_64-apple-darwin", true);
+        assert!(!super::release_has_asset(&inventory, &unavailable));
+        let reason = super::missing_asset_reason("v1.9.0", "x86_64-apple-darwin", &inventory, true);
+        assert!(reason.contains("not a substitute"));
+        assert!(reason.contains("no semantic loaders"));
     }
 
     #[test]
     fn release_asset_url_format() {
-        // Linux ships lite archives only; the URL must use the fsfs-lite
-        // family or self-update 404s against every real release (the previous
-        // pin of the full-build name froze exactly that defect).
-        let url = super::release_asset_url("v0.2.0", "x86_64-unknown-linux-musl");
+        // A model-free MUSL binary must stay in the lite family.
+        let url = super::release_asset_url("v0.2.0", "x86_64-unknown-linux-musl", false);
         assert!(url.contains("v0.2.0"));
         assert!(url.contains("fsfs-lite-0.2.0-x86_64-unknown-linux-musl.tar.xz"));
         assert!(url.starts_with("https://github.com/"));
@@ -35092,7 +35140,7 @@ mod tests {
 
     #[test]
     fn release_asset_url_windows_uses_zip() {
-        let url = super::release_asset_url("v1.1.2", "x86_64-pc-windows-msvc");
+        let url = super::release_asset_url("v1.1.2", "x86_64-pc-windows-msvc", true);
         assert!(url.contains("fsfs-1.1.2-x86_64-pc-windows-msvc.zip"));
     }
 
@@ -35104,16 +35152,16 @@ mod tests {
             "aarch64-unknown-linux-musl",
             "x86_64-apple-darwin",
         ] {
-            let name = super::release_asset_filename("v1.4.2", triple);
+            let name = super::release_asset_filename("v1.4.2", triple, false);
             assert_eq!(name, format!("fsfs-lite-1.4.2-{triple}.tar.xz"));
         }
         // Full family: aarch64 macOS tarball and the Windows zip.
         assert_eq!(
-            super::release_asset_filename("v1.4.2", "aarch64-apple-darwin"),
+            super::release_asset_filename("v1.4.2", "aarch64-apple-darwin", true),
             "fsfs-1.4.2-aarch64-apple-darwin.tar.xz"
         );
         assert_eq!(
-            super::release_asset_filename("v1.4.2", "x86_64-pc-windows-msvc"),
+            super::release_asset_filename("v1.4.2", "x86_64-pc-windows-msvc", true),
             "fsfs-1.4.2-x86_64-pc-windows-msvc.zip"
         );
     }
@@ -35179,7 +35227,7 @@ mod tests {
         .collect();
 
         // The one shipped target resolves.
-        let linux = super::release_asset_filename("v1.4.3", "x86_64-unknown-linux-musl");
+        let linux = super::release_asset_filename("v1.4.3", "x86_64-unknown-linux-musl", false);
         assert!(super::release_has_asset(&assets, &linux));
 
         // Every other matrix target is missing.
@@ -35190,7 +35238,7 @@ mod tests {
             "x86_64-pc-windows-msvc",
             "aarch64-pc-windows-msvc",
         ] {
-            let name = super::release_asset_filename("v1.4.3", triple);
+            let name = super::release_asset_filename("v1.4.3", triple, true);
             assert!(
                 !super::release_has_asset(&assets, &name),
                 "expected {name} to be reported missing on v1.4.3"
@@ -35201,7 +35249,7 @@ mod tests {
     #[test]
     fn missing_asset_reason_is_actionable() {
         let assets = vec!["fsfs-lite-1.4.3-x86_64-unknown-linux-musl.tar.xz".to_owned()];
-        let reason = super::missing_asset_reason("v1.4.3", "aarch64-apple-darwin", &assets);
+        let reason = super::missing_asset_reason("v1.4.3", "aarch64-apple-darwin", &assets, true);
         assert!(reason.contains("v1.4.3"));
         assert!(reason.contains("aarch64-apple-darwin"));
         assert!(reason.contains("build from source"));
@@ -35218,18 +35266,18 @@ mod tests {
             "fsfs-lite-1.6.0-aarch64-apple-darwin.tar.xz".to_owned(),
             "fsfs-lite-1.6.0-x86_64-unknown-linux-musl.tar.xz".to_owned(),
         ];
-        let reason = super::missing_asset_reason("v1.6.0", "aarch64-apple-darwin", &assets);
+        let reason = super::missing_asset_reason("v1.6.0", "aarch64-apple-darwin", &assets, true);
         assert!(
             reason.contains("fsfs-lite-1.6.0-aarch64-apple-darwin.tar.xz")
                 && reason.contains("not a substitute")
-                && reason.contains("no semantic models"),
+                && reason.contains("no semantic loaders"),
             "Apple Silicon update must name the lite sibling without treating it as full: {reason}"
         );
     }
 
     #[test]
     fn missing_asset_reason_handles_empty_release() {
-        let reason = super::missing_asset_reason("v1.4.0", "aarch64-apple-darwin", &[]);
+        let reason = super::missing_asset_reason("v1.4.0", "aarch64-apple-darwin", &[], true);
         assert!(reason.contains("assets on this release: none"));
     }
 
@@ -35286,11 +35334,11 @@ mod tests {
     #[test]
     fn release_asset_filename_includes_version_and_triple() {
         assert_eq!(
-            super::release_asset_filename("v1.1.2", "x86_64-unknown-linux-musl"),
+            super::release_asset_filename("v1.1.2", "x86_64-unknown-linux-musl", false),
             "fsfs-lite-1.1.2-x86_64-unknown-linux-musl.tar.xz"
         );
         assert_eq!(
-            super::release_asset_filename("v1.1.2", "x86_64-pc-windows-msvc"),
+            super::release_asset_filename("v1.1.2", "x86_64-pc-windows-msvc", true),
             "fsfs-1.1.2-x86_64-pc-windows-msvc.zip"
         );
     }
@@ -35823,7 +35871,7 @@ mod tests {
 
     #[test]
     fn release_urls_contain_expected_patterns() {
-        let asset = super::release_asset_url("v1.0.0", "aarch64-apple-darwin");
+        let asset = super::release_asset_url("v1.0.0", "aarch64-apple-darwin", true);
         assert!(asset.contains("v1.0.0"));
         assert!(asset.contains("aarch64-apple-darwin"));
         assert!(asset.contains(".tar.xz"));
@@ -37426,7 +37474,8 @@ mod tests {
             ),
         ];
         for (triple, expected_filename) in triples {
-            let filename = super::release_asset_filename("v1.0.0", triple);
+            let semantic_loaders = !expected_filename.starts_with("fsfs-lite-");
+            let filename = super::release_asset_filename("v1.0.0", triple, semantic_loaders);
             assert_eq!(
                 filename, expected_filename,
                 "asset filename mismatch for triple {triple}"
@@ -37436,7 +37485,7 @@ mod tests {
 
     #[test]
     fn asset_name_strips_v_prefix_from_tag() {
-        let filename = super::release_asset_filename("v2.3.4", "x86_64-unknown-linux-musl");
+        let filename = super::release_asset_filename("v2.3.4", "x86_64-unknown-linux-musl", false);
         assert!(
             !filename.contains("vv"),
             "should not double-prefix the version"
@@ -37449,7 +37498,7 @@ mod tests {
 
     #[test]
     fn asset_name_handles_tag_without_v_prefix() {
-        let filename = super::release_asset_filename("3.0.0", "aarch64-apple-darwin");
+        let filename = super::release_asset_filename("3.0.0", "aarch64-apple-darwin", true);
         assert_eq!(filename, "fsfs-3.0.0-aarch64-apple-darwin.tar.xz");
     }
 

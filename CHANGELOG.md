@@ -10,7 +10,8 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.8.0...main) | 1.9.0 candidate | 2026-09-07 | Native quality selection, verified producer identities, bounded refinement, reranking, watcher recovery, FrankenSQLite 0.3.17, and Quill garbage collection |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.9.0...main) | 1.9.1 candidate | 2026-09-07 | Self-update preserves Linux ABI and full/lite semantic capability |
+| [v1.9.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.0) | Release | 2026-09-07 | Native quality selection, verified producer identities, bounded refinement, reranking, watcher recovery, FrankenSQLite 0.3.17, and Quill garbage collection |
 | [v1.8.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.8.0) | Release | 2026-09-02 | Two-tier fsfs delivered end to end (quality generation at index time, REFINED phase); daemon lifetime and stop verb; append/delete/watch reach every arm; RaptorQ sidecars for both vector generations; dsr quality gate; crates.io 0.4.x patches (gh#416, gh#39, gh#40) |
 | [v1.7.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.7.0) | Release | 2026-08-23 | Registry refresh (FrankenSQLite 0.3.8, Asupersync 0.4.9, fastembed 6), hash-control fuse follow-through, Quill CASS ingest |
 | [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.6.0) | Release | 2026-08-14 | Hash control no longer presented as semantic search |
@@ -22,9 +23,22 @@ Scope window: [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/releas
 
 ---
 
-## [Unreleased] -- development on `main` since [v1.8.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.8.0)
+## [Unreleased] -- fsfs 1.9.1
 
-Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.8.0...main>
+Self-update now preserves the compiled Linux ABI and the full/lite capability
+profile. Previously a Linux GNU binary selected the MUSL lite archive, removing
+its semantic loaders despite a successful version update. Apple Silicon lite
+builds also selected the full archive. Artifact selection now requires the exact
+profile; an unavailable semantic build cannot silently become lite.
+
+When upgrading an older Linux full binary, use the standard installer: the
+artifact choice is made by the old executable, which this patch cannot change.
+The fix is covered against the six published 1.9.0 archives, including the
+same-platform full/lite distinction and refusal of a missing semantic profile.
+
+## [v1.9.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.0) -- 2026-09-07
+
+Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.8.0...v1.9.0>
 
 - **FrankenSQLite 0.3.17.** All 20 database packages move together from 0.3.8;
   storage, durability, fsfs, and ops require the updated family. The release
@@ -53,7 +67,7 @@ Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.8.0...ma
   the index root.
 - **Crate bundle candidate:** facade 0.4.3; core/index/lexical/fusion 0.2.4;
   embed 0.2.5; rerank 0.2.6; storage/durability/quill 0.2.3; tui/ops 0.2.0;
-  fsfs 1.9.0. Publication is pending validation. The publish contract and
+  fsfs 1.9.1. Publication is pending validation. The publish contract and
   fresh-process logging receipts bind the audited Asupersync 0.4.10 identity
   and FrankenSQLite 0.3.17 family.
 
