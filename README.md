@@ -45,7 +45,8 @@ no supported x86_64 Darwin distribution, so ordinary semantic installation
 fails with `unsupported_platform` and points to `--lite` instead of attempting
 a source build that cannot succeed.
 
-The Linux x86-64 full archive requires glibc 2.43. The standard installer
+The Linux x86-64 full archive requires glibc 2.43 or newer; build from source on
+older glibc systems for full semantic search. The standard installer
 provisions and verifies the six registered production models separately; their
 download is roughly 1.64 GB. The two search tiers alone require roughly 621 MB.
 
@@ -58,7 +59,7 @@ the compiled ABI and the full/lite profile for subsequent updates.
 Semantic indexes written by 1.7/1.8 require an explicit rebuild with the original
 configuration: `fsfs index /original/source --index-dir /existing/index`.
 Indexes written by 1.9.0 can be opened directly by 1.9.1.
-The 1.10.0 source changes the embedder adapter version and therefore
+The 1.10.0 release changes the embedder adapter version and therefore
 requires that explicit rebuild for 1.9.x semantic indexes too. Keep the original
 documents and configuration available; opening an old generation with the new
 producer is refused. Model artifact checksums and native producer fingerprints
@@ -752,8 +753,8 @@ Use this as a pragmatic hardening pass before rollout:
 Publication runs on a real host with configured Cargo registry credentials.
 GitHub Actions does not publish this repository. The two release lines are
 versioned independently: `v*` tags identify fsfs binary releases and `crates-v*`
-tags identify library bundles. This source is versioned as `fsfs 1.10.0` and
-`frankensearch 0.5.0`; the changelog lists every member and the index rebuild
+tags identify library bundles. Published versions are `fsfs 1.10.0` and
+`frankensearch 0.5.0` (2026-09-08); the changelog lists every member and the index rebuild
 requirement. The GitHub releases record published bundles and validation receipts.
 
 Run `scripts/check_crates_publish_contract.sh --mode gate --scope workspace`

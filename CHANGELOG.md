@@ -24,11 +24,14 @@ Release history through [v1.9.1](https://github.com/Dicklesworthstone/frankensea
 
 ---
 
-## fsfs 1.10.0 / crate bundle 0.5.0
+## [fsfs 1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) / crate bundle 0.5.0 -- 2026-09-08
+
+Both release tags bind to
+[`9c5d8867`](https://github.com/Dicklesworthstone/frankensearch/commit/9c5d8867cbbc7edf696a24410a86af08402fc468).
 
 - **FrankenSQLite 0.3.18.** The binary lock and database requirements advance
-  together from 0.3.17. The updated storage and CLI paths passed the repository
-  quality gate before the release version bumps.
+  together from 0.3.17. The final release revision passed all ten stages of the
+  unchanged repository quality gate, including seven real-model end-to-end tests.
 - **ChaCha RNG backend correction.** The release lock uses `chacha20 0.10.2`.
   RustCrypto yanked 0.10.1 for an SSE4.1 intrinsic in its SSE2 RNG backend;
   the affected RNG feature is present through the SQLite and PDF dependencies.
@@ -62,9 +65,28 @@ Release history through [v1.9.1](https://github.com/Dicklesworthstone/frankensea
 
 Version set: facade 0.5.0; fsfs 1.10.0; rerank 0.3.0;
 core/index/lexical/fusion 0.2.5; embed 0.2.6;
-storage/durability/quill 0.2.4; tui/ops 0.2.1. Consult the GitHub release receipts
-for publication and final versioned qualification. The ops crate remains
+storage/durability/quill 0.2.4; tui/ops 0.2.1. All 13 public crate archives match
+their verified packages and this source revision. The ops crate remains
 experimental. No performance win or complete native migration is claimed.
+
+The full Linux x86_64 GNU binary requires glibc 2.43 or newer. Full Linux and
+Apple Silicon binaries passed real Potion/ONNX indexing, refined search and
+native reranking with the stock 500 ms quality budget. These checks do not
+establish a universal cold-start deadline. Linux ARM lite ran under QEMU and
+Intel macOS lite under Rosetta; neither is native hardware qualification.
+
+The executed 1.9.1 index migration retained its existing 5,000 ms quality budget.
+Search and append refused incompatible generations without changing the index;
+rebuilding restored both search phases and subsequent appends. Rebuild using
+the original documents and configuration:
+
+```bash
+fsfs index /original/source --full --index-dir /existing/index --config /original/config.toml
+```
+
+For this upgrade, the changed producer fingerprint triggers generation
+replacement. Keep the original inputs; unchanged model bytes alone do not make
+an older index compatible.
 
 ## [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) -- 2026-09-07
 

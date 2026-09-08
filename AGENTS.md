@@ -389,12 +389,11 @@ be git-sourced and are now registry renames — keep the rename form, never the 
 | `ann` | `hnsw_rs = { package = "frankenhnsw", version = "=0.3.5" }` | The published fork carries the layer-invariant/search-correctness fixes; registry `hnsw_rs` 0.3.4 is upstream and would silently drop them. |
 
 `rerank` and `native` are exact aliases — there is no ONNX-only rerank lane, and
-`fastembed-reranker` also enables `native`. Published line as of 2026-09-07: facade
-`frankensearch 0.4.3`, members `0.2.x`, fsfs `1.9.1` (see CHANGELOG). Never republish a version that
+`fastembed-reranker` also enables `native`. Published line as of 2026-09-08: facade
+`frankensearch 0.5.0`, rerank `0.3.0`, other members `0.2.x`, fsfs `1.10.0` (see CHANGELOG). Never republish a version that
 exists on the registry; bumps go forward only.
-This source is versioned as facade `0.5.0`, fsfs `1.10.0`, rerank `0.3.0` and forward
-patch versions for the other ten publishable members. Verify publication against
-the registry and GitHub release receipts. The embedder `0.2.6` adapter
+All 13 public crate archives bind to release source `9c5d8867cbbc7edf696a24410a86af08402fc468`;
+verify later updates against the registry and GitHub release receipts. The embedder `0.2.6` adapter
 version changes Potion and ONNX fingerprints; retain historical fixture checks
 and require explicit rebuilding of older semantic indexes.
 
