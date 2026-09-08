@@ -1,6 +1,202 @@
 # Bridge Plan: frankensearch
 
-## Current assessment — 2026-09-04
+## Current assessment — 2026-09-08
+
+**Verdict:** the core two-tier library and fsfs product work and are published.
+The project is not complete against its full vision. The largest remaining
+product problem is live watch/search availability. The largest integration
+opportunities are retained composite generations, progressive daemon transport,
+and the existing native ANN implementation. Broad relevance superiority and
+the ten competitive Quill targets remain unproven.
+
+This assessment supersedes the September 4 and September 2 status sections
+below without discarding their evidence. Baseline is main
+`5027b964169bc7c42d60bf54b0251cfd64ec46ac`; released executable/crate source is
+`9c5d8867cbbc7edf696a24410a86af08402fc468`. `git diff 9c5d8867..5027b964`
+changes only AGENTS, README, changelog/research and the release bead. Thus the
+release's source tests still describe the inspected product implementation;
+they are retained September 8 execution evidence, not new test runs in this
+assessment. No source, test, golden or gate implementation is changed here.
+
+### Scope, sources and evidence
+
+Read completely: `/data/projects/AGENTS.md` (661 lines), repository `AGENTS.md`
+(953), `README.md` (1,102), this existing bridge plan (948 before revision),
+the Quill comprehensive plan (626), and all three architecture documents.
+Applied the full reality-check skill and its vision, gap, bridge and ambition
+references. Inspected current feature manifests, actual product serving and
+generation paths, test/gate selection, relevant Beads descriptions/acceptance,
+and retained release evidence. Older dated performance receipts retain their
+own revision, workload and host limitations. Experimental Ops and the future
+distributed design remain outside the shipped local-product completion claim.
+
+Authoritative release evidence root (abbreviated **R** below):
+`/data/release-work/frankensearch-release-1.10.0-recovered-20260908`.
+The original temporary root disappeared during release work; the recovery
+report distinguishes recovered originals, repeated Linux checks, reconstructed
+summaries and unavailable private-tool files. This audit does not restore or
+upgrade the provenance of anything missing.
+
+| Evidence | What it proves; what it does not |
+|---|---|
+| Live GitHub `v1.10.0` and `crates-v0.5.0`; R/release-completion.json | Binary release and all 13 crates published at 9c5d8867. Six binary variants across five triples; full GNU x86_64 and macOS ARM, four explicit lite variants. No Windows asset, full ARM Linux or native-only binary family. |
+| R/crates-publication3/quality-evidence/receipt.json and its four hashed logs | All ten stock quality stages passed, including seven real-model E2Es. Gauntlet lib tests and embedded-only fsfs integration suites are not part of that stock gate. Receipt duration fields are not used for timing claims. |
+| R/gnu-smoke-recovered-summary.json and raw command receipt | Three real documents, both semantic tiers, Refined, three finite applied native rerank scores, doctor pass, stock 500 ms config. Cold-load success on this host is not a universal deadline. |
+| R/runtime-validation3-migration-independent.json | Actual 1.9.1 index refuses incompatible search/append without changing old index bytes; explicit rebuild restores both phases and subsequent append. This probe used 5,000 ms, not the stock deadline. |
+| R/crates-publication3/public-consumers-qualification.json and publication.log | Nine fresh registry-only feature consumers compiled and ran; real Quill/Tantivy matching and absent-term queries. No semantic inference or retrieval-quality superiority follows from those consumers. |
+| R/public-bundle-final-verification.json | Public bundle download, 779 members and all 13 actual crate archives checked. Linux ARM execution used QEMU, Intel macOS used Rosetta; neither is native performance evidence. |
+| docs/evidence/perf/*20260903* | Scoped library/product latency, indexing and event-to-applied measurements. Watch freshness was checked after watcher exit; no live cross-process visibility proof. |
+| Current source and keyword/Rust AST scans | Real implementations, no `todo!`/`unimplemented!` macros found in scanned source. Test doubles and dormant files are explicitly distinguished from production behavior; absence of macros is not completeness proof. |
+
+Initial tracker inventory: 1,149 closed, 92 open, 40 in progress, six blocked,
+four deferred (1,291 total). These counts measure bookkeeping, not vision
+delivery. `br doctor` confirms DB/JSONL count and metadata synchronization,
+integrity, and no pending merge; it exits degraded because duplicate executable
+paths and preserved recovery artifacts exist. No repair or cleanup was done.
+Plain `bv` selects `beads.base.jsonl`; it happens to match the initial content
+hash, but this audit explicitly uses `bv --db .beads/issues.jsonl` thereafter.
+Agent Mail attested current reservation reads and granted this agent exclusive
+plan/JSONL leases with no conflicts. Existing assignees remain in place.
+
+### Vision checklist — testable promises and coverage
+
+`WORKING` is restricted to the cited executed surface. `PARTIAL` means named
+behavior is missing; `UNPROVEN` means existing implementation lacks the full
+required evidence. An implementation can be working on one route and partial
+on another. V1–V24 retain the September 4 numbering.
+
+| Goal and testable completion criterion | Current reality | Gap / existing owner |
+|---|---|---|
+| V1 Install a semantic product on every promised platform | PARTIAL. Established full/lite matrix actually installed/upgraded. GNU full requires glibc 2.43; Windows absent, Intel Mac full unsupported with standard ONNX. | `bd-fsfs-cross-platform-semantic-installer-46z3u`, Windows/macOS generation qualification. |
+| V2 One-shot indexing durably publishes both semantic tiers and exits | WORKING on released full binaries and real-model gate. Generation-complete output and explicit fast-only reason exist. | Composite atomicity is V12, not an unreleased-product gap. |
+| V3 Initial arrives before refinement across useful serving routes | PARTIAL. Direct JSONL/TOON streams emit live phases. `run_search_command` branches into streaming before daemon routing; daemon `SearchServeResponse` buffers `Vec<SearchPayload>`. | G1 below: no implementation owner for warm progressive daemon delivery. |
+| V4 Configured quality/fast weighting affects real ranking | WORKING at tested product boundary. `blend_two_tier` reused; daemon policy and cache identity include weight/RRF configuration. | `bd-fsfs-quality-weight-38u9y` closed; broad relevance proof remains V17. |
+| V5 Quality timeout/cancellation preserves admitted Initial | WORKING with documented limits. Timer covers initialization/admission/inference/retrieval; synchronous work may drain after response. Reranker cold preparation occurs before its separate scoring timer. | `bd-fsfs-quality-deadline-yrvjc` closed; transport V3 and native cold-load V16 remain distinct. |
+| V6 Machine formats, streaming, snippets and usable explanations | WORKING for executed command/stream/explain paths; complete cross-backend metadata/snippet equivalence UNPROVEN. | `bd-qwkq`, E6.4/E6.7; do not replace absent BM25 detail with invented numbers. |
+| V7 Watch updates become searchable while watcher and readers live | PARTIAL. The watcher retains exclusive FSVI writers; fresh processes are refused with `fsvi.map_lock`. Event-to-applied is not event-to-visible. | `bd-z2nfa`, `bd-fsfs-identity-bound-watch-staging-t9m9m`. |
+| V8 Append/delete/compact/flush/daemon maintain all search arms | WORKING pieces and real upgrade/append proof. Full immutable concurrent lifecycle remains PARTIAL. | V12/V13 generation, retention, activation and repair owners. |
+| V9 Doctor/status distinguish artifacts, loaders and searchable identity | WORKING for current positive/negative gate and release probes. Automated semantic recovery is not complete. | `bd-p6z6.4`, `bd-3fy9`; status alone is not load/inference proof. |
+| V10 Reusable facade, features, examples and registry consumption | WORKING: 0.5.0 plus 13 public crates and nine clean consumers. Default hash is explicitly a control profile. | Registry blocker prose in `bd-8nqz-6-ft-registry-4hca` and `bd-8nqz.6` is stale; exact terminal requirements must be reconciled. |
+| V11 Quill implements the promised lexical surface conformantly | PARTIAL. Real default engine, encoding/queries/deltas/concat/compaction and tests exist. Complete scaled public-behavior census and residual disposition are open. | E6.4/.6/.7/.8.1, `bd-y7vz`, `bd-quill-union-horizon-exactness-salej`, existing flip-conformance tasks. |
+| V12 Each query pins one complete identity-bound generation | PARTIAL. Substantial generation-root/snapshot APIs exist; product opens fixed fast/quality paths and validates fingerprints rather than retaining one composite authority throughout. | `bd-xomn.1`–`.4`, publisher, retained snapshot, antirollback, `bd-v3hgo`, raw-API retirement. |
+| V13 Corruption/restart/model change recover without mixed generations | PARTIAL. Real FEC repair and descriptor-lock fixes shipped; old-index refusals/rebuild verified. One automatic semantic RecoveryPlan across surfaces is incomplete. | `bd-p6z6.3/.4`, `bd-3fy9`, immutable lifecycle and retention tasks. |
+| V14 Bounded large-corpus search, native ANN and safe vector ownership | PARTIAL. Exact SIMD/Rayon and optional registry ANN exist. Native HNSW has retained-owner/persistence code and tests but no production adapter cutover; fsfs has no ANN feature. | `bd-kcek` (AzureCove); actual routing, tombstone recall and current incumbent evidence still required. |
+| V15 Optional cross-encoder actually scores refined results | WORKING on released full binary and real-model tests; native caller-pool execution wired. | No new reranker implementation task; broad quality and latency claims remain V16/V17. |
+| V16 Native quality inference replaces ONNX with parity and speed | PARTIAL. English/multilingual native selection and ONNX-free source profile ship. Default full still ONNX; no-C/C++ build, >0.999 parity, no ranking regression and within-2x latency acceptance remain open. | `bd-2ba5`; no automatic cross-space fallback or inferred completion from reranking. |
+| V17 Refinement improves relevance on held-out real workloads | UNPROVEN broadly. Real known-item and phase tests demonstrate functioning retrieval, not superiority. | E6.6/E6.7 and `bd-2g2l`, `bd-q4rg`; paired stage ablations and slice losses required. |
+| V18 Latency/memory/index-cost envelopes are measured honestly | WORKING for the dated reference rows only. Native cold starts and broader corpus/host envelopes remain UNPROVEN. | Existing perf receipts/campaign, no new dashboard or blanket SLA. |
+| V19 Quill wins the frozen QG-1..10 targets against live Tantivy | UNPROVEN; ten `activated = false`. QG-3/4/5 promotion unavailable until matched durability witnesses; hardware/control/provenance blockers remain. | E8/E8-H and `bd-h6eh`, existing measured-loss tasks. Default-backend ruling does not certify the targets. |
+| V20 CASS/xf/Mail consume the shared engine end-to-end | PARTIAL. CASS schema-v8 interoperability is real; host adoption and semantic recovery need host-owned proof. | `bd-cass-semantic-cross-repo-receipt-91k2`, `bd-cass-total-lexical-contract-jxyq`, `bd-q4rg`. |
+| V21 Privacy/scope/pressure/replay stay correct in production | PARTIAL: substantial real policies and focused tests; complete cross-surface fault/replay proof remains open. | Existing generation/caches, recovery, public-behavior and privacy consumer tasks. |
+| V22 Real release gates exercise the promised surface in bounded time | PARTIAL. Ten stock stages pass through DSR, Actions disabled. A5's missing-quality/phase/provenance negatives remain open; gauntlet excluded and embedded-only integration targets skipped by default features. | A5 (`bd-fsfs-executable-quickstart-ci-ve3ul`), G2 below; E6 correctness/quality acceptance preserved. |
+| V23 Active guidance matches source; dormant code has a disposition | PARTIAL. Changelog and major active guidance updated. README still mentions embedded macOS/Windows full assets although this release downloads models and has no Windows asset. Seven dormant source files remain tracked. | `bd-d7xk1`; delivery guidance belongs to existing platform/A5 scope, not a second documentation program. |
+| V24 Ops/distributed expansion has a real producer and delivery route | EXPERIMENTAL/FUTURE, not a completed shipping capability. Ops has only its simulator; distributed document is design-only. | Retain explicit owner scope decision; no new distributed program in this bridge. |
+
+### Bridge work — initial ordering and concrete completion
+
+1. **Live watch/search and composite generations (L–XL).** Reuse the existing
+   antirollback → fixed publisher → retained snapshot → production migration
+   chain. `bd-z2nfa` remains the user-visible regression: while writer, daemon
+   and independent readers live, create/update/delete/rename must become
+   visible in lexical and both semantic tiers. Hold old reader handles across
+   publication; inject build/seal/publish/install failures and prove each
+   request sees complete old or new membership, never a mixture. Reuse existing
+   fault hooks and retention roots; no lock weakening, v1 workaround or new
+   authority scheme. Freshness is source event → durable publication → fresh
+   independent result, with bounded processes and complete terminal logs.
+2. **G1: Warm progressive daemon search (M–L).** Reuse the phase sink in
+   `runtime.rs` across socket serving and CLI streaming. Introduce a bounded
+   framed response carrying policy/generation identity before its first hit,
+   Initial, optional Refined/RefinementFailed and exactly one terminal. Forward
+   each phase as it arrives. Cache replay must say it is cached; incomplete or
+   timed-out work must not poison later queries. Prove real IPC first-phase
+   delivery while a controlled quality provider is held, later success/error,
+   disconnect/cancel and bounded shutdown. Real-model repeated distinct queries
+   must reuse the same daemon/model initialization without hash fallback. This
+   is new integration coverage; it does not reopen the correctly scoped
+   quality-deadline fix or promise a universal latency SLA.
+3. **Relevance/conformance (L, existing E6 program).** Execute the existing
+   real-model held-out lexical/fast/Initial/Refined/rerank ablations under E6.6's
+   fixed rules. Attribute losses to actual stage/candidate/filter/hydration
+   behavior and retain every required slice. Verify both lexical backends,
+   persisted restart and actual serving routes; finite scores or a Refined
+   label alone cannot pass. Baseline analysis can proceed before G1; its final
+   transport-specific checks consume the finished stream route.
+4. **Native inference and ANN (L–XL, existing owners).** Native inference
+   retains the original parity/ranking/latency/no-C-toolchain obligations in
+   `bd-2ba5`; source profile availability is partial completion. Native ANN
+   reuses `ValidatedNativeHnsw`, exact FSVI owners and the existing brute-force
+   oracle; bind graph persistence to composite identity before production
+   cutover. Test tombstones/WAL, same-size vector substitution, reopening and
+   0/representative/50/90% tombstone recall with real data. No replacement
+   adapter architecture, duplicate feature flag or premature default change.
+5. **Delivery and automatic recovery (L).** Existing platform task owns real
+   full/lite routes, missing targets and exact installer capabilities. Existing
+   recovery tasks own explicit model repair/rebuild with compatible identities
+   and offline refusal. Preserve current good release receipts; neither typed
+   unsupported Windows nor a compile guard is a Windows product. Do not repeat
+   a full release just to refresh this assessment.
+6. **G2: Bounded mandatory Quill gauntlet lane (M).** Profile the existing
+   excluded gauntlet binary and retain the complete selected-test inventory.
+   Separate fast correctness from costly evidence construction through existing
+   targets/runner selections, preserving every assertion and a runnable full
+   lane. Wire mandatory correctness and real oracle cases into the actual DSR
+   driver. Fail on zero selected tests, missing oracle, timeout and planted
+   divergence; retain stdout/stderr, selection, source and terminal counts.
+   Embedded-only product quality suites remain explicit real-model E6 lanes,
+   not silently counted as default-gate execution. No reduced fixtures or
+   ignored failures to reach a time budget. Historical >50-minute comments
+   justify profiling, not a new current timing claim.
+7. **A5 and tracker reconciliation (S–M).** Finish the existing quick-start
+   positive and named RED cases, including absent quality/phase and external
+   binary provenance. Inspect A5's platform hard edge: its own contract excludes
+   platform certification, so a local harness improvement must not wait for
+   every target. Reconcile registry blockers against actual public archives
+   and consumer evidence without publishing again or closing unmet acceptance.
+   Dormant-file work remains lower priority; never register unused metrics just
+   to satisfy a count, and never delete files without explicit authorization.
+
+**Would the initial open queue close every gap?** No. It covers most hard
+architecture, native, conformance and performance work, but lacks an executable
+warm progressive daemon task and a bounded mandatory gauntlet task. Broad E6
+acceptance is not an implementation owner for either. Some graph blockers are
+already resolved in the shipped product, and A5's platform dependency can
+unnecessarily starve a useful local fix. New G1/G2 tasks plus narrowly scoped
+existing-bead amendments close these identified planning holes. No finite
+backlog guarantees undiscovered defects cannot exist or targets will be won.
+
+### Execution checklist for this skill pass
+
+- [x] Read both governing files and README completely; read current plans and architecture.
+- [x] Separate current source, released artifacts, retained tests and old measurements.
+- [x] Check ownership, peer dirt, Beads synchronization and authoritative graph input.
+- [x] Extract V1–V24 and map each to code, proof, limits and existing coverage.
+- [x] Write initial bridge plan in this existing document.
+- [ ] Apply frozen Phase 3a; create only uncovered logical work with tests included.
+- [ ] Ambition round 1: strengthen user-facing execution semantics.
+- [ ] Ambition round 2: optimize integration order and remove false dependencies.
+- [ ] Ambition round 3: bound resource costs and retain statistically meaningful outcomes.
+- [ ] Reapply Phase 3a and update the same beads after the plan revisions.
+- [ ] Five refinement passes: coverage, dependency direction, negative tests, proof scope, convergence.
+- [ ] Validate final graph, full changed records, source links and diff; commit/push scoped files.
+
+**Process artifact creation check.** This plan is PROCESS, not product runtime
+state. Consumer: the owner explicitly requesting the complete reality check
+on September 8, and the agents executing its Beads. Gate: completion of that
+request and selection of the next actual product work. Observed defect class:
+the old current-status section calls published/fixed functionality missing;
+warm streaming and the excluded gauntlet have no execution owner. Retirement:
+this section becomes historical when superseded by the next source-bound
+assessment; no automatic file deletion. No integrity-control exception is
+needed. The highest-value ready user regression is `bd-z2nfa`; an hour of
+implementation could improve the product, but the explicit assessment request
+is the bounded deliverable now. Verdict: legitimate requested planning, zero
+new capability credit. Tests remain inside implementation beads despite the
+skill reference's companion-test suggestion: suite law forbids scope-splitting.
+
+---
+
+## Historical September 4 assessment (superseded)
 
 This section supersedes the September 2 assessment retained below. It is the
 current bridge plan, revised in place by ChartreuseCarp for the owner's full
