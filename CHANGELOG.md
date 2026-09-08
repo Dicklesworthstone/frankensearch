@@ -29,6 +29,10 @@ Release history through [v1.9.1](https://github.com/Dicklesworthstone/frankensea
 - **FrankenSQLite 0.3.18.** The binary lock and database requirements advance
   together from 0.3.17. The updated storage and CLI paths passed the repository
   quality gate before the release version bumps.
+- **ChaCha RNG backend correction.** The release lock uses `chacha20 0.10.2`.
+  RustCrypto yanked 0.10.1 for an SSE4.1 intrinsic in its SSE2 RNG backend;
+  the affected RNG feature is present through the SQLite and PDF dependencies.
+  The patch release fixes that backend without changing dependency interfaces.
 - **An explicit native semantic source profile.** `--no-default-features
   --features semantic-native` builds Model2Vec, native quality inference and
   native reranking without FastEmbed or ONNX Runtime. Standard full binaries
