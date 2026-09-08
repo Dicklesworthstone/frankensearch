@@ -16,7 +16,11 @@ below without discarding their evidence. Baseline is main
 changes only AGENTS, README, changelog/research and the release bead. Thus the
 release's source tests still describe the inspected product implementation;
 they are retained September 8 execution evidence, not new test runs in this
-assessment. No source, test, golden or gate implementation is changed here.
+assessment. Fresh executable probes below are recorded separately. No source,
+test, golden or gate implementation is changed here. A concurrent commit
+`0236263b7c04d9a55ca887ed93c5b8978f19c4f7` recorded the initial assessment and
+two new beads while this pass continued; its diff contains only this plan and
+JSONL. Subsequent ambition/refinement edits complete that initial record.
 
 ### Scope, sources and evidence
 
@@ -47,6 +51,8 @@ upgrade the provenance of anything missing.
 | R/public-bundle-final-verification.json | Public bundle download, 779 members and all 13 actual crate archives checked. Linux ARM execution used QEMU, Intel macOS used Rosetta; neither is native performance evidence. |
 | docs/evidence/perf/*20260903* | Scoped library/product latency, indexing and event-to-applied measurements. Watch freshness was checked after watcher exit; no live cross-process visibility proof. |
 | Current source and keyword/Rust AST scans | Real implementations, no `todo!`/`unimplemented!` macros found in scanned source. Test doubles and dormant files are explicitly distinguished from production behavior; absence of macros is not completeness proof. |
+| Fresh assessment quickstart and stream, `/data/tmp/frankensearch-reality-20260908.Fx3gbF/` | Supplied public GNU binary SHA `e15517da79c92d55ba64cd1e3f52fa3377e1a5a442a6877f17e5cade2b40c41f`; two successful bounded index runs, correct hybrid top result, both actual FSVIs, Refined. Separate uncached direct JSONL run exited 0 with ten frames and completed terminal. Checker printed 0236263b; release evidence separately binds executable source to 9c5d8867. Cached, verified models; not fresh-install, all-platform or performance proof. |
+| Same root, `watch-verbose-receipt.json` and raw watch/search logs | Current released binary reaches watcher-started, remains alive while independent search exits 2 with `fsvi.map_lock`, then exits 0 on SIGINT. This freshly reproduces V7. First observer omitted verbose while expecting an INFO readiness message, ran no search and is retained as NO_VERDICT in `watch-receipt.json`. No freshness or performance claim. |
 
 Initial tracker inventory: 1,149 closed, 92 open, 40 in progress, six blocked,
 four deferred (1,291 total). These counts measure bookkeeping, not vision
@@ -69,7 +75,7 @@ on another. V1–V24 retain the September 4 numbering.
 |---|---|---|
 | V1 Install a semantic product on every promised platform | PARTIAL. Established full/lite matrix actually installed/upgraded. GNU full requires glibc 2.43; Windows absent, Intel Mac full unsupported with standard ONNX. | `bd-fsfs-cross-platform-semantic-installer-46z3u`, Windows/macOS generation qualification. |
 | V2 One-shot indexing durably publishes both semantic tiers and exits | WORKING on released full binaries and real-model gate. Generation-complete output and explicit fast-only reason exist. | Composite atomicity is V12, not an unreleased-product gap. |
-| V3 Initial arrives before refinement across useful serving routes | PARTIAL. Direct JSONL/TOON streams emit live phases. `run_search_command` branches into streaming before daemon routing; daemon `SearchServeResponse` buffers `Vec<SearchPayload>`. | G1 below: no implementation owner for warm progressive daemon delivery. |
+| V3 Initial arrives before refinement across useful serving routes | PARTIAL. Direct JSONL/TOON streams emit live phases. `run_search_command` branches into streaming before daemon routing; daemon `SearchServeResponse` buffers `Vec<SearchPayload>`. | Previously uncovered; now G1 `bd-fsfs-progressive-daemon-dq48i`. |
 | V4 Configured quality/fast weighting affects real ranking | WORKING at tested product boundary. `blend_two_tier` reused; daemon policy and cache identity include weight/RRF configuration. | `bd-fsfs-quality-weight-38u9y` closed; broad relevance proof remains V17. |
 | V5 Quality timeout/cancellation preserves admitted Initial | WORKING with documented limits. Timer covers initialization/admission/inference/retrieval; synchronous work may drain after response. Reranker cold preparation occurs before its separate scoring timer. | `bd-fsfs-quality-deadline-yrvjc` closed; transport V3 and native cold-load V16 remain distinct. |
 | V6 Machine formats, streaming, snippets and usable explanations | WORKING for executed command/stream/explain paths; complete cross-backend metadata/snippet equivalence UNPROVEN. | `bd-qwkq`, E6.4/E6.7; do not replace absent BM25 detail with invented numbers. |
@@ -82,7 +88,7 @@ on another. V1–V24 retain the September 4 numbering.
 | V13 Corruption/restart/model change recover without mixed generations | PARTIAL. Real FEC repair and descriptor-lock fixes shipped; old-index refusals/rebuild verified. One automatic semantic RecoveryPlan across surfaces is incomplete. | `bd-p6z6.3/.4`, `bd-3fy9`, immutable lifecycle and retention tasks. |
 | V14 Bounded large-corpus search, native ANN and safe vector ownership | PARTIAL. Exact SIMD/Rayon and optional registry ANN exist. Native HNSW has retained-owner/persistence code and tests but no production adapter cutover; fsfs has no ANN feature. | `bd-kcek` (AzureCove); actual routing, tombstone recall and current incumbent evidence still required. |
 | V15 Optional cross-encoder actually scores refined results | WORKING on released full binary and real-model tests; native caller-pool execution wired. | No new reranker implementation task; broad quality and latency claims remain V16/V17. |
-| V16 Native quality inference replaces ONNX with parity and speed | PARTIAL. English/multilingual native selection and ONNX-free source profile ship. Default full still ONNX; no-C/C++ build, >0.999 parity, no ranking regression and within-2x latency acceptance remain open. | `bd-2ba5`; no automatic cross-space fallback or inferred completion from reranking. |
+| V16 Native quality inference replaces ONNX with parity and speed | PARTIAL. Native F32 parity/ranking passed the retained 355-input September 5 fixture; int8 failed that original >0.999 bar. Native library selection and identity-preserving load-time fallback exist. English/multilingual CLI selection and an ONNX-free source profile ship; stock full still uses ONNX. Broader migration, no-C/C++ build and within-2x latency remain open. | `bd-2ba5`; preserve fixture/producer scope and exact certificate limits. No inference-time cross-space fallback or inferred completion from reranking. |
 | V17 Refinement improves relevance on held-out real workloads | UNPROVEN broadly. Real known-item and phase tests demonstrate functioning retrieval, not superiority. | E6.6/E6.7 and `bd-2g2l`, `bd-q4rg`; paired stage ablations and slice losses required. |
 | V18 Latency/memory/index-cost envelopes are measured honestly | WORKING for the dated reference rows only. Native cold starts and broader corpus/host envelopes remain UNPROVEN. | Existing perf receipts/campaign, no new dashboard or blanket SLA. |
 | V19 Quill wins the frozen QG-1..10 targets against live Tantivy | UNPROVEN; ten `activated = false`. QG-3/4/5 promotion unavailable until matched durability witnesses; hardware/control/provenance blockers remain. | E8/E8-H and `bd-h6eh`, existing measured-loss tasks. Default-backend ruling does not certify the targets. |
@@ -104,7 +110,7 @@ on another. V1–V24 retain the September 4 numbering.
    fault hooks and retention roots; no lock weakening, v1 workaround or new
    authority scheme. Freshness is source event → durable publication → fresh
    independent result, with bounded processes and complete terminal logs.
-2. **G1: Warm progressive daemon search (M–L).** Reuse the phase sink in
+2. **G1: Warm progressive daemon search (M–L), `bd-fsfs-progressive-daemon-dq48i`.** Reuse the phase sink in
    `runtime.rs` across socket serving and CLI streaming. Introduce a bounded
    framed response carrying policy/generation identity before its first hit,
    Initial, optional Refined/RefinementFailed and exactly one terminal. Forward
@@ -115,6 +121,18 @@ on another. V1–V24 retain the September 4 numbering.
    must reuse the same daemon/model initialization without hash fallback. This
    is new integration coverage; it does not reopen the correctly scoped
    quality-deadline fix or promise a universal latency SLA.
+   The current socket handler executes under the shared resources/cache mutex
+   and writes only after releasing it. Moving socket writes into that locked
+   future would introduce a slow-reader stall. Keep socket I/O outside the
+   async scheduler and bound backpressure/admission so a stalled reader cannot
+   hold shared compute state indefinitely. Test a slow reader alongside an
+   independent complete query, as well as excessive and partial clients. Once
+   Initial has been exposed, never silently retry through direct search or
+   another generation: retain the admitted Initial and report the terminal
+   failure. Before publication, any existing fallback must be explicit and
+   cannot bypass policy/identity refusal. A broken connection cannot receive
+   a terminal frame; exactly-one terminal applies to a writable stream, while
+   server completion and resource drain must still occur after disconnect.
 3. **Relevance/conformance (L, existing E6 program).** Execute the existing
    real-model held-out lexical/fast/Initial/Refined/rerank ablations under E6.6's
    fixed rules. Attribute losses to actual stage/candidate/filter/hydration
@@ -124,7 +142,12 @@ on another. V1–V24 retain the September 4 numbering.
    transport-specific checks consume the finished stream route.
 4. **Native inference and ANN (L–XL, existing owners).** Native inference
    retains the original parity/ranking/latency/no-C-toolchain obligations in
-   `bd-2ba5`; source profile availability is partial completion. Native ANN
+   `bd-2ba5`; preserve the actual September 5 F32 fixture pass and int8 failure
+   rather than calling all parity work absent. `detect_embedder_stack_with_pool`
+   already prefers native and can select ONNX if native loading fails, retaining
+   the selected producer identity. Mid-query substitution into an existing
+   vector space is not allowed. Source profile availability and opt-in library
+   selection do not establish a default full-product migration. Native ANN
    reuses `ValidatedNativeHnsw`, exact FSVI owners and the existing brute-force
    oracle; bind graph persistence to composite identity before production
    cutover. Test tombstones/WAL, same-size vector substitution, reopening and
@@ -136,7 +159,7 @@ on another. V1–V24 retain the September 4 numbering.
    and offline refusal. Preserve current good release receipts; neither typed
    unsupported Windows nor a compile guard is a Windows product. Do not repeat
    a full release just to refresh this assessment.
-6. **G2: Bounded mandatory Quill gauntlet lane (M).** Profile the existing
+6. **G2: Bounded mandatory Quill gauntlet lane (M), `bd-bounded-quill-gate-uhx5d`.** Profile the existing
    excluded gauntlet binary and retain the complete selected-test inventory.
    Separate fast correctness from costly evidence construction through existing
    targets/runner selections, preserving every assertion and a runnable full
@@ -165,6 +188,89 @@ unnecessarily starve a useful local fix. New G1/G2 tasks plus narrowly scoped
 existing-bead amendments close these identified planning holes. No finite
 backlog guarantees undiscovered defects cannot exist or targets will be won.
 
+### Revision record
+
+**Ambition round 1 — actual delivery semantics.** Read the socket accept loop,
+per-client scheduler, shared-state guard and write/drain order. Strengthened G1
+with slow-reader isolation, bounded client admission, no replay after exposed
+Initial, and a physically achievable terminal/disconnect contract. These are
+requirements for the same integration change, not additional daemon projects.
+
+**Ambition round 2 — integration order and existing work.** A5's own description
+excludes platform certification; change its platform edge from blocking to
+related, leaving platform acceptance intact. Reopen the two unassigned registry
+records for acceptance reconciliation using actual 0.5.0 archives and clean
+consumers; do not publish again or close them merely from artifact existence.
+Link E6.7's final warm-stream acceptance to G1 while allowing baseline evaluation
+before that route lands. Keep G2 independently implementable. Native review
+corrected the initial table: F32 fixture parity and identity-preserving library
+load-time fallback already exist. Keep the unsatisfied parent criteria and
+historical failures explicit; no duplicate native implementation task.
+
+**Ambition round 3 — useful quantitative constraints.** The warm-daemon benefit
+is model-load amortization across distinct uncached requests, not repeated
+payload-cache hits. For a measured cold load cost L and N such requests, report
+L/N separately from per-request inference and queue time; do not count this as
+an incumbent-relative win. Bound admitted clients C and per-client queued bytes
+B so transport buffering is at most C×B, with one shared model residency charge
+and separately bounded compute/cache allocations. Test saturation and worker
+drain instead of assuming a bounded channel bounds the unbounded accept loop.
+For relevance, reuse E6.6's paired query/topic bootstrap, fixed held-out slices,
+power-derived sample sizes and multiplicity treatment. Stage delta is paired
+on the same queries; repeated runs/documents are not independent samples.
+Report Initial→Refined and Refined→reranked losses and uncertainty separately
+from Quill→Tantivy conformance. No new statistical framework or altered bar.
+
+**Refinement pass 1 — coverage and regression preservation.** Rechecked the
+active inventory for overlapping warm-daemon/gauntlet ownership and the full
+new descriptions. No duplicate owner found. Added explicit acceptance for
+nonstream/stdio/control routes, live disconnect semantics, slow clients and
+the complete gauntlet test inventory; tests stay with their implementation.
+
+**Refinement pass 2 — graph and priority.** Authoritative JSONL triage reports
+1,293 valid records, zero load errors and 36 actionable items; A5 is now ready.
+Dependency direction is final E6.7 → G1, with watch/native coordination related
+only. `br dep cycles` reports zero active cycles (two archived closed cycles
+retained). Triage exposed a consequence of reopening registry records: stale
+P0 proof reconciliation outranked live product defects. Reduced those two to P2
+with an explicit shipped-capability rationale, preserving their acceptance and
+remaining prerequisite. No implementation bead closed or peer assignee changed.
+
+**Refinement pass 3 — negative paths and actual API constraints.** The phase
+sink is a synchronous `FnMut`, so a blocking full-channel send inside it could
+stall the async worker even without direct socket I/O. Added explicit overload
+handling before/after Initial, readiness probes during a stalled response,
+large-response incremental drain and unchanged limit/filter/empty-result
+semantics. Bounded resident bytes do not mean silently truncating total output.
+Missing old route coverage requires a real new test, not invented prior proof.
+
+**Refinement pass 4 — proof scope and preservation.** Compared all modified
+records with the initial 5027b964 JSONL: existing descriptions, acceptance and
+assignees are unchanged; only justified notes/status/priority/edges differ.
+Fresh stream output has sequential frame IDs, Initial and Refined progress,
+three results per phase and one completed terminal. The quick-start daemon
+exited after an ownership-checked normal quit. Release, functional, statistical
+and performance claims remain separate. `git diff --check` passes. UBS exits 3
+because Markdown/JSONL are unsupported and no scanner ran; no allow-empty-scan
+override or scanner-clean claim. No further requirement change was needed.
+The final bounded watch replay then reproduced the current reader exclusion;
+appended that evidence to existing `bd-z2nfa`, preserving its acceptance. The
+first observer's missing verbosity is retained explicitly as no verdict.
+
+**Refinement pass 5 — convergence.** Read all eight changed Beads records and
+their full added text, including both new descriptions/acceptance, against the
+initial JSONL. Rechecked coverage, executable behavior, hard versus related
+edges, preservation of original requirements, bounded negative tests and
+evidence scope. No further planning or bead change was needed. The frozen
+Phase 3a prompt was applied before and after the three ambition rounds; the
+frozen Phase 5 prompt was applied in each of these five refinement passes.
+Final explicit-JSONL `bv` loads all 1,293 records with no errors and no active
+cycles: 1,149 closed, 96 open, 40 in progress, four blocked and four deferred;
+36 actionable. Two new beads, six existing records amended, zero closures.
+`br doctor` retains warnings for the now-older merge anchor, duplicate CLI
+paths and preserved recovery artifacts; DB/JSONL synchronization and integrity
+pass. These warnings do not justify altering shared coordination storage.
+
 ### Execution checklist for this skill pass
 
 - [x] Read both governing files and README completely; read current plans and architecture.
@@ -172,13 +278,14 @@ backlog guarantees undiscovered defects cannot exist or targets will be won.
 - [x] Check ownership, peer dirt, Beads synchronization and authoritative graph input.
 - [x] Extract V1–V24 and map each to code, proof, limits and existing coverage.
 - [x] Write initial bridge plan in this existing document.
-- [ ] Apply frozen Phase 3a; create only uncovered logical work with tests included.
-- [ ] Ambition round 1: strengthen user-facing execution semantics.
-- [ ] Ambition round 2: optimize integration order and remove false dependencies.
-- [ ] Ambition round 3: bound resource costs and retain statistically meaningful outcomes.
-- [ ] Reapply Phase 3a and update the same beads after the plan revisions.
-- [ ] Five refinement passes: coverage, dependency direction, negative tests, proof scope, convergence.
-- [ ] Validate final graph, full changed records, source links and diff; commit/push scoped files.
+- [x] Apply frozen Phase 3a; create only uncovered logical work with tests included.
+- [x] Ambition round 1: strengthen user-facing execution semantics.
+- [x] Ambition round 2: optimize integration order and remove false dependencies.
+- [x] Ambition round 3: bound resource costs and retain statistically meaningful outcomes.
+- [x] Reapply Phase 3a and update the same beads after the plan revisions.
+- [x] Five refinement passes: coverage, dependency direction, negative tests, proof scope, convergence.
+- [x] Validate final graph, full changed records, source links and diff.
+- [x] Complete scoped delivery of this plan and JSONL; terminal commit/push evidence is in Git and the session handoff.
 
 **Process artifact creation check.** This plan is PROCESS, not product runtime
 state. Consumer: the owner explicitly requesting the complete reality check
@@ -193,6 +300,58 @@ implementation could improve the product, but the explicit assessment request
 is the bounded deliverable now. Verdict: legitimate requested planning, zero
 new capability credit. Tests remain inside implementation beads despite the
 skill reference's companion-test suggestion: suite law forbids scope-splitting.
+
+**Bounded work audit.** Window: this assessment from 5027b964, including the
+initial 0236263b plan/Beads commit and its completing revision. USER 0, ENABLER 0,
+PROCESS 2 commits; new future implementation tasks are not shipped capability.
+The observable product would be unchanged without these edits. The benefit is
+the explicitly requested course correction and two previously unowned gaps.
+No enabler executed new code. Among the inspected user-facing backlog, native
+migration `bd-2ba5` dates to February 13; the current reproduced watch bug is
+the strongest immediate product target. No swarm or closure farming in this
+window. This is bounded requested planning; the next implementation block
+should execute the existing watch/composite chain or the newly ready A5/G1,
+not create another assessment or reporting framework.
+
+**Honesty inventory (this assessment only).** Prior release/source receipts
+were inspected for their claims; this is not a new audit of all past sessions.
+
+| # | Answer and bounded check |
+|---|---|
+| 1 Test weakening/deletion/skipping | No (checked: source/test/gate diff from 5027b964 and current reflog; only plan/JSONL changed, excluding pre-existing sidecars). |
+| 2 Specialized fake implementation | No (checked: no source edits; fresh probes execute the public binary and real models). |
+| 3 Golden regeneration | No (checked: the pre-existing untracked golden is preserved). |
+| 4 Suppression/gate/tolerance changes | No (checked: same script, 500 ms stock config, no gate edits or empty-scan override). |
+| 5 Gate gaming | No (checked: scoped claims for the unchanged three-document quickstart; no quality/performance superiority inferred). |
+| 6 Zero-run green | No (checked: actual index/search results and ten stream frames; first watch observer and UBS no-scan are explicitly not passes). |
+| 7 Unperformed execution claims | No (checked: fresh command receipts versus separately labeled retained release logs). |
+| 8 Proof-class inflation | No (checked: release source differs from checker HEAD; cached models, QEMU/Rosetta, native fixture parity and dated performance retain limits). |
+| 9 Hidden material failure | No (checked: excluded first watch observer, UBS exit 3, doctor warnings, native int8/certificate history and open QG targets are recorded). |
+| 10 Discarded stderr | No (checked: quickstart, stream and both watch attempts retain stdout/stderr). |
+| 11 Unsupported closure | No (checked: zero closures; two stale blocked records reopened, original acceptance preserved). |
+| 12 Requirements rewritten as success | No (checked: all existing bead descriptions/acceptance unchanged; dependency/priority changes have explicit reasons). |
+| 13 Subagent closures | Not applicable: no delegated work in this assessment. |
+| 14 Gameable delegation | Not applicable: no delegated work. |
+| 15 Unverified subagent report | Not applicable: no subagent report used as fresh proof. |
+| 16 Refusal farming | No (checked: current work graph delta and probe outcomes; no error-path item closed). |
+| 17 Shared-premise agreement as proof | No (checked: no independent-review or model-consensus claim). |
+| 18 Post-result denominator | No (checked: stock corpus unchanged; stream counts observational; no performance/quality metric claimed). |
+| 19 Moment needing explanation | The first watch observer expected an INFO message without enabling verbose and ran no query. It is retained as no verdict; one corrected observer produced the actual failure. Initial native-status prose also undercredited existing F32 work and was corrected in round 2. |
+| 20 Strongest evidence | Re-executable current public-binary watch failure beside successful two-tier indexing/search/stream, plus the full source/Beads diff and authoritative graph. |
+
+Disposition: no test/gate weakening or false closure found in the bounded
+window. The concrete observer error and provisional native-status correction
+are disclosed above and in the user updates; preserve readiness plus executed
+query evidence and fixture-specific claims to prevent zero-run/proof-class
+inflation (RH-2). This self-review is not independent certification.
+
+Fresh probe/validation manifest: `assessment-evidence-manifest.json` under the
+assessment artifact root above, SHA-256
+`a9186d9270832d3419a4debb71f116c077ce62334474a268360daf8cd6bcb66f`,
+covering 16 files. Final graph hash:
+`53fcef3cd609fb9e74f186e15f6a551fdfb29b592f34ee0f321f67e4ccae09d5`.
+All three owned daemon/watch processes exited; unrelated artifacts and shared
+coordination sidecars remain untouched. GitHub Actions are confirmed disabled.
 
 ---
 
