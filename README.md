@@ -115,9 +115,10 @@ Indexing, search, append and watch use the selected native producer;
 The CLI supplies and drains its existing blocking pool. Library users of
 `FsfsRuntime` attach their pool with `with_native_blocking_pool`.
 
-Use an optimized (`--release`) executable for native inference. An unoptimized
-build can exceed the default 500 ms quality deadline during cold model loading
-and return Initial results with a refinement-timeout explanation.
+Use an optimized (`--release`) executable for native inference. Cold model
+loading can exceed the default 500 ms quality deadline even in a release build,
+depending on the host, and return Initial results with a refinement-timeout
+explanation.
 In a daemon or TUI, successful initialization is retained even if that first
 query times out, so later queries can reuse the loaded model. Each query still
 has its own deadline and must match the index's producer identity.

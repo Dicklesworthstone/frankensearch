@@ -935,12 +935,20 @@ require(
     "rerank must retain the explicit optional native backend",
 )
 require(
+    features.get("semantic-support") == ["frankensearch-embed/model2vec"],
+    "semantic-support must compile the registered fast model implementation",
+)
+require(
     features.get("semantic-loaders")
     == [
-        "frankensearch-embed/model2vec",
+        "semantic-support",
         "frankensearch-embed/fastembed",
     ],
     "semantic-loaders must compile both registered model implementations",
+)
+require(
+    features.get("semantic-native") == ["semantic-support", "rerank"],
+    "semantic-native must pair the shared fast loader with the native quality backend",
 )
 require(
     features.get("embedded-models")
@@ -966,8 +974,8 @@ quickstart_target = next(
 )
 require(
     quickstart_target is not None
-    and quickstart_target.get("required-features") == ["semantic-loaders"],
-    "default quickstart must compile under stock loader-capable defaults",
+    and quickstart_target.get("required-features") == ["semantic-support"],
+    "default quickstart must compile under both supported semantic profiles",
 )
 quickstart = quickstart_path.read_text(encoding="utf-8")
 require(

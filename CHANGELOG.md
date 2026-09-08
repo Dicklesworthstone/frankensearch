@@ -52,6 +52,9 @@ Release history through [v1.9.1](https://github.com/Dicklesworthstone/frankensea
   rebuild from the original documents and configuration. Artifact checksums,
   output certificates and native producer fingerprints remain unchanged.
   Exact historical manifest reconstruction checks retain both 0.2.4 and 0.2.5.
+- **Quill version metadata.** New manifests record engine 0.2.4; earlier
+  manifest images remain readable and round-trip unchanged. Current oracle
+  contracts bind the new crate versions while preserving historical identities.
 
 Version set: facade 0.5.0; fsfs 1.10.0; rerank 0.3.0;
 core/index/lexical/fusion 0.2.5; embed 0.2.6;

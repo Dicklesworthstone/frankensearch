@@ -106,6 +106,12 @@ const BUILT_IN_PROFILE_V4_LEXICAL_CRATE_VERSION: &str = "0.2.3";
 // longer create runs, exactly like v1, v2 and v3 before them.
 const BUILT_IN_PROFILE_V5_QUILL_CRATE_VERSION: &str = "0.2.3";
 const BUILT_IN_PROFILE_V5_LEXICAL_CRATE_VERSION: &str = "0.2.3";
+// v6 (fsfs 1.10.0 release): quill is 0.2.4 and lexical is 0.2.5.
+// The lexical wrapper audit recorded by oracle dependency contract v7 retains
+// the registry Tantivy 0.26.1 artifact and v2's analyzer/schema contract.
+// Earlier profiles remain exact archival identities, never current admission.
+const BUILT_IN_PROFILE_V6_QUILL_CRATE_VERSION: &str = "0.2.4";
+const BUILT_IN_PROFILE_V6_LEXICAL_CRATE_VERSION: &str = "0.2.5";
 
 /// Closed engine family used by the cross-engine false-green guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,14 +427,8 @@ impl BuiltInEngineProfileReceipt {
     const V3_SCHEMA_VERSION: u32 = 3;
     const V4_SCHEMA_VERSION: u32 = 4;
     const V5_SCHEMA_VERSION: u32 = 5;
-    #[cfg_attr(
-        not(any(test, feature = "tantivy-oracle")),
-        expect(
-            dead_code,
-            reason = "typed built-in receipts are constructed only by oracle-backed or test lanes"
-        )
-    )]
-    const CURRENT_SCHEMA_VERSION: u32 = Self::V5_SCHEMA_VERSION;
+    const V6_SCHEMA_VERSION: u32 = 6;
+    const CURRENT_SCHEMA_VERSION: u32 = Self::V6_SCHEMA_VERSION;
 
     #[cfg_attr(
         not(any(test, feature = "tantivy-oracle")),
@@ -462,6 +462,7 @@ impl BuiltInEngineProfileReceipt {
             3 => self.validate_stored_v3(engines),
             4 => self.validate_stored_v4(engines),
             5 => self.validate_stored_v5(engines),
+            6 => self.validate_stored_v6(engines),
             _ => Err(GauntletError::InvalidContract {
                 reason: "built-in engine profile receipt schema is unsupported".to_owned(),
             }),
@@ -730,6 +731,49 @@ impl BuiltInEngineProfileReceipt {
         Ok(())
     }
 
+    /// v6 retains v2's semantic contract with the audited release adapter
+    /// versions. The earlier validators keep their frozen version bindings.
+    fn validate_stored_v6(&self, engines: &EnginePairIdentity) -> Result<(), GauntletError> {
+        self.subject_config.validate_stored_v1()?;
+        let (subject_implementation, subject_hash, oracle_hash) = match self.profile {
+            BuiltInEngineProfile::ScalarShipping | BuiltInEngineProfile::ScalarG1a => (
+                "frankensearch-quill/scalar-index",
+                self.subject_config.descriptor_hash_v1(),
+                BUILT_IN_PROFILE_V2_SCALAR_ORACLE_CONFIG_HASH,
+            ),
+            BuiltInEngineProfile::Cass => (
+                "frankensearch-quill/cass-index",
+                format!(
+                    "cass-semantic-v1:{}",
+                    self.subject_config.descriptor_hash_v1()
+                ),
+                BUILT_IN_PROFILE_V2_CASS_ORACLE_CONFIG_HASH,
+            ),
+        };
+        if self.schema_version != Self::V6_SCHEMA_VERSION
+            || engines.comparison_mode != ComparisonMode::CrossEngine
+            || engines.subject.implementation != subject_implementation
+            || engines.subject.crate_version != BUILT_IN_PROFILE_V6_QUILL_CRATE_VERSION
+            || engines.subject.config_hash != subject_hash
+            || engines.oracle.implementation != "frankensearch-lexical/tantivy-index"
+            || engines.oracle.crate_version != BUILT_IN_PROFILE_V6_LEXICAL_CRATE_VERSION
+            || engines.oracle.config_hash != oracle_hash
+            || engines.semantic_contract.as_ref() != Some(&self.stored_semantic_contract_v2())
+            || engines.subject.source_revision != engines.oracle.source_revision
+            || engines.subject.source_dirty != engines.oracle.source_dirty
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "built-in engine profile receipt v6 does not match its stored adapter identities and semantic contract"
+                    .to_owned(),
+            });
+        }
+        validate_recorded_producer_source(
+            &engines.subject.source_revision,
+            engines.subject.source_dirty,
+        )?;
+        Ok(())
+    }
+
     fn validate_creation(&self, engines: &EnginePairIdentity) -> Result<(), GauntletError> {
         self.validate_stored(engines)?;
         self.subject_config.validate_creation()?;
@@ -745,7 +789,9 @@ impl BuiltInEngineProfileReceipt {
                 CASS_TANTIVY_ORACLE_CONFIG_HASH,
             ),
         };
-        if engines.subject.crate_version != frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION
+        if self.schema_version != Self::CURRENT_SCHEMA_VERSION
+            || engines.subject.crate_version
+                != frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION
             || engines.subject.config_hash != expected_subject_hash
             || engines.oracle.crate_version != oracle_version.lexical_package_version
             || engines.oracle.config_hash != expected_oracle_hash
@@ -4625,23 +4671,25 @@ mod tests {
             BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION
             | BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION
             | BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION
-            | BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION => BuiltInEngineProfileReceipt {
+            | BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION
+            | BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION => BuiltInEngineProfileReceipt {
                 schema_version,
                 profile,
                 subject_config: QuillConfigReceipt::from_config(config),
             },
-            BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION => {
+            BuiltInEngineProfileReceipt::V6_SCHEMA_VERSION => {
                 BuiltInEngineProfileReceipt::new(profile, config)
             }
             _ => panic!("unsupported test profile schema {schema_version}"),
         };
         let semantic_contract = match schema_version {
             BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION => receipt.stored_semantic_contract_v1(),
-            // v3, v4 and v5 kept v2's semantic contract byte-identical.
+            // v3 through v6 kept v2's semantic contract byte-identical.
             BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION
             | BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION
             | BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION
-            | BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION => {
+            | BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION
+            | BuiltInEngineProfileReceipt::V6_SCHEMA_VERSION => {
                 receipt.stored_semantic_contract_v2()
             }
             _ => unreachable!("validated above"),
@@ -4658,6 +4706,10 @@ mod tests {
             BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION => (
                 BUILT_IN_PROFILE_V5_QUILL_CRATE_VERSION,
                 BUILT_IN_PROFILE_V5_LEXICAL_CRATE_VERSION,
+            ),
+            BuiltInEngineProfileReceipt::V6_SCHEMA_VERSION => (
+                BUILT_IN_PROFILE_V6_QUILL_CRATE_VERSION,
+                BUILT_IN_PROFILE_V6_LEXICAL_CRATE_VERSION,
             ),
             _ => (
                 BUILT_IN_PROFILE_V1_QUILL_CRATE_VERSION,
@@ -7064,7 +7116,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_profile_v5_is_current_while_v1_to_v4_remain_archive_only() {
+    fn built_in_profile_v6_is_current_while_v1_to_v5_remain_archive_only() {
         for profile in [
             BuiltInEngineProfile::ScalarShipping,
             BuiltInEngineProfile::ScalarG1a,
@@ -7075,6 +7127,7 @@ mod tests {
                 BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION,
                 BuiltInEngineProfileReceipt::V3_SCHEMA_VERSION,
                 BuiltInEngineProfileReceipt::V4_SCHEMA_VERSION,
+                BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION,
             ] {
                 let archived =
                     stored_profile_pair(profile, &QuillConfig::default(), archived_schema);
@@ -7083,22 +7136,22 @@ mod tests {
                     .expect("frozen receipt remains archive-valid");
                 assert!(
                     archived.validate_builtin_contract().is_err(),
-                    "schema v{archived_schema} cannot create a run under the cass#453 \
-                     segment-reclamation dependency contract (quill 0.2.3, lexical 0.2.3)"
+                    "schema v{archived_schema} cannot create a run under the release \
+                     dependency contract (quill 0.2.4, lexical 0.2.5)"
                 );
             }
 
             let current = stored_profile_pair(
                 profile,
                 &QuillConfig::default(),
-                BuiltInEngineProfileReceipt::V5_SCHEMA_VERSION,
+                BuiltInEngineProfileReceipt::V6_SCHEMA_VERSION,
             );
             current
                 .validate_stored_contract()
-                .expect("v5 receipt remains independently replay-valid");
+                .expect("v6 receipt remains independently replay-valid");
             current
                 .validate_builtin_contract()
-                .expect("v5 receipt must match the current adapters");
+                .expect("v6 receipt must match the current adapters");
         }
     }
 
@@ -7190,10 +7243,23 @@ mod tests {
 
     #[test]
     fn built_in_profile_v1_rejects_every_bound_identity_mutation() {
+        assert_profile_rejects_every_bound_identity_mutation(
+            BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION,
+        );
+    }
+
+    #[test]
+    fn built_in_profile_v6_rejects_every_bound_identity_mutation() {
+        assert_profile_rejects_every_bound_identity_mutation(
+            BuiltInEngineProfileReceipt::V6_SCHEMA_VERSION,
+        );
+    }
+
+    fn assert_profile_rejects_every_bound_identity_mutation(schema_version: u32) {
         let baseline = stored_profile_pair(
             BuiltInEngineProfile::ScalarG1a,
             &QuillConfig::default(),
-            BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION,
+            schema_version,
         );
         macro_rules! reject_pair_mutation {
             ($label:literal, $mutation:expr) => {{
