@@ -4,7 +4,7 @@ All notable changes to [frankensearch](https://github.com/Dicklesworthstone/fran
 
 Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/frankensearch/releases) unless noted otherwise. Tags that share a commit with another release are called out explicitly. Each entry links to representative commits using full commit URLs.
 
-Release history through [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0), published 2026-09-08. The 0.5.0 crate versions are published on crates.io; their evidence-bundle GitHub Release is pending. The latest update covers every landed commit from v1.9.1 through v1.10.0 using git diffs, release metadata and checked-in Beads; see [research coverage](CHANGELOG_RESEARCH.md). Earlier history is preserved. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.**
+Release history through [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) and the [0.5.0 crate bundle](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0), published 2026-09-08. All 13 crate versions are also published on crates.io. The latest update covers every landed commit from v1.9.1 through v1.10.0 using git diffs, release metadata and checked-in Beads; see [research coverage](CHANGELOG_RESEARCH.md). Earlier history is preserved. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.**
 
 Scope window: this update researches v1.9.1 → v1.10.0 and their 2026-09-08 publication records.
 
@@ -13,7 +13,7 @@ Scope window: this update researches v1.9.1 → v1.10.0 and their 2026-09-08 pub
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
-| [crates-v0.5.0](https://github.com/Dicklesworthstone/frankensearch/tree/crates-v0.5.0) | Tag; registry versions published | 2026-09-08 | All 13 publishable members share v1.10.0 source; evidence-bundle GitHub Release pending |
+| [crates-v0.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0) | Library bundle | 2026-09-08 | All 13 publishable members and release evidence share v1.10.0 source; binary release retains latest routing |
 | [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) | Release | 2026-09-07 | Self-update preserves Linux ABI and full/lite semantic capability |
 | [crates-v0.4.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.4.3) | Library bundle | 2026-09-07 | All 13 publishable workspace members released to crates.io; same source commit as v1.9.1 |
 | [v1.9.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.0) | Release | 2026-09-07 | Native quality selection, verified producer identities, bounded refinement, reranking, watcher recovery, FrankenSQLite 0.3.17, and Quill garbage collection |
@@ -47,9 +47,9 @@ Both release tags bind to
   --features semantic-native` builds Model2Vec, native quality inference and
   native reranking without FastEmbed or ONNX Runtime. It defaults to English
   native F32 quality; bare `download-models` provisions its configured fast/quality
-  pair. Applying a self-update or an unclassified rollback backup is refused
-  for this profile, so upgrade it from source; update checks and backup listing
-  remain available. Standard full binaries
+  pair. Binary self-update and rollback application are refused for this
+  profile, so upgrade it from source; update checks and backup listing remain
+  available. Standard full binaries
   retain ONNX as their default quality producer. This does not complete the
   native migration or remove every transitive C/assembler requirement.
 - **Caller-owned inference and cancellation.** Native detection, embedding and
@@ -135,6 +135,14 @@ experimental. No performance win or complete native migration is claimed.
 The final release revision passed all ten stages of the unchanged repository
 quality gate, including seven real-model end-to-end tests. Six binary variants
 were built with DSR on real hosts; GitHub Actions remained disabled.
+All nine fresh public-registry consumer configurations passed, including actual
+Quill and Tantivy matching/absent-term queries in the combined-feature run.
+Five public installers and six actual 1.9.1 updates installed the expected binary
+hashes and capability profiles.
+The [crate bundle](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0)
+contains the actual public archives and a per-file evidence manifest. Its README
+distinguishes surviving originals, reconstructed summaries and repeated Linux
+checks after the original temporary evidence directory disappeared.
 
 The full Linux x86_64 GNU binary requires glibc 2.43 or newer. Full Linux and
 Apple Silicon binaries passed real Potion/ONNX indexing, refined search and
@@ -163,7 +171,7 @@ The native work advances [bd-2ba5](https://github.com/Dicklesworthstone/frankens
 which remains open: ONNX is still the standard quality producer and the native
 profile does not establish every native-default or toolchain criterion.
 [bd-apqfa](https://github.com/Dicklesworthstone/frankensearch/blob/9c5d8867cbbc7edf696a24410a86af08402fc468/.beads/issues.jsonl#L711)
-defines the six-platform, 13-crate release scope; the linked record is the frozen
+defines the release scope of six binary variants and 13 crates; the linked record is the frozen
 release-source snapshot, before publication.
 
 ## [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) -- 2026-09-07
