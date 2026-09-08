@@ -13,8 +13,8 @@ existing changelog/release notes; README. Durable release evidence lives at
 
 | Chunk | State | Coverage / open questions |
 |---|---|---|
-| Version spine and publication | Researching | v1.10.0 is a public GitHub Release; crates-v0.5.0 currently a public tag with 13 registry publications, evidence-bundle Release still pending |
-| Complete landed commit window | Not started | Inventory every commit and changed production surface; separate capability changes from release bookkeeping |
+| Version spine and publication | Distilled | Canonical timeline now includes v1.10.0 as a Release and crates-v0.5.0 as a tag with 13 registry publications; evidence-bundle Release still pending |
+| Complete landed commit window | Researching | 21 commits inventoried; inspect production diffs and tests, separate capability changes from release bookkeeping |
 | Tracker workstreams | Not started | Match source changes and actual closure states; preserve open native migration scope |
 | Synthesis and link validation | Not started | Update canonical timeline and themed entries, representative commits, exact tracker links, validation limits |
 

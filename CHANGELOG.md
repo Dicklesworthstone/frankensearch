@@ -4,12 +4,14 @@ All notable changes to [frankensearch](https://github.com/Dicklesworthstone/fran
 
 Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/frankensearch/releases) unless noted otherwise. Tags that share a commit with another release are called out explicitly. Each entry links to representative commits using full commit URLs.
 
-Release history through [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) and the [0.4.3 crate bundle](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.4.3), published 2026-09-07. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.**
+Release history through [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0), published 2026-09-08. The 0.5.0 crate versions are published on crates.io; their evidence-bundle GitHub Release is pending. The latest update covers every landed commit from v1.9.1 through v1.10.0 using git diffs, release metadata and checked-in Beads; see [research coverage](CHANGELOG_RESEARCH.md). Earlier history is preserved. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.**
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
+| [crates-v0.5.0](https://github.com/Dicklesworthstone/frankensearch/tree/crates-v0.5.0) | Tag; registry versions published | 2026-09-08 | All 13 publishable members share v1.10.0 source; evidence-bundle GitHub Release pending |
 | [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) | Release | 2026-09-07 | Self-update preserves Linux ABI and full/lite semantic capability |
 | [crates-v0.4.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.4.3) | Library bundle | 2026-09-07 | All 13 publishable workspace members released to crates.io; same source commit as v1.9.1 |
 | [v1.9.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.0) | Release | 2026-09-07 | Native quality selection, verified producer identities, bounded refinement, reranking, watcher recovery, FrankenSQLite 0.3.17, and Quill garbage collection |
@@ -24,7 +26,9 @@ Release history through [v1.9.1](https://github.com/Dicklesworthstone/frankensea
 
 ---
 
-## [fsfs 1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) / crate bundle 0.5.0 -- 2026-09-08
+## [fsfs 1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) / crates 0.5.0 -- 2026-09-08
+
+Compare: [v1.9.1...v1.10.0](https://github.com/Dicklesworthstone/frankensearch/compare/v1.9.1...v1.10.0)
 
 Both release tags bind to
 [`9c5d8867`](https://github.com/Dicklesworthstone/frankensearch/commit/9c5d8867cbbc7edf696a24410a86af08402fc468).
