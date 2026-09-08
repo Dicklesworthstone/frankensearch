@@ -14,9 +14,9 @@ existing changelog/release notes; README. Durable release evidence lives at
 | Chunk | State | Coverage / open questions |
 |---|---|---|
 | Version spine and publication | Distilled | Canonical timeline now includes v1.10.0 as a Release and crates-v0.5.0 as a tag with 13 registry publications; evidence-bundle Release still pending |
-| Complete landed commit window | Researching | 21 commits inventoried; inspect production diffs and tests, separate capability changes from release bookkeeping |
-| Tracker workstreams | Not started | Match source changes and actual closure states; preserve open native migration scope |
-| Synthesis and link validation | Not started | Update canonical timeline and themed entries, representative commits, exact tracker links, validation limits |
+| Complete landed commit window | Validated | All 21 commits classified below; independent audit of all eight changed fsfs/facade paths completed, corrections incorporated |
+| Tracker workstreams | Distilled | Frozen source and current HEAD agree: durability closed, bd-2ba5 native migration and bd-apqfa release still in progress; exact frozen JSONL line links added |
+| Synthesis and link validation | Researching | Expanded themed entry and representative commits; structural and live-link checks pending |
 
 Initial live check: GitHub v1.10.0 Release ID385005152 published
 2026-09-08T19:36:49Z, latest=true. Previous v1.9.1 published
@@ -24,3 +24,86 @@ Initial live check: GitHub v1.10.0 Release ID385005152 published
 The existing changelog's timeline/scope note still stopped at1.9.1 even though
 its new1.10.0 entry existed. Do not describe the pending crate-bundle tag as an
 already-published GitHub Release.
+
+## Complete commit coverage
+
+The release window contains 21 commits (including one merge), touching 36 files.
+Every commit is accounted for here; the canonical changelog selects the commits
+that best explain landed behavior instead of repeating this inventory.
+
+| Commit | Classification and distilled result |
+|---|---|
+| `71551e93` | Previous-release README version bookkeeping; no new 1.10 capability |
+| `0bc24c38` | Previous-release qualification documentation; no new 1.10 capability |
+| `798a9337` | Merge of concurrent README publication update; no production change |
+| `46ce8a6a` | All 20 FrankenSQLite members and four consumers advance to 0.3.18; 396 FTS5/storage tests and reopen evidence in upgrade log |
+| `4e789c2d` | Checked aligned little-endian weight copy, scalar fallback, exceptional-bit/alignment/trailing-byte tests; no certified speedup |
+| `00f00cf9` | Daemon retains initialized quality model after timed-out waiter; producer/generation checks and pool replacement reset |
+| `e21bfbb8` | Explicit native multilingual selection reaches index/search/doctor/append and daemon producer-bound cache; conflict refusal and real cross-language tests |
+| `b31e792d` | Shared semantic-support feature and ONNX-free semantic-native source profile; English native quality default, configured-pair downloads, refusal of binary self-update/unclassified rollback replacement |
+| `c002fd85` | Facade native/rerank API parity; hash-dependent examples/tests declare required features |
+| `19bf2195` | NativeReranker async trait and caller-owned pool; worker retains model admission, cancellation checkpoints, no inline fallback |
+| `e1f935e7` | NativeEmbedder stopped-pool/shutdown-race refusal; request and child cancellation before output; exact producer-bit tests |
+| `12339664` | Cold reranker load on caller pool; selected-model cache identity frozen, completed initialization retained, worker owns admission after waiter drop |
+| `e0b7ca7b` | Rerank stage deadline spans file reads/capacity/inference; cold model selection/loading precedes that stage and is outside its timer; preserves fused results, propagates cancellation, prevents timeout response caching |
+| `96a66f39` | Actual runtime/model regressions for stopped pool, shutdown after submission and cancellation winning over a load error |
+| `cd4c73a9` | Detection preflight, rejected-submission fallback refusal and post-join request cancellation implement those lifecycle cases |
+| `bc5e86d1` | Creator-owned operation guards release durability locks despite retained descriptors; read guard covers CRC/sidecars/mapping, repair relocks published inode |
+| `87dbb5f4` | Release bead starts; no product behavior |
+| `1b67c0cb` | All 13 forward version bumps and historical adapter fingerprint reconstruction; candidate not independently the final release source |
+| `194c04c0` | Release freeze tracker update; no product behavior |
+| `e82dee23` | Quill engine 0.2.4/CRC with exact historical wire round trips, oracle v7/profile v6, current semantic packaging composition, cold-load limits |
+| `9c5d8867` | Only ChaCha 0.10.1→0.10.2 lock record changes; final qualified and published source |
+
+Research used full commit messages, scoped production/test diffs, the existing
+upgrade log and feature manifests. Runtime/facade changes receive an independent
+read-only draft audit while the root checks dependencies, durability and version
+contracts. Tests mentioned as historical qualification are evidence from their
+landed records; no claim that this documentation pass reran those tests.
+
+## Tracker and release checks
+
+- At frozen release source, `.beads/issues.jsonl` line 102 is bd-2ba5 (open
+  native migration), line 711 is bd-apqfa (release in progress), and line 778 is
+  bd-durability-lock-release-v5lj4 (closed at 2026-09-08T00:11:06Z). Current HEAD
+  agrees. Canonical links pin that immutable file and exact line.
+- The durability closure cites baseline retained-descriptor failures, candidate
+  regressions, 160 durability tests and an unchanged 10-stage gate. The original
+  intermittent repair failure's lock holder was never observed; no fork-holder
+  attribution or performance claim is inferred.
+- Live GitHub and remote refs rechecked during this pass: v1.10.0 is public
+  Release 385005152 with 25 assets, both release tags peel to
+  `9c5d8867cbbc7edf696a24410a86af08402fc468`, and Actions are disabled.
+- Upstream FrankenSQLite 0.3.18 release and RustCrypto stream-ciphers PR583 were
+  read live to confirm dependency-fix descriptions. The local ChaCha upgrade is
+  an upstream defect correction, not a claim of locally reproducing UB.
+- Publication qualification and evidence recovery are documented separately in
+  the release bundle README. Original root temporary evidence disappeared at
+  19:48Z; the recovery record distinguishes exact surviving originals,
+  reconstructed summaries and repeated public delivery probes.
+
+## Validation
+
+The independent runtime review caught an overstatement in the draft: cold
+reranker initialization uses the caller's pool but occurs before the rerank
+stage timer. The changelog now states that boundary explicitly. This is a
+documentation correction against final source, not a runtime behavior change.
+The review also identified native-only delivery boundaries worth making explicit:
+English F32 defaults, configured-pair downloads and refusal of self-update or
+unclassified rollback replacement. The canonical profile bullet now includes
+those behaviors, with the native-profile commit as its representative link.
+
+- [x] Independent runtime/facade coverage audit incorporated: corrected timer
+  boundary, source-profile update behavior and retry after model provisioning.
+  The reviewer found no other missing capability waves or open questions.
+- [x] Skill structural validator on canonical CHANGELOG.md: no errors, one
+  warning about possible bare hashes entirely in preserved older content.
+  The v1.9.1 and older entries are byte-identical to the pre-skill version
+  (SHA256 `f9c4ca2d7ee641875c7f695b777ec56f450ab9e50b38f1ab953b875c803e48c1`).
+- [x] Initial 18-link scoped audit passed with no warnings; the added retained
+  initialization link and final bundle URL receive the final publication check. Older
+  historical links are outside this reconstruction window.
+- [ ] Scope, dates, actual Release-versus-tag states, versions, tracker states
+  and upgrade/platform limitations cross-checked against final publication.
+- [ ] Canonical changelog and this research memo included in the final evidence
+  bundle as post-release documentation, distinct from the frozen product source.

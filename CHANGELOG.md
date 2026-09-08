@@ -6,6 +6,8 @@ Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/fra
 
 Release history through [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0), published 2026-09-08. The 0.5.0 crate versions are published on crates.io; their evidence-bundle GitHub Release is pending. The latest update covers every landed commit from v1.9.1 through v1.10.0 using git diffs, release metadata and checked-in Beads; see [research coverage](CHANGELOG_RESEARCH.md). Earlier history is preserved. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.**
 
+Scope window: this update researches v1.9.1 → v1.10.0 and their 2026-09-08 publication records.
+
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
@@ -33,30 +35,81 @@ Compare: [v1.9.1...v1.10.0](https://github.com/Dicklesworthstone/frankensearch/c
 Both release tags bind to
 [`9c5d8867`](https://github.com/Dicklesworthstone/frankensearch/commit/9c5d8867cbbc7edf696a24410a86af08402fc468).
 
-- **FrankenSQLite 0.3.18.** The binary lock and database requirements advance
-  together from 0.3.17. The final release revision passed all ten stages of the
-  unchanged repository quality gate, including seven real-model end-to-end tests.
-- **ChaCha RNG backend correction.** The release lock uses `chacha20 0.10.2`.
-  RustCrypto yanked 0.10.1 for an SSE4.1 intrinsic in its SSE2 RNG backend;
-  the affected RNG feature is present through the SQLite and PDF dependencies.
-  The patch release fixes that backend without changing dependency interfaces.
+### Delivered capability: native semantic selection and bounded inference
+
+- **Native multilingual quality search.** An explicitly selected native
+  multilingual model now reaches indexing, search, doctor, daemon reuse and
+  append. Cache admission uses the selected producer identity, and conflicting
+  native selections fail before cold initialization can hide the conflict as
+  a timeout. Real-model tests cover cross-language retrieval and exact appended
+  vectors.
 - **An explicit native semantic source profile.** `--no-default-features
   --features semantic-native` builds Model2Vec, native quality inference and
-  native reranking without FastEmbed or ONNX Runtime. Standard full binaries
+  native reranking without FastEmbed or ONNX Runtime. It defaults to English
+  native F32 quality; bare `download-models` provisions its configured fast/quality
+  pair. Applying a self-update or an unclassified rollback backup is refused
+  for this profile, so upgrade it from source; update checks and backup listing
+  remain available. Standard full binaries
   retain ONNX as their default quality producer. This does not complete the
   native migration or remove every transitive C/assembler requirement.
-- **Caller-owned inference and cancellation.** Native detection and inference
-  reject stopped blocking pools and observe request cancellation. Cold
-  reranker initialization uses the caller's pool, and reranking has a bounded
-  stage deadline. A timed-out initialization may finish into the retained
-  model cache for later requests; it does not extend the original deadline.
-  The facade's `native` and `rerank` exports are consistent, and native-only
-  all-target checks no longer compile examples that require the hash feature.
+- **Caller-owned inference and cancellation.** Native detection, embedding and
+  async reranking reject stopped blocking pools, including shutdown races that
+  would otherwise run the work on the async executor. Workers check request
+  cancellation between chunks and before publishing vectors or scores; an
+  already-running tensor kernel is not preempted. Cold reranker initialization
+  also uses the caller's pool. The facade's `native` and `rerank` exports now
+  expose the same native API, and hash-dependent test/example targets declare
+  that requirement so native-only all-target builds can compile.
+- **Timeouts preserve useful work without poisoning caches.** Initialized
+  quality models survive a timed-out daemon request and remain bound to their
+  producer and pool generation. Rerank deadlines cover candidate-file reads,
+  capacity waits and inference; expiration preserves the fused results, and
+  that partial response does not enter the search cache.
+  Cold reranker selection/loading runs on the caller's pool before that stage;
+  it is outside the stage timer. Quality initialization admitted before a
+  request timeout can finish into the model cache for a later request.
+  Reranker discovery retries on later queries after a missing model is
+  installed, while each query keeps its own selected-model cache identity.
+- **Bit-preserving weight loading.** Aligned little-endian F32 model weights use
+  a checked bulk copy; other layouts keep scalar decoding. Tests cover every
+  alignment, exceptional float bit patterns and incomplete trailing bytes.
+  This is a loading-path improvement, without a certified performance claim.
+
+Representative commits: [multilingual wiring](https://github.com/Dicklesworthstone/frankensearch/commit/e21bfbb831e10c06010ccf9663cabacc8711809d),
+[native source profile](https://github.com/Dicklesworthstone/frankensearch/commit/b31e792db48f1ff7149e23b2db94ec57c2d8e44a),
+[caller-owned reranking](https://github.com/Dicklesworthstone/frankensearch/commit/19bf219531a6e95923994e84ea4763bd81e64d04),
+[rerank deadlines](https://github.com/Dicklesworthstone/frankensearch/commit/e0b7ca7b2d3d8d18047deb5e02214aeb82d7609b),
+[retained initialization and retry](https://github.com/Dicklesworthstone/frankensearch/commit/123396648ece10863c67bf4c258732260965da30),
+[weight decoding](https://github.com/Dicklesworthstone/frankensearch/commit/4e789c2d62b1e4b9eb45d6e25cf53188aa8228a5).
+
+### Durability and dependency fixes
+
 - **Durability locks end with their operation.** Protection, verification and
   repair explicitly release their file locks even when a duplicate descriptor
-  remains open. Tests retain a real duplicate and exercise actual RaptorQ
-  corruption recovery. This proves the lock-lifetime defect; the holder behind
-  the earlier intermittent parallel repair failure was not observed.
+  remains open. Reader guards cover sidecar/CRC reads and mapping; a guard
+  dropped in another process cannot unlock its creator's live operation.
+  Tests retain a real duplicate and exercise actual RaptorQ corruption recovery.
+  They establish the lock-lifetime defect; the holder behind the earlier
+  intermittent parallel repair failure was not observed.
+- **FrankenSQLite 0.3.18.** All 20 locked family members and four database
+  consumers advance together from 0.3.17, retaining Asupersync 0.4.10. This
+  incorporates upstream WAL journal-switch, read-only reader registration and
+  Linux I/O cancellation fixes. The dependency update passed 396 FTS5-enabled
+  storage/pipeline tests and commit/rollback reopen probes; no caller API
+  migration was needed. See the [upstream release](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.18).
+- **ChaCha RNG backend correction.** The release lock uses `chacha20 0.10.2`.
+  RustCrypto [yanked 0.10.1](https://github.com/RustCrypto/stream-ciphers/pull/583)
+  for an SSE4.1 intrinsic in its SSE2 RNG backend. That RNG feature is present
+  through the SQLite/PDF closure; the patch fixes it without changing the other
+  locked dependency records. This does not claim a locally reproduced UB failure
+  or a warning-free dependency audit.
+
+Representative commits: [operation-owned file locks](https://github.com/Dicklesworthstone/frankensearch/commit/bc5e86d198ceb56561ac6d257b70ffba521e6f3c),
+[FrankenSQLite qualification](https://github.com/Dicklesworthstone/frankensearch/commit/46ce8a6a690f0495fef8ff4e6449907f95977cc9),
+[ChaCha correction](https://github.com/Dicklesworthstone/frankensearch/commit/9c5d8867cbbc7edf696a24410a86af08402fc468).
+
+### Crate publication and index migration
+
 - **Rebuild existing semantic indexes.** All 13 publishable packages receive
   new versions from one source revision. The embedder adapter version changes
   Potion and ONNX manifest fingerprints, so 1.9.x indexes require an explicit
@@ -65,13 +118,23 @@ Both release tags bind to
   Exact historical manifest reconstruction checks retain both 0.2.4 and 0.2.5.
 - **Quill version metadata.** New manifests record engine 0.2.4; earlier
   manifest images remain readable and round-trip unchanged. Current oracle
-  contracts bind the new crate versions while preserving historical identities.
+  v7 and built-in profile v6 contracts bind the new crate versions while
+  preserving historical identities. Older evidence remains readable but cannot
+  admit a new run. The packaging check follows the actual `semantic-support`
+  feature composition while retaining negative checks for malformed profiles.
+
+Representative commits: [version and producer provenance update](https://github.com/Dicklesworthstone/frankensearch/commit/1b67c0cb5cdeb6edeb8fa945b52da4d877215bef),
+[Quill and packaging contracts](https://github.com/Dicklesworthstone/frankensearch/commit/e82dee232b01243c10017132e5611f47f4e51f2f).
 
 Version set: facade 0.5.0; fsfs 1.10.0; rerank 0.3.0;
 core/index/lexical/fusion 0.2.5; embed 0.2.6;
 storage/durability/quill 0.2.4; tui/ops 0.2.1. All 13 public crate archives match
 their verified packages and this source revision. The ops crate remains
 experimental. No performance win or complete native migration is claimed.
+
+The final release revision passed all ten stages of the unchanged repository
+quality gate, including seven real-model end-to-end tests. Six binary variants
+were built with DSR on real hosts; GitHub Actions remained disabled.
 
 The full Linux x86_64 GNU binary requires glibc 2.43 or newer. Full Linux and
 Apple Silicon binaries passed real Potion/ONNX indexing, refined search and
@@ -91,6 +154,17 @@ fsfs index /original/source --full --index-dir /existing/index --config /origina
 For this upgrade, the changed producer fingerprint triggers generation
 replacement. Keep the original inputs; unchanged model bytes alone do not make
 an older index compatible.
+
+### Workstreams
+
+Closed workstreams: [bd-durability-lock-release-v5lj4](https://github.com/Dicklesworthstone/frankensearch/blob/9c5d8867cbbc7edf696a24410a86af08402fc468/.beads/issues.jsonl#L778)
+records the descriptor-lifetime reproduction, repair and full-gate evidence.
+The native work advances [bd-2ba5](https://github.com/Dicklesworthstone/frankensearch/blob/9c5d8867cbbc7edf696a24410a86af08402fc468/.beads/issues.jsonl#L102),
+which remains open: ONNX is still the standard quality producer and the native
+profile does not establish every native-default or toolchain criterion.
+[bd-apqfa](https://github.com/Dicklesworthstone/frankensearch/blob/9c5d8867cbbc7edf696a24410a86af08402fc468/.beads/issues.jsonl#L711)
+defines the six-platform, 13-crate release scope; the linked record is the frozen
+release-source snapshot, before publication.
 
 ## [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) -- 2026-09-07
 
