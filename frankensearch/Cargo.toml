@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch"
-version = "0.4.3"
+version = "0.5.0"
 description = "Two-tier hybrid search for Rust: sub-millisecond initial results, quality-refined rankings in 150ms"
 edition.workspace = true
 license-file.workspace = true
@@ -82,10 +82,42 @@ ndarray = { workspace = true }
 rayon = { workspace = true }
 sha2 = { workspace = true }
 
+[[test]]
+name = "integration"
+required-features = ["hash"]
+
+[[test]]
+name = "reconciliation"
+required-features = ["hash"]
+
+[[test]]
+name = "cross_component"
+required-features = ["hash"]
+
+[[example]]
+name = "basic_search"
+required-features = ["hash"]
+
+[[example]]
+name = "streaming_search"
+required-features = ["hash"]
+
+[[example]]
+name = "config_override"
+required-features = ["hash"]
+
+[[example]]
+name = "bench_quick"
+required-features = ["hash"]
+
+[[example]]
+name = "validate_full_pipeline"
+required-features = ["hash"]
+
 [[bench]]
 name = "search_bench"
 harness = false
-required-features = ["lexical-tantivy"]
+required-features = ["hash", "lexical-tantivy"]
 
 [[bench]]
 name = "fsvi_4bit_vs_incumbent"

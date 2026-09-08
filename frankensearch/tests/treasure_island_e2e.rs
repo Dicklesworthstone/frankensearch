@@ -189,7 +189,10 @@ fn corpus() -> Vec<Passage> {
 ///
 /// Only the retrieval lanes need this; the fixture-shape tests work on the
 /// passages directly.
-#[cfg(any(feature = "quill", feature = "native"))]
+#[cfg(any(
+    feature = "quill",
+    all(feature = "native", any(feature = "hash", feature = "model2vec"))
+))]
 fn chapters_of(passages: &[Passage], ids: &[String]) -> BTreeSet<u32> {
     ids.iter()
         .filter_map(|id| passages.iter().find(|p| &p.id == id))
@@ -1733,10 +1736,20 @@ mod lexical {
 
 #[cfg(feature = "native")]
 mod semantic {
-    use super::{Passage, SEMANTIC_QUERIES, chapters_of, corpus, resolve_model_dir};
-    use frankensearch::{
-        Embedder, HashAlgorithm, HashEmbedder, InMemoryVectorIndex, NativeEmbedder, SyncEmbed,
-    };
+    #[cfg(any(feature = "hash", feature = "fastembed"))]
+    use super::Passage;
+    #[cfg(any(feature = "hash", feature = "model2vec"))]
+    use super::chapters_of;
+    use super::resolve_model_dir;
+    #[cfg(any(feature = "hash", feature = "fastembed", feature = "model2vec"))]
+    use super::{SEMANTIC_QUERIES, corpus};
+    #[cfg(any(feature = "hash", feature = "fastembed", feature = "model2vec"))]
+    use frankensearch::Embedder;
+    #[cfg(any(feature = "hash", feature = "fastembed"))]
+    use frankensearch::InMemoryVectorIndex;
+    #[cfg(feature = "hash")]
+    use frankensearch::{HashAlgorithm, HashEmbedder};
+    use frankensearch::{NativeEmbedder, SyncEmbed};
 
     #[cfg(feature = "model2vec")]
     fn stage_verified_model_fixture(
@@ -2445,6 +2458,7 @@ mod semantic {
     /// real embedder implements [`SyncEmbed`] while the hash control implements
     /// [`Embedder`] with inherent sync helpers, and forcing them into one bound
     /// would need an adapter that obscures what is being compared.
+    #[cfg(feature = "hash")]
     fn index_with(
         embed_batch: impl Fn(&[&str]) -> Vec<Vec<f32>>,
         dimension: usize,
@@ -2462,6 +2476,7 @@ mod semantic {
     /// Returns the whole vector rather than a count because the assertion is a
     /// PAIRED comparison: what matters is whether the real embedder succeeds on
     /// the same query the degraded one fails, not the two totals.
+    #[cfg(feature = "hash")]
     fn hit_vector(
         embed_one: impl Fn(&str) -> Vec<f32>,
         index: &InMemoryVectorIndex,
@@ -2500,6 +2515,7 @@ mod semantic {
     }
 
     #[test]
+    #[cfg(feature = "hash")]
     fn concept_queries_find_the_right_chapters_and_hashing_cannot() {
         let Some(model_dir) = resolve_model_dir("semantic concept-retrieval lane") else {
             return;
@@ -2617,6 +2633,7 @@ mod semantic {
     }
 
     #[test]
+    #[cfg(feature = "hash")]
     fn a_hash_embedder_is_never_mistaken_for_a_semantic_one() {
         // The degradation is only detectable if these two disagree about
         // themselves. Guard the property directly — it is load-bearing for the

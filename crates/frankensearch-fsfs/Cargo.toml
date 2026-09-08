@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-fsfs"
-version = "1.9.1"
+version = "1.10.0"
 description = "Standalone fsfs CLI for two-tier hybrid local search"
 edition.workspace = true
 rust-version.workspace = true
@@ -126,7 +126,7 @@ ureq = { version = "3", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [dev-dependencies]
-frankensearch = { path = "../../frankensearch", version = "0.4.3", default-features = false }
+frankensearch = { path = "../../frankensearch", version = "0.5.0", default-features = false }
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
 frankensearch-lexical = { workspace = true }

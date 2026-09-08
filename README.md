@@ -58,6 +58,11 @@ the compiled ABI and the full/lite profile for subsequent updates.
 Semantic indexes written by 1.7/1.8 require an explicit rebuild with the original
 configuration: `fsfs index /original/source --index-dir /existing/index`.
 Indexes written by 1.9.0 can be opened directly by 1.9.1.
+The 1.10.0 source changes the embedder adapter version and therefore
+requires that explicit rebuild for 1.9.x semantic indexes too. Keep the original
+documents and configuration available; opening an old generation with the new
+producer is refused. Model artifact checksums and native producer fingerprints
+are unchanged, but the fast Potion tier has a new adapter fingerprint.
 
 Installer goals:
 - zero-friction first run
@@ -746,8 +751,9 @@ Use this as a pragmatic hardening pass before rollout:
 Publication runs on a real host with configured Cargo registry credentials.
 GitHub Actions does not publish this repository. The two release lines are
 versioned independently: `v*` tags identify fsfs binary releases and `crates-v*`
-tags identify library bundles. The current bundle contains `fsfs 1.9.1` and
-`frankensearch 0.4.3`.
+tags identify library bundles. This source is versioned as `fsfs 1.10.0` and
+`frankensearch 0.5.0`; the changelog lists every member and the index rebuild
+requirement. The GitHub releases record published bundles and validation receipts.
 
 Run `scripts/check_crates_publish_contract.sh --mode gate --scope workspace`
 against the clean intended revision and the live registry. Build-verify every

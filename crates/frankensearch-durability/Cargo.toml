@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-durability"
-version = "0.2.3"
+version = "0.2.4"
 description = "RaptorQ durability primitives for frankensearch indices"
 edition.workspace = true
 license-file.workspace = true

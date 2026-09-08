@@ -4160,9 +4160,9 @@ mod tests {
         // 1.28.0 MiniLM/Snowflake certificate change. Nomic's output is unchanged.
         // Historical certificates must fail the actual loader; exact current
         // conformance is checked both at load and in the real-model fixtures.
-        // GOLDEN-CHANGE release 0.2.5: four adapter manifests include the crate
+        // GOLDEN-CHANGE release 0.2.6: four adapter manifests include the crate
         // version in implementation_revision. Only that provenance field moves
-        // from 0.2.4 to 0.2.5; the reconstruction below retains the old hashes
+        // from 0.2.5 to 0.2.6; reconstruction retains both 0.2.4 and 0.2.5 hashes
         // and proves that no other manifest field or output certificate drifted.
         // GOLDEN-CHANGE macOS ARM64 qualification: only the three ONNX
         // numeric profiles and output certificates differ on that platform.
@@ -4184,14 +4184,14 @@ mod tests {
         let expected = [
             (
                 "model2vec-native".to_owned(),
-                "3783488bae83c3fd07e9913df11430f6be4e7c70da94f7c5d75ee78dc0ebfadf".to_owned(),
+                "4e997c1e42f4078b723a0043a3ba941ff63bd52e65e8157c5230a2d7a0bc063b".to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
                 if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                    "2abdd494c4f0b55df508de43a3b780b1cc8c86c849dfbae6173f74ef051bd59d"
+                    "327feba7d864c417b214b32eb49b85b04d6b7fe73c93350e65cac0a7d5ca9c6b"
                 } else {
-                    "7c2debb9bf81b9d6f37a4cab092af12a74fdc563d9ffab9cfa20af7ecb8302ca"
+                    "df15494ac05894c47aef7924b06dee0b937847964ef4c322343e5dad6efcbc97"
                 }
                 .to_owned(),
             ),
@@ -4210,46 +4210,75 @@ mod tests {
             (
                 "fastembed-onnx".to_owned(),
                 if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                    "d0902c28ca154e1d6021768bfa28d3677d56c587cdad67f066e9fc5a490288e5"
+                    "0857407535835be7313cdc767be24e5c11bf37a0a0b62a46672ba7b0078b5654"
                 } else {
-                    "07436d59a036ba2917bd6fa3a6e859101fcd9d91a706f39dd723df0daa15b008"
+                    "3c1a5cc06410ad93869ea522779e496cffb4a4b7742a40be86365444d18c9899"
                 }
                 .to_owned(),
             ),
             (
                 "fastembed-onnx".to_owned(),
                 if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                    "37749da1ec0fe6b80770fa0524270de0a97f82c7a9dfe9392f09fbfe5cb5637b"
+                    "7ad71e245b9cc2c7f38be14d205104eae4c8d6de75e2635d19dcba73bf5a4085"
                 } else {
-                    "f20cac45eb8310e793362e25fa3bcbe943dc2af78536840d93da58a1d31fa40a"
+                    "9559ef790c74d3335ded4dc2aaf8ee2c4818de250ebc44bd3ea020b959513077"
                 }
                 .to_owned(),
             ),
         ];
         assert_eq!(observed, expected);
 
-        for (mut manifest, previous_fingerprint, linux_certificate) in [
+        for (mut manifest, previous_fingerprint, older_fingerprint, linux_certificate) in [
             (
                 ModelArtifactManifestV1::potion_128m_native().unwrap(),
+                "3783488bae83c3fd07e9913df11430f6be4e7c70da94f7c5d75ee78dc0ebfadf",
                 "860061ab2a8de3ad3a36a235ebf856eec6bb3d952840be655b0670595882d3cb",
                 None,
             ),
             (
                 ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+                if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    "2abdd494c4f0b55df508de43a3b780b1cc8c86c849dfbae6173f74ef051bd59d"
+                } else {
+                    "7c2debb9bf81b9d6f37a4cab092af12a74fdc563d9ffab9cfa20af7ecb8302ca"
+                },
                 "6d5cf6dd6bb8dc9de621b03c53248796dddb054b93ae829b98aa7dbf2552cf76",
                 Some("67cec04aef931fb5b5db8be074e92370c4f62e6f89ec45bec5ecd52a2444d6c3"),
             ),
             (
                 ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+                if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    "d0902c28ca154e1d6021768bfa28d3677d56c587cdad67f066e9fc5a490288e5"
+                } else {
+                    "07436d59a036ba2917bd6fa3a6e859101fcd9d91a706f39dd723df0daa15b008"
+                },
                 "ae11db9eda424707fb89a0c70daae5e5a559521d8d1edb45ead90a6344eca247",
                 Some("8ab295190de5eb629ef7920e3aec6d989c1b7f695b4f75baebfb716fb81b7f6c"),
             ),
             (
                 ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+                if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    "37749da1ec0fe6b80770fa0524270de0a97f82c7a9dfe9392f09fbfe5cb5637b"
+                } else {
+                    "f20cac45eb8310e793362e25fa3bcbe943dc2af78536840d93da58a1d31fa40a"
+                },
                 "79882126878654776eec8c64961f6dada37ddf11ac73c4a07cd48d78598f9020",
                 Some("dbb7e33fdb5ccb4864faf9ff425b35a83a2d9dcd4f8d736033d7f819e0c1e851"),
             ),
         ] {
+            let adapter = manifest
+                .execution
+                .implementation_revision
+                .strip_prefix("frankensearch-embed-0.2.6+")
+                .expect("release fixture must name the actual 0.2.6 adapter")
+                .to_owned();
+            manifest.execution.implementation_revision =
+                format!("frankensearch-embed-0.2.5+{adapter}");
+            assert_eq!(
+                manifest.freeze().unwrap().fingerprint,
+                previous_fingerprint,
+                "the release bump must preserve the exact previous platform manifest"
+            );
             if cfg!(all(target_os = "macos", target_arch = "aarch64"))
                 && let Some(certificate) = linux_certificate
             {
@@ -4257,16 +4286,11 @@ mod tests {
                     .clone_into(&mut manifest.execution.numeric_profile);
                 certificate.clone_into(&mut manifest.execution.golden_vectors.vectors_sha256);
             }
-            let adapter = manifest
-                .execution
-                .implementation_revision
-                .strip_prefix("frankensearch-embed-0.2.5+")
-                .expect("release fixture must name the actual 0.2.5 adapter");
             manifest.execution.implementation_revision =
                 format!("frankensearch-embed-0.2.4+{adapter}");
             assert_eq!(
                 manifest.freeze().unwrap().fingerprint,
-                previous_fingerprint,
+                older_fingerprint,
                 "the release bump must change only adapter version provenance"
             );
         }

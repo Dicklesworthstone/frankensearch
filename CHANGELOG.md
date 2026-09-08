@@ -24,6 +24,41 @@ Release history through [v1.9.1](https://github.com/Dicklesworthstone/frankensea
 
 ---
 
+## fsfs 1.10.0 / crate bundle 0.5.0
+
+- **FrankenSQLite 0.3.18.** The binary lock and database requirements advance
+  together from 0.3.17. The updated storage and CLI paths passed the repository
+  quality gate before the release version bumps.
+- **An explicit native semantic source profile.** `--no-default-features
+  --features semantic-native` builds Model2Vec, native quality inference and
+  native reranking without FastEmbed or ONNX Runtime. Standard full binaries
+  retain ONNX as their default quality producer. This does not complete the
+  native migration or remove every transitive C/assembler requirement.
+- **Caller-owned inference and cancellation.** Native detection and inference
+  reject stopped blocking pools and observe request cancellation. Cold
+  reranker initialization uses the caller's pool, and reranking has a bounded
+  stage deadline. A timed-out initialization may finish into the retained
+  model cache for later requests; it does not extend the original deadline.
+  The facade's `native` and `rerank` exports are consistent, and native-only
+  all-target checks no longer compile examples that require the hash feature.
+- **Durability locks end with their operation.** Protection, verification and
+  repair explicitly release their file locks even when a duplicate descriptor
+  remains open. Tests retain a real duplicate and exercise actual RaptorQ
+  corruption recovery. This proves the lock-lifetime defect; the holder behind
+  the earlier intermittent parallel repair failure was not observed.
+- **Rebuild existing semantic indexes.** All 13 publishable packages receive
+  new versions from one source revision. The embedder adapter version changes
+  Potion and ONNX manifest fingerprints, so 1.9.x indexes require an explicit
+  rebuild from the original documents and configuration. Artifact checksums,
+  output certificates and native producer fingerprints remain unchanged.
+  Exact historical manifest reconstruction checks retain both 0.2.4 and 0.2.5.
+
+Version set: facade 0.5.0; fsfs 1.10.0; rerank 0.3.0;
+core/index/lexical/fusion 0.2.5; embed 0.2.6;
+storage/durability/quill 0.2.4; tui/ops 0.2.1. Consult the GitHub release receipts
+for publication and final versioned qualification. The ops crate remains
+experimental. No performance win or complete native migration is claimed.
+
 ## [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) -- 2026-09-07
 
 Compare: <https://github.com/Dicklesworthstone/frankensearch/compare/v1.9.0...v1.9.1>
