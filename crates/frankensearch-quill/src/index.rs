@@ -80,10 +80,10 @@ use crate::keeper::UnrepairableSegmentPolicy;
 use crate::keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, CurrentPointer,
     CurrentPointerError, GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter,
-    LexicalLayout, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats,
-    ManifestSegment, PublicationAuthorityPhase, PublicationAuthorityState, PublicationReadState,
-    RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet, inspect_lexical_layout,
-    plan_tier_merge, validate_manifest_successor,
+    LexicalLayout, LiveDocumentFloor, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest,
+    ManifestFieldStats, ManifestSegment, PublicationAuthorityPhase, PublicationAuthorityState,
+    PublicationReadState, PublishIntent, RecoveredSegment, TierMergePolicy, TierPolicyError,
+    TombstoneSet, inspect_lexical_layout, plan_tier_merge, validate_manifest_successor,
 };
 use crate::query::{
     BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError, QueryDiagnostic,
@@ -1293,7 +1293,10 @@ fn validate_complete_keeper_transition(
             })
         };
     }
-    validate_manifest_successor(current, proposed).map_err(|error| {
+    // The Keeper has already admitted `proposed` with the caller's
+    // `PublishIntent`; this re-derives the process-local view of that
+    // decision, so the live-document floor is not re-applied here.
+    validate_manifest_successor(current, proposed, LiveDocumentFloor::Waived).map_err(|error| {
         SnapshotError::KeeperTransition {
             detail: error.to_string(),
         }
@@ -5227,6 +5230,14 @@ struct QuillWriterState {
     /// out the rendezvous deadline on every batch.
     #[cfg(test)]
     force_ingest_overlap_rendezvous: bool,
+    /// Test-only, default OFF. When set to `Some(n)`, the serial ingest route
+    /// requests cancellation on the request `Cx` once exactly `n` documents of
+    /// the current batch have been accumulated, so a test can reproduce a
+    /// batch that fails midway with real partial shard state behind it
+    /// (gh#45). The cancellation is discovered by the ordinary
+    /// `check_cancel` poll; nothing else is short-circuited.
+    #[cfg(test)]
+    cancel_ingest_after_documents: Option<usize>,
     /// Documents actually analyzed by the adaptive budget proof. This is
     /// per-index and test-only so a regression can distinguish bounded-wave
     /// refusal from eagerly analyzing the whole rejected batch.
@@ -5675,6 +5686,8 @@ impl QuillWriterState {
             #[cfg(test)]
             force_ingest_overlap_rendezvous: false,
             #[cfg(test)]
+            cancel_ingest_after_documents: None,
+            #[cfg(test)]
             parallel_budget_documents_analyzed: AtomicUsize::new(0),
         })
     }
@@ -5769,6 +5782,41 @@ impl QuillWriterState {
         {
             self.unpublished_since = None;
         }
+    }
+
+    /// Drop every uncommitted scalar mutation and return the writer to the
+    /// published generation.
+    ///
+    /// This is the recovery for a replacement that cannot complete: the
+    /// tombstones for the superseded identities are already staged in the
+    /// retained proposal, but the rows meant to stand behind them did not all
+    /// land. Publishing the proposal would delete documents nobody asked to
+    /// delete; publishing the rows without the proposal would leave two live
+    /// rows per replaced identity. Neither half is usable alone, so both are
+    /// discarded and the previous committed generation stays authoritative
+    /// (gh#45).
+    ///
+    /// Only bookkeeping is touched. Allocated document ids, `seal_seq` values
+    /// and any segment file a mid-batch flush already installed stay consumed:
+    /// the watermark and seal sequence are monotone by contract, and an
+    /// installed segment no MANIFEST references is an ordinary grace-window GC
+    /// candidate. Delta transaction state is not scalar state and is left
+    /// alone.
+    fn discard_scalar_transaction(&mut self) {
+        for shard in &mut self.shards {
+            shard.accumulator.reset();
+            shard.identities.clear();
+            shard.current_lease_base = None;
+        }
+        self.staged_flush = None;
+        self.pending_segments.clear();
+        self.pending_owned_segments.clear();
+        self.pending_field_stats.clear();
+        self.pending_manifest = None;
+        self.pending_replacement_manifest = None;
+        self.uncommitted_ids.clear();
+        self.unpublished_since = None;
+        self.ingest_retry_required = false;
     }
 
     /// Reconcile an abandoned durable publication and install the exact
@@ -6095,10 +6143,16 @@ impl QuillWriterState {
         check_cancel(cx, "Delta MANIFEST publish")?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
-                writer.publish(cx, &manifest).await?;
+                writer
+                    .publish_with_intent(cx, &manifest, PublishIntent::PreserveLiveDocuments)
+                    .await?;
             }
             IndexBackend::Memory(snapshot) => {
-                *snapshot = snapshot.publish_owned_segments(&manifest, memory_owned)?;
+                *snapshot = snapshot.publish_owned_segments_with_intent(
+                    &manifest,
+                    memory_owned,
+                    PublishIntent::PreserveLiveDocuments,
+                )?;
             }
         }
 
@@ -7648,6 +7702,10 @@ impl QuillWriterState {
                 let document = documents
                     .get(document_index)
                     .ok_or_else(|| invalid_state("shard document index is outside the batch"))?;
+                #[cfg(test)]
+                if self.cancel_ingest_after_documents == Some(document_index) {
+                    cx.set_cancel_requested(true);
+                }
                 document_index += 1;
                 check_cancel(cx, "index")?;
                 let doc_ord = span
@@ -8031,17 +8089,34 @@ impl QuillWriterState {
             let _open_timer = crate::tracing_conventions::StageTimer::new(&open_span);
             let instrumented = open_span.clone();
             async {
-                match &mut self.backend {
-                    IndexBackend::Durable(writer) => {
-                        writer.publish(cx, &manifest).await?;
-                    }
-                    IndexBackend::Memory(snapshot) => {
-                        let published = snapshot.publish_owned_segments(
+                let published: Result<(), KeeperError> = match &mut self.backend {
+                    IndexBackend::Durable(writer) => writer
+                        .publish_with_intent(cx, &manifest, PublishIntent::PreserveLiveDocuments)
+                        .await
+                        .map(drop),
+                    IndexBackend::Memory(snapshot) => snapshot
+                        .publish_owned_segments_with_intent(
                             &manifest,
                             self.pending_owned_segments.clone(),
-                        )?;
-                        *snapshot = published;
+                            PublishIntent::PreserveLiveDocuments,
+                        )
+                        .map(|successor| *snapshot = successor),
+                };
+                if let Err(error) = published {
+                    if matches!(error, KeeperError::LiveDocumentFloor { .. }) {
+                        // A scalar commit only ever adds rows or replaces them
+                        // one for one, so a proposal that would shrink the live
+                        // set is a replacement whose rows never landed. No
+                        // retry can repair it: the tombstones are already
+                        // staged and scalar indexing is refused while a
+                        // proposal is retained, so the only thing a retry
+                        // could publish is the same deletion. Drop the whole
+                        // transaction and leave the published generation
+                        // authoritative; installed-but-unreferenced segments
+                        // are ordinary grace-window GC candidates (gh#45).
+                        self.discard_scalar_transaction();
                     }
+                    return Err(error.into());
                 }
                 // `writer.publish` may have advanced Keeper before the local
                 // ArcSwap installs the matching successor. Use only the
@@ -8168,10 +8243,16 @@ impl QuillWriterState {
         check_cancel(cx, "bulk completion publish")?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
-                writer.publish(cx, &manifest).await?;
+                writer
+                    .publish_with_intent(cx, &manifest, PublishIntent::PreserveLiveDocuments)
+                    .await?;
             }
             IndexBackend::Memory(snapshot) => {
-                *snapshot = snapshot.publish_owned_segments(&manifest, Vec::new())?;
+                *snapshot = snapshot.publish_owned_segments_with_intent(
+                    &manifest,
+                    Vec::new(),
+                    PublishIntent::PreserveLiveDocuments,
+                )?;
             }
         }
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
@@ -8496,14 +8577,30 @@ impl QuillWriterState {
         }
 
         self.pending_replacement_manifest = Some(manifest);
-        self.index_documents_with_replacements(
-            cx,
-            documents,
-            &replacement_ids,
-            false,
-            IngestParallelismPolicy::Adaptive,
-        )
-        .await?;
+        if let Err(error) = self
+            .index_documents_with_replacements(
+                cx,
+                documents,
+                &replacement_ids,
+                false,
+                IngestParallelismPolicy::Adaptive,
+            )
+            .await
+        {
+            // The batch did not land — admission refused it, it was cancelled
+            // or a shard failed partway through — but the proposal above
+            // already carries a tombstone for every identity it meant to
+            // replace. Left in place, that proposal is a deletion with no rows
+            // behind it, and the explicit `commit()` the caller is told to
+            // issue next would publish exactly that (gh#45). The guard above
+            // proved the writer clean before this call, so discarding the whole
+            // scalar transaction restores precisely the state the caller
+            // started from: the previous generation authoritative, nothing
+            // staged, and the retry guard disarmed because there is nothing
+            // to retry.
+            self.discard_scalar_transaction();
+            return Err(error);
+        }
         self.flush_all_shards(cx, LifecycleTrigger::ExplicitFlush)
             .await?;
         self.prepare_pending_manifest()?;
@@ -8615,12 +8712,21 @@ impl QuillWriterState {
             .prepare_sealed_manifest(self.schema, &manifest)?;
         Self::preflight_prepared_publication(&prepared)?;
         check_cancel(cx, "delete document publish")?;
+        // The caller named every identity being removed: this is the explicit
+        // deletion the live-document floor exists to distinguish from a
+        // replacement that lost its rows (gh#45).
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
-                writer.publish(cx, &manifest).await?;
+                writer
+                    .publish_with_intent(cx, &manifest, PublishIntent::ExplicitDeletion)
+                    .await?;
             }
             IndexBackend::Memory(snapshot) => {
-                *snapshot = snapshot.publish_owned_segments(&manifest, Vec::new())?;
+                *snapshot = snapshot.publish_owned_segments_with_intent(
+                    &manifest,
+                    Vec::new(),
+                    PublishIntent::ExplicitDeletion,
+                )?;
             }
         }
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
@@ -8651,12 +8757,21 @@ impl QuillWriterState {
             .prepare_sealed_manifest(self.schema, &manifest)?;
         Self::preflight_prepared_publication(&prepared)?;
         check_cancel(cx, "delete all publish")?;
+        // `delete_all` is the explicit opt-in for publishing a generation with
+        // no live documents; every other scalar publication is held to the
+        // live-document floor (gh#45).
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
-                writer.publish(cx, &manifest).await?;
+                writer
+                    .publish_with_intent(cx, &manifest, PublishIntent::ExplicitDeletion)
+                    .await?;
             }
             IndexBackend::Memory(snapshot) => {
-                *snapshot = snapshot.publish_owned_segments(&manifest, Vec::new())?;
+                *snapshot = snapshot.publish_owned_segments_with_intent(
+                    &manifest,
+                    Vec::new(),
+                    PublishIntent::ExplicitDeletion,
+                )?;
             }
         }
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
@@ -21807,6 +21922,342 @@ mod tests {
                 published,
                 "a refused replacement leaves nothing for the retry to publish"
             );
+        });
+    }
+
+    /// Seed three committed documents that all match `alpha` and each match
+    /// their own ordinal word, so a hollowed generation shows up both as a
+    /// count and as missing hits (gh#45 fixtures). Returns the published
+    /// generation.
+    async fn seed_three_alpha_documents(cx: &Cx, index: &QuillIndex) -> u64 {
+        LexicalWrite::index_documents(
+            index,
+            cx,
+            &[
+                IndexableDocument::new("gh45-1", "alpha one"),
+                IndexableDocument::new("gh45-2", "alpha two"),
+                IndexableDocument::new("gh45-3", "alpha three"),
+            ],
+        )
+        .await
+        .expect("seed three documents");
+        LexicalWrite::commit(index, cx)
+            .await
+            .expect("publish the seed generation");
+        assert_eq!(index.doc_count().expect("seed doc count"), 3);
+        index
+            .segment_stats()
+            .expect("seed segment stats")
+            .published_generation
+    }
+
+    fn hit_count(index: &QuillIndex, cx: &Cx, query: &str) -> usize {
+        index
+            .search_doc_ids(cx, query, 10)
+            .unwrap_or_else(|error| panic!("search {query:?}: {error}"))
+            .len()
+    }
+
+    fn published_generation(index: &QuillIndex) -> u64 {
+        index
+            .segment_stats()
+            .expect("segment stats")
+            .published_generation
+    }
+
+    /// gh#45 reproduction, admission shape: a replacement batch that is REFUSED
+    /// before any row is accumulated must not leave its tombstones behind.
+    ///
+    /// The writer stages a tombstone for every identity the batch replaces,
+    /// retains that proposal, and only then runs batch admission. Before the
+    /// fix a refused batch returned its error with the proposal still
+    /// retained, and the next `commit()` published it: a valid MANIFEST whose
+    /// only change was the deletion of the document the caller tried to
+    /// update.
+    #[test]
+    fn refused_replacement_batch_leaves_no_deletion_for_commit_to_publish() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let seeded = seed_three_alpha_documents(&cx, &index).await;
+
+            // "gh45-1" is live, so this batch is a replacement; the empty id
+            // fails admission after the tombstone for gh45-1 is staged.
+            let refused = LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[
+                    IndexableDocument::new("gh45-1", "omega one"),
+                    IndexableDocument::new("", "nameless"),
+                ],
+            )
+            .await;
+            assert!(
+                refused.is_err(),
+                "an empty id must be refused, got {refused:?}"
+            );
+            {
+                let writer = index.writer_mut();
+                assert!(
+                    writer.pending_replacement_manifest.is_none(),
+                    "a refused replacement must not retain its tombstoned proposal"
+                );
+                assert!(
+                    !writer.ingest_retry_required,
+                    "nothing was mutated, so nothing needs a retry"
+                );
+            }
+            assert!(
+                !index.has_uncommitted_changes(),
+                "the writer must be exactly as clean as before the refused batch"
+            );
+
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("commit after a refused batch");
+            assert_eq!(
+                index.doc_count().expect("doc count"),
+                3,
+                "commit after a refused replacement must not delete anything"
+            );
+            assert_eq!(hit_count(&index, &cx, "alpha"), 3);
+            assert_eq!(
+                hit_count(&index, &cx, "one"),
+                1,
+                "the document the refused batch tried to replace is still served"
+            );
+            assert_eq!(hit_count(&index, &cx, "omega"), 0);
+            assert_eq!(
+                published_generation(&index),
+                seeded,
+                "there was nothing to publish, so no generation advanced"
+            );
+
+            // A well-formed retry of the same replacement lands normally.
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[IndexableDocument::new("gh45-1", "omega one")],
+            )
+            .await
+            .expect("retry the replacement");
+            assert_eq!(index.doc_count().expect("doc count after retry"), 3);
+            assert_eq!(hit_count(&index, &cx, "omega"), 1);
+            assert_eq!(hit_count(&index, &cx, "alpha"), 2);
+        });
+    }
+
+    /// gh#45 reproduction, partial shape: a replacement batch that fails after
+    /// SOME of its rows were accumulated must not leave either half behind.
+    ///
+    /// Cancellation lands once one of three replacement rows sits in the shard
+    /// accumulator. Before the fix the writer kept the tombstoned proposal AND
+    /// the accumulated row, armed the retry guard, and the retry commit it
+    /// asked for published a generation serving one document where three had
+    /// been live. Publishing the row without the proposal would be no better:
+    /// two live rows for one identity.
+    #[test]
+    fn replacement_cancelled_midway_keeps_the_previous_generation_authoritative() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let seeded = seed_three_alpha_documents(&cx, &index).await;
+            let replacements = [
+                IndexableDocument::new("gh45-1", "omega one"),
+                IndexableDocument::new("gh45-2", "omega two"),
+                IndexableDocument::new("gh45-3", "omega three"),
+            ];
+
+            index.writer_mut().cancel_ingest_after_documents = Some(1);
+            let cancelled = LexicalWrite::index_documents(&index, &cx, &replacements).await;
+            index.writer_mut().cancel_ingest_after_documents = None;
+            cx.set_cancel_requested(false);
+            assert!(
+                matches!(
+                    &cancelled,
+                    Err(frankensearch_core::SearchError::Cancelled { .. })
+                ),
+                "the batch must fail with the typed cancellation, got {cancelled:?}"
+            );
+            {
+                let writer = index.writer_mut();
+                assert!(
+                    writer.pending_replacement_manifest.is_none(),
+                    "a failed replacement must not retain its tombstoned proposal"
+                );
+                assert!(
+                    !writer.ingest_retry_required,
+                    "the discarded transaction leaves nothing to retry"
+                );
+                assert!(
+                    writer
+                        .shards
+                        .iter()
+                        .all(|shard| shard.accumulator.document_count() == 0),
+                    "partially accumulated replacement rows must be discarded with the proposal"
+                );
+                assert!(writer.uncommitted_ids.is_empty());
+            }
+            assert!(!index.has_uncommitted_changes());
+
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("commit after a cancelled batch");
+            assert_eq!(
+                index.doc_count().expect("doc count"),
+                3,
+                "commit after a cancelled replacement must serve every previously live document"
+            );
+            assert_eq!(hit_count(&index, &cx, "alpha"), 3);
+            assert_eq!(
+                hit_count(&index, &cx, "omega"),
+                0,
+                "no replacement row may leak out of a failed batch"
+            );
+            assert_eq!(published_generation(&index), seeded);
+
+            // The same batch, retried whole, replaces all three.
+            LexicalWrite::index_documents(&index, &cx, &replacements)
+                .await
+                .expect("retry the full replacement");
+            assert_eq!(index.doc_count().expect("doc count after retry"), 3);
+            assert_eq!(hit_count(&index, &cx, "omega"), 3);
+            assert_eq!(hit_count(&index, &cx, "alpha"), 0);
+        });
+    }
+
+    /// The commit path refuses a proposal that would hollow the generation,
+    /// independently of how it got there (gh#45, second layer).
+    ///
+    /// The writer is put directly into the shape the pre-fix code left behind
+    /// — a retained tombstone-only replacement proposal with no rows — so this
+    /// keeps guarding `commit()` even if some path other than `upsert` ever
+    /// manages to retain such a proposal.
+    #[test]
+    fn commit_refuses_a_retained_tombstone_only_replacement_proposal() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let seeded = seed_three_alpha_documents(&cx, &index).await;
+            let committed = index.snapshot().expect("authoritative snapshot");
+            let mut hollow = committed.next_manifest().expect("next manifest");
+            assert!(
+                committed
+                    .delete_document(&mut hollow, "gh45-2")
+                    .expect("stage the tombstone")
+            );
+            index.writer_mut().pending_replacement_manifest = Some(hollow);
+
+            match index.commit(&cx).await {
+                Err(QuillIndexError::Keeper(KeeperError::LiveDocumentFloor {
+                    previous_live_docs,
+                    proposed_live_docs,
+                    ..
+                })) => {
+                    assert_eq!((previous_live_docs, proposed_live_docs), (3, 2));
+                }
+                Err(other) => {
+                    panic!("commit must refuse with the live-document floor, got {other:?}")
+                }
+                Ok(_) => panic!("commit must refuse a proposal that deletes without replacing"),
+            }
+            assert_eq!(index.doc_count().expect("doc count"), 3);
+            assert_eq!(hit_count(&index, &cx, "alpha"), 3);
+            assert_eq!(published_generation(&index), seeded);
+            assert!(
+                !index.has_uncommitted_changes(),
+                "an unpublishable proposal is discarded, not retained for a retry that can only fail again"
+            );
+
+            // The writer stays usable: a no-op commit and a real replacement
+            // both succeed.
+            index
+                .commit(&cx)
+                .await
+                .expect("commit after the refusal has nothing to publish");
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[IndexableDocument::new("gh45-2", "omega two")],
+            )
+            .await
+            .expect("replacement after the refusal");
+            assert_eq!(index.doc_count().expect("doc count"), 3);
+            assert_eq!(hit_count(&index, &cx, "omega"), 1);
+        });
+    }
+
+    /// Explicit deletions are the opt-in the floor exists to preserve: they
+    /// publish under `PublishIntent::ExplicitDeletion` and keep working,
+    /// including a full replace with FEWER documents through `delete_all`
+    /// (gh#45).
+    #[test]
+    fn explicit_deletions_still_publish_smaller_generations() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let seeded = seed_three_alpha_documents(&cx, &index).await;
+
+            assert_eq!(
+                index
+                    .delete_documents(&cx, &["gh45-1", "gh45-3"])
+                    .await
+                    .expect("delete two of three"),
+                2
+            );
+            assert_eq!(index.doc_count().expect("doc count"), 1);
+            assert_eq!(hit_count(&index, &cx, "alpha"), 1);
+            assert_eq!(hit_count(&index, &cx, "two"), 1);
+            assert_eq!(published_generation(&index), seeded + 1);
+
+            index.delete_all(&cx).await.expect("delete all");
+            assert_eq!(index.doc_count().expect("doc count"), 0);
+            assert_eq!(hit_count(&index, &cx, "alpha"), 0);
+            assert_eq!(published_generation(&index), seeded + 2);
+
+            // Explicit full replace with fewer documents: an emptied corpus
+            // followed by a smaller one.
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[
+                    IndexableDocument::new("gh45-1", "omega one"),
+                    IndexableDocument::new("gh45-2", "omega two"),
+                ],
+            )
+            .await
+            .expect("index the smaller corpus");
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("publish the smaller corpus");
+            assert_eq!(index.doc_count().expect("doc count"), 2);
+            assert_eq!(hit_count(&index, &cx, "omega"), 2);
+            assert_eq!(hit_count(&index, &cx, "alpha"), 0);
+        });
+    }
+
+    /// An ordinary partial replacement — one of three identities superseded,
+    /// its row landing — is a one-for-one swap and passes the floor unchanged
+    /// (gh#45 control).
+    #[test]
+    fn successful_partial_replacement_is_unaffected_by_the_floor() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let seeded = seed_three_alpha_documents(&cx, &index).await;
+
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[IndexableDocument::new("gh45-2", "omega two")],
+            )
+            .await
+            .expect("replace one of three");
+            assert_eq!(index.doc_count().expect("doc count"), 3);
+            assert_eq!(hit_count(&index, &cx, "omega"), 1);
+            assert_eq!(hit_count(&index, &cx, "alpha"), 2);
+            assert_eq!(
+                hit_count(&index, &cx, "two"),
+                1,
+                "the superseded row is gone and its replacement is served"
+            );
+            assert!(published_generation(&index) > seeded);
+            assert!(!index.has_uncommitted_changes());
         });
     }
 
