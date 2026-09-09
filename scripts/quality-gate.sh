@@ -16,7 +16,7 @@
 #              only the target's std, never a Windows host or a linker. Override the triple
 #              with QUALITY_GATE_CROSS_TARGET.
 #   tests      library unit tests for every crate except the gauntlet harness
-#   quill      bounded native Quill + pinned Tantivy witness and its validator negatives;
+#   quill      native Quill + pinned Tantivy witness, validator negatives and typed replay;
 #              complete all-feature Cargo inventory, 90s execution budget after compilation
 #   quill-full default + all-feature gauntlet binaries, unchanged nonignored workloads;
 #              explicit release/conformance lane (slow evidence assembly included)

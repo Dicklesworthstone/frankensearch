@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the existing Quill native witness; retain the complete gauntlet route.
+"""Run Quill native witness and replay regressions; retain the full gauntlet route.
 
 Invoked by quality-gate.sh on the admitted validation host. This is a test
 driver, not a conformance or performance certificate. --full runs both Cargo
@@ -26,9 +26,12 @@ LIBRARY = "frankensearch_quill_gauntlet"
 ORACLE = "the_committed_expectations_hold_against_real_tantivy"
 QUILL = "the_committed_expectations_hold_against_real_quill"
 WITNESS = "native_enriched_witness::tests::"
+REPLAY = "engine::tests::typed_query_"
 MUTATION = WITNESS + "a_common_mode_mutation_passes_agreement_and_still_fails_the_oracle"
 # Unchanged native integration: 2.915s; all 39 witness unit cases: 0.102s
-# summed test time on vmi1152480, 2026-09-09. Allow cold-host headroom without
+# summed test time on vmi1152480, 2026-09-09. Replay regressions join this lane
+# after the full run exposed the seed and atomic-publication bugs. The entire
+# engine module took 10.9s summed test time in that run. Allow host headroom without
 # including Cargo compilation in the runtime budget. No test workload changes.
 BOUNDED_SECONDS = 90
 
@@ -86,10 +89,9 @@ def events(stdout):
         raise Refusal("INVALID_OUTPUT", str(error)) from error
 
 
-def build(configuration, logs, native_only=False):
+def build(configuration, logs):
     argv = ["cargo", "test", "--locked", "-p", "frankensearch-quill-gauntlet",
-            "--no-run", "--message-format=json"]
-    argv += ["--test", NATIVE] if native_only else ["--tests"]
+            "--no-run", "--message-format=json", "--tests"]
     if configuration == "all":
         argv.append("--all-features")
     else:
@@ -108,7 +110,7 @@ def build(configuration, logs, native_only=False):
             if name in binaries:
                 raise Refusal("DUPLICATE_BINARY", name)
             binaries[name] = Path(row["executable"])
-    if NATIVE not in binaries or (not native_only and LIBRARY not in binaries):
+    if NATIVE not in binaries or LIBRARY not in binaries:
         raise Refusal("MISSING_BINARY", configuration)
     return binaries
 
@@ -210,12 +212,10 @@ def main():
                 raise Refusal("MISSING_MUTATION", MUTATION)
         deadline = time.monotonic() + (28800 if args.full else BOUNDED_SECONDS)
         for name, tests in listed.items():
-            selector = None if args.full or name == NATIVE else WITNESS
-            selected = [row for row in tests if selector is None or selector in row["name"]]
             bounded = name in {NATIVE, LIBRARY}
             emit("route", configuration=configuration, binary=name,
                  bounded=[row["name"] for row in tests if configuration == "all" and bounded
-                          and (name == NATIVE or row["name"].startswith(WITNESS))],
+                          and (name == NATIVE or row["name"].startswith((WITNESS, REPLAY)))],
                  full=[row["name"] for row in tests if not row["ignore"]],
                  separate=[row for row in tests if row["ignore"]])
             if not tests:
@@ -223,16 +223,20 @@ def main():
                 continue
             if not args.full and not bounded:
                 continue
-            if any(row["ignore"] for row in selected) and not args.full:
-                raise Refusal("REQUIRED_TEST_IGNORED", name)
-            try:
-                output = execute(binaries[name], tests, f"run-{configuration}-{name}", logs,
-                                 deadline - time.monotonic(), selector)
-            except Refusal as error:
-                emit("refused", reason=str(error))
-                failures.append(str(error))
-                continue
-            if args.probes and name == NATIVE:
+            output = None
+            selectors = [None] if args.full or name == NATIVE else [WITNESS, REPLAY]
+            for ordinal, selector in enumerate(selectors):
+                selected = [row for row in tests if selector is None or selector in row["name"]]
+                if any(row["ignore"] for row in selected) and not args.full:
+                    raise Refusal("REQUIRED_TEST_IGNORED", name)
+                try:
+                    output = execute(binaries[name], tests, f"run-{configuration}-{name}-{ordinal}", logs,
+                                     deadline - time.monotonic(), selector)
+                except Refusal as error:
+                    emit("refused", reason=str(error))
+                    failures.append(str(error))
+                    continue
+            if args.probes and name == NATIVE and output is not None:
                 expect_refusal("ZERO_TESTS", lambda: execute(binaries[name], tests, "probe-zero", logs,
                                30, "__quill_gate_deliberately_absent_test__"))
                 expect_refusal("TIMEOUT", lambda: execute(binaries[name], tests, "probe-timeout", logs, 0.0001))
@@ -240,13 +244,19 @@ def main():
                                              if not (row.get("type") == "suite" and row.get("event") == "ok"))
                 expect_refusal("MISSING_TERMINAL", lambda: validate(without_terminal, 0, [row["name"] for row in tests]))
         if args.probes:
-            no_oracle = build("default", logs, native_only=True)[NATIVE]
-            no_oracle_tests = inventory(no_oracle, "default-no-oracle", logs)
-            expect_refusal("MISSING_ORACLE", lambda: require_oracle(no_oracle_tests))
+            default_binaries = build("default", logs)
+            default_inventory = {}
+            for name, binary in sorted(default_binaries.items()):
+                tests = inventory(binary, f"default-{name}", logs)
+                default_inventory[name] = tests
+                emit("route", configuration="default", binary=name, bounded=[],
+                     full=[row["name"] for row in tests if not row["ignore"]],
+                     separate=[row for row in tests if row["ignore"]])
+            expect_refusal("MISSING_ORACLE", lambda: require_oracle(default_inventory[NATIVE]))
     if failures:
         raise Refusal("LANE_FAILED", "; ".join(failures))
     emit("passed", mode="full" if args.full else "probes" if args.probes else "bounded",
-         scope="Native witness correctness; no full conformance or performance claim")
+         scope="Native witness and typed-query replay correctness; no full conformance or performance claim")
 
 
 if __name__ == "__main__":

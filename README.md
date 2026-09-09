@@ -817,7 +817,8 @@ build and publication commands with the same gates;
 `docs/crates-publishing-contract.md` are the authoritative recipes.
 
 The default `quill` stage runs the existing native engine witness and all tests
-beside its independent oracle. It inventories the complete all-feature gauntlet
+beside its independent oracle, plus the typed-query seed and replay regressions.
+It inventories the complete all-feature gauntlet
 and checks executed names and terminal counts against that inventory. The
 90-second execution budget excludes compilation; missing Tantivy, ignored
 required tests, an empty selection, timeout or incomplete output fails the stage.

@@ -623,8 +623,9 @@ The cross-target check establishes compilation, not Windows runtime support.
 
 `quill` invokes `scripts/check_quill_correctness.py`: Cargo's all-feature test
 inventory supplies the names, feature availability, ignored reasons and actual
-executables. The native integration binary and the complete
-`native_enriched_witness::tests::` module run with a 90-second total execution
+executables. The native integration binary, the complete
+`native_enriched_witness::tests::` module and the `engine::tests::typed_query_`
+regressions run with a 90-second total execution
 budget after compilation. Both real-engine cases and the existing common-mode
 mutation validator are mandatory. Counts and complete terminal output must agree
 with the selected inventory; zero execution, missing oracle, failure or timeout

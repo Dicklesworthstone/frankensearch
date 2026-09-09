@@ -12598,6 +12598,64 @@ mod tests {
         )
     ))]
     #[test]
+    fn typed_query_publish_rejects_staged_rewrite_even_with_restored_mtime() {
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let root = typed_query_replay_test_root("staged-rewrite-restored-mtime");
+        let sidecar = root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        let sidecar_for_hook = sidecar.clone();
+        let _publish_hook =
+            crate::artifact::install_pinned_regular_file_before_publish_hook(move |directory| {
+                if directory != sidecar_for_hook.as_path() {
+                    return;
+                }
+                let staged = std::fs::read_dir(directory)
+                    .expect("owned staging directory")
+                    .map(|entry| entry.expect("owned staging entry").path())
+                    .find(|path| {
+                        path.file_name()
+                            .expect("staged filename")
+                            .to_string_lossy()
+                            .starts_with(".typed-query-replay-stage-")
+                    })
+                    .expect("the publisher has synced its staged file");
+                let before = std::fs::metadata(&staged).expect("synced staged metadata");
+                let hostile = vec![b'!'; usize::try_from(before.len()).expect("small replay")];
+                typed_query_rewrite_owned_file_same_length(&staged, &hostile);
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&staged)
+                    .expect("owned staged descriptor");
+                file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(before.modified().expect("original modification time")),
+                )
+                .expect("restore mtime so only the content digest exposes the rewrite");
+                file.sync_all().expect("sync rewritten staged file");
+            });
+        let final_path = typed_query_replay_path(&root, &replay);
+        assert!(matches!(
+            persist_typed_query_fuzz_replay(&root, &replay),
+            Err(GauntletError::UnsafeStorePath { path }) if path == final_path
+        ));
+        assert_eq!(
+            std::fs::read(&final_path).expect("retain rejected owned artifact"),
+            vec![b'!'; replay.canonical_bytes().expect("canonical replay").len()]
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
     fn typed_query_public_persist_concurrently_publishes_only_complete_same_key_bytes() {
         use std::sync::{Arc, Barrier};
 
