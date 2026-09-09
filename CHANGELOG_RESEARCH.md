@@ -143,3 +143,44 @@ canonical files, rather than retroactively modifying the bundled snapshots.
 This update completes the requested changelog skill pass for the stated window.
 It does not reconstruct or revalidate every older changelog entry, certify a
 performance win, or close the broader native migration workstream.
+
+## Narrow unreleased update, 2026-09-09
+
+Scope: post-publication history from frozen product source
+`9c5d8867cbbc7edf696a24410a86af08402fc468` through merge `9f965533`.
+The non-merge commit inventory contains three product changes: progressive
+daemon streaming (`35e8c231`), Quill replacement-ingest/live-document protection
+(`e0d24c3e`), and the asupersync requirement correction (`a6d664cf`). The other
+commits record release evidence, changelog research, assessment or tracker
+updates. The two Quill entries arrived with their implementation and are
+preserved; this update supplies the missing daemon capability and behavior
+change, and marks all three as unreleased.
+
+Evidence checked: complete implementation diff and affected runtime/CLI tests,
+the closed `bd-fsfs-progressive-daemon-dq48i` record at `462035f3`, current README,
+and the live GitHub commit and release metadata. GitHub still reports v1.10.0
+published at 2026-09-08T19:36:49Z and crates-v0.5.0 at 21:13:03Z; the new work is
+not a release. The initial local tag-range lookup found no local v1.10.0 ref,
+so the inventory uses the verified frozen source SHA and the remote tag API.
+
+Daemon acceptance is explicitly source-bound to `35e8c231`: clean DSR 8/8 checks,
+all ten stock stages, seven real-model tests, and a subsequent exact release
+replay passed. The replay served two distinct uncached queries on PID3311628
+with one quality-model initialization, ordered frames, direct-result parity,
+JSONL/TOON replay and clean disconnect/signal handling. Release executable
+SHA256: `a62398f078cd82fff36e2aceba85ce2ddc098368a44e00f1d7c62016ab24fcb6`.
+Raw commands and logs are retained under
+`/data/tmp/frankensearch-progressive-daemon-20260908.flI1Y2`, particularly
+`dsr-qualified-summary.json` and `progressive-release-receipt.json`.
+These functional checks do not certify performance, cross-platform publication
+or the subsequently merged Quill implementation.
+
+Coverage status: validated. The skill's structural validator passes with its
+existing older-history bare-hash warning. All four unique links in the
+unreleased section return HTTP 200, and the immutable tracker permalink points
+to the exact completed bead on line 838. Every entry from v1.10.0 backward is
+byte-identical to the pre-update file (SHA256
+`e52cebfc57458900e8786b6329f1df0aeb11107e371c3872ff3e9d35bd6e5b67`).
+The remote annotated v1.10.0 tag was peeled to the frozen source above.
+Validation receipt: `changelog-unreleased-validation.json` in the same artifact
+directory. No release date, published version or old capability entry changed.

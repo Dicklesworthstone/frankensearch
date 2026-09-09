@@ -6,12 +6,13 @@ Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/fra
 
 Release history through [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) and the [0.5.0 crate bundle](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0), published 2026-09-08. All 13 crate versions are also published on crates.io. The latest update covers every landed commit from v1.9.1 through v1.10.0 using git diffs, release metadata and checked-in Beads; see [research coverage](CHANGELOG_RESEARCH.md). Earlier history is preserved. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.**
 
-Scope window: this update researches v1.9.1 → v1.10.0 and their 2026-09-08 publication records.
+Scope window: the release reconstruction covers v1.9.1 → v1.10.0 and their 2026-09-08 publication records. The unreleased section also records the subsequent Quill fixes and warm-daemon streaming, through the 2026-09-09 merge of those workstreams.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| Unreleased | Landed on main | 2026-09-09 | Progressive warm-daemon streaming, Quill replacement-ingest protection and live-document floor, corrected asupersync requirement |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
 | [crates-v0.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0) | Library bundle | 2026-09-08 | All 13 publishable members and release evidence share v1.10.0 source; binary release retains latest routing |
 | [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) | Release | 2026-09-07 | Self-update preserves Linux ABI and full/lite semantic capability |
@@ -30,7 +31,15 @@ Scope window: this update researches v1.9.1 → v1.10.0 and their 2026-09-08 pub
 
 ## Unreleased
 
-Changes on `main` after the 2026-09-08 publication of v1.10.0 / crates 0.5.0. They ship with the next crate publish.
+Changes on `main` after the 2026-09-08 publication of v1.10.0 / crates 0.5.0. These changes are not yet in a published binary or crate release.
+
+### Added
+
+- **Progressive search can reuse the warm fsfs daemon.** On Unix, `fsfs search --stream` now uses the daemon by default and accepts `--daemon`; `--no-daemon` retains direct execution. Previously, streaming bypassed the daemon and could not reuse its loaded models. The daemon now sends an attestation, Initial results, optional refinement, and a terminal frame as they become available. JSONL and TOON clients consume the same validated sequence, and complete cached replays are explicitly marked. Frames, queued bytes, retained cache entries and admitted clients are bounded; disconnects stop publication and drain owned inference. The legacy stdio response remains available. [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/35e8c2312e9c5529a929862f530bfcaafc8ff5d4); [completed workstream and validation](https://github.com/Dicklesworthstone/frankensearch/blob/462035f39d3c70f8705312b8ff7b88c5837b612f/.beads/issues.jsonl#L838) (`bd-fsfs-progressive-daemon-dq48i`).
+
+### Changed
+
+- **Established daemon errors no longer silently replay a search in direct mode.** Policy, producer, generation and protocol disagreements are explicit failures; restart an incompatible daemon or select `--no-daemon`. Once Initial has been delivered, the client cannot replay it, switch generations or hide a failed terminal. Startup connection failure retains the existing direct fallback. [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/35e8c2312e9c5529a929862f530bfcaafc8ff5d4).
 
 ### Fixed
 
