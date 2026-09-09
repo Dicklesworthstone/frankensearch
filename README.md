@@ -759,6 +759,7 @@ Use this as a pragmatic hardening pass before rollout:
    - `cargo check --workspace --all-targets`
    - `cargo clippy --workspace --all-targets -- -D warnings`
    - `cargo test --workspace --lib --exclude frankensearch-quill-gauntlet` plus the fsfs test binaries
+   - the Quill native witness against real Quill and pinned Tantivy, plus its oracle-validator negatives
    - the real-model quick-start lane and the executable quick-start gate against the built binary
 6. Run benchmark and quality harnesses on representative corpora before release.
 7. Validate degradation behavior by intentionally forcing quality timeout/failure.
@@ -800,7 +801,7 @@ before any release lives in the repository and runs on a real host:
 
 ```bash
 scripts/quality-gate.sh                     # fmt, check, clippy -D warnings, lib tests,
-                                            # fsfs test binaries, real-model e2e lane,
+                                            # Quill/Tantivy witness, fsfs tests, real-model e2e,
                                             # executable quick-start gate
 dsr quality --tool frankensearch            # the same gate plus the packaging/installer
                                             # contract checks, driven by dsr
@@ -814,6 +815,30 @@ models and does not use that skip. Releases use `dsr` or the documented real-hos
 build and publication commands with the same gates;
 `docs/fsfs-packaging-release-install-contract.md` and
 `docs/crates-publishing-contract.md` are the authoritative recipes.
+
+The default `quill` stage runs the existing native engine witness and all tests
+beside its independent oracle. It inventories the complete all-feature gauntlet
+and checks executed names and terminal counts against that inventory. The
+90-second execution budget excludes compilation; missing Tantivy, ignored
+required tests, an empty selection, timeout or incomplete output fails the stage.
+This is bounded native correctness coverage, not full Quill conformance or a
+performance verdict.
+
+Before releasing changes to Quill, its analyzer/contracts or the gauntlet, also
+run the complete default and all-feature nonignored suites on the validation host:
+
+```bash
+QUALITY_GATE_STAGES=quill-full scripts/quality-gate.sh
+# When changing the bounded driver or its selection, prove its failure paths:
+QUALITY_GATE_STAGES=quill-probes scripts/quality-gate.sh
+```
+
+The full lane keeps the expensive evidence-assembly tests and their original
+assertions. Existing ignored tests retain the nightly, isolated-process or
+fixture-review prerequisites printed in the inventory; they are never counted
+as passes. E6's scaled-corpus and real-model quality campaigns and the QG
+performance ratchet remain separate requirements. A passing bounded lane does
+not override a failing full lane.
 
 ## Troubleshooting by Symptom
 

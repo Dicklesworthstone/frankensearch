@@ -15,8 +15,13 @@
 #              fallback platform module missing entry points the portable code calls). Needs
 #              only the target's std, never a Windows host or a linker. Override the triple
 #              with QUALITY_GATE_CROSS_TARGET.
-#   tests      library unit tests for every crate except the gauntlet harness (its 894-test
-#              unit binary alone takes >50 min; it has its own lane in the perf ratchet)
+#   tests      library unit tests for every crate except the gauntlet harness
+#   quill      bounded native Quill + pinned Tantivy witness and its validator negatives;
+#              complete all-feature Cargo inventory, 90s execution budget after compilation
+#   quill-full default + all-feature gauntlet binaries, unchanged nonignored workloads;
+#              explicit release/conformance lane (slow evidence assembly included)
+#   quill-probes bounded lane plus real zero-selection, missing-oracle, timeout and
+#              missing-terminal negative probes; required when changing this test driver
 #   fsfs       every fsfs test binary buildable on the default feature set
 #   facade     the library crate's integration tests on the product feature set (`hybrid`:
 #              potion + MiniLM loaders + Quill), including the real-model two-tier lane
@@ -37,7 +42,8 @@
 #   quickstart scripts/check_fsfs_executable_quickstart.sh against the freshly built binary
 #
 # Environment:
-#   QUALITY_GATE_STAGES        comma list to run (default: all of the above)
+#   QUALITY_GATE_STAGES        comma list to run (default: stock stages plus quill;
+#                              examples, perf, quill-full and quill-probes are opt-in)
 #   QUALITY_GATE_MODEL_DIR     registered model cache (default: ~/.local/share/frankensearch/models)
 #   QUALITY_GATE_ALLOW_MODEL_SKIP=1  let the e2e stage SKIP instead of FAIL when models are absent
 #   QUALITY_GATE_CROSS_TARGET  triple for the cross stage (default x86_64-pc-windows-msvc)
@@ -58,7 +64,17 @@ unset RCH_REQUIRE_REMOTE || true
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}"
 MODEL_DIR="${QUALITY_GATE_MODEL_DIR:-$HOME/.local/share/frankensearch/models}"
-STAGES="${QUALITY_GATE_STAGES:-fmt,check,clippy,cross,tests,fsfs,facade,e2e,quickstart}"
+STAGES="${QUALITY_GATE_STAGES:-fmt,check,clippy,cross,tests,quill,fsfs,facade,e2e,quickstart}"
+IFS=',' read -ra selected_stages <<< "$STAGES"
+for stage in "${selected_stages[@]}"; do
+  case "$stage" in
+    fmt|check|clippy|cross|tests|quill|quill-full|quill-probes|fsfs|facade|examples|perf|e2e|quickstart) ;;
+    *) printf '[quality-gate] FAIL unknown stage: %s\n' "$stage" >&2; exit 2 ;;
+  esac
+done
+case "$STAGES" in
+  ,*|*,|*,,*) echo '[quality-gate] FAIL empty stage name' >&2; exit 2 ;;
+esac
 # Non-Unix compile guard target (#42). Overridable so the same stage can prove
 # any other host triple the index crate claims to build for.
 CROSS_TARGET="${QUALITY_GATE_CROSS_TARGET:-x86_64-pc-windows-msvc}"
@@ -112,6 +128,9 @@ if want cross; then
 fi
 
 want tests     && run_stage tests  cargo test --locked --workspace --lib --exclude frankensearch-quill-gauntlet
+want quill     && run_stage quill python3 scripts/check_quill_correctness.py
+want quill-full && run_stage quill-full python3 scripts/check_quill_correctness.py --full
+want quill-probes && run_stage quill-probes python3 scripts/check_quill_correctness.py --probes
 want fsfs      && run_stage fsfs   cargo test --locked -p frankensearch-fsfs --tests
 
 # The library crate's own integration tests on the product feature set. With the registered

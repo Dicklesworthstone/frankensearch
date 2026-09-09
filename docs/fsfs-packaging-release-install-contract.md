@@ -617,8 +617,43 @@ scripts/quality-gate.sh
 
 The default script runs formatting, workspace check/clippy, the non-Unix index
 compile guard, library tests, fsfs tests, facade integration, real-model E2E,
-and executable quick-start stages. Its `examples` and `perf` stages are opt-in.
+the bounded Quill/Tantivy native witness, and executable quick-start stages.
+Its `examples` and `perf` stages are opt-in.
 The cross-target check establishes compilation, not Windows runtime support.
+
+`quill` invokes `scripts/check_quill_correctness.py`: Cargo's all-feature test
+inventory supplies the names, feature availability, ignored reasons and actual
+executables. The native integration binary and the complete
+`native_enriched_witness::tests::` module run with a 90-second total execution
+budget after compilation. Both real-engine cases and the existing common-mode
+mutation validator are mandatory. Counts and complete terminal output must agree
+with the selected inventory; zero execution, missing oracle, failure or timeout
+refuses the lane. Logs retain stdout, stderr, source/lock and executable hashes.
+
+For every release changing Quill, its analyzer/contracts or the gauntlet, the
+release operator must additionally run:
+
+```bash
+QUALITY_GATE_STAGES=quill-full scripts/quality-gate.sh
+```
+
+This runs every nonignored default-feature and all-feature lib/integration/bin
+test with unchanged workloads, including slow evidence assembly. Each feature
+configuration has an eight-hour execution cap separate from its compilation
+budget; reaching that cap is failure, not a partial pass. Cargo doctests remain
+part of `cargo test -p frankensearch-quill-gauntlet` and its `--all-features`
+variant. Existing ignored tests keep their documented nightly/isolated/review
+triggers, emitted verbatim in the inventory. E6 scale/quality campaigns and QG
+performance obligations are not satisfied by this native witness stage. Retain
+and resolve full-lane failures before claiming the relevant release coverage.
+
+Changes to the bounded selector/driver also require
+`QUALITY_GATE_STAGES=quill-probes scripts/quality-gate.sh`. It executes real
+zero-selection and timeout probes, compiles the native test without the oracle
+feature to prove refusal, and removes the terminal from actual successful output
+to verify rejection. The existing common-mode mutation assertion pins
+`total 1 != expected 2`; no mocked engine substitutes for the separate live
+Quill/Tantivy tests.
 
 The earlier hosted-CI design distinguished these profiles:
 
