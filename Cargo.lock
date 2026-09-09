@@ -1945,6 +1945,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "wide 1.6.1",
