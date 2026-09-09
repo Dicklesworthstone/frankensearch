@@ -3185,16 +3185,25 @@ mod loader_only {
             fs::metadata(&tokenizer).unwrap().modified().unwrap(),
             modified
         );
-        assert!(matches!(
-            frankensearch_embed::FastEmbedEmbedder::load(&cache_probe),
-            Err(frankensearch_core::SearchError::HashMismatch { .. })
-        ));
+        let rejected = frankensearch_embed::FastEmbedEmbedder::load(&cache_probe)
+            .expect_err("a stale receipt must not admit changed tokenizer bytes");
+        match rejected {
+            frankensearch_core::SearchError::ModelLoadFailed { source, .. } => {
+                assert!(
+                    source
+                        .to_string()
+                        .contains("tokenizer.json:sha256-or-size-mismatch"),
+                    "the frozen manifest must identify the corrupted tokenizer: {source}"
+                );
+            }
+            other => panic!("expected frozen artifact checksum rejection, got {other}"),
+        }
         assert_eq!(
             fs::read(cache_probe.join(".verified")).unwrap(),
             original_marker
         );
         eprintln!(
-            "[default-build-e2e] stage=fastembed-receipt event=verified real_onnx=true cached_load=true same_size_restored_mtime_corruption=hash_mismatch receipt_unchanged=true"
+            "[default-build-e2e] stage=fastembed-receipt event=verified real_onnx=true cached_load=true same_size_restored_mtime_corruption=frozen_artifact_checksum_rejection receipt_unchanged=true"
         );
 
         let index_outcome = fsfs.run_with_env(
