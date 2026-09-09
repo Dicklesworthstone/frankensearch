@@ -75,6 +75,8 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 tempfile = "3.27"
+# Parses the workspace manifest in tests/asupersync_floor.rs (gh#44).
+toml = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [[bench]]

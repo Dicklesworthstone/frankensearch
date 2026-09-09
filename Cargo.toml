@@ -63,12 +63,17 @@ frankensearch-quill = { version = "0.2.4", path = "crates/frankensearch-quill" }
 #   asupersync = { workspace = true, features = ["test-internals"] }
 # Same fix shape as frankensqlite (#104).
 # Keep this pin aligned with HFDT and FrankenSQLite so downstream workspaces
-# resolve a single Asupersync runtime universe. The 0.4.4 floor carries the
-# native-task abort contract (acknowledged Cancelled is preserved) plus the
-# HTTP/1 streaming cancel/reuse fixes; the <0.5 ceiling permits compatible
-# 0.4.x source overrides without admitting a future semver-major API line.
-# [bd-3h229]
-asupersync = { version = ">=0.4.4, <0.5", default-features = false, features = ["proc-macros"] }
+# resolve a single Asupersync runtime universe. The 0.4.10 floor is the first
+# release that carries `Cx::is_cancelled` (the lock-free cancellation poll
+# frankensearch-quill uses on its per-posting hot path, gh#44); 0.4.4..0.4.9
+# only had `is_cancel_requested`, so a consumer locked below 0.4.10 got E0599
+# from inside the crate instead of a resolver error naming the requirement.
+# Earlier floors carried the native-task abort contract (acknowledged
+# Cancelled is preserved) plus the HTTP/1 streaming cancel/reuse fixes; the
+# <0.5 ceiling permits compatible 0.4.x source overrides without admitting a
+# future semver-major API line. `crates/frankensearch-quill/tests/asupersync_floor.rs`
+# pins this floor against silent regression. [bd-3h229]
+asupersync = { version = ">=0.4.10, <0.5", default-features = false, features = ["proc-macros"] }
 arc-swap = "=1.9.2"
 
 # Descriptor-relative generation-root admission. Keep the syscall surface

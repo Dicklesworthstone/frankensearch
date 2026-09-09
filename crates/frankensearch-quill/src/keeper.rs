@@ -660,6 +660,66 @@ pub enum ConcatMergeError {
     },
 }
 
+/// What a publication is allowed to do to the number of live documents.
+///
+/// A Keeper proposal is derived state: the writer stages a tombstone for every
+/// identity a replacement batch supersedes and then appends the replacement
+/// rows. When the rows never land — the ingest failed after the tombstones
+/// were staged — the derived proposal is a deletion nobody asked for, and at
+/// the MANIFEST level it is indistinguishable from a deliberate one: it
+/// validates, every segment authenticates, and readers simply answer from what
+/// is left (gh#45). The intent says which of the two the caller means, so the
+/// Keeper can refuse the one it did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PublishIntent {
+    /// An additive or one-for-one replacing publication.
+    ///
+    /// The successor must serve at least as many live documents as the
+    /// generation it replaces. A proposal that would shrink the live set is
+    /// refused with [`KeeperError::LiveDocumentFloor`] before any durable or
+    /// in-memory state changes. `commit`, upsert, Delta seals, bulk-load
+    /// completion, tier merges and compaction publish with this intent.
+    PreserveLiveDocuments,
+    /// The caller deliberately removed live documents.
+    ///
+    /// `delete_documents` and `delete_all` publish with this intent, and so do
+    /// the raw [`KeeperWriter::publish`] and
+    /// [`KeeperSnapshot::publish_owned_segments`] entry points, whose proposal
+    /// the caller constructed tombstone by tombstone. The live-document floor
+    /// is waived for that one publication; every other transition rule still
+    /// applies.
+    ExplicitDeletion,
+}
+
+impl PublishIntent {
+    const fn live_document_floor(self) -> LiveDocumentFloor {
+        match self {
+            Self::PreserveLiveDocuments => LiveDocumentFloor::Enforced,
+            Self::ExplicitDeletion => LiveDocumentFloor::Waived,
+        }
+    }
+}
+
+/// Whether one successor validation enforces the live-document floor.
+///
+/// Shape-only validations — reopening an already published MANIFEST pair,
+/// re-checking a proposal against the on-disk predecessor inside the durable
+/// choreography, or staging tombstones into a proposal that has not been
+/// offered for publication yet — waive it: the floor is decided exactly once,
+/// at the publication entry point that knows the caller's [`PublishIntent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveDocumentFloor {
+    Enforced,
+    Waived,
+}
+
+/// Saturating count of live rows a MANIFEST serves across all its segments.
+fn manifest_live_doc_count(manifest: &Manifest) -> u64 {
+    manifest.segments.iter().fold(0_u64, |total, segment| {
+        total.saturating_add(u64::from(segment.live_doc_count()))
+    })
+}
+
 /// Keeper I/O, recovery, locking, and publication failures.
 #[derive(Debug, Error)]
 pub enum KeeperError {
@@ -798,6 +858,31 @@ pub enum KeeperError {
     InvalidTransition {
         /// Violated monotonicity invariant.
         detail: String,
+    },
+    /// A publication declared [`PublishIntent::PreserveLiveDocuments`] but its
+    /// successor would serve fewer live documents than the generation it
+    /// replaces.
+    ///
+    /// This is the shape of a replacement whose tombstones were staged but
+    /// whose replacement rows never landed (gh#45). Nothing was written: the
+    /// outgoing generation remains authoritative. A caller that really means
+    /// to remove documents publishes with [`PublishIntent::ExplicitDeletion`].
+    #[error(
+        "live-document floor violated: generation {proposed_generation} would serve \
+         {proposed_live_docs} live documents where generation {previous_generation} serves \
+         {previous_live_docs}; a replacement whose rows did not land is refused, and a \
+         deliberate removal must publish as one (delete_documents / delete_all, or \
+         PublishIntent::ExplicitDeletion on the Keeper)"
+    )]
+    LiveDocumentFloor {
+        /// Generation the proposal would replace.
+        previous_generation: u64,
+        /// Live documents the outgoing generation serves.
+        previous_live_docs: u64,
+        /// Generation the proposal would publish.
+        proposed_generation: u64,
+        /// Live documents the proposal would serve.
+        proposed_live_docs: u64,
     },
     /// The caller's expected schema does not match the durable MANIFEST.
     #[error("Quill schema mismatch at {path}: expected {expected:#018x}, found {found:#018x}")]
@@ -3755,6 +3840,13 @@ impl KeeperSnapshot {
     /// so encoded bytes remain invisible until this method returns the fully
     /// validated successor.
     ///
+    /// The proposal's tombstones and segment removals are taken as the
+    /// caller's explicit deletion intent ([`PublishIntent::ExplicitDeletion`]).
+    /// A proposal derived from an additive or replacing mutation should go
+    /// through [`Self::publish_owned_segments_with_intent`] with
+    /// [`PublishIntent::PreserveLiveDocuments`] so a proposal that lost its
+    /// replacement rows is refused instead of published (gh#45).
+    ///
     /// # Errors
     ///
     /// Returns a typed backend, MANIFEST-transition, segment-witness, or
@@ -3765,6 +3857,28 @@ impl KeeperSnapshot {
         proposed: &Manifest,
         encoded_segments: Vec<EncodedSegment>,
     ) -> Result<Self, KeeperError> {
+        self.publish_owned_segments_with_intent(
+            proposed,
+            encoded_segments,
+            PublishIntent::ExplicitDeletion,
+        )
+    }
+
+    /// [`Self::publish_owned_segments`] with an explicit [`PublishIntent`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish_owned_segments`], plus
+    /// [`KeeperError::LiveDocumentFloor`] when `intent` is
+    /// [`PublishIntent::PreserveLiveDocuments`] and the proposal would serve
+    /// fewer live documents than this snapshot. The refusal happens before any
+    /// state changes; this snapshot stays authoritative.
+    pub fn publish_owned_segments_with_intent(
+        &self,
+        proposed: &Manifest,
+        encoded_segments: Vec<EncodedSegment>,
+        intent: PublishIntent,
+    ) -> Result<Self, KeeperError> {
         if self.directory.is_some() || self.loaded.source != ManifestSource::InMemory {
             return Err(KeeperError::InvalidTransition {
                 detail: "owned segment publication requires an in-memory Keeper snapshot"
@@ -3774,7 +3888,11 @@ impl KeeperSnapshot {
         proposed
             .validate()
             .map_err(|source| KeeperError::InvalidManifest { source })?;
-        validate_manifest_successor(&self.loaded.manifest, proposed)?;
+        validate_manifest_successor(
+            &self.loaded.manifest,
+            proposed,
+            intent.live_document_floor(),
+        )?;
 
         let mut owned_by_id = Vec::new();
         owned_by_id
@@ -3901,7 +4019,13 @@ impl KeeperSnapshot {
     ) -> Result<Self, KeeperError> {
         let artifact =
             build_concat_merge(self, source_segment_ids, output_segment_id, created_unix_s)?;
-        self.publish_owned_segments(&artifact.manifest, vec![artifact.encoded])
+        // A merge rewrites rows; it never removes a live one, so it is held to
+        // the live-document floor like any other additive publication.
+        self.publish_owned_segments_with_intent(
+            &artifact.manifest,
+            vec![artifact.encoded],
+            PublishIntent::PreserveLiveDocuments,
+        )
     }
 
     /// Fold every segment above `policy` into a new immutable snapshot.
@@ -3924,7 +4048,13 @@ impl KeeperSnapshot {
         if !artifact.report.changed() {
             return Ok((self.clone(), artifact.report));
         }
-        let snapshot = self.publish_owned_segments(&artifact.manifest, artifact.encoded)?;
+        // Compaction folds tombstones into the rewritten segments; every live
+        // row survives, so the live-document floor holds here as well.
+        let snapshot = self.publish_owned_segments_with_intent(
+            &artifact.manifest,
+            artifact.encoded,
+            PublishIntent::PreserveLiveDocuments,
+        )?;
         Ok((snapshot, artifact.report))
     }
 
@@ -4282,7 +4412,10 @@ fn validate_staged_manifest(previous: &Manifest, proposed: &Manifest) -> Result<
     proposed
         .validate()
         .map_err(|source| KeeperError::InvalidManifest { source })?;
-    validate_manifest_successor(previous, proposed)
+    // Staging tombstones into a proposal is not publishing it: the
+    // live-document floor is decided when the proposal is offered to
+    // `publish_with_intent` / `publish_owned_segments_with_intent`.
+    validate_manifest_successor(previous, proposed, LiveDocumentFloor::Waived)
 }
 
 fn manifest_matches_proposal(installed: &Manifest, proposed: &Manifest) -> bool {
@@ -5065,6 +5198,13 @@ impl KeeperWriter {
 
     /// Publish exactly the next MANIFEST generation through an `O_EXCL` claim.
     ///
+    /// The proposal's tombstones and segment removals are taken as the
+    /// caller's explicit deletion intent ([`PublishIntent::ExplicitDeletion`]).
+    /// A proposal derived from an additive or replacing mutation should go
+    /// through [`Self::publish_with_intent`] with
+    /// [`PublishIntent::PreserveLiveDocuments`] so a proposal that lost its
+    /// replacement rows is refused instead of published (gh#45).
+    ///
     /// # Errors
     ///
     /// Returns typed cancellation, claim, transition, durability, or I/O
@@ -5074,6 +5214,26 @@ impl KeeperWriter {
         &mut self,
         cx: &Cx,
         manifest: &Manifest,
+    ) -> Result<&KeeperSnapshot, KeeperError> {
+        self.publish_with_intent(cx, manifest, PublishIntent::ExplicitDeletion)
+            .await
+    }
+
+    /// [`Self::publish`] with an explicit [`PublishIntent`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish`], plus [`KeeperError::LiveDocumentFloor`] when
+    /// `intent` is [`PublishIntent::PreserveLiveDocuments`] and the proposal
+    /// would serve fewer live documents than the retained generation. The
+    /// refusal happens before the generation claim, the temp MANIFEST, or the
+    /// pending-publication marker exist; the outgoing generation stays
+    /// authoritative and the writer remains usable.
+    pub async fn publish_with_intent(
+        &mut self,
+        cx: &Cx,
+        manifest: &Manifest,
+        intent: PublishIntent,
     ) -> Result<&KeeperSnapshot, KeeperError> {
         if cx.is_cancel_requested() {
             return Err(KeeperError::PublishLock {
@@ -5098,7 +5258,11 @@ impl KeeperWriter {
         {
             return Ok(self.retained_snapshot_for_bookkeeping());
         }
-        validate_manifest_successor(&self.snapshot.loaded_manifest().manifest, manifest)?;
+        validate_manifest_successor(
+            &self.snapshot.loaded_manifest().manifest,
+            manifest,
+            intent.live_document_floor(),
+        )?;
         let directory = self.admission.directory.clone();
         let preflight_directory = directory.clone();
         let preflight_manifest = manifest.clone();
@@ -5365,7 +5529,10 @@ impl KeeperWriter {
         })
         .await?;
         self.publish_segment(cx, pending).await?;
-        self.publish(cx, &manifest).await
+        // A merge rewrites rows; it never removes a live one, so it is held to
+        // the live-document floor like any other additive publication.
+        self.publish_with_intent(cx, &manifest, PublishIntent::PreserveLiveDocuments)
+            .await
     }
 
     /// Rewrite every segment above the selected tombstone-density threshold.
@@ -5414,7 +5581,10 @@ impl KeeperWriter {
         if cx.is_cancel_requested() {
             return Err(CompactionError::Cancelled.into());
         }
-        self.publish(cx, &manifest).await?;
+        // Compaction folds tombstones into the rewritten segments; every live
+        // row survives, so the live-document floor holds here as well.
+        self.publish_with_intent(cx, &manifest, PublishIntent::PreserveLiveDocuments)
+            .await?;
         Ok(report)
     }
 
@@ -10706,14 +10876,17 @@ fn validate_manifest_pair(
         });
     }
     if previous.generation != current.generation {
-        validate_segment_transitions(previous, &current).map_err(|error| {
-            KeeperError::InvalidManifestPair {
+        // Both generations are already published; this is a shape check on
+        // the pair, not an admission decision, so the floor is waived — a
+        // legitimately published `delete_all` must reopen.
+        validate_segment_transitions(previous, &current, LiveDocumentFloor::Waived).map_err(
+            |error| KeeperError::InvalidManifestPair {
                 directory: directory.to_path_buf(),
                 current: current.generation,
                 previous: previous.generation,
                 detail: error.to_string(),
-            }
-        })?;
+            },
+        )?;
     }
     Ok(LoadedManifest {
         manifest: current,
@@ -13785,7 +13958,11 @@ where
                 ),
             });
         }
-        validate_segment_transitions(previous, &proposed)?;
+        // Shape re-check against the on-disk predecessor under the writer
+        // LOCK. The live-document floor was already decided against the same
+        // predecessor by `KeeperWriter::publish_with_intent`, which is the
+        // only path into this choreography that carries a caller intent.
+        validate_segment_transitions(previous, &proposed, LiveDocumentFloor::Waived)?;
     }
 
     let temp_path = directory.join(format!(".tmp-manifest-{}", proposed.generation));
@@ -14191,6 +14368,7 @@ fn open_existing_manifest_temp(path: &Path) -> io::Result<File> {
 pub(crate) fn validate_manifest_successor(
     previous: &Manifest,
     proposed: &Manifest,
+    floor: LiveDocumentFloor,
 ) -> Result<(), KeeperError> {
     let expected = previous
         .generation
@@ -14220,12 +14398,18 @@ pub(crate) fn validate_manifest_successor(
             ),
         });
     }
-    validate_segment_transitions(previous, proposed)
+    validate_segment_transitions(previous, proposed, floor)
 }
 
+/// Validate the per-segment rules of one successor: retained segments keep
+/// their immutable metadata and only grow tombstones, new segments carry a
+/// later `seal_seq`, and the field-stat rollup only moves when the segment set
+/// does. With [`LiveDocumentFloor::Enforced`], the successor must also serve
+/// at least as many live documents as `previous` (gh#45).
 fn validate_segment_transitions(
     previous: &Manifest,
     proposed: &Manifest,
+    floor: LiveDocumentFloor,
 ) -> Result<(), KeeperError> {
     let previous_max_seal_seq = previous
         .segments
@@ -14315,6 +14499,23 @@ fn validate_segment_transitions(
             detail: "field-stat rollup changed while the immutable segment set was unchanged"
                 .to_owned(),
         });
+    }
+    if floor == LiveDocumentFloor::Enforced {
+        // Every rule above is per segment. Tombstone growth on a retained
+        // segment and outright segment removal are each legal on their own,
+        // which is exactly how a replacement whose rows never landed publishes
+        // as a valid, quietly hollow generation. The floor is the one rule
+        // that looks at the corpus as a whole.
+        let previous_live_docs = manifest_live_doc_count(previous);
+        let proposed_live_docs = manifest_live_doc_count(proposed);
+        if proposed_live_docs < previous_live_docs {
+            return Err(KeeperError::LiveDocumentFloor {
+                previous_generation: previous.generation,
+                previous_live_docs,
+                proposed_generation: proposed.generation,
+                proposed_live_docs,
+            });
+        }
     }
     Ok(())
 }
@@ -19259,6 +19460,149 @@ mod tests {
                 Err(KeeperError::SchemaMismatch { .. })
             ));
         });
+    }
+
+    /// The live-document floor refuses a successor that serves fewer live
+    /// documents than its predecessor unless the caller declared the deletion
+    /// (gh#45). Every transition shape that can hollow a generation while
+    /// passing the per-segment rules is covered: tombstone growth on a
+    /// retained segment, removal of a whole segment, and `delete_all`. A
+    /// one-for-one replacement keeps the count and passes.
+    #[test]
+    fn live_document_floor_refuses_undeclared_shrink_and_admits_declared_deletion() -> TestResult {
+        let genesis = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let first = encoded_identity_test_segment(0xf01, 0, &[Some("floor-a"), Some("floor-b")])?;
+        let second = encoded_identity_test_segment(0xf02, 65_536, &[Some("floor-c")])?;
+        let mut proposed = genesis.next_manifest()?;
+        proposed.docid_high_watermark = 131_072;
+        proposed.segments = vec![manifest_segment(&first, 10), manifest_segment(&second, 20)];
+        let published = genesis.publish_owned_segments_with_intent(
+            &proposed,
+            vec![first, second],
+            PublishIntent::PreserveLiveDocuments,
+        )?;
+        assert_eq!(
+            published.doc_count(),
+            3,
+            "additive publication passes the floor"
+        );
+        let published_generation = published.loaded_manifest().manifest.generation;
+
+        // Tombstone growth on a retained segment: legal per segment, hollow
+        // as a corpus.
+        let mut tombstoned = published.next_manifest()?;
+        assert!(published.delete_document(&mut tombstoned, "floor-a")?);
+        match published.publish_owned_segments_with_intent(
+            &tombstoned,
+            Vec::new(),
+            PublishIntent::PreserveLiveDocuments,
+        ) {
+            Err(KeeperError::LiveDocumentFloor {
+                previous_generation,
+                previous_live_docs,
+                proposed_generation,
+                proposed_live_docs,
+            }) => {
+                assert_eq!(previous_generation, published_generation);
+                assert_eq!(proposed_generation, published_generation + 1);
+                assert_eq!((previous_live_docs, proposed_live_docs), (3, 2));
+            }
+            Ok(_) => return Err("undeclared tombstone growth must be refused".into()),
+            Err(other) => return Err(format!("expected LiveDocumentFloor, got {other:?}").into()),
+        }
+        assert_eq!(published.doc_count(), 3, "a refusal changes nothing");
+        assert_eq!(
+            published
+                .publish_owned_segments_with_intent(
+                    &tombstoned,
+                    Vec::new(),
+                    PublishIntent::ExplicitDeletion,
+                )?
+                .doc_count(),
+            2,
+            "the same proposal is admitted once the deletion is declared"
+        );
+        assert_eq!(
+            published
+                .publish_owned_segments(&tombstoned, Vec::new())?
+                .doc_count(),
+            2,
+            "the raw entry point takes the proposal's tombstones as the deletion intent"
+        );
+
+        // Removal of a whole segment.
+        let mut removed = published.next_manifest()?;
+        removed
+            .segments
+            .retain(|segment| segment.segment_id != 0xf02);
+        assert!(matches!(
+            published.publish_owned_segments_with_intent(
+                &removed,
+                Vec::new(),
+                PublishIntent::PreserveLiveDocuments,
+            ),
+            Err(KeeperError::LiveDocumentFloor {
+                previous_live_docs: 3,
+                proposed_live_docs: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            published
+                .publish_owned_segments_with_intent(
+                    &removed,
+                    Vec::new(),
+                    PublishIntent::ExplicitDeletion,
+                )?
+                .doc_count(),
+            2
+        );
+
+        // `delete_all`: the zero-segment generation.
+        let mut emptied = published.next_manifest()?;
+        published.delete_all(&mut emptied)?;
+        assert!(matches!(
+            published.publish_owned_segments_with_intent(
+                &emptied,
+                Vec::new(),
+                PublishIntent::PreserveLiveDocuments,
+            ),
+            Err(KeeperError::LiveDocumentFloor {
+                previous_live_docs: 3,
+                proposed_live_docs: 0,
+                ..
+            })
+        ));
+        assert_eq!(
+            published
+                .publish_owned_segments_with_intent(
+                    &emptied,
+                    Vec::new(),
+                    PublishIntent::ExplicitDeletion,
+                )?
+                .doc_count(),
+            0
+        );
+
+        // A one-for-one replacement — tombstone plus the row that supersedes
+        // it — holds the live count and passes under the preserving intent.
+        let replacement = encoded_identity_test_segment(0xf03, 131_072, &[Some("floor-a-v2")])?;
+        let mut replaced = published.next_manifest()?;
+        assert!(published.delete_document(&mut replaced, "floor-a")?);
+        replaced.docid_high_watermark = 196_608;
+        replaced.segments.push(manifest_segment(&replacement, 30));
+        let replaced = published.publish_owned_segments_with_intent(
+            &replaced,
+            vec![replacement],
+            PublishIntent::PreserveLiveDocuments,
+        )?;
+        assert_eq!(replaced.doc_count(), 3);
+        assert_eq!(replaced.materialize_document_id(0), None);
+        assert_eq!(
+            replaced.materialize_document_id(131_072),
+            Some(DocId::new("floor-a-v2"))
+        );
+        Ok(())
     }
 
     #[test]
