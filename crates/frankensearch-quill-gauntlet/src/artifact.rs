@@ -5364,7 +5364,7 @@ impl PinnedDirectory {
             });
         }
         let post_io_sha256: [u8; 32] = Sha256::digest(&read_back).into();
-        let staged_file = PinnedRegularFile {
+        let mut staged_file = PinnedRegularFile {
             file,
             post_io_identity: self.regular_file_identity(&staging_name, &after_read)?,
             post_io_sha256,
@@ -5378,7 +5378,25 @@ impl PinnedDirectory {
             name,
             RenameFlags::NOREPLACE,
         ) {
-            Ok(()) => Ok(Some((read_back, staged_file))),
+            Ok(()) => {
+                // Publishing the staged inode changes ctime. Rebind only those
+                // two fields; every other identity field must still match the
+                // synced readback. Authentication below also checks the final
+                // dirent and the original digest, so a rewrite during publish
+                // cannot become the newly trusted content.
+                let published = fstat(&staged_file.file).map_err(std::io::Error::from)?;
+                let published_identity = self.regular_file_identity(name, &published)?;
+                staged_file.post_io_identity.changed_seconds = published_identity.changed_seconds;
+                staged_file.post_io_identity.changed_nanoseconds =
+                    published_identity.changed_nanoseconds;
+                if published_identity != staged_file.post_io_identity {
+                    return Err(GauntletError::UnsafeStorePath {
+                        path: self.display_path.join(name),
+                    });
+                }
+                self.authenticate_regular_child(name, &staged_file)?;
+                Ok(Some((read_back, staged_file)))
+            }
             Err(Errno::EXIST) => Ok(None),
             Err(Errno::LOOP | Errno::NOTDIR) => Err(GauntletError::UnsafeStorePath {
                 path: self.display_path.join(name),
