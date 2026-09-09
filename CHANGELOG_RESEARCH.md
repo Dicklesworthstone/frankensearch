@@ -264,3 +264,34 @@ the new direct real-ONNX regression, and complete DSR qualification are still
 pending. The changelog describes code behavior without claiming publication,
 complete Quill conformance or measured performance. Final execution results and
 live-link verification must be recorded below before this workstream closes.
+
+Final qualification: clean `719fdd0e425f25f44a871170e1e024204fc11e7f`
+passed all eight DSR checks and all eleven stock quality stages, including
+59 bounded Quill tests and seven real-model tests. The new direct FastEmbed
+test initially expected `HashMismatch`; the existing frozen verifier instead
+aggregates checksums into `ModelLoadFailed`. The first full run retained that
+single failure (six other real-model tests passed). The corrected test requires
+the exact `tokenizer.json:sha256-or-size-mismatch` diagnostic and an unchanged
+receipt; its complete real-model run then passed. No production rejection,
+native deadline, workload, or ignore was relaxed.
+
+The final installed quickstart passed all eighteen controls, retained 1,136
+runtime log lines / 318,235 bytes, and left no owned processes. Installed ELF
+SHA256 is `343b12a660e2558eea2779bc94c32671695677671300e35dc585e5ae7865c565`,
+identical to the invocation-built executable. Optimized real-model ELF SHA256
+is `197a3bcd1f9a1cccd96ed2226bb9f0e8a23cf040c58e3cbeea22ab0c794976e5`,
+retrieved from RCH build 30012625538515447 on vmi1227854; local and remote
+hashes match, and all 297 production/build inputs match the clean qualification
+source through the retained source-content receipt. This is not an assertion
+that the older build's documentation/test files were identical.
+
+`a5-final-validation.json` retains the complete stage list and artifact paths.
+Final DSR receipt SHA256:
+`ff10629a6b5e56ddaccb1b61934459f299db4d53560b611ac817a6f2101b859c`.
+The clean source and lock identity were rechecked after execution. Both new
+representative commit links resolve live, the changelog structural validator
+passes with its existing older-history warning, and published entries from
+v1.10.0 backward are byte-identical. DSR's inconsistent duration_ms fields are
+excluded from timing claims. This completes Linux A5 acceptance, not a new
+release, complete Quill conformance, all-platform installation or performance
+certification.
