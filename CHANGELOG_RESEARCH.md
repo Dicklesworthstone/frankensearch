@@ -184,3 +184,47 @@ byte-identical to the pre-update file (SHA256
 The remote annotated v1.10.0 tag was peeled to the frozen source above.
 Validation receipt: `changelog-unreleased-validation.json` in the same artifact
 directory. No release date, published version or old capability entry changed.
+
+## Quill gate and replay follow-through, 2026-09-09
+
+Bounded inventory: `29b8a71e..820e83e1`, five non-merge commits. The two
+implementation fixes are the atomic-publication identity rebind (`802784a1`)
+and the schema-pinned seed multiplier (`acee3572`). `0147e799` adds the native
+witness gate; `820e83e1` adds replay regressions and complete default-feature
+inventory to its probes. `b384ccca` is tracker-only. No public package version
+or release tag changed.
+
+Read the complete Rust, driver, test-selection and contract diffs. The existing
+seed and hostile replay assertions are unchanged; the additional mutation
+rewrites a staged inode and restores mtime, then requires digest rejection.
+RCH ran the original fuzz-harness selection: 11 passed, zero failed/ignored,
+943 filtered, 0.77s, vmi1227854. The revised real-host driver ran 59 tests
+(39 witness validators, 12 typed-query regressions, eight real-engine cases),
+all passing with zero ignored. Actual zero-selection, missing-oracle build,
+timeout and missing-terminal probes each produced their required refusal.
+Default inventory: 906 library tests, five existing ignored; all-feature
+inventory: 1012 library tests, nine existing ignored. Integration/bin targets
+are inventoried separately, including an empty target never counted as a pass.
+
+Evidence: `quill-typed-query-repair.log`, `dsr-quill-development.log`, and
+`dsr-quill-negative-probes.log` under the same retained artifact directory as
+the daemon acceptance. The first expanded DSR development pass completed all
+eight checks, including all eleven stock-plus-Quill stages and seven real-model
+E2Es. This development snapshot was not clean. The final clean-source run at
+`820e83e1` then passed all eight DSR checks, all eleven stages, 59 Quill tests
+and seven real-model E2Es, with identical source/lock identities before and
+after. It is recorded in `dsr-quill-qualified.log` and
+`quill-final-validation.json`; DSR receipt SHA256 is
+`a1ec0b5ba617fe33b46ce828f6c8a141dd418871115493ae76adae7d12696a35`.
+One subsequent change adds a ten-second timeout only to Git metadata lookup;
+the exact changed call and Python syntax were verified separately. No Rust or
+test-selection change follows the qualified revision.
+
+The unchanged full baseline was stopped after 2492.389 seconds of library
+execution, with its unchanged ELF hash and exit -15 retained. It exposed
+12 failures; replay/seed failures were then repaired, while the QG2 golden
+digest and E6 expected-divergence assertions remain unchanged and unresolved.
+Cargo-configuration fixtures also encountered an in-repository RCH temporary
+directory; the driver now uses a private canonical system-temp directory.
+This is incomplete full-suite coverage, not a full-conformance, performance or
+release claim. Earlier release entries are preserved byte for byte.

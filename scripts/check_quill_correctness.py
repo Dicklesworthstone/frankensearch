@@ -198,7 +198,7 @@ def main():
     logs = Path(tempfile.mkdtemp(prefix="quill-gate-", dir=Path("/tmp").resolve()))
     os.environ["TMPDIR"] = str(logs)
     os.environ.pop("RUST_TEST_NOCAPTURE", None)
-    emit("source", head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+    emit("source", head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, timeout=10).strip(),
          lock_sha256=digest(ROOT / "Cargo.lock"), host=os.uname().nodename, logs=str(logs))
     failures = []
     for configuration in (["default", "all"] if args.full else ["all"]):
