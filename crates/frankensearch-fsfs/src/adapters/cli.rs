@@ -826,7 +826,7 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
     #[cfg(unix)]
     {
         // Default search path uses daemon transport to amortize startup/index warmup.
-        input.daemon = input.command == CliCommand::Search && !input.stream;
+        input.daemon = input.command == CliCommand::Search;
     }
 
     #[cfg(not(unix))]
@@ -862,13 +862,6 @@ fn validate_required_args(input: &CliInput) -> SearchResult<()> {
             field: "cli.download.mode".into(),
             value: "--list --verify".into(),
             reason: "use either --list or --verify, not both".into(),
-        });
-    }
-    if input.command == CliCommand::Search && input.stream && input.daemon {
-        return Err(SearchError::InvalidConfig {
-            field: "cli.search.mode".into(),
-            value: "--stream --daemon".into(),
-            reason: "stream mode is not supported with daemon transport".into(),
         });
     }
     if input.command == CliCommand::Delete && input.delete_ids.is_empty() {
@@ -1452,7 +1445,7 @@ mod tests {
     fn parse_stream_flag() {
         let input = parse_cli_args(["search", "test", "--stream"]).unwrap();
         assert!(input.stream);
-        assert!(!input.daemon);
+        assert_eq!(input.daemon, cfg!(unix));
         assert_eq!(input.format, OutputFormat::Jsonl);
         assert!(!input.format_explicit);
     }
@@ -1493,13 +1486,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_stream_and_daemon_together_rejected() {
-        let err =
-            parse_cli_args(["search", "query", "--stream", "--daemon"]).expect_err("must fail");
-        assert!(
-            err.to_string()
-                .contains("stream mode is not supported with daemon transport")
-        );
+    fn parse_stream_preserves_explicit_daemon_preference() {
+        for format in ["jsonl", "toon"] {
+            for (flag, daemon) in [("--daemon", true), ("--no-daemon", false)] {
+                let input =
+                    parse_cli_args(["search", "query", "--stream", flag, "--format", format])
+                        .unwrap();
+                assert!(input.stream);
+                assert_eq!(input.daemon, daemon);
+                assert_eq!(input.format.to_string(), format);
+                assert_eq!(input.query.as_deref(), Some("query"));
+            }
+        }
     }
 
     #[test]

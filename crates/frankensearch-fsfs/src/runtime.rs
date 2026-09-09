@@ -484,9 +484,20 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v4";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v3";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v1";
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 const FSFS_DAEMON_REQUEST_MAX_BYTES: usize = 1 << 20; // 1 MiB
 const FSFS_DAEMON_RESPONSE_MAX_BYTES: usize = 4 << 20; // 4 MiB
+// Each search publishes an attestation and at most two phases. The socket
+// owner drains these independently of the search scheduler. Retain the old
+// 4 MiB response ceiling per phase, allowing two full phases plus metadata.
+#[cfg(unix)]
+const FSFS_DAEMON_FRAME_QUEUE_CAPACITY: usize = 3;
+#[cfg(unix)]
+const FSFS_DAEMON_STREAM_MAX_BYTES: usize = 2 * FSFS_DAEMON_RESPONSE_MAX_BYTES + (64 << 10);
+#[cfg(unix)]
+const FSFS_DAEMON_MAX_CLIENTS: usize = 16;
+const FSFS_DAEMON_MAX_CACHE_ENTRIES: usize = 8;
 const FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS: u64 = 5_000;
 /// Idle-accept poll cadence for the shutdown-aware serve loop (bd-egkb).
 const FSFS_SERVE_ACCEPT_POLL_MS: u64 = 50;
@@ -970,6 +981,79 @@ struct SearchServeResponse {
     payloads: Vec<SearchPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+/// Socket framing is opt-in; stdio still returns one response per input line.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+enum SearchServeFrame {
+    Attested {
+        schema_version: String,
+        policy: Box<SearchServePolicy>,
+        generation_fingerprint: String,
+        vector_generation_id: Option<String>,
+        query: String,
+        mode: String,
+        limit: usize,
+        filter: Option<String>,
+        rerank: bool,
+        cached: bool,
+    },
+    Phase {
+        payload: Box<SearchPayload>,
+    },
+    Terminal {
+        ok: bool,
+        error: Option<String>,
+    },
+}
+
+#[cfg(unix)]
+impl SearchServeFrame {
+    fn terminal(result: SearchResult<()>) -> Self {
+        Self::Terminal {
+            ok: result.is_ok(),
+            error: result.err().map(|error| {
+                let message = error.to_string();
+                let mut bounded = message.chars().take(512).collect::<String>();
+                if bounded.len() < message.len() {
+                    bounded.push_str(" [error detail truncated]");
+                }
+                bounded
+            }),
+        }
+    }
+}
+
+type SearchServeFrameSink<'a> = &'a mut (dyn FnMut(SearchServeFrame) -> SearchResult<()> + Send);
+type SearchDaemonPhaseSink<'a> =
+    &'a mut (dyn FnMut(&SearchPayload, bool) -> SearchResult<()> + Send);
+
+#[cfg(unix)]
+#[derive(Default)]
+struct SearchServeStreamState {
+    attested: bool,
+    cached: bool,
+    vector_generation_id: Option<String>,
+    phase: Option<SearchOutputPhase>,
+    terminal: bool,
+}
+
+#[derive(Default)]
+struct SearchServeFrameBuffer(Vec<u8>);
+
+impl Write for SearchServeFrameBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > FSFS_DAEMON_RESPONSE_MAX_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("daemon frame exceeds byte limit"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -6035,15 +6119,16 @@ impl FsfsRuntime {
             .limit
             .unwrap_or(self.config.search.default_limit);
 
-        if self.cli_input.stream {
-            return self.run_search_stream_command(cx, query, limit).await;
-        }
-
         let mut search_runtime = self.clone();
         if let Some(index_override) = self.ensure_search_index_ready(cx).await? {
             let mut cli_input = search_runtime.cli_input.clone();
             cli_input.index_dir = Some(index_override);
             search_runtime = search_runtime.with_cli_input(cli_input);
+        }
+        if self.cli_input.stream {
+            return search_runtime
+                .run_search_stream_command(cx, query, limit)
+                .await;
         }
 
         let started = Instant::now();
@@ -6068,8 +6153,8 @@ impl FsfsRuntime {
                 // observed and would relabel the cancellation as a daemon
                 // outage, so the daemon wait's fail-closed result must
                 // propagate instead of being retried in process.
-                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-                Err(error) => {
+                Err(error) if matches!(&error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket") =>
+                {
                     warn!(
                         error = %error,
                         "fsfs daemon-backed search unavailable; falling back to in-process retrieval"
@@ -6078,6 +6163,7 @@ impl FsfsRuntime {
                         .execute_search_payloads_cached_for_cli(cx, query, limit)
                         .await?
                 }
+                Err(error) => return Err(error),
             }
         } else {
             search_runtime
@@ -6321,6 +6407,47 @@ impl FsfsRuntime {
                         .map(|artifact| artifact.payload)
                         .collect::<Vec<_>>()
                 })
+            } else if self.cli_input.daemon {
+                let mut daemon_sink = |payload: &SearchPayload, cached: bool| {
+                    if cached && payload.phase == SearchOutputPhase::Initial {
+                        let frame = StreamFrame::new(
+                            stream_id.to_owned(),
+                            seq,
+                            iso_timestamp_now(),
+                            "search",
+                            StreamEvent::<SearchHitPayload>::Progress(StreamProgressEvent {
+                                stage: "cache".to_owned(),
+                                completed_units: 1,
+                                total_units: Some(1),
+                                reason_code: "daemon_cache_hit".to_owned(),
+                                message: "Replaying complete cached search phases".to_owned(),
+                            }),
+                        );
+                        emit_stream_frame(&frame, self.cli_input.format, writer)?;
+                        seq = seq.saturating_add(1);
+                    }
+                    self.emit_search_stream_payload(payload, stream_id, &mut seq, writer)
+                };
+                match self
+                    .search_payloads_via_daemon_with_sink(cx, query, limit, Some(&mut daemon_sink))
+                    .await
+                {
+                    Err(error) if matches!(&error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket") =>
+                    {
+                        warn!(error = %error, "daemon startup unavailable; using in-process retrieval");
+                        let mut direct_sink = |payload: &SearchPayload| {
+                            self.emit_search_stream_payload(payload, stream_id, &mut seq, writer)
+                        };
+                        self.execute_search_payloads_cached_for_cli_with_phase_sink(
+                            cx,
+                            query,
+                            limit,
+                            &mut direct_sink,
+                        )
+                        .await
+                    }
+                    result => result,
+                }
             } else {
                 self.execute_search_payloads_cached_for_cli_with_phase_sink(
                     cx,
@@ -6556,6 +6683,10 @@ impl FsfsRuntime {
                     Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                     Err(error) => return Err(SearchError::Io(error)),
                 };
+                if let Err(error) = stream.set_nonblocking(false) {
+                    warn!(error = %error, "fsfs daemon failed to configure accepted socket");
+                    continue;
+                }
                 if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(
                     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS,
                 ))) {
@@ -6572,6 +6703,22 @@ impl FsfsRuntime {
                         error = %error,
                         "fsfs daemon failed to set socket write timeout; skipping request"
                     );
+                    continue;
+                }
+                if in_flight.load(std::sync::atomic::Ordering::Acquire) >= FSFS_DAEMON_MAX_CLIENTS {
+                    // No new thread or blocking write on the accept loop. A
+                    // terminal refusal is best effort; an unreadable refusal
+                    // is still a failed connection, never a successful search.
+                    let mut stream = stream;
+                    let _ = stream.set_nonblocking(true);
+                    if let Ok(bytes) =
+                        Self::encode_search_serve_frame(&SearchServeFrame::Terminal {
+                            ok: false,
+                            error: Some("daemon client capacity exhausted".to_owned()),
+                        })
+                    {
+                        let _ = stream.write(&bytes);
+                    }
                     continue;
                 }
                 let shared = Arc::clone(&shared);
@@ -6608,7 +6755,10 @@ impl FsfsRuntime {
         stop_requested: Arc<std::sync::atomic::AtomicBool>,
         hot_cache_enabled: bool,
     ) {
-        let raw_request = match Self::read_search_serve_socket_request(&mut stream) {
+        let raw_request = match Self::read_search_serve_socket_request(
+            &mut stream,
+            Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS),
+        ) {
             Ok(Some(raw_request)) => raw_request,
             Ok(None) => return,
             Err(error) => {
@@ -6636,6 +6786,30 @@ impl FsfsRuntime {
         if matches!(raw, "ready" | ":ready") {
             Self::write_search_serve_socket_ready(&runtime, &mut stream, shared);
             return;
+        }
+        if raw.starts_with('{') {
+            match serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|value| value.get("stream").cloned())
+            {
+                Some(serde_json::Value::Bool(true)) => {
+                    Self::handle_search_serve_progressive_client(
+                        runtime,
+                        stream,
+                        shared,
+                        raw,
+                        hot_cache_enabled,
+                    );
+                    return;
+                }
+                Some(serde_json::Value::Bool(false)) | None => {}
+                Some(_) => {
+                    let response =
+                        Self::search_serve_error_response("", "full", "stream must be a boolean");
+                    let _ = Self::write_search_serve_socket_response(&mut stream, &response);
+                    return;
+                }
+            }
         }
 
         // Keep the pool alive until the response is flushed and its write side
@@ -6712,6 +6886,173 @@ impl FsfsRuntime {
         drop(blocking_pool);
     }
 
+    fn search_daemon_error(reason: impl Into<String>) -> SearchError {
+        SearchError::InvalidConfig {
+            field: "cli.daemon".to_owned(),
+            value: "stream".to_owned(),
+            reason: reason.into(),
+        }
+    }
+
+    fn search_daemon_checkpoint(cx: &Cx) -> SearchResult<()> {
+        cx.checkpoint().map_err(|error| SearchError::Cancelled {
+            phase: "daemon.stream".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn encode_search_serve_frame(frame: &SearchServeFrame) -> SearchResult<Vec<u8>> {
+        let mut buffer = SearchServeFrameBuffer::default();
+        serde_json::to_writer(&mut buffer, frame).map_err(|error| {
+            Self::search_daemon_error(format!("cannot encode daemon frame: {error}"))
+        })?;
+        // The limit includes the newline framing byte.
+        buffer.write_all(b"\n").map_err(SearchError::Io)?;
+        Ok(buffer.0)
+    }
+
+    #[cfg(unix)]
+    fn handle_search_serve_progressive_client(
+        runtime: Self,
+        mut stream: UnixStream,
+        shared: SharedSearchServeState,
+        raw: &str,
+        hot_cache_enabled: bool,
+    ) {
+        let request = match Self::parse_search_serve_request(raw) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = Self::write_search_serve_socket_json(
+                    &mut stream,
+                    &SearchServeFrame::terminal(Err(error)),
+                );
+                return;
+            }
+        };
+        let blocking_pool = SearchBlockingPool::default();
+        let pool_handle = blocking_pool.handle();
+        let request_context = Arc::new(asupersync::sync::OnceCell::<Cx>::new());
+        let task_context = Arc::clone(&request_context);
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let task_disconnected = Arc::clone(&disconnected);
+        let budget = Duration::from_millis(
+            request
+                .quality_timeout_ms
+                .unwrap_or(runtime.config.search.quality_timeout_ms)
+                .saturating_add(30_000),
+        );
+        let started = Instant::now();
+        let (sender, mut receiver) =
+            asupersync::channel::mpsc::channel(FSFS_DAEMON_FRAME_QUEUE_CAPACITY);
+        std::thread::scope(|scope| {
+            let compute = scope.spawn(move || -> SearchResult<()> {
+                let scheduler = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 2)
+                    .build()
+                    .map_err(|error| {
+                        Self::search_daemon_error(format!("request scheduler: {error}"))
+                    })?;
+                let task = scheduler.handle().spawn(async move {
+                    // Scoped CPU work needs the live runtime's region and
+                    // spawn capabilities as well as the explicit pool owner.
+                    let request_cx = Cx::current()
+                        .expect("asupersync runtime installs a request context")
+                        .with_blocking_pool_handle(Some(pool_handle));
+                    let _ = task_context.set(request_cx.clone());
+                    if task_disconnected.load(Ordering::Acquire) {
+                        request_cx.cancel_with(
+                            asupersync::types::CancelKind::User,
+                            Some("daemon delivery stopped"),
+                        );
+                    }
+                    let mut guard = asupersync::sync::OwnedMutexGuard::lock(shared, &request_cx)
+                        .await
+                        .map_err(|error| {
+                            Self::search_daemon_error(format!("search state admission: {error}"))
+                        })?;
+                    let (resources, hot_cache) = &mut *guard;
+                    let mut total_bytes = 0_usize;
+                    let mut publish = |frame: SearchServeFrame| {
+                        Self::search_daemon_checkpoint(&request_cx)?;
+                        let permit = sender.try_reserve().map_err(|error| {
+                            Self::search_daemon_error(format!("daemon output queue: {error}"))
+                        })?;
+                        let bytes = Self::encode_search_serve_frame(&frame)?;
+                        total_bytes = total_bytes.saturating_add(bytes.len());
+                        // Leave space for a terminal, including a typed refusal.
+                        if total_bytes > FSFS_DAEMON_STREAM_MAX_BYTES - (16 << 10) {
+                            return Err(Self::search_daemon_error(
+                                "daemon stream exceeds aggregate byte limit",
+                            ));
+                        }
+                        permit.try_send(bytes).map_err(|error| {
+                            Self::search_daemon_error(format!(
+                                "daemon output disconnected: {error}"
+                            ))
+                        })
+                    };
+                    runtime
+                        .execute_search_serve_request_with_sink(
+                            &request_cx,
+                            request,
+                            resources,
+                            hot_cache,
+                            hot_cache_enabled,
+                            Some(&mut publish),
+                        )
+                        .await
+                        .map(|_| ())
+                });
+                scheduler.block_on(task)
+            });
+            let mut transport = Ok(());
+            loop {
+                if started.elapsed() >= budget {
+                    transport = Err(Self::search_daemon_error(
+                        "daemon request delivery deadline exceeded",
+                    ));
+                    break;
+                }
+                match receiver.try_recv() {
+                    Ok(bytes) => {
+                        if let Err(error) =
+                            Self::write_search_serve_bytes(&mut stream, &bytes, started, budget)
+                        {
+                            transport = Err(error);
+                            break;
+                        }
+                    }
+                    Err(asupersync::channel::mpsc::RecvError::Empty) => {
+                        // This is the dedicated socket thread, not an async worker.
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+            if transport.is_err() {
+                disconnected.store(true, Ordering::Release);
+                if let Some(cx) = request_context.get() {
+                    cx.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("daemon delivery stopped"),
+                    );
+                }
+            }
+            drop(receiver);
+            let result = compute.join().unwrap_or_else(|_| {
+                Err(Self::search_daemon_error("daemon search worker panicked"))
+            });
+            let result = transport.and(result);
+            let terminal = SearchServeFrame::terminal(result);
+            let _ = Self::write_search_serve_socket_json(&mut stream, &terminal);
+            let _ = stream.shutdown(Shutdown::Write);
+        });
+        // Non-preemptible inference is owned until completion, but EOF and a
+        // quality-timeout terminal have already reached the reader.
+        drop(blocking_pool);
+    }
+
     fn parse_search_serve_request(raw: &str) -> SearchResult<SearchServeRequest> {
         if raw.starts_with('{') {
             serde_json::from_str::<SearchServeRequest>(raw).map_err(|source| {
@@ -6743,6 +7084,26 @@ impl FsfsRuntime {
         resources: &mut SearchExecutionResources,
         hot_cache: &mut HashMap<SearchCacheKey, Vec<SearchPayload>>,
         hot_cache_enabled: bool,
+    ) -> SearchResult<SearchServeResponse> {
+        self.execute_search_serve_request_with_sink(
+            cx,
+            request,
+            resources,
+            hot_cache,
+            hot_cache_enabled,
+            None,
+        )
+        .await
+    }
+
+    async fn execute_search_serve_request_with_sink(
+        &self,
+        cx: &Cx,
+        request: SearchServeRequest,
+        resources: &mut SearchExecutionResources,
+        hot_cache: &mut HashMap<SearchCacheKey, Vec<SearchPayload>>,
+        hot_cache_enabled: bool,
+        mut frame_sink: Option<SearchServeFrameSink<'_>>,
     ) -> SearchResult<SearchServeResponse> {
         let mode = parse_search_execution_mode(request.mode.as_deref())?;
         if self
@@ -6810,31 +7171,49 @@ impl FsfsRuntime {
         runtime.prepare_search_reranker(cx).await?;
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 
-        let (cached, payloads) = if hot_cache_enabled {
-            if let Some(cached_payloads) = hot_cache.get(&cache_key) {
-                (true, cached_payloads.clone())
-            } else {
-                let payloads = runtime
-                    .execute_search_payloads_with_mode_using_resources(
-                        cx,
-                        &request.query,
-                        requested_limit,
-                        mode,
-                        resources,
-                        SearchExecutionFlags {
-                            include_snippets: true,
-                            persist_explain_session: false,
-                        },
-                    )
-                    .await?;
-                if Self::search_payloads_cacheable(&payloads) {
-                    hot_cache.insert(cache_key, payloads.clone());
-                }
-                (false, payloads)
+        let cached_payloads = hot_cache_enabled
+            .then(|| hot_cache.get(&cache_key))
+            .flatten();
+        let cached = cached_payloads.is_some();
+        Self::validate_bound_search_resources(resources, mode)?;
+        let policy = runtime.search_serve_policy()?;
+        if let Some(sink) = frame_sink.as_mut() {
+            sink(SearchServeFrame::Attested {
+                schema_version: FSFS_SEARCH_SERVE_STREAM_VERSION.to_owned(),
+                policy: Box::new(policy.clone()),
+                generation_fingerprint: resources.generation_fingerprint.clone(),
+                vector_generation_id: resources
+                    .vector_index
+                    .as_ref()
+                    .map(|index| index.embedder_id().to_owned()),
+                query: request.query.clone(),
+                mode: mode.label().to_owned(),
+                limit: requested_limit,
+                filter: request.filter.clone(),
+                rerank: runtime.config.search.rerank,
+                cached,
+            })?;
+        }
+        let index_root = resources.index_root.clone();
+        let fingerprint = resources.generation_fingerprint.clone();
+        let mut publish = |payload: &SearchPayload| {
+            Self::search_daemon_checkpoint(cx)?;
+            Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
+            if let Some(sink) = frame_sink.as_mut() {
+                sink(SearchServeFrame::Phase {
+                    payload: Box::new(payload.clone()),
+                })?;
             }
+            Ok(())
+        };
+        let payloads = if let Some(payloads) = cached_payloads {
+            for payload in payloads {
+                publish(payload)?;
+            }
+            payloads.clone()
         } else {
-            let payloads = runtime
-                .execute_search_payloads_with_mode_using_resources(
+            runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
                     cx,
                     &request.query,
                     requested_limit,
@@ -6844,15 +7223,31 @@ impl FsfsRuntime {
                         include_snippets: true,
                         persist_explain_session: false,
                     },
+                    Some(&mut publish),
                 )
-                .await?;
-            (false, payloads)
+                .await?
+                .into_iter()
+                .map(|artifact| artifact.payload)
+                .collect::<Vec<_>>()
         };
         Self::validate_bound_search_resources(resources, mode)?;
+        Self::search_daemon_checkpoint(cx)?;
+        if hot_cache_enabled
+            && !cached
+            && Self::search_payloads_cacheable(&payloads)
+            && serde_json::to_writer(&mut SearchServeFrameBuffer::default(), &payloads).is_ok()
+        {
+            // Bound persistent query retention independently of transport
+            // buffers. Large successful streams remain deliverable uncached.
+            if hot_cache.len() >= FSFS_DAEMON_MAX_CACHE_ENTRIES {
+                hot_cache.clear();
+            }
+            hot_cache.insert(cache_key, payloads.clone());
+        }
 
         Ok(SearchServeResponse {
             schema_version: FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
-            policy: Some(runtime.search_serve_policy()?),
+            policy: Some(policy),
             ok: true,
             query: request.query,
             mode: mode.label().to_owned(),
@@ -6928,26 +7323,93 @@ impl FsfsRuntime {
     }
 
     #[cfg(unix)]
-    fn read_search_serve_socket_request(stream: &mut UnixStream) -> SearchResult<Option<String>> {
-        let mut raw_request = String::new();
-        let read_limit = FSFS_DAEMON_REQUEST_MAX_BYTES.saturating_add(1);
-        {
-            let mut limited_reader = (&mut *stream).take(read_limit as u64);
-            limited_reader
-                .read_to_string(&mut raw_request)
+    fn read_search_serve_socket_request(
+        stream: &mut UnixStream,
+        budget: Duration,
+    ) -> SearchResult<Option<String>> {
+        let started = Instant::now();
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(Self::search_daemon_error(
+                    "daemon request read deadline exceeded",
+                ));
+            }
+            stream
+                .set_read_timeout(Some(remaining))
                 .map_err(SearchError::Io)?;
+            let count = match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    return Err(Self::search_daemon_error(
+                        "daemon request read deadline exceeded",
+                    ));
+                }
+                Err(error) => return Err(SearchError::Io(error)),
+            };
+            if bytes.len().saturating_add(count) > FSFS_DAEMON_REQUEST_MAX_BYTES {
+                return Err(SearchError::InvalidConfig {
+                    field: "cli.serve.request".to_owned(),
+                    value: "<payload>".to_owned(),
+                    reason: format!("request exceeds {FSFS_DAEMON_REQUEST_MAX_BYTES} bytes limit"),
+                });
+            }
+            bytes.extend_from_slice(&chunk[..count]);
         }
+        let raw_request = String::from_utf8(bytes)
+            .map_err(|error| SearchError::Io(std::io::Error::new(ErrorKind::InvalidData, error)))?;
         if raw_request.trim().is_empty() {
             return Ok(None);
         }
-        if raw_request.len() > FSFS_DAEMON_REQUEST_MAX_BYTES {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.serve.request".to_owned(),
-                value: "<payload>".to_owned(),
-                reason: format!("request exceeds {FSFS_DAEMON_REQUEST_MAX_BYTES} bytes limit"),
-            });
-        }
         Ok(Some(raw_request))
+    }
+
+    #[cfg(unix)]
+    fn write_search_serve_bytes(
+        stream: &mut UnixStream,
+        bytes: &[u8],
+        started: Instant,
+        budget: Duration,
+    ) -> SearchResult<()> {
+        // SO_SNDTIMEO alone can restart inside a write that keeps making
+        // progress. Nonblocking writes keep the absolute budget in our control.
+        // Only the dedicated socket owner calls this helper.
+        stream.set_nonblocking(true).map_err(SearchError::Io)?;
+        let result = (|| {
+            let mut written = 0;
+            let mut last_progress = Instant::now();
+            while written < bytes.len() {
+                if started.elapsed() >= budget
+                    || last_progress.elapsed()
+                        >= Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS)
+                {
+                    return Err(Self::search_daemon_error(
+                        "daemon response write deadline exceeded",
+                    ));
+                }
+                match stream.write(&bytes[written..]) {
+                    Ok(0) => return Err(Self::search_daemon_error("daemon response write closed")),
+                    Ok(count) => {
+                        written += count;
+                        last_progress = Instant::now();
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => return Err(SearchError::Io(error)),
+                }
+            }
+            Ok(())
+        })();
+        let restore = stream.set_nonblocking(false).map_err(SearchError::Io);
+        result.and(restore)
     }
 
     #[cfg(unix)]
@@ -6955,15 +7417,20 @@ impl FsfsRuntime {
         stream: &mut UnixStream,
         value: &T,
     ) -> SearchResult<()> {
-        let response_bytes =
-            serde_json::to_vec(value).map_err(|source| SearchError::SubsystemError {
+        let mut buffer = SearchServeFrameBuffer::default();
+        serde_json::to_writer(&mut buffer, value).map_err(|source| {
+            SearchError::SubsystemError {
                 subsystem: "fsfs.search.serve",
                 source: Box::new(source),
-            })?;
-        stream.write_all(&response_bytes).map_err(SearchError::Io)?;
-        stream.write_all(b"\n").map_err(SearchError::Io)?;
-        stream.flush().map_err(SearchError::Io)?;
-        Ok(())
+            }
+        })?;
+        buffer.write_all(b"\n").map_err(SearchError::Io)?;
+        Self::write_search_serve_bytes(
+            stream,
+            &buffer.0,
+            Instant::now(),
+            Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS),
+        )
     }
 
     #[cfg(unix)]
@@ -7035,6 +7502,17 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
+        self.search_payloads_via_daemon_with_sink(cx, query, limit, None)
+            .await
+    }
+
+    async fn search_payloads_via_daemon_with_sink(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        mut phase_sink: Option<SearchDaemonPhaseSink<'_>>,
+    ) -> SearchResult<Vec<SearchPayload>> {
         #[cfg(unix)]
         {
             let socket_path = self.resolve_daemon_socket_path()?;
@@ -7058,67 +7536,261 @@ impl FsfsRuntime {
                 rrf_k: Some(self.config.search.rrf_k),
                 fast_only: Some(self.config.search.fast_only),
             };
-            let request_json =
-                serde_json::to_vec(&request).map_err(|source| SearchError::SubsystemError {
+            let mut request_value =
+                serde_json::to_value(&request).map_err(|source| SearchError::SubsystemError {
                     subsystem: "fsfs.search.daemon",
                     source: Box::new(source),
                 })?;
-            stream.write_all(&request_json).map_err(SearchError::Io)?;
-            stream.write_all(b"\n").map_err(SearchError::Io)?;
-            stream.flush().map_err(SearchError::Io)?;
-            let _ = stream.shutdown(Shutdown::Write);
-
-            let mut raw_response = String::new();
-            {
-                let response_read_limit = FSFS_DAEMON_RESPONSE_MAX_BYTES.saturating_add(1);
-                let mut limited_reader = (&mut stream).take(response_read_limit as u64);
-                limited_reader
-                    .read_to_string(&mut raw_response)
-                    .map_err(SearchError::Io)?;
-            }
-            if raw_response.len() > FSFS_DAEMON_RESPONSE_MAX_BYTES {
-                return Err(SearchError::InvalidConfig {
-                    field: "cli.daemon".to_owned(),
-                    value: "search".to_owned(),
-                    reason: format!(
-                        "daemon response exceeded {FSFS_DAEMON_RESPONSE_MAX_BYTES} bytes"
-                    ),
-                });
-            }
-            let response = serde_json::from_str::<SearchServeResponse>(raw_response.trim())
-                .map_err(|source| SearchError::SubsystemError {
+            request_value["stream"] = serde_json::Value::Bool(true);
+            let mut request_json = serde_json::to_vec(&request_value).map_err(|source| {
+                SearchError::SubsystemError {
                     subsystem: "fsfs.search.daemon",
                     source: Box::new(source),
-                })?;
-            if !response.ok {
-                return Err(SearchError::InvalidConfig {
-                    field: "cli.daemon".to_owned(),
-                    value: "search".to_owned(),
-                    reason: response
-                        .error
-                        .unwrap_or_else(|| "daemon search request failed".to_owned()),
-                });
+                }
+            })?;
+            request_json.push(b'\n');
+            if request_json.len() > FSFS_DAEMON_REQUEST_MAX_BYTES {
+                return Err(Self::search_daemon_error(
+                    "daemon request exceeds byte limit",
+                ));
             }
-            self.validate_search_serve_policy(&response)?;
-            if let Err(error) =
-                self.persist_explain_session_for_cached_payloads(query, &response.payloads)
+            stream.set_nonblocking(true).map_err(SearchError::Io)?;
+            let started = Instant::now();
+            let budget =
+                Duration::from_millis(self.config.search.quality_timeout_ms.saturating_add(30_000));
+            let mut written = 0;
+            while written < request_json.len() {
+                Self::search_daemon_transport_checkpoint(cx, started, budget)?;
+                match stream.write(&request_json[written..]) {
+                    Ok(0) => return Err(Self::search_daemon_error("daemon request write closed")),
+                    Ok(count) => written += count,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(SearchError::Io(error)),
+                }
+            }
+            stream.shutdown(Shutdown::Write).map_err(SearchError::Io)?;
+            let index_root = self.resolve_status_index_root()?;
+            let fingerprint = Self::search_index_fingerprint_at_root(&index_root)?;
+            let mut reader = BufReader::new(stream);
+            let mut state = SearchServeStreamState::default();
+            let mut payloads = Vec::with_capacity(2);
+            let mut total_bytes = 0_usize;
+            while let Some(bytes) =
+                Self::read_search_serve_frame(cx, &mut reader, started, budget).await?
             {
+                total_bytes = total_bytes.saturating_add(bytes.len());
+                if total_bytes > FSFS_DAEMON_STREAM_MAX_BYTES {
+                    return Err(Self::search_daemon_error(
+                        "daemon stream exceeds aggregate byte limit",
+                    ));
+                }
+                let frame = serde_json::from_slice(&bytes).map_err(|error| {
+                    Self::search_daemon_error(format!(
+                        "invalid daemon frame: {error}; restart the query daemon or use --no-daemon"
+                    ))
+                })?;
+                if let Some(payload) = self.accept_search_serve_frame(
+                    frame,
+                    &mut state,
+                    &request,
+                    &index_root,
+                    &fingerprint,
+                )? {
+                    if let Some(sink) = phase_sink.as_mut() {
+                        sink(&payload, state.cached)?;
+                    }
+                    payloads.push(payload);
+                }
+            }
+            if !state.terminal {
+                return Err(Self::search_daemon_error("daemon stream missing terminal"));
+            }
+            Self::validate_search_generation_fingerprint(
+                &index_root,
+                &fingerprint,
+                SearchExecutionMode::Full,
+            )?;
+            if let Err(error) = self.persist_explain_session_for_cached_payloads(query, &payloads) {
                 warn!(
                     error = %error,
                     "fsfs daemon-backed search could not persist explain-session context"
                 );
             }
-            Ok(response.payloads)
+            Ok(payloads)
         }
 
         #[cfg(not(unix))]
         {
-            let _ = (cx, query, limit);
+            let _ = (cx, query, limit, &mut phase_sink);
             Err(SearchError::InvalidConfig {
                 field: "cli.daemon".to_owned(),
                 value: "search".to_owned(),
                 reason: "daemon transport is only supported on unix platforms".to_owned(),
             })
+        }
+    }
+
+    #[cfg(unix)]
+    fn search_daemon_transport_checkpoint(
+        cx: &Cx,
+        started: Instant,
+        budget: Duration,
+    ) -> SearchResult<()> {
+        Self::search_daemon_checkpoint(cx)?;
+        if started.elapsed() >= budget {
+            return Err(Self::search_daemon_error(
+                "daemon request delivery deadline exceeded",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn read_search_serve_frame(
+        cx: &Cx,
+        reader: &mut BufReader<UnixStream>,
+        started: Instant,
+        budget: Duration,
+    ) -> SearchResult<Option<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        loop {
+            Self::search_daemon_transport_checkpoint(cx, started, budget)?;
+            let remaining = FSFS_DAEMON_RESPONSE_MAX_BYTES
+                .saturating_add(1)
+                .saturating_sub(bytes.len());
+            let read = (&mut *reader)
+                .take(remaining as u64)
+                .read_until(b'\n', &mut bytes);
+            if bytes.len() > FSFS_DAEMON_RESPONSE_MAX_BYTES {
+                return Err(Self::search_daemon_error("daemon frame exceeds byte limit"));
+            }
+            if bytes.last() == Some(&b'\n') {
+                return Ok(Some(bytes));
+            }
+            match read {
+                Ok(0) if bytes.is_empty() => return Ok(None),
+                Ok(_) => return Err(Self::search_daemon_error("truncated daemon frame")),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(SearchError::Io(error)),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn accept_search_serve_frame(
+        &self,
+        frame: SearchServeFrame,
+        state: &mut SearchServeStreamState,
+        request: &SearchServeRequest,
+        index_root: &Path,
+        fingerprint: &str,
+    ) -> SearchResult<Option<SearchPayload>> {
+        if state.terminal {
+            return Err(Self::search_daemon_error("daemon frame after terminal"));
+        }
+        match frame {
+            SearchServeFrame::Attested {
+                schema_version,
+                policy,
+                generation_fingerprint,
+                vector_generation_id,
+                query,
+                mode,
+                limit,
+                filter,
+                rerank,
+                cached,
+            } => {
+                if state.attested {
+                    return Err(Self::search_daemon_error("duplicate daemon attestation"));
+                }
+                if schema_version != FSFS_SEARCH_SERVE_STREAM_VERSION
+                    || *policy != self.search_serve_policy()?
+                    || query != request.query
+                    || mode != "full"
+                    || Some(limit) != request.limit
+                    || filter != request.filter
+                    || Some(rerank) != request.rerank
+                {
+                    return Err(Self::search_daemon_error(
+                        "daemon did not acknowledge requested search policy; restart the query daemon or use --no-daemon",
+                    ));
+                }
+                if generation_fingerprint != fingerprint
+                    || vector_generation_id
+                        != Self::inspect_published_vector_generation(index_root)
+                            .map(|generation| generation.id)
+                {
+                    return Err(Self::search_daemon_error(
+                        "daemon generation or producer disagreement",
+                    ));
+                }
+                Self::validate_search_generation_fingerprint(
+                    index_root,
+                    fingerprint,
+                    SearchExecutionMode::Full,
+                )?;
+                state.attested = true;
+                state.cached = cached;
+                state.vector_generation_id = vector_generation_id;
+                Ok(None)
+            }
+            SearchServeFrame::Phase { payload } => {
+                if !state.attested {
+                    return Err(Self::search_daemon_error("daemon phase before attestation"));
+                }
+                if !matches!(
+                    (state.phase, payload.phase),
+                    (None, SearchOutputPhase::Initial)
+                        | (
+                            Some(SearchOutputPhase::Initial),
+                            SearchOutputPhase::Refined | SearchOutputPhase::RefinementFailed
+                        )
+                ) {
+                    return Err(Self::search_daemon_error(
+                        "duplicate or out-of-order daemon phase",
+                    ));
+                }
+                if payload.query != Self::normalize_search_query(&request.query)
+                    || payload.vector_generation_id != state.vector_generation_id
+                    || payload.vector_generation_is_hash
+                        != state
+                            .vector_generation_id
+                            .as_deref()
+                            .is_some_and(Self::is_legacy_hash_vector_generation)
+                    || payload.returned_hits != payload.hits.len()
+                    || payload.returned_hits > request.limit.unwrap_or(0)
+                {
+                    return Err(Self::search_daemon_error(
+                        "daemon phase request or producer disagreement",
+                    ));
+                }
+                Self::validate_search_generation_fingerprint(
+                    index_root,
+                    fingerprint,
+                    SearchExecutionMode::Full,
+                )?;
+                state.phase = Some(payload.phase);
+                Ok(Some(*payload))
+            }
+            SearchServeFrame::Terminal { ok, error } => {
+                if !ok {
+                    return Err(Self::search_daemon_error(
+                        error.unwrap_or_else(|| "daemon search failed".to_owned()),
+                    ));
+                }
+                if !state.attested || state.phase.is_none() || error.is_some() {
+                    return Err(Self::search_daemon_error("invalid daemon success terminal"));
+                }
+                state.terminal = true;
+                Ok(None)
+            }
         }
     }
 
@@ -8312,6 +8984,7 @@ impl FsfsRuntime {
         })
     }
 
+    #[cfg(test)]
     fn validate_search_serve_policy(&self, response: &SearchServeResponse) -> SearchResult<()> {
         if response.schema_version != FSFS_SEARCH_SERVE_SCHEMA_VERSION
             || response.policy.as_ref() != Some(&self.search_serve_policy()?)
@@ -16324,6 +16997,7 @@ impl FsfsRuntime {
                 // The actual job owns both the permit and successful model,
                 // including when its original query has already timed out.
                 let mut slot = permit;
+                let initialization_started = Instant::now();
                 #[cfg(not(test))]
                 let resolved = runtime.resolve_quality_embedder();
                 #[cfg(test)]
@@ -16331,6 +17005,13 @@ impl FsfsRuntime {
                 if let Ok(Some(embedder)) = &resolved {
                     slot.0 = Some(Arc::clone(embedder));
                 }
+                info!(
+                    phase = "quality_initialization",
+                    elapsed_us = u64::try_from(initialization_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                    loaded = resolved.as_ref().is_ok_and(Option::is_some),
+                    "fsfs quality model initialization completed"
+                );
                 resolved
             })
             .await?
@@ -23228,6 +23909,8 @@ mod tests {
             && std::io::IsTerminal::is_terminal(&std::io::stdin());
         assert!(!interactive_terminal || std::env::var_os("FSFS_ALLOW_TTY_TEST").is_some());
     }
+    #[cfg(unix)]
+    use std::io::{BufRead as _, Read as _};
     use std::io::{ErrorKind, Write as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24283,6 +24966,778 @@ mod tests {
             completed.load(Ordering::SeqCst),
             "shutdown must retain work past the dependency's five-second grace period"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progressive_daemon_initial_arrives_before_quality_is_released() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut resources = disagreeing_blend_resources(temp.path());
+        let gate = Arc::new(asupersync::sync::Mutex::new(()));
+        let held = futures_lite_block_on(asupersync::sync::OwnedMutexGuard::lock(
+            Arc::clone(&gate),
+            &Cx::for_request(),
+        ))
+        .unwrap();
+        let completed = Arc::new(AtomicUsize::new(0));
+        resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
+            gate,
+            calls: Arc::new(AtomicUsize::new(0)),
+            completed: Arc::clone(&completed),
+        }));
+        let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let handler = thread::spawn(move || {
+            FsfsRuntime::handle_search_serve_socket_client(
+                FsfsRuntime::new(FsfsConfig::default()),
+                server,
+                shared,
+                Arc::new(AtomicBool::new(false)),
+                false,
+            );
+        });
+        client.write_all(b"{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":2000,\"limit\":10,\"stream\":true}\n").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reader = std::io::BufReader::new(client);
+        let mut first = String::new();
+        let mut initial = String::new();
+        let first_read = reader.read_line(&mut first);
+        let initial_read = reader.read_line(&mut initial);
+        let completed_before_release = completed.load(Ordering::SeqCst);
+        drop(held);
+        let mut remaining = String::new();
+        let remaining_read = reader.read_to_string(&mut remaining);
+        handler.join().unwrap();
+        first_read.unwrap();
+        initial_read.unwrap();
+        remaining_read.unwrap();
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["event"], "attested", "{first}");
+        let initial: serde_json::Value = serde_json::from_str(&initial).unwrap();
+        assert_eq!(initial["event"], "phase");
+        assert_eq!(initial["payload"]["phase"], "initial");
+        assert_eq!(completed_before_release, 0);
+        let remaining = remaining
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 2, "{remaining:?}");
+        assert_eq!(remaining[0]["payload"]["phase"], "refined", "{remaining:?}");
+        assert_eq!(remaining[1]["event"], "terminal");
+        assert_eq!(remaining[1]["ok"], true);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progressive_daemon_decoder_refuses_unattested_reordered_and_changed_results() {
+        use super::{SearchServeFrame, SearchServeStreamState};
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let fingerprint = FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+        let request = FsfsRuntime::parse_search_serve_request(
+            r#"{"query":"  two   words ","mode":"full","limit":3,"rerank":false}"#,
+        )
+        .unwrap();
+        let header = || SearchServeFrame::Attested {
+            schema_version: super::FSFS_SEARCH_SERVE_STREAM_VERSION.to_owned(),
+            policy: Box::new(runtime.search_serve_policy().unwrap()),
+            generation_fingerprint: fingerprint.clone(),
+            vector_generation_id: None,
+            query: request.query.clone(),
+            mode: "full".to_owned(),
+            limit: 3,
+            filter: None,
+            rerank: false,
+            cached: false,
+        };
+        let phase = |phase| SearchServeFrame::Phase {
+            payload: Box::new(SearchPayload::new("two words", phase, 0, Vec::new())),
+        };
+        let accept = |frame, state: &mut SearchServeStreamState| {
+            runtime.accept_search_serve_frame(frame, state, &request, temp.path(), &fingerprint)
+        };
+        let mut state = SearchServeStreamState::default();
+        assert!(
+            accept(phase(SearchOutputPhase::Initial), &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("before attestation")
+        );
+        let mut bad = header();
+        if let SearchServeFrame::Attested { policy, .. } = &mut bad {
+            policy.quality_weight_bits = 0;
+        }
+        assert!(
+            accept(bad, &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("search policy")
+        );
+        let mut bad = header();
+        if let SearchServeFrame::Attested {
+            generation_fingerprint,
+            ..
+        } = &mut bad
+        {
+            *generation_fingerprint = "different-generation".to_owned();
+        }
+        assert!(
+            accept(bad, &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("producer disagreement")
+        );
+        accept(header(), &mut state).unwrap();
+        assert!(
+            accept(header(), &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate daemon attestation")
+        );
+        assert!(
+            accept(phase(SearchOutputPhase::Refined), &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("out-of-order")
+        );
+        let mut bad = phase(SearchOutputPhase::Initial);
+        if let SearchServeFrame::Phase { payload } = &mut bad {
+            payload.vector_generation_id = Some("foreign-producer".to_owned());
+        }
+        assert!(
+            accept(bad, &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("producer disagreement")
+        );
+        accept(phase(SearchOutputPhase::Initial), &mut state).unwrap();
+        assert!(
+            accept(phase(SearchOutputPhase::Initial), &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("out-of-order")
+        );
+        accept(phase(SearchOutputPhase::RefinementFailed), &mut state).unwrap();
+        assert!(
+            accept(phase(SearchOutputPhase::Refined), &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("out-of-order")
+        );
+        accept(
+            SearchServeFrame::Terminal {
+                ok: true,
+                error: None,
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert!(
+            accept(
+                SearchServeFrame::Terminal {
+                    ok: true,
+                    error: None
+                },
+                &mut state
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("after terminal")
+        );
+        assert!(
+            serde_json::from_str::<SearchServeFrame>(
+                r#"{"event":"terminal","ok":true,"error":null,"unknown":1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progressive_daemon_frame_reader_bounds_bytes_and_observes_cancel() {
+        use std::os::unix::net::UnixStream;
+        for (bytes, expected) in [
+            (b"{broken".to_vec(), "truncated daemon frame"),
+            (
+                vec![b'x'; super::FSFS_DAEMON_RESPONSE_MAX_BYTES + 1],
+                "frame exceeds byte limit",
+            ),
+        ] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            client.set_nonblocking(true).unwrap();
+            let writer = thread::spawn(move || {
+                let _ = server.write_all(&bytes);
+            });
+            let result = futures_lite_block_on(FsfsRuntime::read_search_serve_frame(
+                &Cx::for_request(),
+                &mut std::io::BufReader::new(client),
+                Instant::now(),
+                Duration::from_secs(5),
+            ));
+            writer.join().unwrap();
+            assert!(result.unwrap_err().to_string().contains(expected));
+        }
+        let (client, _server) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let cx = Cx::for_request();
+        cx.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel stalled daemon read"),
+        );
+        let result = futures_lite_block_on(FsfsRuntime::read_search_serve_frame(
+            &cx,
+            &mut std::io::BufReader::new(client),
+            Instant::now(),
+            Duration::from_secs(5),
+        ));
+        assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progressive_daemon_socket_budgets_cannot_be_extended_by_trickling_bytes() {
+        use std::os::unix::net::UnixStream;
+        let budget = Duration::from_millis(200);
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let sent_by_peer = Arc::clone(&sent);
+        let peer = thread::spawn(move || {
+            for _ in 0..100 {
+                if writer.write_all(b"x").is_err() {
+                    break;
+                }
+                sent_by_peer.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let result = FsfsRuntime::read_search_serve_socket_request(&mut reader, budget);
+        drop(reader);
+        peer.join().unwrap();
+        assert!(
+            sent.load(Ordering::SeqCst) > 1,
+            "exercise progress, not just an idle timeout"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("request read deadline exceeded")
+        );
+
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let peer = thread::spawn(move || {
+            let mut total = 0;
+            let mut bytes = [0_u8; 16 << 10];
+            while let Ok(count) = reader.read(&mut bytes) {
+                if count == 0 {
+                    break;
+                }
+                total += count;
+                thread::sleep(Duration::from_millis(10));
+            }
+            total
+        });
+        let result = FsfsRuntime::write_search_serve_bytes(
+            &mut writer,
+            &vec![b'x'; 4 << 20],
+            Instant::now(),
+            budget,
+        );
+        drop(writer);
+        let received = peer.join().unwrap();
+        assert!(received > 0 && received < 4 << 20);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("response write deadline exceeded")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progressive_daemon_client_rejects_bad_socket_sequences_without_replaying() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_dir = short_socket_tempdir();
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let header = serde_json::json!({
+            "event":"attested", "schema_version":super::FSFS_SEARCH_SERVE_STREAM_VERSION,
+            "policy":runtime.search_serve_policy().unwrap(),
+            "generation_fingerprint":FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap(),
+            "vector_generation_id":null, "query":"query", "mode":"full", "limit":3,
+            "filter":null, "rerank":false, "cached":false,
+        });
+        let initial = serde_json::json!({"event":"phase","payload":SearchPayload::new("query", SearchOutputPhase::Initial, 0, Vec::new())});
+        let terminal = serde_json::json!({"event":"terminal","ok":true,"error":null});
+        let valid_prefix = format!("{header}\n{initial}\n");
+        for (number, (wire, reason, delivered)) in [
+            ("{invalid}\n".to_owned(), "invalid daemon frame", 0),
+            (format!("{initial}\n"), "before attestation", 0),
+            (String::new(), "missing terminal", 0),
+            (valid_prefix.clone(), "missing terminal", 1),
+            (format!("{valid_prefix}{initial}\n"), "out-of-order", 1),
+            (
+                format!("{valid_prefix}{header}\n"),
+                "duplicate daemon attestation",
+                1,
+            ),
+            (
+                format!("{valid_prefix}{terminal}\n{terminal}\n"),
+                "after terminal",
+                1,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let socket = socket_dir.path().join(format!("negative-{number}.sock"));
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                let _ = stream.write_all(wire.as_bytes());
+            });
+            let client = runtime.clone().with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                daemon: true,
+                daemon_socket: Some(socket),
+                ..CliInput::default()
+            });
+            let mut count = 0;
+            let mut sink = |_: &SearchPayload, _cached| {
+                count += 1;
+                Ok(())
+            };
+            let result = futures_lite_block_on(client.search_payloads_via_daemon_with_sink(
+                &Cx::for_request(),
+                "query",
+                3,
+                Some(&mut sink),
+            ));
+            server.join().unwrap();
+            assert!(
+                result.unwrap_err().to_string().contains(reason),
+                "case {number}"
+            );
+            assert_eq!(
+                count, delivered,
+                "case {number}: no replay or unvalidated hits"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn published_blend_resources(root: &Path) -> SearchExecutionResources {
+        let mut resources = disagreeing_blend_resources(root);
+        fs::create_dir_all(root.join("vector")).unwrap();
+        fs::copy(
+            root.join("fast.fsvi"),
+            root.join(super::FSFS_VECTOR_INDEX_FILE),
+        )
+        .unwrap();
+        fs::copy(
+            root.join("quality.fsvi"),
+            root.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE),
+        )
+        .unwrap();
+        resources.generation_fingerprint =
+            FsfsRuntime::search_index_fingerprint_at_root(root).unwrap();
+        resources
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progressive_daemon_client_preserves_policy_cache_stream_and_direct_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_dir = short_socket_tempdir();
+        let socket_path = socket_dir.path().join("progressive.sock");
+        let resources = published_blend_resources(temp.path());
+        let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server_shared = Arc::clone(&shared);
+        let server = thread::spawn(move || {
+            for _ in 0..6 {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => return,
+                    }
+                };
+                FsfsRuntime::handle_search_serve_socket_client(
+                    FsfsRuntime::new(FsfsConfig::default()),
+                    stream,
+                    Arc::clone(&server_shared),
+                    Arc::new(AtomicBool::new(false)),
+                    true,
+                );
+            }
+        });
+        let client = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            index_dir: Some(temp.path().to_path_buf()),
+            daemon: true,
+            daemon_socket: Some(socket_path),
+            format: OutputFormat::Jsonl,
+            ..CliInput::default()
+        });
+        run_on_runtime_task(move |cx| async move {
+            let query = "recover failed network requests";
+            let first = client
+                .search_payloads_via_daemon(&cx, query, 10)
+                .await
+                .unwrap();
+            assert_eq!(first.len(), 2);
+            let mut cached = Vec::new();
+            client
+                .run_search_stream_command_with_writer(&cx, query, 10, "cached", &mut cached, None)
+                .await
+                .unwrap();
+            let cached = String::from_utf8(cached).unwrap();
+            assert!(cached.contains("daemon_cache_hit"), "{cached}");
+            assert!(cached.contains("retrieve.quality"), "{cached}");
+            let mut fast = client.clone();
+            fast.config.search.fast_only = true;
+            let fast_payloads = fast
+                .search_payloads_via_daemon(&cx, query, 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                fast_payloads.len(),
+                1,
+                "policy must not reuse refined cache"
+            );
+            let mut toon = client.clone();
+            toon.cli_input.format = OutputFormat::Toon;
+            let mut output = Vec::new();
+            toon.run_search_stream_command_with_writer(
+                &cx,
+                "  recover   network requests ",
+                10,
+                "toon",
+                &mut output,
+                None,
+            )
+            .await
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("retrieve.quality"), "{output}");
+            assert!(
+                !output.contains("daemon_cache_hit"),
+                "distinct query must compute"
+            );
+            let mut filtered = client.clone();
+            filtered.cli_input.filter = Some("ext:rs".to_owned());
+            let limited = filtered
+                .search_payloads_via_daemon(&cx, query, 1)
+                .await
+                .unwrap();
+            assert!(limited.iter().all(|phase| phase.hits.len() == 1));
+            filtered.cli_input.filter = Some("ext:md".to_owned());
+            let excluded = filtered
+                .search_payloads_via_daemon(&cx, query, 1)
+                .await
+                .unwrap();
+            assert!(excluded.iter().all(|phase| phase.hits.is_empty()));
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(shared, &cx)
+                .await
+                .unwrap();
+            let direct = client
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    query,
+                    10,
+                    SearchExecutionMode::Full,
+                    &mut guard.0,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(first.last().unwrap().hits, direct.last().unwrap().hits);
+        });
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progressive_daemon_large_phases_do_not_hold_state_behind_a_slow_reader() {
+        use std::os::unix::net::UnixStream;
+        for oversized_refinement in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let resources = disagreeing_blend_resources(temp.path());
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let key = runtime
+                .search_cache_key("network", 10, SearchExecutionMode::Full)
+                .unwrap();
+            let mut payload = SearchPayload::new(
+                "network",
+                SearchOutputPhase::Initial,
+                1,
+                vec![SearchHitPayload {
+                    rank: 1,
+                    path: "network.rs".to_owned(),
+                    score: 1.0,
+                    snippet: Some("x".repeat(3 << 20)),
+                    lexical_rank: None,
+                    semantic_rank: Some(1),
+                    hash_rank: None,
+                    in_both_sources: false,
+                }],
+            );
+            payload.vector_generation_id = resources
+                .vector_index
+                .as_ref()
+                .map(|index| index.embedder_id().to_owned());
+            let mut refined = payload.clone();
+            refined.phase = SearchOutputPhase::Refined;
+            if oversized_refinement {
+                refined.hits[0].snippet = Some("x".repeat(super::FSFS_DAEMON_RESPONSE_MAX_BYTES));
+            }
+            let shared = Arc::new(asupersync::sync::Mutex::new((
+                resources,
+                HashMap::from([(key, vec![payload, refined])]),
+            )));
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let server_shared = Arc::clone(&shared);
+            let slow = thread::spawn(move || {
+                FsfsRuntime::handle_search_serve_socket_client(
+                    runtime,
+                    server,
+                    server_shared,
+                    Arc::new(AtomicBool::new(false)),
+                    true,
+                );
+            });
+            client
+                .write_all(b"{\"query\":\"network\",\"limit\":10,\"stream\":true}")
+                .unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            // Only consume the attestation, leaving a multi-megabyte phase blocked
+            // in the socket writer. A separate readiness request needs the state.
+            let mut reader = std::io::BufReader::new(client);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("\"cached\":true"));
+            let (mut probe, server) = UnixStream::pair().unwrap();
+            probe
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let ready = thread::spawn(move || {
+                FsfsRuntime::handle_search_serve_socket_client(
+                    FsfsRuntime::new(FsfsConfig::default()),
+                    server,
+                    shared,
+                    Arc::new(AtomicBool::new(false)),
+                    false,
+                );
+            });
+            probe.write_all(b"ready").unwrap();
+            probe.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            let probe_result = probe.read_to_string(&mut response);
+            let mut phases = String::new();
+            let drain_result = reader.read_to_string(&mut phases);
+            ready.join().unwrap();
+            slow.join().unwrap();
+            probe_result.unwrap();
+            drain_result.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response).unwrap()["event"],
+                "ready"
+            );
+            let frames = phases
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), if oversized_refinement { 2 } else { 3 });
+            assert_eq!(
+                frames[0]["payload"]["hits"][0]["snippet"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                3 << 20
+            );
+            if oversized_refinement {
+                assert_eq!(frames[1]["event"], "terminal");
+                assert_eq!(frames[1]["ok"], false);
+                assert!(
+                    frames[1]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("frame exceeds byte limit")
+                );
+            } else {
+                assert!(phases.len() > super::FSFS_DAEMON_RESPONSE_MAX_BYTES);
+                assert_eq!(frames[1]["payload"]["phase"], "refined");
+                assert_eq!(frames[2]["ok"], true);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progressive_daemon_timeout_and_disconnect_do_not_cache_incomplete_searches() {
+        use std::os::unix::net::UnixStream;
+        for disconnect in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let completed = Arc::new(AtomicUsize::new(0));
+            resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
+                gate: Arc::new(asupersync::sync::Mutex::new(())),
+                calls: Arc::new(AtomicUsize::new(0)),
+                completed: Arc::clone(&completed),
+            }));
+            let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
+            let server_shared = Arc::clone(&shared);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let handler = thread::spawn(move || {
+                FsfsRuntime::handle_search_serve_socket_client(
+                    FsfsRuntime::new(FsfsConfig::default()),
+                    server,
+                    server_shared,
+                    Arc::new(AtomicBool::new(false)),
+                    true,
+                );
+            });
+            client.write_all(b"{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":50,\"stream\":true}").unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut reader = std::io::BufReader::new(client);
+            let mut header = String::new();
+            let mut initial = String::new();
+            reader.read_line(&mut header).unwrap();
+            reader.read_line(&mut initial).unwrap();
+            assert!(initial.contains("\"phase\":\"initial\""));
+            let mut remaining = String::new();
+            if disconnect {
+                reader.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+            } else {
+                reader.read_to_string(&mut remaining).unwrap();
+                assert_eq!(
+                    completed.load(Ordering::SeqCst),
+                    0,
+                    "EOF must precede owned backend drain"
+                );
+            }
+            drop(reader);
+            handler.join().unwrap();
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                1,
+                "handler must drain admitted inference"
+            );
+            let guard = futures_lite_block_on(asupersync::sync::OwnedMutexGuard::lock(
+                shared,
+                &Cx::for_request(),
+            ))
+            .unwrap();
+            assert!(
+                guard.1.is_empty(),
+                "partial responses cannot become cache hits"
+            );
+            if !disconnect {
+                let frames = remaining
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(frames.len(), 2);
+                assert_eq!(frames[0]["payload"]["phase"], "refinement_failed");
+                assert_eq!(frames[0]["payload"]["quality_timeout"]["budget_ms"], 50);
+                assert_eq!(frames[1]["event"], "terminal");
+                assert_eq!(frames[1]["ok"], true);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progressive_daemon_client_cancels_after_initial_without_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_dir = short_socket_tempdir();
+        let socket = socket_dir.path().join("cancel.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut resources = published_blend_resources(temp.path());
+        let completed = Arc::new(AtomicUsize::new(0));
+        resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
+            gate: Arc::new(asupersync::sync::Mutex::new(())),
+            calls: Arc::new(AtomicUsize::new(0)),
+            completed: Arc::clone(&completed),
+        }));
+        let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
+        let server_shared = Arc::clone(&shared);
+        let handler = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            FsfsRuntime::handle_search_serve_socket_client(
+                FsfsRuntime::new(FsfsConfig::default()),
+                stream,
+                server_shared,
+                Arc::new(AtomicBool::new(false)),
+                true,
+            );
+        });
+        let mut config = FsfsConfig::default();
+        config.search.quality_timeout_ms = 50;
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            daemon: true,
+            daemon_socket: Some(socket),
+            index_dir: Some(temp.path().to_path_buf()),
+            ..CliInput::default()
+        });
+        let cx = Cx::for_request();
+        let mut count = 0;
+        let mut sink = |payload: &SearchPayload, _cached| {
+            assert_eq!(payload.phase, SearchOutputPhase::Initial);
+            count += 1;
+            cx.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel after Initial"),
+            );
+            Ok(())
+        };
+        let result = futures_lite_block_on(runtime.search_payloads_via_daemon_with_sink(
+            &cx,
+            "recover failed network requests",
+            10,
+            Some(&mut sink),
+        ));
+        handler.join().unwrap();
+        assert!(
+            matches!(result, Err(SearchError::Cancelled { .. })),
+            "{result:?}"
+        );
+        assert_eq!(count, 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        let guard = futures_lite_block_on(asupersync::sync::OwnedMutexGuard::lock(
+            shared,
+            &Cx::for_request(),
+        ))
+        .unwrap();
+        assert!(guard.1.is_empty());
     }
 
     #[cfg(unix)]
@@ -27810,8 +29265,9 @@ mod tests {
                 .expect("shutdown write side");
         });
 
-        let error = FsfsRuntime::read_search_serve_socket_request(&mut reader)
-            .expect_err("oversized request should fail");
+        let error =
+            FsfsRuntime::read_search_serve_socket_request(&mut reader, Duration::from_secs(5))
+                .expect_err("oversized request should fail");
         writer_task.join().expect("writer thread");
         assert!(
             matches!(
@@ -28091,6 +29547,24 @@ mod tests {
         assert_eq!(response["ok"], serde_json::json!(true), "query succeeds");
         drop(stalled);
         drop(complete);
+
+        // Partial requests consume the same bounded admission slots as active
+        // searches. Saturation must refuse without spawning another reader.
+        let partial = (0..super::FSFS_DAEMON_MAX_CLIENTS)
+            .map(|_| connect_socket_with_retry(&socket_path))
+            .collect::<Vec<_>>();
+        thread::sleep(Duration::from_millis(150));
+        let mut refused = connect_socket_with_retry(&socket_path);
+        refused
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut raw = String::new();
+        refused.read_to_string(&mut raw).unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["event"], "terminal");
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "daemon client capacity exhausted");
+        drop(partial);
 
         coordinator.request_shutdown(ShutdownReason::UserRequest);
         let result = join_with_timeout(handle, Duration::from_secs(6));
