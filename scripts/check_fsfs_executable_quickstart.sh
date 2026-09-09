@@ -123,7 +123,8 @@ BINARY_SOURCE="unknown"
 BUILD_EXECUTABLE_SHA="unknown"
 build_env=(env "HOME=$WORK_DIR/home" "XDG_CONFIG_HOME=$WORK_DIR/config"
   "XDG_CACHE_HOME=$WORK_DIR/cache" "XDG_DATA_HOME=$WORK_DIR/data"
-  "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}")
+  "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
+  "PATH=${CARGO_HOME:-$HOME/.cargo}/bin:$PATH")
 mkdir -p "$WORK_DIR/home" "$WORK_DIR/config" "$WORK_DIR/cache" "$WORK_DIR/data"
 if [[ -n "${BINARY_OVERRIDE}" ]]; then
   FSFS_BIN="${BINARY_OVERRIDE}"
@@ -208,7 +209,8 @@ commands, controls = [], []
 corpus, index = work / 'corpus', work / 'index'
 model_root = Path(os.environ.get('FRANKENSEARCH_MODEL_DIR',
                   str(Path.home() / '.local/share/frankensearch/models'))).resolve()
-# HOME/XDG isolation applies only to the child, never to the build toolchain.
+# Runtime and installation share isolated HOME/XDG roots. Toolchain caches stay
+# explicitly located by Cargo/Rustup variables in the shell build environment.
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(('FRANKENSEARCH_', 'FSFS_', 'HF_', 'HUGGINGFACE_'))}
 for key, name in [('HOME', 'home'), ('XDG_CONFIG_HOME', 'config'),
