@@ -2921,7 +2921,7 @@ const TYPED_QUERY_FUZZ_OVERSIZED_TOKEN_BYTES: usize = 65_531;
 #[cfg(feature = "fuzz-harness")]
 const TYPED_QUERY_FUZZ_SEED_BASIS: u64 = 0x6273_6a77_0002_f29b;
 #[cfg(feature = "fuzz-harness")]
-const TYPED_QUERY_FUZZ_SEED_MULTIPLIER: u64 = 0x1000_0000_01b3;
+const TYPED_QUERY_FUZZ_SEED_MULTIPLIER: u64 = 0x0100_0000_01b3;
 
 /// Closed AST grammar consumed by the typed-query fuzz target.
 ///
