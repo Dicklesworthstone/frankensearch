@@ -228,3 +228,39 @@ Cargo-configuration fixtures also encountered an in-repository RCH temporary
 directory; the driver now uses a private canonical system-temp directory.
 This is incomplete full-suite coverage, not a full-conformance, performance or
 release claim. Earlier release entries are preserved byte for byte.
+
+## Executable quickstart and FastEmbed receipt follow-through, 2026-09-09
+
+Narrow inventory: `fc893e6e..8789e044`. Read all three commits: `f5eb50e2`
+records the A5 claim, `3d1c2fdd` implements receipt reuse and the strengthened
+quickstart, and `8789e044` repairs Cargo discovery under the isolated HOME.
+The actual `bd-fsfs-executable-quickstart-ci-ve3ul` acceptance and its original
+history were read. Historical records establish two executed RED cases; the
+later refinement requires twelve named classes. This update preserves all
+twelve and adds six explicitly labeled controls, without inventing a historical
+twelve-case pass. GitHub metadata still reports v1.10.0 as latest, published
+2026-09-08T19:36:49Z, and crates-v0.5.0 at 21:13:03Z. Actions remain disabled.
+
+The stronger loader assertion exposed FastEmbed's direct full-hash call. Its
+three registered model mappings now call the existing cached verifier. Exact
+artifact matching, stale-file invalidation and execution certificate validation
+remain intact. The Rust real-model test adds a direct FastEmbed stale-receipt
+control and requires actual result records in both progressive phases.
+
+Retained evidence is under
+`/data/tmp/frankensearch-progressive-daemon-20260908.flI1Y2`.
+RCH build 30012625538515439 ran 122 model-manifest tests successfully, with one
+existing ignored case; that run preceded the FastEmbed caller change. The
+rebuilt executable's positive and all eighteen controls passed in
+`/data/tmp/fsfs-quickstart.IrpzmjHA`. This supplied-binary smoke correctly records
+unknown source. `--binary --require-source` independently refuses, and unknown
+options exit 2. The first clean installation run failed before compilation
+because the host Cargo launcher resolves below HOME; its failure receipt is
+retained at `/data/tmp/fsfs-quickstart.ns65acIV`. The correction preserves the
+explicit toolchain cache locations and fresh build/runtime HOME/XDG.
+
+Current coverage status: implementation landed; final clean-source installation,
+the new direct real-ONNX regression, and complete DSR qualification are still
+pending. The changelog describes code behavior without claiming publication,
+complete Quill conformance or measured performance. Final execution results and
+live-link verification must be recorded below before this workstream closes.

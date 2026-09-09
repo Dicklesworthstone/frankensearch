@@ -477,7 +477,7 @@ def reject(name, expected, action, kind):
 
 receipt = dict(checker_revision=checker, binary_source=source, binary_sha256=binary_sha,
                build_executable_sha256=build_sha, executed_path=str(binary),
-               origin='supplied-binary' if source == 'unknown' else 'invocation-build',
+               origin='supplied-binary' if build_sha == 'unknown' else 'invocation-build',
                profile=profile, model_root=str(model_root), commands=commands, controls=controls,
                result='FAIL', network_policy='offline; warm query network syscalls traced separately')
 try:
