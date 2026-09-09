@@ -191,7 +191,7 @@ if want e2e; then
 fi
 
 if want quickstart; then
-  run_stage quickstart env FRANKENSEARCH_MODEL_DIR="$MODEL_DIR" scripts/check_fsfs_executable_quickstart.sh
+  run_stage quickstart env FRANKENSEARCH_MODEL_DIR="$MODEL_DIR" scripts/check_fsfs_executable_quickstart.sh --negative-probes --require-source --keep-artifacts
 fi
 
 echo "[quality-gate] finished=$(date -u +%FT%TZ) failures=${#failures[@]}"

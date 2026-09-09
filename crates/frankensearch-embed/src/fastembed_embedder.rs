@@ -29,7 +29,7 @@ use tracing::instrument;
 
 use crate::model_manifest::{
     FASTEMBED_MAX_LENGTH_V1, FASTEMBED_OUTPUT_NORMALIZATION_V1, FASTEMBED_SEQUENCE_POLICY_V1,
-    ModelArtifactManifestV1,
+    ModelArtifactManifestV1, ModelManifest,
 };
 use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -248,7 +248,20 @@ impl FastEmbedEmbedder {
         let name = &config.model_id;
         let expected_dim = config.dimension;
         let model_dir = resolve_model_dir(model_dir, name)?;
-        let verified = frozen_manifest.verify_dir(&model_dir)?;
+        let download_manifest = match name.as_str() {
+            DEFAULT_MODEL_NAME | "all-minilm-l6-v2" => Some(ModelManifest::minilm_v2()),
+            "snowflake-arctic-embed-s" => Some(ModelManifest::snowflake_arctic_s()),
+            "nomic-embed-text-v1.5" => Some(ModelManifest::nomic_embed()),
+            _ => None,
+        };
+        // Reuse only a receipt for these exact registered artifact bytes. The
+        // shared verifier rehashes on every absent, stale or mismatched receipt;
+        // execution-certificate attestation below remains mandatory in both paths.
+        let verified = if let Some(download_manifest) = download_manifest {
+            frozen_manifest.verify_dir_cached(&download_manifest, &model_dir)?
+        } else {
+            frozen_manifest.verify_dir(&model_dir)?
+        };
         let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
         let model_file =
             select_model_file(&model_dir).ok_or_else(|| SearchError::ModelNotFound {

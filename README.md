@@ -89,6 +89,24 @@ fsfs status --format json
 fsfs doctor --format json
 ```
 
+For an uninstalled development binary, use
+`cargo build --locked -p frankensearch-fsfs --bin fsfs` with the repository's
+pinned toolchain, then run `target/debug/fsfs` with the same model setup.
+The Linux DSR quality lane builds in a clean checkout, installs with
+`cargo install --locked --debug --path crates/frankensearch-fsfs --root <private-root>`,
+and verifies that the installed executable matches the Cargo build byte for byte.
+It uses fresh HOME/XDG directories and checks repeat indexing, both vector
+generations, ranked hybrid and vector-only search, and actual Initial/Refined
+result records. Its executable quick-start
+driver retains each run's artifacts and exercises model, result, authority,
+timeout, child/listener and provenance failures. It needs Python 3.11+ and
+`strace` for the warm-query network check.
+
+Replay it with `scripts/check_fsfs_executable_quickstart.sh --negative-probes --require-source`.
+`--binary /absolute/path/to/fsfs` checks a supplied executable as a smoke test;
+its SHA-256 is recorded, while its source revision remains explicitly unknown.
+The checker checkout revision cannot establish where that binary was built.
+
 The two downloads use revision-pinned manifests and verify every file before
 atomic promotion. Explicit `--verify` is fail-closed: a missing or corrupt
 registered cache returns a typed nonzero error rather than a successful payload.

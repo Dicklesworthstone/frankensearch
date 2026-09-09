@@ -978,6 +978,8 @@ require(
     "default quickstart must compile under both supported semantic profiles",
 )
 quickstart = quickstart_path.read_text(encoding="utf-8")
+dsr_quality = (root / "scripts/quality-gate.sh").read_text(encoding="utf-8")
+executable_quickstart = (root / "scripts/check_fsfs_executable_quickstart.sh").read_text(encoding="utf-8")
 require(
     '#[cfg(not(feature = "embedded-models"))]\nmod loader_only {' in quickstart,
     "stock-default quickstart tests must run only when embedded bytes are absent",
@@ -1135,20 +1137,21 @@ if all(command in quality for command in (default_check, provision, embedded_che
 missing_e2e = "loader_only::default_build_without_models_fails_closed_with_actionable_guidance"
 real_e2e = "loader_only::default_build_indexes_and_returns_a_real_hybrid_result"
 require(
-    missing_e2e in quality
-    and real_e2e in quality
-    and "FRANKENSEARCH_REQUIRE_SEMANTIC_E2E: \"1\"" in quality
-    and "-- --ignored --exact --nocapture" in quality,
-    "quality must execute both fully-qualified stock-default quickstart lanes after model provisioning",
+    missing_e2e.removeprefix("loader_only::") in quickstart
+    and real_e2e.removeprefix("loader_only::") in quickstart
+    and 'FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1' in dsr_quality
+    and 'cargo test --locked -p frankensearch-fsfs --test default_build_quickstart -- --include-ignored' in dsr_quality,
+    "real-host DSR must execute the real-model and missing-model quickstart tests",
 )
 require(
-    "fsfs-default-semantic-e2e-${{ github.run_id }}-${{ github.run_attempt }}" in quality
-    and "if-no-files-found: error" in quality
-    and "receipt.json" in quality,
-    "stock-default semantic E2E must publish a durable fail-closed evidence bundle",
+    'scripts/check_fsfs_executable_quickstart.sh --negative-probes --require-source --keep-artifacts' in dsr_quality
+    and "receipt.json" in executable_quickstart
+    and "Artifacts retained at:" in executable_quickstart
+    and 'rm -rf' not in executable_quickstart,
+    "DSR must require source-bound executable acceptance and retain positive/failure artifacts",
 )
-for lane in ("missing-corrupt", "real-model-semantic-only", "real-model-hybrid"):
-    require(lane in quality, f"stock-default semantic E2E receipt missing lane: {lane}")
+for lane in ("corrupt-model", "semantic-only", "hybrid", "progressive", "warm-offline"):
+    require(lane in executable_quickstart, f"executable quickstart missing lane: {lane}")
 
 for platform in (
     "ubuntu-latest",

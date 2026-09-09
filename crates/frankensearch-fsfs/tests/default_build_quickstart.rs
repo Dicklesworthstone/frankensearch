@@ -3149,7 +3149,55 @@ mod loader_only {
             );
         }
 
-        let index_outcome = fsfs.run(
+        // Exercise the FastEmbed caller itself with a real cached ONNX model,
+        // then make that same receipt stale without changing size or mtime.
+        // Auto-detection is deliberately bypassed: it can reject bad inputs
+        // before the FastEmbed loader whose receipt wiring this proves.
+        let cache_probe = temp.path().join("quality-receipt-control");
+        let manifest = ModelManifest::minilm_v2();
+        for entry in &manifest.files {
+            let target = cache_probe.join(&entry.name);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::copy(
+                model_root.join("all-MiniLM-L6-v2").join(&entry.name),
+                target,
+            )
+            .unwrap();
+        }
+        frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &cache_probe)
+            .expect("mint real quality verification receipt");
+        let cached = frankensearch_embed::FastEmbedEmbedder::load(&cache_probe)
+            .expect("real FastEmbed load with a valid receipt");
+        drop(cached);
+        let tokenizer = cache_probe.join("tokenizer.json");
+        let modified = fs::metadata(&tokenizer).unwrap().modified().unwrap();
+        let original_marker = fs::read(cache_probe.join(".verified")).unwrap();
+        let mut bytes = fs::read(&tokenizer).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&tokenizer, &bytes).unwrap();
+        File::options()
+            .write(true)
+            .open(&tokenizer)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&tokenizer).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(matches!(
+            frankensearch_embed::FastEmbedEmbedder::load(&cache_probe),
+            Err(frankensearch_core::SearchError::HashMismatch { .. })
+        ));
+        assert_eq!(
+            fs::read(cache_probe.join(".verified")).unwrap(),
+            original_marker
+        );
+        eprintln!(
+            "[default-build-e2e] stage=fastembed-receipt event=verified real_onnx=true cached_load=true same_size_restored_mtime_corruption=hash_mismatch receipt_unchanged=true"
+        );
+
+        let index_outcome = fsfs.run_with_env(
             temp.path(),
             "index",
             [
@@ -3161,8 +3209,26 @@ mod loader_only {
                 "json",
             ],
             QUICKSTART_TIMEOUT,
+            &[("FRANKENSEARCH_LOG", "info")],
         );
         let index_envelope = parse_success_envelope("default-build index", &index_outcome);
+        for directory in ["potion-multilingual-128M", "all-MiniLM-L6-v2"] {
+            let receipt: Value = serde_json::from_slice(
+                &fs::read(model_root.join(directory).join(".verified"))
+                    .expect("read authoritative loader verification receipt"),
+            )
+            .expect("parse authoritative loader verification receipt");
+            let fingerprint = receipt["manifest_fingerprint"]
+                .as_str()
+                .expect("receipt fingerprint");
+            assert!(
+                index_outcome.stderr.lines().any(|line| {
+                    line.contains("model verification receipt accepted")
+                        && line.contains(&format!("receipt_manifest_fingerprint={fingerprint}"))
+                }),
+                "index must log the admitted {directory} receipt, not merely report model availability"
+            );
+        }
         eprintln!(
             "[default-build-e2e] stage=index-one-shot event=verified timed_out=false exit=0 elapsed_ms={} watch_requested=false",
             index_outcome.elapsed.as_millis()
@@ -3596,10 +3662,13 @@ mod loader_only {
             "a two-tier search must open the quality model exactly once; stderr:\n{}",
             two_tier_outcome.stderr
         );
-        let stream_reason_codes = two_tier_outcome
+        let stream_frames = two_tier_outcome
             .stdout
             .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .map(|line| serde_json::from_str::<Value>(line).expect("every stream frame is JSON"))
+            .collect::<Vec<_>>();
+        let stream_reason_codes = stream_frames
+            .iter()
             .filter_map(|frame| {
                 frame
                     .pointer("/payload/reason_code")
@@ -3619,6 +3688,45 @@ mod loader_only {
                 .any(|code| code == "query.stream.refined_ready"),
             "stream must announce REFINED over a two-tier generation: {stream_reason_codes:?}"
         );
+        let phase_positions =
+            ["query.stream.initial_ready", "query.stream.refined_ready"].map(|reason| {
+                let positions = stream_frames
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, frame)| {
+                        (frame["payload"]["reason_code"] == reason).then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(positions.len(), 1, "one announcement per phase: {reason}");
+                positions[0]
+            });
+        assert!(
+            phase_positions[0] < phase_positions[1],
+            "Initial precedes Refined"
+        );
+        for (begin, end) in [
+            phase_positions.into(),
+            (phase_positions[1], stream_frames.len() - 1),
+        ] {
+            let results = stream_frames[begin + 1..end]
+                .iter()
+                .filter(|frame| frame["event"] == "result")
+                .collect::<Vec<_>>();
+            assert!(
+                !results.is_empty(),
+                "phase announcement must carry actual results"
+            );
+            assert_eq!(results[0]["payload"]["item"]["path"], "retry.md");
+            assert_eq!(results[0]["payload"]["item"]["in_both_sources"], true);
+            assert_eq!(
+                stream_frames[begin]["payload"]["completed_units"].as_u64(),
+                Some(u64::try_from(results.len()).expect("result count fits u64"))
+            );
+        }
+        let terminal = stream_frames.last().expect("stream terminal");
+        assert_eq!(terminal["event"], "terminal");
+        assert_eq!(terminal["payload"]["status"], "completed");
+        assert_eq!(terminal["payload"]["exit_code"], 0);
         eprintln!(
             "[default-build-e2e] stage=quality-tier-load event=verified fast_only_quality_loaded=false two_tier_quality_loads=1 refined_ready=true"
         );

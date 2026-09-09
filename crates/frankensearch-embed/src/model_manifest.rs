@@ -932,6 +932,14 @@ impl ModelArtifactManifestV1 {
         {
             let frozen = self.freeze()?;
             verify_no_extra_artifacts(model_dir, &self.artifacts)?;
+            // This is the receipt actually admitted above, not an observation
+            // from status/doctor or an unchecked marker found on disk.
+            let receipt_manifest = download_manifest.freeze_verification_manifest()?;
+            tracing::info!(
+                manifest_id = %download_manifest.id,
+                receipt_manifest_fingerprint = %receipt_manifest.fingerprint,
+                "model verification receipt accepted"
+            );
             return Ok(VerifiedModelArtifactsV1 { frozen });
         }
         self.verify_dir(model_dir)
