@@ -28,6 +28,18 @@ Scope window: this update researches v1.9.1 → v1.10.0 and their 2026-09-08 pub
 
 ---
 
+## Unreleased
+
+Changes on `main` after the 2026-09-08 publication of v1.10.0 / crates 0.5.0. They ship with the next crate publish.
+
+### Fixed
+
+- **Quill: a failed replacement ingest can no longer be committed as a deletion ([#45](https://github.com/Dicklesworthstone/frankensearch/issues/45)).** `upsert` staged a tombstone for every identity the batch replaced and retained that proposal on the writer *before* batch admission ran and any row was accumulated. When the batch then failed — an admission refusal, a cancellation, a shard error partway through — the tombstone-only proposal survived, and the explicit `commit()` the retry guard demanded published it: a valid MANIFEST, every segment authenticating, serving none of the documents the batch meant to update (the engine half of cass#457). A failed replacement ingest now discards the whole scalar transaction — the proposal, any partially accumulated rows, and the retry guard — so the previous committed generation stays authoritative and the writer is left exactly as the caller found it. Regression tests cover the admission-refused shape, the cancelled-midway shape with real partial shard state, and the retry that follows.
+- **Quill: publication gained a live-document floor ([#45](https://github.com/Dicklesworthstone/frankensearch/issues/45)).** `KeeperWriter::publish_with_intent` and `KeeperSnapshot::publish_owned_segments_with_intent` take a new `PublishIntent`; `validate_segment_transitions` refuses a `PreserveLiveDocuments` successor that would serve fewer live documents than the generation it replaces, with the new typed `KeeperError::LiveDocumentFloor` naming both generations and both counts. `commit`, upsert, Delta seals, bulk-load completion, tier merges and compaction publish with that intent; `delete_documents` and `delete_all` publish with `ExplicitDeletion` and are the explicit opt-in for a smaller generation (a full replace with fewer documents is `delete_all` followed by the new corpus). A `commit()` refused by the floor discards the unpublishable proposal instead of retaining it for a retry that could only fail again, so the writer stays usable. The raw `publish` / `publish_owned_segments` entry points keep their semantics: a proposal handed to them tombstone by tombstone is taken as the caller's explicit deletion intent. Reopening an already published pair is a shape check and never re-applies the floor, so a published `delete_all` still opens.
+- **`frankensearch-quill` declares the asupersync floor it actually needs ([#44](https://github.com/Dicklesworthstone/frankensearch/issues/44)).** The workspace requirement is now `asupersync >=0.4.10, <0.5` (was `>=0.4.4`). `Cx::is_cancelled`, the lock-free poll on the per-posting cancellation hot path, exists only from asupersync 0.4.10, so a consumer whose lockfile held 0.4.9 or below resolved the published 0.2.3 / 0.2.4 crates fine and then failed with three `E0599` errors from inside `index.rs` instead of a resolver error naming the requirement. `Cargo.lock` already resolved 0.4.10, so nothing else changes. `crates/frankensearch-quill/tests/asupersync_floor.rs` reads the declared requirement and fails the suite if the floor ever drops below the API the crate calls — a lockfile cannot catch that regression, because it records what was resolved rather than what was declared.
+
+---
+
 ## [fsfs 1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) / crates 0.5.0 -- 2026-09-08
 
 Compare: [v1.9.1...v1.10.0](https://github.com/Dicklesworthstone/frankensearch/compare/v1.9.1...v1.10.0)
