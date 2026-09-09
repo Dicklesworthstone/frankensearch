@@ -266,6 +266,23 @@ the sidecar until the next compaction re-protects the file. The first search in 
 query daemon that `fsfs search` starts by default keeps later searches to tens
 of milliseconds and exits on its own after ten idle minutes.
 
+`--stream` also uses that warm daemon: Initial can arrive while quality
+refinement is still running, followed by Refined or RefinementFailed and one terminal
+event. JSONL and TOON announce complete cached replays with `daemon_cache_hit`.
+Use `--no-daemon` for direct execution. A daemon policy or producer mismatch is
+an error requiring a daemon restart or explicit direct execution; a request
+that has delivered Initial is never silently retried.
+
+The Unix socket transport admits at most 16 clients, bounds each phase frame
+to 4 MiB and each response to 8 MiB plus 64 KiB, and reports capacity failures
+explicitly. Slow readers do not hold the shared search state while socket
+writes drain. Queued and currently written response bytes are bounded by
+16 × (8 MiB + 64 KiB); the shared query cache retains at most eight entries
+of at most 4 MiB of encoded phases each. Search admission to the shared index
+is serialized. Model/index memory and the active query's candidate set depend
+on the corpus and requested limit; these transport budgets are not a process
+memory cap.
+
 ## What It Does
 
 `frankensearch` combines lexical and semantic retrieval with progressive delivery:

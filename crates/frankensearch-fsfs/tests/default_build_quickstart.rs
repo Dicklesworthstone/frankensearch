@@ -630,6 +630,262 @@ mod loader_only {
     }
 
     #[cfg(feature = "semantic-loaders")]
+    #[cfg(unix)]
+    fn verify_real_progressive_daemon(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        struct Owner {
+            child: std::process::Child,
+            socket: PathBuf,
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                if let Ok(mut socket) = UnixStream::connect(&self.socket) {
+                    let _ = socket.write_all(b"quit\n");
+                }
+                let deadline = Instant::now() + FAILURE_TIMEOUT;
+                while Instant::now() < deadline {
+                    if let Ok(Some(status)) = self.child.try_wait() {
+                        if !thread::panicking() {
+                            assert!(status.success());
+                        }
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                assert!(
+                    thread::panicking(),
+                    "progressive daemon failed graceful shutdown"
+                );
+            }
+        }
+        let socket =
+            std::env::temp_dir().join(format!("fsfs-progressive-{}.sock", std::process::id()));
+        let config = root.join("progressive.toml");
+        fs::write(&config, "[search]\nquality_timeout_ms = 5000\n").unwrap();
+        let log = fsfs.log_root.join("progressive-daemon.stderr.log");
+        let start = Instant::now();
+        let child = fsfs
+            .command(root)
+            .args([
+                "serve",
+                "--daemon",
+                "--daemon-socket",
+                socket.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--index-dir",
+                index.to_str().unwrap(),
+            ])
+            .env("FRANKENSEARCH_LOG", "info")
+            .stdout(File::create(fsfs.log_root.join("progressive-daemon.stdout.log")).unwrap())
+            .stderr(File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let mut owner = Owner { child, socket };
+        while !owner.socket.exists() {
+            assert!(
+                owner.child.try_wait().unwrap().is_none(),
+                "progressive daemon exited"
+            );
+            assert!(
+                start.elapsed() < QUICKSTART_TIMEOUT,
+                "progressive daemon startup timed out"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut ready = UnixStream::connect(&owner.socket).unwrap();
+        ready.set_read_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();
+        ready.write_all(b"ready").unwrap();
+        ready.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut raw = String::new();
+        ready.read_to_string(&mut raw).unwrap();
+        let ready: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ready["pid"], owner.child.id());
+        // Readiness precedes lazy model initialization; admission is checked
+        // again after distinct real queries have loaded and used the model.
+        assert_eq!(ready["semantic_admitted"], false);
+        eprintln!(
+            "[default-build-e2e] stage=progressive-daemon pid={} ready_ms={} fast_id={}",
+            owner.child.id(),
+            start.elapsed().as_millis(),
+            ready["vector_generation_id"]
+        );
+        for (number, query) in [
+            "How can reconnect attempts avoid repeating temporary network failures?",
+            "What care helps young tomato plants establish healthy roots?",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut socket = UnixStream::connect(&owner.socket).unwrap();
+            socket.set_read_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();
+            let request = serde_json::json!({"query":query,"limit":3,"quality_timeout_ms":5000,"stream":true});
+            let started = Instant::now();
+            writeln!(socket, "{request}").unwrap();
+            socket.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut received =
+                File::create(fsfs.log_root.join(format!("progressive-{number}.jsonl"))).unwrap();
+            let mut frames = Vec::new();
+            for line in std::io::BufReader::new(socket).lines() {
+                let line = line.unwrap();
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                let receipt =
+                    serde_json::json!({"received_us":started.elapsed().as_micros(),"frame":frame});
+                writeln!(received, "{receipt}").unwrap();
+                // --nocapture retains actual arrival times and attestation
+                // even after the temporary corpus is released by the test.
+                eprintln!("[progressive-frame] query_index={number} {receipt}");
+                frames.push(frame);
+            }
+            assert_eq!(frames.len(), 4, "{frames:?}");
+            assert_eq!(frames[0]["event"], "attested");
+            assert_eq!(
+                frames[0]["cached"], false,
+                "distinct queries must execute against the same model owner"
+            );
+            assert_eq!(
+                frames[0]["vector_generation_id"],
+                ready["vector_generation_id"]
+            );
+            assert_eq!(frames[1]["payload"]["phase"], "initial");
+            assert_eq!(frames[2]["payload"]["phase"], "refined");
+            assert_eq!(frames[3]["event"], "terminal");
+            assert_eq!(frames[3]["ok"], true);
+            let direct = fsfs.run(
+                root,
+                &format!("progressive-{number}-direct"),
+                [
+                    "search",
+                    query,
+                    "--no-daemon",
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--limit",
+                    "3",
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let direct = parse_success_envelope("progressive direct reference", &direct);
+            assert_eq!(frames[2]["payload"]["hits"], direct["data"]["hits"]);
+            for format in ["jsonl", "toon"] {
+                let stream = fsfs.run(
+                    root,
+                    &format!("progressive-{number}-{format}"),
+                    [
+                        "search",
+                        query,
+                        "--daemon",
+                        "--daemon-socket",
+                        owner.socket.to_str().unwrap(),
+                        "--config",
+                        config.to_str().unwrap(),
+                        "--index-dir",
+                        index.to_str().unwrap(),
+                        "--limit",
+                        "3",
+                        "--stream",
+                        "--format",
+                        format,
+                    ],
+                    QUICKSTART_TIMEOUT,
+                );
+                assert_finished_successfully("progressive cached CLI replay", &stream);
+                assert!(stream.stdout.contains("daemon_cache_hit"), "{stream:?}");
+                assert!(
+                    stream.stdout.contains("query.stream.initial_ready"),
+                    "{stream:?}"
+                );
+                assert!(
+                    stream.stdout.contains("query.stream.refined_ready"),
+                    "{stream:?}"
+                );
+                assert!(!stream.stderr.contains("falling back"));
+            }
+            assert!(owner.child.try_wait().unwrap().is_none());
+        }
+        // Drop a real connection immediately after Initial, then prove the
+        // same process remains usable before exercising signal shutdown.
+        let mut disconnected = UnixStream::connect(&owner.socket).unwrap();
+        disconnected
+            .set_read_timeout(Some(QUICKSTART_TIMEOUT))
+            .unwrap();
+        writeln!(
+            disconnected,
+            "{}",
+            serde_json::json!({
+                "query":"How does structured concurrency join outstanding work?",
+                "limit":3,"quality_timeout_ms":5000,"stream":true,
+            })
+        )
+        .unwrap();
+        disconnected.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reader = std::io::BufReader::new(disconnected);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["payload"]["phase"],
+            "initial"
+        );
+        reader.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+        drop(reader);
+        let mut ready = UnixStream::connect(&owner.socket).unwrap();
+        ready.set_read_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();
+        ready.write_all(b"ready").unwrap();
+        ready.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut raw = String::new();
+        ready.read_to_string(&mut raw).unwrap();
+        let pid = owner.child.id();
+        let ready: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ready["pid"], pid);
+        assert_eq!(ready["semantic_admitted"], true);
+        assert!(
+            Command::new("kill")
+                .args(["-INT", &pid.to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let deadline = Instant::now() + FAILURE_TIMEOUT;
+        loop {
+            if let Some(status) = owner.child.try_wait().unwrap() {
+                assert!(status.success(), "signal shutdown: {status}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "signal shutdown timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(owner);
+        let diagnostics = fs::read_to_string(log).unwrap();
+        eprintln!("[progressive-daemon-diagnostics]\n{diagnostics}");
+        assert_eq!(
+            diagnostics.matches("FastEmbed model loaded").count(),
+            1,
+            "{diagnostics}"
+        );
+        let initialization = diagnostics
+            .lines()
+            .filter(|line| line.contains("fsfs quality model initialization completed"))
+            .collect::<Vec<_>>();
+        assert_eq!(initialization.len(), 1, "{diagnostics}");
+        eprintln!(
+            "[default-build-e2e] stage=progressive-daemon cold_initialization={} distinct_completed_queries=2 load_amortization_denominator=2",
+            initialization[0]
+        );
+        eprintln!(
+            "[default-build-e2e] stage=progressive-daemon event=verified pid={pid} uncached_queries=2 quality_loads=1 ordered_phases=true direct_parity=true jsonl=true toon=true disconnect=true signal_shutdown=true functional_only=true"
+        );
+    }
+
+    #[cfg(feature = "semantic-loaders")]
     fn verify_real_blend_and_deadline(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
         use sha2::Digest as _;
         use std::fmt::Write as _;
@@ -1494,13 +1750,44 @@ mod loader_only {
                 ],
                 QUICKSTART_TIMEOUT,
             );
-            let rejected = parse_success_envelope("wrong daemon producer", &wrong);
-            assert_ne!(rejected["data"]["phase"], "refined", "{rejected}");
+            assert!(
+                !wrong.status.success(),
+                "policy refusal must reach the caller: {wrong:?}"
+            );
             assert!(
                 wrong
-                    .stderr
-                    .contains("falling back to in-process retrieval"),
+                    .combined_output()
+                    .contains("did not acknowledge requested search policy"),
                 "{wrong:?}"
+            );
+            assert!(
+                !wrong
+                    .stderr
+                    .contains("falling back to in-process retrieval")
+            );
+            let direct = fsfs.run(
+                temp.path(),
+                "onnx-cannot-read-native-generation-direct",
+                [
+                    "search",
+                    query,
+                    "--config",
+                    onnx_config.to_str().unwrap(),
+                    "--index-dir",
+                    index_arg,
+                    "--no-daemon",
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let refused = parse_success_envelope("wrong native producer direct", &direct);
+            assert_eq!(refused["data"]["phase"], "refinement_failed", "{refused}");
+            assert_eq!(
+                refused["data"]["degradation_advice"]["degrade.advice.embedding_space_unverifiable"]
+                    ["failure"],
+                "unverifiable_embedding_space",
+                "{refused}"
             );
             drop(daemon);
             let deadline = Instant::now() + FAILURE_TIMEOUT;
@@ -2001,18 +2288,43 @@ mod loader_only {
             ],
             QUICKSTART_TIMEOUT,
         );
-        let refused = parse_success_envelope("wrong multilingual producer", &wrong);
+        assert!(
+            !wrong.timed_out && !wrong.status.success(),
+            "policy refusal must reach the caller: {wrong:?}"
+        );
+        assert!(
+            wrong
+                .combined_output()
+                .contains("did not acknowledge requested search policy"),
+            "{wrong:?}"
+        );
+        assert!(
+            !wrong
+                .stderr
+                .contains("falling back to in-process retrieval")
+        );
+        let direct = fsfs.run(
+            temp.path(),
+            "onnx-cannot-read-multilingual-generation-direct",
+            [
+                "search",
+                queries[0].0,
+                "--config",
+                onnx_config.to_str().unwrap(),
+                "--index-dir",
+                index_arg,
+                "--no-daemon",
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        let refused = parse_success_envelope("wrong multilingual producer direct", &direct);
         assert_eq!(refused["data"]["phase"], "refinement_failed", "{refused}");
         assert_eq!(
             refused["data"]["degradation_advice"]["degrade.advice.embedding_space_unverifiable"]["failure"],
             "unverifiable_embedding_space",
             "{refused}"
-        );
-        assert!(
-            wrong
-                .stderr
-                .contains("falling back to in-process retrieval"),
-            "{wrong:?}"
         );
         drop(daemon);
 
@@ -3312,6 +3624,8 @@ mod loader_only {
         );
         #[cfg(feature = "semantic-loaders")]
         verify_real_blend_and_deadline(&fsfs, temp.path(), &index);
+        #[cfg(all(unix, feature = "semantic-loaders"))]
+        verify_real_progressive_daemon(&fsfs, temp.path(), &index);
 
         // Reality check 2026-09-01, G2: the auto-spawned query daemon must
         // outlive the search that spawned it (so the next search is warm), be
