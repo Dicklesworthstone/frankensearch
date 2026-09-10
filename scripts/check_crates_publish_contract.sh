@@ -367,6 +367,37 @@ run_self_test() {
     and (.blockers | length) == 0
   ' "$positive_receipt" >/dev/null
 
+  # Each defect must independently reject an otherwise valid publication
+  # graph; a combined negative fixture can conceal a missing check.
+  local isolated_case isolated_metadata isolated_receipt expected_code
+  for isolated_case in missing-crate wrong-version; do
+    isolated_metadata="${temp_dir}/metadata-${isolated_case}.json"
+    isolated_receipt="${temp_dir}/receipt-${isolated_case}.json"
+    if [[ "$isolated_case" == "missing-crate" ]]; then
+      jq '.packages |= map(select(.name != "frankensearch-core"))' \
+        "$metadata_path" >"$isolated_metadata"
+      expected_code="PATH_DEPENDENCY_METADATA_MISSING"
+    else
+      jq '(.packages[] | select(.name == "frankensearch-quill")
+        | .dependencies[] | select(.name == "frankensearch-core")
+        | .req) = "^9.9.9"' "$metadata_path" >"$isolated_metadata"
+      expected_code="INTERNAL_DEPENDENCY_VERSION_MISMATCH"
+    fi
+    if bash "$script_path" \
+      --mode gate --scope facade --metadata "$isolated_metadata" \
+      --registry-census "$census_path" --release-tag "crates-v0.4.0" \
+      --source-sha "$source_sha" --allow-dirty --output "$isolated_receipt"; then
+      echo "ERROR: ${isolated_case} self-test unexpectedly passed" >&2
+      return 1
+    fi
+    jq -e --arg code "$expected_code" '
+      .status == "blocked"
+      and [.blockers[].code] == [$code]
+      and .blockers[0].package == "frankensearch-quill"
+      and .blockers[0].dependency == "frankensearch-core"
+    ' "$isolated_receipt" >/dev/null
+  done
+
   jq --arg root "$temp_dir" '
     (.packages[] | select(.name == "frankensearch-quill") | .readme) = null
     | (.packages[] | select(.name == "frankensearch-quill") | .dependencies[] | select(.name == "frankensearch-core") | .req) = "^9.9.9"
@@ -1218,6 +1249,17 @@ for package_name in "${SEQUENCE[@]}"; do
           "Registry package '$package_name' depends on unpublished workspace package '$dependency_name'." \
           "Publish the dependency or remove it from the registry-facing graph."
       fi
+    elif [[ -n "$(jq -r '.path // ""' <<<"$dependency_json")" ]]; then
+      # A path crate absent from the package census cannot participate in
+      # version validation or topological ordering. Do not silently treat
+      # an incomplete candidate graph as a registry-resolved dependency.
+      add_blocker \
+        "PATH_DEPENDENCY_METADATA_MISSING" \
+        "$package_name" \
+        "$dependency_name" \
+        "bd-8nqz.6" \
+        "Path dependency '$dependency_name' in '$package_name' is absent from candidate package metadata." \
+        "Include the dependency in the publication candidate or use a proven registry dependency."
     elif [[ "$dependency_source" == git+* ]]; then
       bead_id="$(dependency_bead "$dependency_name")"
       if [[ -z "$dependency_req" || "$dependency_req" == "*" ]]; then
