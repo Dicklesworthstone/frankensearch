@@ -409,3 +409,50 @@ while validation was running. This does not change the evidence boundary.
 Previous-generation retention remains unresolved under the existing publisher
 HOLD, cross-process tokenizer reuse is absent, and both original beads remain
 open. Retained commands and outcomes are linked from their Beads comments.
+
+## GH #41 continuous-writer lease repair — 2026-09-11 UTC
+
+This update covers `bd-458gu` and the concat retirement path in
+`frankensearch-quill/src/index.rs`. The unchanged-production baseline used
+`021ad1ac` plus the two test-only probes preserved in
+`/data/tmp/fsfs-gh41-combined-baseline-20260911.patch`. RCH on vmi1152480
+executed both probes: 0 passed, 2 failed. A continuous writer committing 192
+single-document batches produced 24 segments and last docid 1,507,335. The
+same regression with conditional retirement produced 3 segments and docids
+0–191, with every original document identity preserved. All 21 selected
+concat, cross-shard, compaction and lease controls passed. These are structural
+correctness results, not an incumbent-relative performance claim.
+
+The separate durable diagnostic retained 24 searchable identities across 24
+writer reopenings but left 24 segments, versus 3 for its 24-document continuous
+control. The real concat builder expanded eight reopened-session segments
+from 10,672 total source bytes to 16,345,526 bytes over a 458,753-row hull.
+This supports retaining the existing hole-ratio guard. The temporary failing
+diagnostic was removed after capture; its patch and terminal failure remain
+available. Reopen fragmentation, merge fuel and visibility checkpoints remain
+open obligations, so this repair does not close GH #41.
+
+The baseline ELF SHA256 is
+`d05a4f6b802dc7ade87187c47ae431f6f6c135d8b7fecf488815e3e58635f62a`;
+the passing candidate ELF SHA256 is
+`beaf165fca329edf974fdfdab0cdb3496df8d4e277ccda0c4780382ca1d93c25`.
+Candidate `index.rs` SHA256 is
+`3f15d88e1162ced4a244b722c99284a1c177c52dec25e39594f4eaa051c8007f`.
+Exact commands, source/worker hashes and terminal output are retained under
+`/data/tmp/fsfs-gh41-combined-baseline-20260911.*` and
+`/data/tmp/fsfs-gh41-candidate-20260911.*`. The candidate worker-source receipt
+is the `worker-source-final-sha256` file captured after synchronization; the
+earlier capture still contains the baseline and is not candidate provenance.
+Earlier attempts include a disk-pressure cancellation and a compile failure
+in the temporary diagnostic, corrected before the observed baseline. Neither
+is a test verdict. Existing workspace quality-gate failures described above
+are not cleared by the focused Quill result.
+
+Final Quill validation completed remotely on vmi1152480 at
+2026-09-11T21:03:42Z: workspace formatting passed, Quill all-targets clippy
+passed with `-D warnings`, and the complete default-feature Quill library suite
+reported 681 passed, 0 failed, 3 existing ignored, 0 filtered. The exact job and
+terminal output are in `/data/tmp/fsfs-gh41-quill-validation-warm-20260911.log`.
+An earlier wrapper job selected a cold target directory and was canceled before
+completion; the final job explicitly reused the candidate's Cargo target. This
+does not certify the full workspace gate, release lanes or all-feature gauntlet.

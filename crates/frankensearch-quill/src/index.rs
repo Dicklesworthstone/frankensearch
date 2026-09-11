@@ -8287,7 +8287,29 @@ impl QuillWriterState {
                 "concat merge requires a fully committed scalar index",
             ));
         }
-        self.retire_ingest_leases()?;
+        // A cross-shard concat can cover an earlier shard's unused lease
+        // tail. Retire leases in that case so future seals cannot overlap
+        // the merged hull. When every next ID is beyond all published
+        // intervals, however, keeping the live leases is safe and avoids
+        // introducing burned gaps after each continuous-writer tier merge.
+        let published_hi = self
+            .authority_snapshot()?
+            .loaded_manifest()
+            .manifest
+            .segments
+            .last()
+            .map_or(0, |segment| segment.docid_hi);
+        let retirement_required = (0..self.docid_allocator.shard_count()).any(|shard| {
+            self.docid_allocator
+                .live_lease(shard)
+                .is_some_and(|(base, next)| {
+                    base.checked_add(u64::from(next))
+                        .is_none_or(|next_docid| next_docid < published_hi)
+                })
+        });
+        if retirement_required {
+            self.retire_ingest_leases()?;
+        }
         let next_seal_seq = self
             .next_seal_seq
             .checked_add(1)
@@ -33993,6 +34015,59 @@ mod tests {
                     .expect("search committed bounded batches")
                     .total_count,
                 Some(4),
+            );
+        });
+    }
+
+    #[test]
+    fn continuous_tier_merges_preserve_safe_live_ingest_leases() {
+        run_with_cx(|cx| async move {
+            let config = deterministic_config();
+            let segment_bound = 3 * (config.tier_fanout - 1);
+            let index = QuillIndex::in_memory(config).expect("continuous tier index");
+            for ordinal in 0_u32..192 {
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new(
+                            format!("continuous-{ordinal}"),
+                            "shared continuous content",
+                        )],
+                    )
+                    .await
+                    .expect("append to the same live writer");
+                let snapshot = index
+                    .commit(&cx)
+                    .await
+                    .expect("commit and apply tier policy");
+                assert_pairwise_disjoint_manifest(&snapshot.loaded_manifest().manifest.segments);
+            }
+            let snapshot = index.snapshot().expect("continuous tier snapshot");
+            let ids = index
+                .collect_docids(&cx, "shared")
+                .expect("query all committed rows");
+            let expected_ids: Vec<_> = (0_u32..192).collect();
+            assert_eq!(snapshot.doc_count(), 192);
+            eprintln!(
+                "GH41 continuous writer: documents={} segments={} bound={segment_bound} last_docid={:?}",
+                snapshot.doc_count(),
+                snapshot.segments().len(),
+                ids.last()
+            );
+            assert_eq!(
+                ids, expected_ids,
+                "a merge must not burn a live lease whose next ID is beyond every published interval"
+            );
+            for ordinal in 0_u32..192 {
+                assert_eq!(
+                    snapshot.materialize_document_id(ordinal),
+                    Some(DocId::new(format!("continuous-{ordinal}"))),
+                    "each retained numeric ID must still name its original document"
+                );
+            }
+            assert!(
+                snapshot.segments().len() <= segment_bound,
+                "continuous commit/merge cycles must retain the S/M/L segment-count bound"
             );
         });
     }
