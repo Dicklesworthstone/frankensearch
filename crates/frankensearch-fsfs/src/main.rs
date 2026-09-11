@@ -262,6 +262,7 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     shutdown.register_signals()?;
     let run_with_shutdown = matches!(interface_mode, InterfaceMode::Tui)
         || app_runtime.config().indexing.watch_mode
+        || command == CliCommand::Index
         || command == CliCommand::Daemon
         || command == CliCommand::Serve;
     // ── Startup version check (non-blocking) ──────────────────────────

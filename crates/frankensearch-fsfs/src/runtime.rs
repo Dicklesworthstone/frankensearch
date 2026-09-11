@@ -1507,6 +1507,51 @@ struct IndexDiscoveryStats {
     reason_codes: Vec<String>,
 }
 
+/// Cooperative admission checks for one-shot indexing. Synchronous model
+/// loaders can exceed the threshold before returning; this is not an OS cap.
+struct IndexRunControl {
+    collector: HostPressureCollector,
+    sample_interval: Duration,
+    last_sample: Instant,
+    memory_ceiling_mb: usize,
+}
+
+impl IndexRunControl {
+    fn new(config: &FsfsConfig) -> Self {
+        Self {
+            collector: HostPressureCollector::default(),
+            sample_interval: Duration::from_millis(config.pressure.sample_interval_ms.max(1)),
+            last_sample: Instant::now(),
+            memory_ceiling_mb: config.pressure.memory_ceiling_mb,
+        }
+    }
+
+    fn checkpoint(&mut self, cx: &Cx, phase: &'static str, force: bool) -> SearchResult<()> {
+        FsfsRuntime::semantic_retry_checkpoint(cx, phase)?;
+        let elapsed = self.last_sample.elapsed();
+        if force || elapsed >= self.sample_interval {
+            let sample = self.collector.collect(elapsed, self.memory_ceiling_mb)?;
+            self.last_sample = Instant::now();
+            self.admit_memory(sample.memory_pct, phase)?;
+        }
+        Ok(())
+    }
+
+    fn admit_memory(&self, memory_pct: f64, phase: &'static str) -> SearchResult<()> {
+        if memory_pct >= 100.0 {
+            return Err(SearchError::SubsystemError {
+                subsystem: "fsfs.index.memory_pressure",
+                source: Box::new(std::io::Error::other(format!(
+                    "indexing stopped at {phase}: process RSS reached the configured \
+                     pressure.memory_ceiling_mb={} MiB threshold; no further work admitted",
+                    self.memory_ceiling_mb
+                ))),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct IndexManifestEntry {
     file_key: String,
@@ -6097,6 +6142,7 @@ impl FsfsRuntime {
         );
 
         if matches!(command, CliCommand::Index | CliCommand::Watch) {
+            let _cancellation_scope = shutdown.map(|shutdown| shutdown.cancellation_scope(cx));
             self.run_one_shot_index_scaffold(cx, command).await?;
         }
 
@@ -13683,7 +13729,9 @@ impl FsfsRuntime {
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
     {
-        const BATCH_SIZE: usize = 256;
+        let batch_size = self.effective_embedding_batch_size();
+        let mut control = IndexRunControl::new(&self.config);
+        control.checkpoint(cx, "index.start", true)?;
         let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
@@ -13708,7 +13756,13 @@ impl FsfsRuntime {
 
         let mut candidates = Vec::new();
         let discovery_start = Instant::now();
-        let stats = self.collect_index_candidates(&target_root, &index_root, &mut candidates)?;
+        let stats = self.collect_index_candidates(
+            cx,
+            &mut control,
+            &target_root,
+            &index_root,
+            &mut candidates,
+        )?;
         let discovery_elapsed_ms = discovery_start.elapsed().as_millis();
         info!(
             target_root = %target_root.display(),
@@ -13830,8 +13884,11 @@ impl FsfsRuntime {
         // prompt to provision missing registered models; every other lane
         // (offline, non-TTY, machine formats, declined) falls through to the
         // existing typed readiness error with its `fsfs download-models` argv.
+        control.checkpoint(cx, "index.model_provisioning", true)?;
         self.maybe_offer_interactive_model_provisioning(cx).await?;
+        control.checkpoint(cx, "index.fast_model_load", true)?;
         let embedder = self.resolve_fast_embedder()?;
+        control.checkpoint(cx, "index.fast_model_loaded", true)?;
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
         Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
 
@@ -13840,11 +13897,13 @@ impl FsfsRuntime {
         // verified quality model is present; otherwise the reason is recorded
         // on the generation and search serves INITIAL only.
         let (quality_embedder, mut quality_tier_reason) = self.resolve_indexing_quality_embedder();
+        control.checkpoint(cx, "index.quality_model_loaded", true)?;
         if let Some(quality_embedder) = quality_embedder.as_ref() {
             Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;
         }
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
 
+        control.checkpoint(cx, "index.artifact_directories", true)?;
         publication_lease.fence("one-shot index artifact directories")?;
         fs::create_dir_all(index_root.join("vector"))?;
         fs::create_dir_all(index_root.join("cache"))?;
@@ -13924,6 +13983,7 @@ impl FsfsRuntime {
             .as_ref()
             .filter(|_| checkpoint_metadata_valid)
             .map_or_else(pressure_timestamp_ms, |previous| previous.started_at_ms);
+        control.checkpoint(cx, "index.initial_checkpoint", true)?;
         publication_lease.fence("one-shot initial checkpoint publication")?;
         write_indexing_checkpoint(
             &index_root,
@@ -14111,6 +14171,7 @@ impl FsfsRuntime {
             (existing_checkpoint.as_ref(), checkpoint_manifests.as_ref())
         {
             for candidate in &candidates {
+                control.checkpoint(cx, "index.resume_validation", false)?;
                 let Some(entry) = previous.files.get(&candidate.file_key) else {
                     continue;
                 };
@@ -14263,7 +14324,8 @@ impl FsfsRuntime {
             .count();
 
         // 3. Process in batches
-        for chunk in candidates.chunks(BATCH_SIZE) {
+        for chunk in candidates.chunks(batch_size) {
+            control.checkpoint(cx, "index.batch", true)?;
             checkpoint.artifacts_durable = false;
             checkpoint.updated_at_ms = pressure_timestamp_ms();
             publication_lease.fence("one-shot batch checkpoint publication")?;
@@ -14272,6 +14334,7 @@ impl FsfsRuntime {
 
             // Read & Canonicalize
             for candidate in chunk {
+                control.checkpoint(cx, "index.file", false)?;
                 let mut reuse = resume_reuse
                     .get(&candidate.file_key)
                     .copied()
@@ -14297,6 +14360,7 @@ impl FsfsRuntime {
                     }
                     Err(error) => return Err(error.into()),
                 };
+                control.checkpoint(cx, "index.file_loaded", false)?;
                 let content_hash_hex = content_sha256_hex(&bytes);
                 if validated_content_hashes
                     .get(&candidate.file_key)
@@ -14398,6 +14462,7 @@ impl FsfsRuntime {
             }
 
             // Lexical Indexing
+            control.checkpoint(cx, "index.lexical_batch", true)?;
             let lexical_start = Instant::now();
             for pending in &chunk_docs {
                 if pending.lexical_required
@@ -14459,6 +14524,7 @@ impl FsfsRuntime {
             let mut semantic_succeeded_this_chunk = HashSet::new();
 
             if !semantic_docs.is_empty() {
+                control.checkpoint(cx, "index.semantic_batch", true)?;
                 let semantic_texts = semantic_docs
                     .iter()
                     .map(|pending| pending.document.content.as_str())
@@ -14471,6 +14537,7 @@ impl FsfsRuntime {
                     &semantic_texts,
                     &RETRY_BACKOFFS_MS,
                     |retry_number, retry_budget, backoff_ms, error, batch_embedding_elapsed_ms| {
+                        control.checkpoint(cx, "index.semantic_retry", true)?;
                         let error_code = error_code_for(error);
                         let reason = Self::semantic_runtime_failure_summary(error);
                         warn!(
@@ -14516,6 +14583,7 @@ impl FsfsRuntime {
                 )
                 .await?;
 
+                control.checkpoint(cx, "index.semantic_batch_complete", true)?;
                 match batch_outcome {
                     IndexingBatchEmbeddingOutcome::Ready {
                         embeddings,
@@ -14586,6 +14654,7 @@ impl FsfsRuntime {
                     })
                     .collect::<Vec<_>>();
                 if !quality_docs.is_empty() {
+                    control.checkpoint(cx, "index.quality_batch", true)?;
                     let quality_texts = quality_docs
                         .iter()
                         .map(|pending| pending.document.content.as_str())
@@ -14598,6 +14667,7 @@ impl FsfsRuntime {
                         &quality_texts,
                         &QUALITY_RETRY_BACKOFFS_MS,
                         |retry_number, retry_budget, backoff_ms, error, _elapsed_ms| {
+                            control.checkpoint(cx, "index.quality_retry", true)?;
                             let error_code = error_code_for(error);
                             let reason = Self::semantic_runtime_failure_summary(error);
                             warn!(
@@ -14621,6 +14691,7 @@ impl FsfsRuntime {
                         },
                     )
                     .await?;
+                    control.checkpoint(cx, "index.quality_batch_complete", true)?;
                     match quality_outcome {
                         IndexingBatchEmbeddingOutcome::Ready {
                             embeddings,
@@ -14709,6 +14780,7 @@ impl FsfsRuntime {
 
             batch_counter = batch_counter.saturating_add(1);
             if batch_counter % CHECKPOINT_PERSIST_INTERVAL == 0 && remaining_reused_semantic == 0 {
+                control.checkpoint(cx, "index.incremental_publication", true)?;
                 publication_lease.fence("one-shot incremental generation publication")?;
                 checkpoint.artifacts_durable = false;
                 checkpoint.updated_at_ms = pressure_timestamp_ms();
@@ -14795,6 +14867,7 @@ impl FsfsRuntime {
             ))?;
         }
 
+        control.checkpoint(cx, "index.stale_reconciliation", true)?;
         let stale_lexical_candidates = lexical_reconciliation_ids.len();
         let stale_lexical_deleted = if lexical_reconciliation_ids.is_empty() {
             0
@@ -14853,6 +14926,7 @@ impl FsfsRuntime {
 
         // 4. Publish the final durable generation. The checkpoint is always
         // last, so every row it advertises is already represented on disk.
+        control.checkpoint(cx, "index.final_publication", true)?;
         publication_lease.fence("final generation checkpoint publication")?;
         checkpoint.artifacts_durable = false;
         checkpoint.updated_at_ms = pressure_timestamp_ms();
@@ -14965,6 +15039,7 @@ impl FsfsRuntime {
         // checkpoint remains an admission lock across the entire publication
         // window, so a concurrent search cannot combine the successor vector
         // generation with the predecessor lexical CURRENT.
+        control.checkpoint(cx, "index.final_admission", true)?;
         publication_lease.fence("final generation admission publication")?;
         self.write_index_sentinel(&index_root, &sentinel)?;
         publication_lease.fence("final checkpoint admission transition")?;
@@ -17311,6 +17386,8 @@ impl FsfsRuntime {
 
     fn collect_index_candidates(
         &self,
+        cx: &Cx,
+        control: &mut IndexRunControl,
         target_root: &Path,
         index_root: &Path,
         output: &mut Vec<IndexCandidate>,
@@ -17330,6 +17407,7 @@ impl FsfsRuntime {
         walker.standard_filters(true);
 
         for entry in walker.build() {
+            control.checkpoint(cx, "index.discovery", false)?;
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -18965,6 +19043,12 @@ impl FsfsRuntime {
             match self.build_live_watcher_shutdown(cx).await {
                 Ok((watcher, vi_handle, quality_handle)) => {
                     watcher.start(cx).await?;
+                    #[cfg(test)]
+                    WATCHER_SHUTDOWN_TEST_STARTED.with(|slot| {
+                        if let Some(started) = slot.borrow().as_ref() {
+                            started.store(true, Ordering::SeqCst);
+                        }
+                    });
                     let policy = watcher.execution_policy();
                     let storage_paths = self.default_index_storage_paths();
                     let lifecycle_tracker = self.new_runtime_lifecycle_tracker(&storage_paths);
@@ -19297,6 +19381,8 @@ thread_local! {
         RefCell<Option<WatcherShutdownTestSessionFactory>> = const { RefCell::new(None) };
     static WATCHER_SHUTDOWN_TEST_FINALIZATION_CALLS:
         RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = const { RefCell::new(None) };
+    static WATCHER_SHUTDOWN_TEST_STARTED:
+        RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -19350,6 +19436,9 @@ impl Drop for WatcherShutdownTestSeamGuard {
             let _ = slot.borrow_mut().take();
         });
         WATCHER_SHUTDOWN_TEST_FINALIZATION_CALLS.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+        WATCHER_SHUTDOWN_TEST_STARTED.with(|slot| {
             let _ = slot.borrow_mut().take();
         });
     }
@@ -30645,10 +30734,31 @@ mod tests {
             });
             let coordinator: Arc<ShutdownCoordinator> = Arc::new(ShutdownCoordinator::new());
 
+            let started = Arc::new(AtomicBool::new(false));
+            let finalization_calls = Arc::new(AtomicUsize::new(0));
+            super::WATCHER_SHUTDOWN_TEST_STARTED.with(|slot| {
+                *slot.borrow_mut() = Some(Arc::clone(&started));
+            });
+            super::WATCHER_SHUTDOWN_TEST_FINALIZATION_CALLS.with(|slot| {
+                *slot.borrow_mut() = Some(Arc::clone(&finalization_calls));
+            });
+            let _observers = super::WatcherShutdownTestSeamGuard;
+
             let trigger: Arc<ShutdownCoordinator> = Arc::clone(&coordinator);
             let worker = thread::spawn(move || {
-                thread::sleep(Duration::from_millis(120));
+                // Initial indexing may exceed 120 ms. Interrupting it now
+                // correctly returns Cancelled; this test covers shutdown
+                // after the real watcher has started, without replacing ingest.
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !started.load(Ordering::SeqCst) {
+                    if Instant::now() >= deadline {
+                        trigger.request_shutdown(ShutdownReason::UserRequest);
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
                 trigger.request_shutdown(ShutdownReason::UserRequest);
+                true
             });
 
             runtime
@@ -30656,7 +30766,11 @@ mod tests {
                 .await
                 .expect("watch mode with shutdown");
 
-            worker.join().expect("shutdown trigger thread join");
+            assert!(
+                worker.join().expect("shutdown trigger thread join"),
+                "watcher did not start within 60 s"
+            );
+            assert_eq!(finalization_calls.load(Ordering::SeqCst), 1);
         });
     }
 
@@ -32565,6 +32679,102 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn gh43_one_shot_cancellation_refuses_completion_and_retry_recovers() {
+        run_test_with_cx(|cx| async move {
+            for interrupted_stage in [
+                super::IndexingProgressStage::Discovering,
+                super::IndexingProgressStage::Indexing,
+                super::IndexingProgressStage::Finalizing,
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let project = temp.path().join("project");
+                fs::create_dir_all(&project).expect("project");
+                for name in ["first.md", "second.md", "third.md"] {
+                    fs::write(project.join(name), "recoverable_cancel_token").expect("document");
+                }
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = ".frankensearch".to_owned();
+                config.indexing.embedding_batch_size = 1;
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                });
+                let index_root = project.join(".frankensearch");
+                let shutdown = ShutdownCoordinator::new();
+                let scope = shutdown.cancellation_scope(&cx);
+                let mut interrupted = false;
+                let result = runtime
+                    .run_one_shot_index_scaffold_with_progress(&cx, CliCommand::Index, |snapshot| {
+                        assert_ne!(snapshot.stage, super::IndexingProgressStage::Completed);
+                        if snapshot.stage == interrupted_stage {
+                            if interrupted_stage == super::IndexingProgressStage::Indexing {
+                                assert_eq!(snapshot.processed_files, 1);
+                            }
+                            interrupted = true;
+                            shutdown.request_shutdown(ShutdownReason::UserRequest);
+                        }
+                        Ok(())
+                    })
+                    .await;
+                assert!(interrupted, "must execute the selected interruption point");
+                assert!(
+                    matches!(result, Err(SearchError::Cancelled { .. })),
+                    "{result:?}"
+                );
+                drop(scope);
+                cx.set_cancel_requested(false);
+                assert!(!index_root.join(super::FSFS_SENTINEL_FILE).exists());
+
+                let mut processed_batches = Vec::new();
+                runtime
+                    .run_one_shot_index_scaffold_with_progress(&cx, CliCommand::Index, |snapshot| {
+                        if snapshot.stage == super::IndexingProgressStage::Indexing {
+                            processed_batches.push(snapshot.processed_files);
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .expect("retry after cancellation");
+                assert_eq!(processed_batches, [1, 2, 3]);
+                FsfsRuntime::validate_search_generation_at_root(
+                    &index_root,
+                    SearchExecutionMode::Full,
+                )
+                .expect("retry must publish an admitted generation");
+                let lexical = open_test_quill(&cx, &index_root.join("lexical")).await;
+                let hits = lexical
+                    .search(&cx, "recoverable_cancel_token", 5)
+                    .await
+                    .expect("search retry");
+                assert_eq!(hits.len(), 3);
+            }
+        });
+    }
+
+    #[test]
+    fn gh43_memory_threshold_stops_at_boundary_with_typed_error() {
+        let mut config = FsfsConfig::default();
+        config.pressure.memory_ceiling_mb = 128;
+        let control = super::IndexRunControl::new(&config);
+        control.admit_memory(99.9, "test").expect("below ceiling");
+        for pct in [100.0, 125.0] {
+            let error = control
+                .admit_memory(pct, "index.fast_model_loaded")
+                .expect_err("at ceiling");
+            assert!(matches!(
+                &error,
+                SearchError::SubsystemError {
+                    subsystem: "fsfs.index.memory_pressure",
+                    ..
+                }
+            ));
+            assert!(error.to_string().contains("memory_ceiling_mb=128"));
+            assert!(error.to_string().contains("index.fast_model_loaded"));
+        }
     }
 
     #[test]

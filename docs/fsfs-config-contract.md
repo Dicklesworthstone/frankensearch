@@ -60,7 +60,9 @@ Path expansion rule:
 - `fast_model: string`
 - `quality_model: string`
 - `model_dir: string`
-- `embedding_batch_size: int` (`1..4096`)
+- `embedding_batch_size: int` (`1..4096`, default `64`; bounds document batches in
+  one-shot indexing and the watch vector pipeline. Smaller batches reduce working
+  memory and the time between batch checkpoints; they do not reduce model size.)
 - `reindex_on_change: bool`
 - `watch_mode: bool`
 
@@ -79,6 +81,18 @@ Path expansion rule:
 - `profile: "strict" | "performance" | "degraded"`
 - `cpu_ceiling_pct: int` (`1..100`)
 - `memory_ceiling_mb: int` (`>=128`)
+
+One-shot indexing samples process RSS at discovery/file checkpoints, model-load
+boundaries, and batch/publication boundaries. At or above `memory_ceiling_mb`, it
+stops admitting work with a `fsfs.index.memory_pressure` subsystem error. This is
+a cooperative threshold: synchronous model loading and individual allocations
+can temporarily exceed it. The `strict` profile does not impose an OS memory cap.
+
+SIGINT and SIGTERM cancel an active one-shot pass at its next checkpoint. A second
+SIGINT within three seconds exits immediately with status 130, including during a
+synchronous model load. An interrupted pass leaves its existing checkpoint safety
+rules in force: an incomplete generation may refuse searches until indexing is
+retried. The previous complete generation is not retained as an atomic snapshot.
 
 ## `[tui]`
 

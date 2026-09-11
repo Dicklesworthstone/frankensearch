@@ -1,10 +1,11 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
+use asupersync::types::CancelKind;
 use frankensearch_core::{SearchError, SearchResult};
 #[cfg(not(windows))]
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
@@ -70,6 +71,7 @@ pub struct ShutdownCoordinator {
     signal_registration_active: AtomicBool,
     signal_handle: Mutex<Option<SignalHandle>>,
     signal_listener_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    cancellation_contexts: Mutex<Vec<Weak<Cx>>>,
 }
 
 impl Default for ShutdownCoordinator {
@@ -90,6 +92,7 @@ impl ShutdownCoordinator {
             signal_registration_active: AtomicBool::new(false),
             signal_handle: Mutex::new(None),
             signal_listener_thread: Mutex::new(None),
+            cancellation_contexts: Mutex::new(Vec::new()),
         }
     }
 
@@ -137,6 +140,9 @@ impl ShutdownCoordinator {
                 .spawn(move || {
                     for signal in signals.forever() {
                         coordinator.handle_signal(signal);
+                        if coordinator.is_force_exit_requested() {
+                            std::process::exit(crate::exit_code::INTERRUPTED);
+                        }
                     }
                 })
                 .map_err(|error| {
@@ -210,8 +216,32 @@ impl ShutdownCoordinator {
             .is_ok()
         {
             self.set_reason(reason);
+            let mut contexts = lock_or_recover(&self.cancellation_contexts);
+            contexts.retain(|context| {
+                context.upgrade().is_some_and(|cx| {
+                    cx.cancel_fast(CancelKind::User);
+                    true
+                })
+            });
+            drop(contexts);
             info!(reason = ?self.current_reason(), "shutdown requested");
         }
+    }
+
+    /// Bind cancellation to shutdown for the lifetime of the returned guard.
+    ///
+    /// The state check and registration share a lock with notification so a
+    /// shutdown racing registration cannot leave the operation running.
+    pub(crate) fn cancellation_scope(&self, cx: &Cx) -> Arc<Cx> {
+        let context = Arc::new(cx.clone());
+        let mut contexts = lock_or_recover(&self.cancellation_contexts);
+        contexts.retain(|context| context.strong_count() > 0);
+        contexts.push(Arc::downgrade(&context));
+        if self.is_shutting_down() {
+            context.cancel_fast(CancelKind::User);
+        }
+        drop(contexts);
+        context
     }
 
     /// Mark a pending config reload request (SIGHUP).
@@ -366,6 +396,59 @@ mod tests {
 
         assert!(coordinator.is_shutting_down());
         assert_eq!(coordinator.state(), ShutdownState::ShuttingDown);
+    }
+
+    #[test]
+    fn gh43_shutdown_cancels_only_live_scopes() {
+        run_test_with_cx(|cx| async move {
+            let coordinator = ShutdownCoordinator::new();
+            let scope = coordinator.cancellation_scope(&cx);
+            coordinator.process_signal_for_test(SIGTERM);
+            assert!(cx.checkpoint().is_err());
+            drop(scope);
+            cx.set_cancel_requested(false);
+
+            let coordinator = ShutdownCoordinator::new();
+            drop(coordinator.cancellation_scope(&cx));
+            coordinator.process_signal_for_test(SIGTERM);
+            assert!(
+                cx.checkpoint().is_ok(),
+                "dropped scope must not cancel watch cleanup"
+            );
+        });
+    }
+
+    #[test]
+    fn gh43_shutdown_before_registration_cancels_new_scope() {
+        run_test_with_cx(|cx| async move {
+            let coordinator = ShutdownCoordinator::new();
+            coordinator.request_shutdown(ShutdownReason::UserRequest);
+            let _scope = coordinator.cancellation_scope(&cx);
+            assert!(cx.checkpoint().is_err());
+            cx.set_cancel_requested(false);
+        });
+    }
+
+    #[test]
+    fn gh43_concurrent_shutdown_and_registration_cannot_lose_cancellation() {
+        run_test_with_cx(|cx| async move {
+            for _ in 0..32 {
+                let coordinator = Arc::new(ShutdownCoordinator::new());
+                let trigger = Arc::clone(&coordinator);
+                let barrier = Arc::new(std::sync::Barrier::new(2));
+                let worker_barrier = Arc::clone(&barrier);
+                let worker = thread::spawn(move || {
+                    worker_barrier.wait();
+                    trigger.request_shutdown(ShutdownReason::UserRequest);
+                });
+                barrier.wait();
+                let scope = coordinator.cancellation_scope(&cx);
+                worker.join().expect("shutdown thread");
+                assert!(cx.checkpoint().is_err());
+                drop(scope);
+                cx.set_cancel_requested(false);
+            }
+        });
     }
 
     #[test]
