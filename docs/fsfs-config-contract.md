@@ -66,6 +66,11 @@ Path expansion rule:
 - `reindex_on_change: bool`
 - `watch_mode: bool`
 
+Model upgrades must pass the stored producer-revision check, even if the
+embedding space and output vectors are unchanged. The Model2Vec adapter bump
+from `frankensearch-embed` 0.2.6 to 0.2.7 changes that revision; rebuild with
+`fsfs index` before searching or watching an index produced by 0.2.6.
+
 ## `[search]`
 
 - `default_limit: int` (`1..200`)

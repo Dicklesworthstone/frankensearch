@@ -370,6 +370,68 @@ fn verify_dir_cached_succeeds_from_cache_on_second_call() {
     assert!(is_verification_cached(&manifest, tmp.path()));
 }
 
+/// Unlike inline loader fixtures, integration tests compile the public loader
+/// with production admission enabled. Keep a real instance alive while its
+/// private artifact copy changes, so a misplaced cache lookup would admit it.
+#[cfg(feature = "model2vec")]
+#[test]
+#[ignore = "requires POTION_FIXTURE_DIR with the registered 512 MB Potion model"]
+fn gh46_shared_loader_rejects_mutation_before_cache_hit_and_recovers() {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    use std::sync::Arc;
+
+    use frankensearch_core::SearchError;
+    use frankensearch_embed::Model2VecEmbedder;
+
+    let fixture = std::path::PathBuf::from(
+        std::env::var_os("POTION_FIXTURE_DIR").expect("POTION_FIXTURE_DIR is required"),
+    );
+    let tmp = tempfile::tempdir().expect("private artifact directory");
+    let manifest = ModelManifest::potion_128m();
+    for artifact in &manifest.files {
+        std::fs::copy(fixture.join(&artifact.name), tmp.path().join(&artifact.name))
+            .expect("copy registered artifact without changing the shared model cache");
+    }
+    verify_dir_and_record(&manifest, tmp.path()).expect("attest private model copy");
+    let resident = Model2VecEmbedder::load_shared(tmp.path()).expect("production first load");
+    let cached = Model2VecEmbedder::load_shared(tmp.path()).expect("verified cache hit");
+    assert!(Arc::ptr_eq(&resident, &cached));
+    drop(cached);
+
+    for name in ["model.safetensors", "tokenizer.json"] {
+        let path = tmp.path().join(name);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open private artifact");
+        file.seek(SeekFrom::End(-1)).expect("seek final byte");
+        let mut original = [0_u8; 1];
+        file.read_exact(&mut original).expect("retain original byte");
+        file.seek(SeekFrom::End(-1)).expect("seek mutation");
+        file.write_all(&[original[0] ^ 1])
+            .expect("mutate private artifact");
+        file.sync_all().expect("persist mutation");
+
+        let error = Model2VecEmbedder::load_shared(tmp.path())
+            .expect_err("a resident instance cannot authorize changed artifacts");
+        assert!(
+            matches!(error, SearchError::HashMismatch { path: ref rejected, .. } if rejected == &path),
+            "expected artifact hash refusal before the cache lookup: {error:?}"
+        );
+
+        file.seek(SeekFrom::End(-1)).expect("seek restoration");
+        file.write_all(&original).expect("restore original byte");
+        file.sync_all().expect("persist restoration");
+        let recovered = Model2VecEmbedder::load_shared(tmp.path())
+            .expect("restored verified artifacts allow retry");
+        assert!(
+            Arc::ptr_eq(&resident, &recovered),
+            "successful re-admission reuses the still-live instance"
+        );
+    }
+}
+
 #[test]
 fn verify_dir_cached_rejects_placeholder_checksums() {
     let tmp = tempfile::tempdir().unwrap();

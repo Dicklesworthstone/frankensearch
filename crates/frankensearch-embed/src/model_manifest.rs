@@ -4173,8 +4173,10 @@ mod tests {
         // field moves from 0.2.6 to 0.2.7; reconstruction retains both 0.2.5
         // and 0.2.6 hashes and proves that no other manifest field or output
         // certificate drifted. The space identity is built from
-        // space_contract_fingerprint, which carries no crate version, so an
-        // index built by 0.2.6 stays compatible.
+        // space_contract_fingerprint, which carries no crate version. The
+        // producer and bundle fingerprints still change: fsfs revision checks
+        // and strict library search activation require rebuilding an index
+        // produced by 0.2.6, even when its space and output certificate agree.
         // GOLDEN-CHANGE macOS ARM64 qualification: only the three ONNX
         // numeric profiles and output certificates differ on that platform.
         // Retain exact Linux fixtures and reconstruct them below before the
