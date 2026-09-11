@@ -6779,7 +6779,14 @@ mod tests {
             .join(pristine.sidecar_generation.as_ref().expect("generation"))
             .join(HNSW_GENERATION_RECEIPT_FILENAME);
         let original_receipt = std::fs::read(&receipt_path).expect("receipt");
-        for case in ["reordered", "duplicate", "outside", "missing", "extent"] {
+        for case in [
+            "reordered",
+            "duplicate",
+            "outside",
+            "missing",
+            "extent",
+            "v6",
+        ] {
             let mut meta: HnswMeta = serde_json::from_slice(&original_meta).expect("metadata");
             match case {
                 "reordered" => meta.source_positions.swap(0, 1),
@@ -6788,6 +6795,7 @@ mod tests {
                 "missing" => {
                     meta.source_positions.pop();
                 }
+                "v6" => meta.format_version = 6,
                 _ => meta.source_record_count += 1,
             }
             std::fs::write(&ann_path, serde_json::to_vec(&meta).expect("encode map"))

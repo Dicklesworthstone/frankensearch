@@ -43,7 +43,7 @@ rust-version = "1.95"
 # Internal crates
 frankensearch-core = { version = "0.2.5", path = "crates/frankensearch-core" }
 frankensearch-embed = { version = "0.2.7", path = "crates/frankensearch-embed", default-features = false }
-frankensearch-index = { version = "0.2.5", path = "crates/frankensearch-index" }
+frankensearch-index = { version = "0.2.6", path = "crates/frankensearch-index" }
 frankensearch-lexical = { version = "0.2.5", path = "crates/frankensearch-lexical" }
 frankensearch-fusion = { version = "0.2.5", path = "crates/frankensearch-fusion" }
 frankensearch-rerank = { version = "0.3.0", path = "crates/frankensearch-rerank" }
