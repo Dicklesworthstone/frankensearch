@@ -316,11 +316,51 @@ overbroad no-rebuild comment and documented the explicit fsfs rebuild step.
 GH #43 has five passing focused RCH tests plus six real-Potion CLI controls
 (signal, same-index retry, double interrupt, two low-threshold profiles, and a
 successful high-threshold run), and a separate real discovery-phase signal
-probe. The full gate passed formatting, checks, clippy, cross-target and bounded
-Quill correctness, then exposed an existing 120 ms watch-test timing assumption.
-The repaired test waits for actual watcher startup and checks finalization once.
-Final-source verification and remaining gate stages are still pending at this
-research checkpoint; the changelog makes no full-gate or release claim.
+probe. The process probes used ELF SHA256
+`2a0acfcf2ef358506483c076a6d9d5aaf596cad753fd8d47a63582a676ffbbb9`.
+The 128 MiB threshold runs reached about 1.07 GiB RSS during synchronous model
+loading before rejection: this is a soft pressure threshold, not a memory cap.
+The first signal is cooperative; the second interrupt terminated promptly.
+Same-index retry succeeded, but that does not establish retention of a previous
+committed generation. These are bounded development diagnostics, not a
+performance comparison.
+
+The required full gate ended with three failures, retained in
+`/data/tmp/fsfs-gh43-quality-gate-final-20260911.log`: the workspace library
+stage exposed an existing 120 ms watch-test timing assumption; two of seven
+real-model E2Es lacked registered native/multilingual fixture files; and the
+quickstart refused dirty-source provenance. Formatting, checks, clippy,
+cross-target, bounded Quill correctness, all 2,400 selected fsfs tests and
+the facade stage passed in that invocation. That snapshot preceded the watch
+test repair, which now waits for actual watcher startup and checks finalization
+once. A later RCH invocation passed final-source formatting, checks, clippy
+(including hybrid) and cross-target compilation; its log is
+`/data/tmp/fsfs-final-compiler-gates-20260911.log`.
+
+GH #46's three fixture-backed loader tests passed: frozen conformance,
+same-process shared construction, and bit-identical streamed matrix decoding.
+The new production loader integration test also passed: modifying either real
+artifact is rejected before a resident-cache hit, preserves the verification
+receipt, and allows reuse after restoring the original bytes. Logs are
+`/data/tmp/fsfs-gh46-real-model-tests-vmi1227854-20260911.log` and
+`/data/tmp/fsfs-gh46-production-cache-recovery-20260911.log`. The test executable
+SHA256 values are respectively
+`bd8010c828e458bd596521d3c97ce4924ff5e743a269fa654ed65d6e62c85abf`
+and `6b7c0919b7a538d27dd2f6d5c8d11207a1de16844ec39c93719eabdf76d59d58`.
+The draft expected a raw hash error; before execution it was corrected to require
+the production verifier's exact aggregated `ModelLoadFailed` diagnostic.
+No admission rule or golden fingerprint changed. The changelog also avoids
+calling shared loads free: verification still runs and reuse requires a live
+caller retaining the model.
+
+A final watch-only RCH attempt lost its client without terminal test evidence
+and remains `NO_VERDICT`. After confirming its compilers had exited, the three
+failed stages were scheduled against clean `4ea318c0`, with all required model
+artifacts hash-verified. One initial follow-up was cancelled before tests to
+correct its Cargo cache routing; both attempts' logs remain available. The
+replacement run records a remote log and terminal exit receipt independently
+of client output. Its tests, E2E and quickstart outcomes are still pending at
+this checkpoint; neither the changelog nor this record claims a full-gate pass.
 
 Another session committed and pushed the reserved GH #43 edits as `90e8fb14`
 while validation was running. This does not change the evidence boundary.
