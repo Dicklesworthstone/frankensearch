@@ -83,9 +83,10 @@ impl Default for HnswConfig {
 /// graphs built with the dimension-aware `DistDot` roundoff budget; v4 replaces
 /// the sampled source fingerprint with a digest of every live vector; v5 records
 /// the exact native sidecar generation and basename selected during publication;
-/// v6 attests point/layer invariants after build and native load. Older native
+/// v6 attests point/layer invariants after build and native load; v7 persists
+/// graph-origin-to-source-row mappings for incremental insertion. Older native
 /// graphs must be rebuilt under the current persistence contract.
-pub(crate) const HNSW_META_FORMAT_CURRENT: u32 = 6;
+pub(crate) const HNSW_META_FORMAT_CURRENT: u32 = 7;
 
 const HNSW_GENERATION_RECEIPT_VERSION: u32 = 1;
 const HNSW_GENERATION_RECEIPT_FILENAME: &str = ".frankensearch-hnsw-ready.json";
@@ -112,6 +113,12 @@ struct HnswMeta {
     #[serde(default)]
     format_version: u32,
     doc_ids: Vec<String>,
+    /// Physical source row for each graph origin id, in graph insertion order.
+    #[serde(default)]
+    source_positions: Vec<u32>,
+    /// Physical source extent, including retained tombstones.
+    #[serde(default)]
+    source_record_count: usize,
     config: HnswConfig,
     dimension: usize,
     /// Deterministic fingerprint of the vectors the persisted graph was built
@@ -226,6 +233,8 @@ struct HnswGenerationReceipt {
     vector_fingerprint: u64,
     dimension: usize,
     config: HnswConfig,
+    /// Binds the origin-to-row map and physical extent used at publication.
+    source_map_fingerprint: u64,
     graph: HnswSidecarDigest,
     data: HnswSidecarDigest,
     /// Source FSVI generation identity this generation was dumped from
@@ -260,6 +269,23 @@ pub enum HnswLoadDisposition {
     Native,
     /// Metadata was readable, but the graph had to be rebuilt from the source index.
     Rebuilt,
+}
+
+/// Result of attempting to extend an existing graph without rebuilding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswAppendDisposition {
+    /// The graph already belongs to the requested source generation.
+    NoOp,
+    /// New points were inserted into the existing graph.
+    Appended {
+        /// Number of new graph points inserted.
+        inserted: usize,
+    },
+    /// The returned graph is unchanged and still belongs to the prior source.
+    FullRebuildRequired {
+        /// Stable diagnostic explaining why append was refused.
+        reason: &'static str,
+    },
 }
 
 /// Diagnostics for one ANN query.
@@ -363,6 +389,129 @@ impl std::fmt::Debug for HnswIndex {
 }
 
 impl HnswIndex {
+    /// Append new document IDs to an existing (including natively loaded) graph.
+    ///
+    /// Both sources must carry explicit generation identities and identical model,
+    /// space, and storage identities. Every prior row must remain byte-equivalent
+    /// after decoding; deletions, duplicate IDs, and edited old vectors require
+    /// a rebuild. Source rows may move when FSVI sorts new IDs: old graph origin
+    /// IDs stay unchanged and their physical source mapping is updated.
+    /// Refusal returns the unchanged graph. On an insertion
+    /// error this consuming API discards the candidate, so a partially modified
+    /// graph cannot escape under its old identity. Persisted graphs are untouched.
+    ///
+    /// Validation and fingerprinting read the full source; native insertion only
+    /// processes new IDs. Loading and saving still process the whole graph.
+    ///
+    /// # Errors
+    /// Returns source decoding, invalid vector, or graph topology errors.
+    pub fn append_from_vector_index(
+        mut self,
+        previous: &VectorIndex,
+        current: &VectorIndex,
+    ) -> SearchResult<(Self, HnswAppendDisposition)> {
+        let refuse = |graph, reason| {
+            Ok((graph, HnswAppendDisposition::FullRebuildRequired { reason }))
+        };
+        if !self.matches_vector_index(previous)?
+            || self.source_record_count != previous.record_count()
+        {
+            return refuse(self, "prior_source_mismatch");
+        }
+        if self.matches_vector_index(current)? {
+            return Ok((self, HnswAppendDisposition::NoOp));
+        }
+        let (Some(prior_identity), Some(current_identity)) = (
+            HnswSourceIdentityV1::capture(previous),
+            HnswSourceIdentityV1::capture(current),
+        ) else {
+            return refuse(self, "missing_source_identity");
+        };
+        if previous.dimension() != current.dimension()
+            || previous.embedder_id() != current.embedder_id()
+            || prior_identity.identity_bundle_fingerprint
+                != current_identity.identity_bundle_fingerprint
+            || prior_identity.space_fingerprint != current_identity.space_fingerprint
+            || prior_identity.storage_fingerprint != current_identity.storage_fingerprint
+        {
+            return refuse(self, "embedding_identity_changed");
+        }
+        if current.record_count() <= previous.record_count() {
+            return refuse(self, "not_an_append");
+        }
+        if prior_identity.generation == current_identity.generation {
+            return refuse(self, "generation_not_advanced");
+        }
+        if self.doc_ids.len() != previous.record_count() {
+            return refuse(self, "deleted_rows");
+        }
+        let old_origins: std::collections::HashMap<_, _> = self
+            .doc_ids.iter().enumerate().map(|(origin, id)| (id.clone(), origin)).collect();
+        if old_origins.len() != self.doc_ids.len() {
+            return refuse(self, "duplicate_document_id");
+        }
+        let mut positions = vec![0_u32; self.doc_ids.len()];
+        let mut matched_old = 0_usize;
+        let mut identifiers = std::collections::HashSet::new();
+        let mut new_rows = Vec::new();
+        for row in 0..current.record_count() {
+            if current.is_deleted(row) {
+                return refuse(self, "deleted_rows");
+            }
+            let id = current.doc_id_at(row)?;
+            if !identifiers.insert(id.to_owned()) {
+                return refuse(self, "duplicate_document_id");
+            }
+            let Ok(position) = u32::try_from(row) else {
+                return refuse(self, "source_position_overflow");
+            };
+            if let Some(&origin) = old_origins.get(id) {
+                let prior_row = self.source_positions[origin] as usize;
+                if previous.vector_at_f32(prior_row)?.iter().map(|v| v.to_bits()).ne(
+                    current.vector_at_f32(row)?.iter().map(|v| v.to_bits()),
+                ) {
+                    return refuse(self, "old_vector_changed");
+                }
+                positions[origin] = position;
+                matched_old += 1;
+            } else {
+                new_rows.push((id.to_owned(), position));
+            }
+        }
+        if matched_old != self.doc_ids.len() {
+            return refuse(self, "old_document_missing");
+        }
+        let budget = dist_dot_budget(self.dimension)?;
+        let mut suffix = Vec::new();
+        let mut doc_ids = self.doc_ids.clone();
+        for (id, position) in new_rows {
+            let vector = current.vector_at_f32(position as usize)?;
+            if vector.len() != self.dimension || vector.iter().any(|value| !value.is_finite()) {
+                return refuse(self, "invalid_suffix_vector");
+            }
+            doc_ids.push(id);
+            positions.push(position);
+            suffix.push(normalize_for_dist_dot(vector, budget));
+        }
+        let fingerprint = fingerprint_vector_index_positions(
+            current, &positions, &doc_ids, self.dimension,
+        )?;
+        let inserted = suffix.len();
+        self.hnsw.set_searching_mode(false);
+        for (offset, vector) in suffix.into_iter().enumerate() {
+            self.hnsw.insert_slice((&vector, self.doc_ids.len() + offset));
+        }
+        validate_hnsw_topology(&self.hnsw, doc_ids.len())
+            .map_err(|detail| ann_topology_error(&detail))?;
+        self.doc_ids = doc_ids;
+        self.source_positions = positions;
+        self.source_record_count = current.record_count();
+        self.vector_fingerprint = fingerprint;
+        self.source_identity = Some(current_identity);
+        self.underfill_warned = AtomicBool::new(false);
+        Ok((self, HnswAppendDisposition::Appended { inserted }))
+    }
+
     /// Build a new HNSW index from an opened `VectorIndex`.
     ///
     /// # Errors
@@ -541,6 +690,7 @@ impl HnswIndex {
             &metadata_file_name,
             &meta.doc_ids,
             meta.vector_fingerprint,
+            fingerprint_source_map(&meta.source_positions, meta.source_record_count),
             meta.dimension,
             meta.config,
         ) {
@@ -561,7 +711,9 @@ impl HnswIndex {
                 return None;
             }
         };
-        if validated_generation.basename != basename || validated_generation.graph != graph {
+        if validated_generation.basename != basename || validated_generation.graph != graph
+            || !HnswSourceIdentityV1::admits(validated_generation.source_identity.as_ref(), meta.source_identity.as_ref())
+        {
             tracing::warn!(
                 path = %path.display(),
                 "HNSW metadata and digest receipt name different native sidecars; \
@@ -607,8 +759,9 @@ impl HnswIndex {
         // that no longer exist. `try_load_native_graph` is only called for the
         // current format, so a missing fingerprint cannot be treated as a
         // legacy exception: 0 is compared like any other digest value.
-        let live_fp =
-            fingerprint_live_vector_index(source_index, meta.doc_ids.len(), meta.dimension).ok()?;
+        let live_fp = fingerprint_vector_index_positions(
+            source_index, &meta.source_positions, &meta.doc_ids, meta.dimension,
+        ).ok()?;
         if live_fp != meta.vector_fingerprint {
             tracing::warn!(
                 path = %path.display(),
@@ -685,12 +838,8 @@ impl HnswIndex {
             hnsw,
             underfill_warned: AtomicBool::new(false),
             doc_ids: meta.doc_ids.clone(),
-            source_positions: live_vector_positions(source_index)
-                .into_iter()
-                .map(u32::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?,
-            source_record_count: source_index.record_count(),
+            source_positions: meta.source_positions.clone(),
+            source_record_count: meta.source_record_count,
             dimension: meta.dimension,
             config: meta.config,
             vector_fingerprint: meta.vector_fingerprint,
@@ -805,6 +954,7 @@ impl HnswIndex {
             doc_count: self.doc_ids.len(),
             doc_ids_fingerprint: fingerprint_doc_ids(&self.doc_ids),
             vector_fingerprint: self.vector_fingerprint,
+            source_map_fingerprint: fingerprint_source_map(&self.source_positions, self.source_record_count),
             dimension: self.dimension,
             config: self.config,
             source_identity: self.source_identity.clone(),
@@ -830,6 +980,8 @@ impl HnswIndex {
         HnswMeta {
             format_version: HNSW_META_FORMAT_CURRENT,
             doc_ids: self.doc_ids.clone(),
+            source_positions: self.source_positions.clone(),
+            source_record_count: self.source_record_count,
             config: self.config,
             dimension: self.dimension,
             vector_fingerprint: self.vector_fingerprint,
@@ -1415,28 +1567,11 @@ impl HnswIndex {
         ) {
             return Ok(false);
         }
-        let mut live_position = 0_usize;
-        for i in 0..index.record_count() {
-            if index.is_deleted(i) {
-                continue;
-            }
-            let Some(expected_doc_id) = self.doc_ids.get(live_position) else {
-                // HNSW has fewer docs than VectorIndex
-                return Ok(false);
-            };
-            if expected_doc_id != index.doc_id_at(i)? {
-                return Ok(false);
-            }
-            if self.source_positions.get(live_position).copied() != u32::try_from(i).ok() {
-                return Ok(false);
-            }
-            live_position = live_position.saturating_add(1);
-        }
-        if live_position != self.doc_ids.len() {
+        if !source_map_matches_live_rows(index, &self.doc_ids, &self.source_positions, self.source_record_count)? {
             return Ok(false);
         }
         Ok(
-            fingerprint_live_vector_index(index, self.doc_ids.len(), self.dimension)?
+            fingerprint_vector_index_positions(index, &self.source_positions, &self.doc_ids, self.dimension)?
                 == self.vector_fingerprint,
         )
     }
@@ -2316,6 +2451,7 @@ fn reusable_hnsw_generation(
         metadata_file_name,
         &index.doc_ids,
         index.vector_fingerprint,
+        fingerprint_source_map(&index.source_positions, index.source_record_count),
         index.dimension,
         index.config,
     )?
@@ -2381,6 +2517,7 @@ fn validate_hnsw_generation_receipt(
     metadata_file_name: &str,
     doc_ids: &[String],
     vector_fingerprint: u64,
+    source_map_fingerprint: u64,
     dimension: usize,
     config: HnswConfig,
 ) -> SearchResult<Option<ValidatedHnswGeneration>> {
@@ -2441,6 +2578,7 @@ fn validate_hnsw_generation_receipt(
         || receipt.doc_count != doc_ids.len()
         || receipt.doc_ids_fingerprint != fingerprint_doc_ids(doc_ids)
         || receipt.vector_fingerprint != vector_fingerprint
+        || receipt.source_map_fingerprint != source_map_fingerprint
         || receipt.dimension != dimension
         || receipt.config != config
     {
@@ -2825,7 +2963,7 @@ fn fnv1a_update_f32(mut h: u64, vec: &[f32]) -> u64 {
 /// Every vector contributes in live-row order. Doc IDs are mixed in alongside
 /// their vectors, so either a vector edit or a doc-id permutation changes the
 /// digest. The output is stored in the native metadata sidecar and re-derived
-/// at load time by [`fingerprint_live_vector_index`] against the live
+/// at load time by [`fingerprint_vector_index_positions`] against the live
 /// `VectorIndex`; a mismatch means "doc IDs match but the underlying vector
 /// bytes were silently swapped" → reject the persisted graph.
 fn fingerprint_vectors(doc_ids: &[String], vectors: &[Vec<f32>]) -> u64 {
@@ -2846,6 +2984,7 @@ fn fingerprint_vectors(doc_ids: &[String], vectors: &[Vec<f32>]) -> u64 {
 /// live index has fewer live records than the persisted graph, the digest
 /// will not match and the caller falls back to a rebuild — which is the right
 /// behavior.
+#[cfg(test)]
 fn fingerprint_live_vector_index(
     index: &VectorIndex,
     expected_len: usize,
@@ -2882,7 +3021,7 @@ fn fingerprint_live_vector_index(
 
 /// Recompute a graph fingerprint from its original physical source rows.
 ///
-/// Unlike [`fingerprint_live_vector_index`], this deliberately includes rows
+/// Unlike a live-row scan, this deliberately includes rows
 /// that were tombstoned after the graph was built. Soft deletion is a valid
 /// in-process state transition: native candidates for those rows are filtered,
 /// while an exact underfill repair scans the source's current live set. A row
@@ -2943,34 +3082,46 @@ fn fingerprint_vector_index_positions(
     Ok(h)
 }
 
-fn live_vector_positions(index: &VectorIndex) -> Vec<usize> {
-    (0..index.record_count())
-        .filter(|&position| !index.is_deleted(position))
-        .collect()
-}
-
-/// Verify the metadata `doc_ids` sequence matches the live `VectorIndex`'s
-/// live (non-tombstoned) doc IDs in row order. Same semantics as the public
+/// Verify the graph's persisted row map covers every live source row exactly
+/// once and binds the expected document identity. Same semantics as the public
 /// `matches_vector_index` but doesn't need a constructed `HnswIndex`, so we
 /// can check it before paying for the native graph load.
 fn meta_matches_live_doc_ids(meta: &HnswMeta, index: &VectorIndex) -> SearchResult<bool> {
     if meta.dimension != index.dimension() {
         return Ok(false);
     }
-    let mut live_position = 0_usize;
-    for i in 0..index.record_count() {
-        if index.is_deleted(i) {
-            continue;
-        }
-        let Some(expected_doc_id) = meta.doc_ids.get(live_position) else {
+    source_map_matches_live_rows(index, &meta.doc_ids, &meta.source_positions, meta.source_record_count)
+}
+
+fn source_map_matches_live_rows(
+    index: &VectorIndex,
+    doc_ids: &[String],
+    positions: &[u32],
+    source_record_count: usize,
+) -> SearchResult<bool> {
+    if source_record_count != index.record_count() || positions.len() != doc_ids.len() {
+        return Ok(false);
+    }
+    let mut covered = vec![false; source_record_count];
+    for (id, &position) in doc_ids.iter().zip(positions) {
+        let row = position as usize;
+        let Some(seen) = covered.get_mut(row) else {
             return Ok(false);
         };
-        if expected_doc_id != index.doc_id_at(i)? {
+        if *seen || index.is_deleted(row) || id != index.doc_id_at(row)? {
             return Ok(false);
         }
-        live_position = live_position.saturating_add(1);
+        *seen = true;
     }
-    Ok(live_position == meta.doc_ids.len())
+    Ok(covered.iter().enumerate().all(|(row, &seen)| seen != index.is_deleted(row)))
+}
+
+fn fingerprint_source_map(positions: &[u32], source_record_count: usize) -> u64 {
+    let mut fingerprint = fnv1a_update(FNV_OFFSET_BASIS_64, &(source_record_count as u64).to_le_bytes());
+    for position in positions {
+        fingerprint = fnv1a_update(fingerprint, &position.to_le_bytes());
+    }
+    fingerprint
 }
 
 fn validate_config(config: HnswConfig) -> SearchResult<()> {
@@ -5721,6 +5872,8 @@ mod tests {
         let metadata = HnswMeta {
             format_version: HNSW_META_FORMAT_CURRENT,
             doc_ids: Vec::new(),
+            source_positions: Vec::new(),
+            source_record_count: 0,
             config: HnswConfig::default(),
             dimension: 0,
             vector_fingerprint: 0,
@@ -5867,6 +6020,8 @@ mod tests {
         let legacy_meta = HnswMeta {
             format_version: 0,
             doc_ids: vec!["duplicate".to_owned(), "duplicate".to_owned()],
+            source_positions: Vec::new(),
+            source_record_count: 0,
             config: HnswConfig::default(),
             dimension: 2,
             vector_fingerprint: 0,
@@ -6330,6 +6485,195 @@ mod tests {
             new_hits[0].doc_id, "doc-0007",
             "rebuild path must have picked up the swapped vector for doc-0007"
         );
+    }
+
+    fn append_test_source(
+        path: &Path,
+        sequence: u64,
+        model: &str,
+        rows: &[(String, Vec<f32>)],
+    ) -> crate::ValidatedFsviBytes {
+        use frankensearch_core::generation::{
+            ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+        };
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model, 32);
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.quantization = QuantizationFormat::F32;
+        identity.storage.endianness = "little-endian".to_owned();
+        let binding = crate::FsviV2IdentityBinding::new(
+            ArtifactGenerationIdentityV1::new(sequence, [0xb1; 16]).expect("generation"),
+            identity.freeze().expect("identity"),
+        )
+        .expect("binding");
+        let mut writer = VectorIndex::create_v2(path, binding.clone()).expect("create source");
+        for (id, vector) in rows {
+            writer.write_record(id, vector).expect("write row");
+        }
+        writer.finish().expect("finish source");
+        crate::ValidatedFsviBytes::from_arc(
+            std::sync::Arc::<[u8]>::from(std::fs::read(path).expect("source bytes")),
+            &binding,
+        )
+        .expect("validated source")
+    }
+
+    #[test]
+    fn incremental_append_loaded_graph_preserves_nodes_and_searches_after_reload() {
+        let dir = tempfile::tempdir().expect("test directory");
+        let mut rows: Vec<_> = (0..33)
+            .map(|row| (format!("doc-{row:04}"), normalized_vector(row + 1, 32)))
+            .collect();
+        rows.sort_by_key(|(id, _)| crate::fnv1a_hash(id.as_bytes()));
+        // FSVI sorts by hash. Insert before every old physical row, forcing
+        // remapping while all existing graph origin IDs remain unchanged.
+        let (new_id, query) = rows.remove(0);
+        let prior = append_test_source(&dir.path().join("prior.fsvi"), 1, "append-model", &rows);
+        let ann_path = dir.path().join("ann.json");
+        HnswIndex::build_from_vector_index(&prior.index, HnswConfig::default())
+            .expect("build prior graph")
+            .save(&ann_path)
+            .expect("save prior graph");
+        let (loaded, load) = HnswIndex::load_with_disposition(&ann_path, &prior.index)
+            .expect("native prior load");
+        assert_eq!(load, HnswLoadDisposition::Native);
+        let old_points: Vec<_> = loaded.hnsw.get_point_indexation().into_iter().collect();
+        let (loaded, noop) = loaded
+            .append_from_vector_index(&prior.index, &prior.index)
+            .expect("no-change append");
+        assert_eq!(noop, HnswAppendDisposition::NoOp);
+        rows.push((new_id.clone(), query.clone()));
+        let current =
+            append_test_source(&dir.path().join("current.fsvi"), 2, "append-model", &rows);
+        let (appended, disposition) = loaded
+            .append_from_vector_index(&prior.index, &current.index)
+            .expect("append to loaded graph");
+        assert_eq!(disposition, HnswAppendDisposition::Appended { inserted: 1 });
+        assert_eq!(appended.source_positions[0], 1);
+        assert_eq!(appended.source_positions[32], 0);
+        for old in &old_points {
+            let retained = appended
+                .hnsw
+                .get_point_indexation()
+                .into_iter()
+                .find(|point| point.get_origin_id() == old.get_origin_id())
+                .expect("retained original point");
+            assert!(std::sync::Arc::ptr_eq(old, &retained), "must reuse old graph nodes");
+        }
+        assert!(appended.matches_vector_index(&current.index).expect("current match"));
+        assert!(!appended.matches_vector_index(&prior.index).expect("prior mismatch"));
+        let (hits, stats) = appended.knn_search_with_stats(&query, 1, 128).expect("ANN query");
+        assert_eq!(hits[0].doc_id, new_id);
+        assert!(stats.is_approximate);
+        assert_eq!(stats.fallback_reason, None);
+        let (source_hits, source_stats) = appended
+            .knn_search_with_stats_against(&current.index, &query, 1, 128)
+            .expect("mapped source ANN");
+        assert_eq!(source_hits[0].index, 0);
+        assert!(source_stats.is_approximate);
+        appended.save(&ann_path).expect("publish appended graph");
+        let (reloaded, load) = HnswIndex::load_with_disposition(&ann_path, &current.index)
+            .expect("reload appended graph");
+        assert_eq!(load, HnswLoadDisposition::Native);
+        assert_eq!(reloaded.source_positions, appended.source_positions);
+        let (hits, stats) = reloaded.knn_search_with_stats(&query, 1, 128).expect("reloaded ANN");
+        assert_eq!(hits[0].doc_id, new_id);
+        assert!(stats.is_approximate);
+        assert_eq!(stats.fallback_reason, None);
+        assert!(HnswIndex::try_load_native(&ann_path, &prior.index).expect("old admission").is_none());
+    }
+
+    #[test]
+    fn incremental_append_refuses_changes_and_preserves_prior_graph() {
+        let dir = tempfile::tempdir().expect("test directory");
+        let mut rows: Vec<_> = (0..9)
+            .map(|row| (format!("doc-{row:04}"), normalized_vector(row + 1, 32)))
+            .collect();
+        rows.sort_by_key(|(id, _)| crate::fnv1a_hash(id.as_bytes()));
+        let suffix = rows.pop().expect("suffix row");
+        let prior = append_test_source(&dir.path().join("prior.fsvi"), 1, "append-model", &rows);
+        let ann_path = dir.path().join("ann.json");
+        HnswIndex::build_from_vector_index(&prior.index, HnswConfig::default())
+            .expect("build graph").save(&ann_path).expect("save graph");
+        let persisted = std::fs::read(&ann_path).expect("prior metadata");
+        for case in ["changed", "deleted", "replaced", "model", "generation"] {
+            let mut changed = rows.clone();
+            changed.push(suffix.clone());
+            match case {
+                "changed" => changed[2].1 = normalized_vector(102, 32),
+                "deleted" => { changed.remove(2); }
+                "replaced" => changed[2].0 = "replacement-id".to_owned(),
+                _ => {}
+            }
+            let current = append_test_source(
+                &dir.path().join(format!("{case}.fsvi")),
+                if case == "generation" { 1 } else { 2 },
+                if case == "model" { "other-model" } else { "append-model" },
+                &changed,
+            );
+            let (loaded, disposition) = HnswIndex::load_with_disposition(&ann_path, &prior.index)
+                .expect("load original graph");
+            assert_eq!(disposition, HnswLoadDisposition::Native);
+            let old_points: Vec<_> = loaded.hnsw.get_point_indexation().into_iter().collect();
+            let (unchanged, disposition) = loaded
+                .append_from_vector_index(&prior.index, &current.index).expect("refuse delta");
+            let expected_reason = match case {
+                "deleted" => "not_an_append",
+                "model" => "embedding_identity_changed",
+                "generation" => "generation_not_advanced",
+                "changed" => "old_vector_changed",
+                _ => "old_document_missing",
+            };
+            assert_eq!(disposition, HnswAppendDisposition::FullRebuildRequired { reason: expected_reason }, "{case}");
+            assert!(unchanged.matches_vector_index(&prior.index).expect("prior preserved"));
+            assert!(!unchanged.matches_vector_index(&current.index).expect("current rejected"));
+            assert_eq!(unchanged.hnsw.get_nb_point(), rows.len());
+            for old in &old_points {
+                assert!(unchanged.hnsw.get_point_indexation().into_iter().any(|p| std::sync::Arc::ptr_eq(old, &p)));
+            }
+            assert_eq!(std::fs::read(&ann_path).expect("unchanged metadata"), persisted);
+        }
+    }
+
+    #[test]
+    fn incremental_append_native_load_rejects_invalid_source_maps() {
+        let dir = tempfile::tempdir().expect("test directory");
+        let rows: Vec<_> = (0..8)
+            .map(|row| (format!("doc-{row:04}"), normalized_vector(row + 1, 32)))
+            .collect();
+        let source = append_test_source(&dir.path().join("source.fsvi"), 1, "append-model", &rows);
+        let ann_path = dir.path().join("ann.json");
+        HnswIndex::build_from_vector_index(&source.index, HnswConfig::default())
+            .expect("build graph").save(&ann_path).expect("save graph");
+        let original_meta = std::fs::read(&ann_path).expect("metadata");
+        let pristine: HnswMeta = serde_json::from_slice(&original_meta).expect("parse metadata");
+        let receipt_path = dir.path().join(pristine.sidecar_generation.as_ref().expect("generation"))
+            .join(HNSW_GENERATION_RECEIPT_FILENAME);
+        let original_receipt = std::fs::read(&receipt_path).expect("receipt");
+        for case in ["reordered", "duplicate", "outside", "missing", "extent"] {
+            let mut meta: HnswMeta = serde_json::from_slice(&original_meta).expect("metadata");
+            match case {
+                "reordered" => meta.source_positions.swap(0, 1),
+                "duplicate" => meta.source_positions[1] = meta.source_positions[0],
+                "outside" => meta.source_positions[0] = u32::MAX,
+                "missing" => { meta.source_positions.pop(); }
+                _ => meta.source_record_count += 1,
+            }
+            std::fs::write(&ann_path, serde_json::to_vec(&meta).expect("encode map"))
+                .expect("plant invalid map");
+            // First reject metadata that diverges from its unchanged receipt.
+            std::fs::write(&receipt_path, &original_receipt).expect("restore receipt");
+            assert!(HnswIndex::try_load_native(&ann_path, &source.index)
+                .expect("native admission").is_none(), "{case}");
+            // Even a matching map digest cannot authorize invalid coverage or
+            // wrong row identities against the real source generation.
+            let mut receipt: HnswGenerationReceipt = serde_json::from_slice(&original_receipt)
+                .expect("parse receipt");
+            receipt.source_map_fingerprint = fingerprint_source_map(&meta.source_positions, meta.source_record_count);
+            std::fs::write(&receipt_path, serde_json::to_vec(&receipt).expect("encode receipt"))
+                .expect("plant matching digest");
+            assert!(HnswIndex::try_load_native(&ann_path, &source.index)
+                .expect("source admission").is_none(), "{case}");
+        }
     }
 
     // ─── bd-r65a: ANN sidecars are bound to the source FSVI generation ───
