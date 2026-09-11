@@ -3786,7 +3786,10 @@ mod tests {
             false,
             3,
             |graph| Err(graph.label.to_owned()),
-            || panic!("a serial build must never recursively rebuild"),
+            || {
+                assert!(false, "a serial build must never recursively rebuild");
+                unreachable!()
+            },
         )
         .expect_err("serial construction failure");
         assert_eq!(error, "serial-only-invalid");
