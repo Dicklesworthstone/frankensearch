@@ -132,17 +132,7 @@ impl Model2VecEmbedder {
         }
         #[cfg(not(test))]
         {
-            // The native manifest is derived from the potion download manifest,
-            // whose `.verified` receipt is minted after a full hash pass. Reuse
-            // that receipt instead of re-hashing the 512 MB safetensors file on
-            // every process start; any mismatch falls back to the full pass.
-            let verified = ModelArtifactManifestV1::potion_128m_native()?.verify_dir_cached(
-                &crate::model_manifest::ModelManifest::potion_128m(),
-                model_dir,
-            )?;
-            let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
-            validate_registered_execution_contract(&identity)?;
-            Self::load_preverified(model_dir, name, identity)
+            Self::load_preverified(model_dir, name, admit_registered_potion(model_dir)?)
         }
     }
 
@@ -156,12 +146,20 @@ impl Model2VecEmbedder {
     /// the caller, so the second and later loads in a process should be free
     /// (GH #46).
     ///
-    /// Artifact verification runs on EVERY call, before any cached instance is
-    /// handed back, and the cache key carries the attested identity
-    /// fingerprint — so a model that fails admission is never served from
-    /// cache, and a changed model never reuses the old matrix. The cache holds
-    /// only a [`Weak`] reference, so the matrix is released as soon as the
-    /// last caller drops its `Arc`.
+    /// **What keeps a changed model from being served from cache is
+    /// `admit_registered_potion`, which runs on EVERY call before the cache is
+    /// consulted** — not the cache key. The receipt it checks carries each
+    /// file's size, mtime, ctime, device and inode, so a rewritten or replaced
+    /// model invalidates it and forces a full hash pass; an artifact that
+    /// fails admission returns before the lookup and can never be handed back.
+    /// Do not weaken that call on the theory that the key protects you: in
+    /// production the identity fingerprint is derived from a frozen manifest
+    /// and is the same constant for every successful load. It is in the key so
+    /// that a future caller loading a DIFFERENT registered model cannot
+    /// collide, not to detect a changed one.
+    ///
+    /// The cache holds only a [`Weak`] reference, so the matrix is released as
+    /// soon as the last caller drops its `Arc`.
     ///
     /// The key also carries the display name, so two callers that load the
     /// same directory under different names get separate instances rather than
@@ -194,15 +192,7 @@ impl Model2VecEmbedder {
         #[cfg(test)]
         let identity = EmbeddingIdentityBundleV1::explicit_test_model(name, 1);
         #[cfg(not(test))]
-        let identity = {
-            let verified = ModelArtifactManifestV1::potion_128m_native()?.verify_dir_cached(
-                &crate::model_manifest::ModelManifest::potion_128m(),
-                model_dir,
-            )?;
-            let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
-            validate_registered_execution_contract(&identity)?;
-            identity
-        };
+        let identity = admit_registered_potion(model_dir)?;
         Self::load_shared_preverified(model_dir, name, identity)
     }
 
@@ -665,6 +655,31 @@ fn discover_tensor_name(names: &[&str]) -> Option<String> {
     None
 }
 
+/// Admit a model directory as the registered potion artifact and derive its
+/// runtime identity.
+///
+/// The ONE place this policy lives. Both public constructors call it, so
+/// `load` and `load_shared` cannot drift apart — and the shared constructor's
+/// central safety claim is that this runs on EVERY call, before any cached
+/// instance is handed back.
+///
+/// The native manifest is derived from the potion download manifest, whose
+/// `.verified` receipt is minted after a full hash pass. Reusing that receipt
+/// is what keeps the 512 MB safetensors file from being re-hashed on every
+/// process start; any mismatch — size, mtime, ctime, device or inode — falls
+/// back to the full pass, so a model replaced or rewritten on disk cannot be
+/// admitted on the strength of the old receipt.
+#[cfg(not(test))]
+fn admit_registered_potion(model_dir: &Path) -> SearchResult<EmbeddingIdentityBundleV1> {
+    let verified = ModelArtifactManifestV1::potion_128m_native()?.verify_dir_cached(
+        &crate::model_manifest::ModelManifest::potion_128m(),
+        model_dir,
+    )?;
+    let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
+    validate_registered_execution_contract(&identity)?;
+    Ok(identity)
+}
+
 /// Length prefix of a safetensors file: a little-endian `u64` header size.
 const SAFETENSORS_HEADER_LEN_PREFIX: usize = 8;
 
@@ -896,9 +911,11 @@ fn canonical_model_dir(model_dir: &Path) -> PathBuf {
 
 /// Key for the process-wide loaded-model cache.
 ///
-/// Includes the attested identity fingerprint, not just the path, so a model
-/// directory whose contents changed can never be answered from a cache entry
-/// built for the old contents.
+/// The identity fingerprint is here so that two DIFFERENT registered models
+/// cannot collide, not to detect a changed one — in production it is derived
+/// from a frozen manifest and is constant across successful loads. Detection
+/// of a changed model is `admit_registered_potion`'s job, and it runs before
+/// this key is ever looked up.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct SharedModelKey {
     dir: PathBuf,
@@ -2382,19 +2399,47 @@ mod tests {
         let first = Model2VecEmbedder::load_shared_with_name(dir, DEFAULT_MODEL_NAME).unwrap();
         assert_eq!(model2vec_full_loads_for(&key), before + 1);
 
-        let cold = std::time::Instant::now();
         let second = Model2VecEmbedder::load_shared_with_name(dir, DEFAULT_MODEL_NAME).unwrap();
-        let warm_elapsed = cold.elapsed();
 
+        // The counter and the pointer identity ARE the proof. A wall-clock
+        // threshold would add nothing but a flake on a loaded build host.
         assert_eq!(
             model2vec_full_loads_for(&key),
             before + 1,
             "the second real-model load must be served from the process cache"
         );
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// Offset validation must survive the move off `SafeTensors::deserialize`.
+    ///
+    /// `locate` parses the header by deserializing `safetensors::tensor::
+    /// Metadata` directly, which reaches `Metadata::new` -> `validate()` and
+    /// therefore enforces contiguity from offset 0. That is an implementation
+    /// detail of the upstream crate — `Deserialize for Metadata` does not
+    /// document it — so pin it here: if a future `safetensors` routes
+    /// deserialization around `validate()`, this loader would silently stop
+    /// checking offsets and still compile.
+    #[test]
+    fn load_rejects_non_contiguous_tensor_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_model(dir.path(), 12, 8);
+
+        // A header whose single tensor does not start at offset 0. Written by
+        // hand because the safetensors serializer cannot emit one.
+        let payload = vec![0_u8; 16 + 12 * 8 * 4];
+        let header =
+            br#"{"embeddings":{"dtype":"F32","shape":[12,8],"data_offsets":[16,400]}}"#.to_vec();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&payload[..400]);
+        fs::write(dir.path().join("model.safetensors"), &bytes).unwrap();
+
+        let error = Model2VecEmbedder::load_with_name(dir.path(), "gapped").unwrap_err();
+        let text = error.to_string();
         assert!(
-            warm_elapsed < std::time::Duration::from_millis(250),
-            "a cache hit must not cost a load; took {warm_elapsed:?}"
+            text.contains("failed to parse safetensors"),
+            "a tensor that does not start at offset 0 must be refused by the header validation, got: {text}"
         );
     }
 }

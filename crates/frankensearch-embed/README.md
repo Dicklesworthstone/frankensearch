@@ -73,11 +73,12 @@ let embedder = Model2VecEmbedder::load_shared(model_dir)?;   // -> Arc<Model2Vec
 ```
 
 The second and later loads of the same directory are served from a
-process-wide cache. Artifact verification still runs on every call, before any
-cached instance is returned, so a model that fails admission is never served
-from cache; the cache key carries the attested identity fingerprint, so a
-changed model never reuses the old matrix; and the cache holds only a `Weak`
-reference, so the matrix is released once the last caller drops its `Arc`.
+process-wide cache. Artifact verification still runs on **every** call, before
+the cache is consulted, so a model that fails admission is never served from
+cache and a model rewritten or replaced on disk invalidates its verification
+receipt and forces a full hash pass rather than reusing the resident matrix.
+The cache holds only a `Weak` reference, so the matrix is released once the
+last caller drops its `Arc`.
 
 This amortises **within** a process, not across processes: a one-shot CLI
 invocation still pays a full load.
