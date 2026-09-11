@@ -359,8 +359,50 @@ failed stages were scheduled against clean `4ea318c0`, with all required model
 artifacts hash-verified. One initial follow-up was cancelled before tests to
 correct its Cargo cache routing; both attempts' logs remain available. The
 replacement run records a remote log and terminal exit receipt independently
-of client output. Its tests, E2E and quickstart outcomes are still pending at
-this checkpoint; neither the changelog nor this record claims a full-gate pass.
+of client output. Its final receipt reports exit 1 at 2026-09-11T06:18:05Z on
+vmi1149989. All three selected stages failed; this is not a full-gate pass.
+
+The repaired watch-start test and all five GH #43 tests passed in that clean
+run. The fsfs library aggregate was 2,102 passed, one failed and 14 ignored.
+The unchanged unreadable-subtree test correctly rejected its fixture
+precondition: root could still read the directory after chmod 000. A separate
+workspace-stage rerun removed `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH`,
+preserving the test and its assertions. Its client exited 143 during compilation,
+with no terminal test output or exit receipt and no remaining owned compiler
+observed afterward. That attempt remains `NO_VERDICT`.
+
+All seven real-model E2Es were executed: six passed and one failed in 164.28 s.
+The multilingual CLI case passed. Native English F32 loading, producer admission,
+indexing, status and doctor succeeded, but search exceeded the unchanged 500 ms
+quality budget and returned `refinement_failed`. This was not a certificate
+mismatch. The executed fsfs ELF SHA256 is
+`88e88901c1f7476cda88debc57e000e0dbc65f0f98e19a9981a0c7919d7a976f`;
+the test driver is
+`d2ca61f58620c84bb1821b588dd8c205b3a82544911f408d34dd8654ffd60f08`.
+
+The clean quickstart built and installed identical executable bytes, SHA256
+`458465d861d6cdd4a288e7e5e9c10348a69763ffeda23dddb9c10a25934f1181`,
+with source identity `4ea318c0`. Both index passes succeeded. The subsequent
+ONNX hybrid query also exceeded its 500 ms quality budget, so the gate failed
+with `MISSING-PHASE`; its negative controls were not reached. The receipt reports
+no remaining owned processes. This resolves the earlier provenance refusal,
+but does not qualify the executable quickstart.
+
+The enclosing RCH connection later timed out at 06:25:00Z and reported its remote
+process group stopped. The retained gate exit receipt and quickstart failure
+receipt establish the failures above despite that transport error. Local copies
+are `/data/tmp/fsfs-gh43-clean-followup-2-4ea318c0-20260911.remote.log`, the
+matching `.exit.json`, and
+`/data/tmp/fsfs-gh43-validation-20260911/quickstart-Z6m9dthU/receipt.json`.
+The incomplete workspace attempt is retained in
+`/data/tmp/fsfs-gh43-permission-workspace-vmi1227854-20260911.remote.log`.
+
+An isolated native rerun was prepared with byte-identical binaries on
+vmi1156319, but that host became busy and RCH refused admission with exit 103
+(`RCH-I003`, no free slots). No test ran there and no local fallback occurred.
+Neither timeout budgets, expected phases nor golden fingerprints were changed.
+The cause of the two quality-budget failures remains unresolved; the results
+do not establish an inference-performance comparison or ARM qualification.
 
 Another session committed and pushed the reserved GH #43 edits as `90e8fb14`
 while validation was running. This does not change the evidence boundary.
