@@ -12154,6 +12154,12 @@ impl FsfsRuntime {
             });
         }
         match status.tier.as_str() {
+            // Deliberately the UNSHARED loader, not `load_shared_with_name`.
+            // This probe exists to prove the artifact still loads, and a
+            // process-cache hit would answer from a model read minutes ago
+            // rather than from the bytes on disk now — which is exactly the
+            // question `doctor` is asked. The duplicate 512 MB read is the
+            // point here, and `doctor` is not a hot path (GH #46).
             "fast" => Model2VecEmbedder::load_with_name(model_path, &status.name).map(|_| ()),
             #[cfg(feature = "semantic-loaders")]
             "quality" => FastEmbedEmbedder::load_with_name(model_path, &status.name).map(|_| ()),

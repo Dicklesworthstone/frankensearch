@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "asupersync",
  "criterion",

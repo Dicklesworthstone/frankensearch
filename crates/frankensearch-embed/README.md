@@ -55,6 +55,33 @@ let stack = EmbedderStack::auto_detect_semantic_with(Some(Path::new("/path/to/mo
 // stack.quality() -> highest quality embedder (if available)
 ```
 
+## Loading the Model2Vec model more than once per process
+
+`Model2VecEmbedder::load` builds the tokenizer and reads the embedding matrix
+every time it is called. On the registered `potion-multilingual-128M` that is a
+500,353-piece Unigram tokenizer and a 512 MB F32 matrix — seconds of work and
+about a gigabyte of resident memory that does not depend on the caller.
+
+Anything that may load the model more than once in a process — a daemon, a
+server, a runtime rebuilt per request, a doctor probe running beside a live
+stack — should use the shared constructors instead:
+
+```rust,ignore
+use frankensearch_embed::Model2VecEmbedder;
+
+let embedder = Model2VecEmbedder::load_shared(model_dir)?;   // -> Arc<Model2VecEmbedder>
+```
+
+The second and later loads of the same directory are served from a
+process-wide cache. Artifact verification still runs on every call, before any
+cached instance is returned, so a model that fails admission is never served
+from cache; the cache key carries the attested identity fingerprint, so a
+changed model never reuses the old matrix; and the cache holds only a `Weak`
+reference, so the matrix is released once the last caller drops its `Arc`.
+
+This amortises **within** a process, not across processes: a one-shot CLI
+invocation still pays a full load.
+
 ## Dependency Graph Position
 
 ```

@@ -1313,7 +1313,7 @@ impl LazyModel2VecEmbedder {
         let manifest = ModelManifest::potion_128m();
         let destination = install_destination_dir(self.model_root.as_deref(), POTION_MODEL_NAME)?;
         download_and_install_manifest(cx, &manifest, &destination, self.policy).await?;
-        let embedder = Model2VecEmbedder::load_with_name(&destination, POTION_MODEL_NAME)?;
+        let embedder = Model2VecEmbedder::load_shared_with_name(&destination, POTION_MODEL_NAME)?;
         let loaded_identity = embedder.identity()?;
         // ubs:ignore — fingerprints are public compatibility IDs, not secrets.
         if loaded_identity.fingerprint() != self.identity.fingerprint() {
@@ -1324,7 +1324,7 @@ impl LazyModel2VecEmbedder {
                     .to_owned(),
             });
         }
-        Ok(Arc::new(embedder))
+        Ok(embedder as Arc<dyn Embedder>)
     }
 }
 
@@ -1747,7 +1747,11 @@ fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> 
             continue;
         }
 
-        match Model2VecEmbedder::load_with_name(&candidate, POTION_MODEL_NAME) {
+        // Shared load: a process that builds more than one embedder stack —
+        // a daemon, or a runtime reconstructed per request — reuses the
+        // resident tokenizer and matrix instead of paying seconds and half a
+        // gigabyte again (GH #46).
+        match Model2VecEmbedder::load_shared_with_name(&candidate, POTION_MODEL_NAME) {
             Ok(embedder) => {
                 info!(
                     model = POTION_MODEL_NAME,
@@ -1759,7 +1763,7 @@ fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> 
                     ),
                     "embedder detected"
                 );
-                return Some(Arc::new(embedder));
+                return Some(embedder as Arc<dyn Embedder>);
             }
             Err(_error) => {
                 warn!(
