@@ -349,7 +349,7 @@ struct HnswTopologyPoint {
     neighborhoods: Vec<Vec<Neighbour>>,
 }
 
-/// HNSW ANN index over vectors aligned to `VectorIndex` row order.
+/// HNSW ANN index with a durable mapping from graph origins to `VectorIndex` rows.
 pub struct HnswIndex {
     hnsw: Hnsw<'static, f32, DistDot>,
     doc_ids: Vec<String>,
@@ -410,9 +410,8 @@ impl HnswIndex {
         previous: &VectorIndex,
         current: &VectorIndex,
     ) -> SearchResult<(Self, HnswAppendDisposition)> {
-        let refuse = |graph, reason| {
-            Ok((graph, HnswAppendDisposition::FullRebuildRequired { reason }))
-        };
+        let refuse =
+            |graph, reason| Ok((graph, HnswAppendDisposition::FullRebuildRequired { reason }));
         if !self.matches_vector_index(previous)?
             || self.source_record_count != previous.record_count()
         {
@@ -446,7 +445,11 @@ impl HnswIndex {
             return refuse(self, "deleted_rows");
         }
         let old_origins: std::collections::HashMap<_, _> = self
-            .doc_ids.iter().enumerate().map(|(origin, id)| (id.clone(), origin)).collect();
+            .doc_ids
+            .iter()
+            .enumerate()
+            .map(|(origin, id)| (id.clone(), origin))
+            .collect();
         if old_origins.len() != self.doc_ids.len() {
             return refuse(self, "duplicate_document_id");
         }
@@ -467,9 +470,12 @@ impl HnswIndex {
             };
             if let Some(&origin) = old_origins.get(id) {
                 let prior_row = self.source_positions[origin] as usize;
-                if previous.vector_at_f32(prior_row)?.iter().map(|v| v.to_bits()).ne(
-                    current.vector_at_f32(row)?.iter().map(|v| v.to_bits()),
-                ) {
+                if previous
+                    .vector_at_f32(prior_row)?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .ne(current.vector_at_f32(row)?.iter().map(|v| v.to_bits()))
+                {
                     return refuse(self, "old_vector_changed");
                 }
                 positions[origin] = position;
@@ -493,13 +499,13 @@ impl HnswIndex {
             positions.push(position);
             suffix.push(normalize_for_dist_dot(vector, budget));
         }
-        let fingerprint = fingerprint_vector_index_positions(
-            current, &positions, &doc_ids, self.dimension,
-        )?;
+        let fingerprint =
+            fingerprint_vector_index_positions(current, &positions, &doc_ids, self.dimension)?;
         let inserted = suffix.len();
         self.hnsw.set_searching_mode(false);
         for (offset, vector) in suffix.into_iter().enumerate() {
-            self.hnsw.insert_slice((&vector, self.doc_ids.len() + offset));
+            self.hnsw
+                .insert_slice((&vector, self.doc_ids.len() + offset));
         }
         validate_hnsw_topology(&self.hnsw, doc_ids.len())
             .map_err(|detail| ann_topology_error(&detail))?;
@@ -711,8 +717,12 @@ impl HnswIndex {
                 return None;
             }
         };
-        if validated_generation.basename != basename || validated_generation.graph != graph
-            || !HnswSourceIdentityV1::admits(validated_generation.source_identity.as_ref(), meta.source_identity.as_ref())
+        if validated_generation.basename != basename
+            || validated_generation.graph != graph
+            || !HnswSourceIdentityV1::admits(
+                validated_generation.source_identity.as_ref(),
+                meta.source_identity.as_ref(),
+            )
         {
             tracing::warn!(
                 path = %path.display(),
@@ -760,8 +770,12 @@ impl HnswIndex {
         // current format, so a missing fingerprint cannot be treated as a
         // legacy exception: 0 is compared like any other digest value.
         let live_fp = fingerprint_vector_index_positions(
-            source_index, &meta.source_positions, &meta.doc_ids, meta.dimension,
-        ).ok()?;
+            source_index,
+            &meta.source_positions,
+            &meta.doc_ids,
+            meta.dimension,
+        )
+        .ok()?;
         if live_fp != meta.vector_fingerprint {
             tracing::warn!(
                 path = %path.display(),
@@ -954,7 +968,10 @@ impl HnswIndex {
             doc_count: self.doc_ids.len(),
             doc_ids_fingerprint: fingerprint_doc_ids(&self.doc_ids),
             vector_fingerprint: self.vector_fingerprint,
-            source_map_fingerprint: fingerprint_source_map(&self.source_positions, self.source_record_count),
+            source_map_fingerprint: fingerprint_source_map(
+                &self.source_positions,
+                self.source_record_count,
+            ),
             dimension: self.dimension,
             config: self.config,
             source_identity: self.source_identity.clone(),
@@ -1544,11 +1561,11 @@ impl HnswIndex {
         ))
     }
 
-    /// Returns true when this ANN index matches row order and shape of a `VectorIndex`.
+    /// Returns true when this ANN index maps exactly to a `VectorIndex` generation.
     ///
     /// Since `HnswIndex` no longer stores vectors, this checks:
     /// 1. Dimension match.
-    /// 2. Live physical-row and `doc_id` sequence match.
+    /// 2. Every live physical row is mapped once with the correct `doc_id`.
     /// 3. The fingerprint of every live vector.
     ///
     /// # Errors
@@ -1567,13 +1584,20 @@ impl HnswIndex {
         ) {
             return Ok(false);
         }
-        if !source_map_matches_live_rows(index, &self.doc_ids, &self.source_positions, self.source_record_count)? {
+        if !source_map_matches_live_rows(
+            index,
+            &self.doc_ids,
+            &self.source_positions,
+            self.source_record_count,
+        )? {
             return Ok(false);
         }
-        Ok(
-            fingerprint_vector_index_positions(index, &self.source_positions, &self.doc_ids, self.dimension)?
-                == self.vector_fingerprint,
-        )
+        Ok(fingerprint_vector_index_positions(
+            index,
+            &self.source_positions,
+            &self.doc_ids,
+            self.dimension,
+        )? == self.vector_fingerprint)
     }
 
     /// Number of indexed vectors.
@@ -3090,7 +3114,12 @@ fn meta_matches_live_doc_ids(meta: &HnswMeta, index: &VectorIndex) -> SearchResu
     if meta.dimension != index.dimension() {
         return Ok(false);
     }
-    source_map_matches_live_rows(index, &meta.doc_ids, &meta.source_positions, meta.source_record_count)
+    source_map_matches_live_rows(
+        index,
+        &meta.doc_ids,
+        &meta.source_positions,
+        meta.source_record_count,
+    )
 }
 
 fn source_map_matches_live_rows(
@@ -3113,11 +3142,17 @@ fn source_map_matches_live_rows(
         }
         *seen = true;
     }
-    Ok(covered.iter().enumerate().all(|(row, &seen)| seen != index.is_deleted(row)))
+    Ok(covered
+        .iter()
+        .enumerate()
+        .all(|(row, &seen)| seen != index.is_deleted(row)))
 }
 
 fn fingerprint_source_map(positions: &[u32], source_record_count: usize) -> u64 {
-    let mut fingerprint = fnv1a_update(FNV_OFFSET_BASIS_64, &(source_record_count as u64).to_le_bytes());
+    let mut fingerprint = fnv1a_update(
+        FNV_OFFSET_BASIS_64,
+        &(source_record_count as u64).to_le_bytes(),
+    );
     for position in positions {
         fingerprint = fnv1a_update(fingerprint, &position.to_le_bytes());
     }
@@ -6533,8 +6568,8 @@ mod tests {
             .expect("build prior graph")
             .save(&ann_path)
             .expect("save prior graph");
-        let (loaded, load) = HnswIndex::load_with_disposition(&ann_path, &prior.index)
-            .expect("native prior load");
+        let (loaded, load) =
+            HnswIndex::load_with_disposition(&ann_path, &prior.index).expect("native prior load");
         assert_eq!(load, HnswLoadDisposition::Native);
         let old_points: Vec<_> = loaded.hnsw.get_point_indexation().into_iter().collect();
         let (loaded, noop) = loaded
@@ -6557,11 +6592,24 @@ mod tests {
                 .into_iter()
                 .find(|point| point.get_origin_id() == old.get_origin_id())
                 .expect("retained original point");
-            assert!(std::sync::Arc::ptr_eq(old, &retained), "must reuse old graph nodes");
+            assert!(
+                std::sync::Arc::ptr_eq(old, &retained),
+                "must reuse old graph nodes"
+            );
         }
-        assert!(appended.matches_vector_index(&current.index).expect("current match"));
-        assert!(!appended.matches_vector_index(&prior.index).expect("prior mismatch"));
-        let (hits, stats) = appended.knn_search_with_stats(&query, 1, 128).expect("ANN query");
+        assert!(
+            appended
+                .matches_vector_index(&current.index)
+                .expect("current match")
+        );
+        assert!(
+            !appended
+                .matches_vector_index(&prior.index)
+                .expect("prior mismatch")
+        );
+        let (hits, stats) = appended
+            .knn_search_with_stats(&query, 1, 128)
+            .expect("ANN query");
         assert_eq!(hits[0].doc_id, new_id);
         assert!(stats.is_approximate);
         assert_eq!(stats.fallback_reason, None);
@@ -6575,11 +6623,56 @@ mod tests {
             .expect("reload appended graph");
         assert_eq!(load, HnswLoadDisposition::Native);
         assert_eq!(reloaded.source_positions, appended.source_positions);
-        let (hits, stats) = reloaded.knn_search_with_stats(&query, 1, 128).expect("reloaded ANN");
+        let (hits, stats) = reloaded
+            .knn_search_with_stats(&query, 1, 128)
+            .expect("reloaded ANN");
         assert_eq!(hits[0].doc_id, new_id);
         assert!(stats.is_approximate);
         assert_eq!(stats.fallback_reason, None);
-        assert!(HnswIndex::try_load_native(&ann_path, &prior.index).expect("old admission").is_none());
+        assert!(
+            HnswIndex::try_load_native(&ann_path, &prior.index)
+                .expect("old admission")
+                .is_none()
+        );
+        // Repeat from a natively loaded, already non-identity row map. A
+        // one-shot remapping implementation must not fail on the next delta.
+        let retained_points: Vec<_> = reloaded.hnsw.get_point_indexation().into_iter().collect();
+        let (reloaded, disposition) = reloaded
+            .append_from_vector_index(&current.index, &current.index)
+            .expect("mapped no-op");
+        assert_eq!(disposition, HnswAppendDisposition::NoOp);
+        let second_query = normalized_vector(101, 32);
+        rows.push(("second-new-doc".to_owned(), second_query.clone()));
+        let next = append_test_source(&dir.path().join("next.fsvi"), 3, "append-model", &rows);
+        let (next_graph, disposition) = reloaded
+            .append_from_vector_index(&current.index, &next.index)
+            .expect("second mapped append");
+        assert_eq!(disposition, HnswAppendDisposition::Appended { inserted: 1 });
+        for point in retained_points {
+            assert!(
+                next_graph
+                    .hnsw
+                    .get_point_indexation()
+                    .into_iter()
+                    .any(|p| std::sync::Arc::ptr_eq(&point, &p))
+            );
+        }
+        next_graph.save(&ann_path).expect("save second append");
+        let (next_loaded, disposition) = HnswIndex::load_with_disposition(&ann_path, &next.index)
+            .expect("load second append");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+        let (hits, stats) = next_loaded
+            .knn_search_with_stats_against(&next.index, &second_query, 1, 128)
+            .expect("second appended ANN");
+        assert_eq!(hits[0].doc_id, "second-new-doc");
+        assert_eq!(
+            next.index
+                .doc_id_at(hits[0].index as usize)
+                .expect("physical row"),
+            "second-new-doc"
+        );
+        assert!(stats.is_approximate);
+        assert_eq!(stats.fallback_reason, None);
     }
 
     #[test]
@@ -6593,21 +6686,30 @@ mod tests {
         let prior = append_test_source(&dir.path().join("prior.fsvi"), 1, "append-model", &rows);
         let ann_path = dir.path().join("ann.json");
         HnswIndex::build_from_vector_index(&prior.index, HnswConfig::default())
-            .expect("build graph").save(&ann_path).expect("save graph");
+            .expect("build graph")
+            .save(&ann_path)
+            .expect("save graph");
         let persisted = std::fs::read(&ann_path).expect("prior metadata");
         for case in ["changed", "deleted", "replaced", "model", "generation"] {
             let mut changed = rows.clone();
             changed.push(suffix.clone());
             match case {
                 "changed" => changed[2].1 = normalized_vector(102, 32),
-                "deleted" => { changed.remove(2); }
+                "deleted" => {
+                    changed.remove(2);
+                    changed.push(("extra-new-doc".to_owned(), normalized_vector(103, 32)));
+                }
                 "replaced" => changed[2].0 = "replacement-id".to_owned(),
                 _ => {}
             }
             let current = append_test_source(
                 &dir.path().join(format!("{case}.fsvi")),
                 if case == "generation" { 1 } else { 2 },
-                if case == "model" { "other-model" } else { "append-model" },
+                if case == "model" {
+                    "other-model"
+                } else {
+                    "append-model"
+                },
                 &changed,
             );
             let (loaded, disposition) = HnswIndex::load_with_disposition(&ann_path, &prior.index)
@@ -6615,22 +6717,46 @@ mod tests {
             assert_eq!(disposition, HnswLoadDisposition::Native);
             let old_points: Vec<_> = loaded.hnsw.get_point_indexation().into_iter().collect();
             let (unchanged, disposition) = loaded
-                .append_from_vector_index(&prior.index, &current.index).expect("refuse delta");
+                .append_from_vector_index(&prior.index, &current.index)
+                .expect("refuse delta");
             let expected_reason = match case {
-                "deleted" => "not_an_append",
+                "deleted" => "old_document_missing",
                 "model" => "embedding_identity_changed",
                 "generation" => "generation_not_advanced",
                 "changed" => "old_vector_changed",
                 _ => "old_document_missing",
             };
-            assert_eq!(disposition, HnswAppendDisposition::FullRebuildRequired { reason: expected_reason }, "{case}");
-            assert!(unchanged.matches_vector_index(&prior.index).expect("prior preserved"));
-            assert!(!unchanged.matches_vector_index(&current.index).expect("current rejected"));
+            assert_eq!(
+                disposition,
+                HnswAppendDisposition::FullRebuildRequired {
+                    reason: expected_reason
+                },
+                "{case}"
+            );
+            assert!(
+                unchanged
+                    .matches_vector_index(&prior.index)
+                    .expect("prior preserved")
+            );
+            assert!(
+                !unchanged
+                    .matches_vector_index(&current.index)
+                    .expect("current rejected")
+            );
             assert_eq!(unchanged.hnsw.get_nb_point(), rows.len());
             for old in &old_points {
-                assert!(unchanged.hnsw.get_point_indexation().into_iter().any(|p| std::sync::Arc::ptr_eq(old, &p)));
+                assert!(
+                    unchanged
+                        .hnsw
+                        .get_point_indexation()
+                        .into_iter()
+                        .any(|p| std::sync::Arc::ptr_eq(old, &p))
+                );
             }
-            assert_eq!(std::fs::read(&ann_path).expect("unchanged metadata"), persisted);
+            assert_eq!(
+                std::fs::read(&ann_path).expect("unchanged metadata"),
+                persisted
+            );
         }
     }
 
@@ -6643,10 +6769,14 @@ mod tests {
         let source = append_test_source(&dir.path().join("source.fsvi"), 1, "append-model", &rows);
         let ann_path = dir.path().join("ann.json");
         HnswIndex::build_from_vector_index(&source.index, HnswConfig::default())
-            .expect("build graph").save(&ann_path).expect("save graph");
+            .expect("build graph")
+            .save(&ann_path)
+            .expect("save graph");
         let original_meta = std::fs::read(&ann_path).expect("metadata");
         let pristine: HnswMeta = serde_json::from_slice(&original_meta).expect("parse metadata");
-        let receipt_path = dir.path().join(pristine.sidecar_generation.as_ref().expect("generation"))
+        let receipt_path = dir
+            .path()
+            .join(pristine.sidecar_generation.as_ref().expect("generation"))
             .join(HNSW_GENERATION_RECEIPT_FILENAME);
         let original_receipt = std::fs::read(&receipt_path).expect("receipt");
         for case in ["reordered", "duplicate", "outside", "missing", "extent"] {
@@ -6655,24 +6785,38 @@ mod tests {
                 "reordered" => meta.source_positions.swap(0, 1),
                 "duplicate" => meta.source_positions[1] = meta.source_positions[0],
                 "outside" => meta.source_positions[0] = u32::MAX,
-                "missing" => { meta.source_positions.pop(); }
+                "missing" => {
+                    meta.source_positions.pop();
+                }
                 _ => meta.source_record_count += 1,
             }
             std::fs::write(&ann_path, serde_json::to_vec(&meta).expect("encode map"))
                 .expect("plant invalid map");
             // First reject metadata that diverges from its unchanged receipt.
             std::fs::write(&receipt_path, &original_receipt).expect("restore receipt");
-            assert!(HnswIndex::try_load_native(&ann_path, &source.index)
-                .expect("native admission").is_none(), "{case}");
+            assert!(
+                HnswIndex::try_load_native(&ann_path, &source.index)
+                    .expect("native admission")
+                    .is_none(),
+                "{case}"
+            );
             // Even a matching map digest cannot authorize invalid coverage or
             // wrong row identities against the real source generation.
-            let mut receipt: HnswGenerationReceipt = serde_json::from_slice(&original_receipt)
-                .expect("parse receipt");
-            receipt.source_map_fingerprint = fingerprint_source_map(&meta.source_positions, meta.source_record_count);
-            std::fs::write(&receipt_path, serde_json::to_vec(&receipt).expect("encode receipt"))
-                .expect("plant matching digest");
-            assert!(HnswIndex::try_load_native(&ann_path, &source.index)
-                .expect("source admission").is_none(), "{case}");
+            let mut receipt: HnswGenerationReceipt =
+                serde_json::from_slice(&original_receipt).expect("parse receipt");
+            receipt.source_map_fingerprint =
+                fingerprint_source_map(&meta.source_positions, meta.source_record_count);
+            std::fs::write(
+                &receipt_path,
+                serde_json::to_vec(&receipt).expect("encode receipt"),
+            )
+            .expect("plant matching digest");
+            assert!(
+                HnswIndex::try_load_native(&ann_path, &source.index)
+                    .expect("source admission")
+                    .is_none(),
+                "{case}"
+            );
         }
     }
 
