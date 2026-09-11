@@ -295,3 +295,35 @@ v1.10.0 backward are byte-identical. DSR's inconsistent duration_ms fields are
 excluded from timing claims. This completes Linux A5 acceptance, not a new
 release, complete Quill conformance, all-platform installation or performance
 certification.
+
+## GH #43/#46 follow-through — 2026-09-11 UTC
+
+This narrow update covers one-shot cancellation/pressure in `90e8fb14` and the
+producer-revision consequences of the loader work in `c92d193c` / `6ec30ef1`.
+The GitHub API still reports v1.10.0 as the latest published release, published
+2026-09-08T19:36:49Z. Its annotated tag `74e2a47a` resolves to `9c5d8867`.
+The local checkout lacks that tag, so release identity was checked through the
+live tag object rather than inferred from local refs. The new implementation
+commit resolves through the live GitHub API; no version or release was created.
+
+Evidence reviewed: exact diffs of those three commits, GH #43/#46 discussion,
+Beads `bd-pz8va` and `bd-u8cof`, current fsfs producer-revision admission, and the
+strict library activation test that refuses a conformance-compatible foreign
+producer. Stable space and golden outputs do not imply admission: the 0.2.7
+implementation revision changes the producer/bundle fingerprint. Corrected the
+overbroad no-rebuild comment and documented the explicit fsfs rebuild step.
+
+GH #43 has five passing focused RCH tests plus six real-Potion CLI controls
+(signal, same-index retry, double interrupt, two low-threshold profiles, and a
+successful high-threshold run), and a separate real discovery-phase signal
+probe. The full gate passed formatting, checks, clippy, cross-target and bounded
+Quill correctness, then exposed an existing 120 ms watch-test timing assumption.
+The repaired test waits for actual watcher startup and checks finalization once.
+Final-source verification and remaining gate stages are still pending at this
+research checkpoint; the changelog makes no full-gate or release claim.
+
+Another session committed and pushed the reserved GH #43 edits as `90e8fb14`
+while validation was running. This does not change the evidence boundary.
+Previous-generation retention remains unresolved under the existing publisher
+HOLD, cross-process tokenizer reuse is absent, and both original beads remain
+open. Retained commands and outcomes are linked from their Beads comments.

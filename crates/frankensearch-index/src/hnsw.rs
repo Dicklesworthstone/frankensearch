@@ -6658,8 +6658,8 @@ mod tests {
             );
         }
         next_graph.save(&ann_path).expect("save second append");
-        let (next_loaded, disposition) = HnswIndex::load_with_disposition(&ann_path, &next.index)
-            .expect("load second append");
+        let (next_loaded, disposition) =
+            HnswIndex::load_with_disposition(&ann_path, &next.index).expect("load second append");
         assert_eq!(disposition, HnswLoadDisposition::Native);
         let (hits, stats) = next_loaded
             .knn_search_with_stats_against(&next.index, &second_query, 1, 128)

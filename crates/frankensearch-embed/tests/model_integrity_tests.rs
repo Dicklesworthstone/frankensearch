@@ -389,10 +389,15 @@ fn gh46_shared_loader_rejects_mutation_before_cache_hit_and_recovers() {
     let tmp = tempfile::tempdir().expect("private artifact directory");
     let manifest = ModelManifest::potion_128m();
     for artifact in &manifest.files {
-        std::fs::copy(fixture.join(&artifact.name), tmp.path().join(&artifact.name))
-            .expect("copy registered artifact without changing the shared model cache");
+        std::fs::copy(
+            fixture.join(&artifact.name),
+            tmp.path().join(&artifact.name),
+        )
+        .expect("copy registered artifact without changing the shared model cache");
     }
     verify_dir_and_record(&manifest, tmp.path()).expect("attest private model copy");
+    let receipt_path = tmp.path().join(".verified");
+    let receipt = std::fs::read(&receipt_path).expect("retain verification receipt");
     let resident = Model2VecEmbedder::load_shared(tmp.path()).expect("production first load");
     let cached = Model2VecEmbedder::load_shared(tmp.path()).expect("verified cache hit");
     assert!(Arc::ptr_eq(&resident, &cached));
@@ -407,7 +412,8 @@ fn gh46_shared_loader_rejects_mutation_before_cache_hit_and_recovers() {
             .expect("open private artifact");
         file.seek(SeekFrom::End(-1)).expect("seek final byte");
         let mut original = [0_u8; 1];
-        file.read_exact(&mut original).expect("retain original byte");
+        file.read_exact(&mut original)
+            .expect("retain original byte");
         file.seek(SeekFrom::End(-1)).expect("seek mutation");
         file.write_all(&[original[0] ^ 1])
             .expect("mutate private artifact");
@@ -415,9 +421,15 @@ fn gh46_shared_loader_rejects_mutation_before_cache_hit_and_recovers() {
 
         let error = Model2VecEmbedder::load_shared(tmp.path())
             .expect_err("a resident instance cannot authorize changed artifacts");
+        let diagnostic = format!("{name}:sha256-or-size-mismatch");
         assert!(
-            matches!(error, SearchError::HashMismatch { path: ref rejected, .. } if rejected == &path),
+            matches!(&error, SearchError::ModelLoadFailed { source, .. } if source.to_string().contains(&diagnostic)),
             "expected artifact hash refusal before the cache lookup: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("read receipt after refusal"),
+            receipt,
+            "a refused read must not rewrite verification authority"
         );
 
         file.seek(SeekFrom::End(-1)).expect("seek restoration");
