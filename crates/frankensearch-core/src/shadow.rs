@@ -14,6 +14,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -786,6 +787,97 @@ impl Drop for InFlightGuard {
     }
 }
 
+struct ShadowWake(asupersync::channel::mpsc::Sender<()>);
+
+impl Wake for ShadowWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        // One pending wake is enough: coalesce repeated wakes without allowing
+        // a backend to allocate an unbounded notification queue.
+        let _ = self.0.try_send(());
+    }
+}
+
+/// Keep synchronous work inside an async backend's poll off the serving
+/// scheduler. Each poll belongs to the same region and blocking pool as the
+/// shadow task; waiting for the next wake uses a cancel-aware runtime channel.
+/// Pool-less contexts retain Asupersync's deterministic inline behavior.
+async fn poll_shadow_on_pool(
+    cx: &Cx,
+    mut future: SearchFuture<'static, Vec<ScoredResult>>,
+) -> SearchResult<Vec<ScoredResult>> {
+    let Some(pool) = cx.blocking_pool_handle() else {
+        return future.await;
+    };
+    let (wake_tx, mut wake_rx) = asupersync::channel::mpsc::channel(1);
+    let wake = Arc::new(ShadowWake(wake_tx));
+    loop {
+        cx.checkpoint().map_err(|error| SearchError::Cancelled {
+            phase: "shadow.search".to_owned(),
+            reason: error.to_string(),
+        })?;
+        if pool.is_shutdown() {
+            return Err(SearchError::SubsystemError {
+                subsystem: "shadow",
+                source: "caller-owned blocking pool is shut down".into(),
+            });
+        }
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut worker = cx
+            .spawn_blocking(move |child| {
+                // A pool shutdown can race admission. Asupersync may recover
+                // rejected work inline; do not let that run backend code on
+                // the serving scheduler.
+                if Cx::is_active() {
+                    return Err(SearchError::SubsystemError {
+                        subsystem: "shadow",
+                        source: "blocking pool dispatch fell back to an async executor".into(),
+                    });
+                }
+                child.checkpoint().map_err(|error| SearchError::Cancelled {
+                    phase: "shadow.search".to_owned(),
+                    reason: error.to_string(),
+                })?;
+                let outcome = future.as_mut().poll(&mut Context::from_waker(&waker));
+                Ok((future, outcome))
+            })
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "shadow",
+                source: error.into(),
+            })?;
+        let (next, outcome) = worker.join(cx).await.map_err(|error| match error {
+            asupersync::runtime::JoinError::Cancelled(reason) => SearchError::Cancelled {
+                phase: "shadow.search".to_owned(),
+                reason: reason.to_string(),
+            },
+            error => SearchError::SubsystemError {
+                subsystem: "shadow",
+                source: error.into(),
+            },
+        })??;
+        future = next;
+        // join itself does not check request cancellation. Never publish a
+        // result after cancellation or exhaustion during a blocking poll.
+        cx.checkpoint().map_err(|error| SearchError::Cancelled {
+            phase: "shadow.search".to_owned(),
+            reason: error.to_string(),
+        })?;
+        if let Poll::Ready(result) = outcome {
+            return result;
+        }
+        wake_rx
+            .recv(cx)
+            .await
+            .map_err(|error| SearchError::Cancelled {
+                phase: "shadow.search".to_owned(),
+                reason: error.to_string(),
+            })?;
+    }
+}
+
 fn build_shadow_state(
     config: ShadowLexicalConfig,
     load_probe: Arc<dyn ShadowLoadProbe>,
@@ -1136,18 +1228,28 @@ impl ShadowLexical {
         );
         let spawn_result = cx.spawn(move |task_cx| {
             async move {
-                let _in_flight = in_flight;
+                let in_flight = Arc::new(in_flight);
+                let query_in_flight = Arc::clone(&in_flight);
+                let query_cx = task_cx.clone();
+                let shadow_query = query.clone();
                 let shadow_started = Instant::now();
-                let outcome = match path {
-                    ShadowSearchPath::Search => shadow.search(&task_cx, &query, limit).await,
-                    ShadowSearchPath::FusionCandidates => shadow
-                        .search_candidates(&task_cx, &query, limit)
-                        .await
-                        // The comparison ranks candidates; it never reads their
-                        // metadata, so the shadow side does not hydrate and the
-                        // oracle's own pin is dropped with the batch.
-                        .map(|batch| batch.into_parts().0),
-                };
+                let query_future = async move {
+                    // Retain admission while a pool poll is still running,
+                    // even if cancellation drops the waiting shadow task.
+                    let _in_flight = query_in_flight;
+                    match path {
+                        ShadowSearchPath::Search => {
+                            shadow.search(&query_cx, &shadow_query, limit).await
+                        }
+                        ShadowSearchPath::FusionCandidates => shadow
+                            .search_candidates(&query_cx, &shadow_query, limit)
+                            .await
+                            // Comparison needs ranks, not hydrated metadata.
+                            .map(|batch| batch.into_parts().0),
+                    }
+                }
+                .instrument(tracing::Span::current());
+                let outcome = poll_shadow_on_pool(&task_cx, Box::pin(query_future)).await;
                 let shadow_latency_micros = micros(shadow_started.elapsed());
                 tracing::Span::current().record("shadow_latency_micros", shadow_latency_micros);
 
@@ -1900,6 +2002,72 @@ mod tests {
             elapsed < std::time::Duration::from_millis(100),
             "serving took {elapsed:?} and appears to have awaited the 250ms shadow"
         );
+    }
+
+    #[test]
+    fn shadow_pool_preserves_wakes_and_polls_off_the_serving_thread() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let serving_thread = std::thread::current().id();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let task = runtime.handle().spawn(async move {
+            let cx = Cx::current().expect("request context");
+            let future = std::future::poll_fn(move |context| {
+                assert_ne!(std::thread::current().id(), serving_thread);
+                let count = observed.fetch_add(1, Ordering::AcqRel);
+                if count < 2 {
+                    // Wakes issued before Pending, including duplicates, must
+                    // neither disappear nor trigger unbounded eager polling.
+                    context.waker().wake_by_ref();
+                    context.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(vec![result("shadow", 3.0)]))
+                }
+            });
+            poll_shadow_on_pool(&cx, Box::pin(future)).await
+        });
+        let actual = runtime.block_on(task).expect("shadow result");
+        assert_eq!(polls.load(Ordering::Acquire), 3);
+        assert_eq!(ranked_hits(&actual), ranked_hits(&[result("shadow", 3.0)]));
+    }
+
+    #[test]
+    fn shadow_pool_does_not_publish_a_result_cancelled_during_its_poll() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+        let cancel_cx = cx.clone();
+        let future = async move {
+            cancel_cx.set_cancel_requested(true);
+            Ok(vec![result("must-not-publish", 1.0)])
+        };
+        let error = runtime
+            .block_on(poll_shadow_on_pool(&cx, Box::pin(future)))
+            .expect_err("cancelled result");
+        assert!(matches!(error, SearchError::Cancelled { .. }));
+    }
+
+    #[test]
+    fn shadow_pool_shutdown_never_polls_the_backend_inline() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+        let handle = pool.handle();
+        assert!(pool.shutdown_and_wait(std::time::Duration::from_secs(2)));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let task = runtime.handle().spawn(async move {
+            let cx = Cx::current()
+                .expect("request context")
+                .with_blocking_pool_handle(Some(handle));
+            let future = async move {
+                observed.fetch_add(1, Ordering::AcqRel);
+                Ok(vec![result("must-not-run", 1.0)])
+            };
+            poll_shadow_on_pool(&cx, Box::pin(future)).await
+        });
+        let error = runtime.block_on(task).expect_err("stopped pool");
+        assert!(error.to_string().contains("blocking pool is shut down"));
+        assert_eq!(polls.load(Ordering::Acquire), 0);
     }
 
     #[test]
