@@ -1125,10 +1125,16 @@ mod tests {
             std::env::consts::OS,
             std::env::consts::ARCH
         )));
-        assert!(diagnostic.len() < 2048, "certificate diagnostic must be bounded");
+        assert!(
+            diagnostic.len() < 2048,
+            "certificate diagnostic must be bounded"
+        );
         for text in MODEL_CONFORMANCE_TEXTS_V1 {
             if !text.is_empty() {
-                assert!(!diagnostic.contains(text), "diagnostic must not expose inputs");
+                assert!(
+                    !diagnostic.contains(text),
+                    "diagnostic must not expose inputs"
+                );
             }
         }
     }
