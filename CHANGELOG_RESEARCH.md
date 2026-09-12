@@ -1,5 +1,51 @@
 # Changelog research: fsfs 1.10.0 / FrankenSearch 0.5.0
 
+## September 12 registry-publication reconciliation
+
+Small-update scope: correct the publication status of the existing post-1.10.0
+inventory and document the new runtime boundary. This is not a reconstruction
+of earlier history or a claim that the next binary release is qualified.
+
+- Live crates.io metadata plus downloads verified ten new library archives:
+  facade 0.6.0, rerank 0.4.0, core/embed/index/lexical/fusion/Quill/storage/
+  durability 0.3.0. Every SHA-256 matches the registry and every
+  `.cargo_vcs_info.json` identifies `dd093fb230404ab08be2ed6f27776ed6c4796485`.
+  Publication times span 2026-09-12 14:28:46–14:33:59 UTC; all are unyanked.
+  Receipt: `/data/release-work/frankensearch-release-20260912/registry-20260912-family.json`.
+- GitHub API confirms annotated tag `frankensearch-v0.6.0`, object
+  `8c9ed3c53cede7d6489bdc97f6e87d61afc1215f`, tagged 14:28:41 UTC, targets that
+  same commit. Live Releases list still ends at September 8. Therefore the
+  new timeline entry is crates.io publication plus a plain tag, not a GitHub
+  Release. fsfs remains 1.10.0; TUI/ops remain 0.2.1.
+- Inspected the final ten nonmerge publication commits and their relevant
+  diffs: `347be73e` runtime/component boundary, `f20e9446` durability type
+  alignment, `4fcbdb55` FTS5 Send proof, `06e053e1`/`309ae25a` caller-owned
+  shadow polling and admission, `ad0a6083`/`ff29cf76` persisted pooled
+  comparison regressions, `b9e0c109` lock closure, `dd093fb2` assertion
+  formatting, plus `8b588964` descriptor-bound mapping inspection. Existing
+  research below covers the earlier loader/HNSW/Quill changes in the shared
+  post-1.10.0 inventory. The full source window contains 82 nonmerge commits.
+- Corrected the obsolete claims that all post-September-8 library changes were
+  unreleased and that current consumers still resolve Asupersync 0.4.10. The
+  earlier 0.4.11 latency failure remains in the upgrade log; historical
+  0.4.10 receipts are not current 0.5.0 qualification.
+- Bead `bd-dsbym` remains in progress. Cross-platform binary publication,
+  current full gates and fresh registry-consumer execution are not established
+  by the archive checks. No new release/tag/publication was performed by this
+  reconciliation.
+- Structural changelog validation passes with the existing historical bare-hash
+  warning. All newly added GitHub commit/tag/issue URLs return HTTP 200. The
+  crates.io HTML routes return 404 in this environment despite available API
+  metadata and archives; the new version entry therefore links to its verified
+  HTTP-200 official version API record.
+- Independent draft audit corrected a mistaken adapter/package distinction:
+  `model_manifest.rs` derives implementation revision from `CARGO_PKG_VERSION`,
+  so published package 0.3.0 also identifies producer 0.3.0. The preparation
+  version 0.2.7 is historical, not the current producer. Changelog migration
+  advice now requires rebuilding both older producer generations. The audit
+  also found a stale 0.2.7 prefix in historical fixture reconstruction; repair
+  and validation are tracked separately under the ongoing dependency bead.
+
 Requested 2026-09-08 using `changelog-md-workmanship`, small-update mode.
 Scope: every landed commit after the 1.9.1 release source
 `9d132a0315e12da0442aa7a943852091fe043037` through the 1.10.0 source
