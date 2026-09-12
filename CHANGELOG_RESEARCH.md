@@ -468,9 +468,17 @@ rejected after a source-verified remote core run returned 1,122 passes and a
 255.521109 ms shadow serving-latency failure against the unchanged 100 ms guard.
 Its new current-thread post-root drain executes the deliberately slow shadow
 before returning. The prior runtime family is restored, with consumer resolution
-capped below 0.4.11; the unchanged baseline rerun is pending. Tokenizers 0.23.2
-is prepared next, with its required Daachorse 3.0.3 transition. No new release
-qualification is claimed. Publication-contract positive and negative self-tests pass;
+capped below 0.4.11; the unchanged baseline rerun passes all 1,123 core tests
+and 986 fusion tests, with four existing fusion ignores. Tokenizers 0.23.2
+and its required Daachorse 3.0.3 transition pass 402 embedder tests, eight logging
+contracts, and three real Potion tests. FastEmbed 6.0.3 removes the separate
+Tokenizers 0.22.2 dependency; it passes 426 embedder and 35 reranker tests plus
+the exact MiniLM, Snowflake, and Nomic certificates. The stale producer protocol
+fields were corrected, all historical fingerprint fixtures retained, and the
+426 + 35 unit tests and six real-model checks passed again. The new changelog
+entry explicitly records the semantic-index rebuild consequence. crc32fast
+1.5.1 passes 160 durability, 774 index, and 681 Quill tests. Further dependency
+and release qualification remains in progress. Publication-contract positive and negative self-tests pass;
 `cargo audit` reports zero vulnerability advisories, four unmaintained warnings
 and the existing lru 0.16.4 unsoundness warning (RUSTSEC-2026-0253).
 
