@@ -37,16 +37,36 @@ impl ReadOnlyMappedFile {
     /// Returns an I/O error if the file cannot be opened or the operating
     /// system cannot create a read-only mapping for it.
     pub fn open_published(path: &Path) -> io::Result<Self> {
+        Self::open_published_with_file(path, |mapped, _file| Ok(mapped))
+    }
+
+    /// Inspect a mapping together with the exact opened file backing it.
+    ///
+    /// The file cursor starts at zero. The handle is dropped on return, even
+    /// when the mapping is retained by the callback's result. Reads through
+    /// this handle do not fault the corresponding mapped pages into the
+    /// process. The immutable publication contract of [`Self::open_published`]
+    /// still applies; this does not protect against in-place writers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opening/mapping error or the callback's validation error.
+    pub fn open_published_with_file<T, E: From<io::Error>>(
+        path: &Path,
+        inspect: impl FnOnce(Self, &mut File) -> Result<T, E>,
+    ) -> Result<T, E> {
         let path_metadata = path.symlink_metadata()?;
         if !path_metadata.file_type().is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "published artifact must be a regular file, not a symlink or special file",
-            ));
+            )
+            .into());
         }
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
         ensure_same_file(&path_metadata, &file.metadata()?)?;
-        map_immutable(&file).map(|mmap| Self { mmap })
+        let mmap = map_immutable(&file)?;
+        inspect(Self { mmap }, &mut file)
     }
 
     /// Borrow all mapped bytes.
@@ -112,6 +132,62 @@ fn map_immutable(file: &File) -> io::Result<Mmap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    #[cfg(unix)]
+    #[test]
+    fn inspected_handle_and_mapping_survive_path_replacement() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("published.bin");
+        let replacement = directory.path().join("replacement.bin");
+        std::fs::write(&path, b"original immutable bytes")?;
+        std::fs::write(&replacement, b"unrelated replacement")?;
+        let mapped = ReadOnlyMappedFile::open_published_with_file(&path, |mapped, file| {
+            std::fs::rename(&replacement, &path)?;
+            let mut streamed = Vec::new();
+            file.read_to_end(&mut streamed)?;
+            assert_eq!(streamed, b"original immutable bytes");
+            assert_eq!(mapped.as_bytes(), streamed);
+            Ok::<_, io::Error>(mapped)
+        })?;
+        assert_eq!(std::fs::read(&path)?, b"unrelated replacement");
+        assert_eq!(mapped.as_bytes(), b"original immutable bytes");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inspected_open_releases_descriptors_while_mappings_remain_live() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("published.bin");
+        std::fs::write(&path, b"retained mapping")?;
+        let mut mappings = Vec::new();
+        for _ in 0..256 {
+            mappings.push(ReadOnlyMappedFile::open_published_with_file(
+                &path,
+                |mapped, file| {
+                    let mut byte = [0_u8; 1];
+                    file.read_exact(&mut byte)?;
+                    assert_eq!(byte, [b'r']);
+                    Ok::<_, io::Error>(mapped)
+                },
+            )?);
+        }
+        for entry in std::fs::read_dir("/proc/self/fd")? {
+            if let Ok(target) = std::fs::read_link(entry?.path()) {
+                assert_ne!(
+                    target, path,
+                    "construction must release its file descriptor"
+                );
+            }
+        }
+        assert!(
+            mappings
+                .iter()
+                .all(|mapped| mapped.as_bytes() == b"retained mapping")
+        );
+        Ok(())
+    }
 
     #[test]
     fn exposes_exact_file_bytes_through_all_views() {

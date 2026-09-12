@@ -923,6 +923,40 @@ impl<'a> SegmentReader<&'a [u8]> {
 }
 
 impl SegmentReader<ReadOnlyMappedFile> {
+    /// Used only inside the same-descriptor open callback, after MANIFEST checks.
+    pub(crate) fn verify_streamed_file_witness(
+        &self,
+        file: &mut fs::File,
+    ) -> Result<u64, QuillError> {
+        use std::io::Read;
+
+        let prefix_len = self
+            .source
+            .len()
+            .checked_sub(TRAILER_LEN)
+            .ok_or_else(|| corrupted(&self.path, "file is shorter than its trailer"))?;
+        let mut hasher = Xxh3::new();
+        let mut remaining = prefix_len;
+        let mut buffer = [0_u8; 16 * 1024];
+        while remaining != 0 {
+            let count = remaining.min(buffer.len());
+            file.read_exact(&mut buffer[..count])?;
+            hasher.update(&buffer[..count]);
+            remaining -= count;
+        }
+        let actual = hasher.digest();
+        if actual != self.file_xxh3 {
+            return Err(corrupted(
+                &self.path,
+                format!(
+                    "file checksum mismatch: expected {:#018x}, got {actual:#018x}",
+                    self.file_xxh3
+                ),
+            ));
+        }
+        Ok(actual)
+    }
+
     /// Open and validate an immutable, published FSLX file through the shared mmap facade.
     ///
     /// Only canonical `seg-<hex16>.fslx` generation files are accepted. Keeper
@@ -946,6 +980,17 @@ impl SegmentReader<ReadOnlyMappedFile> {
         schema: SchemaDescriptor,
         limits: SegmentLimits,
     ) -> Result<Self, QuillError> {
+        Self::open_published_checked(path, schema, limits, |_, _| Ok(())).map(|(reader, ())| reader)
+    }
+
+    /// Run admission while the exact descriptor backing the mapping is alive.
+    /// The descriptor is released before returning the reader and admission result.
+    pub(crate) fn open_published_checked<T>(
+        path: &Path,
+        schema: SchemaDescriptor,
+        limits: SegmentLimits,
+        check: impl FnOnce(&Self, &mut fs::File) -> Result<T, QuillError>,
+    ) -> Result<(Self, T), QuillError> {
         let expected_segment_id =
             published_segment_id(path).map_err(|detail| corrupted(path, detail))?;
         let metadata = fs::symlink_metadata(path)?;
@@ -969,18 +1014,20 @@ impl SegmentReader<ReadOnlyMappedFile> {
         {
             return Err(corrupted(path, format!("truncated file length {file_len}")));
         }
-        let mapped = ReadOnlyMappedFile::open_published(path)?;
-        let reader = Self::parse_source(mapped, path.to_path_buf(), schema, limits)?;
-        if reader.header.segment_id != expected_segment_id {
-            return Err(corrupted(
-                path,
-                format!(
-                    "published filename identifies segment {expected_segment_id:#018x}, but the header identifies {:#018x}",
-                    reader.header.segment_id
-                ),
-            ));
-        }
-        Ok(reader)
+        ReadOnlyMappedFile::open_published_with_file(path, |mapped, file| {
+            let reader = Self::parse_source(mapped, path.to_path_buf(), schema, limits)?;
+            if reader.header.segment_id != expected_segment_id {
+                return Err(corrupted(
+                    path,
+                    format!(
+                        "published filename identifies segment {expected_segment_id:#018x}, but the header identifies {:#018x}",
+                        reader.header.segment_id
+                    ),
+                ));
+            }
+            let witness = check(&reader, file)?;
+            Ok((reader, witness))
+        })
     }
 }
 
@@ -2695,6 +2742,60 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::AlreadyExists
         ));
         assert_eq!(fs::read(&temp_path)?, differing);
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_witness_agrees_with_mapped_verifier_and_rejects_corruption() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("seg-0123456789abcdef.fslx");
+        let mut owned = fixture_sections(DEFAULT_SCHEMA, true);
+        owned[0].bytes.resize(137_123, 0x5a);
+        let encoded = encode_owned(fixture_header(DEFAULT_SCHEMA), &owned)?;
+        let prefix_len = encoded.as_bytes().len() - TRAILER_LEN;
+        assert!(prefix_len > 2 * 64 * 1024);
+        assert_ne!(prefix_len % (16 * 1024), 0);
+        fs::write(&path, encoded.as_bytes())?;
+        let open = || {
+            SegmentReader::open_published_checked(
+                &path,
+                DEFAULT_SCHEMA,
+                SegmentLimits::default(),
+                |reader, file| reader.verify_streamed_file_witness(file),
+            )
+        };
+        {
+            let (reader, witness) = open()?;
+            assert_eq!(witness, reader.verify_file_witness()?);
+            assert_eq!(witness, encoded.file_xxh3());
+            for section in &owned {
+                assert_eq!(
+                    reader.section(section.kind)?,
+                    Some(section.bytes.as_slice())
+                );
+            }
+        }
+
+        // Mutate only after dropping the published mapping. The old trailer
+        // remains intact, so structural open succeeds but both hashes refuse.
+        let mut corrupt = encoded.as_bytes().to_vec();
+        let final_section = encoded.section_entries().last().ok_or("missing section")?;
+        let offset = usize::try_from(final_section.offset + final_section.len - 1)?;
+        assert!(offset >= prefix_len / (16 * 1024) * (16 * 1024));
+        corrupt[offset] ^= 0x40;
+        fs::write(&path, &corrupt)?;
+        assert!(matches!(
+            SegmentReader::from_owned(corrupt, DEFAULT_SCHEMA)?.verify_file_witness(),
+            Err(QuillError::IndexCorrupted { .. })
+        ));
+        assert!(matches!(open(), Err(QuillError::IndexCorrupted { .. })));
+        for length in [0, FILE_PREFIX_LEN, encoded.as_bytes().len() - 1] {
+            fs::write(&path, &encoded.as_bytes()[..length])?;
+            assert!(
+                matches!(open(), Err(QuillError::IndexCorrupted { .. })),
+                "truncation at {length} must fail"
+            );
+        }
         Ok(())
     }
 

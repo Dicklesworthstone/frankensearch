@@ -3714,14 +3714,24 @@ impl KeeperSnapshot {
             })?;
         for manifest_segment in &loaded.manifest.segments {
             let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
-            let reader = SegmentReader::open_published(&path, schema).map_err(|source| {
-                KeeperError::SegmentOpen {
-                    path: path.clone(),
-                    source,
-                }
+            let (reader, authenticated_file_witness) = SegmentReader::open_published_checked(
+                &path,
+                schema,
+                crate::segment::SegmentLimits::default(),
+                |reader, file| {
+                    Ok(authenticate_segment_witness(
+                        &path,
+                        manifest_segment,
+                        reader,
+                        file,
+                    ))
+                },
+            )
+            .map_err(|source| KeeperError::SegmentOpen {
+                path: path.clone(),
+                source,
             })?;
-            let authenticated_file_witness =
-                authenticate_segment_witness(&path, manifest_segment, &reader)?;
+            let authenticated_file_witness = authenticated_file_witness?;
             segments.push(RecoveredSegment::bind(
                 path,
                 manifest_segment.clone(),
@@ -11036,30 +11046,16 @@ fn validate_proposed_manifest_segments(
     Ok(())
 }
 
-/// Recompute and authenticate the trailer witness without eagerly validating
-/// every section. Ordinary read-only Keeper open uses this once before binding
-/// a segment; lazy section checks retain their normal behavior.
-fn verified_file_witness(
-    path: &Path,
-    reader: &SegmentReader<impl AsRef<[u8]>>,
-) -> Result<u64, KeeperError> {
-    reader
-        .verify_file_witness()
-        .map_err(|source| KeeperError::SegmentOpen {
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
 /// Authenticate a MANIFEST segment binding against the backing FSLX bytes.
 ///
 /// `validate_segment_witnesses` retains the cheap header and length checks
-/// before this helper reaches the full-prefix hash closure. A successful
+/// before invoking the same-descriptor streamed hash closure. A successful
 /// return mints an [`AuthenticatedFileWitness`] for a recovered segment.
 fn authenticate_segment_witness(
     path: &Path,
     manifest: &ManifestSegment,
-    reader: &SegmentReader<impl AsRef<[u8]>>,
+    reader: &SegmentReader<ReadOnlyMappedFile>,
+    file: &mut File,
 ) -> Result<AuthenticatedFileWitness, KeeperError> {
     let mut verified_file_xxh3 = None;
     #[cfg(test)]
@@ -11067,7 +11063,12 @@ fn authenticate_segment_witness(
     validate_segment_witnesses(path, manifest, reader, || {
         #[cfg(test)]
         full_prefix_hash_count.fetch_add(1, AtomicOrdering::Relaxed);
-        let file_xxh3 = verified_file_witness(path, reader)?;
+        let file_xxh3 = reader
+            .verify_streamed_file_witness(file)
+            .map_err(|source| KeeperError::SegmentOpen {
+                path: path.to_path_buf(),
+                source,
+            })?;
         verified_file_xxh3 = Some(file_xxh3);
         Ok(file_xxh3)
     })?;
