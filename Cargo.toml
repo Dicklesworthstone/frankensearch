@@ -70,10 +70,11 @@ frankensearch-quill = { version = "0.2.4", path = "crates/frankensearch-quill" }
 # from inside the crate instead of a resolver error naming the requirement.
 # Earlier floors carried the native-task abort contract (acknowledged
 # Cancelled is preserved) plus the HTTP/1 streaming cancel/reuse fixes; the
-# <0.5 ceiling permits compatible 0.4.x source overrides without admitting a
-# future semver-major API line. `crates/frankensearch-quill/tests/asupersync_floor.rs`
-# pins this floor against silent regression. [bd-3h229]
-asupersync = { version = ">=0.4.10, <0.5", default-features = false, features = ["proc-macros"] }
+# 0.4.11 current-thread driver drains queued shadow work before block_on returns,
+# violating the existing shadow serving-latency guard. Keep it out of consumer
+# resolution until that contract is restored (bd-dsbym, UPGRADE_LOG.md).
+# `crates/frankensearch-quill/tests/asupersync_floor.rs` retains the API floor.
+asupersync = { version = ">=0.4.10, <0.4.11", default-features = false, features = ["proc-macros"] }
 arc-swap = "=1.9.2"
 
 # Descriptor-relative generation-root admission. Keep the syscall surface
@@ -122,7 +123,7 @@ fastembed = { version = "=6.0.0", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
 ] }
 safetensors = "0.8.0"
-tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 # frankentorch (pure-Rust tensor lib) backing the frankensearch-rerank `native`
 # feature (cross-encoder reranker + MiniLM embedder). The family is published
 # on crates.io under `frankentorch-*` names (`ft-api` on crates.io belongs to

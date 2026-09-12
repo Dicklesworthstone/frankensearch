@@ -7,18 +7,39 @@ dependencies. FrankenSQLite 0.3.18 remains current. Updates are applied and
 validated one library family at a time under bead `bd-dsbym`; publication waits
 for the complete release gates.
 
-### Asupersync 0.4.10 → 0.4.11
+### Asupersync 0.4.11 rejected; 0.4.10 retained pending baseline validation
 
-The runtime and its coupled macros, decision, evidence, and kernel crates move
-to 0.4.11. The workspace API floor remains 0.4.10. The fresh-process receipt
-and publication audit identities follow the actual lock. The separate fuzz
-manifest's stale exact 0.4.4 pin is aligned with the same runtime identity.
+The attempted runtime-family upgrade compiled, but the core suite returned
+1,122 passes and one failure on `vmi1156319` (RCH job `30017369531219996`).
+`shadow::tests::wall_clock_guard_never_awaits_slow_shadow_backend` took
+255.521109 ms against its unchanged 100 ms limit; its shadow backend deliberately
+blocks for 250 ms. Cargo stopped before running the fusion suite.
 
-The [upstream release source](https://github.com/Dicklesworthstone/asupersync/tree/v0.4.11)
-changes current-thread scheduling to execute on the caller and fixes runtime
-teardown and timer wakeups. The CLI awaits its spawned root task; blocking
-model work uses the blocking pool. Regression validation is pending; no
-performance improvement or release qualification is claimed.
+The [0.4.11 current-thread driver](https://github.com/Dicklesworthstone/asupersync/blob/v0.4.11/src/runtime/current_thread.rs)
+drains queued work after the root result becomes ready, before `block_on`
+returns. A dispatch-count bound cannot prevent an individual shadow poll from
+blocking the caller. Replacing this guard with a different runtime or moving
+its timer inside the root would stop checking the existing caller-visible
+contract; neither change was made.
+
+The runtime and its coupled lock entries are restored to the prior versions.
+The manifest retains the 0.4.10 API floor and temporarily excludes 0.4.11 from
+consumer resolution. The separate fuzz manifest's stale exact 0.4.4 pin is
+aligned to 0.4.10. The unchanged core/fusion baseline rerun is pending.
+The failed run's source files matched the isolated checkout both during
+compilation and after execution; it is a real failed test, unlike the earlier
+excluded RCH transfer/source-drift attempts. Terminal logs and source manifests
+are retained under `/data/release-work/frankensearch-release-20260912/dependencies/`.
+
+### Tokenizers 0.23.1 → 0.23.2 (validation pending)
+
+The [upstream patch](https://github.com/huggingface/tokenizers/releases/tag/v0.23.2)
+adds a default pretokenized-model hook and vocabulary-size improvements; the
+used tokenizer constructors and encode APIs remain compatible. The existing
+`default-features = false` and `fancy-regex` selection are preserved. Its required
+`daachorse` dependency moves from 1.0.1 to 3.0.3. No other resolved package
+version changes in this step. Fresh-process receipt identities follow the new
+tokenizer version; logging isolation and real-model behavior still require tests.
 
 ## 2026-09-07 — FrankenSQLite 0.3.18 source follow-through
 
