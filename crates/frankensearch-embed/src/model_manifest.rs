@@ -253,7 +253,7 @@ impl ModelArtifactManifestV1 {
                 "frankensearch-embed-{}+model2vec-native-v1",
                 env!("CARGO_PKG_VERSION")
             ),
-            protocol_revision: "tokenizers-0.23.2+safetensors-0.7.0-static-table-v1".to_owned(),
+            protocol_revision: "tokenizers-0.23.2+safetensors-0.8.0-static-table-v1".to_owned(),
             numeric_profile: "f32-row-gather-mean-l2-v1".to_owned(),
             weights_format: "safetensors-f32-matrix-v1".to_owned(),
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
@@ -4161,15 +4161,124 @@ mod tests {
         assert_eq!(identity.storage.endianness, "little-endian");
     }
 
+    // Package 0.3.0 changes only these adapters' implementation provenance.
+    // Reconstruct the historical 0.2.7 revision before checking its frozen
+    // fixtures; native frankentorch producers use independently pinned revisions.
+    fn before_adapter_release(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        if matches!(
+            manifest.execution.backend.as_str(),
+            "model2vec-native" | "fastembed-onnx"
+        ) {
+            let adapter = manifest
+                .execution
+                .implementation_revision
+                .strip_prefix("frankensearch-embed-0.3.0+")
+                .expect("current adapter must identify the actual 0.3.0 package");
+            manifest.execution.implementation_revision =
+                format!("frankensearch-embed-0.2.7+{adapter}");
+        }
+        manifest
+    }
+
+    #[test]
+    fn adapter_release_changes_producer_identity_without_changing_space_or_vectors() {
+        use frankensearch_core::generation::ProducerCompatibilityErrorV1;
+
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.0");
+        for current in [
+            ModelArtifactManifestV1::potion_128m_native().unwrap(),
+            ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+            ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+            ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+        ] {
+            let historical = before_adapter_release(current.clone());
+            assert_eq!(
+                current.space_contract_fingerprint().unwrap(),
+                historical.space_contract_fingerprint().unwrap()
+            );
+            assert_eq!(
+                current.execution.golden_vectors,
+                historical.execution.golden_vectors
+            );
+            let current_identity = current
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            let historical_identity = historical
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            assert_ne!(current_identity.producer, historical_identity.producer);
+            assert_ne!(
+                current_identity.fingerprint(),
+                historical_identity.fingerprint()
+            );
+            current_identity
+                .verify_exact_producer_with(&current_identity)
+                .expect("the current producer must admit itself");
+            assert_eq!(
+                current_identity.verify_exact_producer_with(&historical_identity),
+                Err(ProducerCompatibilityErrorV1::CertificateRequired),
+                "matching spaces and vectors must not admit a historical producer as current"
+            );
+            assert_ne!(
+                current.freeze().unwrap().fingerprint,
+                historical.freeze().unwrap().fingerprint
+            );
+        }
+    }
+
+    #[test]
+    fn potion_safetensors_refresh_requires_distinct_producer_admission() {
+        use frankensearch_core::generation::ProducerCompatibilityErrorV1;
+
+        let current = ModelArtifactManifestV1::potion_128m_native().unwrap();
+        assert_eq!(
+            current.execution.protocol_revision,
+            "tokenizers-0.23.2+safetensors-0.8.0-static-table-v1"
+        );
+        let mut previous = current.clone();
+        previous.execution.protocol_revision =
+            "tokenizers-0.23.2+safetensors-0.7.0-static-table-v1".to_owned();
+        assert_eq!(
+            current.execution.implementation_revision, previous.execution.implementation_revision,
+            "this negative must isolate protocol drift from the adapter bump"
+        );
+        assert_eq!(
+            current.execution.golden_vectors,
+            previous.execution.golden_vectors
+        );
+        assert_eq!(
+            current.space_contract_fingerprint().unwrap(),
+            previous.space_contract_fingerprint().unwrap()
+        );
+        let current_identity = current
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        let previous_identity = previous
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        current_identity
+            .verify_exact_producer_with(&current_identity)
+            .expect("current Potion producer admits itself");
+        assert_eq!(
+            current_identity.verify_exact_producer_with(&previous_identity),
+            Err(ProducerCompatibilityErrorV1::CertificateRequired)
+        );
+        assert_ne!(
+            current.freeze().unwrap().fingerprint,
+            previous.freeze().unwrap().fingerprint
+        );
+    }
+
     // Reconstruct the pre-refresh producer without changing any artifact,
     // numeric contract, preprocessing, or output certificate. The exact
     // historical hashes below therefore continue to constrain every other
     // field while the current producer names its actual dependencies.
     fn before_dependency_refresh(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
         let current = manifest.freeze().unwrap().fingerprint;
+        manifest = before_adapter_release(manifest);
         let (current_protocol, previous_protocol) = match manifest.execution.backend.as_str() {
             "model2vec-native" => (
-                "tokenizers-0.23.2+safetensors-0.7.0-static-table-v1",
+                "tokenizers-0.23.2+safetensors-0.8.0-static-table-v1",
                 "tokenizers-0.23.1+safetensors-0.7.0-static-table-v1",
             ),
             "fastembed-onnx" => {
@@ -4226,6 +4335,12 @@ mod tests {
         // previous-version check; all artifact and input fields stay frozen.
         // bd-dsbym: retain every prior fixture verbatim after correcting the
         // Tokenizers/FastEmbed dependency identity. No vector golden changes.
+        // GOLDEN-CHANGE release 0.3.0: reconstruct the prior 0.2.7 adapter
+        // before checking these exact historical hashes. Production manifests
+        // keep their actual package revision; no historical hash is replaced.
+        // GOLDEN-CHANGE Safetensors 0.8.0: Potion's producer protocol now names
+        // its actual dependency. The reconstruction restores 0.7.0 alongside
+        // the old Tokenizers protocol; artifacts and vector certificates stay exact.
         let observed = [
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
@@ -4329,7 +4444,7 @@ mod tests {
                 .execution
                 .implementation_revision
                 .strip_prefix("frankensearch-embed-0.2.7+")
-                .expect("release fixture must name the actual 0.2.7 adapter")
+                .expect("reconstructed fixture must name the historical 0.2.7 adapter")
                 .to_owned();
             manifest.execution.implementation_revision =
                 format!("frankensearch-embed-0.2.6+{adapter}");

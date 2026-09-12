@@ -628,7 +628,7 @@ impl ReceiptIdentity {
             ),
             active_features_sha256: output_sha256(active_features.as_bytes(), &[]),
             active_features,
-            asupersync: registry_package_identity(&lock, "asupersync", "0.4.10"),
+            asupersync: registry_package_identity(&lock, "asupersync", "0.5.0"),
             tokenizers: registry_package_identity(&lock, "tokenizers", "0.23.2"),
         }
     }
@@ -826,7 +826,7 @@ fn assert_sealed_receipt(
         !receipt.identity.active_features.is_empty(),
         "receipt must retain the exact active feature set"
     );
-    assert_registry_package_identity(&receipt.identity.asupersync, "asupersync", "0.4.10");
+    assert_registry_package_identity(&receipt.identity.asupersync, "asupersync", "0.5.0");
     assert_registry_package_identity(&receipt.identity.tokenizers, "tokenizers", "0.23.2");
 }
 
@@ -875,7 +875,11 @@ fn fresh_process_contract_binds_pinned_dependency_and_source_identities() {
     let root = workspace_root();
     let lock = std::fs::read_to_string(root.join("Cargo.lock"))
         .expect("fresh-process contract must read the workspace Cargo.lock");
-    for (name, version) in [("asupersync", "0.4.10"), ("tokenizers", "0.23.2")] {
+    for (name, version) in [
+        ("asupersync", "0.5.0"),
+        ("tokenizers", "0.23.2"),
+        ("safetensors", "0.8.0"),
+    ] {
         let block = lock_package_block(&lock, name, version);
         assert!(
             block.contains("source = \"registry+https://github.com/rust-lang/crates.io-index\""),
@@ -891,6 +895,20 @@ fn fresh_process_contract_binds_pinned_dependency_and_source_identities() {
             "checksum must be hexadecimal"
         );
     }
+
+    // The registered producer must name the dependencies actually selected by
+    // Cargo, not just agree with another literal in its manifest unit tests.
+    let tokenizers = registry_package_identity(&lock, "tokenizers", "0.23.2");
+    let safetensors = registry_package_identity(&lock, "safetensors", "0.8.0");
+    let potion = frankensearch_embed::ModelArtifactManifestV1::potion_128m_native()
+        .expect("registered Potion producer");
+    assert_eq!(
+        potion.execution.protocol_revision,
+        format!(
+            "tokenizers-{}+safetensors-{}-static-table-v1",
+            tokenizers.version, safetensors.version
+        )
+    );
 
     assert!(
         std::env::current_exe()

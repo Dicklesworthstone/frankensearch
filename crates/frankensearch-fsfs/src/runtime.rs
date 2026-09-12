@@ -11922,8 +11922,9 @@ impl FsfsRuntime {
 
         // 2. Model cache checks
         let model_root = PathBuf::from(&self.config.indexing.model_dir);
+        let index_root = self.resolve_status_index_root()?;
         for status in self.collect_model_statuses()? {
-            checks.push(Self::model_doctor_check(&status));
+            checks.push(Self::model_doctor_check(&status, &index_root));
         }
 
         // 3. Model directory permissions. Doctor is an observer: an actual
@@ -11943,7 +11944,6 @@ impl FsfsRuntime {
         }
 
         // 4. Index directory
-        let index_root = self.resolve_status_index_root()?;
         if index_root.exists() {
             let sentinel = Self::read_index_sentinel(&index_root)?;
             if let Some(sentinel) = &sentinel {
@@ -12096,13 +12096,15 @@ impl FsfsRuntime {
         })
     }
 
-    fn model_doctor_check(status: &FsfsModelStatus) -> DoctorCheck {
+    fn model_doctor_check(status: &FsfsModelStatus, index_root: &Path) -> DoctorCheck {
+        #[cfg(not(feature = "semantic-support"))]
+        let _ = index_root;
         let name = format!("model.{}", status.tier);
         match status.verification_state.as_str() {
             "verified" => {
                 #[cfg(feature = "semantic-support")]
                 {
-                    match Self::probe_model_loader(status) {
+                    match Self::probe_model_loader(status, index_root) {
                         Ok(()) => DoctorCheck {
                             name,
                             verdict: DoctorVerdict::Pass,
@@ -12116,10 +12118,13 @@ impl FsfsRuntime {
                             name,
                             verdict: DoctorVerdict::Fail,
                             detail: format!(
-                                "{} passed manifest verification at {}, but its compiled loader rejected it: {error}",
+                                "{} passed manifest verification at {}, but model or vector-generation admission failed: {error}",
                                 status.name, status.cache_path
                             ),
                             suggestion: Some(match error {
+                                SearchError::UnverifiableRemoteSpace { .. }
+                                | SearchError::DimensionMismatch { .. } =>
+                                    "rebuild the index with the verified model using `fsfs index --full`; installing a model alone does not update stored vector identities".to_owned(),
                                 SearchError::EmbedderUnavailable { reason, .. } => reason,
                                 _ => "reinstall the selected model with `fsfs download-models --model MODEL_ID --force`, then run `fsfs download-models --model MODEL_ID --verify`".to_owned(),
                             }),
@@ -12185,13 +12190,15 @@ impl FsfsRuntime {
     }
 
     #[cfg(feature = "semantic-support")]
-    fn probe_model_loader(status: &FsfsModelStatus) -> SearchResult<()> {
+    fn probe_model_loader(status: &FsfsModelStatus, index_root: &Path) -> SearchResult<()> {
         let model_path = Path::new(&status.cache_path);
         if status.tier == "quality"
             && let Some(native_model) = NativeQualityModel::from_name(&status.name)
         {
             #[cfg(feature = "rerank")]
-            return native_model.load(model_path).map(|_| ());
+            return native_model.load(model_path).and_then(|embedder| {
+                Self::validate_doctor_model_generation(index_root, &status.tier, &embedder)
+            });
             #[cfg(not(feature = "rerank"))]
             return Err(SearchError::EmbedderUnavailable {
                 model: native_model.manifest_id().to_owned(),
@@ -12206,9 +12213,13 @@ impl FsfsRuntime {
             // rather than from the bytes on disk now — which is exactly the
             // question `doctor` is asked. The duplicate 512 MB read is the
             // point here, and `doctor` is not a hot path (GH #46).
-            "fast" => Model2VecEmbedder::load_with_name(model_path, &status.name).map(|_| ()),
+            "fast" => Model2VecEmbedder::load_with_name(model_path, &status.name).and_then(|embedder| {
+                Self::validate_doctor_model_generation(index_root, &status.tier, &embedder)
+            }),
             #[cfg(feature = "semantic-loaders")]
-            "quality" => FastEmbedEmbedder::load_with_name(model_path, &status.name).map(|_| ()),
+            "quality" => FastEmbedEmbedder::load_with_name(model_path, &status.name).and_then(|embedder| {
+                Self::validate_doctor_model_generation(index_root, &status.tier, &embedder)
+            }),
             #[cfg(not(feature = "semantic-loaders"))]
             "quality" => Err(SearchError::EmbedderUnavailable {
                 model: status.name.clone(),
@@ -12220,6 +12231,35 @@ impl FsfsRuntime {
                 reason: "doctor only probes registered fast and quality semantic tiers".to_owned(),
             }),
         }
+    }
+
+    #[cfg(any(feature = "semantic-support", test))]
+    fn validate_doctor_model_generation(
+        index_root: &Path,
+        tier: &str,
+        embedder: &dyn Embedder,
+    ) -> SearchResult<()> {
+        let relative_path = match tier {
+            "fast" => FSFS_VECTOR_INDEX_FILE,
+            "quality" => FSFS_VECTOR_QUALITY_INDEX_FILE,
+            other => {
+                return Err(SearchError::InvalidConfig {
+                    field: "model.tier".to_owned(),
+                    value: other.to_owned(),
+                    reason: "doctor only admits fast and quality vector generations".to_owned(),
+                });
+            }
+        };
+        let path = index_root.join(relative_path);
+        // Absence is reported by the generation checks, not a model failure.
+        // Do not use exists(): permission errors must not become healthy absence.
+        match fs::metadata(&path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let index = VectorIndex::open_read_only(&path)?;
+        Self::validate_fast_embedder_for_vector_index(&index, embedder, false)
     }
 
     fn collect_shadow_oracle_doctor_check(&self, index_root: &Path) -> SearchResult<DoctorCheck> {
@@ -36879,6 +36919,79 @@ mod tests {
     }
 
     #[test]
+    fn doctor_model_generation_uses_exact_search_admission_without_writes() {
+        let embedder = SemanticFastEmbedder;
+        let current = embedder
+            .identity()
+            .expect("test producer identity")
+            .fingerprint();
+        for tier in ["fast", "quality"] {
+            for (label, revision, id, dimension, admitted) in [
+                (
+                    "current",
+                    current.as_str(),
+                    embedder.id(),
+                    embedder.dimension(),
+                    true,
+                ),
+                ("missing", "", embedder.id(), embedder.dimension(), false),
+                (
+                    "historical",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    embedder.id(),
+                    embedder.dimension(),
+                    false,
+                ),
+                (
+                    "foreign",
+                    current.as_str(),
+                    "other-producer",
+                    embedder.dimension(),
+                    false,
+                ),
+                (
+                    "width",
+                    current.as_str(),
+                    embedder.id(),
+                    embedder.dimension() + 1,
+                    false,
+                ),
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let relative = if tier == "fast" {
+                    super::FSFS_VECTOR_INDEX_FILE
+                } else {
+                    super::FSFS_VECTOR_QUALITY_INDEX_FILE
+                };
+                let path = temp.path().join(relative);
+                fs::create_dir_all(path.parent().expect("parent")).expect("vector directory");
+                VectorIndex::create_with_revision(
+                    &path,
+                    id,
+                    revision,
+                    dimension,
+                    frankensearch_index::Quantization::F16,
+                )
+                .expect("fixture writer")
+                .finish()
+                .expect("finish fixture");
+                let before = fs::read(&path).expect("fixture bytes");
+                let reader = VectorIndex::open_read_only(&path).expect("live reader");
+                let search =
+                    FsfsRuntime::validate_fast_embedder_for_vector_index(&reader, &embedder, false);
+                let doctor =
+                    FsfsRuntime::validate_doctor_model_generation(temp.path(), tier, &embedder);
+                assert_eq!(doctor.is_ok(), admitted, "{tier}/{label}: {doctor:?}");
+                assert_eq!(doctor.is_ok(), search.is_ok(), "{tier}/{label}");
+                assert_eq!(fs::read(&path).expect("read after doctor"), before);
+            }
+            let absent = tempfile::tempdir().expect("absent index");
+            FsfsRuntime::validate_doctor_model_generation(absent.path(), tier, &embedder)
+                .expect("missing generations are diagnosed separately");
+        }
+    }
+
+    #[test]
     fn doctor_vector_generation_fails_closed_on_hash_identity() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_root = temp.path().join("index");
@@ -39364,7 +39477,7 @@ mod tests {
                 cached: true,
                 size_bytes: 1,
             };
-            let check = FsfsRuntime::model_doctor_check(&status);
+            let check = FsfsRuntime::model_doctor_check(&status, Path::new("unused-lite-index"));
             assert_eq!(
                 check.verdict,
                 super::DoctorVerdict::Warn,
@@ -39401,7 +39514,7 @@ mod tests {
             FsfsRuntime::collect_model_status("fast", "potion-multilingual-128M", temp.path())
                 .expect("missing default model status");
         assert_eq!(status.verification_state, "missing");
-        let doctor = FsfsRuntime::model_doctor_check(&status);
+        let doctor = FsfsRuntime::model_doctor_check(&status, temp.path());
         assert_eq!(doctor.verdict, super::DoctorVerdict::Warn);
         assert!(
             doctor
@@ -39422,7 +39535,7 @@ mod tests {
         assert_eq!(missing.verification_state, "missing");
         assert!(!missing.cached);
         assert_eq!(
-            FsfsRuntime::model_doctor_check(&missing).verdict,
+            FsfsRuntime::model_doctor_check(&missing, temp.path()).verdict,
             super::DoctorVerdict::Warn
         );
 
@@ -39434,7 +39547,7 @@ mod tests {
         assert_eq!(incomplete.verification_state, "incomplete");
         assert!(incomplete.diagnostic.is_some());
         assert_eq!(
-            FsfsRuntime::model_doctor_check(&incomplete).verdict,
+            FsfsRuntime::model_doctor_check(&incomplete, temp.path()).verdict,
             super::DoctorVerdict::Fail
         );
 
@@ -39446,7 +39559,7 @@ mod tests {
         assert_eq!(mismatch.verification_state, "mismatch");
         assert!(mismatch.diagnostic.is_some());
         assert_eq!(
-            FsfsRuntime::model_doctor_check(&mismatch).verdict,
+            FsfsRuntime::model_doctor_check(&mismatch, temp.path()).verdict,
             super::DoctorVerdict::Fail
         );
 
@@ -39455,7 +39568,7 @@ mod tests {
                 .expect("unregistered model inspection");
         assert_eq!(unregistered.verification_state, "unregistered");
         assert_eq!(
-            FsfsRuntime::model_doctor_check(&unregistered).verdict,
+            FsfsRuntime::model_doctor_check(&unregistered, temp.path()).verdict,
             super::DoctorVerdict::Fail
         );
     }

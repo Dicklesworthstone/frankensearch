@@ -3065,6 +3065,154 @@ mod loader_only {
 
     #[cfg(feature = "semantic-loaders")]
     #[test]
+    #[ignore = "requires pinned Potion and MiniLM caches; executes the production CLI"]
+    fn doctor_rejects_stale_real_model_producer_revisions() -> Result<(), String> {
+        log_binary_profile("doctor-producer-revision");
+        let model_root = configured_model_root();
+        verify_pinned_model_cache(&model_root)?;
+        let temp = tempfile::tempdir().expect("doctor producer fixture");
+        let corpus = temp.path().join("corpus");
+        let index = temp.path().join("index");
+        write_quickstart_corpus(&corpus);
+        let fsfs = IsolatedFsfs::new(temp.path(), model_root);
+        let indexed = fsfs.run(
+            temp.path(),
+            "doctor-producer-index",
+            [
+                "index",
+                corpus.to_str().unwrap(),
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        parse_success_envelope("doctor producer index", &indexed);
+
+        for (tier, filename) in [("fast", "index.fsvi"), ("quality", "quality.fsvi")] {
+            let source = index.join("vector").join(filename);
+            let original = fs::read(&source).expect("real indexed vectors");
+            let reader = VectorIndex::open_read_only(&source).expect("real generation reader");
+            assert!(
+                reader.record_count() > 0,
+                "fixture must contain real model vectors"
+            );
+            let mut revision = reader.embedder_revision().as_bytes().to_vec();
+            assert_eq!(revision.len(), 64, "complete producer fingerprint");
+            revision[0] = if revision[0] == b'a' { b'b' } else { b'a' };
+            let stale_revision = String::from_utf8(revision).expect("hex producer fingerprint");
+            let isolated = temp.path().join(format!("doctor-{tier}"));
+            fs::create_dir_all(isolated.join("vector")).expect("private vector directory");
+            let candidate = isolated.join("vector").join(filename);
+            // Use the normal writer so the stale identity has a valid header
+            // checksum. A raw byte flip would only exercise corruption refusal.
+            let mut writer = VectorIndex::create_with_revision(
+                &candidate,
+                reader.embedder_id(),
+                &stale_revision,
+                reader.dimension(),
+                reader.quantization(),
+            )
+            .expect("stale private generation writer")
+            .with_publication_nonce(reader.publication_nonce());
+            for row in 0..reader.record_count() {
+                writer
+                    .write_record(
+                        reader.doc_id_at(row).unwrap(),
+                        &reader.vector_at_f32(row).unwrap(),
+                    )
+                    .expect("retain genuine model vector");
+            }
+            writer.finish().expect("seal valid stale generation");
+            {
+                let stale_reader = VectorIndex::open_read_only(&candidate)
+                    .expect("stale fixture must be structurally valid, including CRC");
+                assert_eq!(stale_reader.embedder_revision(), stale_revision);
+                assert_eq!(stale_reader.record_count(), reader.record_count());
+                assert_eq!(stale_reader.quantization(), reader.quantization());
+                for row in 0..reader.record_count() {
+                    assert_eq!(
+                        stale_reader.doc_id_at(row).unwrap(),
+                        reader.doc_id_at(row).unwrap()
+                    );
+                    let actual = stale_reader.vector_at_f32(row).unwrap();
+                    let expected = reader.vector_at_f32(row).unwrap();
+                    assert!(
+                        actual
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .eq(expected.into_iter().map(f32::to_bits)),
+                        "fixture must preserve every genuine vector bit"
+                    );
+                }
+            }
+            drop(reader);
+            let stale = fs::read(&candidate).expect("valid stale generation bytes");
+            let refused = fsfs.run(
+                temp.path(),
+                &format!("doctor-{tier}-stale"),
+                [
+                    "doctor",
+                    "--index-dir",
+                    isolated.to_str().unwrap(),
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            assert!(!refused.timed_out, "doctor must terminate: {refused:?}");
+            assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+            let envelope: Value =
+                serde_json::from_str(&refused.stdout).expect("doctor refusal JSON");
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error"]["code"], "subsystem_error");
+            let diagnostic = envelope["error"].to_string();
+            assert!(
+                diagnostic.contains(&format!("model.{tier}")),
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("Embedding space identity is unverifiable."),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("fsfs index --full"), "{diagnostic}");
+            assert_eq!(
+                fs::read(&candidate).unwrap(),
+                stale,
+                "doctor must not repair in place"
+            );
+            assert_eq!(
+                fs::read(&source).unwrap(),
+                original,
+                "source generation must stay intact"
+            );
+
+            fs::write(&candidate, &original).expect("restore exact producer in private fixture");
+            let accepted = fsfs.run(
+                temp.path(),
+                &format!("doctor-{tier}-current"),
+                [
+                    "doctor",
+                    "--index-dir",
+                    isolated.to_str().unwrap(),
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let envelope = parse_success_envelope("doctor exact producer control", &accepted);
+            assert_eq!(envelope["data"]["fail_count"], 0);
+            assert_eq!(fs::read(&candidate).unwrap(), original);
+            eprintln!(
+                "[default-build-e2e] stage=doctor-producer tier={tier} stale=refused current=accepted read_only=true"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "semantic-loaders")]
+    #[test]
     #[ignore = "mock-free model-backed quickstart; provision the pinned cache, then run with --ignored --nocapture"]
     fn default_build_indexes_and_returns_a_real_hybrid_result() -> Result<(), String> {
         log_binary_profile("real-model");
