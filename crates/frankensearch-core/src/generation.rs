@@ -808,10 +808,12 @@ const LOCAL_FLOOR_FILE_SUFFIX_V1: &str = ".floor";
 /// idempotent replay, and exactly one same-base winner. Durability and
 /// linearizability come from the filesystem rather than a mutex:
 ///
+/// * a persistent sibling `<root_hex>.lock` serializes readers and publishers
+///   through scan, write, and durability completion. Each operation opens its
+///   own descriptor; the kernel releases its lock on close or process exit;
 /// * every CAS version is its own immutable file `<root_hex>/v<cas>.floor`,
-///   created with `create_new` — the kernel's `O_EXCL` election is what makes
-///   two same-base publishers resolve to exactly one winner, with no lock file
-///   that could go stale;
+///   created with `create_new`. The lock prevents a competing scan from
+///   mistaking an in-progress write for an abandoned torn record;
 /// * each file ends in a SHA-256 of its own bytes, so a torn or partial write
 ///   never reads as a floor: a highest-numbered file that fails to verify is
 ///   reported as [`GenerationAuthorityErrorV1::UnresolvedAttempt`], which
@@ -977,6 +979,44 @@ impl LocalAntiRollbackFloorStoreV1 {
         root_directory.join(format!("v{cas_version:020}{LOCAL_FLOOR_FILE_SUFFIX_V1}"))
     }
 
+    fn lock_root(&self, root_id: [u8; 16]) -> Result<std::fs::File, GenerationAuthorityErrorV1> {
+        // Never unlink or replace this inode. Separate opens, rather than
+        // cloned handles, also exclude callers sharing the same store instance.
+        // This cooperative store assumes its owner preserves the directory.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root_directory(root_id).with_extension("lock"))
+            .map_err(floor_io_unavailable)?;
+        lock.lock().map_err(floor_io_unavailable)?;
+        Ok(lock)
+    }
+
+    fn sync_directories(
+        &self,
+        root_directory: &std::path::Path,
+    ) -> Result<(), GenerationAuthorityErrorV1> {
+        std::fs::File::open(root_directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(floor_io_unavailable)?;
+        std::fs::File::open(&self.directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(floor_io_unavailable)
+    }
+
+    fn sync_record(
+        &self,
+        record: AntiRollbackFloorRecordV1,
+    ) -> Result<(), GenerationAuthorityErrorV1> {
+        let root_directory = self.root_directory(record.root_id);
+        std::fs::File::open(Self::version_path(&root_directory, record.cas_version))
+            .and_then(|file| file.sync_all())
+            .map_err(floor_io_unavailable)?;
+        self.sync_directories(&root_directory)
+    }
+
     /// Every version file for `root_id`, keyed by the CAS version in its name,
     /// with the decode outcome of its bytes. A missing directory is no floor.
     #[allow(clippy::type_complexity)]
@@ -1041,10 +1081,16 @@ impl LocalAntiRollbackFloorStoreV1 {
                 field: "anti_rollback_floor.root_id",
             });
         }
+        let _lock = self.lock_root(root_id)?;
         let files = self.scan(root_id)?;
         match files.into_iter().next_back() {
             None => Ok(None),
-            Some((_, Ok(file))) => Ok(Some(file.record)),
+            Some((_, Ok(file))) => {
+                // A previous writer may have completed its bytes but failed
+                // the durability barrier. Reconcile before reporting a floor.
+                self.sync_record(file.record)?;
+                Ok(Some(file.record))
+            }
             Some((_, Err(_))) => Err(GenerationAuthorityErrorV1::UnresolvedAttempt),
         }
     }
@@ -1082,12 +1128,14 @@ impl LocalAntiRollbackFloorStoreV1 {
         }
         let expected_record_sha256 = expected.map(|record| record.record_sha256);
 
+        let _lock = self.lock_root(next.root_id)?;
         let files = self.scan(next.root_id)?;
         for file in files.values().flatten() {
             if file.idempotency_key == idempotency_key {
                 if file.expected_record_sha256 == expected_record_sha256
                     && file.record.authority == next.authority
                 {
+                    self.sync_record(file.record)?;
                     return Ok(file.record);
                 }
                 return Err(GenerationAuthorityErrorV1::FloorIdempotencyConflict);
@@ -1133,9 +1181,8 @@ impl LocalAntiRollbackFloorStoreV1 {
         let root_directory = self.root_directory(next.root_id);
         std::fs::create_dir_all(&root_directory).map_err(floor_io_unavailable)?;
         let path = Self::version_path(&root_directory, cas_version);
-        // `create_new` is the election: whichever same-base publisher opens
-        // this name first owns this CAS version; every other one loses with a
-        // typed conflict and must reload.
+        // Keep immutable creation as a second fence. The root lock remains
+        // held until both the record and its directory entries are durable.
         let mut handle = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1151,9 +1198,9 @@ impl LocalAntiRollbackFloorStoreV1 {
             .and_then(|()| handle.sync_all())
             .map_err(floor_io_unavailable)?;
         drop(handle);
-        std::fs::File::open(&root_directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(floor_io_unavailable)?;
+        // The first publication also creates root_directory itself; syncing
+        // only that new directory does not persist its entry in the store.
+        self.sync_directories(&root_directory)?;
         Ok(record)
     }
 }
@@ -6228,6 +6275,184 @@ mod tests {
             2,
             "losers never leave version files behind"
         );
+    }
+
+    struct FloorProbeChild(std::process::Child);
+
+    impl FloorProbeChild {
+        fn spawn(directory: &std::path::Path, role: &str) -> Self {
+            Self(
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "generation::tests::local_floor_process_probe",
+                        "--nocapture",
+                    ])
+                    .env("FRANKENSEARCH_FLOOR_PROBE_DIR", directory)
+                    .env("FRANKENSEARCH_FLOOR_PROBE_ROLE", role)
+                    .spawn()
+                    .expect("spawn floor probe"),
+            )
+        }
+
+        fn await_ready(&mut self, directory: &std::path::Path, role: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !directory.join(format!("{role}.ready")).exists() {
+                assert!(self.0.try_wait().expect("probe status").is_none());
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "probe startup timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        fn finish(&mut self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = self.0.try_wait().expect("probe status") {
+                    assert!(status.success(), "floor probe failed: {status}");
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "probe did not finish");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for FloorProbeChild {
+        fn drop(&mut self) {
+            // Also runs during assertion unwinding: no blocked subprocess escapes.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess helper executed by the bounded local-floor overlap tests"]
+    fn local_floor_process_probe() {
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("FRANKENSEARCH_FLOOR_PROBE_DIR").expect("probe directory"),
+        );
+        let role = std::env::var("FRANKENSEARCH_FLOOR_PROBE_ROLE").expect("probe role");
+        let store = LocalAntiRollbackFloorStoreV1::open(&directory).expect("independent store");
+        let root_id = [0x5a; 16];
+        let genesis = authority_reference(1, None);
+        let base =
+            AntiRollbackFloorRecordV1::new(AuthorityFloorV1::new(root_id, genesis).unwrap(), 1)
+                .unwrap();
+        let successor =
+            AuthorityFloorV1::new(root_id, authority_reference(2, Some(genesis.fingerprint())))
+                .unwrap();
+        if role == "interrupted" {
+            let _guard = store.lock_root(root_id).expect("child writer lock");
+            let path =
+                LocalAntiRollbackFloorStoreV1::version_path(&store.root_directory(root_id), 2);
+            std::fs::write(path, b"partial publication").expect("partial writer bytes");
+            std::fs::write(directory.join("interrupted.ready"), b"ready").unwrap();
+            // Parent kills this process while it owns the lock. Bounded even
+            // if the parent disappears; unwinding then releases the kernel lock.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            panic!("parent failed to interrupt writer");
+        }
+        std::fs::write(directory.join(format!("{role}.ready")), b"ready").unwrap();
+        match role.as_str() {
+            "reader" => assert_eq!(
+                store.load(root_id).unwrap().unwrap(),
+                AntiRollbackFloorRecordV1::new(successor, 2).unwrap()
+            ),
+            "competitor" => assert_eq!(
+                store.compare_and_advance(Some(base), successor, [0x63; 16]),
+                Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict)
+            ),
+            "recovery" => {
+                assert_eq!(
+                    store.load(root_id),
+                    Err(GenerationAuthorityErrorV1::UnresolvedAttempt)
+                );
+                assert_eq!(
+                    store.compare_and_advance(Some(base), successor, [0x63; 16]),
+                    Err(GenerationAuthorityErrorV1::UnresolvedAttempt)
+                );
+            }
+            _ => panic!("unknown floor probe role"),
+        }
+    }
+
+    #[test]
+    fn local_floor_processes_wait_for_complete_durable_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalAntiRollbackFloorStoreV1::open(directory.path()).unwrap();
+        let root_id = [0x5a; 16];
+        let genesis = authority_reference(1, None);
+        let base = store
+            .compare_and_advance(
+                None,
+                AuthorityFloorV1::new(root_id, genesis).unwrap(),
+                [0x41; 16],
+            )
+            .unwrap();
+        let record = AntiRollbackFloorRecordV1::new(
+            AuthorityFloorV1::new(root_id, authority_reference(2, Some(genesis.fingerprint())))
+                .unwrap(),
+            2,
+        )
+        .unwrap();
+        let bytes = LocalFloorFileV1 {
+            record,
+            idempotency_key: [0x42; 16],
+            expected_record_sha256: Some(base.record_sha256),
+        }
+        .encode();
+        let guard = store.lock_root(root_id).unwrap();
+        let path = LocalAntiRollbackFloorStoreV1::version_path(&store.root_directory(root_id), 2);
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        std::io::Write::write_all(&mut writer, &bytes[..bytes.len() / 2]).unwrap();
+        let mut reader = FloorProbeChild::spawn(directory.path(), "reader");
+        let mut competitor = FloorProbeChild::spawn(directory.path(), "competitor");
+        reader.await_ready(directory.path(), "reader");
+        competitor.await_ready(directory.path(), "competitor");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            reader.0.try_wait().unwrap().is_none(),
+            "reader observed partial publication"
+        );
+        assert!(
+            competitor.0.try_wait().unwrap().is_none(),
+            "competitor observed partial publication"
+        );
+        std::io::Write::write_all(&mut writer, &bytes[bytes.len() / 2..]).unwrap();
+        writer.sync_all().unwrap();
+        store
+            .sync_directories(&store.root_directory(root_id))
+            .unwrap();
+        drop(guard);
+        reader.finish();
+        competitor.finish();
+    }
+
+    #[test]
+    fn local_floor_interrupted_process_releases_lock_but_preserves_unresolved_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalAntiRollbackFloorStoreV1::open(directory.path()).unwrap();
+        store
+            .compare_and_advance(
+                None,
+                AuthorityFloorV1::new([0x5a; 16], authority_reference(1, None)).unwrap(),
+                [0x41; 16],
+            )
+            .unwrap();
+        let mut interrupted = FloorProbeChild::spawn(directory.path(), "interrupted");
+        interrupted.await_ready(directory.path(), "interrupted");
+        interrupted.0.kill().expect("interrupt writer");
+        assert!(!interrupted.0.wait().unwrap().success());
+        let mut recovery = FloorProbeChild::spawn(directory.path(), "recovery");
+        recovery.finish();
     }
 
     #[test]
