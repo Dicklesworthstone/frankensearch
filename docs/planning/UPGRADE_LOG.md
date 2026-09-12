@@ -1,5 +1,25 @@
 # Dependency Upgrade Log
 
+## 2026-09-12 — Stable dependency refresh (in progress)
+
+The live crates.io census found 19 newer direct packages among 67 registry
+dependencies. FrankenSQLite 0.3.18 remains current. Updates are applied and
+validated one library family at a time under bead `bd-dsbym`; publication waits
+for the complete release gates.
+
+### Asupersync 0.4.10 → 0.4.11
+
+The runtime and its coupled macros, decision, evidence, and kernel crates move
+to 0.4.11. The workspace API floor remains 0.4.10. The fresh-process receipt
+and publication audit identities follow the actual lock. The separate fuzz
+manifest's stale exact 0.4.4 pin is aligned with the same runtime identity.
+
+The [upstream release source](https://github.com/Dicklesworthstone/asupersync/tree/v0.4.11)
+changes current-thread scheduling to execute on the caller and fixes runtime
+teardown and timer wakeups. The CLI awaits its spawned root task; blocking
+model work uses the blocking pool. Regression validation is pending; no
+performance improvement or release qualification is claimed.
+
 ## 2026-09-07 — FrankenSQLite 0.3.18 source follow-through
 
 The storage, durability, fsfs, and ops manifests now require FrankenSQLite

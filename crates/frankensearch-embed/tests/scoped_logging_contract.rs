@@ -628,7 +628,7 @@ impl ReceiptIdentity {
             ),
             active_features_sha256: output_sha256(active_features.as_bytes(), &[]),
             active_features,
-            asupersync: registry_package_identity(&lock, "asupersync", "0.4.10"),
+            asupersync: registry_package_identity(&lock, "asupersync", "0.4.11"),
             tokenizers: registry_package_identity(&lock, "tokenizers", "0.23.1"),
         }
     }
@@ -826,7 +826,7 @@ fn assert_sealed_receipt(
         !receipt.identity.active_features.is_empty(),
         "receipt must retain the exact active feature set"
     );
-    assert_registry_package_identity(&receipt.identity.asupersync, "asupersync", "0.4.10");
+    assert_registry_package_identity(&receipt.identity.asupersync, "asupersync", "0.4.11");
     assert_registry_package_identity(&receipt.identity.tokenizers, "tokenizers", "0.23.1");
 }
 
@@ -875,7 +875,7 @@ fn fresh_process_contract_binds_pinned_dependency_and_source_identities() {
     let root = workspace_root();
     let lock = std::fs::read_to_string(root.join("Cargo.lock"))
         .expect("fresh-process contract must read the workspace Cargo.lock");
-    for (name, version) in [("asupersync", "0.4.10"), ("tokenizers", "0.23.1")] {
+    for (name, version) in [("asupersync", "0.4.11"), ("tokenizers", "0.23.1")] {
         let block = lock_package_block(&lock, name, version);
         assert!(
             block.contains("source = \"registry+https://github.com/rust-lang/crates.io-index\""),
