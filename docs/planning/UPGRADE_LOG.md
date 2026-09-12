@@ -2,8 +2,34 @@
 
 ## 2026-09-12 — Stable dependency refresh (in progress)
 
+### Current integration status at 19:49 UTC
+
+Main now resolves Asupersync 0.5.0 and FrankenSQLite 0.4, following a separate
+publication session. Live crates.io records confirm facade 0.6.0, core/lexical/
+Quill 0.3.0, and rerank 0.4.0 were published today. The downloaded facade and
+lexical archives both identify source `dd093fb230404ab08be2ed6f27776ed6c4796485`.
+fsfs remains 1.10.0. These published versions are immutable; publication alone
+does not establish that the complete release gates passed.
+
+The earlier compiler and dependency-family results below describe the isolated
+Asupersync 0.4.10 candidate, not the current runtime/storage graph. Both broad
+product and retained-output Quill runs reached RCH's 1,800-second transport
+deadline during compilation. Neither produced a complete test verdict. The
+installed RCH accepts per-invocation `RCH_BUILD_TIMEOUT_SEC` and
+`RCH_TEST_TIMEOUT_SEC`; the current focused run uses finite 7,200-second
+transport allowances without changing test deadlines or shared configuration.
+
+The package bumps left three integration defects: the current oracle contract
+still named lexical 0.2.5, the built-in profile still named Quill 0.2.4, and the
+standalone fuzz crate still selected a different Asupersync `Cx` type. The
+candidate introduces oracle v9 and profile v7 for the actual 0.3.0 adapters,
+retains exact historical v8/v6 identities for archive inspection only, and
+aligns the fuzz runtime closure to 0.5.0. Focused remote tests are pending.
+
+### Earlier dependency census and isolated candidate
+
 The live crates.io census found 19 newer direct packages among 67 registry
-dependencies. FrankenSQLite 0.3.18 remains current. Updates are applied and
+dependencies. FrankenSQLite 0.3.18 was current at that census. Updates were applied and
 validated one library family at a time under bead `bd-dsbym`; publication waits
 for the complete release gates.
 
@@ -13,8 +39,8 @@ and hybrid-feature Clippy with warnings denied, and the Windows index compile
 guard. The remote command exited 0. All 1,776 tracked non-coordination source
 files matched during the final stage and after completion. The Windows check
 emitted nine warnings; that stage does not deny warnings. This is compiler
-qualification, not a complete release gate. The full default/all-feature Quill
-run and remaining product test stages remain in progress.
+qualification, not a complete release gate. The later broad attempts timed out
+during compilation, as recorded above.
 
 The follow-up native F32 MiniLM test passes with the new certificate-refusal
 diagnostics: one test, 3.15 seconds, remote exit 0 on `ovh-a`. It checks exact
@@ -31,9 +57,9 @@ requires readable output files before exiting fails against the former driver
 (exit 9) and passes against the revised driver. An inherited-pipe control still
 times out and kills the process group. Test selection, validation, and budgets
 are unchanged. The existing repository probe suite and full default/all-feature
-run are in progress; neither has a completed verdict yet.
+run did not complete before the transport timeout.
 
-### Asupersync 0.4.11 rejected; 0.4.10 retained and verified
+### Earlier Asupersync 0.4.11 rejection and 0.4.10 baseline verification
 
 The attempted runtime-family upgrade compiled, but the core suite returned
 1,122 passes and one failure on `vmi1156319` (RCH job `30017369531219996`).
