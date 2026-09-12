@@ -64,6 +64,14 @@ identity repair below, also remain unreleased.
 
 ### Fixed
 
+- **Concurrent local anti-rollback publishers no longer expose an unfinished record.**
+  Readers and competing publishers wait for the active writer's durability barrier,
+  so same-base attempts produce one winner and typed conflicts. If a writer dies
+  with a torn record, later operations still refuse the unresolved head. New root
+  entries and completed records are synced before acknowledgement. This library
+  correction follows the September 12 publication and remains unreleased.
+  [Fix and cross-process regressions](https://github.com/Dicklesworthstone/frankensearch/commit/a4e86336761d982783ab0f4fec002cbbcee0e6bf).
+
 - **Potion now identifies the SafeTensors version it actually uses.** The
   September 12 dependency update selected SafeTensors 0.8.0, but the published
   embedder's producer protocol still named 0.7.0. The corrected producer

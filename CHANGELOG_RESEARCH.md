@@ -18,10 +18,16 @@ both test-binary hashes and the terminal log are retained under
 `/data/release-work/frankensearch-release-20260912/dependencies/` in
 `producer-tests-receipt.json` and `producer-independent-embed-vmi.log`.
 The full core suite separately exposed an existing anti-rollback publication
-race; that failure remains open while its repair is validated. These focused
-results do not qualify the complete release.
+race. Commit `a4e86336761d982783ab0f4fec002cbbcee0e6bf` fixes it with a
+per-root kernel lock across publication and durability. Independent-process
+reader/competitor and interrupted-writer regressions preserve torn-head refusal.
+The subsequent RCH batch passed all 1,131 core tests, formatting, focused Clippy,
+and the Windows index compile guard; the single ignored core entry is a helper
+executed by the subprocess tests. `floor-publication-receipt.json` retains the
+source and executable identities. The broader floor bead remains open for
+consumer profile wiring. These focused results do not qualify the complete release.
 
-The new repair link names the exact local commit; public link availability
+The new repair links name exact local commits; public link availability
 must be checked after the qualified source is pushed.
 
 ## September 12 registry-publication reconciliation
