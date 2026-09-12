@@ -3093,30 +3093,62 @@ mod loader_only {
         for (tier, filename) in [("fast", "index.fsvi"), ("quality", "quality.fsvi")] {
             let source = index.join("vector").join(filename);
             let original = fs::read(&source).expect("real indexed vectors");
-            let revision = {
-                let reader = VectorIndex::open_read_only(&source).expect("real generation reader");
-                assert!(
-                    reader.record_count() > 0,
-                    "fixture must contain real model vectors"
-                );
-                reader.embedder_revision().as_bytes().to_vec()
-            };
+            let reader = VectorIndex::open_read_only(&source).expect("real generation reader");
+            assert!(
+                reader.record_count() > 0,
+                "fixture must contain real model vectors"
+            );
+            let mut revision = reader.embedder_revision().as_bytes().to_vec();
             assert_eq!(revision.len(), 64, "complete producer fingerprint");
-            let offsets: Vec<_> = original
-                .windows(revision.len())
-                .enumerate()
-                .filter_map(|(offset, bytes)| (bytes == revision).then_some(offset))
-                .collect();
-            assert_eq!(offsets.len(), 1, "fixture revision must be unambiguous");
+            revision[0] = if revision[0] == b'a' { b'b' } else { b'a' };
+            let stale_revision = String::from_utf8(revision).expect("hex producer fingerprint");
             let isolated = temp.path().join(format!("doctor-{tier}"));
             fs::create_dir_all(isolated.join("vector")).expect("private vector directory");
             let candidate = isolated.join("vector").join(filename);
-            let mut stale = original.clone();
-            // Change only the revision in a private copy, retaining valid hex,
-            // the exact shape and all genuine model-produced vector bytes.
-            let offset = offsets[0];
-            stale[offset] = if stale[offset] == b'a' { b'b' } else { b'a' };
-            fs::write(&candidate, &stale).expect("stale private generation");
+            // Use the normal writer so the stale identity has a valid header
+            // checksum. A raw byte flip would only exercise corruption refusal.
+            let mut writer = VectorIndex::create_with_revision(
+                &candidate,
+                reader.embedder_id(),
+                &stale_revision,
+                reader.dimension(),
+                reader.quantization(),
+            )
+            .expect("stale private generation writer")
+            .with_publication_nonce(reader.publication_nonce());
+            for row in 0..reader.record_count() {
+                writer
+                    .write_record(
+                        reader.doc_id_at(row).unwrap(),
+                        &reader.vector_at_f32(row).unwrap(),
+                    )
+                    .expect("retain genuine model vector");
+            }
+            writer.finish().expect("seal valid stale generation");
+            {
+                let stale_reader = VectorIndex::open_read_only(&candidate)
+                    .expect("stale fixture must be structurally valid, including CRC");
+                assert_eq!(stale_reader.embedder_revision(), stale_revision);
+                assert_eq!(stale_reader.record_count(), reader.record_count());
+                assert_eq!(stale_reader.quantization(), reader.quantization());
+                for row in 0..reader.record_count() {
+                    assert_eq!(
+                        stale_reader.doc_id_at(row).unwrap(),
+                        reader.doc_id_at(row).unwrap()
+                    );
+                    let actual = stale_reader.vector_at_f32(row).unwrap();
+                    let expected = reader.vector_at_f32(row).unwrap();
+                    assert!(
+                        actual
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .eq(expected.into_iter().map(f32::to_bits)),
+                        "fixture must preserve every genuine vector bit"
+                    );
+                }
+            }
+            drop(reader);
+            let stale = fs::read(&candidate).expect("valid stale generation bytes");
             let refused = fsfs.run(
                 temp.path(),
                 &format!("doctor-{tier}-stale"),
