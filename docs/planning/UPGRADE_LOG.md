@@ -14,7 +14,24 @@ guard. The remote command exited 0. All 1,776 tracked non-coordination source
 files matched during the final stage and after completion. The Windows check
 emitted nine warnings; that stage does not deny warnings. This is compiler
 qualification, not a complete release gate. The full default/all-feature Quill
-run and standalone fuzz-manifest check remain in progress.
+run and remaining product test stages remain in progress.
+
+The follow-up native F32 MiniLM test passes with the new certificate-refusal
+diagnostics: one test, 3.15 seconds, remote exit 0 on `ovh-a`. It checks exact
+certification, batching, repeatability, and bounded diagnostics without exposing
+conformance inputs. The 1,776 source files match after execution. The executable
+was removed before later hash retrieval, so this run has no retained ELF hash.
+It does not resolve the separate ARM Int8 certificate refusal.
+
+The full Quill attempt ended without a terminal test result; its successful
+build is not a suite pass. The driver previously buffered both output streams
+until child exit, losing test output when interrupted. It now writes both
+streams incrementally and reports observed byte growth. A real child that
+requires readable output files before exiting fails against the former driver
+(exit 9) and passes against the revised driver. An inherited-pipe control still
+times out and kills the process group. Test selection, validation, and budgets
+are unchanged. The existing repository probe suite and full default/all-feature
+run are in progress; neither has a completed verdict yet.
 
 ### Asupersync 0.4.11 rejected; 0.4.10 retained and verified
 
