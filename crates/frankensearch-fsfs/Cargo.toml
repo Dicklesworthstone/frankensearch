@@ -106,8 +106,8 @@ ahash = { workspace = true }
 # lexical token text — the per-token to_ascii_lowercase heap alloc dominated
 # tokenize_lexical emission. Already resolved in the workspace lock (fusion dep).
 compact_str = "0.10"
-fsqlite = { version = "0.3.18", default-features = false, features = ["native", "async-api"] }
-fsqlite-types = { version = "0.3.18", features = ["native"] }
+fsqlite = { version = "0.4.0", default-features = false, features = ["native", "async-api"] }
+fsqlite-types = { version = "0.4.0", features = ["native"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toon-rust = { workspace = true }
@@ -126,7 +126,7 @@ ureq = { version = "3.4.1", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [dev-dependencies]
-frankensearch = { path = "../../frankensearch", version = "0.5.0", default-features = false }
+frankensearch = { path = "../../frankensearch", version = "0.6.0", default-features = false }
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
 frankensearch-lexical = { workspace = true }

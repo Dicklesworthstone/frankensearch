@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-core"
-version = "0.2.5"
+version = "0.3.0"
 description = "Core traits, types, and error types for frankensearch"
 edition.workspace = true
 license-file.workspace = true

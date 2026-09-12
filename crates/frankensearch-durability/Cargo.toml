@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-durability"
-version = "0.2.4"
+version = "0.3.0"
 description = "RaptorQ durability primitives for frankensearch indices"
 edition.workspace = true
 license-file.workspace = true
@@ -9,9 +9,9 @@ rust-version.workspace = true
 
 [dependencies]
 frankensearch-core = { workspace = true }
-fsqlite-core = { version = "0.3.18", default-features = false, features = ["native"] }
+fsqlite-core = { version = "0.4.0", default-features = false, features = ["native"] }
 fsqlite-error = "0.3.18"
-fsqlite-types = { version = "0.3.18", features = ["native"] }
+fsqlite-types = { version = "0.4.0", features = ["native"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

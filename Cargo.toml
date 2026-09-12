@@ -41,18 +41,18 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 # Internal crates
-frankensearch-core = { version = "0.2.5", path = "crates/frankensearch-core" }
-frankensearch-embed = { version = "0.2.7", path = "crates/frankensearch-embed", default-features = false }
-frankensearch-index = { version = "0.2.6", path = "crates/frankensearch-index" }
-frankensearch-lexical = { version = "0.2.5", path = "crates/frankensearch-lexical" }
-frankensearch-fusion = { version = "0.2.5", path = "crates/frankensearch-fusion" }
-frankensearch-rerank = { version = "0.3.0", path = "crates/frankensearch-rerank" }
-frankensearch-storage = { version = "0.2.4", path = "crates/frankensearch-storage" }
-frankensearch-durability = { version = "0.2.4", path = "crates/frankensearch-durability", default-features = false }
+frankensearch-core = { version = "0.3.0", path = "crates/frankensearch-core" }
+frankensearch-embed = { version = "0.3.0", path = "crates/frankensearch-embed", default-features = false }
+frankensearch-index = { version = "0.3.0", path = "crates/frankensearch-index" }
+frankensearch-lexical = { version = "0.3.0", path = "crates/frankensearch-lexical" }
+frankensearch-fusion = { version = "0.3.0", path = "crates/frankensearch-fusion" }
+frankensearch-rerank = { version = "0.4.0", path = "crates/frankensearch-rerank" }
+frankensearch-storage = { version = "0.3.0", path = "crates/frankensearch-storage" }
+frankensearch-durability = { version = "0.3.0", path = "crates/frankensearch-durability", default-features = false }
 frankensearch-fsfs = { version = "1.10.0", path = "crates/frankensearch-fsfs" }
 frankensearch-tui = { version = "0.2.1", path = "crates/frankensearch-tui" }
 frankensearch-ops = { version = "0.2.1", path = "crates/frankensearch-ops" }
-frankensearch-quill = { version = "0.2.4", path = "crates/frankensearch-quill" }
+frankensearch-quill = { version = "0.3.0", path = "crates/frankensearch-quill" }
 
 # Async runtime (structured concurrency, NO tokio)
 # `default-features = false` keeps asupersync's `test-internals` feature out
@@ -62,19 +62,12 @@ frankensearch-quill = { version = "0.2.4", path = "crates/frankensearch-quill" }
 # it through their [dev-dependencies] entry:
 #   asupersync = { workspace = true, features = ["test-internals"] }
 # Same fix shape as frankensqlite (#104).
-# Keep this pin aligned with HFDT and FrankenSQLite so downstream workspaces
-# resolve a single Asupersync runtime universe. The 0.4.10 floor is the first
-# release that carries `Cx::is_cancelled` (the lock-free cancellation poll
-# frankensearch-quill uses on its per-posting hot path, gh#44); 0.4.4..0.4.9
-# only had `is_cancel_requested`, so a consumer locked below 0.4.10 got E0599
-# from inside the crate instead of a resolver error naming the requirement.
-# Earlier floors carried the native-task abort contract (acknowledged
-# Cancelled is preserved) plus the HTTP/1 streaming cancel/reuse fixes; the
-# 0.4.11 current-thread driver drains queued shadow work before block_on returns,
-# violating the existing shadow serving-latency guard. Keep it out of consumer
-# resolution until that contract is restored (bd-dsbym, UPGRADE_LOG.md).
-# `crates/frankensearch-quill/tests/asupersync_floor.rs` retains the API floor.
-asupersync = { version = ">=0.4.10, <0.4.11", default-features = false, features = ["proc-macros"] }
+# Public Cx types must share the consumer's runtime version. The 0.3 component
+# line (0.4 rerank, 0.6 facade) uses Asupersync 0.5 and FrankenSQLite 0.4.
+# Keep the shadow serving-latency regression and cancellation tests mandatory:
+# the earlier 0.4.11 driver drained queued shadow work before block_on returned
+# (bd-dsbym). A dependency bump alone is not evidence that contract holds.
+asupersync = { version = "0.5.0", default-features = false, features = ["proc-macros"] }
 arc-swap = "=1.9.2"
 
 # Descriptor-relative generation-root admission. Keep the syscall surface

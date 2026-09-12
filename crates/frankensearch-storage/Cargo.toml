@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-storage"
-version = "0.2.4"
+version = "0.3.0"
 description = "FrankenSQLite-backed metadata and embedding job storage for frankensearch"
 edition.workspace = true
 license-file.workspace = true
@@ -10,9 +10,9 @@ rust-version.workspace = true
 [dependencies]
 frankensearch-core = { workspace = true }
 asupersync = { workspace = true }
-fsqlite = { version = "0.3.18", default-features = false, features = ["native", "async-api", "fts5"] }
-fsqlite-types = { version = "0.3.18", features = ["native"] }
-fsqlite-ext-fts5 = { version = "0.3.18", optional = true }
+fsqlite = { version = "0.4.0", default-features = false, features = ["native", "async-api", "fts5"] }
+fsqlite-types = { version = "0.4.0", features = ["native"] }
+fsqlite-ext-fts5 = { version = "0.4.0", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
