@@ -493,8 +493,18 @@ Cargo configuration, all 14 selected tests pass without assertion changes.
 The broad run was canceled after its observed failures and is not a full pass.
 The next oracle run passes 11 tests but fails the live Q1 merge fixture because
 it did not construct the required interior burned lease tail. Source comparison
-again matches all 1,776 files. The requested updater skill's checkpoint pauses
-further repairs after 11 accumulated test-failure events; confirmation is pending.
+again matches all 1,776 files. The requested updater skill paused repairs after
+11 accumulated test-failure events; the owner then authorized continuation.
+The fixture depended on an obsolete assumption that a single-writer merge
+always retires its lease. It now reopens the committed first-stage snapshot,
+making the unused reserved tail unavailable to subsequent batches while keeping
+every original gap, identity, merge-order, and query check. The existing snapshot
+constructor is also exposed to the conformance feature. Default Q1 (one test),
+oracle contracts (12 tests), the unchanged continuous-writer regression (one
+test), and a library-only no-default-features compile check all pass remotely.
+Matching source manifests and executable hashes are retained. Full release
+qualification remains outstanding; capacity and cache-permission refusals are
+not passing tests.
 Oracle v8 and QG-1's
 new screen version distinguish the new dependency from retained historical
 evidence. Further dependency and release qualification remains in

@@ -547,8 +547,8 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
             })?;
             // A single writer's merge safely retains its live lease. Reopen
             // the committed snapshot after merging to end that writer session:
-            // the successor allocator burns the unconsumed lease tail before
-            // later batches create a real gap inside the final merge hull.
+            // the successor allocator starts beyond the reserved lease range,
+            // leaving a real unused tail inside the final merge hull.
             index
                 .concat_merge(
                     cx,
@@ -558,8 +558,11 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
                 )
                 .await
                 .map_err(|error| q1_merge_error("publish first-stage concat merge", error))?;
-            index = QuillIndex::from_in_memory_snapshot(index.snapshot()?.clone(), config.clone())
-                .map_err(|error| q1_merge_error("reopen first-stage snapshot", error))?;
+            index = QuillIndex::from_in_memory_snapshot(
+                index.snapshot()?.as_ref().clone(),
+                config.clone(),
+            )
+            .map_err(|error| q1_merge_error("reopen first-stage snapshot", error))?;
         }
     }
 

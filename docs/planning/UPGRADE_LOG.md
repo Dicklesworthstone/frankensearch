@@ -7,6 +7,15 @@ dependencies. FrankenSQLite 0.3.18 remains current. Updates are applied and
 validated one library family at a time under bead `bd-dsbym`; publication waits
 for the complete release gates.
 
+The combined dependency candidate passed the compiler stages on `hz3` at
+2026-09-12 13:51:44 UTC: formatting, workspace/all-target checking, workspace
+and hybrid-feature Clippy with warnings denied, and the Windows index compile
+guard. The remote command exited 0. All 1,776 tracked non-coordination source
+files matched during the final stage and after completion. The Windows check
+emitted nine warnings; that stage does not deny warnings. This is compiler
+qualification, not a complete release gate. The full default/all-feature Quill
+run and standalone fuzz-manifest check remain in progress.
+
 ### Asupersync 0.4.11 rejected; 0.4.10 retained and verified
 
 The attempted runtime-family upgrade compiled, but the core suite returned
@@ -170,15 +179,39 @@ overlay. `TMPDIR=/tmp` also keeps Cargo configuration isolation fixtures outside
 the real workspace's ancestor configuration. With that environment, all 14
 selected cancellation, configuration-guard, and unchanged startup-deadline tests
 pass. No validator or assertion was weakened. Full qualification remains pending.
-The subsequent oracle-contract run passes 11 tests, including the current v8
+The first subsequent oracle-contract run passed 11 tests, including the current v8
 identity, every retained v2–v7 identity, exact lock resolution, and rejection of
-retired incumbent screens. One live Q1 merge fixture fails with `Q1 E3.5 did not
+retired incumbent screens. One live Q1 merge fixture failed with `Q1 E3.5 did not
 construct an interior burned lease tail`. All 1,776 tracked source files match
-the worker after execution. Repair is paused at the library-updater skill's
+the worker after execution. Repair paused at the library-updater skill's
 explicit checkpoint: 11 test-failure events across this upgrade run, including
 the seven observations in the incomplete broad run and one repeated diagnostic.
-The environment-related failures subsequently passed; the Q1 failure remains
-unresolved. No new version, tag, or publication has been made.
+The environment-related failures subsequently passed; Q1 was unresolved at that
+checkpoint. No new version, tag, or publication has been made.
+
+The owner authorized continuation after that checkpoint. The Q1 fixture still
+assumed that every concat merge retired an ingest lease, but commit
+`9e3117dffa980b73e6292e29fdbd0cc7fdcf1fd4` correctly preserves safe live leases
+for continuous single-writer ingestion. The candidate fixture now reopens its
+committed first-stage snapshot before appending later batches; the existing
+allocator starts beyond the prior reserved lease range, creating the required
+real unused tail inside the final merge hull.
+All original gap, merge-order, identity, and query assertions remain. The existing
+snapshot constructor is exposed to `conformance-internals` as well as benchmarks
+so the default gauntlet can compile this fixture. The exact fixture passes in
+the default-feature build; all 12 oracle-contract tests pass with the oracle
+feature. The unchanged continuous-writer regression also passes (192 documents,
+IDs 0–191, three segments), and a library-only `--no-default-features` check
+confirms the helper is available without development-feature unification.
+Both workers match all 1,776 tracked source files after testing; executable
+hashes are retained. The first candidate's `Arc<KeeperSnapshot>` argument error
+was corrected by cloning the referenced snapshot; its failed compiler attempt
+is not counted as a passing gate. Broader release qualification remains pending.
+
+The standalone fuzz workspace also passes `cargo check --locked --manifest-path
+crates/frankensearch-quill-gauntlet/fuzz/Cargo.toml --bins` on `ovh-a` (100 seconds,
+exit 0). Both fuzz targets resolve the reconciled lockfile, and all 1,776 source
+files match after checking. This verifies compilation; no fuzz campaign ran.
 
 ## 2026-09-07 — FrankenSQLite 0.3.18 source follow-through
 
