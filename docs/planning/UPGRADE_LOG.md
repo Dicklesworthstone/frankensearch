@@ -2,7 +2,7 @@
 
 ## 2026-09-12 — Stable dependency refresh (in progress)
 
-### Current integration status at 20:50 UTC
+### Current integration status at 21:16 UTC
 
 Main now resolves Asupersync 0.5.0 and FrankenSQLite 0.4, following a separate
 publication session. Live crates.io records confirm facade 0.6.0, core/lexical/
@@ -52,21 +52,39 @@ Source and both executed ELF hashes are retained in
 `dependencies/producer-tests-receipt.json`. Focused core/embedder Clippy with
 warnings denied also passed; the RCH batch finished with exit 0 at 20:55:07 UTC.
 
-The current core suite passes 1,128 tests but fails the concurrent anti-rollback
+The first current core suite passed 1,128 tests but failed the concurrent anti-rollback
 publisher test: one loser observes a partially written version file and returns
 `UnresolvedAttempt` instead of a conflict. This race predates the dependency
 upgrade. The evidence and required preservation of torn-head refusal were sent
 to AzureCove under `bd-generation-antirollback-floor-ynwdi`. The previous owner
 has been inactive since August 30 and the file had no reservation or local edits,
 so ChartreuseCarp claimed the existing bead and reserved the bounded repair.
-The core gate remains failed. All shadow pool, cancellation, and serving-latency
-tests passed.
+The repair holds a fresh-descriptor kernel lock through load/CAS scanning,
+publication, and durability completion. It also syncs the store parent for a
+new root and reconciles completed record bytes before load or replay succeeds.
+Two bounded subprocess tests cover overlapping readers/publishers and an
+interrupted writer; genuinely torn heads still refuse further advancement.
+The RCH batch finished with exit 0 at 21:16:08 UTC: 1,131 core tests passed
+(one subprocess helper is ignored in the parent inventory), 404 embedder tests
+passed (five existing ignores), formatting and focused all-target Clippy passed,
+and the Windows index compile guard passed with nine existing warnings.
+All 1,777 source files matched after each command. The terminal log and executed
+core/embedder hashes are retained in `dependencies/floor-publication-receipt.json`.
+Consumer profile wiring remains unfinished; the broader floor bead stays open.
 
-The publication guard still pins the earlier audited runtime/storage family.
-A current publication audit refuses those exact mismatches. Its pins must
-advance deliberately with consumer tests and the existing source/version
-rejection controls, before another release. PurpleBay owns the separate
-current-family storage/durability validation after the doctor regression.
+PurpleBay's current-family consumer run passed 351 storage and 160 durability
+tests, with terminal exit 0 and retained executable hashes. All 25 source hashes
+in `.rch-results/storage-durability-20260912/source.sha256` match this checkout.
+The genuine-model doctor regression also passed, rejecting both stale producer
+tiers and accepting the byte-restored current indexes.
+
+The publication guard now pins exactly Asupersync 0.5.0 and FrankenSQLite 0.4.0.
+Its complete self-test passes, including new isolated negative controls for
+the preceding 0.4.10 runtime and coherent 0.3.18 storage family. Wrong-source,
+duplicate-runtime, patched-dependency, mixed-family, and source-cleanliness
+controls remain intact. These focused results do not complete the broader
+workspace/product or full Quill gates, and macOS ARM qualification remains
+blocked by host memory pressure and the unresolved native certificate mismatch.
 
 ### Earlier dependency census and isolated candidate
 

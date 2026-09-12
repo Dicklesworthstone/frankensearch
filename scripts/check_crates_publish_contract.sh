@@ -16,8 +16,8 @@ CENSUS_SCHEMA_VERSION="frankensearch-crates-registry-census-v1"
 # Audited dependency universe (bd-rnb6l). Both families come from crates.io
 # only; bump these literals deliberately, together with the lockfile, the
 # fresh-process contract pin in frankensearch-embed, and docs/planning/UPGRADE_LOG.md.
-AUDITED_ASUPERSYNC_VERSION="0.4.10"
-AUDITED_FSQLITE_FAMILY_VERSION="0.3.18"
+AUDITED_ASUPERSYNC_VERSION="0.5.0"
+AUDITED_FSQLITE_FAMILY_VERSION="0.4.0"
 USER_AGENT="frankensearch-publish-contract/1.0 (https://github.com/Dicklesworthstone/frankensearch)"
 
 usage() {
@@ -210,27 +210,29 @@ run_source_cleanliness_self_test() {
 # Positive dependency-universe lockfile: one registry Asupersync identity plus
 # a three-member fsqlite family, all at the audited versions.
 write_registry_universe_lock() {
+  local fixture_asupersync="${2:-$AUDITED_ASUPERSYNC_VERSION}"
+  local fixture_fsqlite="${3:-$AUDITED_FSQLITE_FAMILY_VERSION}"
   printf '%s\n' \
     'version = 4' \
     '' \
     '[[package]]' \
     'name = "asupersync"' \
-    "version = \"${AUDITED_ASUPERSYNC_VERSION}\"" \
+    "version = \"${fixture_asupersync}\"" \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' \
     '' \
     '[[package]]' \
     'name = "fsqlite"' \
-    "version = \"${AUDITED_FSQLITE_FAMILY_VERSION}\"" \
+    "version = \"${fixture_fsqlite}\"" \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' \
     '' \
     '[[package]]' \
     'name = "fsqlite-core"' \
-    "version = \"${AUDITED_FSQLITE_FAMILY_VERSION}\"" \
+    "version = \"${fixture_fsqlite}\"" \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' \
     '' \
     '[[package]]' \
     'name = "fsqlite-types"' \
-    "version = \"${AUDITED_FSQLITE_FAMILY_VERSION}\"" \
+    "version = \"${fixture_fsqlite}\"" \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' >"$1"
 }
 
@@ -603,6 +605,30 @@ run_self_test() {
     'members = []' >"${source_root}/Cargo.toml"
 
   # ── Rule 1: Asupersync identity ─────────────────────────────────────────
+
+  # The immediately preceding audited versions remain invalid for this
+  # candidate, even with coherent registry sources and no duplicate packages.
+  local prior_family prior_receipt prior_code
+  for prior_family in asupersync fsqlite; do
+    prior_receipt="${temp_dir}/receipt-prior-${prior_family}.json"
+    if [[ "$prior_family" == "asupersync" ]]; then
+      write_registry_universe_lock "${source_root}/Cargo.lock" "0.4.10"
+      prior_code="DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID"
+    else
+      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.3.18"
+      prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
+    fi
+    if bash "$script_path" \
+      --mode gate --scope facade --metadata "$metadata_path" \
+      --registry-census "$census_path" --release-tag "crates-v0.4.0" \
+      --source-sha "$source_sha" --allow-dirty --output "$prior_receipt"; then
+      echo "ERROR: prior ${prior_family} universe self-test unexpectedly passed" >&2
+      return 1
+    fi
+    jq -e --arg code "$prior_code" '
+      .status == "blocked" and .blocker_codes == [$code]
+    ' "$prior_receipt" >/dev/null
+  done
 
   # right version, wrong registry
   printf '%s\n' \
