@@ -12,24 +12,27 @@ open until their acceptance criteria, including consumer execution, are met.
 - [x] Inventory all 22 nonclosed bug beads and GitHub issues 41, 43, 46, 47, 48.
 - [x] Ask existing owners for current progress and bounded handoffs (Mail 41382).
 - [ ] Reconcile owner replies; do not interpret silence or null assignee as permission to overwrite work.
-- [ ] Restore tracker mutation capability with its graph owner: current CLI expects schema 19, DB is 17.
+  - ChartreuseCarp resumed release/dependency ownership (Mail 41394); active gate and new CLI regression handed off in 41397/41398. Await execution acknowledgment/results.
+- [x] Restore tracker mutation capability with its graph owner: migrate schema 17 to 19.
   - [x] Inspect explicit migration plan read-only and its source preconditions: eligible 17→19, integrity OK, 1298 issues/2257 dependencies/3779 comments. Prestate-bound receipt reported in Agent Mail; no apply performed.
-  - [ ] Coordinate a single migration writer before any apply; preserve JSONL and DB family.
-  - [ ] Verify ready/show, import only when appropriate, and dependency-cycle checks after recovery.
-  - [ ] Record provisional claims and the doctor follow-up in Beads after recovery.
+  - [x] Coordinate a single migration writer before any apply; preserve JSONL and DB family. ChartreuseCarp delegated PurpleBay in Mail 41399; peers notified in 41401. Snapshot `.beads/recovery_20260912T194346Z`; supported migration run `20260912T194351.279401Z-476704-0` retains raw prestate under `.beads/.br_recovery/schema-migrations/` and supports undo.
+  - [x] Verify ready/show, import and dependency-cycle checks after recovery: reads work, sync healthy with 1298 DB/JSONL issues and no drift, import zero changes, zero active cycles (two archived closed cycles). Doctor remains degraded for retained historical recovery artifacts; no deletion or blanket repair performed.
+  - [x] Record claim bd-6kafg as PurpleBay/in_progress and doctor follow-up under bd-pz8va after recovery; flush succeeded.
 - [x] Land doctor producer-admission fix `062f5b8f` (main and compatibility mirror).
 - [x] Run remote formatting and 16 doctor library tests (semantic-support/no-default; all pass).
 - [ ] Validate doctor fix with a genuine model and stale index through the production CLI.
   - [x] Add isolated production-CLI regression `loader_only::doctor_rejects_stale_real_model_producer_revisions` in the existing quickstart suite; real index vectors, both tiers, stale-revision refusal, exact-byte restoration acceptance, observer-only assertions.
   - [ ] Compile and execute the ignored genuine-model regression with both pinned caches; no pass yet.
+  - [x] Remote rustfmt passed for this new regression on hz4 at 19:37:30 UTC.
 - [ ] Validate default, native, lite and full workspace gates for the doctor fix.
 - [ ] Reproduce ARM native refusal with the new digest diagnostic; locate first numerical divergence.
 - [ ] Implement the supported numerical repair or explicitly distinct qualified producer only after evidence.
 - [ ] Continue code-bearing bug work in dependency order; retain each new discovered task below.
+  - Ordinary `br ready --json` now works: bd-6kafg was the only unowned ready bug and is now claimed; other ready entries are the owned installer, publication reconciliation and bd-d7xk1.
 
 ## GH #47 / bd-6kafg: native MiniLM ARM64 exact producer rejection
 
-Owner: provisional PurpleBay; native migration parent bd-2ba5 remains peer-owned.
+Owner: PurpleBay (Beads claim recorded); native migration parent bd-2ba5 remains peer-owned.
 
 - [x] Reproduce native Int8 refusal on ARM and success on x86 with matched source/model (existing receipts).
 - [x] Preserve exact certificate gate; no tolerance or reporter-hash substitution.
@@ -38,6 +41,7 @@ Owner: provisional PurpleBay; native migration parent bd-2ba5 remains peer-owned
 - [x] Refresh private Mac RCH controller health/capacity: healthy, zero jobs, eight available slots. Preserve original dirty release clone; use a separate clean current-source clone.
 - [ ] Run one native certificate probe with the diagnostic patch; retain terminal output and executable hash.
   - Attempt 2026-09-12 19:32 UTC: strict private RCH refused before execution (exit 103, memory_pressure_critical). No model/compile verdict; retry only after fresh host-pressure admission. Own clean clone exists at `/tmp/fsfs-release-root-20260912/frankensearch-purplebay`; peer release clone is untouched.
+  - Fresh 19:39 UTC status confirms critical memory pressure 95.081%, high confidence, telemetry age 59s. Host-owner relief or another admitted ARM worker is required; no blind retries or threshold changes.
 - [ ] Bind compiler target features, model hashes and source to both platforms.
 - [ ] Compare tokenizer IDs and positions before numerical kernels.
 - [ ] Compare embedding layer-normalization outputs.
@@ -141,7 +145,8 @@ RCH validation, and evidence-backed Beads closure. None is silently waived.
 
 - [ ] Preserve exact command, source, selected test count, terminal exit and executed artifact identity where required.
 - [ ] Complete `scripts/quality-gate.sh` remotely with registered models; retain failures instead of weakening gates.
-  - Running strict RCH on ovh-a from transferred 062f5b8f source, 19:33 UTC. fmt passed; check compiling. Remote Git metadata reports dd093fb2+dirty, so this invocation is not release-source provenance; preserve this limitation. The newly added genuine-model regression is not part of that earlier transferred tree.
+  - Running strict RCH on ovh-a from transferred 062f5b8f source, 19:33 UTC. Remote Git metadata reports dd093fb2+dirty, so this invocation is not release-source provenance; preserve this limitation. The newly added genuine-model regression is not part of that earlier transferred tree.
+  - Formatting, workspace/all-target check (282s), Clippy plus hybrid Clippy, and Windows index cross-check (92s) passed; workspace library tests are compiling. External fast_cmaes emits seven deprecated-constant warnings and Windows index check emits nine dead-code warnings; no unrelated dependency edits or lint suppressions made.
 - [ ] Complete additional Quill full/probe lanes for affected changes.
 - [ ] Reconcile actual shipped fixes with every GH/bead acceptance criterion; do not close a broad issue for one sub-fix.
 - [ ] Commit only intended paths; preserve the unrelated golden `.actual.json` file.
@@ -150,3 +155,4 @@ RCH validation, and evidence-backed Beads closure. None is silently waived.
 - [ ] Newly discovered: RCH source-content receipt refuses a symlink in sibling fast_cmaes `.claude/worktrees`; use a supported isolated-source route, do not delete peer files or weaken proof.
 - [ ] Newly discovered: retain executable provenance before remote cleanup; old F32 diagnostic run has source/log evidence but no executable digest.
 - [ ] Newly discovered: full-feature/genuine-model doctor regression is still needed despite 16 passing library tests.
+- [ ] bd-d7xk1 (ready problem task, not bug-typed): inspect seven unreferenced source files (`core/metrics.rs`, `durability/tantivy_wrapper.rs`, `fusion/repro_blend.rs`, `fusion/repro_rrf.rs`, `tui/repro_input.rs`, `rerank/test_api.rs`, `rerank/test_inputs.rs`). Register only real supported functionality or move valid repros into actual tests; deletion requires explicit written permission. Add a meaningful source-reachability check without compiling dead code solely to satisfy a census.
