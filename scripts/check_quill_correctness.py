@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import selectors
 import signal
 import subprocess
 import sys
@@ -55,23 +56,68 @@ def invoke(argv, seconds, label, logs):
     """Keep both output streams and reap this invocation's entire process group."""
     started = time.monotonic()
     emit("started", label=label, argv=argv, budget_seconds=seconds)
-    process = subprocess.Popen(
-        argv, cwd=PACKAGE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, start_new_session=True,
-    )
+    stdout_path = logs / f"{label}.stdout"
+    stderr_path = logs / f"{label}.stderr"
     timed_out = False
-    try:
-        stdout, stderr = process.communicate(timeout=max(seconds, 0.0001))
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        os.killpg(process.pid, signal.SIGTERM)
+    # Retain child output even if the remote controller interrupts this driver.
+    # Report only observed output growth, not a synthetic liveness heartbeat.
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file, \
+            selectors.DefaultSelector() as streams:
+        process = subprocess.Popen(
+            argv, cwd=PACKAGE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        streams.register(process.stdout, selectors.EVENT_READ, stdout_file)
+        streams.register(process.stderr, selectors.EVENT_READ, stderr_file)
+        previous_sizes = (0, 0)
+        last_output_time = started
+
+        def collect(deadline):
+            nonlocal previous_sizes, last_output_time
+            while streams.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, seconds)
+                for key, _ in streams.select(timeout=min(5, remaining)):
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if chunk:
+                        key.data.write(chunk)
+                        key.data.flush()
+                    else:
+                        streams.unregister(key.fileobj)
+                        key.fileobj.close()
+                sizes = (stdout_file.tell(), stderr_file.tell())
+                now = time.monotonic()
+                if sizes != previous_sizes and (now - last_output_time >= 5 or not streams.get_map()):
+                    emit("output", label=label, stdout_bytes=sizes[0], stderr_bytes=sizes[1])
+                    previous_sizes = sizes
+                    last_output_time = now
+            process.wait(timeout=max(deadline - time.monotonic(), 0.0001))
+
         try:
-            stdout, stderr = process.communicate(timeout=5)
+            collect(started + max(seconds, 0.0001))
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
-    (logs / f"{label}.stdout").write_text(stdout)
-    (logs / f"{label}.stderr").write_text(stderr)
+            timed_out = True
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                collect(time.monotonic() + 5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                collect(float("inf"))
+                process.wait()
+        except BaseException:
+            # A log write failure must not leave the command running unobserved.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        finally:
+            for key in list(streams.get_map().values()):
+                key.fileobj.close()
+    stdout = stdout_path.read_text()
+    stderr = stderr_path.read_text()
     if stderr:
         print(stderr, end="", file=sys.stderr, flush=True)
     emit("finished", label=label, exit_code=process.returncode,
@@ -185,6 +231,34 @@ def expect_refusal(code, operation):
         raise Refusal("NEGATIVE_ACCEPTED", code)
 
 
+def probe_output_retention(logs):
+    # The real child refuses success unless both streams are readable before it
+    # exits. The former communicate-then-write implementation fails this probe.
+    child = """import pathlib, sys, time
+print('live-out', flush=True)
+print('live-err', file=sys.stderr, flush=True)
+paths = [pathlib.Path(p) for p in sys.argv[1:]]
+deadline = time.monotonic() + 2
+while time.monotonic() < deadline:
+    if all(p.exists() and marker in p.read_text() for p, marker in zip(paths, ['live-out', 'live-err'])):
+        sys.exit(0)
+    time.sleep(0.01)
+sys.exit(9)
+"""
+    label = "probe-live-output"
+    code, output = invoke([sys.executable, "-c", child,
+                           str(logs / f"{label}.stdout"), str(logs / f"{label}.stderr")],
+                          10, label, logs)
+    if code or output != "live-out\n" or (logs / f"{label}.stderr").read_text() != "live-err\n":
+        raise Refusal("OUTPUT_RETENTION_FAILED", label)
+    emit("positive_control", observed="both streams retained before child exit")
+    # Parent exit must not silently truncate output inherited by a descendant;
+    # the unchanged timeout still kills the invocation's whole process group.
+    descendant = "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])"
+    expect_refusal("TIMEOUT", lambda: invoke([sys.executable, "-c", descendant],
+                                           0.5, "probe-inherited-output-timeout", logs))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -200,6 +274,8 @@ def main():
     os.environ.pop("RUST_TEST_NOCAPTURE", None)
     emit("source", head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, timeout=10).strip(),
          lock_sha256=digest(ROOT / "Cargo.lock"), host=os.uname().nodename, logs=str(logs))
+    if args.probes:
+        probe_output_retention(logs)
     failures = []
     for configuration in (["default", "all"] if args.full else ["all"]):
         binaries = build(configuration, logs)
