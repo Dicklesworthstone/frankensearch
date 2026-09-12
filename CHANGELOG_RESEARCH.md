@@ -1,5 +1,81 @@
 # Changelog research: fsfs 1.10.0 / FrankenSearch 0.5.0
 
+## September 12 producer correction after registry publication
+
+`b62074148d7fd38029818e638aa31f7699dc93fd` corrects Potion's execution
+protocol from SafeTensors 0.7.0 to the actual 0.8.0 selected by `347be73e`.
+The archive publication source `dd093fb2` predates this correction, so the
+changelog labels it unreleased and includes published adapter 0.3.0 among the
+producer identities that require rebuilding. No vector certificate or
+historical manifest fingerprint was replaced.
+
+RCH validation: the unchanged historical fixture fails on the bumped adapter;
+the repaired candidate passes 404 embedder unit tests, eight fresh-process
+logging tests, three real-Potion checks, formatting and focused Clippy. The
+fresh-process preflight compares the protocol against the actual locked
+Tokenizers and SafeTensors versions. Source matches all 1,777 tracked inputs;
+both test-binary hashes and the terminal log are retained under
+`/data/release-work/frankensearch-release-20260912/dependencies/` in
+`producer-tests-receipt.json` and `producer-independent-embed-vmi.log`.
+The full core suite separately exposed an existing anti-rollback publication
+race. Commit `a4e86336761d982783ab0f4fec002cbbcee0e6bf` fixes it with a
+per-root kernel lock across publication and durability. Independent-process
+reader/competitor and interrupted-writer regressions preserve torn-head refusal.
+The subsequent RCH batch passed all 1,131 core tests, formatting, focused Clippy,
+and the Windows index compile guard; the single ignored core entry is a helper
+executed by the subprocess tests. `floor-publication-receipt.json` retains the
+source and executable identities. The broader floor bead remains open for
+consumer profile wiring. These focused results do not qualify the complete release.
+
+The new repair links name exact local commits; public link availability
+must be checked after the qualified source is pushed.
+
+## September 12 registry-publication reconciliation
+
+Small-update scope: correct the publication status of the existing post-1.10.0
+inventory and document the new runtime boundary. This is not a reconstruction
+of earlier history or a claim that the next binary release is qualified.
+
+- Live crates.io metadata plus downloads verified ten new library archives:
+  facade 0.6.0, rerank 0.4.0, core/embed/index/lexical/fusion/Quill/storage/
+  durability 0.3.0. Every SHA-256 matches the registry and every
+  `.cargo_vcs_info.json` identifies `dd093fb230404ab08be2ed6f27776ed6c4796485`.
+  Publication times span 2026-09-12 14:28:46–14:33:59 UTC; all are unyanked.
+  Receipt: `/data/release-work/frankensearch-release-20260912/registry-20260912-family.json`.
+- GitHub API confirms annotated tag `frankensearch-v0.6.0`, object
+  `8c9ed3c53cede7d6489bdc97f6e87d61afc1215f`, tagged 14:28:41 UTC, targets that
+  same commit. Live Releases list still ends at September 8. Therefore the
+  new timeline entry is crates.io publication plus a plain tag, not a GitHub
+  Release. fsfs remains 1.10.0; TUI/ops remain 0.2.1.
+- Inspected the final ten nonmerge publication commits and their relevant
+  diffs: `347be73e` runtime/component boundary, `f20e9446` durability type
+  alignment, `4fcbdb55` FTS5 Send proof, `06e053e1`/`309ae25a` caller-owned
+  shadow polling and admission, `ad0a6083`/`ff29cf76` persisted pooled
+  comparison regressions, `b9e0c109` lock closure, `dd093fb2` assertion
+  formatting, plus `8b588964` descriptor-bound mapping inspection. Existing
+  research below covers the earlier loader/HNSW/Quill changes in the shared
+  post-1.10.0 inventory. The full source window contains 82 nonmerge commits.
+- Corrected the obsolete claims that all post-September-8 library changes were
+  unreleased and that current consumers still resolve Asupersync 0.4.10. The
+  earlier 0.4.11 latency failure remains in the upgrade log; historical
+  0.4.10 receipts are not current 0.5.0 qualification.
+- Bead `bd-dsbym` remains in progress. Cross-platform binary publication,
+  current full gates and fresh registry-consumer execution are not established
+  by the archive checks. No new release/tag/publication was performed by this
+  reconciliation.
+- Structural changelog validation passes with the existing historical bare-hash
+  warning. All newly added GitHub commit/tag/issue URLs return HTTP 200. The
+  crates.io HTML routes return 404 in this environment despite available API
+  metadata and archives; the new version entry therefore links to its verified
+  HTTP-200 official version API record.
+- Independent draft audit corrected a mistaken adapter/package distinction:
+  `model_manifest.rs` derives implementation revision from `CARGO_PKG_VERSION`,
+  so published package 0.3.0 also identifies producer 0.3.0. The preparation
+  version 0.2.7 is historical, not the current producer. Changelog migration
+  advice now requires rebuilding both older producer generations. The audit
+  also found a stale 0.2.7 prefix in historical fixture reconstruction; repair
+  and validation are tracked separately under the ongoing dependency bead.
+
 Requested 2026-09-08 using `changelog-md-workmanship`, small-update mode.
 Scope: every landed commit after the 1.9.1 release source
 `9d132a0315e12da0442aa7a943852091fe043037` through the 1.10.0 source
@@ -493,8 +569,18 @@ Cargo configuration, all 14 selected tests pass without assertion changes.
 The broad run was canceled after its observed failures and is not a full pass.
 The next oracle run passes 11 tests but fails the live Q1 merge fixture because
 it did not construct the required interior burned lease tail. Source comparison
-again matches all 1,776 files. The requested updater skill's checkpoint pauses
-further repairs after 11 accumulated test-failure events; confirmation is pending.
+again matches all 1,776 files. The requested updater skill paused repairs after
+11 accumulated test-failure events; the owner then authorized continuation.
+The fixture depended on an obsolete assumption that a single-writer merge
+always retires its lease. It now reopens the committed first-stage snapshot,
+making the unused reserved tail unavailable to subsequent batches while keeping
+every original gap, identity, merge-order, and query check. The existing snapshot
+constructor is also exposed to the conformance feature. Default Q1 (one test),
+oracle contracts (12 tests), the unchanged continuous-writer regression (one
+test), and a library-only no-default-features compile check all pass remotely.
+Matching source manifests and executable hashes are retained. Full release
+qualification remains outstanding; capacity and cache-permission refusals are
+not passing tests.
 Oracle v8 and QG-1's
 new screen version distinguish the new dependency from retained historical
 evidence. Further dependency and release qualification remains in

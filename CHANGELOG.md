@@ -6,13 +6,14 @@ Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/fra
 
 Release history through [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) and the [0.5.0 crate bundle](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0), published 2026-09-08. All 13 crate versions are also published on crates.io. The latest update covers every landed commit from v1.9.1 through v1.10.0 using git diffs, release metadata and checked-in Beads; see [research coverage](CHANGELOG_RESEARCH.md). Earlier history is preserved. **v1.4.1 and v1.4.2 are git tags with no GitHub Release.**
 
-Scope window: the release reconstruction covers v1.9.1 → v1.10.0 and their 2026-09-08 publication records. The unreleased section also records subsequent Quill fixes, warm-daemon streaming, model-receipt reuse, executable acceptance, the GH #43/#46 indexing and loader work, and dependency qualification through 2026-09-12 (UTC).
+Scope window: the release reconstruction covers v1.9.1 → v1.10.0 and their 2026-09-08 publication records. The subsequent-change inventory covers Quill fixes, warm-daemon streaming, model-receipt reuse, executable acceptance, the GH #43/#46 indexing and loader work, and dependency qualification through 2026-09-12 (UTC). The 0.6.0 library family was published to crates.io on September 12; its plain git tag is not a GitHub Release, and the next fsfs binary release remains pending.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased | Release preparation | 2026-09-09–12 | Progressive warm-daemon streaming, model receipt/shared-load reuse, indexing cancellation and pressure checks, Quill repairs, and dependency updates |
+| Unreleased fsfs | Release preparation | 2026-09-09–12 | Progressive warm-daemon streaming, indexing cancellation and pressure checks, model reuse, and doctor producer admission |
+| [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
 | [crates-v0.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0) | Library bundle | 2026-09-08 | All 13 publishable members and release evidence share v1.10.0 source; binary release retains latest routing |
 | [v1.9.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.9.1) | Release | 2026-09-07 | Self-update preserves Linux ABI and full/lite semantic capability |
@@ -29,25 +30,31 @@ Scope window: the release reconstruction covers v1.9.1 → v1.10.0 and their 202
 
 ---
 
-## Unreleased
+## Changes since fsfs 1.10.0 / crates 0.5.0
 
-Changes on `main` after the 2026-09-08 publication of v1.10.0 / crates 0.5.0. These changes are not yet in a published binary or crate release.
+Changes on `main` after the 2026-09-08 publication. Library changes through
+[`dd093fb2`](https://github.com/Dicklesworthstone/frankensearch/commit/dd093fb230404ab08be2ed6f27776ed6c4796485)
+are included in the September 12 crate publication described below. fsfs CLI
+changes remain unreleased; fsfs is still 1.10.0. Gauntlet and release-checker
+changes describe repository tooling, not published library capabilities.
+Library corrections after that publication, including the Potion dependency
+identity repair below, also remain unreleased.
 
 ### Added
 
 - **Progressive search can reuse the warm fsfs daemon.** On Unix, `fsfs search --stream` now uses the daemon by default and accepts `--daemon`; `--no-daemon` retains direct execution. Previously, streaming bypassed the daemon and could not reuse its loaded models. The daemon now sends an attestation, Initial results, optional refinement, and a terminal frame as they become available. JSONL and TOON clients consume the same validated sequence, and complete cached replays are explicitly marked. Frames, queued bytes, retained cache entries and admitted clients are bounded; disconnects stop publication and drain owned inference. The legacy stdio response remains available. [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/35e8c2312e9c5529a929862f530bfcaafc8ff5d4); [completed workstream and validation](https://github.com/Dicklesworthstone/frankensearch/blob/462035f39d3c70f8705312b8ff7b88c5837b612f/.beads/issues.jsonl#L838) (`bd-fsfs-progressive-daemon-dq48i`).
 
-- **`Model2VecEmbedder::load_shared` / `load_shared_with_name` reuse the process-wide instance ([#46](https://github.com/Dicklesworthstone/frankensearch/issues/46)).** While a caller retains the model, later loads in the same process reuse its parsed 500,353-piece Unigram tokenizer and 512 MB matrix. Artifact verification still runs on every call, before the cache is consulted, so an artifact that fails admission is never served from cache and a model rewritten or replaced on disk invalidates its verification receipt and forces a full hash pass rather than reusing the resident matrix. The cache holds a `Weak`, so the matrix is released when the last caller drops its `Arc`. `detect_fast_embedder` and the lazy download path use it; `fsfs doctor`'s loader probe deliberately does not, because a cache hit would answer from a model read minutes ago rather than from the bytes on disk now. This amortises within a process, not across processes: a one-shot CLI invocation still pays a full load, and cross-process tokenizer reuse would need a compiled representation `tokenizers` 0.23 does not provide (its Unigram serializer omits the trie and its deserializer rebuilds it). `frankensearch-embed` 0.2.7.
+- **`Model2VecEmbedder::load_shared` / `load_shared_with_name` reuse the process-wide instance ([#46](https://github.com/Dicklesworthstone/frankensearch/issues/46)).** While a caller retains the model, later loads in the same process reuse its parsed 500,353-piece Unigram tokenizer and 512 MB matrix. Artifact admission runs before cache lookup; replacing or rewriting model files invalidates the receipt and requires full hashing. A `Weak` cache releases the matrix when the last caller drops its `Arc`. `detect_fast_embedder` and lazy downloads use this path; the doctor loader probe reads the current disk artifacts independently. A new CLI process still pays the full load because Tokenizers 0.23 rebuilds its Unigram trie when deserializing. Published in `frankensearch-embed` 0.3.0, whose producer implementation revision also names 0.3.0.
 
 ### Changed
 
 - **FrankenTUI 0.7.0, wide 1.7.0, crc32fast 1.5.1, and TOML 1.1.6.** The terminal framework, SIMD, checksum, and configuration updates pass their affected consumer suites. The Wide update also passes the real native F32 MiniLM certificate, batching, and repeatability check on x86. These checks establish compatibility, not a measured speedup. Full release qualification remains pending; see the [upgrade log](docs/planning/UPGRADE_LOG.md).
 
-- **Model producer identities name the updated Tokenizers and FastEmbed dependencies.** Tokenizers 0.23.2 and FastEmbed 6.0.3 pass the existing Potion, MiniLM, Snowflake, and Nomic conformance checks without changing their vector certificates. Historical manifest fingerprints remain covered. The corrected producer identities require rebuilding semantic indexes made by the prior producers. Asupersync remains on 0.4.10 because 0.4.11 failed the existing caller-visible shadow latency guard. See the [dependency qualification record](docs/planning/UPGRADE_LOG.md).
+- **Model producer identities name the updated Tokenizers and FastEmbed dependencies.** Tokenizers 0.23.2 and FastEmbed 6.0.3 pass the existing Potion, MiniLM, Snowflake, and Nomic conformance checks without changing their vector certificates. Historical manifest fingerprints remain covered. The corrected producer identities require rebuilding semantic indexes made by the prior producers. The initial Asupersync 0.4.11 attempt failed the caller-visible shadow latency guard; the published family subsequently moved to 0.5.0 with the shadow execution changes described below. Earlier dependency checks do not qualify that later combined graph. See the [dependency qualification record](docs/planning/UPGRADE_LOG.md).
 
 - **Native HNSW persistence now records the source-row map.** Metadata format v7 binds graph origins to the physical vector rows and their source extent. Append preserves graph origins when sorted vector rows move, and refuses changed or deleted old vectors, duplicate IDs, and mismatched source maps with an explicit rebuild disposition. Old v6 sidecars require rebuilding. The validation still reads the full source, and loading/saving still processes the whole graph; this is not a constant-cost append claim. [Persistent mapping and append](https://github.com/Dicklesworthstone/frankensearch/commit/ecbc659815a418d44a9aad949b374ac7b0999f2b); [source-map refusal](https://github.com/Dicklesworthstone/frankensearch/commit/8f429d2ea204f18870705406ff19a69258dbfeff).
 
-- **The 0.2.7 Model2Vec adapter changes the stored producer revision.** Its embedding space and output certificate are unchanged, but fsfs and strict library search admission also require the producer identity. Rebuild a 0.2.6-produced index before using it with the new adapter; equal vectors do not bypass that check. [Adapter change](https://github.com/Dicklesworthstone/frankensearch/commit/c92d193c0efcb445ca51863c7cbbb1acb50ef781); [fsfs admission](https://github.com/Dicklesworthstone/frankensearch/blob/90e8fb147db19741c0f9205aa456d1e9b1362034/crates/frankensearch-fsfs/src/runtime.rs#L15409).
+- **The published 0.3.0 embedder changes the stored producer revision.** Model2Vec first moved to adapter 0.2.7 during preparation; the final package bump also changes its implementation revision to 0.3.0. fsfs and strict library admission require that exact producer identity even when the embedding space and output certificate are unchanged. Rebuild indexes made by earlier producers, including 0.2.6 and 0.2.7, before using the new adapter. [Initial adapter change](https://github.com/Dicklesworthstone/frankensearch/commit/c92d193c0efcb445ca51863c7cbbb1acb50ef781); [published package bump](https://github.com/Dicklesworthstone/frankensearch/commit/347be73ebad6d0172df99ec78c394e2095ece8a4); [fsfs admission](https://github.com/Dicklesworthstone/frankensearch/blob/90e8fb147db19741c0f9205aa456d1e9b1362034/crates/frankensearch-fsfs/src/runtime.rs#L15409).
 
 - **Model2Vec loading no longer holds the safetensors file and the decoded matrix at the same time ([#46](https://github.com/Dicklesworthstone/frankensearch/issues/46)).** The loader read the whole `model.safetensors` into a `Vec<u8>`, deserialized over that buffer and then materialised a second full `Vec<f32>` — two live copies of a half-gigabyte artifact. It now parses only the header, runs every admission check (receipt, dtype, 2-D shape, exact byte count, attested dimension, identity) against the shape that header reports, and only then streams the tensor into its final buffer in 1 MiB reads. Decoding is unchanged — the same little-endian `f32::from_le_bytes` over the same bytes in the same order — and a real-model regression asserts the streamed matrix is bit-identical to the previous whole-buffer decode, as are the embeddings it feeds. Measured on the registered `potion-multilingual-128M` (F32 `[500353, 256]`, 512,361,560 B), median of 9 runs on an otherwise idle host: peak RSS for one cold load 1,801,240,576 B → 1,288,880,128 B (**−512,360,448 B, −28.4%** — exactly one copy of the 512,361,472-byte tensor), page reclaims 112,001 → 80,792 (−27.9%), load-and-embed wall time 810 ms → 729 ms (−10.0%). The dtype is now checked outright rather than implied by a byte-count comparison, and a truncated, over-long or absurd-header artifact is refused by name.
 
@@ -56,6 +63,23 @@ Changes on `main` after the 2026-09-08 publication of v1.10.0 / crates 0.5.0. Th
 - **The executable quickstart gate requires both search tiers and actual progressive results.** The Linux DSR lane builds and installs into a private root, checks executable byte identity, and requires ranked hybrid and vector-only results, Initial/Refined records, authoritative generation artifacts, and the model receipts actually admitted by the loaders. Eighteen failure controls cover model, result, generation, lifecycle and provenance failures. Supplied binaries retain an explicitly unknown source revision; the checker revision cannot qualify them as a source-bound release build. [Gate and receipt wiring](https://github.com/Dicklesworthstone/frankensearch/commit/3d1c2fddb09641153cc7d66a61f835751a4b1538); [isolated Cargo discovery](https://github.com/Dicklesworthstone/frankensearch/commit/8789e0449eb01e3e6250cc4358eef003366d4ff9).
 
 ### Fixed
+
+- **Concurrent local anti-rollback publishers no longer expose an unfinished record.**
+  Readers and competing publishers wait for the active writer's durability barrier,
+  so same-base attempts produce one winner and typed conflicts. If a writer dies
+  with a torn record, later operations still refuse the unresolved head. New root
+  entries and completed records are synced before acknowledgement. This library
+  correction follows the September 12 publication and remains unreleased.
+  [Fix and cross-process regressions](https://github.com/Dicklesworthstone/frankensearch/commit/a4e86336761d982783ab0f4fec002cbbcee0e6bf).
+
+- **Potion now identifies the SafeTensors version it actually uses.** The
+  September 12 dependency update selected SafeTensors 0.8.0, but the published
+  embedder's producer protocol still named 0.7.0. The corrected producer
+  requires rebuilding indexes carrying that earlier identity, including those
+  made with the published 0.3.0 adapter. Historical fingerprints and numerical
+  certificates are unchanged; real-Potion certification and streamed decoding
+  still pass. A fresh-process check now compares the declared protocol with
+  Cargo.lock. [Repair and regressions](https://github.com/Dicklesworthstone/frankensearch/commit/b62074148d7fd38029818e638aa31f7699dc93fd).
 
 - **Published Quill segment authentication streams from the same opened file that backs the mapping.** MANIFEST admission hashes the prefix in 16 KiB reads, then releases the file handle. A path rename cannot switch the bytes being authenticated, and malformed or truncated witnesses remain rejected. This avoids reading the witness through every mapped page while preserving the content check. [Implementation and descriptor/corruption regressions](https://github.com/Dicklesworthstone/frankensearch/commit/b51b46ab90142c35668a74e19afab88219eefb7e).
 
@@ -67,11 +91,42 @@ Changes on `main` after the 2026-09-08 publication of v1.10.0 / crates 0.5.0. Th
 - **Typed-query fuzz replays can be published and reopened successfully.** Atomic publication changes the file's change-time; the retained descriptor now accounts for that transition while still checking inode identity, the final directory entry and the original content digest. A staged rewrite remains rejected even if its modification time is restored. The fuzz seed multiplier also matches the existing schema-pinned mapping. [Publication repair](https://github.com/Dicklesworthstone/frankensearch/commit/802784a144a5270396ba3d945fe9fdadc825f7c0); [seed correction](https://github.com/Dicklesworthstone/frankensearch/commit/acee3572cbf8dfc592d7ee3454f4c6b4ea8351c9); [adversarial regression](https://github.com/Dicklesworthstone/frankensearch/commit/820e83e1e6df618f3db7b655c55882d307fa89af).
 - **Quill: a failed replacement ingest can no longer be committed as a deletion ([#45](https://github.com/Dicklesworthstone/frankensearch/issues/45)).** `upsert` staged a tombstone for every identity the batch replaced and retained that proposal on the writer *before* batch admission ran and any row was accumulated. When the batch then failed — an admission refusal, a cancellation, a shard error partway through — the tombstone-only proposal survived, and the explicit `commit()` the retry guard demanded published it: a valid MANIFEST, every segment authenticating, serving none of the documents the batch meant to update (the engine half of cass#457). A failed replacement ingest now discards the whole scalar transaction — the proposal, any partially accumulated rows, and the retry guard — so the previous committed generation stays authoritative and the writer is left exactly as the caller found it. Regression tests cover the admission-refused shape, the cancelled-midway shape with real partial shard state, and the retry that follows.
 - **Quill: publication gained a live-document floor ([#45](https://github.com/Dicklesworthstone/frankensearch/issues/45)).** `KeeperWriter::publish_with_intent` and `KeeperSnapshot::publish_owned_segments_with_intent` take a new `PublishIntent`; `validate_segment_transitions` refuses a `PreserveLiveDocuments` successor that would serve fewer live documents than the generation it replaces, with the new typed `KeeperError::LiveDocumentFloor` naming both generations and both counts. `commit`, upsert, Delta seals, bulk-load completion, tier merges and compaction publish with that intent; `delete_documents` and `delete_all` publish with `ExplicitDeletion` and are the explicit opt-in for a smaller generation (a full replace with fewer documents is `delete_all` followed by the new corpus). A `commit()` refused by the floor discards the unpublishable proposal instead of retaining it for a retry that could only fail again, so the writer stays usable. The raw `publish` / `publish_owned_segments` entry points keep their semantics: a proposal handed to them tombstone by tombstone is taken as the caller's explicit deletion intent. Reopening an already published pair is a shape check and never re-applies the floor, so a published `delete_all` still opens.
-- **`frankensearch-quill` declares the asupersync floor it actually needs ([#44](https://github.com/Dicklesworthstone/frankensearch/issues/44)).** The minimum requirement rises from 0.4.4 to 0.4.10; the later dependency qualification described above also caps resolution below 0.4.11. `Cx::is_cancelled`, the lock-free poll on the per-posting cancellation hot path, exists only from asupersync 0.4.10, so a consumer whose lockfile held 0.4.9 or below resolved the published 0.2.3 / 0.2.4 crates fine and then failed with three `E0599` errors from inside `index.rs` instead of a resolver error naming the requirement. `crates/frankensearch-quill/tests/asupersync_floor.rs` checks the declared requirement because a lockfile alone cannot catch an incorrect minimum.
+- **`frankensearch-quill` declares the asupersync floor it actually needs ([#44](https://github.com/Dicklesworthstone/frankensearch/issues/44)).** The initial fix raised the minimum from 0.4.4 to 0.4.10; the published Quill 0.3.0 family now requires 0.5.0. `Cx::is_cancelled`, the lock-free poll on the per-posting cancellation hot path, exists only from asupersync 0.4.10, so a consumer whose lockfile held 0.4.9 or below resolved the published 0.2.3 / 0.2.4 crates fine and then failed with three `E0599` errors from inside `index.rs` instead of a resolver error naming the requirement. `crates/frankensearch-quill/tests/asupersync_floor.rs` checks the declared requirement because a lockfile alone cannot catch an incorrect minimum.
 
 ### Known limitations
 
 - **Native English Int8 MiniLM remains unqualified on ARM64 ([#47](https://github.com/Dicklesworthstone/frankensearch/issues/47)).** A real ARM64 run with verified model files reproduces the producer-certificate refusal. The loader continues to reject mismatched numerical output; replacing model files or weakening admission is not a remedy. Standard full binaries use ONNX quality embeddings by default. This result does not qualify the separate native F32 producer or establish a numerical root cause.
+
+---
+
+## [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) — 2026-09-12
+
+Registry-only publication: facade 0.6.0, rerank 0.4.0, and core, embed, index,
+lexical, fusion, Quill, storage and durability 0.3.0. All ten downloaded archives
+match their registry checksums and record source
+[`dd093fb2`](https://github.com/Dicklesworthstone/frankensearch/commit/dd093fb230404ab08be2ed6f27776ed6c4796485),
+also the target of the [annotated git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0).
+No matching GitHub Release exists at the September 12 verification. fsfs, TUI
+and ops retain their previous published versions; cross-platform binary and
+full release qualification remain pending under `bd-dsbym`.
+
+- **Consumers move together to Asupersync 0.5 and FrankenSQLite 0.4.** The public
+  `Cx` boundary requires a shared runtime version; the component and facade
+  version bumps reflect that change. Storage and durability use the matching
+  registry family. [Dependency boundary](https://github.com/Dicklesworthstone/frankensearch/commit/347be73ebad6d0172df99ec78c394e2095ece8a4).
+- **Shadow comparison uses caller-owned blocking capacity.** Missing capacity
+  sheds the comparison instead of polling a potentially blocking backend on the
+  serving scheduler. Inline execution requires explicit opt-in; cancellation
+  remains checked on both paths. [Isolation](https://github.com/Dicklesworthstone/frankensearch/commit/06e053e1003c8ea12ab84dd774279489812de914);
+  [admission and pooled regression](https://github.com/Dicklesworthstone/frankensearch/commit/309ae25ad5d21ff8f547335739b8dcdf56ce1dc6).
+- **Published mappings survive pathname replacement.** Inspection uses the
+  already-open file backing the mapping and releases the descriptor after
+  validation. This retains the immutable-file requirement and does not protect
+  against in-place mutation. [Implementation and regressions](https://github.com/Dicklesworthstone/frankensearch/commit/8b588964b01ffc00c06f5c43d7969162219dd88e).
+
+The shared change inventory above covers the included loader, producer identity,
+HNSW and Quill repairs. Archive publication and source attribution are verified
+here; they do not establish a fresh full-suite or performance result.
 
 ---
 

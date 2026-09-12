@@ -5585,7 +5585,7 @@ impl QuillWriterState {
     /// # Errors
     ///
     /// Returns typed configuration, parser/schema, or snapshot failures.
-    #[cfg(feature = "bench-internals")]
+    #[cfg(any(feature = "bench-internals", feature = "conformance-internals"))]
     pub fn from_in_memory_snapshot(
         snapshot: KeeperSnapshot,
         config: QuillConfig,
@@ -11780,7 +11780,7 @@ impl QuillIndex {
     /// # Errors
     ///
     /// Returns typed configuration, schema, or snapshot-validation failures.
-    #[cfg(feature = "bench-internals")]
+    #[cfg(any(feature = "bench-internals", feature = "conformance-internals"))]
     pub fn from_in_memory_snapshot(
         snapshot: KeeperSnapshot,
         config: QuillConfig,
