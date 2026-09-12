@@ -2120,7 +2120,16 @@ mod tests {
         let status = wrapper.status();
         assert_eq!(status.sampled, 1);
         assert_eq!(status.shed, 0);
-        assert_eq!(status.degradations, 0);
+        assert_eq!(
+            status.degradations,
+            0,
+            "comparison degradations: {:?}",
+            std::fs::read_to_string(
+                temp.path()
+                    .join(SHADOW_ARTIFACT_DIRECTORY)
+                    .join(SHADOW_DEGRADATIONS_FILE)
+            )
+        );
         assert_eq!(status.completed, 1);
         assert_eq!(status.divergences, 1);
         assert_eq!(status.in_flight, 0);
