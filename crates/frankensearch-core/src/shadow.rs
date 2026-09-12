@@ -2093,6 +2093,7 @@ mod tests {
             )
             .expect("wrapper"),
         );
+        wrapper.seed_corpus(&[IndexableDocument::new("serving", "pool latency")], 0);
         let runtime = RuntimeBuilder::current_thread()
             .blocking_threads(0, 1)
             .build()
