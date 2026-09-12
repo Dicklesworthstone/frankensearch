@@ -1,5 +1,29 @@
 # Changelog research: fsfs 1.10.0 / FrankenSearch 0.5.0
 
+## September 12 producer correction after registry publication
+
+`b62074148d7fd38029818e638aa31f7699dc93fd` corrects Potion's execution
+protocol from SafeTensors 0.7.0 to the actual 0.8.0 selected by `347be73e`.
+The archive publication source `dd093fb2` predates this correction, so the
+changelog labels it unreleased and includes published adapter 0.3.0 among the
+producer identities that require rebuilding. No vector certificate or
+historical manifest fingerprint was replaced.
+
+RCH validation: the unchanged historical fixture fails on the bumped adapter;
+the repaired candidate passes 404 embedder unit tests, eight fresh-process
+logging tests, three real-Potion checks, formatting and focused Clippy. The
+fresh-process preflight compares the protocol against the actual locked
+Tokenizers and SafeTensors versions. Source matches all 1,777 tracked inputs;
+both test-binary hashes and the terminal log are retained under
+`/data/release-work/frankensearch-release-20260912/dependencies/` in
+`producer-tests-receipt.json` and `producer-independent-embed-vmi.log`.
+The full core suite separately exposed an existing anti-rollback publication
+race; that failure remains open while its repair is validated. These focused
+results do not qualify the complete release.
+
+The new repair link names the exact local commit; public link availability
+must be checked after the qualified source is pushed.
+
 ## September 12 registry-publication reconciliation
 
 Small-update scope: correct the publication status of the existing post-1.10.0

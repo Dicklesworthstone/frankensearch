@@ -37,6 +37,8 @@ Changes on `main` after the 2026-09-08 publication. Library changes through
 are included in the September 12 crate publication described below. fsfs CLI
 changes remain unreleased; fsfs is still 1.10.0. Gauntlet and release-checker
 changes describe repository tooling, not published library capabilities.
+Library corrections after that publication, including the Potion dependency
+identity repair below, also remain unreleased.
 
 ### Added
 
@@ -61,6 +63,15 @@ changes describe repository tooling, not published library capabilities.
 - **The executable quickstart gate requires both search tiers and actual progressive results.** The Linux DSR lane builds and installs into a private root, checks executable byte identity, and requires ranked hybrid and vector-only results, Initial/Refined records, authoritative generation artifacts, and the model receipts actually admitted by the loaders. Eighteen failure controls cover model, result, generation, lifecycle and provenance failures. Supplied binaries retain an explicitly unknown source revision; the checker revision cannot qualify them as a source-bound release build. [Gate and receipt wiring](https://github.com/Dicklesworthstone/frankensearch/commit/3d1c2fddb09641153cc7d66a61f835751a4b1538); [isolated Cargo discovery](https://github.com/Dicklesworthstone/frankensearch/commit/8789e0449eb01e3e6250cc4358eef003366d4ff9).
 
 ### Fixed
+
+- **Potion now identifies the SafeTensors version it actually uses.** The
+  September 12 dependency update selected SafeTensors 0.8.0, but the published
+  embedder's producer protocol still named 0.7.0. The corrected producer
+  requires rebuilding indexes carrying that earlier identity, including those
+  made with the published 0.3.0 adapter. Historical fingerprints and numerical
+  certificates are unchanged; real-Potion certification and streamed decoding
+  still pass. A fresh-process check now compares the declared protocol with
+  Cargo.lock. [Repair and regressions](https://github.com/Dicklesworthstone/frankensearch/commit/b62074148d7fd38029818e638aa31f7699dc93fd).
 
 - **Published Quill segment authentication streams from the same opened file that backs the mapping.** MANIFEST admission hashes the prefix in 16 KiB reads, then releases the file handle. A path rename cannot switch the bytes being authenticated, and malformed or truncated witnesses remain rejected. This avoids reading the witness through every mapped page while preserving the content check. [Implementation and descriptor/corruption regressions](https://github.com/Dicklesworthstone/frankensearch/commit/b51b46ab90142c35668a74e19afab88219eefb7e).
 
