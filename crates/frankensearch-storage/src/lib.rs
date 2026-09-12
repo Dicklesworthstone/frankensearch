@@ -2,6 +2,9 @@
 //!
 //! This crate owns schema bootstrap, document metadata persistence,
 //! content-hash dedup bookkeeping, and an embedding job queue.
+// The instrumented FTS5 search future nests FrankenSQLite and Asupersync
+// futures deeply enough that proving Send exceeds rustc's default depth.
+#![recursion_limit = "256"]
 #![allow(
     clippy::missing_const_for_fn,
     clippy::missing_errors_doc,
