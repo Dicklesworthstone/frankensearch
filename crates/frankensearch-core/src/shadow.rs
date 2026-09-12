@@ -47,6 +47,11 @@ const CORPUS_HASH_DOMAIN: &[u8] = b"frankensearch/shadow-corpus/v1\0";
 pub struct ShadowLexicalConfig {
     /// Explicit opt-in. The default is off.
     pub enabled: bool,
+    /// Allow shadow polls on the serving scheduler when no blocking pool is
+    /// attached to the caller's context. This can block serving and is intended
+    /// for explicit deterministic execution, such as `LabRuntime` comparisons.
+    /// The default requires caller-owned blocking capacity and sheds otherwise.
+    pub allow_inline_shadow: bool,
     /// Deterministic sample rate in basis points.
     pub sample_rate_basis_points: u16,
     /// Maximum number of admitted background comparisons.
@@ -106,6 +111,7 @@ impl Default for ShadowLexicalConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_inline_shadow: false,
             sample_rate_basis_points: 10_000,
             max_in_flight: 2,
             score_epsilon: 1.0e-5,
@@ -131,6 +137,8 @@ pub enum ShadowShedReason {
     ShadowDegraded,
     /// The caller did not provide a spawn-capable runtime context.
     RuntimeUnavailable,
+    /// The caller did not provide blocking capacity or opt into inline polls.
+    BlockingPoolUnavailable,
     /// Index generation changed while the comparison ran.
     GenerationDrift,
 }
@@ -144,6 +152,7 @@ impl ShadowShedReason {
             Self::Capacity => "capacity",
             Self::ShadowDegraded => "shadow_degraded",
             Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::BlockingPoolUnavailable => "blocking_pool_unavailable",
             Self::GenerationDrift => "generation_drift",
         }
     }
@@ -429,6 +438,8 @@ pub enum ShadowDegradationKind {
     Search,
     /// No spawn-capable runtime was attached to the request context.
     RuntimeUnavailable,
+    /// Shadow search requires caller-owned blocking capacity or inline opt-in.
+    BlockingPoolUnavailable,
     /// A divergence artifact could not be persisted.
     ArtifactWrite,
     /// Generation or corpus revision changed during comparison.
@@ -679,6 +690,7 @@ pub fn append_shadow_degradation(
 
 struct ShadowState {
     enabled: AtomicBool,
+    allow_inline_shadow: bool,
     sample_rate_basis_points: u16,
     max_in_flight: usize,
     score_epsilon: f32,
@@ -804,13 +816,29 @@ impl Wake for ShadowWake {
 /// Keep synchronous work inside an async backend's poll off the serving
 /// scheduler. Each poll belongs to the same region and blocking pool as the
 /// shadow task; waiting for the next wake uses a cancel-aware runtime channel.
-/// Pool-less contexts retain Asupersync's deterministic inline behavior.
+/// Pool-less contexts may run inline only when the caller explicitly opts in.
 async fn poll_shadow_on_pool(
     cx: &Cx,
     mut future: SearchFuture<'static, Vec<ScoredResult>>,
+    allow_inline_shadow: bool,
 ) -> SearchResult<Vec<ScoredResult>> {
     let Some(pool) = cx.blocking_pool_handle() else {
-        return future.await;
+        if !allow_inline_shadow {
+            return Err(SearchError::SubsystemError {
+                subsystem: "shadow",
+                source: "shadow search requires a caller-owned blocking pool".into(),
+            });
+        }
+        cx.checkpoint().map_err(|error| SearchError::Cancelled {
+            phase: "shadow.search".to_owned(),
+            reason: error.to_string(),
+        })?;
+        let result = future.await;
+        cx.checkpoint().map_err(|error| SearchError::Cancelled {
+            phase: "shadow.search".to_owned(),
+            reason: error.to_string(),
+        })?;
+        return result;
     };
     let (wake_tx, mut wake_rx) = asupersync::channel::mpsc::channel(1);
     let wake = Arc::new(ShadowWake(wake_tx));
@@ -885,6 +913,7 @@ fn build_shadow_state(
     config.validate()?;
     Ok(Arc::new(ShadowState {
         enabled: AtomicBool::new(config.enabled),
+        allow_inline_shadow: config.allow_inline_shadow,
         sample_rate_basis_points: config.sample_rate_basis_points,
         max_in_flight: config.max_in_flight,
         score_epsilon: config.score_epsilon,
@@ -1205,6 +1234,16 @@ impl ShadowLexical {
             state.record_shed(reason, query, generation);
             return;
         }
+        if !state.allow_inline_shadow && cx.blocking_pool_handle().is_none() {
+            state.record_shed(ShadowShedReason::BlockingPoolUnavailable, query, generation);
+            state.record_degradation(
+                generation,
+                ShadowDegradationKind::BlockingPoolUnavailable,
+                "shadow search requires a caller-owned blocking pool; attach one to the request context",
+                false,
+            );
+            return;
+        }
         let Some(in_flight) = state.try_admit() else {
             state.record_shed(ShadowShedReason::Capacity, query, generation);
             return;
@@ -1249,7 +1288,12 @@ impl ShadowLexical {
                     }
                 }
                 .instrument(tracing::Span::current());
-                let outcome = poll_shadow_on_pool(&task_cx, Box::pin(query_future)).await;
+                let outcome = poll_shadow_on_pool(
+                    &task_cx,
+                    Box::pin(query_future),
+                    task_state.allow_inline_shadow,
+                )
+                .await;
                 let shadow_latency_micros = micros(shadow_started.elapsed());
                 tracing::Span::current().record("shadow_latency_micros", shadow_latency_micros);
 
@@ -1931,9 +1975,9 @@ mod tests {
         let serving_result = vec![result("serving", 3.0), result("second", 2.0)];
         let serving = Arc::new(StaticLexical::new(serving_result.clone()));
         let shadow = Arc::new(StaticLexical::new(vec![result("shadow", 9.0)]));
-        let wrapper = Arc::new(
-            ShadowLexical::new(serving, shadow, enabled_config(temp.path())).expect("wrapper"),
-        );
+        let mut config = enabled_config(temp.path());
+        config.allow_inline_shadow = true;
+        let wrapper = Arc::new(ShadowLexical::new(serving, shadow, config).expect("wrapper"));
         wrapper.seed_corpus(&[IndexableDocument::new("serving", "alpha")], 0);
 
         let mut lab = LabRuntime::new(LabConfig::new(0x5ad0_0001).max_steps(100_000));
@@ -2005,8 +2049,93 @@ mod tests {
     }
 
     #[test]
-    fn shadow_pool_preserves_wakes_and_polls_off_the_serving_thread() {
+    fn missing_pool_sheds_shadow_without_polling_its_backend() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shadow = Arc::new(StaticLexical::new(vec![result("shadow", 2.0)]));
+        let config = enabled_config(temp.path());
+        assert!(!config.allow_inline_shadow);
+        let wrapper = Arc::new(
+            ShadowLexical::new(
+                Arc::new(StaticLexical::new(vec![result("serving", 1.0)])),
+                shadow.clone(),
+                config,
+            )
+            .expect("wrapper"),
+        );
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let task_wrapper = wrapper.clone();
+        let task = runtime.handle().spawn(async move {
+            let cx = Cx::current().expect("request context");
+            assert!(cx.blocking_pool_handle().is_none());
+            task_wrapper.search(&cx, "no pool", 10).await
+        });
+        let actual = runtime.block_on(task).expect("serving result");
+        assert_eq!(ranked_hits(&actual), ranked_hits(&[result("serving", 1.0)]));
+        assert_eq!(shadow.search_count.load(Ordering::Acquire), 0);
+        let status = wrapper.status();
+        assert_eq!(status.sampled, 1);
+        assert_eq!(status.shed, 1);
+        assert_eq!(status.degradations, 1);
+        assert_eq!(status.completed, 0);
+        assert_eq!(status.in_flight, 0);
+    }
+
+    #[test]
+    fn caller_pool_completes_slow_shadow_without_delaying_serving() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wrapper = Arc::new(
+            ShadowLexical::new(
+                Arc::new(StaticLexical::new(vec![result("serving", 1.0)])),
+                Arc::new(SlowShadow {
+                    delay: std::time::Duration::from_millis(250),
+                }),
+                enabled_config(temp.path()),
+            )
+            .expect("wrapper"),
+        );
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .expect("runtime");
+        let task_wrapper = wrapper.clone();
+        let started = Instant::now();
+        let task = runtime.handle().spawn(async move {
+            let cx = Cx::current().expect("request context");
+            task_wrapper.search(&cx, "pool latency", 10).await
+        });
+        let actual = runtime.block_on(task).expect("serving result");
+        let elapsed = started.elapsed();
+        assert_eq!(ranked_hits(&actual), ranked_hits(&[result("serving", 1.0)]));
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "serving took {elapsed:?} despite caller-owned blocking capacity"
+        );
+        // The runtime keeps driving background work after block_on returns.
+        // Wait separately for comparison and durable observation completion;
+        // this wait is deliberately outside the serving latency measurement.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while wrapper.status().in_flight != 0 && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let status = wrapper.status();
+        assert_eq!(status.sampled, 1);
+        assert_eq!(status.shed, 0);
+        assert_eq!(status.degradations, 0);
+        assert_eq!(status.completed, 1);
+        assert_eq!(status.divergences, 1);
+        assert_eq!(status.in_flight, 0);
+        let summary = ShadowArtifactSummary::read_index_root(temp.path()).expect("summary");
+        assert_eq!(summary.observation_count, 1);
+        assert_eq!(summary.divergence_count, 1);
+        assert_eq!(summary.degradation_count, 0);
+    }
+
+    #[test]
+    fn shadow_pool_preserves_wakes_and_polls_off_the_serving_thread() {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .expect("runtime");
         let serving_thread = std::thread::current().id();
         let polls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&polls);
@@ -2025,7 +2154,7 @@ mod tests {
                     Poll::Ready(Ok(vec![result("shadow", 3.0)]))
                 }
             });
-            poll_shadow_on_pool(&cx, Box::pin(future)).await
+            poll_shadow_on_pool(&cx, Box::pin(future), false).await
         });
         let actual = runtime.block_on(task).expect("shadow result");
         assert_eq!(polls.load(Ordering::Acquire), 3);
@@ -2034,7 +2163,10 @@ mod tests {
 
     #[test]
     fn shadow_pool_does_not_publish_a_result_cancelled_during_its_poll() {
-        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 1)
+            .build()
+            .expect("runtime");
         let cx = runtime.request_cx_with_budget(Budget::INFINITE);
         let cancel_cx = cx.clone();
         let future = async move {
@@ -2042,8 +2174,24 @@ mod tests {
             Ok(vec![result("must-not-publish", 1.0)])
         };
         let error = runtime
-            .block_on(poll_shadow_on_pool(&cx, Box::pin(future)))
+            .block_on(poll_shadow_on_pool(&cx, Box::pin(future), false))
             .expect_err("cancelled result");
+        assert!(matches!(error, SearchError::Cancelled { .. }));
+    }
+
+    #[test]
+    fn inline_opt_in_does_not_publish_a_cancelled_shadow_result() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+        assert!(cx.blocking_pool_handle().is_none());
+        let cancel_cx = cx.clone();
+        let future = async move {
+            cancel_cx.set_cancel_requested(true);
+            Ok(vec![result("must-not-publish", 1.0)])
+        };
+        let error = runtime
+            .block_on(poll_shadow_on_pool(&cx, Box::pin(future), true))
+            .expect_err("cancelled inline result");
         assert!(matches!(error, SearchError::Cancelled { .. }));
     }
 
@@ -2063,7 +2211,7 @@ mod tests {
                 observed.fetch_add(1, Ordering::AcqRel);
                 Ok(vec![result("must-not-run", 1.0)])
             };
-            poll_shadow_on_pool(&cx, Box::pin(future)).await
+            poll_shadow_on_pool(&cx, Box::pin(future), false).await
         });
         let error = runtime.block_on(task).expect_err("stopped pool");
         assert!(error.to_string().contains("blocking pool is shut down"));

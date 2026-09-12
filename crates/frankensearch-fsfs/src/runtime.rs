@@ -16818,6 +16818,7 @@ impl FsfsRuntime {
         };
         let config = frankensearch_core::ShadowLexicalConfig {
             enabled: true,
+            allow_inline_shadow: false,
             sample_rate_basis_points: self.config.search.shadow_sample_rate_basis_points,
             max_in_flight: self.config.search.shadow_max_in_flight,
             score_epsilon: self.config.search.shadow_score_epsilon,

@@ -53,7 +53,7 @@ const DEFAULT_SNIPPET_TOKENS: usize = 20;
 
 /// The on-disk marker written after applying the 0.2.1 Porter rebuild.
 ///
-/// FrankenSQLite 0.2.1 changes Porter token handling. A prior Porter index
+/// `FrankenSQLite` 0.2.1 changes Porter token handling. A prior Porter index
 /// must be rebuilt from its complete content source; accepting an unmarked
 /// table would make terms silently unfindable.
 pub const PORTER_FTS5_REBUILD_VERSION: i64 = 1;
@@ -327,6 +327,9 @@ impl Fts5LexicalSearch {
             return Ok(false);
         };
         table.delete_document(rowid);
+        // Keep the table and ID map locked until both mutations are complete.
+        drop(rowid_map);
+        drop(table);
         Ok(true)
     }
 
@@ -342,6 +345,8 @@ impl Fts5LexicalSearch {
         }
         rowid_map.doc_to_row.clear();
         rowid_map.row_to_doc.clear();
+        drop(rowid_map);
+        drop(table);
 
         debug!("fts5: cleared all documents");
         Ok(())
@@ -411,7 +416,7 @@ impl PersistedFts5LexicalSearch {
     ///
     /// This is the authoritative alternative to the synchronous
     /// [`frankensearch_core::LexicalRead::doc_count`] capability, which cannot
-    /// pin or await this adapter's live FrankenSQLite generation.
+    /// pin or await this adapter's live `FrankenSQLite` generation.
     ///
     /// # Errors
     ///
@@ -1428,6 +1433,8 @@ impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
             let rowid = rowid_map.get_or_assign(&doc.id);
             let columns = Self::doc_to_columns(doc);
             table.insert_document(rowid, &columns);
+            drop(rowid_map);
+            drop(table);
 
             Ok(())
         })
@@ -1453,6 +1460,8 @@ impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
                 let columns = Self::doc_to_columns(doc);
                 table.insert_document(rowid, &columns);
             }
+            drop(rowid_map);
+            drop(table);
 
             debug!(count = docs.len(), "fts5: batch indexed documents");
             Ok(())
