@@ -456,3 +456,34 @@ terminal output are in `/data/tmp/fsfs-gh41-quill-validation-warm-20260911.log`.
 An earlier wrapper job selected a cold target directory and was canceled before
 completion; the final job explicitly reused the candidate's Cargo target. This
 does not certify the full workspace gate, release lanes or all-feature gauntlet.
+
+## 2026-09-12 dependency and release continuation
+
+Release bead `bd-dsbym` tracks the user-authorized dependency refresh and next
+full publication. The complete granular checklist and per-dependency state live
+at `/data/release-work/frankensearch-release-20260912/progress.json`.
+The live 67-package registry census and upstream source research found 19 newer
+direct packages; FrankenSQLite 0.3.18 remains current. Asupersync 0.4.11 was
+rejected after a source-verified remote core run returned 1,122 passes and a
+255.521109 ms shadow serving-latency failure against the unchanged 100 ms guard.
+Its new current-thread post-root drain executes the deliberately slow shadow
+before returning. The prior runtime family is restored, with consumer resolution
+capped below 0.4.11; the unchanged baseline rerun is pending. Tokenizers 0.23.2
+is prepared next, with its required Daachorse 3.0.3 transition. No new release
+qualification is claimed. Publication-contract positive and negative self-tests pass;
+`cargo audit` reports zero vulnerability advisories, four unmaintained warnings
+and the existing lru 0.16.4 unsoundness warning (RUSTSEC-2026-0253).
+
+The v1.10.0 source-to-current history review found two capabilities missing from
+the unreleased prose: HNSW v7 durable row maps and refusal-safe incremental append
+(`ecbc6598`, `8f429d2e`, `33b8dacb`, `ee95e999`), and same-descriptor streamed
+FSLX witness authentication (`b51b46ab`). Their implementation diffs and existing
+regressions were inspected; the new notes describe behavior and migration
+requirements without inferring a fresh test pass or performance certification.
+
+CASS search timed out while its index refresh was owned by another process;
+`cass view` successfully read the prior release session directly. Original
+v1.10.0 receipts confirm six binary variants, 13 crates and nine public consumer
+lanes. The recovered initial DSR configuration is historical, not the final
+configuration or authorization to bypass RCH. The live Homebrew tap has no fsfs
+formula. No version bump, new tag or publication has occurred in this run.
