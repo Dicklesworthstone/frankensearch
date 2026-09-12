@@ -20,6 +20,8 @@ open until their acceptance criteria, including consumer execution, are met.
 - [x] Land doctor producer-admission fix `062f5b8f` (main and compatibility mirror).
 - [x] Run remote formatting and 16 doctor library tests (semantic-support/no-default; all pass).
 - [ ] Validate doctor fix with a genuine model and stale index through the production CLI.
+  - [x] Add isolated production-CLI regression `loader_only::doctor_rejects_stale_real_model_producer_revisions` in the existing quickstart suite; real index vectors, both tiers, stale-revision refusal, exact-byte restoration acceptance, observer-only assertions.
+  - [ ] Compile and execute the ignored genuine-model regression with both pinned caches; no pass yet.
 - [ ] Validate default, native, lite and full workspace gates for the doctor fix.
 - [ ] Reproduce ARM native refusal with the new digest diagnostic; locate first numerical divergence.
 - [ ] Implement the supported numerical repair or explicitly distinct qualified producer only after evidence.
@@ -139,6 +141,7 @@ RCH validation, and evidence-backed Beads closure. None is silently waived.
 
 - [ ] Preserve exact command, source, selected test count, terminal exit and executed artifact identity where required.
 - [ ] Complete `scripts/quality-gate.sh` remotely with registered models; retain failures instead of weakening gates.
+  - Running strict RCH on ovh-a from transferred 062f5b8f source, 19:33 UTC. fmt passed; check compiling. Remote Git metadata reports dd093fb2+dirty, so this invocation is not release-source provenance; preserve this limitation. The newly added genuine-model regression is not part of that earlier transferred tree.
 - [ ] Complete additional Quill full/probe lanes for affected changes.
 - [ ] Reconcile actual shipped fixes with every GH/bead acceptance criterion; do not close a broad issue for one sub-fix.
 - [ ] Commit only intended paths; preserve the unrelated golden `.actual.json` file.
