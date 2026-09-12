@@ -477,10 +477,46 @@ the exact MiniLM, Snowflake, and Nomic certificates. The stale producer protocol
 fields were corrected, all historical fingerprint fixtures retained, and the
 426 + 35 unit tests and six real-model checks passed again. The new changelog
 entry explicitly records the semantic-index rebuild consequence. crc32fast
-1.5.1 passes 160 durability, 774 index, and 681 Quill tests. Further dependency
-and release qualification remains in progress. Publication-contract positive and negative self-tests pass;
+1.5.1 passes 160 durability, 774 index, and 681 Quill tests. Wide 1.7.0 passes
+3,093 focused tests plus the real native F32 certificate/batching/repeatability
+test on x86. TOML 1.1.6 passes 1,123 core tests. FrankenTUI 0.7.0 passes 2,103
+fsfs, 827 ops, and 205 shared-TUI tests; all 1,776 tracked non-coordination
+source files match after execution. After the first ureq 3.4.1 attempt lost its
+worker SSH connection during compilation, all nine client tests passed on an
+admitted alternate worker. JSONSchema 0.56 passes 119 fsfs schema tests and eight
+gauntlet schema tests; Ed25519-Dalek 3.0 passes all 21 supervisor signing and
+verification tests. Each worker's source matched after these runs. Tantivy
+0.26.2 passes all 129 lexical tests, but the broader gauntlet has reported
+cancellation-receipt, Cargo configuration guard, and startup-deadline failures.
+After restoring accurate worker Git metadata and isolating TMPDIR from workspace
+Cargo configuration, all 14 selected tests pass without assertion changes.
+The broad run was canceled after its observed failures and is not a full pass.
+The next oracle run passes 11 tests but fails the live Q1 merge fixture because
+it did not construct the required interior burned lease tail. Source comparison
+again matches all 1,776 files. The requested updater skill's checkpoint pauses
+further repairs after 11 accumulated test-failure events; confirmation is pending.
+Oracle v8 and QG-1's
+new screen version distinguish the new dependency from retained historical
+evidence. Further dependency and release qualification remains in
+progress. Publication-contract positive and negative self-tests pass;
 `cargo audit` reports zero vulnerability advisories, four unmaintained warnings
 and the existing lru 0.16.4 unsoundness warning (RUSTSEC-2026-0253).
+
+The existing native ARM issue #47 is now independently reproduced through an
+isolated RCH Darwin route. The exact ignored native Int8 certificate test ran
+and failed during loader admission after model verification: zero passes, one
+failure, 0.15 s, exit 101. Source comparison matched 1,776 files; the ARM64
+Mach-O SHA-256 is `e6765302951134f17302ed633e628b4f4efcec1de8fd760e0c44d1449ff98381`.
+The terminal log and source/executable records live under the release work
+directory's `rch-mac/`. A matched-source x86 run passes the same Int8 certificate
+test (one pass, 1.78 s); its ELF SHA-256 is
+`29cecb02573818ad6e7f170b7cc8369fdbe61ef3c0340ba85a2db6956238d9ba`.
+The two builds select the same native features without CPU-feature overrides.
+This does not prove a specific numerical root cause,
+qualify F32 or reranking, or validate the reporter's proposed hash. The
+changelog names this existing limitation and distinguishes the standard ONNX
+quality default. Bead `bd-6kafg` is reopened for numerical investigation now
+that native execution is available; its acceptance criteria are unchanged.
 
 The v1.10.0 source-to-current history review found two capabilities missing from
 the unreleased prose: HNSW v7 durable row maps and refusal-safe incremental append

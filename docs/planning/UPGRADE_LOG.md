@@ -82,13 +82,103 @@ index tests (15 existing ignores), 681 Quill tests (three existing ignores),
 and 160 durability tests. All 1,776 tracked non-coordination files match before
 and after execution. No performance gain is claimed.
 
-### wide 1.6.1 → 1.7.0 (validation pending)
+### wide 1.6.1 → 1.7.0 — focused suites verified
 
 The published release consolidates SIMD implementations and adds operations.
 Used vector arithmetic APIs remain compatible; changed `signum` semantics and
 deprecated swizzle methods are not used here. Validation targets the existing
 SIMD/scalar parity, exceptional-float, quantization, and postings tests. The
 separate transitive wide 0.7 line remains under its own consumers' constraints.
+Remote tests pass core 1,123, embedder 355 (two existing ignores), index 774
+(15 existing ignores), Quill 681 (three existing ignores), and durability 160.
+The native F32 MiniLM certificate passes with both the prior wide version and
+wide 1.7.0. The latter explicitly selected test checks certification, batching,
+and repeatability on the pinned real model (one pass, zero failures, 8.43 s).
+
+### toml 1.1.4 → 1.1.6 — focused configuration suite verified
+
+The patch fixes ownership of borrowed numeric values and avoids unnecessary
+table cloning. The used serde/configuration APIs remain compatible. Only the
+toml package changes in this lockfile step. The remote core suite passes all
+1,123 tests, including configuration round-tripping, partial defaults, and
+invalid-input fallback. All 1,776 tracked non-coordination source files matched
+during compilation. Full fsfs coverage remains part of the release gate.
+
+### FrankenTUI 0.5.x → 0.7.0 — consumer suites verified
+
+The nine direct framework packages move together. Published 0.7.0 retains the
+frame, layout, and widget APIs used here. The existing markdown feature remains
+enabled; runtime telemetry and its HTTP dependencies remain disabled. The
+optional Asupersync executor is not enabled by these consumers. Validation
+covers the shared TUI and both fsfs and ops consumers: 205 TUI tests, 2,103 fsfs
+tests (14 existing ignores), and 827 ops tests (one existing ignore), all passing.
+All 1,776 tracked non-coordination source files match after execution. The
+lockfile changes only the twelve coupled framework packages in this step.
+
+### ureq 3.4.0 → 3.4.1 — client tests verified
+
+The patch repairs timeout handling around TLS and connection establishment and
+buffer reuse. The JSON feature and default TLS configuration remain unchanged.
+The project uses ureq in its query-expansion client; existing tests cover client
+configuration and response parsing, not live transport behavior. The required
+ureq-proto dependency moves from 0.6.1 to 0.6.2; no other package changes in this
+step. After hz3 lost its SSH connection during compilation, an admitted ovh-a
+rerun passes all nine query-expansion tests. The other two selected consumer
+binaries have zero matching tests and contribute no additional passes. All
+1,776 tracked non-coordination source files match after execution.
+
+### jsonschema 0.50.0 → 0.56.0 — schema contracts verified
+
+Both development dependencies advance together. Defaults remain disabled;
+the newly optional `idna` feature is enabled explicitly to retain the earlier
+internationalized-name behavior. Validation targets the fsfs schema fixtures
+and the gauntlet's current and retained divergence-register schema checks.
+All 119 fsfs schema tests and eight gauntlet tests pass. The required supporting
+packages jsonschema-regex, jsonschema-value, and referencing move to 0.56.0;
+fraction moves to 0.17.0. Both workers match all 1,776 tracked non-coordination
+source files after execution. Historical schemas and fixtures are unchanged.
+
+### ed25519-dalek 2.2.0 → 3.0.0 — signing contracts verified
+
+The signing-key, signature, and verification APIs used by ArtifactStore v4 remain
+compatible. The update changes the RustCrypto dependency family; stored signed
+records, domain separation, and rejection checks must retain their existing
+contracts. Validation targets the real supervisor signing and verification tests.
+Asupersync's nkeys dependency still requires the separate 2.x line. Updating the
+gauntlet consumer adds the five required 3.x-family packages while retaining that
+transitive edge; forcing every old 2.x requirement to 3.0 correctly fails
+resolution. No dependency requirement was loosened to evade that constraint.
+All 21 supervisor tests pass remotely, including valid signatures, tampering,
+wrong keys, retired/revoked keys, cancellation, and timeout handling. All 1,776
+tracked non-coordination source files match after execution.
+
+### Tantivy 0.26.1 → 0.26.2 — validation in progress
+
+The patch fixes nested aggregation flushing and buffered union seeking. Only
+Tantivy changes in this lockfile step. The current oracle dependency record
+advances to v8 with the published 0.26.2 checksum; the exact v7 record remains
+readable as historical evidence and cannot authorize a new run. Earlier frozen
+oracle versions and hashes remain unchanged. The QG-1 incumbent screen also
+advances its protocol version and rejects screens from the prior dependency.
+Validation runs the lexical consumer and the complete gauntlet library suite.
+The lexical suite passes all 129 tests. The first broad gauntlet attempt was
+stopped after seven failures, before its slow evidence-assembly tests finished;
+it is not a completed suite. Four cancellation failures shared a missing
+compiled Git revision because RCH excludes `.git`. The worker now has accurate
+Git metadata for the isolated checkout's actual base and retains its dirty
+overlay. `TMPDIR=/tmp` also keeps Cargo configuration isolation fixtures outside
+the real workspace's ancestor configuration. With that environment, all 14
+selected cancellation, configuration-guard, and unchanged startup-deadline tests
+pass. No validator or assertion was weakened. Full qualification remains pending.
+The subsequent oracle-contract run passes 11 tests, including the current v8
+identity, every retained v2–v7 identity, exact lock resolution, and rejection of
+retired incumbent screens. One live Q1 merge fixture fails with `Q1 E3.5 did not
+construct an interior burned lease tail`. All 1,776 tracked source files match
+the worker after execution. Repair is paused at the library-updater skill's
+explicit checkpoint: 11 test-failure events across this upgrade run, including
+the seven observations in the incomplete broad run and one repeated diagnostic.
+The environment-related failures subsequently passed; the Q1 failure remains
+unresolved. No new version, tag, or publication has been made.
 
 ## 2026-09-07 — FrankenSQLite 0.3.18 source follow-through
 
