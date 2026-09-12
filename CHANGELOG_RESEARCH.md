@@ -359,11 +359,175 @@ failed stages were scheduled against clean `4ea318c0`, with all required model
 artifacts hash-verified. One initial follow-up was cancelled before tests to
 correct its Cargo cache routing; both attempts' logs remain available. The
 replacement run records a remote log and terminal exit receipt independently
-of client output. Its tests, E2E and quickstart outcomes are still pending at
-this checkpoint; neither the changelog nor this record claims a full-gate pass.
+of client output. Its final receipt reports exit 1 at 2026-09-11T06:18:05Z on
+vmi1149989. All three selected stages failed; this is not a full-gate pass.
+
+The repaired watch-start test and all five GH #43 tests passed in that clean
+run. The fsfs library aggregate was 2,102 passed, one failed and 14 ignored.
+The unchanged unreadable-subtree test correctly rejected its fixture
+precondition: root could still read the directory after chmod 000. A separate
+workspace-stage rerun removed `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH`,
+preserving the test and its assertions. Its client exited 143 during compilation,
+with no terminal test output or exit receipt and no remaining owned compiler
+observed afterward. That attempt remains `NO_VERDICT`.
+
+All seven real-model E2Es were executed: six passed and one failed in 164.28 s.
+The multilingual CLI case passed. Native English F32 loading, producer admission,
+indexing, status and doctor succeeded, but search exceeded the unchanged 500 ms
+quality budget and returned `refinement_failed`. This was not a certificate
+mismatch. The executed fsfs ELF SHA256 is
+`88e88901c1f7476cda88debc57e000e0dbc65f0f98e19a9981a0c7919d7a976f`;
+the test driver is
+`d2ca61f58620c84bb1821b588dd8c205b3a82544911f408d34dd8654ffd60f08`.
+
+The clean quickstart built and installed identical executable bytes, SHA256
+`458465d861d6cdd4a288e7e5e9c10348a69763ffeda23dddb9c10a25934f1181`,
+with source identity `4ea318c0`. Both index passes succeeded. The subsequent
+ONNX hybrid query also exceeded its 500 ms quality budget, so the gate failed
+with `MISSING-PHASE`; its negative controls were not reached. The receipt reports
+no remaining owned processes. This resolves the earlier provenance refusal,
+but does not qualify the executable quickstart.
+
+The enclosing RCH connection later timed out at 06:25:00Z and reported its remote
+process group stopped. The retained gate exit receipt and quickstart failure
+receipt establish the failures above despite that transport error. Local copies
+are `/data/tmp/fsfs-gh43-clean-followup-2-4ea318c0-20260911.remote.log`, the
+matching `.exit.json`, and
+`/data/tmp/fsfs-gh43-validation-20260911/quickstart-Z6m9dthU/receipt.json`.
+The incomplete workspace attempt is retained in
+`/data/tmp/fsfs-gh43-permission-workspace-vmi1227854-20260911.remote.log`.
+
+An isolated native rerun was prepared with byte-identical binaries on
+vmi1156319, but that host became busy and RCH refused admission with exit 103
+(`RCH-I003`, no free slots). No test ran there and no local fallback occurred.
+Neither timeout budgets, expected phases nor golden fingerprints were changed.
+The cause of the two quality-budget failures remains unresolved; the results
+do not establish an inference-performance comparison or ARM qualification.
 
 Another session committed and pushed the reserved GH #43 edits as `90e8fb14`
 while validation was running. This does not change the evidence boundary.
 Previous-generation retention remains unresolved under the existing publisher
 HOLD, cross-process tokenizer reuse is absent, and both original beads remain
 open. Retained commands and outcomes are linked from their Beads comments.
+
+## GH #41 continuous-writer lease repair — 2026-09-11 UTC
+
+This update covers `bd-458gu` and the concat retirement path in
+`frankensearch-quill/src/index.rs`. The unchanged-production baseline used
+`021ad1ac` plus the two test-only probes preserved in
+`/data/tmp/fsfs-gh41-combined-baseline-20260911.patch`. RCH on vmi1152480
+executed both probes: 0 passed, 2 failed. A continuous writer committing 192
+single-document batches produced 24 segments and last docid 1,507,335. The
+same regression with conditional retirement produced 3 segments and docids
+0–191, with every original document identity preserved. All 21 selected
+concat, cross-shard, compaction and lease controls passed. These are structural
+correctness results, not an incumbent-relative performance claim.
+
+The separate durable diagnostic retained 24 searchable identities across 24
+writer reopenings but left 24 segments, versus 3 for its 24-document continuous
+control. The real concat builder expanded eight reopened-session segments
+from 10,672 total source bytes to 16,345,526 bytes over a 458,753-row hull.
+This supports retaining the existing hole-ratio guard. The temporary failing
+diagnostic was removed after capture; its patch and terminal failure remain
+available. Reopen fragmentation, merge fuel and visibility checkpoints remain
+open obligations, so this repair does not close GH #41.
+
+The baseline ELF SHA256 is
+`d05a4f6b802dc7ade87187c47ae431f6f6c135d8b7fecf488815e3e58635f62a`;
+the passing candidate ELF SHA256 is
+`beaf165fca329edf974fdfdab0cdb3496df8d4e277ccda0c4780382ca1d93c25`.
+Candidate `index.rs` SHA256 is
+`3f15d88e1162ced4a244b722c99284a1c177c52dec25e39594f4eaa051c8007f`.
+Exact commands, source/worker hashes and terminal output are retained under
+`/data/tmp/fsfs-gh41-combined-baseline-20260911.*` and
+`/data/tmp/fsfs-gh41-candidate-20260911.*`. The candidate worker-source receipt
+is the `worker-source-final-sha256` file captured after synchronization; the
+earlier capture still contains the baseline and is not candidate provenance.
+Earlier attempts include a disk-pressure cancellation and a compile failure
+in the temporary diagnostic, corrected before the observed baseline. Neither
+is a test verdict. Existing workspace quality-gate failures described above
+are not cleared by the focused Quill result.
+
+Final Quill validation completed remotely on vmi1152480 at
+2026-09-11T21:03:42Z: workspace formatting passed, Quill all-targets clippy
+passed with `-D warnings`, and the complete default-feature Quill library suite
+reported 681 passed, 0 failed, 3 existing ignored, 0 filtered. The exact job and
+terminal output are in `/data/tmp/fsfs-gh41-quill-validation-warm-20260911.log`.
+An earlier wrapper job selected a cold target directory and was canceled before
+completion; the final job explicitly reused the candidate's Cargo target. This
+does not certify the full workspace gate, release lanes or all-feature gauntlet.
+
+## 2026-09-12 dependency and release continuation
+
+Release bead `bd-dsbym` tracks the user-authorized dependency refresh and next
+full publication. The complete granular checklist and per-dependency state live
+at `/data/release-work/frankensearch-release-20260912/progress.json`.
+The live 67-package registry census and upstream source research found 19 newer
+direct packages; FrankenSQLite 0.3.18 remains current. Asupersync 0.4.11 was
+rejected after a source-verified remote core run returned 1,122 passes and a
+255.521109 ms shadow serving-latency failure against the unchanged 100 ms guard.
+Its new current-thread post-root drain executes the deliberately slow shadow
+before returning. The prior runtime family is restored, with consumer resolution
+capped below 0.4.11; the unchanged baseline rerun passes all 1,123 core tests
+and 986 fusion tests, with four existing fusion ignores. Tokenizers 0.23.2
+and its required Daachorse 3.0.3 transition pass 402 embedder tests, eight logging
+contracts, and three real Potion tests. FastEmbed 6.0.3 removes the separate
+Tokenizers 0.22.2 dependency; it passes 426 embedder and 35 reranker tests plus
+the exact MiniLM, Snowflake, and Nomic certificates. The stale producer protocol
+fields were corrected, all historical fingerprint fixtures retained, and the
+426 + 35 unit tests and six real-model checks passed again. The new changelog
+entry explicitly records the semantic-index rebuild consequence. crc32fast
+1.5.1 passes 160 durability, 774 index, and 681 Quill tests. Wide 1.7.0 passes
+3,093 focused tests plus the real native F32 certificate/batching/repeatability
+test on x86. TOML 1.1.6 passes 1,123 core tests. FrankenTUI 0.7.0 passes 2,103
+fsfs, 827 ops, and 205 shared-TUI tests; all 1,776 tracked non-coordination
+source files match after execution. After the first ureq 3.4.1 attempt lost its
+worker SSH connection during compilation, all nine client tests passed on an
+admitted alternate worker. JSONSchema 0.56 passes 119 fsfs schema tests and eight
+gauntlet schema tests; Ed25519-Dalek 3.0 passes all 21 supervisor signing and
+verification tests. Each worker's source matched after these runs. Tantivy
+0.26.2 passes all 129 lexical tests, but the broader gauntlet has reported
+cancellation-receipt, Cargo configuration guard, and startup-deadline failures.
+After restoring accurate worker Git metadata and isolating TMPDIR from workspace
+Cargo configuration, all 14 selected tests pass without assertion changes.
+The broad run was canceled after its observed failures and is not a full pass.
+The next oracle run passes 11 tests but fails the live Q1 merge fixture because
+it did not construct the required interior burned lease tail. Source comparison
+again matches all 1,776 files. The requested updater skill's checkpoint pauses
+further repairs after 11 accumulated test-failure events; confirmation is pending.
+Oracle v8 and QG-1's
+new screen version distinguish the new dependency from retained historical
+evidence. Further dependency and release qualification remains in
+progress. Publication-contract positive and negative self-tests pass;
+`cargo audit` reports zero vulnerability advisories, four unmaintained warnings
+and the existing lru 0.16.4 unsoundness warning (RUSTSEC-2026-0253).
+
+The existing native ARM issue #47 is now independently reproduced through an
+isolated RCH Darwin route. The exact ignored native Int8 certificate test ran
+and failed during loader admission after model verification: zero passes, one
+failure, 0.15 s, exit 101. Source comparison matched 1,776 files; the ARM64
+Mach-O SHA-256 is `e6765302951134f17302ed633e628b4f4efcec1de8fd760e0c44d1449ff98381`.
+The terminal log and source/executable records live under the release work
+directory's `rch-mac/`. A matched-source x86 run passes the same Int8 certificate
+test (one pass, 1.78 s); its ELF SHA-256 is
+`29cecb02573818ad6e7f170b7cc8369fdbe61ef3c0340ba85a2db6956238d9ba`.
+The two builds select the same native features without CPU-feature overrides.
+This does not prove a specific numerical root cause,
+qualify F32 or reranking, or validate the reporter's proposed hash. The
+changelog names this existing limitation and distinguishes the standard ONNX
+quality default. Bead `bd-6kafg` is reopened for numerical investigation now
+that native execution is available; its acceptance criteria are unchanged.
+
+The v1.10.0 source-to-current history review found two capabilities missing from
+the unreleased prose: HNSW v7 durable row maps and refusal-safe incremental append
+(`ecbc6598`, `8f429d2e`, `33b8dacb`, `ee95e999`), and same-descriptor streamed
+FSLX witness authentication (`b51b46ab`). Their implementation diffs and existing
+regressions were inspected; the new notes describe behavior and migration
+requirements without inferring a fresh test pass or performance certification.
+
+CASS search timed out while its index refresh was owned by another process;
+`cass view` successfully read the prior release session directly. Original
+v1.10.0 receipts confirm six binary variants, 13 crates and nine public consumer
+lanes. The recovered initial DSR configuration is historical, not the final
+configuration or authorization to bypass RCH. The live Homebrew tap has no fsfs
+formula. No version bump, new tag or publication has occurred in this run.

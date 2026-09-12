@@ -1,8 +1,8 @@
 {
-  "schema_version": 7,
-  "tantivy_version": "0.26.1",
+  "schema_version": 8,
+  "tantivy_version": "0.26.2",
   "tantivy_source": "registry+https://github.com/rust-lang/crates.io-index",
-  "tantivy_checksum_sha256": "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07",
+  "tantivy_checksum_sha256": "861facfabd71044968f364837f9a083b56464ba5a59079f88706ee5c451ca069",
   "lexical_package": "frankensearch-lexical",
   "lexical_package_version": "0.2.5",
   "lexical_contract_audit_revision": "1b67c0cb5cdeb6edeb8fa945b52da4d877215bef"

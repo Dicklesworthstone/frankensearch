@@ -31,19 +31,28 @@ def _list_execs() -> list[Path]:
 
 def _run_child(path: Path, * , stdin_bytes=None):
     # On Windows, prefer 'python' for .py plugins to avoid PATHEXT reliance.
-    if os.name != 'posix' and path.suffix.lower() == '.py':
-        return subprocess.run([sys.executable, str(path)], input=stdin_bytes, check=False).returncode
-    return subprocess.run([str(path)], input=stdin_bytes, check=False).returncode
+    try:
+        if os.name != 'posix' and path.suffix.lower() == '.py':
+            return subprocess.run([sys.executable, str(path)], input=stdin_bytes, check=False).returncode
+        return subprocess.run([str(path)], input=stdin_bytes, check=False).returncode
+    except OSError as exc:
+        print(f'mcp-agent-mail chain-runner: could not execute {path.name}: {exc}', file=sys.stderr)
+        return 126
+
+def _remember_failure(path: Path, rc: int, first_failure: int) -> int:
+    if rc == 0:
+        return first_failure
+    print(f'mcp-agent-mail chain-runner: {path.name} exited with status {rc}', file=sys.stderr)
+    return first_failure or rc
 
 # Read STDIN once (Git passes ref tuples); forward to children
 stdin_bytes = sys.stdin.buffer.read()
+first_failure = 0
 for exe in _list_execs():
     rc = _run_child(exe, stdin_bytes=stdin_bytes)
-    if rc != 0:
-        sys.exit(rc)
+    first_failure = _remember_failure(exe, rc, first_failure)
 
 if ORIG.exists():
     rc = _run_child(ORIG, stdin_bytes=stdin_bytes)
-    if rc != 0:
-        sys.exit(rc)
-sys.exit(0)
+    first_failure = _remember_failure(ORIG, rc, first_failure)
+sys.exit(first_failure)

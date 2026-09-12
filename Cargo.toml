@@ -70,10 +70,11 @@ frankensearch-quill = { version = "0.2.4", path = "crates/frankensearch-quill" }
 # from inside the crate instead of a resolver error naming the requirement.
 # Earlier floors carried the native-task abort contract (acknowledged
 # Cancelled is preserved) plus the HTTP/1 streaming cancel/reuse fixes; the
-# <0.5 ceiling permits compatible 0.4.x source overrides without admitting a
-# future semver-major API line. `crates/frankensearch-quill/tests/asupersync_floor.rs`
-# pins this floor against silent regression. [bd-3h229]
-asupersync = { version = ">=0.4.10, <0.5", default-features = false, features = ["proc-macros"] }
+# 0.4.11 current-thread driver drains queued shadow work before block_on returns,
+# violating the existing shadow serving-latency guard. Keep it out of consumer
+# resolution until that contract is restored (bd-dsbym, UPGRADE_LOG.md).
+# `crates/frankensearch-quill/tests/asupersync_floor.rs` retains the API floor.
+asupersync = { version = ">=0.4.10, <0.4.11", default-features = false, features = ["proc-macros"] }
 arc-swap = "=1.9.2"
 
 # Descriptor-relative generation-root admission. Keep the syscall surface
@@ -109,7 +110,7 @@ half = "2.4"
 # Floor 1.6.0 is load-bearing: simd.rs/in_memory.rs call `widening_mul`, which only
 # exists in wide >= 1.6.0 (1.5.0 has only the pre-rename `mul_widen`). A lower floor
 # lets a consumer's stale lockfile resolve 1.1.1-1.5.0 and fail mid-compile (bd-efe5y).
-wide = "1.6.0"
+wide = "1.7.0"
 
 # Memory-mapped I/O
 memmap2 = "0.9"
@@ -118,11 +119,11 @@ memmap2 = "0.9"
 # Default features pull in native-tls and network stacks that transitively
 # depend on forbidden Tokio ecosystem crates. Keep only ORT's rustls-backed
 # binary acquisition path; model provisioning is owned by frankensearch.
-fastembed = { version = "=6.0.0", default-features = false, features = [
+fastembed = { version = "=6.0.3", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
 ] }
 safetensors = "0.8.0"
-tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 # frankentorch (pure-Rust tensor lib) backing the frankensearch-rerank `native`
 # feature (cross-encoder reranker + MiniLM embedder). The family is published
 # on crates.io under `frankentorch-*` names (`ft-api` on crates.io belongs to
@@ -142,7 +143,7 @@ ft-core = { package = "frankentorch-core", version = "0.1.0" }
 # and other trivially-droppable types, so the pattern cannot occur in this
 # graph. A registry pin is required for crates.io publication (a git dep is
 # unpublishable); move to tantivy 0.27 when it ships with patched lru.
-tantivy = "=0.26.1"
+tantivy = "=0.26.2"
 
 ndarray = "0.17"
 
@@ -152,7 +153,7 @@ ndarray = "0.17"
 hnsw_rs = { package = "frankenhnsw", version = "=0.3.5", default-features = false }
 
 # CRC32 checksums for FSVI index integrity
-crc32fast = "1"
+crc32fast = "1.5.1"
 
 # Fast non-cryptographic hashing for hot-path HashMaps (inspired by fff.nvim)
 ahash = "0.8"
@@ -166,7 +167,7 @@ unicode-normalization = "0.1"
 # Platform-standard directories for model storage
 
 # TOML parsing for configuration surfaces
-toml = "1.0.3"
+toml = "1.1.6"
 
 # SHA-256 verification for model manifests
 sha2 = "0.11.0"
@@ -186,7 +187,7 @@ zeroize = "=1.9.0"
 # or the gauntlet crate before removing. Pinned to the version the lock
 # already resolves through asupersync, so no new dependency universe entry
 # is introduced.
-ed25519-dalek = "=2.2.0"
+ed25519-dalek = "=3.0.0"
 
 # PDF text extraction (digital PDFs with selectable text)
 pdf-extract = "0.12.0"
@@ -201,15 +202,15 @@ proptest = "1.6"
 sysinfo = "0.39.6"
 
 # FrankenTUI terminal UI framework
-ftui-core = "0.5.0"
-ftui-render = "0.5.0"
-ftui-style = "0.5.0"
-ftui-text = "0.5.0"
-ftui-layout = "0.5.1"
-ftui-widgets = "0.5.0"
-ftui-tty = "0.5.0"
-ftui-backend = "0.5.0"
-ftui-extras = "0.5.0"
+ftui-core = "0.7.0"
+ftui-render = "0.7.0"
+ftui-style = "0.7.0"
+ftui-text = "0.7.0"
+ftui-layout = "0.7.0"
+ftui-widgets = "0.7.0"
+ftui-tty = "0.7.0"
+ftui-backend = "0.7.0"
+ftui-extras = "0.7.0"
 
 # FrankenSQLite production edge is crates.io 0.3.8 (async Connection plus
 # the AsyncConnection sync facade). Do not reintroduce a 0.1 compatibility

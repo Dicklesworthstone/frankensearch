@@ -1,5 +1,185 @@
 # Dependency Upgrade Log
 
+## 2026-09-12 — Stable dependency refresh (in progress)
+
+The live crates.io census found 19 newer direct packages among 67 registry
+dependencies. FrankenSQLite 0.3.18 remains current. Updates are applied and
+validated one library family at a time under bead `bd-dsbym`; publication waits
+for the complete release gates.
+
+### Asupersync 0.4.11 rejected; 0.4.10 retained and verified
+
+The attempted runtime-family upgrade compiled, but the core suite returned
+1,122 passes and one failure on `vmi1156319` (RCH job `30017369531219996`).
+`shadow::tests::wall_clock_guard_never_awaits_slow_shadow_backend` took
+255.521109 ms against its unchanged 100 ms limit; its shadow backend deliberately
+blocks for 250 ms. Cargo stopped before running the fusion suite.
+
+The [0.4.11 current-thread driver](https://github.com/Dicklesworthstone/asupersync/blob/v0.4.11/src/runtime/current_thread.rs)
+drains queued work after the root result becomes ready, before `block_on`
+returns. A dispatch-count bound cannot prevent an individual shadow poll from
+blocking the caller. Replacing this guard with a different runtime or moving
+its timer inside the root would stop checking the existing caller-visible
+contract; neither change was made.
+
+The runtime and its coupled lock entries are restored to the prior versions.
+The manifest retains the 0.4.10 API floor and temporarily excludes 0.4.11 from
+consumer resolution. The separate fuzz manifest's stale exact 0.4.4 pin is
+aligned to 0.4.10. The unchanged baseline rerun on the same worker passes:
+core 1,123/1,123, including the shadow latency guard; fusion 986 passed,
+four existing ignores, zero failures (RCH `30017369531220011`, exit 0).
+The failed run's source files matched the isolated checkout both during
+compilation and after execution; it is a real failed test, unlike the earlier
+excluded RCH transfer/source-drift attempts. Terminal logs and source manifests
+are retained under `/data/release-work/frankensearch-release-20260912/dependencies/`.
+
+### Tokenizers 0.23.1 → 0.23.2 — verified
+
+The [upstream patch](https://github.com/huggingface/tokenizers/releases/tag/v0.23.2)
+adds a default pretokenized-model hook and vocabulary-size improvements; the
+used tokenizer constructors and encode APIs remain compatible. The existing
+`default-features = false` and `fancy-regex` selection are preserved. Its required
+`daachorse` dependency moves from 1.0.1 to 3.0.3. No other resolved package
+version changes in this step. Fresh-process receipt identities follow the new
+tokenizer version. Remote validation passes 402 unit tests and all eight logging
+contract tests (RCH `30017369531220019`). The three explicitly selected real-Potion
+tests also pass: conformance certification, shared initialization, and bit-exact
+streamed matrix/embedding parity. The five default ignored tests include these
+opt-in model lanes and an unrelated performance probe. All 1,812 tracked source
+files matched the worker during compilation and after testing.
+
+### FastEmbed 6.0.0 → 6.0.3 — API and ONNX conformance verified
+
+The [published 6.0.3 package](https://crates.io/crates/fastembed/6.0.3)
+retains the builder APIs used here; new CPU-fallback and dimension-override
+options have defaults. The existing disabled defaults and
+`ort-download-binaries-rustls-tls` feature remain unchanged. FastEmbed now shares
+Tokenizers 0.23.2 with the native adapters, removing the separate 0.22.2 package.
+The embedder suite passes 426 tests (eight existing opt-in ignores), and the
+optional ONNX reranker suite passes 35. Explicit MiniLM, Snowflake, and Nomic
+real-model tests all match the unchanged exact vector certificates and reject
+historical certificates. Every additional fixture file was checked against its
+pinned revision, size, and SHA-256. The audit reports no vulnerability advisories
+and retains four unmaintained-package warnings and the existing `lru` soundness
+warning; none is hidden.
+
+The review also caught stale producer provenance in the model manifests.
+Current protocols now name Tokenizers 0.23.2 and FastEmbed 6.0.3. All seven
+historical fingerprint fixtures remain verbatim: their reconstruction changes
+only those dependency fields, preserving artifact, numeric, preprocessing, and
+vector-certificate fields. The corrected manifest passes the same 426 + 35
+unit tests. All six explicitly selected real-model tests also pass with the
+corrected producer (three ONNX certificates and three Potion checks).
+The full release gates remain pending. Existing semantic indexes require rebuilding
+when their stored producer identity differs.
+
+### crc32fast 1.5.0 → 1.5.1 — verified
+
+The published patch adds wider x86 VPCLMULQDQ implementations and documents
+the existing AArch64 CRC path. The used `Hasher` API is unchanged. This step
+updates only crc32fast in the lockfile. The admitted `hz3` worker passes 774
+index tests (15 existing ignores), 681 Quill tests (three existing ignores),
+and 160 durability tests. All 1,776 tracked non-coordination files match before
+and after execution. No performance gain is claimed.
+
+### wide 1.6.1 → 1.7.0 — focused suites verified
+
+The published release consolidates SIMD implementations and adds operations.
+Used vector arithmetic APIs remain compatible; changed `signum` semantics and
+deprecated swizzle methods are not used here. Validation targets the existing
+SIMD/scalar parity, exceptional-float, quantization, and postings tests. The
+separate transitive wide 0.7 line remains under its own consumers' constraints.
+Remote tests pass core 1,123, embedder 355 (two existing ignores), index 774
+(15 existing ignores), Quill 681 (three existing ignores), and durability 160.
+The native F32 MiniLM certificate passes with both the prior wide version and
+wide 1.7.0. The latter explicitly selected test checks certification, batching,
+and repeatability on the pinned real model (one pass, zero failures, 8.43 s).
+
+### toml 1.1.4 → 1.1.6 — focused configuration suite verified
+
+The patch fixes ownership of borrowed numeric values and avoids unnecessary
+table cloning. The used serde/configuration APIs remain compatible. Only the
+toml package changes in this lockfile step. The remote core suite passes all
+1,123 tests, including configuration round-tripping, partial defaults, and
+invalid-input fallback. All 1,776 tracked non-coordination source files matched
+during compilation. Full fsfs coverage remains part of the release gate.
+
+### FrankenTUI 0.5.x → 0.7.0 — consumer suites verified
+
+The nine direct framework packages move together. Published 0.7.0 retains the
+frame, layout, and widget APIs used here. The existing markdown feature remains
+enabled; runtime telemetry and its HTTP dependencies remain disabled. The
+optional Asupersync executor is not enabled by these consumers. Validation
+covers the shared TUI and both fsfs and ops consumers: 205 TUI tests, 2,103 fsfs
+tests (14 existing ignores), and 827 ops tests (one existing ignore), all passing.
+All 1,776 tracked non-coordination source files match after execution. The
+lockfile changes only the twelve coupled framework packages in this step.
+
+### ureq 3.4.0 → 3.4.1 — client tests verified
+
+The patch repairs timeout handling around TLS and connection establishment and
+buffer reuse. The JSON feature and default TLS configuration remain unchanged.
+The project uses ureq in its query-expansion client; existing tests cover client
+configuration and response parsing, not live transport behavior. The required
+ureq-proto dependency moves from 0.6.1 to 0.6.2; no other package changes in this
+step. After hz3 lost its SSH connection during compilation, an admitted ovh-a
+rerun passes all nine query-expansion tests. The other two selected consumer
+binaries have zero matching tests and contribute no additional passes. All
+1,776 tracked non-coordination source files match after execution.
+
+### jsonschema 0.50.0 → 0.56.0 — schema contracts verified
+
+Both development dependencies advance together. Defaults remain disabled;
+the newly optional `idna` feature is enabled explicitly to retain the earlier
+internationalized-name behavior. Validation targets the fsfs schema fixtures
+and the gauntlet's current and retained divergence-register schema checks.
+All 119 fsfs schema tests and eight gauntlet tests pass. The required supporting
+packages jsonschema-regex, jsonschema-value, and referencing move to 0.56.0;
+fraction moves to 0.17.0. Both workers match all 1,776 tracked non-coordination
+source files after execution. Historical schemas and fixtures are unchanged.
+
+### ed25519-dalek 2.2.0 → 3.0.0 — signing contracts verified
+
+The signing-key, signature, and verification APIs used by ArtifactStore v4 remain
+compatible. The update changes the RustCrypto dependency family; stored signed
+records, domain separation, and rejection checks must retain their existing
+contracts. Validation targets the real supervisor signing and verification tests.
+Asupersync's nkeys dependency still requires the separate 2.x line. Updating the
+gauntlet consumer adds the five required 3.x-family packages while retaining that
+transitive edge; forcing every old 2.x requirement to 3.0 correctly fails
+resolution. No dependency requirement was loosened to evade that constraint.
+All 21 supervisor tests pass remotely, including valid signatures, tampering,
+wrong keys, retired/revoked keys, cancellation, and timeout handling. All 1,776
+tracked non-coordination source files match after execution.
+
+### Tantivy 0.26.1 → 0.26.2 — validation in progress
+
+The patch fixes nested aggregation flushing and buffered union seeking. Only
+Tantivy changes in this lockfile step. The current oracle dependency record
+advances to v8 with the published 0.26.2 checksum; the exact v7 record remains
+readable as historical evidence and cannot authorize a new run. Earlier frozen
+oracle versions and hashes remain unchanged. The QG-1 incumbent screen also
+advances its protocol version and rejects screens from the prior dependency.
+Validation runs the lexical consumer and the complete gauntlet library suite.
+The lexical suite passes all 129 tests. The first broad gauntlet attempt was
+stopped after seven failures, before its slow evidence-assembly tests finished;
+it is not a completed suite. Four cancellation failures shared a missing
+compiled Git revision because RCH excludes `.git`. The worker now has accurate
+Git metadata for the isolated checkout's actual base and retains its dirty
+overlay. `TMPDIR=/tmp` also keeps Cargo configuration isolation fixtures outside
+the real workspace's ancestor configuration. With that environment, all 14
+selected cancellation, configuration-guard, and unchanged startup-deadline tests
+pass. No validator or assertion was weakened. Full qualification remains pending.
+The subsequent oracle-contract run passes 11 tests, including the current v8
+identity, every retained v2–v7 identity, exact lock resolution, and rejection of
+retired incumbent screens. One live Q1 merge fixture fails with `Q1 E3.5 did not
+construct an interior burned lease tail`. All 1,776 tracked source files match
+the worker after execution. Repair is paused at the library-updater skill's
+explicit checkpoint: 11 test-failure events across this upgrade run, including
+the seven observations in the incomplete broad run and one repeated diagnostic.
+The environment-related failures subsequently passed; the Q1 failure remains
+unresolved. No new version, tag, or publication has been made.
+
 ## 2026-09-07 — FrankenSQLite 0.3.18 source follow-through
 
 The storage, durability, fsfs, and ops manifests now require FrankenSQLite

@@ -297,10 +297,28 @@ impl NativeEmbedder {
             .producer
             .golden_vectors
             .verify_exact_f32(texts, &probe)
-            .map_err(|_| SearchError::ModelLoadFailed {
-                path: dir.to_path_buf(),
-                source: "native execution does not match the registered producer certificate; use a qualified runtime build before rebuilding the index (model files already verified)"
+            .map_err(|error| {
+                // Keep exact admission above authoritative. On refusal, report
+                // only certificate digests/shapes, never model inputs or vector
+                // bytes, so cross-platform failures can be compared (bd-6kafg).
+                let observed =
+                    frankensearch_core::generation::GoldenVectorCertificateV1::from_exact_f32(
+                        texts, &probe,
+                    );
+                SearchError::ModelLoadFailed {
+                    path: dir.to_path_buf(),
+                    source: format!(
+                        "native execution does not match the registered producer certificate; \
+                         use a qualified runtime build before rebuilding the index \
+                         (model files already verified); target={}/{} precision={:?}; \
+                         expected={:?}; observed={observed:?}; verification={error}",
+                        std::env::consts::OS,
+                        std::env::consts::ARCH,
+                        profile.linear_precision(),
+                        embedder.identity.producer.golden_vectors,
+                    )
                     .into(),
+                }
             })?;
 
         tracing::info!(
@@ -1085,6 +1103,7 @@ mod tests {
 
         // Valid, identical model bytes must not let F32 execution attest int8
         // output. Exercise the owning constructor, not just the verifier alone.
+        let actual_certificate = manifest.execution.golden_vectors.clone();
         let mut nonconformant = manifest;
         nonconformant.execution.golden_vectors = NativeEmbeddingModel::AllMiniLmL6V2
             .manifest()
@@ -1096,7 +1115,22 @@ mod tests {
         let SearchError::ModelLoadFailed { source, .. } = error else {
             panic!("expected execution conformance refusal, got {error}");
         };
-        assert!(source.to_string().contains("producer certificate"));
+        let diagnostic = source.to_string();
+        assert!(diagnostic.contains("producer certificate"));
+        assert!(diagnostic.contains(&actual_certificate.vectors_sha256));
+        assert!(diagnostic.contains(&nonconformant.execution.golden_vectors.vectors_sha256));
+        assert!(diagnostic.contains("precision=F32"));
+        assert!(diagnostic.contains(&format!(
+            "target={}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )));
+        assert!(diagnostic.len() < 2048, "certificate diagnostic must be bounded");
+        for text in MODEL_CONFORMANCE_TEXTS_V1 {
+            if !text.is_empty() {
+                assert!(!diagnostic.contains(text), "diagnostic must not expose inputs");
+            }
+        }
     }
 
     /// Smoke test against a real `all-MiniLM-L6-v2` directory. Ignored by default
