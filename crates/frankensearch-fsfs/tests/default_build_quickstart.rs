@@ -3141,7 +3141,7 @@ mod loader_only {
                 "{diagnostic}"
             );
             assert!(
-                diagnostic.contains("unverifiable_remote_space"),
+                diagnostic.contains("Embedding space identity is unverifiable."),
                 "{diagnostic}"
             );
             assert!(diagnostic.contains("fsfs index --full"), "{diagnostic}");

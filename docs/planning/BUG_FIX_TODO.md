@@ -12,7 +12,7 @@ open until their acceptance criteria, including consumer execution, are met.
 - [x] Inventory all 22 nonclosed bug beads and GitHub issues 41, 43, 46, 47, 48.
 - [x] Ask existing owners for current progress and bounded handoffs (Mail 41382).
 - [ ] Reconcile owner replies; do not interpret silence or null assignee as permission to overwrite work.
-  - ChartreuseCarp resumed release/dependency ownership (Mail 41394); active gate and new CLI regression handed off in 41397/41398. Await execution acknowledgment/results.
+  - ChartreuseCarp resumed release/dependency ownership (Mail 41394), owns oracle/profile/fuzz and full Quill qualification. Per Mail 41407, PurpleBay will execute the genuine-model doctor regression on the existing ovh fsfs target after the active gate; peer's old fsfs target was reaped. No independent watcher subpiece is ready.
 - [x] Restore tracker mutation capability with its graph owner: migrate schema 17 to 19.
   - [x] Inspect explicit migration plan read-only and its source preconditions: eligible 17→19, integrity OK, 1298 issues/2257 dependencies/3779 comments. Prestate-bound receipt reported in Agent Mail; no apply performed.
   - [x] Coordinate a single migration writer before any apply; preserve JSONL and DB family. ChartreuseCarp delegated PurpleBay in Mail 41399; peers notified in 41401. Snapshot `.beads/recovery_20260912T194346Z`; supported migration run `20260912T194351.279401Z-476704-0` retains raw prestate under `.beads/.br_recovery/schema-migrations/` and supports undo.
@@ -24,6 +24,7 @@ open until their acceptance criteria, including consumer execution, are met.
   - [x] Add isolated production-CLI regression `loader_only::doctor_rejects_stale_real_model_producer_revisions` in the existing quickstart suite; real index vectors, both tiers, stale-revision refusal, exact-byte restoration acceptance, observer-only assertions.
   - [ ] Compile and execute the ignored genuine-model regression with both pinned caches; no pass yet.
   - [x] Remote rustfmt passed for this new regression on hz4 at 19:37:30 UTC.
+  - [x] Source review caught and corrected the new test's diagnostic expectation: doctor embeds the safe `SearchError` display text, not its internal variant code. The production error envelope remains `subsystem_error`; refusal/recovery/observer-only assertions are retained. Corrected-source remote formatting passed on hz4 at 19:53:34 UTC; execution remains pending.
 - [ ] Validate default, native, lite and full workspace gates for the doctor fix.
 - [ ] Reproduce ARM native refusal with the new digest diagnostic; locate first numerical divergence.
 - [ ] Implement the supported numerical repair or explicitly distinct qualified producer only after evidence.
@@ -148,6 +149,7 @@ RCH validation, and evidence-backed Beads closure. None is silently waived.
   - Running strict RCH on ovh-a from transferred 062f5b8f source, 19:33 UTC. Remote Git metadata reports dd093fb2+dirty, so this invocation is not release-source provenance; preserve this limitation. The newly added genuine-model regression is not part of that earlier transferred tree.
   - Formatting, workspace/all-target check (282s), Clippy plus hybrid Clippy, and Windows index cross-check (92s) passed; workspace library tests are compiling. External fast_cmaes emits seven deprecated-constant warnings and Windows index check emits nine dead-code warnings; no unrelated dependency edits or lint suppressions made.
 - [ ] Complete additional Quill full/probe lanes for affected changes.
+  - ChartreuseCarp reports stale oracle v8/engine profile v6 contracts against new 0.3.0 adapters in the already-transferred gate source (Mail 41406). Their isolated five-file repair is under RCH validation; old identities remain historical. Expected contract refusal is not a doctor regression or permission to weaken conformance.
 - [ ] Reconcile actual shipped fixes with every GH/bead acceptance criterion; do not close a broad issue for one sub-fix.
 - [ ] Commit only intended paths; preserve the unrelated golden `.actual.json` file.
 - [ ] Keep main/mirror synchronization and coordinate concurrent remote histories without force pushes.
@@ -155,4 +157,5 @@ RCH validation, and evidence-backed Beads closure. None is silently waived.
 - [ ] Newly discovered: RCH source-content receipt refuses a symlink in sibling fast_cmaes `.claude/worktrees`; use a supported isolated-source route, do not delete peer files or weaken proof.
 - [ ] Newly discovered: retain executable provenance before remote cleanup; old F32 diagnostic run has source/log evidence but no executable digest.
 - [ ] Newly discovered: full-feature/genuine-model doctor regression is still needed despite 16 passing library tests.
+- [ ] Newly discovered: ChartreuseCarp reports today's registry publication of facade 0.6.0 / component 0.3.0 / rerank 0.4.0 from dd093fb2 (Mail 41404/41406); reconcile publication-owner receipts before release qualification. These immutable versions must not be reused, and they do not contain the later doctor repair. This is peer-reported registry evidence, not an independent publication receipt collected by PurpleBay.
 - [ ] bd-d7xk1 (ready problem task, not bug-typed): inspect seven unreferenced source files (`core/metrics.rs`, `durability/tantivy_wrapper.rs`, `fusion/repro_blend.rs`, `fusion/repro_rrf.rs`, `tui/repro_input.rs`, `rerank/test_api.rs`, `rerank/test_inputs.rs`). Register only real supported functionality or move valid repros into actual tests; deletion requires explicit written permission. Add a meaningful source-reachability check without compiling dead code solely to satisfy a census.
