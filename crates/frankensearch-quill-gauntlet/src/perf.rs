@@ -369,11 +369,10 @@ pub const QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION: &str =
     crate::version_contract::CURRENT_ORACLE_TANTIVY_VERSION;
 /// Wire schema for the provisional QG-1 Tantivy incumbent screen.
 ///
-/// v5 (gh#416): the oracle moved from the git tantivy 0.27-dev pin to
-/// registry 0.26.1, and per the protocol-pin rule above that retires every
-/// v4 screen record — a new screen must be taken under the 0.26.1 writer.
+/// v6 updates the registry oracle to 0.26.2. Every earlier screen is retired:
+/// a new screen must execute the pinned 0.26.2 writer.
 pub const QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION: &str =
-    "quill-qg1-tantivy-incumbent-screen-v5-tantivy-0.26.1";
+    "quill-qg1-tantivy-incumbent-screen-v6-tantivy-0.26.2";
 
 /// Tantivy writer construction admitted to the QG-1 incumbent screen.
 ///
@@ -8945,16 +8944,25 @@ mod tests {
         );
         assert_eq!(
             QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION,
-            "quill-qg1-tantivy-incumbent-screen-v5-tantivy-0.26.1"
+            "quill-qg1-tantivy-incumbent-screen-v6-tantivy-0.26.2"
         );
 
-        // The retired v4 screens ran under the git tantivy 0.27-dev pin; a
-        // contract still claiming that writer must not admit into v5 records.
-        let mut retired_v4 = qg1_semantic_contract();
-        retired_v4.tantivy_version = "0.27.0".to_owned();
+        for version in ["0.27.0", "0.26.1"] {
+            let mut retired = qg1_semantic_contract();
+            retired.tantivy_version = version.to_owned();
+            assert!(matches!(
+                retired.contract_sha256(),
+                Err(Qg1TantivyIncumbentError::InvalidSemanticContract)
+            ));
+        }
+
+        let cell = qg1_bulk_cell(2);
+        let mut retired_plan = qg1_screen_plan(&cell, vec![1, 2]);
+        retired_plan.schema_version =
+            "quill-qg1-tantivy-incumbent-screen-v5-tantivy-0.26.1".to_owned();
         assert!(matches!(
-            retired_v4.contract_sha256(),
-            Err(Qg1TantivyIncumbentError::InvalidSemanticContract)
+            retired_plan.validate_for_cell(&cell),
+            Err(Qg1TantivyIncumbentError::InvalidScreenPlan)
         ));
     }
 

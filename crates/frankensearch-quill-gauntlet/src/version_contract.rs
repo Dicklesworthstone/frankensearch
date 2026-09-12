@@ -42,7 +42,8 @@ const ORACLE_V4_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "062a5e5b2d41653b1c8b078
 // change. The registry tantivy artifact is byte-identical to v4 (same
 // checksum). v4 joins v2/v3 as a retained decode-only line: historical
 // artifacts stay verifiable, but nothing new admits under the 0.2.2 wrapper.
-pub const CURRENT_ORACLE_TANTIVY_VERSION: &str = "0.26.1";
+pub const CURRENT_ORACLE_TANTIVY_VERSION: &str = "0.26.2";
+const ORACLE_V5_TANTIVY_VERSION: &str = "0.26.1";
 const ORACLE_V5_TANTIVY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const ORACLE_V5_TANTIVY_CHECKSUM_SHA256: &str =
     "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07";
@@ -55,6 +56,7 @@ const ORACLE_V5_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "b31fa58fec3dafbdd279556
 // Package version (0.2.3) and the registry tantivy artifact are unchanged;
 // the audit revision moves to the commit that changed the surface. v5 joins
 // v2/v3/v4 as a retained decode-only line.
+const ORACLE_V6_TANTIVY_VERSION: &str = "0.26.1";
 const ORACLE_V6_TANTIVY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const ORACLE_V6_TANTIVY_CHECKSUM_SHA256: &str =
     "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07";
@@ -68,12 +70,22 @@ const ORACLE_V6_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "e6394bc808f00313db077aa
 // sha2 is now optional but remains enabled by tantivy-oracle. The exact registry
 // Tantivy artifact is unchanged. The audit binds the final wrapper bytes at
 // 1b67c0cb; v6 remains exact decode-only evidence and cannot admit new runs.
+const ORACLE_V7_TANTIVY_VERSION: &str = "0.26.1";
 const ORACLE_V7_TANTIVY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const ORACLE_V7_TANTIVY_CHECKSUM_SHA256: &str =
     "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07";
 const ORACLE_V7_LEXICAL_PACKAGE: &str = "frankensearch-lexical";
 const ORACLE_V7_LEXICAL_PACKAGE_VERSION: &str = "0.2.5";
 const ORACLE_V7_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "1b67c0cb5cdeb6edeb8fa945b52da4d877215bef";
+// v8 updates the registry oracle to Tantivy 0.26.2. The wrapper observation
+// surface is unchanged; the new artifact checksum and domain distinguish new
+// runs from every retained 0.26.1 record. v7 remains exact decode-only evidence.
+const ORACLE_V8_TANTIVY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const ORACLE_V8_TANTIVY_CHECKSUM_SHA256: &str =
+    "861facfabd71044968f364837f9a083b56464ba5a59079f88706ee5c451ca069";
+const ORACLE_V8_LEXICAL_PACKAGE: &str = "frankensearch-lexical";
+const ORACLE_V8_LEXICAL_PACKAGE_VERSION: &str = "0.2.5";
+const ORACLE_V8_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "1b67c0cb5cdeb6edeb8fa945b52da4d877215bef";
 const LOCKED_TANTIVY_VERSION: &str = env!("QUILL_ORACLE_TANTIVY_VERSION");
 const LOCKED_TANTIVY_SOURCE: &str = env!("QUILL_ORACLE_TANTIVY_SOURCE");
 const LOCKED_TANTIVY_CHECKSUM_SHA256: &str = env!("QUILL_ORACLE_TANTIVY_CHECKSUM_SHA256");
@@ -89,6 +101,8 @@ const ORACLE_V6_DEPENDENCY_CONTRACT_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/oracle-dependency-contract/v6\0";
 const ORACLE_V7_DEPENDENCY_CONTRACT_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/oracle-dependency-contract/v7\0";
+const ORACLE_V8_DEPENDENCY_CONTRACT_HASH_DOMAIN: &[u8] =
+    b"frankensearch/quill/oracle-dependency-contract/v8\0";
 /// Exact `frankensearch-lexical` crate version resolved by this build.
 pub const FRANKENSEARCH_LEXICAL_CRATE_VERSION: &str = env!("FRANKENSEARCH_LEXICAL_CRATE_VERSION");
 const QUIVER_DIFFERENTIAL_FIXTURE_ID: &str = "quiver-postings-bitpack-scalar-wide-v1";
@@ -113,7 +127,7 @@ pub struct OracleVersionContract {
 }
 
 impl OracleVersionContract {
-    /// Validate the self-contained current (v7) dependency record without
+    /// Validate the self-contained current (v8) dependency record without
     /// consulting the current checkout, executable, manifest, or lockfile.
     ///
     /// # Errors
@@ -126,7 +140,7 @@ impl OracleVersionContract {
 
     /// Validate an exact historical dependency record while inspecting a
     /// committed, decode-only witness. This admits only the frozen v2 through
-    /// v6 records in addition to the current v7 record; it never authorizes
+    /// v7 records in addition to the current v8 record; it never authorizes
     /// creation or admission under an old dependency.
     pub(crate) fn validate_retained_structure(&self) -> Result<(), GauntletError> {
         self.validate_structure(true)
@@ -155,29 +169,41 @@ impl OracleVersionContract {
             && self.lexical_package_version == ORACLE_V4_LEXICAL_PACKAGE_VERSION
             && self.lexical_contract_audit_revision == ORACLE_V4_LEXICAL_CONTRACT_AUDIT_REVISION;
         let matches_v5 = self.schema_version == 5
-            && self.tantivy_version == CURRENT_ORACLE_TANTIVY_VERSION
+            && self.tantivy_version == ORACLE_V5_TANTIVY_VERSION
             && self.tantivy_source == ORACLE_V5_TANTIVY_SOURCE
             && self.tantivy_checksum_sha256 == ORACLE_V5_TANTIVY_CHECKSUM_SHA256
             && self.lexical_package == ORACLE_V5_LEXICAL_PACKAGE
             && self.lexical_package_version == ORACLE_V5_LEXICAL_PACKAGE_VERSION
             && self.lexical_contract_audit_revision == ORACLE_V5_LEXICAL_CONTRACT_AUDIT_REVISION;
         let matches_v6 = self.schema_version == 6
-            && self.tantivy_version == CURRENT_ORACLE_TANTIVY_VERSION
+            && self.tantivy_version == ORACLE_V6_TANTIVY_VERSION
             && self.tantivy_source == ORACLE_V6_TANTIVY_SOURCE
             && self.tantivy_checksum_sha256 == ORACLE_V6_TANTIVY_CHECKSUM_SHA256
             && self.lexical_package == ORACLE_V6_LEXICAL_PACKAGE
             && self.lexical_package_version == ORACLE_V6_LEXICAL_PACKAGE_VERSION
             && self.lexical_contract_audit_revision == ORACLE_V6_LEXICAL_CONTRACT_AUDIT_REVISION;
         let matches_v7 = self.schema_version == 7
-            && self.tantivy_version == CURRENT_ORACLE_TANTIVY_VERSION
+            && self.tantivy_version == ORACLE_V7_TANTIVY_VERSION
             && self.tantivy_source == ORACLE_V7_TANTIVY_SOURCE
             && self.tantivy_checksum_sha256 == ORACLE_V7_TANTIVY_CHECKSUM_SHA256
             && self.lexical_package == ORACLE_V7_LEXICAL_PACKAGE
             && self.lexical_package_version == ORACLE_V7_LEXICAL_PACKAGE_VERSION
             && self.lexical_contract_audit_revision == ORACLE_V7_LEXICAL_CONTRACT_AUDIT_REVISION;
-        if !(matches_v7
+        let matches_v8 = self.schema_version == 8
+            && self.tantivy_version == CURRENT_ORACLE_TANTIVY_VERSION
+            && self.tantivy_source == ORACLE_V8_TANTIVY_SOURCE
+            && self.tantivy_checksum_sha256 == ORACLE_V8_TANTIVY_CHECKSUM_SHA256
+            && self.lexical_package == ORACLE_V8_LEXICAL_PACKAGE
+            && self.lexical_package_version == ORACLE_V8_LEXICAL_PACKAGE_VERSION
+            && self.lexical_contract_audit_revision == ORACLE_V8_LEXICAL_CONTRACT_AUDIT_REVISION;
+        if !(matches_v8
             || permit_retained_historical
-                && (matches_v2 || matches_v3 || matches_v4 || matches_v5 || matches_v6))
+                && (matches_v2
+                    || matches_v3
+                    || matches_v4
+                    || matches_v5
+                    || matches_v6
+                    || matches_v7))
             || !is_lower_hex(&self.tantivy_checksum_sha256, 64)
             || !is_lower_hex(&self.lexical_contract_audit_revision, 40)
         {
@@ -189,7 +215,7 @@ impl OracleVersionContract {
         Ok(())
     }
 
-    /// Validate that this v7 record describes the exact dependency resolved by
+    /// Validate that this v8 record describes the exact dependency resolved by
     /// the current producer build.
     pub(crate) fn validate_current_dependency(&self) -> Result<(), GauntletError> {
         self.validate_stored_structure()?;
@@ -225,6 +251,7 @@ impl OracleVersionContract {
             5 => ORACLE_V5_DEPENDENCY_CONTRACT_HASH_DOMAIN,
             6 => ORACLE_V6_DEPENDENCY_CONTRACT_HASH_DOMAIN,
             7 => ORACLE_V7_DEPENDENCY_CONTRACT_HASH_DOMAIN,
+            8 => ORACLE_V8_DEPENDENCY_CONTRACT_HASH_DOMAIN,
             _ => unreachable!("validated oracle dependency contract has an unknown schema"),
         };
         let mut hasher = Sha256::new();
@@ -443,11 +470,12 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
         ConcatMergeError, KeeperError, QuillConfig, QuillIndex, QuillIndexError, SectionKind,
     };
 
-    let index = QuillIndex::in_memory(QuillConfig {
+    let config = QuillConfig {
         deterministic_ingest: true,
         ..QuillConfig::default()
-    })
-    .map_err(|error| q1_merge_error("create deterministic index", error))?;
+    };
+    let mut index = QuillIndex::in_memory(config.clone())
+        .map_err(|error| q1_merge_error("create deterministic index", error))?;
     let batches = [
         vec![
             IndexableDocument::new("merge-a1", "shared alpha exact phrase")
@@ -517,9 +545,10 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
             .ok_or_else(|| GauntletError::InvalidContract {
                 reason: "Q1 E3.5 could not choose a first-stage fixture segment id".to_owned(),
             })?;
-            // The explicit first-stage merge retires the active ingest lease.
-            // Appending the remaining batches from the successor lease then
-            // creates a real burned-tail gap inside the final merge hull.
+            // A single writer's merge safely retains its live lease. Reopen
+            // the committed snapshot after merging to end that writer session:
+            // the successor allocator burns the unconsumed lease tail before
+            // later batches create a real gap inside the final merge hull.
             index
                 .concat_merge(
                     cx,
@@ -529,6 +558,8 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
                 )
                 .await
                 .map_err(|error| q1_merge_error("publish first-stage concat merge", error))?;
+            index = QuillIndex::from_in_memory_snapshot(index.snapshot()?.clone(), config.clone())
+                .map_err(|error| q1_merge_error("reopen first-stage snapshot", error))?;
         }
     }
 
@@ -860,7 +891,7 @@ mod tests {
         assert_eq!(contract.lexical_contract_audit_revision.len(), 40);
         contract
             .validate_stored_structure()
-            .expect("stored v7 contract is self-contained");
+            .expect("stored v8 contract is self-contained");
         contract
             .validate_current_dependency()
             .expect("stored contract matches current lock resolution");
@@ -996,7 +1027,7 @@ mod tests {
     fn retained_v5_oracle_contract_is_exact_but_never_current() {
         let retained = OracleVersionContract {
             schema_version: 5,
-            tantivy_version: CURRENT_ORACLE_TANTIVY_VERSION.to_owned(),
+            tantivy_version: ORACLE_V5_TANTIVY_VERSION.to_owned(),
             tantivy_source: ORACLE_V5_TANTIVY_SOURCE.to_owned(),
             tantivy_checksum_sha256: ORACLE_V5_TANTIVY_CHECKSUM_SHA256.to_owned(),
             lexical_package: ORACLE_V5_LEXICAL_PACKAGE.to_owned(),
@@ -1029,7 +1060,7 @@ mod tests {
     fn retained_v6_oracle_contract_is_exact_but_never_current() {
         let retained = OracleVersionContract {
             schema_version: 6,
-            tantivy_version: CURRENT_ORACLE_TANTIVY_VERSION.to_owned(),
+            tantivy_version: ORACLE_V6_TANTIVY_VERSION.to_owned(),
             tantivy_source: ORACLE_V6_TANTIVY_SOURCE.to_owned(),
             tantivy_checksum_sha256: ORACLE_V6_TANTIVY_CHECKSUM_SHA256.to_owned(),
             lexical_package: ORACLE_V6_LEXICAL_PACKAGE.to_owned(),
@@ -1087,13 +1118,77 @@ mod tests {
     }
 
     #[test]
-    fn current_v7_oracle_contract_identity_is_pinned() {
+    fn retained_v7_oracle_contract_is_exact_but_never_current() {
+        let retained = OracleVersionContract {
+            schema_version: 7,
+            tantivy_version: ORACLE_V7_TANTIVY_VERSION.to_owned(),
+            tantivy_source: ORACLE_V7_TANTIVY_SOURCE.to_owned(),
+            tantivy_checksum_sha256: ORACLE_V7_TANTIVY_CHECKSUM_SHA256.to_owned(),
+            lexical_package: ORACLE_V7_LEXICAL_PACKAGE.to_owned(),
+            lexical_package_version: ORACLE_V7_LEXICAL_PACKAGE_VERSION.to_owned(),
+            lexical_contract_audit_revision: ORACLE_V7_LEXICAL_CONTRACT_AUDIT_REVISION.to_owned(),
+        };
+        retained
+            .validate_retained_structure()
+            .expect("the committed v7 dependency record remains decode-only evidence");
+        assert!(retained.validate_stored_structure().is_err());
+        assert!(retained.validate_current_dependency().is_err());
+        assert_eq!(
+            retained.identity_sha256().expect("retained v7 identity"),
+            "5552a08677e98b660e25bc9b178e48bb96a49fd2b13989d39af57230f96c0558",
+            "retained evidence must keep the exact v7 identity",
+        );
+
+        let encoded = serde_json::to_value(&retained).expect("serialize retained v7");
+        for (field, value) in [
+            ("schema_version", serde_json::json!(8)),
+            (
+                "tantivy_version",
+                serde_json::json!(CURRENT_ORACLE_TANTIVY_VERSION),
+            ),
+            (
+                "tantivy_source",
+                serde_json::json!("git+https://example.invalid/tantivy"),
+            ),
+            (
+                "tantivy_checksum_sha256",
+                serde_json::json!(ORACLE_V8_TANTIVY_CHECKSUM_SHA256),
+            ),
+            ("lexical_package", serde_json::json!("lookalike-lexical")),
+            ("lexical_package_version", serde_json::json!("0.2.999")),
+            (
+                "lexical_contract_audit_revision",
+                serde_json::json!("0".repeat(40)),
+            ),
+        ] {
+            let mut mutated = encoded.clone();
+            mutated[field] = value;
+            let mutated: OracleVersionContract =
+                serde_json::from_value(mutated).expect("well-typed mutation");
+            assert!(
+                mutated.validate_retained_structure().is_err(),
+                "v7 accepted mutated {field}"
+            );
+            assert!(
+                mutated.identity_sha256().is_err(),
+                "v7 hashed mutated {field}"
+            );
+        }
+
+        let mut relabeled = retained;
+        relabeled.tantivy_version = CURRENT_ORACLE_TANTIVY_VERSION.to_owned();
+        relabeled.tantivy_checksum_sha256 = ORACLE_V8_TANTIVY_CHECKSUM_SHA256.to_owned();
+        assert!(relabeled.validate_retained_structure().is_err());
+    }
+
+    #[test]
+    fn current_v8_oracle_contract_identity_is_pinned() {
         let contract = oracle_version_contract().expect("valid oracle contract");
-        assert_eq!(contract.schema_version, 7);
+        assert_eq!(contract.schema_version, 8);
         assert_eq!(
             contract.identity_sha256().expect("current identity"),
-            "5552a08677e98b660e25bc9b178e48bb96a49fd2b13989d39af57230f96c0558",
-            "v7 binds the audited 0.2.5 wrapper while retaining the v6 identity above",
+            "6b29d3de2f15784574c605ed63ad35b7f0691f99f961981a3c03d6a69dae152a",
+            "v8 binds the new registry artifact while retaining the v7 identity above",
         );
     }
 

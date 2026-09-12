@@ -68,7 +68,7 @@ path = "src/bin/quill_perf_run_plan.rs"
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 frankensearch-quill = { workspace = true, features = ["bench-internals"] }
-jsonschema = { version = "0.50", default-features = false }
+jsonschema = { version = "0.56", default-features = false, features = ["idna"] }
 rayon = { workspace = true }
 proptest = { workspace = true }
 tempfile = "3.27"

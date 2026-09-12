@@ -143,7 +143,7 @@ ft-core = { package = "frankentorch-core", version = "0.1.0" }
 # and other trivially-droppable types, so the pattern cannot occur in this
 # graph. A registry pin is required for crates.io publication (a git dep is
 # unpublishable); move to tantivy 0.27 when it ships with patched lru.
-tantivy = "=0.26.1"
+tantivy = "=0.26.2"
 
 ndarray = "0.17"
 
@@ -167,7 +167,7 @@ unicode-normalization = "0.1"
 # Platform-standard directories for model storage
 
 # TOML parsing for configuration surfaces
-toml = "1.0.3"
+toml = "1.1.6"
 
 # SHA-256 verification for model manifests
 sha2 = "0.11.0"
@@ -187,7 +187,7 @@ zeroize = "=1.9.0"
 # or the gauntlet crate before removing. Pinned to the version the lock
 # already resolves through asupersync, so no new dependency universe entry
 # is introduced.
-ed25519-dalek = "=2.2.0"
+ed25519-dalek = "=3.0.0"
 
 # PDF text extraction (digital PDFs with selectable text)
 pdf-extract = "0.12.0"
@@ -202,15 +202,15 @@ proptest = "1.6"
 sysinfo = "0.39.6"
 
 # FrankenTUI terminal UI framework
-ftui-core = "0.5.0"
-ftui-render = "0.5.0"
-ftui-style = "0.5.0"
-ftui-text = "0.5.0"
-ftui-layout = "0.5.1"
-ftui-widgets = "0.5.0"
-ftui-tty = "0.5.0"
-ftui-backend = "0.5.0"
-ftui-extras = "0.5.0"
+ftui-core = "0.7.0"
+ftui-render = "0.7.0"
+ftui-style = "0.7.0"
+ftui-text = "0.7.0"
+ftui-layout = "0.7.0"
+ftui-widgets = "0.7.0"
+ftui-tty = "0.7.0"
+ftui-backend = "0.7.0"
+ftui-extras = "0.7.0"
 
 # FrankenSQLite production edge is crates.io 0.3.8 (async Connection plus
 # the AsyncConnection sync facade). Do not reintroduce a 0.1 compatibility
