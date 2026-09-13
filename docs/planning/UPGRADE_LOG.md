@@ -4,6 +4,45 @@
 
 ### Follow-up qualification on September 13 (UTC)
 
+The later fixed-source run at `67c9652c` passes formatting, workspace checking,
+workspace and hybrid Clippy, the Windows compile guard, and all 7,955 workspace
+library tests across 13 targets (58 existing ignores). RCH's 1,800-second command
+limit stopped the run during bounded Quill compilation; subsequent product
+stages did not run. All 1,777 project source files match afterward. The 36-file
+`fast_cmaes` sibling dependency matches between the during-check and post-run
+samples; that first run did not capture it before compilation. Executable hashes
+in `dependencies/quality-67c9652c-partial-receipt.json` are explicitly post-run
+samples. A separate continuation binds both source sets before and after and
+passes all 59 bounded Quill checks with no failures or ignores. Its receipt is
+`dependencies/quality-67c9652c-quill-receipt.json`.
+
+The two slow Quill tests still lack a valid terminal result. The package-only
+optimization probe compiled with optimization level 2, debug assertions and
+overflow checks enabled, but the old RCH daemon canceled its supervisor during
+shutdown. The exact cancellation is retained in
+`dependencies/quill-optprobe-supervisor-cancellation-journal.log`. The replacement
+daemon contains the shutdown-order correction; one fresh unchanged-binary
+attempt was refused for insufficient worker slots before execution. Neither
+attempt certifies these tests or the complete gauntlet.
+
+The separate ARM F32 producer now has an executed failure, rather than only an
+admission refusal: its constructor expects `aa230ec7...` but observes
+`eded4623...`. Source, model, and executable hashes match before and after this
+single run. Batching and repeatability assertions were not reached. See
+`rch-mac/native-exp87-arm-f32-resume-20260913.log` and the corresponding
+`native-exp87-arm-f32-resume-before.json` / `-after.json` receipts. The qualified
+Int8 result below remains valid; the F32 certificate has not been changed.
+
+The existing certificate recorder is now available in the F32 fixture as well.
+It records only constructor execution and flushes before preserving the original
+success or failure assertion. The test-only change passes x86 formatting,
+native all-target Clippy, all 47 enabled native tests (12 ignored), and the
+unchanged F32 certificate/batching/repeatability fixture. The frozen source
+contains the qualified Int8 correction plus this observer change; all 1,777
+source hashes match throughout. The executed ELF is
+`cc99d76521e7e82677b4e7e096b3bc4efc7dd459a1320cd9e4cfc122653495e1`.
+See `dependencies/native-f32-observer-x86-rch.log` for the terminal results.
+
 The repaired fsfs fixtures pass in the broader product run: 2,105 library tests
 passed with no failures and 14 existing ignores, both in the workspace lane and
 the separate fsfs lane. The fsfs and facade stages passed. Formatting, workspace

@@ -1071,8 +1071,12 @@ mod tests {
         let dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
         let profile = NativeEmbeddingModel::AllMiniLmL6V2F32;
         let manifest = profile.manifest().unwrap();
-        let embedder =
-            NativeEmbedder::load_model(&dir, profile).expect("load verified F32 producer");
+        let trace = crate::native::certificate_trace::begin();
+        let loaded = NativeEmbedder::load_model(&dir, profile);
+        if let Some(trace) = trace {
+            trace.flush();
+        }
+        let embedder = loaded.expect("load verified F32 producer");
         assert_eq!(embedder.id(), "minilm-384-native-f32");
         assert_eq!(
             embedder.identity().unwrap(),
