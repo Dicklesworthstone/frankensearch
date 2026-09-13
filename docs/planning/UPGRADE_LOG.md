@@ -87,9 +87,8 @@ the registered `bed15455...`. The first 41-stage comparison agrees through
 tokenization, initial normalization, QKV, and attention scores. Scalar softmax
 and vector GELU differ, but those initial differences disappear before the first
 encoder-layer output. Layer two is the first output that remains different;
-only one of the four public corpus embeddings differs at the end. This narrows
-the investigation without yet proving which operation causes the certificate
-mismatch. See `dependencies/native-trace-comparison.json`.
+only one of the four public corpus embeddings differs at the end. See
+`dependencies/native-trace-comparison.json` for that initial comparison.
 
 An expanded all-layer ARM probe was refused before transfer or execution by
 RCH's critical-memory-pressure admission check; no retry or policy change was
@@ -99,9 +98,52 @@ all-target Clippy with warnings denied, all 45 enabled native library tests
 116 records across all six layers. All 1,777 source hashes match throughout;
 `dependencies/native-observer-lintfixed-hz3.log` retains the terminal results and
 executed binary hash. The initial observer's eight Clippy findings were repaired
-without suppressions before this validation. Final-source full qualification,
-the complete Quill gauntlet, and native ARM qualification still prevent release
-completion.
+without suppressions before this validation.
+
+A later admitted ARM run reproduced the failure and captured all 116 records.
+The first persistent difference begins in layer two's vector softmax, propagates
+through the attention projection and residual, and survives in one token row.
+The GELU differences in that layer disappear at the next quantized projection.
+The original failing ARM executable is retained alongside
+`dependencies/native-trace-alllayers-comparison-eb935aa1.json`.
+
+The repair adapts wide 1.7.0's vector exponential with explicit non-fused
+arithmetic, preserving its x86 expression tree and license notice. It changes
+the six vector exponential sites; scalar exponential calls, certificate hashes,
+and acceptance rules remain unchanged. The corrected source passes native
+rerank Clippy with warnings denied, formatting in the isolated qualification
+snapshot, and all 47 enabled x86 tests (12 ignored), including a bitwise oracle
+against wide over dense samples, exponent boundaries, and arbitrary input bits.
+The unchanged real-model certificate passes on both x86 and ARM. ARM also passes
+all 46 enabled native tests (12 ignored). All six encoder outputs and all four
+final embeddings on ARM exactly match the original validated x86 producer.
+Some intermediate scalar-path values still differ; this is not a claim that
+every floating-point intermediate is identical across architectures.
+
+The qualified native source SHA-256 is
+`87cc9bd27c03bfbbd833c01ff6b805fc19cde990db014f7d925ebabd057af604`.
+The x86 qualification uses the earlier `86d59ee4` snapshot plus this file; ARM
+uses `eb935aa1` plus the same file. Their base difference is documentation only.
+The executed x86 ELF hash is
+`27c1d842ca09d3915afab46bdb06b3ad1e8038479a5b376a160f0f69ff0dd1dd`;
+the ARM Mach-O hash is
+`25ffe16af9b15e473a4cd4c9a2772541f34354c5ba0b18f9d3e6d82cd4f43053`.
+Receipts are `dependencies/native-exp-isolated-receipt.json`,
+`rch-mac/native-exp87-arm-source-after-executable.json`,
+`rch-mac/native-exp87-arm-suite.log`, and
+`dependencies/native-exp87-arm-vs-original-x86-comparison.json`.
+Earlier Clippy, transport, and admission failures remain separate evidence.
+
+Five formatting-only corrections to the newly integrated facade index builder
+also pass remote `cargo fmt --check` on main `8020489d` with the qualified native
+file. All 1,777 frozen source hashes match; see
+`dependencies/facade-fmt-receipt.json`. A subsequent ARM F32 fixture request was
+refused before transfer or execution for critical memory pressure (exit 103);
+`rch-mac/native-exp87-arm-f32.log` records no numerical verdict.
+
+These focused passes do not certify later changes on main. Final-source full
+qualification, the complete Quill gauntlet, the distinct native F32 ARM profile,
+and a populated CASS consumer query remain release follow-through work.
 
 ### Follow-up qualification at 23:36 UTC
 

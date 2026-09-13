@@ -274,20 +274,20 @@ fn exp_vec8_non_fused(input: f32x8) -> f32x8 {
             0.0
         }
     }));
-    let r = (bounded * f32x8::LOG2_E).round_ties_even();
-    let max_r = f32x8::splat(127.0);
-    let scale = pow2((r - max_r).max(f32x8::ZERO));
-    let n2 = pow2(r.min(max_r));
-    let x = bounded - r * f32x8::splat(0.693_359_4);
-    let x = x - r * f32x8::splat(-2.121_944_4e-4);
-    let x2 = x * x;
-    let x4 = x2 * x2;
-    let a = f32x8::splat(1.0 / 120.0) * x + f32x8::splat(1.0 / 24.0);
-    let b = f32x8::splat(1.0 / 5040.0) * x + f32x8::splat(1.0 / 720.0);
-    let c = f32x8::splat(1.0 / 6.0) * x + f32x8::splat(1.0 / 2.0);
-    let p = a * x2 + (b * x4 + c);
-    let z = p * x2 + x;
-    let result = ((z + f32x8::ONE) * scale * n2).to_array();
+    let exponent = (bounded * f32x8::LOG2_E).round_ties_even();
+    let max_exponent = f32x8::splat(127.0);
+    let scale = pow2((exponent - max_exponent).max(f32x8::ZERO));
+    let power = pow2(exponent.min(max_exponent));
+    let reduced = bounded - exponent * f32x8::splat(0.693_359_4);
+    let reduced = reduced - exponent * f32x8::splat(-2.121_944_4e-4);
+    let squared = reduced * reduced;
+    let fourth = squared * squared;
+    let pair_23 = f32x8::splat(1.0 / 120.0) * reduced + f32x8::splat(1.0 / 24.0);
+    let pair_45 = f32x8::splat(1.0 / 5040.0) * reduced + f32x8::splat(1.0 / 720.0);
+    let pair_01 = f32x8::splat(1.0 / 6.0) * reduced + f32x8::splat(1.0 / 2.0);
+    let polynomial = pair_23 * squared + (pair_45 * fourth + pair_01);
+    let increment = polynomial * squared + reduced;
+    let result = ((increment + f32x8::ONE) * scale * power).to_array();
     f32x8::new(std::array::from_fn(|i| {
         if lanes[i].is_nan() {
             f32::from_bits(0x7fc0_0101)
