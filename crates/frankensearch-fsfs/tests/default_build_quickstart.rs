@@ -1429,8 +1429,8 @@ mod loader_only {
                 .unwrap();
         let fingerprint = native.identity().unwrap().fingerprint();
         assert_eq!(
-            fingerprint, "35d0a014b4ec6224eb42552ea1099b24bead0c9c51906b6035207b6105e8af01",
-            "existing native producer must stay unchanged"
+            fingerprint, "aa25d24b07a2d233445cb6605c95d33601ea36a044d3a4b2bed65e7590386109",
+            "native producer must name the current tokenizer protocol; historical identity is pinned separately"
         );
         let config = temp.path().join("native.toml");
         fs::write(

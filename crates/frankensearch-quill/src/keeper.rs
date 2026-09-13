@@ -97,7 +97,7 @@ pub const WRITER_LOCK_RECORD_BYTES: usize = 36;
 ///
 /// The build-time assertion in this module's tests intentionally forces this
 /// value to change when `Cargo.toml` changes.
-pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 2, 4);
+pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 3, 0);
 
 const MANIFEST_MIN_BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 /// v2 images carry the additional `last_publish_unix_s` word after `flags`.
@@ -17514,26 +17514,37 @@ mod tests {
     fn empty_manifest_has_stable_wire_golden() -> TestResult {
         let manifest = Manifest::empty(1, 0x1122_3344_5566_7788, 0);
         let bytes = manifest.to_bytes()?;
-        // Bytes 36..40 are `CURRENT_ENGINE_VERSION` (0.2.4 => `04 00 02 00`);
-        // the trailing CRC32 covers everything before it.
+        // GOLDEN-CHANGE: the 0.3.0 package release advances producer metadata,
+        // not the wire format. Bytes 36..40 are `CURRENT_ENGINE_VERSION`
+        // (0.3.0 => `00 00 03 00`); the trailing CRC32 covers all prior bytes.
         let expected = hex_bytes(
             "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
-             040002000000000000000000000000000000000000000000ff1540c8",
+             00000300000000000000000000000000000000000000000060ef6eb6",
         );
         assert_eq!(bytes, expected);
         assert_eq!(Manifest::from_bytes(&bytes)?, manifest);
 
-        // Keep the previous producer's exact wire image readable and writable;
-        // only its engine-version word and the covering CRC differ.
-        let previous_bytes = hex_bytes(
-            "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
-             030002000000000000000000000000000000000000000000882258f9",
-        );
-        let mut previous = Manifest::from_bytes(&previous_bytes)?;
-        assert_eq!(previous.engine_version, pack_engine_version(0, 2, 3));
-        assert_eq!(previous.to_bytes()?, previous_bytes);
-        previous.engine_version = CURRENT_ENGINE_VERSION;
-        assert_eq!(previous, manifest);
+        // Keep previous producers' exact wire images readable and writable;
+        // only their engine-version word and the covering CRC differ.
+        for (version, wire_hex) in [
+            (
+                pack_engine_version(0, 2, 4),
+                "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
+                 040002000000000000000000000000000000000000000000ff1540c8",
+            ),
+            (
+                pack_engine_version(0, 2, 3),
+                "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
+                 030002000000000000000000000000000000000000000000882258f9",
+            ),
+        ] {
+            let previous_bytes = hex_bytes(wire_hex);
+            let mut previous = Manifest::from_bytes(&previous_bytes)?;
+            assert_eq!(previous.engine_version, version);
+            assert_eq!(previous.to_bytes()?, previous_bytes);
+            previous.engine_version = CURRENT_ENGINE_VERSION;
+            assert_eq!(previous, manifest);
+        }
         Ok(())
     }
 

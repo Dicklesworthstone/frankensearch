@@ -4548,7 +4548,7 @@ struct PinnedRegularFileIdentity {
     target_os = "visionos",
     target_os = "watchos"
 ))]
-pub(crate) struct PinnedRegularFile {
+pub struct PinnedRegularFile {
     file: File,
     post_io_identity: PinnedRegularFileIdentity,
     post_io_sha256: [u8; 32],
@@ -4580,9 +4580,7 @@ static PINNED_REGULAR_FILE_STAGING_NONCE: std::sync::atomic::AtomicU64 =
         target_os = "watchos"
     )
 ))]
-static PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK: std::sync::Mutex<
-    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
-> = std::sync::Mutex::new(None);
+type PinnedPathHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
 
 #[cfg(all(
     test,
@@ -4597,9 +4595,8 @@ static PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK: std::sync::Mutex<
         target_os = "watchos"
     )
 ))]
-static PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK: std::sync::Mutex<
-    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
-> = std::sync::Mutex::new(None);
+static PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK: std::sync::Mutex<Option<PinnedPathHook>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(all(
     test,
@@ -4614,9 +4611,8 @@ static PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK: std::sync::Mutex<
         target_os = "watchos"
     )
 ))]
-static PINNED_DIRECTORY_BEFORE_SYNC_HOOK: std::sync::Mutex<
-    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
-> = std::sync::Mutex::new(None);
+static PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK: std::sync::Mutex<Option<PinnedPathHook>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(all(
     test,
@@ -4631,7 +4627,8 @@ static PINNED_DIRECTORY_BEFORE_SYNC_HOOK: std::sync::Mutex<
         target_os = "watchos"
     )
 ))]
-pub(crate) struct PinnedRegularFileBeforePublishHookGuard;
+static PINNED_DIRECTORY_BEFORE_SYNC_HOOK: std::sync::Mutex<Option<PinnedPathHook>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(all(
     test,
@@ -4646,7 +4643,7 @@ pub(crate) struct PinnedRegularFileBeforePublishHookGuard;
         target_os = "watchos"
     )
 ))]
-pub(crate) struct PinnedRegularFileBeforeDigestHookGuard;
+pub struct PinnedRegularFileBeforePublishHookGuard;
 
 #[cfg(all(
     test,
@@ -4661,7 +4658,7 @@ pub(crate) struct PinnedRegularFileBeforeDigestHookGuard;
         target_os = "watchos"
     )
 ))]
-pub(crate) struct PinnedDirectoryBeforeSyncHookGuard;
+pub struct PinnedRegularFileBeforeDigestHookGuard;
 
 #[cfg(all(
     test,
@@ -4676,7 +4673,22 @@ pub(crate) struct PinnedDirectoryBeforeSyncHookGuard;
         target_os = "watchos"
     )
 ))]
-pub(crate) fn install_pinned_regular_file_before_publish_hook(
+pub struct PinnedDirectoryBeforeSyncHookGuard;
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub fn install_pinned_regular_file_before_publish_hook(
     hook: impl Fn(&Path) + Send + Sync + 'static,
 ) -> PinnedRegularFileBeforePublishHookGuard {
     let mut slot = PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK
@@ -4703,7 +4715,7 @@ pub(crate) fn install_pinned_regular_file_before_publish_hook(
         target_os = "watchos"
     )
 ))]
-pub(crate) fn install_pinned_regular_file_before_digest_hook(
+pub fn install_pinned_regular_file_before_digest_hook(
     hook: impl Fn(&Path) + Send + Sync + 'static,
 ) -> PinnedRegularFileBeforeDigestHookGuard {
     let mut slot = PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK
@@ -4732,7 +4744,7 @@ pub(crate) fn install_pinned_regular_file_before_digest_hook(
         target_os = "watchos"
     )
 ))]
-pub(crate) fn install_pinned_directory_before_sync_hook(
+pub fn install_pinned_directory_before_sync_hook(
     hook: impl Fn(&Path) + Send + Sync + 'static,
 ) -> PinnedDirectoryBeforeSyncHookGuard {
     let mut slot = PINNED_DIRECTORY_BEFORE_SYNC_HOOK
@@ -5304,7 +5316,7 @@ impl PinnedDirectory {
                 Mode::RUSR | Mode::WUSR,
             ) {
                 Ok(descriptor) => break (staging_name, descriptor),
-                Err(Errno::EXIST) => continue,
+                Err(Errno::EXIST) => {}
                 Err(Errno::LOOP | Errno::NOTDIR) => {
                     return Err(GauntletError::UnsafeStorePath {
                         path: self.display_path.join(name),
@@ -5466,27 +5478,28 @@ impl PinnedDirectory {
     ) -> Result<PinnedRegularFileIdentity, GauntletError> {
         use rustix::fs::FileType;
 
+        // Stat field widths and signedness vary across the supported Unix
+        // targets. Keep every conversion checked, including identity
+        // conversions on platforms where a field already has the stored type.
+        fn checked_field<T, U: TryFrom<T>>(value: T, path: &Path) -> Result<U, GauntletError> {
+            U::try_from(value).map_err(|_| GauntletError::UnsafeStorePath {
+                path: path.to_path_buf(),
+            })
+        }
+
         let path = self.display_path.join(name);
         if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
             return Err(GauntletError::UnsafeStorePath { path });
         }
         Ok(PinnedRegularFileIdentity {
-            device: u64::try_from(stat.st_dev)
-                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
-            inode: u64::try_from(stat.st_ino)
-                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
-            mode: u32::try_from(stat.st_mode)
-                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
-            size: u64::try_from(stat.st_size)
-                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
-            modified_seconds: i64::try_from(stat.st_mtime)
-                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
-            modified_nanoseconds: i64::try_from(stat.st_mtime_nsec)
-                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
-            changed_seconds: i64::try_from(stat.st_ctime)
-                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
-            changed_nanoseconds: i64::try_from(stat.st_ctime_nsec)
-                .map_err(|_| GauntletError::UnsafeStorePath { path })?,
+            device: checked_field(stat.st_dev, &path)?,
+            inode: checked_field(stat.st_ino, &path)?,
+            mode: checked_field(stat.st_mode, &path)?,
+            size: checked_field(stat.st_size, &path)?,
+            modified_seconds: checked_field(stat.st_mtime, &path)?,
+            modified_nanoseconds: checked_field(stat.st_mtime_nsec, &path)?,
+            changed_seconds: checked_field(stat.st_ctime, &path)?,
+            changed_nanoseconds: checked_field(stat.st_ctime_nsec, &path)?,
         })
     }
 
@@ -6989,15 +7002,63 @@ mod tests {
              records; add the new emission to the receipt or the snapshot overstates its exactness"
         );
 
-        // The values must be the ones actually compiled in, not placeholders:
-        // an entry whose value is empty would satisfy the name comparison above
-        // while recording nothing about the build.
+        // Bind the raw feature list to compiler configuration, including the
+        // legitimate empty set under --no-default-features. Its digest still
+        // records an exact value; blank elements and placeholder lists do not.
+        let mut expected_features = [
+            (cfg!(feature = "default"), "default"),
+            (cfg!(feature = "tantivy-oracle"), "tantivy_oracle"),
+            (cfg!(feature = "fuzz-harness"), "fuzz_harness"),
+            (cfg!(feature = "pruning-conformance"), "pruning_conformance"),
+            (cfg!(feature = "perf-harness"), "perf_harness"),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, name)| enabled.then_some(name))
+        .collect::<Vec<_>>();
+        expected_features.sort_unstable();
+        assert_eq!(
+            env!("QUILL_PERF_PRODUCER_ENABLED_FEATURES"),
+            expected_features.join(",")
+        );
+        assert_eq!(
+            env!("QUILL_PERF_PRODUCER_ENABLED_FEATURES_SHA256"),
+            lower_hex(&Sha256::digest(expected_features.join("\n").as_bytes()))
+        );
+
+        // Every other field still requires a nonempty compiled-in value.
         for (name, value) in PRODUCER_BUILD_SCRIPT_EMISSIONS {
+            if name == "QUILL_PERF_PRODUCER_ENABLED_FEATURES" {
+                continue;
+            }
             assert!(
                 !value.is_empty(),
                 "{name} recorded an empty value; the receipt would claim exactness over nothing"
             );
         }
+    }
+
+    #[test]
+    fn producer_build_identity_rejects_missing_or_malformed_feature_receipts() {
+        let empty = golden_producer_build_identity();
+        empty
+            .validate_stored_v2()
+            .expect("the canonical empty feature set is a valid stored identity");
+        for invalid_hash in [String::new(), "0".repeat(64)] {
+            let mut invalid = empty.clone();
+            invalid.enabled_features_sha256 = invalid_hash;
+            assert!(invalid.validate_stored_v2().is_err());
+        }
+
+        // An empty element hashes like the empty set, but is not canonical.
+        let mut blank_element = empty.clone();
+        blank_element.enabled_features.push(String::new());
+        assert!(blank_element.validate_stored_v2().is_err());
+
+        let mut mismatched_features = empty;
+        mismatched_features
+            .enabled_features
+            .push("tantivy_oracle".to_owned());
+        assert!(mismatched_features.validate_stored_v2().is_err());
     }
 
     #[cfg(target_os = "linux")]

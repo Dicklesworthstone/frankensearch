@@ -11331,11 +11331,14 @@ mod tests {
             .args(["--exact", helper_name, "--nocapture", "--test-threads=1"])
             .env("QUILL_PERF_TEST_INHERITED_LEASE_PRODUCER_PATH", &lease_path)
             .stdin(Stdio::null())
-            .status()
+            .output()
             .expect("run isolated inherited-lease producer");
         assert!(
-            helper.success(),
-            "isolated inherited-lease producer failed: {helper}"
+            helper.status.success(),
+            "isolated inherited-lease producer failed: {}; stdout: {}; stderr: {}",
+            helper.status,
+            String::from_utf8_lossy(&helper.stdout),
+            String::from_utf8_lossy(&helper.stderr)
         );
     }
 
@@ -12698,22 +12701,28 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn unrelated canary");
-        let status = Command::new(std::env::current_exe().expect("current test executable"))
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
             .args([
                 "local_perf_runner::tests::linux_subreaper_scope_isolated_probe",
                 "--exact",
                 "--ignored",
                 "--test-threads=1",
             ])
-            .status()
-            .expect("run isolated subreaper probe");
+            .output();
         let canary_survived = unrelated_canary
             .try_wait()
             .expect("inspect unrelated canary")
             .is_none();
         let _ = unrelated_canary.kill();
         let _ = unrelated_canary.wait();
-        assert!(status.success(), "isolated subreaper probe must pass");
+        let output = output.expect("run isolated subreaper probe");
+        assert!(
+            output.status.success(),
+            "isolated subreaper probe must pass: {}; stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             canary_survived,
             "descendant cleanup must not signal a sibling process canary"

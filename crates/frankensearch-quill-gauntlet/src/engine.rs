@@ -3248,6 +3248,10 @@ impl TypedQueryFailureFingerprint {
 ///
 /// Score epsilon and tie order are accepted automatic classes and cannot name
 /// an emitted minimized divergence artifact by themselves.
+///
+/// # Errors
+///
+/// Returns `InvalidObservation` when no non-automatic divergence class exists.
 #[cfg(feature = "fuzz-harness")]
 pub fn typed_query_failure_divergence_class(
     report: &ComparisonReport,
@@ -3314,6 +3318,11 @@ impl TypedQueryFuzzWorkload {
 ///
 /// The input bytes are retained even when several byte strings decode to one
 /// AST: their seed determines the corpus and is thus part of replay identity.
+///
+/// # Errors
+///
+/// Rejects oversized inputs, invalid corpus generation or manifest verification,
+/// and corpora without searchable regular terms.
 #[cfg(feature = "fuzz-harness")]
 pub fn materialize_typed_query_fuzz_workload(
     input: &[u8],
@@ -3412,6 +3421,10 @@ pub fn typed_query_fuzz_seed(input: &[u8]) -> u64 {
 }
 
 /// Derive the exact regular-corpus vocabulary used to render a fuzz AST.
+///
+/// # Errors
+///
+/// Returns `ManifestMismatch` when the corpus contains no regular `termN` tokens.
 #[cfg(feature = "fuzz-harness")]
 pub fn typed_query_fuzz_vocabulary(
     documents: &[GeneratedDocument],
@@ -3500,8 +3513,9 @@ pub enum TypedQueryOracleBehavior {
     AcceptedWithoutAstDifferences,
 }
 
-/// Typed classification of a malformed grammar input, rather than an assumed
-/// shared parser error.  The recovered AST and all Quill diagnostic kinds are
+/// Typed classification of a malformed grammar input.
+///
+/// The recovered AST and all Quill diagnostic kinds are
 /// retained so the fuzz lane asserts the production `parse_lenient` contract.
 #[cfg(feature = "fuzz-harness")]
 #[derive(Clone, Debug, PartialEq)]
@@ -3519,6 +3533,10 @@ impl QuillSubject {
     /// This API is deliberately fuzz-harness-only: regular observations return
     /// normalized result evidence, while this corrective lane must also assert
     /// the raw recovered Quill AST and diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an uncommitted subject or an invalid default parser schema.
     pub fn parse_typed_query_lenient(&self, query: &str) -> Result<ParsedQuery, GauntletError> {
         self.require_committed()?;
         let parser = DefaultQueryParser::new(DEFAULT_SCHEMA).map_err(|error| {
@@ -3531,6 +3549,11 @@ impl QuillSubject {
 
     /// Classify the expected malformed-syntax asymmetry after both live engine
     /// observations completed successfully.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-malformed AST, unavailable parser, missing Quill recovery
+    /// diagnostics, or an oracle observation containing AST differences.
     pub fn classify_typed_query_lenient_asymmetry(
         &self,
         ast: TypedQueryTree,
@@ -3618,13 +3641,14 @@ const TYPED_QUERY_FUZZ_REPLAY_DIRECTORY: &str = "typed_query_tree";
 const MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES: u64 = 1024 * 1024;
 
 #[cfg(all(test, feature = "fuzz-harness"))]
+type TypedQueryReplayHook = std::cell::RefCell<Option<Box<dyn FnOnce(&std::path::Path)>>>;
+
+#[cfg(all(test, feature = "fuzz-harness"))]
 thread_local! {
-    static TYPED_QUERY_FUZZ_REPLAY_FINAL_BINDING_HOOK:
-        std::cell::RefCell<Option<Box<dyn FnOnce(&std::path::Path)>>> =
-            std::cell::RefCell::new(None);
-    static TYPED_QUERY_FUZZ_REPLAY_POST_DISPLAY_VERIFICATION_HOOK:
-        std::cell::RefCell<Option<Box<dyn FnOnce(&std::path::Path)>>> =
-            std::cell::RefCell::new(None);
+    static TYPED_QUERY_FUZZ_REPLAY_FINAL_BINDING_HOOK: TypedQueryReplayHook =
+        std::cell::RefCell::new(None);
+    static TYPED_QUERY_FUZZ_REPLAY_POST_DISPLAY_VERIFICATION_HOOK: TypedQueryReplayHook =
+        std::cell::RefCell::new(None);
 }
 
 /// Test-only interlock for a deterministic mutation after replay I/O and
@@ -3686,6 +3710,11 @@ fn install_typed_query_fuzz_replay_post_display_verification_hook(
 #[cfg(feature = "fuzz-harness")]
 impl TypedQueryFuzzReplay {
     /// Create and immediately validate a minimized artifact from a live run.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a report without a fix-required failure or a replay whose stored
+    /// corpus, seed, AST, query, or failure signature cannot be reconstructed.
     pub fn from_failure(
         workload: &TypedQueryFuzzWorkload,
         minimized_ast: TypedQueryTree,
@@ -3721,6 +3750,11 @@ impl TypedQueryFuzzReplay {
     /// Deterministically rebuild the corpus and minimized case from durable
     /// replay bytes, refusing any seed, corpus, AST, query, or fingerprint
     /// mutation before an engine is invoked.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported schemas, inconsistent replay fields, or failures to
+    /// regenerate and verify the exact stored corpus and vocabulary.
     pub fn replay_workload(&self) -> Result<TypedQueryFuzzWorkload, GauntletError> {
         if self.schema_version != TYPED_QUERY_FUZZ_REPLAY_SCHEMA_VERSION
             || self.generator_id != TYPED_QUERY_FUZZ_GENERATOR_ID
@@ -3790,6 +3824,10 @@ impl TypedQueryFuzzReplay {
 
     /// Collision-resistant artifact key that visibly binds corpus and exact
     /// failure signature as well as the full replay payload.
+    ///
+    /// # Errors
+    ///
+    /// Propagates replay validation and canonical JSON serialization failures.
     pub fn artifact_key(&self) -> Result<String, GauntletError> {
         let canonical_bytes = self.canonical_bytes()?;
         self.artifact_key_from_canonical_bytes(&canonical_bytes)
@@ -3809,6 +3847,10 @@ impl TypedQueryFuzzReplay {
     }
 
     /// Canonical JSON bytes validated by the real replay entrypoint.
+    ///
+    /// # Errors
+    ///
+    /// Propagates replay validation or JSON serialization failures.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, GauntletError> {
         self.replay_workload()?;
         Ok(serde_json::to_vec(self)?)
@@ -3819,6 +3861,10 @@ impl TypedQueryFuzzReplay {
 impl TypedQueryFuzzReplayArtifact {
     /// Reconstruct the minimized workload through the still-owned descriptor
     /// binding, rejecting a later replacement of the original sidecar entry.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a changed descriptor binding or an invalid stored replay workload.
     pub fn replay_workload(&self) -> Result<TypedQueryFuzzWorkload, GauntletError> {
         self.replay_directory
             .authenticate_regular_child(&self.filename, &self.file)?;
@@ -3827,6 +3873,10 @@ impl TypedQueryFuzzReplayArtifact {
 
     /// Return the content-addressed key for diagnostics without exposing an
     /// ambient path as an authenticated replay handle.
+    ///
+    /// # Errors
+    ///
+    /// Propagates replay validation and canonical JSON serialization failures.
     pub fn artifact_key(&self) -> Result<String, GauntletError> {
         self.replay.artifact_key()
     }
@@ -3837,6 +3887,11 @@ impl TypedQueryFuzzReplayArtifact {
 /// The returned capability owns the canonical no-follow directory and regular
 /// file descriptors. Consumers must use its replay method rather than treating
 /// an ambient path as authenticated after this call returns.
+///
+/// # Errors
+///
+/// Rejects invalid or oversized replays, unsafe directory/file bindings, and
+/// content-address collisions. Propagates filesystem and durability failures.
 #[cfg(feature = "fuzz-harness")]
 pub fn persist_typed_query_fuzz_replay(
     root: &std::path::Path,
@@ -3896,6 +3951,12 @@ pub fn persist_typed_query_fuzz_replay(
 
 /// Load and validate a minimized replay into an owned descriptor-bound
 /// capability before returning it to a runner.
+///
+/// # Errors
+///
+/// Rejects invalid paths, unsafe descriptor bindings, oversized or noncanonical
+/// payloads, mismatched filenames, and invalid replay contents. Propagates I/O
+/// and JSON decoding failures.
 #[cfg(feature = "fuzz-harness")]
 pub fn load_typed_query_fuzz_replay(
     path: &std::path::Path,

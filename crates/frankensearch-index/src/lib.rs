@@ -7664,7 +7664,8 @@ mod tests {
                 ),
                 backing_before
             );
-            assert_eq!(directory_entry_names(directory.path()), entries_before);
+            // Inspect metadata before our own read_dir can update directory
+            // access time on filesystems that record every directory read.
             assert_eq!(
                 stable_file_identity(
                     &fs::symlink_metadata(directory.path())
@@ -7672,6 +7673,7 @@ mod tests {
                 ),
                 parent_before
             );
+            assert_eq!(directory_entry_names(directory.path()), entries_before);
             assert_eq!(
                 fs::read(&wal_path).expect("read aliased WAL after rejection"),
                 wal_bytes_before

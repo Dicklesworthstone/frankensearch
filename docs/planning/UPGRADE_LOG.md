@@ -2,6 +2,164 @@
 
 ## 2026-09-12 — Stable dependency refresh (in progress)
 
+### Follow-up qualification on September 13 (UTC)
+
+The repaired fsfs fixtures pass in the broader product run: 2,105 library tests
+passed with no failures and 14 existing ignores, both in the workspace lane and
+the separate fsfs lane. The fsfs and facade stages passed. Formatting, workspace
+checking, both Clippy configurations, and the Windows index guard also passed.
+The run ended at 00:33:03 UTC with all 1,777 source hashes matching, but failed
+the index library and two real-model end-to-end tests. The complete log and
+28 executed binary hashes are retained in `dependencies/product-fixture-terminal-receipt.json`
+and `dependencies/product-fixture-all-executables.json`.
+
+The index failure came from the test reading its temporary directory before
+checking the directory's access time. Commit `59d53a62` checks metadata before
+that read, retaining every metadata, entry-name, and byte assertion. The exact
+regression, all 774 enabled index library tests, formatting, and index Clippy
+pass; 15 existing tests remain ignored. The workspace continuation then reached
+Quill and exposed a separate producer-version inconsistency: the crate is 0.3.0
+but `CURRENT_ENGINE_VERSION` still names 0.2.4. That run ended with Quill at
+711 passed, one failed, and three ignored. Its source matched throughout.
+
+The native CLI fixture still expected the producer identity from Tokenizers
+0.23.1 after the protocol moved to 0.23.2. The proposed correction pins both
+historical and current fingerprints, proves that only protocol provenance
+changed, and retains the old producer's `CertificateRequired` refusal. That
+regression and the installation-receipt test with real native model files pass;
+their executable hash is retained in `dependencies/native-identity-focused-receipt.json`.
+The fixture correction is committed as `9cd2b365`.
+The real native CLI then passed identity verification, indexing, and doctor,
+but its first direct refinement exceeded the unchanged 500 ms budget. This is
+a separate timing failure, not a remaining fingerprint mismatch. The Quill
+correction retains the exact 0.2.4 and 0.2.3 wire fixtures while naming the current
+producer in new artifacts. Both focused version/manifest tests and all 712
+enabled Quill library tests pass, with three existing ignores. This correction
+is committed as `8738e50f`. All-target Clippy for embed, Quill, and fsfs passes
+with warnings denied at 01:32:20 UTC and all 1,777 source hashes matching.
+
+The workspace run with failure collection enabled completed every library:
+7,952 passed, one failed, and 58 existing ignores across 13 crates. Its only
+failure was a different index test: simultaneous thread release did not
+ensure that a retained-owner read overlapped a successor installation. The test
+correctly rejected that vacuous run. A bounded acknowledgement now
+requires a checked read after the real pathname rewrite and before installation;
+all original parity and non-vacuity assertions remain. This correction is
+validated by its exact regression, all 774 enabled index library tests, formatting,
+and all-target Clippy with warnings denied. The batch exited 0 at 01:41:35 UTC
+with all 1,777 source hashes matching; the repair is committed as `85612f0a`.
+The fsfs library again passed 2,105 tests, this time taking 188.56
+seconds as a whole. That suite duration is not a per-test shutdown measurement.
+
+Multilingual end-to-end testing now has all five verified model files. Its first
+two distinct warm queries refined successfully; the mixed Chinese/English query
+exceeded the unchanged 500 ms deadline. One isolated probe using the same test
+executable also failed. Other projects' compiler workloads were active on the
+host, so this does not identify a runtime regression or a performance cause.
+That isolated failure is retained in
+`dependencies/multilingual-isolated-receipt.json`. On clean source `41e72e56`,
+the subsequent CSS end-to-end run passed multilingual testing but still missed
+the native cold-start deadline with a debug CLI. The stock optimized CLI then
+passed all eight unchanged end-to-end tests, including both model paths, in
+89.42 seconds. The actual tested release binary and its source hashes are bound
+by `dependencies/css-release-e2e-receipt.json`. No timeout or acceptance
+assertion changed; the debug failure remains separate evidence.
+
+Source-qualified quickstart also passes on that clean source: 12 real commands,
+18 negative controls, and no remaining owned processes. The initial attempt
+could not admit old shared-cache verification receipts. A private copy of the
+registered model files was explicitly verified by the current public CLI before
+the unchanged gate ran. The shared cache was not modified. See
+`dependencies/css-clean-quickstart-pass-receipt.json`.
+
+The older frozen Quill gauntlet ended with SIGKILL (exit 137), without a suite
+terminal result. Its partial output contains 483 successful tests, four ignored
+tests, and two unfinished tests; the all-feature phase never started. The source
+and executed binary hashes still match. No matching kernel OOM evidence was
+found, so the termination cause is unproven. Retained logs in
+`dependencies/quill-gate-q3beg8in` are an interrupted run, not a qualification
+pass, and cannot certify subsequent producer metadata changes.
+
+The native ARM certificate failure is now independently reproduced on the same
+source and model bytes used for an x86 pass. Test-only stage capture preserves
+the existing certificate outcome: ARM observes `cf39f307...`, while x86 matches
+the registered `bed15455...`. The first 41-stage comparison agrees through
+tokenization, initial normalization, QKV, and attention scores. Scalar softmax
+and vector GELU differ, but those initial differences disappear before the first
+encoder-layer output. Layer two is the first output that remains different;
+only one of the four public corpus embeddings differs at the end. This narrows
+the investigation without yet proving which operation causes the certificate
+mismatch. See `dependencies/native-trace-comparison.json`.
+
+An expanded all-layer ARM probe was refused before transfer or execution by
+RCH's critical-memory-pressure admission check; no retry or policy change was
+made. The corrected test-only observer passes remote formatting, native rerank
+all-target Clippy with warnings denied, all 45 enabled native library tests
+(12 existing ignores), and the unchanged exact x86 certificate test. It captures
+116 records across all six layers. All 1,777 source hashes match throughout;
+`dependencies/native-observer-lintfixed-hz3.log` retains the terminal results and
+executed binary hash. The initial observer's eight Clippy findings were repaired
+without suppressions before this validation. Final-source full qualification,
+the complete Quill gauntlet, and native ARM qualification still prevent release
+completion.
+
+### Follow-up qualification at 23:36 UTC
+
+The current product compiler stages pass on `ovh-a`: formatting, workspace
+checking, workspace and hybrid Clippy, and the Windows index compile guard.
+The library stage fails in fsfs with 2,100 passed, four failed, and 14 existing
+ignores; the separate fsfs stage repeats those failures. Rerank setup rejects a
+producer identity mismatch, two watcher fixtures miss their startup hooks, and
+the socket capacity fixture times out reading the expected overflow refusal.
+The failed executable and output are retained in
+`dependencies/product-library-failure-receipt.json`. That run finished with
+exit 1 at 22:48:33 UTC and all 1,777 source hashes matching. The facade stage
+passed 144 tests. The end-to-end lane passed six tests but lacked native and
+multilingual fixture files for two others. Quickstart refused the dirty checkout's
+source provenance. Fourteen executed binary hashes are retained in
+`dependencies/product-current-executables.json`.
+
+Source investigation identifies two fixture races. The Asupersync 0.5
+current-thread runtime can transfer a pre-spawned test task from its background
+worker to the caller, losing thread-local overrides. Running the test directly
+in the registered root avoids that transfer; a new regression checks thread
+and TLS continuity across a forced yield and real blocking work. The socket
+fixture can reject a partial client before older handlers retire, then admit
+the designated overflow client into the freed slot. Restarting the server
+between responsiveness and saturation checks isolates those admissions.
+All five exact fixture regressions now pass on `hz3`, with formatting and all
+1,777 source hashes matching after each command. The normal watcher test passed
+in 101.13 seconds; its startup assertion succeeded. The executed binary hash and
+terminal counts are retained in `dependencies/fsfs-fixture-focused-receipt.json`.
+The fixture repair is committed as `491f151f`; production identity checks,
+capacity limits, and timeout bounds remain unchanged. Broader product checks
+continue against the isolated candidate.
+
+The attempt to reuse ovh after its original run was refused by RCH with exit 103
+for critical disk pressure; no build or local fallback ran. `hz3` admitted the
+replacement on a separate checkout. Its native fixture is available, and all
+five multilingual files were downloaded from the manifest's immutable revision
+and verified against their sizes and SHA-256 hashes. The next model checks use
+explicit fixture paths. Source-qualified quickstart still requires a clean
+checkout after validation; no provenance override was used.
+
+The retained-output Quill probes pass: 39 witness units, 12 replay tests, eight
+live Quill/Tantivy tests, and the existing refusal controls. The first full
+attempt exposed a test that incorrectly rejected the valid empty feature set
+and subprocess helpers that polluted the parent JSON stream. The corrected
+artifact module passes 64 tests in both feature configurations (one existing
+ignore each). Both subprocess parents also pass the unchanged strict JSON
+parser, while the original polluted output still produces `INVALID_OUTPUT`.
+The combined focused receipt is `dependencies/quill-combined-focused-receipt.json`.
+
+All-feature Clippy then exposed existing fuzz-harness documentation, callback
+type, visibility, and platform conversion lints. Direct repairs preserve
+checked conversions and introduce no suppressions. Formatting and all-target,
+all-feature Clippy with warnings denied pass at 22:23:25 UTC with all 1,777
+source hashes matching. These repairs are committed as `2c0b9e36`. The full
+default/all-feature gauntlet is running under SwiftWillow's monitoring;
+none of these focused passes is a full-suite or performance verdict.
+
 ### Current integration status at 21:16 UTC
 
 Main now resolves Asupersync 0.5.0 and FrankenSQLite 0.4, following a separate
