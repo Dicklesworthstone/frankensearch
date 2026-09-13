@@ -465,6 +465,14 @@ impl NativeEmbedder {
         texts: &[&str],
         checkpoint: impl Fn() -> SearchResult<()>,
     ) -> SearchResult<Vec<Vec<f32>>> {
+        #[cfg(test)]
+        if crate::native::certificate_trace::active() {
+            assert_eq!(
+                texts,
+                &frankensearch_embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1,
+                "certificate trace only accepts the frozen public corpus"
+            );
+        }
         checkpoint()?;
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -476,6 +484,10 @@ impl NativeEmbedder {
                 self.tokenize(t)
             })
             .collect::<SearchResult<_>>()?;
+        #[cfg(test)]
+        for (document, ids) in token_batches.iter().enumerate() {
+            crate::native::certificate_trace::ids(&format!("document.{document}.tokens"), ids);
+        }
         let mut model = self.lock_model()?;
         let mut out = Vec::with_capacity(texts.len());
         // Chunk inputs by total token budget so each forward's intermediates stay
@@ -1182,7 +1194,12 @@ mod tests {
         let expected_identity = manifest
             .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
             .expect("derive registered native MiniLM identity");
-        let embedder = NativeEmbedder::load(&dir).expect("load native MiniLM embedder");
+        let trace = crate::native::certificate_trace::begin();
+        let loaded = NativeEmbedder::load(&dir);
+        if let Some(trace) = trace {
+            trace.flush();
+        }
+        let embedder = loaded.expect("load native MiniLM embedder");
         assert_eq!(embedder.identity().unwrap(), &expected_identity);
         let texts = &frankensearch_embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
         let vectors = embedder

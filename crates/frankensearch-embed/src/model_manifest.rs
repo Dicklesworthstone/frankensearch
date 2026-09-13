@@ -5712,6 +5712,46 @@ mod tests {
     }
 
     #[test]
+    fn native_f32_tokenizer_refresh_preserves_historical_identity_and_requires_admission() {
+        use frankensearch_core::generation::ProducerCompatibilityErrorV1;
+
+        let current = ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap();
+        let historical = before_dependency_refresh(current.clone());
+        let mut restored = historical.clone();
+        current
+            .execution
+            .protocol_revision
+            .clone_into(&mut restored.execution.protocol_revision);
+        assert_eq!(
+            restored, current,
+            "only tokenizer protocol provenance changed"
+        );
+        let current_identity = current
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        let historical_identity = historical
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        assert_eq!(
+            historical_identity.fingerprint(),
+            "35d0a014b4ec6224eb42552ea1099b24bead0c9c51906b6035207b6105e8af01"
+        );
+        assert_eq!(
+            current_identity.fingerprint(),
+            "aa25d24b07a2d233445cb6605c95d33601ea36a044d3a4b2bed65e7590386109"
+        );
+        assert_eq!(current_identity.space, historical_identity.space);
+        assert_eq!(
+            current.execution.golden_vectors,
+            historical.execution.golden_vectors
+        );
+        assert_eq!(
+            current_identity.verify_exact_producer_with(&historical_identity),
+            Err(ProducerCompatibilityErrorV1::CertificateRequired)
+        );
+    }
+
+    #[test]
     #[ignore = "requires real native MiniLM files via MINILM_FIXTURE_DIR"]
     fn native_installation_receipt_verifies_real_files_and_preserves_identity() {
         use std::io::{Read as _, Seek as _, SeekFrom};
@@ -5735,7 +5775,7 @@ mod tests {
                     .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
                     .unwrap()
                     .fingerprint(),
-                "35d0a014b4ec6224eb42552ea1099b24bead0c9c51906b6035207b6105e8af01"
+                "aa25d24b07a2d233445cb6605c95d33601ea36a044d3a4b2bed65e7590386109"
             );
             TEST_VERIFY_FILE_HASH_CALLS.with(std::cell::Cell::get)
         };

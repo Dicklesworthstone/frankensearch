@@ -36,6 +36,150 @@ use wide::f32x8;
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{RerankDocument, RerankScore, SyncRerank};
 
+/// Observation of the existing public certificate execution, never another engine.
+#[cfg(test)]
+pub(crate) mod certificate_trace {
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    struct Record {
+        label: String,
+        shape: Vec<usize>,
+        dtype: &'static str,
+        bytes: Vec<u8>,
+    }
+
+    struct Recorder {
+        directory: PathBuf,
+        records: Vec<Record>,
+        bytes: usize,
+        detail: bool,
+    }
+
+    thread_local! {
+        static RECORDER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
+    }
+
+    pub struct Guard;
+
+    pub fn begin() -> Option<Guard> {
+        let directory = PathBuf::from(std::env::var_os("FSFS_NATIVE_CERTIFICATE_TRACE_DIR")?);
+        // create_dir refuses an existing directory, including a symlink.
+        std::fs::create_dir(&directory).expect("create new certificate trace directory");
+        RECORDER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "certificate trace already active");
+            *slot = Some(Recorder {
+                directory,
+                records: Vec::new(),
+                bytes: 0,
+                detail: false,
+            });
+        });
+        Some(Guard)
+    }
+
+    pub fn active() -> bool {
+        RECORDER.with(|slot| slot.borrow().is_some())
+    }
+
+    pub fn detail(enabled: bool) {
+        RECORDER.with(|slot| {
+            if let Some(recorder) = slot.borrow_mut().as_mut() {
+                recorder.detail = enabled;
+            }
+        });
+    }
+
+    fn record(label: &str, shape: &[usize], dtype: &'static str, bytes: Vec<u8>) {
+        RECORDER.with(|slot| {
+            if let Some(recorder) = slot.borrow_mut().as_mut() {
+                recorder.bytes += bytes.len();
+                assert!(
+                    recorder.bytes <= 32 * 1024 * 1024,
+                    "certificate trace exceeded 32 MiB"
+                );
+                recorder.records.push(Record {
+                    label: label.to_owned(),
+                    shape: shape.to_vec(),
+                    dtype,
+                    bytes,
+                });
+            }
+        });
+    }
+
+    pub fn floats(label: &str, shape: &[usize], values: &[f32]) {
+        if active() {
+            assert_eq!(shape.iter().product::<usize>(), values.len());
+            record(
+                label,
+                shape,
+                "f32-le",
+                values
+                    .iter()
+                    .flat_map(|v| v.to_bits().to_le_bytes())
+                    .collect(),
+            );
+        }
+    }
+
+    pub fn detailed(label: &str, shape: &[usize], values: &[f32]) {
+        if RECORDER.with(|slot| slot.borrow().as_ref().is_some_and(|r| r.detail)) {
+            floats(label, shape, values);
+        }
+    }
+
+    pub fn ids(label: &str, values: &[i64]) {
+        if active() {
+            record(
+                label,
+                &[values.len()],
+                "i64-le",
+                values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            );
+        }
+    }
+
+    impl Guard {
+        pub(crate) fn flush(self) {
+            let recorder = RECORDER
+                .with(|slot| slot.borrow_mut().take())
+                .expect("active trace");
+            let mut metadata = Vec::new();
+            for (ordinal, record) in recorder.records.into_iter().enumerate() {
+                let filename = format!("{ordinal:04}.bin");
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(recorder.directory.join(&filename))
+                    .expect("create trace record");
+                file.write_all(&record.bytes).expect("write trace record");
+                metadata.push(serde_json::json!({
+                    "ordinal": ordinal, "label": record.label, "shape": record.shape,
+                    "dtype": record.dtype, "file": filename,
+                }));
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(recorder.directory.join("manifest.json"))
+                .expect("create trace manifest");
+            serde_json::to_writer_pretty(&mut file, &metadata).expect("write trace manifest");
+            drop(self);
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            RECORDER.with(|slot| {
+                let _ = slot.borrow_mut().take();
+            });
+        }
+    }
+}
+
 const H: usize = 384;
 const RERANKER_LAYERS: usize = 6;
 const NH: usize = 12;
@@ -77,9 +221,89 @@ fn index_to_i64(index: usize, ctx: &str) -> SearchResult<i64> {
     i64::try_from(index).map_err(|_| rerank_err(ctx, format!("index {index} exceeds i64::MAX")))
 }
 
+// Adapted from wide 1.7.0's f32x8::exp, polynomial_5 and vm_pow2n.
+// Alteration: explicitly separate multiplication and addition on every target;
+// construct exponent bits through safe scalar lane access.
+//
+// Copyright (c) 2020 Daniel "Lokathor" Gee.
+//
+// This software is provided 'as-is', without any express or implied
+// warranty.  In no event will the authors be held liable for any damages
+// arising from the use of this software.
+//
+// Permission is granted to anyone to use this software for any purpose,
+// including commercial applications, and to alter it and redistribute it
+// freely, subject to the following restrictions:
+//
+// 1. The origin of this software must not be misrepresented; you must not
+// claim that you wrote the original software. If you use this software
+// in a product, an acknowledgment in the product documentation would be
+// appreciated but is not required.
+// 2. Altered source versions must be plainly marked as such, and must not be
+// misrepresented as being the original software.
+// 3. This notice may not be removed or altered from any source distribution.
+
+/// Preserve the non-FMA x86 exponential's rounding on every vector target.
+/// `wide::exp` uses fused operations on NEON, which changes model output bits.
+/// Keep this expression tree: reassociation or `mul_add` changes the producer.
+#[inline]
+fn exp_vec8_non_fused(input: f32x8) -> f32x8 {
+    fn pow2(exponents: f32x8) -> f32x8 {
+        f32x8::new(exponents.to_array().map(|n| {
+            debug_assert!((-150.0..=127.0).contains(&n));
+            if n < -149.0 {
+                0.0
+            } else if n < -126.0 {
+                // Adding 2^23 encodes an integral shift (0..=22) in the
+                // mantissa, without a float-to-integer conversion.
+                let shift = (n + 149.0 + 8_388_608.0).to_bits() & 0x007f_ffff;
+                f32::from_bits(1_u32 << shift)
+            } else {
+                f32::from_bits((n + (127.0 + 8_388_608.0)).to_bits() << 23)
+            }
+        }))
+    }
+
+    let lanes = input.to_array();
+    // Exceptional lanes have fixed outputs. Sanitize them before reduction so
+    // the exponent construction only receives finite, bounded integers.
+    let bounded = f32x8::new(lanes.map(|x| {
+        if (-103.63..=88.723).contains(&x) {
+            x
+        } else {
+            0.0
+        }
+    }));
+    let r = (bounded * f32x8::LOG2_E).round_ties_even();
+    let max_r = f32x8::splat(127.0);
+    let scale = pow2((r - max_r).max(f32x8::ZERO));
+    let n2 = pow2(r.min(max_r));
+    let x = bounded - r * f32x8::splat(0.693_359_4);
+    let x = x - r * f32x8::splat(-2.121_944_4e-4);
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    let a = f32x8::splat(1.0 / 120.0) * x + f32x8::splat(1.0 / 24.0);
+    let b = f32x8::splat(1.0 / 5040.0) * x + f32x8::splat(1.0 / 720.0);
+    let c = f32x8::splat(1.0 / 6.0) * x + f32x8::splat(1.0 / 2.0);
+    let p = a * x2 + (b * x4 + c);
+    let z = p * x2 + x;
+    let result = ((z + f32x8::ONE) * scale * n2).to_array();
+    f32x8::new(std::array::from_fn(|i| {
+        if lanes[i].is_nan() {
+            f32::from_bits(0x7fc0_0101)
+        } else if lanes[i] > 88.723 {
+            f32::INFINITY
+        } else if lanes[i] < -103.63 {
+            0.0
+        } else {
+            result[i]
+        }
+    }))
+}
+
 /// In-place fused scale + numerically-stable softmax for one attention-score row.
 /// Computes `softmax(scale · row)` over `row` (one head's query position), using
-/// `wide`'s 8-wide polynomial `exp` (~1-2 ULP) instead of scalar libm `expf`.
+/// The 8-wide non-fused polynomial `exp` (~1-2 ULP) instead of scalar libm `expf`.
 /// `scale > 0`, so the argmax (hence the stabilising max-subtraction) is
 /// unchanged by the scale: `exp(scale·(x − max)) == exp(scale·x)/exp(scale·max)`.
 fn softmax_row_fused(row: &mut [f32], scale: f32) {
@@ -102,10 +326,10 @@ fn softmax_row_fused(row: &mut [f32], scale: f32) {
     // breaks the sum chain wins LESS, confirming the bottleneck is exp latency (not
     // the reduction), so the bit-identical single-accumulator form is also the fastest.
     while i + 32 <= n {
-        let e0 = ((f32x8_from_slice(&row[i..i + 8]) - max_v) * scale_v).exp();
-        let e1 = ((f32x8_from_slice(&row[i + 8..i + 16]) - max_v) * scale_v).exp();
-        let e2 = ((f32x8_from_slice(&row[i + 16..i + 24]) - max_v) * scale_v).exp();
-        let e3 = ((f32x8_from_slice(&row[i + 24..i + 32]) - max_v) * scale_v).exp();
+        let e0 = exp_vec8_non_fused((f32x8_from_slice(&row[i..i + 8]) - max_v) * scale_v);
+        let e1 = exp_vec8_non_fused((f32x8_from_slice(&row[i + 8..i + 16]) - max_v) * scale_v);
+        let e2 = exp_vec8_non_fused((f32x8_from_slice(&row[i + 16..i + 24]) - max_v) * scale_v);
+        let e3 = exp_vec8_non_fused((f32x8_from_slice(&row[i + 24..i + 32]) - max_v) * scale_v);
         row[i..i + 8].copy_from_slice(&e0.to_array());
         row[i + 8..i + 16].copy_from_slice(&e1.to_array());
         row[i + 16..i + 24].copy_from_slice(&e2.to_array());
@@ -117,7 +341,7 @@ fn softmax_row_fused(row: &mut [f32], scale: f32) {
         i += 32;
     }
     while i + 8 <= n {
-        let e = ((f32x8_from_slice(&row[i..i + 8]) - max_v) * scale_v).exp();
+        let e = exp_vec8_non_fused((f32x8_from_slice(&row[i..i + 8]) - max_v) * scale_v);
         row[i..i + 8].copy_from_slice(&e.to_array());
         sum_v += e;
         i += 8;
@@ -183,7 +407,7 @@ fn gelu_vec8(x: f32x8) -> f32x8 {
     let a4 = f32x8::splat(-1.453_152);
     let a5 = f32x8::splat(1.061_405_4);
     let poly = t * (a1 + t * (a2 + t * (a3 + t * (a4 + t * a5))));
-    let erf_abs = one - poly * (-(z * z)).exp();
+    let erf_abs = one - poly * exp_vec8_non_fused(-(z * z));
     let erf = erf_abs.copysign(z);
     f32x8::splat(0.5) * x * (one + erf)
 }
@@ -419,7 +643,11 @@ fn fused_attention(
     let km = TensorMeta::from_shape(vec![NH, HD, s_len], DType::F32, Device::Cpu);
     ft_api::bmm_tensor_contiguous_f32_into(q_hm, kt, &qm, &km, scores)
         .expect("attn QKᵀ bmm: shapes are internally consistent");
+    #[cfg(test)]
+    certificate_trace::detailed("attention.scores", &[NH, s_len, s_len], scores);
     fast_softmax_inplace(scores, NH * s_len, s_len, scale);
+    #[cfg(test)]
+    certificate_trace::detailed("attention.softmax", &[NH, s_len, s_len], scores);
     // ctx_hm[NH, S, HD] = scores @ V.
     let sm = TensorMeta::from_shape(vec![NH, s_len, s_len], DType::F32, Device::Cpu);
     let vm = TensorMeta::from_shape(vec![NH, s_len, HD], DType::F32, Device::Cpu);
@@ -711,6 +939,8 @@ impl Model {
         // Fused QKV projection (batched over all the chunk's tokens).
         // Fused QKV projection output shape: [total, 3H].
         let qkv = self.linear_raw(emb, total, &format!("{p}.attention.self.qkv"))?;
+        #[cfg(test)]
+        certificate_trace::detailed("layer.qkv", &[total, 3 * H], &qkv);
         // Per-document self-attention written straight into one re-concatenated
         // [total, H] context (no per-doc temporary).
         let mut ctx = vec![0.0f32; total * H];
@@ -725,6 +955,11 @@ impl Model {
             );
         }
         let attn = self.linear_raw(&ctx, total, &format!("{p}.attention.output.dense"))?;
+        #[cfg(test)]
+        {
+            certificate_trace::detailed("layer.context", &[total, H], &ctx);
+            certificate_trace::detailed("layer.attention_projection", &[total, H], &attn);
+        }
         let emb = self.add_ln_raw(
             emb,
             &attn,
@@ -733,9 +968,18 @@ impl Model {
         )?;
         // FFN: [total, H] -> [total, INTER] -> GELU -> [total, H].
         let mut inter = self.linear_raw(&emb, total, &format!("{p}.intermediate.dense"))?;
+        #[cfg(test)]
+        {
+            certificate_trace::detailed("layer.attention_norm", &[total, H], &emb);
+            certificate_trace::detailed("layer.ffn_projection", &[total, INTER], &inter);
+        }
         debug_assert_eq!(inter.len(), total * INTER);
         fast_gelu_inplace(&mut inter);
+        #[cfg(test)]
+        certificate_trace::detailed("layer.gelu", &[total, INTER], &inter);
         let ffn = self.linear_raw(&inter, total, &format!("{p}.output.dense"))?;
+        #[cfg(test)]
+        certificate_trace::detailed("layer.ffn_output", &[total, H], &ffn);
         self.add_ln_raw(&emb, &ffn, total, &format!("{p}.output.LayerNorm"))
     }
 
@@ -1296,6 +1540,12 @@ impl Model {
             }
         }
         // Embeddings → [total, H]: word + position + token_type, then LayerNorm.
+        #[cfg(test)]
+        {
+            certificate_trace::ids("embedding.token_ids", &ids_flat);
+            certificate_trace::ids("embedding.position_ids", &pos_flat);
+            certificate_trace::ids("embedding.type_ids", &typ_flat);
+        }
         let id_t = self.idx(&ids_flat)?;
         let pos_t = self.idx(&pos_flat)?;
         let typ_t = self.idx(&typ_flat)?;
@@ -1328,11 +1578,35 @@ impl Model {
             .s
             .tensor_values_f32(emb)
             .map_err(|e| rerank_err("embed.extract", e))?;
+        #[cfg(test)]
+        {
+            if certificate_trace::active() {
+                for (label, node) in [
+                    ("embedding.word", e_word),
+                    ("embedding.position", e_pos),
+                    ("embedding.type", e_typ),
+                    ("embedding.word_position_sum", emb_wp),
+                ] {
+                    let values = self
+                        .s
+                        .tensor_values_f32(node)
+                        .map_err(|e| rerank_err("embed.trace", e))?;
+                    certificate_trace::floats(label, &[total, H], &values);
+                }
+                certificate_trace::floats("embedding.normalized", &[total, H], &emb_vals);
+            }
+        }
         for i in 0..self.encoder_layers {
             let p = format!("bert.encoder.layer.{i}");
+            #[cfg(test)]
+            certificate_trace::detail(true);
             emb_vals =
                 self.encoder_layer_raw(&emb_vals, total, &offsets, &lens, &p, scale, &mut scratch)?;
+            #[cfg(test)]
+            certificate_trace::floats(&format!("{p}.output"), &[total, H], &emb_vals);
         }
+        #[cfg(test)]
+        certificate_trace::detail(false);
         self.s.truncate_autograd_graph(self.weights_boundary);
 
         // Mean-pool each input's token rows → [H], then L2-normalize to a unit vector.
@@ -1353,12 +1627,16 @@ impl Model {
                 }
             }
             let norm = acc.iter().map(|x| x * x).sum::<f32>().sqrt();
+            #[cfg(test)]
+            certificate_trace::floats("embedding.mean_pool", &[H], &acc);
             if norm > 0.0 {
                 let inv = 1.0 / norm;
                 for a in &mut acc {
                     *a *= inv;
                 }
             }
+            #[cfg(test)]
+            certificate_trace::floats("embedding.output", &[H], &acc);
             out.push(acc);
         }
         Ok(out)
@@ -2066,6 +2344,96 @@ impl frankensearch_core::traits::Reranker for NativeReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_fused_exp_preserves_exceptional_lanes() {
+        let input = f32x8::new([
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7fc0_1234),
+            f32::from_bits(0xff80_0001),
+            f32::MAX,
+            -f32::MAX,
+        ]);
+        assert_eq!(
+            exp_vec8_non_fused(input).to_array().map(f32::to_bits),
+            [
+                1.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                f32::INFINITY.to_bits(),
+                0,
+                0x7fc0_0101,
+                0x7fc0_0101,
+                f32::INFINITY.to_bits(),
+                0,
+            ]
+        );
+        assert_eq!(
+            exp_vec8_non_fused(f32x8::splat(-104.0))
+                .to_array()
+                .map(f32::to_bits),
+            [0; 8]
+        );
+    }
+
+    // The oracle is the existing producer's actual separately rounded wide
+    // implementation. FMA-enabled builds use a different oracle and must not
+    // silently replace this comparison with a tolerance or another polynomial.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    #[test]
+    fn non_fused_exp_matches_existing_x86_producer_bits() {
+        fn check(lanes: [f32; 8]) {
+            let input = f32x8::new(lanes);
+            assert_eq!(
+                exp_vec8_non_fused(input).to_array().map(f32::to_bits),
+                input.exp().to_array().map(f32::to_bits),
+                "input bits: {:?}",
+                lanes.map(f32::to_bits)
+            );
+        }
+
+        for sample in 0_u16..=u16::MAX {
+            let x = -104.0 + f32::from(sample) * (193.0 / 65_535.0);
+            check([x, x.next_down(), x.next_up(), -x, 0.0, -0.0, 1.0, -1.0]);
+        }
+        check([
+            (-103.63_f32).next_down(),
+            -103.63,
+            (-103.63_f32).next_up(),
+            88.723_f32.next_down(),
+            88.723,
+            88.723_f32.next_up(),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ]);
+        for exponent in -150_i16..=128 {
+            let boundary = (f32::from(exponent) + 0.5) / std::f32::consts::LOG2_E;
+            let center = f32::from(exponent) / std::f32::consts::LOG2_E;
+            check([
+                boundary.next_down(),
+                boundary,
+                boundary.next_up(),
+                center.next_down(),
+                center,
+                center.next_up(),
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ]);
+        }
+        let mut seed = 0x6d2b_79f5_u32;
+        for _ in 0..8192 {
+            let lanes = std::array::from_fn(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                f32::from_bits(seed)
+            });
+            check(lanes);
+            let mut reversed = lanes;
+            reversed.reverse();
+            check(reversed);
+        }
+    }
 
     fn verified_async_fixture() -> NativeReranker {
         let dir = std::path::PathBuf::from(

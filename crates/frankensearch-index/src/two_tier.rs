@@ -6799,12 +6799,21 @@ mod tests {
     fn retained_owners_serve_concurrent_readers_while_a_successor_installs() {
         use std::sync::Barrier;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc;
         use std::thread;
+        use std::time::Duration;
 
         const READERS: usize = 4;
-        // Enough that the writer's rewrite+admit is overwhelmingly likely to
-        // land mid-loop rather than after every reader has finished.
+        // Retain repeated-read coverage in addition to the overlap handshake.
         const MIN_ITERATIONS_PER_READER: usize = 200;
+
+        struct WriterCompletion<'a>(&'a AtomicBool);
+
+        impl Drop for WriterCompletion<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
 
         let dir = temp_index_dir("admitted-v2-concurrent-refresh");
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -6831,10 +6840,12 @@ mod tests {
             .witness()
             .clone();
 
-        // Gate every thread on the same barrier so readers are already in
-        // their loop when the rewrite starts.
+        // Release all threads together; this alone does not guarantee that a
+        // reader runs before the writer finishes, so also handshake below.
         let barrier = Barrier::new(READERS + 1);
         let writer_done = AtomicBool::new(false);
+        let pathname_rewritten = AtomicBool::new(false);
+        let (checked_read_tx, checked_read_rx) = mpsc::channel();
         let observed = AtomicUsize::new(0);
         // Reads completed strictly BETWEEN the writer starting its rewrite and
         // finishing its install. This is the overlap proof: a run where the
@@ -6845,20 +6856,27 @@ mod tests {
         let index_ref = &reader_index;
         let barrier_ref = &barrier;
         let writer_done_ref = &writer_done;
+        let pathname_rewritten_ref = &pathname_rewritten;
         let observed_ref = &observed;
         let overlapped_ref = &overlapped;
         let fast_path_ref = fast_path.as_path();
 
         thread::scope(|scope| {
             for _ in 0..READERS {
+                let checked_read_tx = checked_read_tx.clone();
                 scope.spawn(move || {
                     barrier_ref.wait();
                     let mut iterations = 0_usize;
+                    let mut acknowledged_rewrite = false;
                     // Keep going until the writer is finished AND this reader
                     // has done enough passes for the overlap to be real.
                     while !writer_done_ref.load(Ordering::Acquire)
                         || iterations < MIN_ITERATIONS_PER_READER
                     {
+                        // Sample BEFORE searching: the acknowledgement must
+                        // prove a complete read of the retained owner after
+                        // the pathname holds the successor's bytes.
+                        let after_rewrite = pathname_rewritten_ref.load(Ordering::Acquire);
                         let hits = index_ref
                             .search_fast(&[0.0, 1.0, 0.0, 0.0], 3)
                             .expect("a retained owner never fails a concurrent read");
@@ -6881,11 +6899,20 @@ mod tests {
                         assert_eq!(index_ref.doc_count(), 2);
                         iterations = iterations.saturating_add(1);
                         observed_ref.fetch_add(1, Ordering::Release);
+                        if after_rewrite && !acknowledged_rewrite {
+                            // The writer may already have received another
+                            // reader's acknowledgement and dropped its end.
+                            let _ = checked_read_tx.send(());
+                            acknowledged_rewrite = true;
+                        }
                     }
                 });
             }
 
             scope.spawn(move || {
+                // A writer assertion or I/O panic must also release readers
+                // before the scope propagates that failure.
+                let _completion = WriterCompletion(writer_done_ref);
                 barrier_ref.wait();
                 let (generation_two, _) = fsvi_v2_binding("concurrent-model", 4, 42);
                 let successor_rows: [(&str, &[f32]); 3] = [
@@ -6897,6 +6924,14 @@ mod tests {
                 // then admit and install the successor on a separate handle.
                 let reads_before_rewrite = observed_ref.load(Ordering::Acquire);
                 write_v2_tier(fast_path_ref, &generation_two, &successor_rows);
+                pathname_rewritten_ref.store(true, Ordering::Release);
+                // Require a fully checked retained-owner read before install,
+                // independent of which OS thread ran first after the barrier.
+                // Fail boundedly and let readers exit if no acknowledgement
+                // arrives, rather than hanging the scoped thread join.
+                checked_read_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("a checked retained-owner read after pathname rewrite");
                 let successor_paths = TwoTierIndexPaths::new(fast_path_ref);
                 let mut successor = TwoTierIndex::open_admitted_v2_with_paths(
                     &successor_paths,

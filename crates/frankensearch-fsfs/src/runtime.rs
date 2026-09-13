@@ -24070,11 +24070,55 @@ mod tests {
             .blocking_threads(0, 2)
             .build()
             .expect("build runtime test scheduler");
-        let test_task = scheduler.handle().spawn(async move {
-            let cx = Cx::current().expect("runtime task installs a spawn-capable Cx");
+        // The current-thread root is a registered, spawn-capable task. Do not
+        // spawn it before block_on: the background worker could poll it before
+        // handing execution to this thread, stranding thread-local test seams.
+        scheduler.block_on(async move {
+            let cx = Cx::current().expect("runtime root installs a spawn-capable Cx");
             test(cx).await;
         });
-        scheduler.block_on(test_task);
+    }
+
+    #[test]
+    fn runtime_test_context_preserves_thread_local_state_across_blocking_work() {
+        thread_local! {
+            static TEST_OWNER: std::cell::Cell<Option<thread::ThreadId>> = const {
+                std::cell::Cell::new(None)
+            };
+        }
+
+        let caller = thread::current().id();
+        run_on_runtime_task(move |cx| async move {
+            assert_eq!(thread::current().id(), caller);
+            TEST_OWNER.with(|owner| owner.set(Some(caller)));
+            let (release, released) = std::sync::mpsc::channel();
+            let mut worker = cx
+                .spawn_blocking(move |_| {
+                    released
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("caller releases the blocking worker");
+                    thread::current().id()
+                })
+                .expect("real runtime context admits blocking work");
+            let mut joined = std::pin::pin!(worker.join(&cx));
+            let mut yielded = false;
+            std::future::poll_fn(|task_cx| {
+                assert!(joined.as_mut().poll(task_cx).is_pending());
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    task_cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+            release.send(()).expect("release blocking worker");
+            let worker_thread = joined.await.expect("join blocking worker");
+            assert_ne!(worker_thread, caller);
+            assert_eq!(thread::current().id(), caller);
+            TEST_OWNER.with(|owner| assert_eq!(owner.take(), Some(caller)));
+        });
     }
     use frankensearch_core::{
         Embedder, IndexableDocument, LexicalRead as _, ModelCategory, SearchError, SearchFuture,
@@ -29642,7 +29686,11 @@ mod tests {
         });
 
         let coordinator: Arc<ShutdownCoordinator> = Arc::new(ShutdownCoordinator::new());
-        let handle = spawn_socket_serve(index_root, socket_path.clone(), Arc::clone(&coordinator));
+        let handle = spawn_socket_serve(
+            index_root.clone(),
+            socket_path.clone(),
+            Arc::clone(&coordinator),
+        );
 
         // Client A connects and stalls without sending a request.
         let stalled = connect_socket_with_retry(&socket_path);
@@ -29684,8 +29732,17 @@ mod tests {
         drop(stalled);
         drop(complete);
 
+        coordinator.request_shutdown(ShutdownReason::UserRequest);
+        let result = join_with_timeout(handle, Duration::from_secs(6));
+        assert!(result.is_ok(), "serve exits cleanly: {result:?}");
+        assert!(!socket_path.exists(), "socket path is removed");
+
         // Partial requests consume the same bounded admission slots as active
         // searches. Saturation must refuse without spawning another reader.
+        // A fresh server ensures earlier handlers cannot occupy slots during
+        // admission and then release them after a partial client was refused.
+        let coordinator: Arc<ShutdownCoordinator> = Arc::new(ShutdownCoordinator::new());
+        let handle = spawn_socket_serve(index_root, socket_path.clone(), Arc::clone(&coordinator));
         let partial = (0..super::FSFS_DAEMON_MAX_CLIENTS)
             .map(|_| connect_socket_with_retry(&socket_path))
             .collect::<Vec<_>>();
