@@ -472,18 +472,18 @@ impl IndexBuilder {
         }
 
         #[cfg(feature = "lexical-tantivy")]
-        let tantivy_lexical =
-            if matches!(self.lexical_backend, Some(IndexLexicalBackend::Tantivy)) {
-                match prepare_existing_tantivy_lexical_index(&self.data_dir.join("lexical")) {
-                    Ok(index) => index,
-                    Err(error) => {
-                        export_error(metrics_exporter.as_ref(), &error);
-                        return Err(error);
-                    }
+        let tantivy_lexical = if matches!(self.lexical_backend, Some(IndexLexicalBackend::Tantivy))
+        {
+            match prepare_existing_tantivy_lexical_index(&self.data_dir.join("lexical")) {
+                Ok(index) => index,
+                Err(error) => {
+                    export_error(metrics_exporter.as_ref(), &error);
+                    return Err(error);
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
 
         // Resolve embedder stack.
         let stack = match self.embedder_stack.take() {
@@ -819,6 +819,40 @@ impl IndexBuilder {
             return Err(error);
         }
 
+        // Admit a new writer only after embedding/cancellation succeeds, but
+        // still before replacing vector generations. Recheck an initially
+        // empty path in case another builder populated it while we embedded.
+        #[cfg(feature = "lexical-tantivy")]
+        let tantivy_lexical = if matches!(self.lexical_backend, Some(IndexLexicalBackend::Tantivy))
+            && tantivy_lexical.is_none()
+        {
+            let lexical_path = self.data_dir.join("lexical");
+            let prepared =
+                prepare_existing_tantivy_lexical_index(&lexical_path).and_then(|existing| {
+                    match existing {
+                        Some(index) => Ok(index),
+                        None => {
+                            let index = TantivyIndex::create(&lexical_path)?;
+                            validate_tantivy_adapter_schema(&index, &lexical_path)?;
+                            Ok(index)
+                        }
+                    }
+                });
+            match prepared {
+                Ok(index) => Some(index),
+                Err(error) => {
+                    export_error(metrics_exporter.as_ref(), &error);
+                    return Err(error);
+                }
+            }
+        } else {
+            tantivy_lexical
+        };
+        #[cfg(feature = "lexical-tantivy")]
+        if tantivy_lexical.is_some() {
+            build_checkpoint(cx, "vector index finalize")?;
+        }
+
         let _index = match index_builder.finish() {
             Ok(index) => index,
             Err(error) => {
@@ -838,44 +872,45 @@ impl IndexBuilder {
         #[cfg(feature = "quill")]
         let lexical_docs = lexical_docs.as_slice();
         #[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
-        let (lexical_receipt, lexical_ms) =
-            if let Some(backend) = self.lexical_backend.filter(|_| !lexical_docs.is_empty()) {
-                build_checkpoint(cx, "lexical index build")?;
-                let lexical_path = self.data_dir.join("lexical");
-                let lexical_start = Instant::now();
-                let result = match backend {
-                    #[cfg(feature = "quill")]
-                    IndexLexicalBackend::Quill => {
-                        build_lexical_index(cx, &lexical_path, lexical_docs).await
-                    }
-                    #[cfg(feature = "lexical-tantivy")]
-                    IndexLexicalBackend::Tantivy => {
-                        build_tantivy_lexical_index(
-                            cx,
-                            &lexical_path,
-                            lexical_docs,
-                            tantivy_lexical,
-                        )
-                        .await
-                    }
-                };
-                match result {
-                    Ok(receipt) => (
-                        Some(receipt),
-                        lexical_start.elapsed().as_secs_f64() * 1000.0,
-                    ),
-                    // Publication failure (create/seal/commit) stays fatal: a
-                    // half-written lexical index is worse than an absent arm.
-                    // Per-document indexing errors are NOT fatal; they are
-                    // reported in the receipt.
-                    Err(error) => {
-                        export_error(metrics_exporter.as_ref(), &error);
-                        return Err(error);
-                    }
+        let (lexical_receipt, lexical_ms) = if let Some(backend) =
+            self.lexical_backend.filter(|_| !lexical_docs.is_empty())
+        {
+            build_checkpoint(cx, "lexical index build")?;
+            let lexical_path = self.data_dir.join("lexical");
+            let lexical_start = Instant::now();
+            let result = match backend {
+                #[cfg(feature = "quill")]
+                IndexLexicalBackend::Quill => {
+                    build_lexical_index(cx, &lexical_path, lexical_docs).await
                 }
-            } else {
-                (None, 0.0)
+                #[cfg(feature = "lexical-tantivy")]
+                IndexLexicalBackend::Tantivy => {
+                    build_tantivy_lexical_index(
+                        cx,
+                        &lexical_path,
+                        lexical_docs,
+                        tantivy_lexical.expect("Tantivy writer admitted before vector publication"),
+                    )
+                    .await
+                }
             };
+            match result {
+                Ok(receipt) => (
+                    Some(receipt),
+                    lexical_start.elapsed().as_secs_f64() * 1000.0,
+                ),
+                // Publication failure (create/seal/commit) stays fatal: a
+                // half-written lexical index is worse than an absent arm.
+                // Per-document indexing errors are NOT fatal; they are
+                // reported in the receipt.
+                Err(error) => {
+                    export_error(metrics_exporter.as_ref(), &error);
+                    return Err(error);
+                }
+            }
+        } else {
+            (None, 0.0)
+        };
 
         #[cfg(feature = "durability")]
         {
@@ -1493,8 +1528,7 @@ fn validate_tantivy_adapter_schema(index: &TantivyIndex, data_dir: &Path) -> Sea
     let mismatch = || SearchError::InvalidConfig {
         field: "data_dir/lexical.schema".to_owned(),
         value: data_dir.display().to_string(),
-        reason: "existing Tantivy schema is incompatible with the frankensearch adapter"
-            .to_owned(),
+        reason: "existing Tantivy schema is incompatible with the frankensearch adapter".to_owned(),
     };
     for (name, options) in expected {
         let Some((_, entry)) = fields.next() else {
@@ -1507,7 +1541,7 @@ fn validate_tantivy_adapter_schema(index: &TantivyIndex, data_dir: &Path) -> Sea
     // The adapter resolves `ord` by name, and deliberately supports the older
     // schema without it. Unrelated extra fields do not change the four slots.
     if let Ok(ord) = schema.get_field("ord")
-        && schema.get_field_entry(ord).field_type() != &FieldType::U64(FAST | STORED)
+        && schema.get_field_entry(ord).field_type() != &FieldType::U64((FAST | STORED).into())
     {
         return Err(mismatch());
     }
@@ -1519,15 +1553,11 @@ async fn build_tantivy_lexical_index(
     cx: &Cx,
     data_dir: &Path,
     documents: &[IndexableDocument],
-    existing: Option<TantivyIndex>,
+    lexical: TantivyIndex,
 ) -> SearchResult<LexicalArmReceipt> {
     use frankensearch_core::traits::LexicalWrite;
 
     build_checkpoint(cx, "Tantivy lexical index initialization")?;
-    let lexical = match existing {
-        Some(index) => index,
-        None => TantivyIndex::create(data_dir)?,
-    };
     let mut indexed = 0usize;
     let mut errors: Vec<(String, String)> = Vec::new();
     for document in documents {
@@ -2766,6 +2796,45 @@ mod tests {
 
     #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
     #[test]
+    fn tantivy_builder_late_writer_creation_failure_preserves_existing_vectors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let mut vectors = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
+            vectors
+                .add_fast_record("doc-retained", &[1.0, 0.0])
+                .unwrap();
+            drop(vectors.finish().unwrap());
+            let vector_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            let before_vectors = std::fs::read(&vector_path).unwrap();
+            let lexical_path = dir.join("lexical");
+            let obstruction = lexical_path.clone();
+            let error = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .with_progress(move |_| {
+                    std::fs::write(&obstruction, b"retained late obstruction").unwrap();
+                })
+                .add_document("doc-refused", "latewriterfailure")
+                .build(&cx)
+                .await
+                .expect_err("late writer admission failure precedes vector publication");
+            assert!(matches!(
+                error,
+                SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    ..
+                }
+            ));
+            assert_eq!(std::fs::read(&vector_path).unwrap(), before_vectors);
+            assert_eq!(
+                std::fs::read(&lexical_path).unwrap(),
+                b"retained late obstruction",
+            );
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
     fn tantivy_builder_refuses_mixed_markers_before_touching_vectors() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for marker in ["MANIFEST", "CURRENT"] {
@@ -2775,7 +2844,10 @@ mod tests {
                 frankensearch_core::traits::LexicalWrite::index_documents(
                     &lexical,
                     &cx,
-                    &[IndexableDocument::new("doc-retained", "mixedmarkersentinel")],
+                    &[IndexableDocument::new(
+                        "doc-retained",
+                        "mixedmarkersentinel",
+                    )],
                 )
                 .await
                 .expect("index retained document");
@@ -2809,10 +2881,120 @@ mod tests {
                     before_meta,
                 );
                 let lexical = TantivyIndex::open_read_only(&lexical_path).unwrap();
-                let hits = lexical.search(&cx, "mixedmarkersentinel", 10).await.unwrap();
+                let hits = lexical
+                    .search(&cx, "mixedmarkersentinel", 10)
+                    .await
+                    .unwrap();
                 assert_eq!(hits.len(), 1);
                 assert_eq!(hits[0].doc_id, "doc-retained");
             }
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_refuses_foreign_schema_without_replacing_vectors() {
+        use frankensearch_lexical::{
+            Count, Index, IndexRecordOption, IndexWriter, Schema, TantivyDocument, Term, TermQuery,
+        };
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let lexical_path = dir.join("lexical");
+            std::fs::create_dir(&lexical_path).unwrap();
+            let template = TantivyIndex::in_memory().unwrap();
+            let template_schema = template.index_handle().schema();
+            let mut fields: Vec<_> = template_schema
+                .fields()
+                .map(|(_, entry)| entry.clone())
+                .collect();
+            drop(template);
+            // Every field has the shipping name and options, but the adapter's
+            // hard-coded ID/content handles point at the wrong fields.
+            fields.swap(0, 1);
+            let mut schema = Schema::builder();
+            for field in fields {
+                schema.add_field(field);
+            }
+            let schema = schema.build();
+            let id = schema.get_field("id").unwrap();
+            let foreign = Index::create_in_dir(&lexical_path, schema).unwrap();
+            let mut writer: IndexWriter = foreign.writer(50_000_000).unwrap();
+            let mut document = TantivyDocument::default();
+            document.add_text(id, "doc-retained");
+            writer.add_document(document).unwrap();
+            writer.commit().unwrap();
+            drop(writer);
+
+            let mut vectors = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
+            vectors
+                .add_fast_record("doc-retained", &[1.0, 0.0])
+                .unwrap();
+            drop(vectors.finish().unwrap());
+            let vector_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            let before_vectors = std::fs::read(&vector_path).unwrap();
+            let before_meta = std::fs::read(lexical_path.join("meta.json")).unwrap();
+            let error = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .add_document("doc-refused", "foreign schema must not accept writes")
+                .build(&cx)
+                .await
+                .expect_err("openable Tantivy is not sufficient adapter-schema admission");
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, .. } if field == "data_dir/lexical.schema"
+            ));
+            assert_eq!(std::fs::read(&vector_path).unwrap(), before_vectors);
+            assert_eq!(
+                std::fs::read(lexical_path.join("meta.json")).unwrap(),
+                before_meta,
+            );
+            let reader: frankensearch_lexical::IndexReader = foreign.reader().unwrap();
+            let retained = TermQuery::new(
+                Term::from_field_text(id, "doc-retained"),
+                IndexRecordOption::Basic,
+            );
+            assert_eq!(reader.searcher().search(&retained, &Count).unwrap(), 1);
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_preserves_legacy_schema_without_ordinal_field() {
+        use frankensearch_lexical::{Index, Schema};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let lexical_path = dir.join("lexical");
+            std::fs::create_dir(&lexical_path).unwrap();
+            let template = TantivyIndex::in_memory().unwrap();
+            let template_schema = template.index_handle().schema();
+            let mut schema = Schema::builder();
+            for (_, entry) in template_schema
+                .fields()
+                .filter(|(_, entry)| entry.name() != "ord")
+            {
+                schema.add_field(entry.clone());
+            }
+            drop(template);
+            drop(Index::create_in_dir(&lexical_path, schema.build()).unwrap());
+            let stats = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .add_document("doc-legacy", "legacyordinalsentry")
+                .build(&cx)
+                .await
+                .expect("the supported pre-ordinal schema remains writable");
+            assert!(stats.lexical.unwrap().published);
+            let lexical = TantivyIndex::open_read_only(&lexical_path).unwrap();
+            assert!(lexical.index_handle().schema().get_field("ord").is_err());
+            let hits = lexical
+                .search(&cx, "legacyordinalsentry", 10)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-legacy");
         });
     }
 
