@@ -66,6 +66,16 @@ identity repair below, also remain unreleased.
 
 ### Fixed
 
+- **Native Int8 MiniLM passes its existing certificate on ARM64.** Fused vector
+  exponential arithmetic on ARM changed attention values enough to reject the
+  registered producer certificate. The corrected vector implementation preserves
+  the validated x86 arithmetic order. Real-model checks now produce identical
+  final embeddings on both architectures, with the original certificate and
+  strict index admission retained. This fix remains unreleased; the separate
+  F32 profile and populated CASS consumer acceptance are still pending.
+  [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/8020489d55e9e8dba770db20098fb5cf523d0802);
+  [paired qualification evidence](docs/planning/UPGRADE_LOG.md).
+
 - **New Quill artifacts report the current engine version.** The 0.3.0 package had retained the 0.2.4 producer word in manifests, segment headers, and compaction identity inputs. The correction aligns that word with the crate version. The wire format is unchanged, and exact 0.2.4 and 0.2.3 manifest fixtures remain readable and byte-for-byte reproducible. This correction is not included in the September 12 crate archives. [Implementation and historical wire checks](https://github.com/Dicklesworthstone/frankensearch/commit/8738e50f888c49ceb69ba295b694355d662fede2).
 
 - **Concurrent local anti-rollback publishers no longer expose an unfinished record.**
