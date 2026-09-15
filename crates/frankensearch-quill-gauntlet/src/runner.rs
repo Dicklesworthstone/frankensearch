@@ -782,14 +782,18 @@ impl MetamorphicLawRegistry {
                 law(
                     "e6.3-three-term-or-associativity-v1",
                     "e6.3-three-term-or-associativity-v1",
-                    "three distinct unboosted optional scalar OR operands, regrouped only",
+                    "three distinct unboosted optional scalar OR operands, regrouped only; qualified five-document, three-triple replay",
                     "ranked document sequence, doc count, match count, and snippets; score bits EXCLUDED and separately witnessed (measured one ULP)",
-                    "same ranked documents under re-association, WITHIN each engine only; the cross-engine scope is excluded because the un-transformed baseline (alpha OR gamma) OR delta already diverges by one ULP — DIV-008, disposition blocking on bd-gx7n4",
+                    "same ranked documents under re-association; each identical spelling has exact cross-engine score bits in this replay, while regrouping within each engine retains the measured one-ULP exclusion; broader DIV-007 is unchanged",
                     "tie_order",
                     "e63-three-term-or-associativity-positive",
                     "e63-three-term-or-associativity-mixed-operator",
-                    "engine::tests::e63_three_term_or_associates_within_each_engine_while_cross_engine_stays_registered",
-                    vec![MetamorphicLawScope::Quill, MetamorphicLawScope::Tantivy],
+                    "engine::tests::e63_three_term_or_associates_with_exact_cross_engine_replays",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
                 ),
                 law(
                     "e6.3-single-term-quote-v1",

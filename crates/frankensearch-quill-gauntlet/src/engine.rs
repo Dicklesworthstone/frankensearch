@@ -4972,10 +4972,10 @@ mod tests {
     /// finds it growing beyond the measured one ULP is looking at a different
     /// effect than the one this projection was declared for.
     ///
-    /// `e6.3-three-term-or-associativity-v1` also uses it in a second role —
-    /// to MEASURE the cross-engine cell it excludes, rather than to apply a
-    /// law across engines. Measuring an excluded cell keeps the exclusion
-    /// earned; it does not make the projection a cross-engine relation.
+    /// `e6.3-three-term-or-associativity-v1` also uses this projection for
+    /// its qualified cross-engine replay. Each unchanged spelling must have
+    /// exact score bits across engines; regrouping still has a measured
+    /// one-ULP exclusion within each engine.
     #[cfg(feature = "perf-harness")]
     fn e63_reassociation_projection(
         before: &EngineObservation,
@@ -10082,41 +10082,17 @@ mod tests {
         });
     }
 
-    /// E6.3 law `e6.3-three-term-or-associativity-v1`: three distinct
-    /// unboosted optional scalar `OR` operands re-associate WITHIN each
-    /// engine, under the same score-insensitive projection the `AND` law
-    /// declares. Its cross-engine scope is deliberately excluded, and this
-    /// test measures the reason rather than asserting it.
-    ///
-    /// WHY THE LAW IS NOT CROSS-ENGINE. The BASELINE spelling
-    /// `(alpha OR gamma) OR delta` — no transform applied — already
-    /// diverges between Quill and the pinned oracle: same document, same rank,
-    /// `doc-4@3fdc09b7` versus `3fdc09b6`. The divergence is a property of
-    /// that operand triple, not of re-association, and `(alpha OR beta) OR
-    /// gamma` compares cleanly.
-    ///
-    /// It is now DIV-008 in the Divergence Register — the register's first
-    /// machine-witnessed entry, ingested from the artifact that observed it,
-    /// disposition **blocking** on bead `bd-gx7n4`, with its own executable
-    /// regression at
-    /// `runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope`.
-    /// That disposition is exactly why this law's cross-engine cell is
-    /// omitted rather than claimed: a raw `RankMismatch` is never accepted,
-    /// so no law may assert cross-engine equivalence over it while the
-    /// envelope's scope is undecided. DIV-008 also records the same
-    /// boundary problem from the other side — the DIV-007 mechanism observed
-    /// OUTSIDE its documented qualifiers, on a shape the entry says should be
-    /// bit-exact.
-    ///
-    /// So the law declares `[Quill, Tantivy]` and the cross-engine cell is
-    /// omitted rather than claimed. The exclusion is EARNED, not asserted:
-    /// this test measures the cross-engine comparison through the opt-in seam
-    /// and requires the divergence to still be there and still be one ULP. If
-    /// it ever becomes exact, this test fails and the scope must be widened;
-    /// if it ever grows, this test fails and it is a different finding.
+    /// E6.3 OR-associativity replay on five documents and three operand triples.
+    /// Both engines preserve ranked IDs, counts and snippets under regrouping,
+    /// with a measured one-ULP score change for two triples. Each identical
+    /// spelling is now bit-exact across engines in both perf-only and all-feature
+    /// replays. The historical cross-engine divergence guard therefore no
+    /// longer describes this fixture: require exactness for both spellings
+    /// while retaining the within-engine rounding witness and invalid control.
+    /// This narrow replay does not retire the broader DIV-007 envelope.
     #[cfg(feature = "perf-harness")]
     #[test]
-    fn e63_three_term_or_associates_within_each_engine_while_cross_engine_stays_registered() {
+    fn e63_three_term_or_associates_with_exact_cross_engine_replays() {
         use frankensearch_core::IndexableDocument;
 
         const SEEDS: [u64; 3] = [
@@ -10133,11 +10109,10 @@ mod tests {
         ];
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let mut cross_engine_divergences = 0_u32;
-            for ((first, second, third), seed) in [
-                (("alpha", "beta", "gamma"), SEEDS[0]),
-                (("alpha", "gamma", "delta"), SEEDS[1]),
-                (("beta", "gamma", "delta"), SEEDS[2]),
+            for ((first, second, third), seed, expected_regrouping_distance) in [
+                (("alpha", "beta", "gamma"), SEEDS[0], 0),
+                (("alpha", "gamma", "delta"), SEEDS[1], 1),
+                (("beta", "gamma", "delta"), SEEDS[2], 1),
             ] {
                 let left_grouped = format!("({first} OR {second}) OR {third}");
                 let right_grouped = format!("{first} OR ({second} OR {third})");
@@ -10195,38 +10170,30 @@ mod tests {
                         equivalent,
                         "E6.3 {engine} seed {seed:#x} OR association changed the projected observation"
                     );
-                    assert!(
-                        score_bit_distance <= 1,
-                        "E6.3 {engine} seed {seed:#x} excluded a {score_bit_distance}-ULP score \
-                         shift under OR association; re-measure before widening the projection"
+                    assert_eq!(
+                        score_bit_distance, expected_regrouping_distance,
+                        "E6.3 {engine} seed {seed:#x} OR regrouping rounding witness changed"
                     );
                 }
 
-                // THE EXCLUSION, measured on the UN-transformed spelling so it
-                // cannot be blamed on re-association.
-                let (cross_equivalent, cross_distance) =
-                    e63_reassociation_projection(&baseline_case.1.oracle, &baseline_case.1.subject);
-                assert!(
-                    cross_equivalent,
-                    "E6.3 seed {seed:#x} cross-engine OR baseline diverged in RANKED DOCUMENTS, \
-                     not just scores; that is outside the registered finding and must be \
-                     investigated rather than excluded"
-                );
-                assert!(
-                    cross_distance <= 1,
-                    "E6.3 seed {seed:#x} cross-engine OR baseline score distance grew to \
-                     {cross_distance} ULP; the registered rm3q.8.1 finding is one ULP"
-                );
-                if cross_distance == 1 {
-                    cross_engine_divergences += 1;
+                // Compare each spelling independently; regrouping's rounding
+                // exclusion must never conceal a cross-engine score mismatch.
+                for (spelling, report) in [
+                    (left_grouped.as_str(), &baseline_case.1),
+                    (right_grouped.as_str(), &regrouped_case.1),
+                ] {
+                    let (cross_equivalent, cross_distance) =
+                        e63_reassociation_projection(&report.oracle, &report.subject);
+                    assert!(
+                        cross_equivalent,
+                        "E6.3 seed {seed:#x} cross-engine observation differs for {spelling}"
+                    );
+                    assert_eq!(
+                        cross_distance, 0,
+                        "E6.3 seed {seed:#x} cross-engine score bits differ for {spelling}"
+                    );
                 }
             }
-            assert!(
-                cross_engine_divergences >= 1,
-                "E6.3 no cross-engine OR divergence reproduced; the registered rm3q.8.1 finding \
-                 has gone away, so the cross-engine scope must be re-analysed rather than left \
-                 excluded"
-            );
         });
     }
 
@@ -10293,8 +10260,8 @@ mod tests {
         });
     }
 
-    /// The OR-associativity law's opt-in into the non-asserting seam, in ONE
-    /// place so the exclusion is auditable rather than scattered.
+    /// Non-asserting observations for the OR replay's explicit same-spelling
+    /// equality and separately bounded regrouping checks.
     #[cfg(feature = "perf-harness")]
     async fn e63_or_associativity_runs(
         cx: &Cx,
