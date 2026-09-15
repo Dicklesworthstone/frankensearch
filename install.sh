@@ -518,24 +518,30 @@ install_binary() {
 }
 
 provision_default_semantic_models() {
-  local staged_binary="$1"
+  local staged_binary="$1" model_id
 
   if [ "$OFFLINE" -eq 1 ]; then
-    info "Offline install: verifying the existing semantic model artifacts..."
+    info "Offline install: verifying the default search model artifacts..."
   else
-    info "Provisioning the registered semantic model artifacts..."
-    if ! "$staged_binary" download-models; then
-      err "Semantic model provisioning failed. The existing fsfs installation was not replaced."
+    info "Provisioning the default search model artifacts..."
+  fi
+
+  # Select the shipped default search pair explicitly. Older fsfs releases
+  # interpret a bare download-models command as the entire optional catalog.
+  for model_id in potion-multilingual-128m all-minilm-l6-v2; do
+    if [ "$OFFLINE" -eq 0 ]; then
+      if ! "$staged_binary" download-models "$model_id"; then
+        err "Semantic model provisioning failed for $model_id. The existing fsfs installation was not replaced."
+        return 1
+      fi
+    fi
+    if ! "$staged_binary" download-models "$model_id" --verify; then
+      err "Semantic model verification failed for $model_id. The existing fsfs installation was not replaced."
       return 1
     fi
-  fi
+  done
 
-  if ! "$staged_binary" download-models --verify; then
-    err "Semantic model verification failed. The existing fsfs installation was not replaced."
-    return 1
-  fi
-
-  ok "Registered semantic model artifacts are present and verified."
+  ok "Default search model artifacts are present and verified."
 }
 
 verify_staged_binary() {
@@ -572,7 +578,8 @@ Options:
   --checksum-url URL Fetch the expected SHA-256 from URL instead of the release
   --force            Permit installing an older version over a newer version
   --offline          Never touch the network; requires --version plus a local
-                     --artifact-url and --checksum
+                     --artifact-url and --checksum; full installs also require
+                     the verified default models in the local cache
   --from-source      Build from source instead of downloading binary
   --lite             Install the model-free profile (~15MB). Prefers the
                      prebuilt fsfs-lite-* release artifact and only builds from

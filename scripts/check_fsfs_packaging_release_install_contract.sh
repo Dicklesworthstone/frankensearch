@@ -526,7 +526,14 @@ case "\${1:-}" in
     printf 'fsfs $version (frankensearch $version)\n'
     ;;
   download-models)
-    if [ "\${2:-}" = "--verify" ]; then exit "\${FSFS_STUB_VERIFY_STATUS:-0}"; fi
+    case "\${2:-}" in
+      potion-multilingual-128m|all-minilm-l6-v2) ;;
+      *) exit 72 ;;
+    esac
+    if [ "\${3:-}" = "--verify" ]; then
+      if [ "\${FSFS_STUB_FAIL_MODEL:-}" = "\${2:-}" ]; then exit 74; fi
+      exit "\${FSFS_STUB_VERIFY_STATUS:-0}"
+    fi
     exit "\${FSFS_STUB_DOWNLOAD_STATUS:-0}"
     ;;
   *) exit 0 ;;
@@ -644,7 +651,20 @@ check_installer_offline_e2e() {
     FAILURES=$((FAILURES + 1))
   fi
 
-  # 6. Offline without an explicit checksum is refused before any staging.
+  # 6. The quality model is required even when the fast model verifies.
+  status=0
+  output=$(env NO_COLOR=1 FSFS_STUB_FAIL_MODEL=all-minilm-l6-v2 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "${base_cmd[@]:1}" 2>&1) || status=$?
+  after_digest=$(installer_file_digest "$dest/fsfs")
+  if [[ "$status" -ne 0 && "$output" == *"Semantic model verification failed for all-minilm-l6-v2"* \
+    && "$before_digest" == "$after_digest" ]]; then
+    echo "[installer][OK]   missing quality model preserves the incumbent after fast-model verification"
+  else
+    echo "[installer][FAIL] quality model verification gate failed status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # 7. Offline without an explicit checksum is refused before any staging.
   status=0
   output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
     "$installer_shell" "$installer" --offline --version v9.9.9 \
@@ -654,6 +674,33 @@ check_installer_offline_e2e() {
     echo "[installer][OK]   offline install without a checksum fails closed"
   else
     echo "[installer][FAIL] offline checksum gate status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # 8. The regular path still provisions both selected models before replacing
+  # the incumbent. Local archive and model-command fixtures keep this offline.
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --version v9.9.9 --artifact-url "$archive" \
+    --checksum "$digest" --dest "$dest" 2>&1) || status=$?
+  after_digest=$(installer_file_digest "$dest/fsfs")
+  if [[ "$status" -eq 0 && "$after_digest" == "$staged_digest" ]]; then
+    echo "[installer][OK]   regular installation provisions and verifies the default models"
+  else
+    echo "[installer][FAIL] regular model provisioning failed status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  before_digest=$(installer_file_digest "$dest/fsfs")
+  status=0
+  output=$(env NO_COLOR=1 FSFS_STUB_DOWNLOAD_STATUS=73 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --version v9.9.9 --artifact-url "$archive" \
+    --checksum "$digest" --dest "$dest" 2>&1) || status=$?
+  after_digest=$(installer_file_digest "$dest/fsfs")
+  if [[ "$status" -ne 0 && "$output" == *"Semantic model provisioning failed"* && "$before_digest" == "$after_digest" ]]; then
+    echo "[installer][OK]   regular model download failure preserves the same-version incumbent"
+  else
+    echo "[installer][FAIL] regular download failure gate failed status=$status output=${output:-<empty>}"
     FAILURES=$((FAILURES + 1))
   fi
 
@@ -1281,9 +1328,10 @@ source_install = 'install_binary "$BIN" "$DEST/${BINARY_NAME}"'
 artifact_start = installer.index('[ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }')
 artifact_section = installer[artifact_start:]
 require(
-    '"$staged_binary" download-models' in installer
-    and '"$staged_binary" download-models --verify' in installer,
-    "ordinary source installation must provision and verify registered semantic models",
+    'for model_id in potion-multilingual-128m all-minilm-l6-v2; do' in installer
+    and '"$staged_binary" download-models "$model_id"' in installer
+    and '"$staged_binary" download-models "$model_id" --verify' in installer,
+    "ordinary source installation must explicitly provision and verify both default search models",
 )
 require(
     provision_call in installer

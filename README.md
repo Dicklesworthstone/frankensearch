@@ -47,8 +47,10 @@ a source build that cannot succeed.
 
 The Linux x86-64 full archive requires glibc 2.43 or newer; build from source on
 older glibc systems for full semantic search. The standard installer
-provisions and verifies the six registered production models separately; their
-download is roughly 1.64 GB. The two search tiers alone require roughly 621 MB.
+provisions and verifies the two default search models, Potion and MiniLM,
+requiring roughly 621 MB. Install optional models separately with
+`fsfs download-models MODEL`. Offline installation requires the default pair
+to be cached and verified; it never downloads missing models.
 
 When upgrading a Linux full installation from 1.9.0 or earlier, use the installer
 above: those executables' `fsfs update` selects the MUSL lite archive and loses
@@ -220,8 +222,8 @@ identities as the default source build.
 
 ## Quick Start
 
-The two semantic search tiers use roughly 621 MB of pinned model artifacts;
-the standard installer also provisions the other registered production models.
+The standard installer provisions the two semantic search tiers, using roughly
+621 MB of pinned model artifacts. Other registered models are optional.
 First setup time depends on network speed. Later starts reuse the
 verification receipt while the exact manifest and file states remain unchanged.
 
