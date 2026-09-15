@@ -49,6 +49,7 @@ FROM_SOURCE=0
 LITE=0
 FORCE=0
 OFFLINE=0
+PRESERVE_RECOVERY=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
@@ -309,7 +310,8 @@ roll_back_incumbent() {
     err "upgrade.apply.rollback_triggered: $reason; the previous ${BINARY_NAME} has been restored"
     return 0
   fi
-  err "upgrade.apply.rollback_triggered: $reason; restoring the previous ${BINARY_NAME} also failed"
+  PRESERVE_RECOVERY=1
+  err "upgrade.apply.rollback_triggered: $reason; restoring the previous ${BINARY_NAME} also failed. Recovery copy retained at: $backup_path"
   return 1
 }
 
@@ -1005,7 +1007,9 @@ else
 fi
 
 cleanup() {
-  rm -rf "$TMP"
+  if [ "$PRESERVE_RECOVERY" -eq 0 ]; then
+    rm -rf "$TMP"
+  fi
   if [ "$LOCKED" -eq 1 ]; then rm -rf "$LOCK_DIR"; fi
 }
 

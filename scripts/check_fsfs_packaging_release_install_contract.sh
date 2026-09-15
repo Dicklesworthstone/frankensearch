@@ -930,6 +930,13 @@ exec "$FSFS_REAL_CP" "$@"
 CP_FAULT
   cat >"$shim_dir/install" <<'INSTALL_FAULT'
 #!/usr/bin/env bash
+if [[ "${FSFS_IO_FAULT:-}" == restoration ]]; then
+  if [[ "$3" == *.incumbent ]]; then
+    printf '%s\n' "$3" >"$FSFS_RECOVERY_PATH_RECORD"
+  fi
+  printf 'partial publication\n' >"$4"
+  exit 73
+fi
 if [[ "${FSFS_IO_FAULT:-}" == publication && "$3" != *.incumbent ]]; then
   printf 'partial publication\n' >"$4"
   exit 73
@@ -1001,6 +1008,31 @@ INSTALL_FAULT
     echo "[installer][OK]   --force permits an explicit downgrade"
   else
     echo "[installer][FAIL] forced downgrade status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # A persistent destination error can defeat rollback too. The original
+  # executable must remain at the reported recovery path after EXIT cleanup.
+  installer_write_stub "$dest/fsfs" "1.0.0"
+  local recovery_record="$work/recovery-path" recovery_path=""
+  status=0
+  output=$(env NO_COLOR=1 "PATH=$shim_dir:$PATH" \
+    "FSFS_REAL_CP=$real_cp" "FSFS_REAL_INSTALL=$real_install" \
+    FSFS_IO_FAULT=restoration "FSFS_RECOVERY_PATH_RECORD=$recovery_record" \
+    "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --lite --version v9.9.9 \
+    --artifact-url "$archive" --checksum "$digest" --dest "$dest" 2>&1) || status=$?
+  if [[ -f "$recovery_record" ]]; then
+    IFS= read -r recovery_path <"$recovery_record"
+  fi
+  if [[ "$status" -ne 0 && -n "$recovery_path" && -f "$recovery_path" ]] \
+    && [[ "$output" == *"restoring the previous fsfs also failed"* ]] \
+    && [[ "$output" == *"$recovery_path"* ]] \
+    && [[ "$(installer_file_digest "$recovery_path")" == "$incumbent_digest" ]] \
+    && [[ "$(installer_file_digest "$dest/fsfs")" != "$incumbent_digest" ]]; then
+    echo "[installer][OK]   failed restoration retains and reports the original recovery copy"
+  else
+    echo "[installer][FAIL] restoration failure status=$status recovery=$recovery_path output=$output"
     FAILURES=$((FAILURES + 1))
   fi
 
