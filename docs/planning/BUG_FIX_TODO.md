@@ -6,6 +6,50 @@ Inventory baseline: `062f5b8f`; GitHub issues and JSONL read live on September 1
 Checked items mean only the specific stated step is complete. Parent issues stay
 open until their acceptance criteria, including consumer execution, are met.
 
+## September 15 active handoff (supersedes older pending probe notes)
+
+This owner-requested checklist is process, not shipped capability. Consumer:
+the owner and PurpleBay; retire it from active maintenance when this bug campaign
+is reconciled against Beads (no file deletion implied).
+
+- [x] Review committed Tantivy fixture repair `25a8d576`: copy the production
+  tokenizer manager into the foreign-schema fixture before writing its retained
+  document. Schema rejection and vector-preservation assertions remain unchanged.
+- [ ] Execute post-fix facade validation (initial baseline `f7c2e727`).
+  - [ ] `hash,lexical-tantivy`: focused `tantivy_builder_` library tests.
+    Strict RCH clean-overlay/no-overlay invocation admitted on `vmi1264463`
+    at 17:07:28 UTC but exited 101 before compilation: missing sibling
+    `fast_cmaes/Cargo.toml`. No tests ran. Dependency-aware strict RCH job
+    `30022149863374855` on `am-release-css` transferred both roots and began
+    compilation at 17:09 UTC; result pending. Prior peer session 71871 timed
+    out before execution, so it supplies no post-fix test result.
+  - [ ] `hash,lexical-tantivy,quill`: the same focused tests.
+  - [ ] Complete remaining facade integration executables after focused success.
+  - [ ] Retain terminal result and artifact identity; report any failure without
+    converting compilation, a filtered zero-test binary, or admission into a pass.
+- [x] Read retained x86 scalar-candidate receipt:
+  `dependencies/scalar-candidate-hz3-native-receipt.json` under
+  `/data/release-work/frankensearch-release-20260912` binds native source
+  `685f5e7c97201e79731cebae980dda9a13afb2753f48fbeb591416674f5e4243`
+  and executed ELF `167c353683f0a90dd1d2825c0f66475c00e98296ad59d0ff4b51af91a5390066`.
+  It records 48 normal tests, the live GNU exponential oracle, the F32
+  certificate, and 116 trace records equal to the preceding x86 execution.
+  This is retained focused evidence, not a new execution by PurpleBay.
+- [ ] Qualify the committed scalar repair `5953b314` on admitted ARM capacity;
+  prior paired Int8 success does not qualify this later F32 candidate.
+- [ ] Execute populated CASS semantic acceptance with qualified consumer artifacts;
+  hash-only or lexical fallback does not count (handoff to GreenFinch).
+- [ ] Let ChartreuseCarp qualify the `engine.rs` E63 diagnostic, now committed
+  as `8ff42f65`; do not retire DIV007 or alter its existing tolerance.
+- [ ] Complete current-source full quality and release acceptance before closure.
+- [ ] Newly found installer same-version profile mismatch (Mail 41952): the
+  version-only shortcut can retain lite during a requested full install, or
+  vice versa; substring matching can also confuse 1.1 with 1.10. ChartreuseCarp
+  claimed the narrow repair after checking the prior owner's inactivity and
+  obtaining exact reservations (Mail 41956). Require exact
+  version/profile transition and incumbent-preservation tests; keep the broad
+  cross-platform installer bead open.
+
 ## Execution rules and immediate queue
 
 - [x] Read governing documentation and inspect current source/history.
