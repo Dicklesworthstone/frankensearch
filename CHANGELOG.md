@@ -83,6 +83,13 @@ identity repair below, also remain unreleased.
   checks must succeed before replacing the binary; missing models fail closed.
   [Default-pair provisioning and regressions](https://github.com/Dicklesworthstone/frankensearch/commit/4d73425ae6238368017024ec234ba2dee6ee5325).
 
+- **Installer replacement now requires the requested binary version and a recoverable incumbent.**
+  A checksummed archive with the wrong version is rejected even without
+  `--verify`. If the incumbent cannot be backed up, installation stops before
+  replacement; a failed publication restores the backup. Regression checks
+  exercise wrong-version archives, backup failure, and partial publication.
+  [Identity and rollback repair](https://github.com/Dicklesworthstone/frankensearch/commit/d87f070c7331f9206c800ee398a931598f425d68).
+
 - **Native Int8 MiniLM passes its existing certificate on ARM64.** Fused vector
   exponential arithmetic on ARM changed attention values enough to reject the
   registered producer certificate. The corrected vector implementation preserves
@@ -126,7 +133,7 @@ identity repair below, also remain unreleased.
 
 ### Known limitations
 
-- **Native English Int8 MiniLM remains unqualified on ARM64 ([#47](https://github.com/Dicklesworthstone/frankensearch/issues/47)).** A real ARM64 run with verified model files reproduces the producer-certificate refusal. The loader continues to reject mismatched numerical output; replacing model files or weakening admission is not a remedy. Standard full binaries use ONNX quality embeddings by default. This result does not qualify the separate native F32 producer or establish a numerical root cause.
+- **Native F32 MiniLM still awaits ARM64 qualification ([#47](https://github.com/Dicklesworthstone/frankensearch/issues/47)).** The Int8 correction above passes its unchanged certificate on both architectures. The separate F32 producer failed its ARM certificate before the subsequent scalar-exponential repair; that repair passes the existing x86 certificates but has not yet been qualified on ARM. Populated CASS native-consumer acceptance also remains pending. Standard full binaries use ONNX quality embeddings by default, and the native loader continues to reject mismatched numerical output. [Scalar repair](https://github.com/Dicklesworthstone/frankensearch/commit/5953b314ffba14437fd5d5bf93d1f247f9fc7408); [qualification record](docs/planning/UPGRADE_LOG.md).
 
 ---
 
