@@ -15,11 +15,14 @@ is reconciled against Beads (no file deletion implied).
 - [x] Review committed Tantivy fixture repair `25a8d576`: copy the production
   tokenizer manager into the foreign-schema fixture before writing its retained
   document. Schema rejection and vector-preservation assertions remain unchanged.
-- [ ] Execute post-fix facade validation at committed source `f7c2e727`.
+- [ ] Execute post-fix facade validation (initial baseline `f7c2e727`).
   - [ ] `hash,lexical-tantivy`: focused `tantivy_builder_` library tests.
     Strict RCH clean-overlay/no-overlay invocation admitted on `vmi1264463`
-    at 17:07:28 UTC; result pending. Prior peer session 71871 timed out before
-    execution, so it supplies no post-fix test result.
+    at 17:07:28 UTC but exited 101 before compilation: missing sibling
+    `fast_cmaes/Cargo.toml`. No tests ran. Dependency-aware strict RCH job
+    `30022149863374855` on `am-release-css` transferred both roots and began
+    compilation at 17:09 UTC; result pending. Prior peer session 71871 timed
+    out before execution, so it supplies no post-fix test result.
   - [ ] `hash,lexical-tantivy,quill`: the same focused tests.
   - [ ] Complete remaining facade integration executables after focused success.
   - [ ] Retain terminal result and artifact identity; report any failure without
@@ -36,9 +39,16 @@ is reconciled against Beads (no file deletion implied).
   prior paired Int8 success does not qualify this later F32 candidate.
 - [ ] Execute populated CASS semantic acceptance with qualified consumer artifacts;
   hash-only or lexical fallback does not count (handoff to GreenFinch).
-- [ ] Preserve ChartreuseCarp's uncommitted `engine.rs` E63 diagnostic and let
-  its owner qualify it; do not retire DIV007 or alter its existing tolerance.
+- [ ] Let ChartreuseCarp qualify the `engine.rs` E63 diagnostic, now committed
+  as `8ff42f65`; do not retire DIV007 or alter its existing tolerance.
 - [ ] Complete current-source full quality and release acceptance before closure.
+- [ ] Newly found installer same-version profile mismatch (Mail 41952): the
+  version-only shortcut can retain lite during a requested full install, or
+  vice versa; substring matching can also confuse 1.1 with 1.10. ChartreuseCarp
+  claimed the narrow repair after checking the prior owner's inactivity and
+  obtaining exact reservations (Mail 41956). Require exact
+  version/profile transition and incumbent-preservation tests; keep the broad
+  cross-platform installer bead open.
 
 ## Execution rules and immediate queue
 
