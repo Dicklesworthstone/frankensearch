@@ -10173,6 +10173,22 @@ mod tests {
                     ("Quill", &baseline_case.1.subject, &regrouped_case.1.subject),
                     ("Tantivy", &baseline_case.1.oracle, &regrouped_case.1.oracle),
                 ] {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "case": "e63-three-term-or-associativity",
+                            "seed": seed,
+                            "engine": engine,
+                            "baseline_query": left_grouped,
+                            "regrouped_query": right_grouped,
+                            "baseline": before,
+                            "regrouped": after,
+                        })
+                    );
+                    assert!(
+                        !before.hits.is_empty() && !after.hits.is_empty(),
+                        "E6.3 {engine} seed {seed:#x} must exercise nonempty OR results"
+                    );
                     let (equivalent, score_bit_distance) =
                         e63_reassociation_projection(before, after);
                     assert!(
