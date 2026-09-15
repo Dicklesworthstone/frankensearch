@@ -1324,18 +1324,32 @@ mod lexical {
             assert_eq!(documents.len(), 339);
             let tmp = tempfile::tempdir().expect("diagnostic corpus directory");
             let quill = build_quill_index(&cx, &tmp.path().join("quill"), &documents).await;
-            let deterministic = QuillIndex::create(&cx, &tmp.path().join("deterministic"), QuillConfig {
-                deterministic_ingest: true,
-                ..QuillConfig::default()
-            }).await.expect("deterministic Quill");
-            LexicalWrite::index_documents(&deterministic, &cx, &documents).await.expect("deterministic corpus");
-            LexicalWrite::commit(&deterministic, &cx).await.expect("deterministic commit");
+            let deterministic = QuillIndex::create(
+                &cx,
+                &tmp.path().join("deterministic"),
+                QuillConfig {
+                    deterministic_ingest: true,
+                    ..QuillConfig::default()
+                },
+            )
+            .await
+            .expect("deterministic Quill");
+            LexicalWrite::index_documents(&deterministic, &cx, &documents)
+                .await
+                .expect("deterministic corpus");
+            LexicalWrite::commit(&deterministic, &cx)
+                .await
+                .expect("deterministic commit");
             let auto_disk = build_tantivy_index(&cx, &tmp.path().join("auto"), &documents).await;
             let auto_ram = TantivyIndex::in_memory().expect("automatic RAM writer");
             let fixed = TantivyIndex::in_memory_single_threaded_oracle().expect("width-one oracle");
             for index in [&auto_ram, &fixed] {
-                LexicalWrite::index_documents(index, &cx, &documents).await.expect("index corpus");
-                LexicalWrite::commit(index, &cx).await.expect("commit corpus");
+                LexicalWrite::index_documents(index, &cx, &documents)
+                    .await
+                    .expect("index corpus");
+                LexicalWrite::commit(index, &cx)
+                    .await
+                    .expect("commit corpus");
             }
             let quill_hits = {
                 let _guard = ScorerTraceSinkGuard::install(Arc::new(Trace("default")));
@@ -1354,11 +1368,18 @@ mod lexical {
                     eprintln!("LJS_QUILL_SEGMENT {label} {:?}", segment.manifest());
                 }
             }
-            for (label, index) in [("auto_disk", &auto_disk), ("auto_ram", &auto_ram), ("fixed_one_ram", &fixed)] {
+            for (label, index) in [
+                ("auto_disk", &auto_disk),
+                ("auto_ram", &auto_ram),
+                ("fixed_one_ram", &fixed),
+            ] {
                 let public = public_observation(index, &cx, "Long John Silver", 339).await;
                 eprintln!("LJS_PUBLIC {label} {public:?}");
                 if label == "fixed_one_ram" {
-                    assert_eq!(deterministic_hits, public, "same-layout lenient public score/order counterfactual");
+                    assert_eq!(
+                        deterministic_hits, public,
+                        "same-layout lenient public score/order counterfactual"
+                    );
                 }
                 let handle = index.index_handle();
                 let schema = handle.schema();
@@ -1369,21 +1390,47 @@ mod lexical {
                 reader.reload().expect("reader reload");
                 let searcher = reader.searcher();
                 for (ordinal, segment) in searcher.segment_readers().iter().enumerate() {
-                    eprintln!("LJS_SEGMENT {label} {ordinal} {:?} {}", segment.segment_id(), segment.num_docs());
+                    eprintln!(
+                        "LJS_SEGMENT {label} {ordinal} {:?} {}",
+                        segment.segment_id(),
+                        segment.num_docs()
+                    );
                 }
                 let mut parser = QueryParser::for_index(&handle, vec![content, title]);
                 parser.set_field_boost(title, 2.0);
                 let (lenient, errors) = parser.parse_query_lenient("Long John Silver");
                 assert!(errors.is_empty(), "diagnostic lenient query is valid");
                 eprintln!("LJS_LENIENT_QUERY {label} {lenient:?}");
-                for text in ["Long John Silver", "Long", "John", "Silver", "content:long", "title:long", "content:john", "title:john", "content:silver", "title:silver"] {
+                for text in [
+                    "Long John Silver",
+                    "Long",
+                    "John",
+                    "Silver",
+                    "content:long",
+                    "title:long",
+                    "content:john",
+                    "title:john",
+                    "content:silver",
+                    "title:silver",
+                ] {
                     let query = parser.parse_query(text).expect("diagnostic query");
                     eprintln!("LJS_QUERY {label} {text:?} {query:?}");
-                    let hits = searcher.search(query.as_ref(), &TopDocs::with_limit(339).order_by_score()).expect("diagnostic search");
+                    let hits = searcher
+                        .search(query.as_ref(), &TopDocs::with_limit(339).order_by_score())
+                        .expect("diagnostic search");
                     for (score, address) in hits {
-                        let doc: TantivyDocument = searcher.doc(address).expect("diagnostic document");
-                        let doc_id = doc.get_first(id).and_then(|value| value.as_str()).expect("document id");
-                        eprintln!("LJS_HIT {label} {text:?} {doc_id} {} {} {}", address.segment_ord, address.doc_id, score.to_bits());
+                        let doc: TantivyDocument =
+                            searcher.doc(address).expect("diagnostic document");
+                        let doc_id = doc
+                            .get_first(id)
+                            .and_then(|value| value.as_str())
+                            .expect("document id");
+                        eprintln!(
+                            "LJS_HIT {label} {text:?} {doc_id} {} {} {}",
+                            address.segment_ord,
+                            address.doc_id,
+                            score.to_bits()
+                        );
                     }
                 }
             }

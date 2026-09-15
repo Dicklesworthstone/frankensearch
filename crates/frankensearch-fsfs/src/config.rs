@@ -4418,11 +4418,17 @@ mod tests {
                 .contains("/frankensearch/config.toml")
         );
 
-        let project = default_project_config_file_path(Path::new("/tmp/workspace"));
-        assert_eq!(
-            project,
-            Path::new("/tmp/workspace/.frankensearch/config.toml")
-        );
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fsfs-default-paths-{unique}"));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("mkdir workspace");
+        fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+
+        let project = default_project_config_file_path(&workspace);
+        assert_eq!(project, root.join(".frankensearch").join("config.toml"));
 
         let result = load_from_str(
             None,
