@@ -617,3 +617,28 @@ v1.10.0 receipts confirm six binary variants, 13 crates and nine public consumer
 lanes. The recovered initial DSR configuration is historical, not the final
 configuration or authorization to bypass RCH. The live Homebrew tap has no fsfs
 formula. No version bump, new tag or publication has occurred in this run.
+
+## September 15 supplement: installer profile and model selection
+
+Scope is the installer workstream `bd-fsfs-cross-platform-semantic-installer-46z3u`,
+not a reconstruction of all intervening commits. Reviewed implementation and
+policy-test diffs in `6d345be35ca48925c42a5c4ac8c54805cc19cca6` and
+`4d73425ae6238368017024ec234ba2dee6ee5325`, the bead's retained failure comments,
+and the shipped full/lite 1.10.0 binaries. The existing installer suite passes
+with exact model arguments, same-version replacement, offline download refusal,
+separate quality-model rejection, checksum preservation and rollback checks.
+Its scripted CLI fixtures are policy evidence, not real-model qualification.
+
+Real RCH execution reproduced the old version-only no-op. The intermediate
+installer made an HTTPS connection during `--offline`; that run timed out and
+is not a successful transition. The final explicit-pair implementation installed
+the genuine full binary over lite with only the nine default-model files and
+completed indexing without observed internet socket calls. Its first search
+returned hits but exceeded the unchanged 500 ms quality-refinement deadline.
+The broad four-platform installer bead and release gates remain open.
+
+Live `gh release list` on September 15 still reports September 8's `v1.10.0`
+and `crates-v0.5.0` as the newest GitHub Releases. The September 12
+`frankensearch-v0.6.0` remains a plain tag associated with the existing crates.io
+publication. This supplement adds unreleased behavior notes without inventing
+a new release or claiming complete September 14–15 history coverage.

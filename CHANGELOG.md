@@ -8,11 +8,14 @@ Release history through [v1.10.0](https://github.com/Dicklesworthstone/frankense
 
 Scope window: the release reconstruction covers v1.9.1 → v1.10.0 and their 2026-09-08 publication records. The subsequent-change inventory covers Quill fixes, warm-daemon streaming, model-receipt reuse, executable acceptance, the GH #43/#46 indexing and loader work, and dependency qualification through 2026-09-13 (UTC). The 0.6.0 library family was published to crates.io on September 12; its plain git tag is not a GitHub Release, and the next fsfs binary release remains pending.
 
+A September 15 supplement covers installer profile switching, offline verification,
+and default-model provisioning.
+
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased fsfs | Release preparation | 2026-09-09–13 | Progressive warm-daemon streaming, indexing cancellation and pressure checks, model reuse, and doctor producer admission |
+| Unreleased fsfs | Release preparation | 2026-09-09–15 | Progressive warm-daemon streaming, indexing cancellation and pressure checks, model reuse, doctor producer admission, and installer profile/offline fixes |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
 | [crates-v0.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0) | Library bundle | 2026-09-08 | All 13 publishable members and release evidence share v1.10.0 source; binary release retains latest routing |
@@ -65,6 +68,20 @@ identity repair below, also remain unreleased.
 - **The executable quickstart gate requires both search tiers and actual progressive results.** The Linux DSR lane builds and installs into a private root, checks executable byte identity, and requires ranked hybrid and vector-only results, Initial/Refined records, authoritative generation artifacts, and the model receipts actually admitted by the loaders. Eighteen failure controls cover model, result, generation, lifecycle and provenance failures. Supplied binaries retain an explicitly unknown source revision; the checker revision cannot qualify them as a source-bound release build. [Gate and receipt wiring](https://github.com/Dicklesworthstone/frankensearch/commit/3d1c2fddb09641153cc7d66a61f835751a4b1538); [isolated Cargo discovery](https://github.com/Dicklesworthstone/frankensearch/commit/8789e0449eb01e3e6250cc4358eef003366d4ff9).
 
 ### Fixed
+
+- **Reinstalling the same version honors the requested full/lite profile.**
+  The installer stages and verifies the requested artifact instead of returning
+  success based only on the incumbent's version. Version detection now matches
+  the complete reported version, including the normal CLI annotation, rather
+  than accepting a substring. Verification failures preserve the incumbent.
+  [Profile and offline repair](https://github.com/Dicklesworthstone/frankensearch/commit/6d345be35ca48925c42a5c4ac8c54805cc19cca6).
+
+- **Offline installation verifies cached models without downloading them.**
+  Full installs explicitly provision and verify Potion and ONNX MiniLM, the two
+  default search models. Optional catalog entries no longer trigger extra
+  downloads or prevent an offline install with a valid default pair. Both model
+  checks must succeed before replacing the binary; missing models fail closed.
+  [Default-pair provisioning and regressions](https://github.com/Dicklesworthstone/frankensearch/commit/4d73425ae6238368017024ec234ba2dee6ee5325).
 
 - **Native Int8 MiniLM passes its existing certificate on ARM64.** Fused vector
   exponential arithmetic on ARM changed attention values enough to reject the
