@@ -386,6 +386,8 @@ fn semantic_queries_do_not_leak_the_answer_vocabulary() {
 mod lexical {
     #[cfg(feature = "lexical-tantivy")]
     use std::collections::{BTreeMap, BTreeSet};
+    #[cfg(feature = "lexical-tantivy")]
+    use std::fmt::Write as _;
 
     use super::{LEXICAL_QUERIES, Passage, chapters_of, corpus};
     #[cfg(feature = "lexical-tantivy")]
@@ -1226,7 +1228,7 @@ mod lexical {
                 if pair + 1 < PAIRS {
                     missing_outer_required.push_str(&required);
                 }
-                all_title.push_str(&format!(" optional{pair}"));
+                write!(all_title, " optional{pair}").expect("writing to a String cannot fail");
             }
             let documents = Vec::from([
                 IndexableDocument::new("all-clauses", all_content).with_title(all_title),
@@ -1306,7 +1308,7 @@ mod lexical {
     /// nested per-term default-field expansion association (repaired by the
     /// bd-5o5z8 structural mirror) and the counted-route lowering mismatch
     /// (repaired by `topdocs_root = limit != 0 && !exact_count`). This pin
-    /// is the focused ExactRepair replay: every family shape must match
+    /// is the focused `ExactRepair` replay: every family shape must match
     /// Tantivy in document order and exact f32 score bits on the full
     /// 339-passage Treasure Island corpus, and no shape may be vacuous.
     #[cfg(feature = "lexical-tantivy")]
