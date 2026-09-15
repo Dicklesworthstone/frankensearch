@@ -456,7 +456,8 @@ detect_existing_install() {
     return 0
   fi
   case "$existing_version" in
-    *"${resolved_version#v}"*) printf '%s\n' "same-version" ;;
+    "${BINARY_NAME} ${resolved_version#v}"|"${BINARY_NAME} ${resolved_version#v} (frankensearch ${resolved_version#v})")
+      printf '%s\n' "same-version" ;;
     *) printf '%s\n' "different-version" ;;
   esac
 }
@@ -519,10 +520,14 @@ install_binary() {
 provision_default_semantic_models() {
   local staged_binary="$1"
 
-  info "Provisioning the registered semantic model artifacts..."
-  if ! "$staged_binary" download-models; then
-    err "Semantic model provisioning failed. The existing fsfs installation was not replaced."
-    return 1
+  if [ "$OFFLINE" -eq 1 ]; then
+    info "Offline install: verifying the existing semantic model artifacts..."
+  else
+    info "Provisioning the registered semantic model artifacts..."
+    if ! "$staged_binary" download-models; then
+      err "Semantic model provisioning failed. The existing fsfs installation was not replaced."
+      return 1
+    fi
   fi
 
   if ! "$staged_binary" download-models --verify; then
@@ -565,7 +570,7 @@ Options:
   --artifact-url URL Install from an explicit archive URL or local path
   --checksum HEX     Expected SHA-256 of the archive (64 hex characters)
   --checksum-url URL Fetch the expected SHA-256 from URL instead of the release
-  --force            Reinstall even when the resolved version is already present
+  --force            Permit installing an older version over a newer version
   --offline          Never touch the network; requires --version plus a local
                      --artifact-url and --checksum
   --from-source      Build from source instead of downloading binary
@@ -905,11 +910,9 @@ case "$EXISTING_STATE" in
     info "Preflight: no existing ${BINARY_NAME} at $DEST"
     ;;
   same-version)
-    if [ "$FORCE" -eq 0 ]; then
-      ok "${BINARY_NAME} ${VERSION} is already installed at $DEST/${BINARY_NAME}; pass --force to reinstall"
-      exit 0
-    fi
-    info "Preflight: ${VERSION} already installed; --force requested, reinstalling"
+    # Full and lite binaries report the same version. Reinstall the requested
+    # profile through staging and verification even when the version matches.
+    info "Preflight: ${VERSION} already installed; verifying and installing the requested profile"
     ;;
   different-version)
     INSTALLED_VERSION_TEXT=$("$DEST/${BINARY_NAME}" version 2>/dev/null | head -n 1 || true)

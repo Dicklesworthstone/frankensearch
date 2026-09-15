@@ -434,11 +434,16 @@ check_installer_preflight() {
   local incumbent="$work/incumbent/fsfs"
   mkdir -p "$work/incumbent"
   installer_write_stub "$incumbent" "1.0.0"
+  installer_write_stub "$work/incumbent/fsfs-prerelease" "1.0.0-rc.1"
 
   local detected probe probe_path probe_version probe_expected
   for probe in \
     "$work/incumbent/absent v1.0.0 fresh" \
     "$incumbent v1.0.0 same-version" \
+    "$incumbent v1.0 different-version" \
+    "$incumbent v0.0 different-version" \
+    "$incumbent v1.0.0-rc.1 different-version" \
+    "$work/incumbent/fsfs-prerelease v1.0.0 different-version" \
     "$incumbent v2.0.0 different-version"; do
     read -r probe_path probe_version probe_expected <<<"$probe"
     detected=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" \
@@ -518,7 +523,7 @@ case "\${1:-}" in
         *"\${FSFS_STUB_FAIL_FROM_DEST}"*) exit 1 ;;
       esac
     fi
-    printf 'fsfs $version\n'
+    printf 'fsfs $version (frankensearch $version)\n'
     ;;
   download-models)
     if [ "\${2:-}" = "--verify" ]; then exit "\${FSFS_STUB_VERIFY_STATUS:-0}"; fi
@@ -552,12 +557,13 @@ check_installer_offline_e2e() {
   staged_digest=$(installer_file_digest "$work/stage/fsfs")
 
   local -a base_cmd=(
-    env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock"
+    env NO_COLOR=1 FSFS_STUB_DOWNLOAD_STATUS=73 "FSFS_INSTALL_LOCK_FILE=$work/install.lock"
     "$installer_shell" "$installer"
     --offline --version v9.9.9 --artifact-url "$archive" --checksum "$digest" --dest "$dest"
   )
 
-  # 1. Fresh offline install replaces nothing and lands a working binary.
+  # 1. Offline installs verify the cache without calling the download route,
+  # which this fixture deliberately makes fail with status 73.
   status=0
   output=$("${base_cmd[@]}" 2>&1) || status=$?
   if [[ "$status" -eq 0 && -x "$dest/fsfs" ]] && "$dest/fsfs" version | grep -q '9\.9\.9'; then
@@ -567,23 +573,25 @@ check_installer_offline_e2e() {
     FAILURES=$((FAILURES + 1))
   fi
 
-  # 2. Re-running without --force preserves the incumbent instead of reinstalling.
-  # The incumbent is marked so a silent no-op is distinguishable from a
-  # byte-identical reinstall: only a real replacement can drop the marker.
+  # 2. A version cannot distinguish full from lite. An ordinary same-version
+  # install must replace the incumbent with the verified requested artifact.
+  # The marker distinguishes replacement from the former silent no-op.
   local before_digest after_digest
   printf '# installed-marker\n' >>"$dest/fsfs"
   before_digest=$(installer_file_digest "$dest/fsfs")
   status=0
   output=$("${base_cmd[@]}" 2>&1) || status=$?
   after_digest=$(installer_file_digest "$dest/fsfs")
-  if [[ "$status" -eq 0 && "$output" == *"already installed"* && "$before_digest" == "$after_digest" ]]; then
-    echo "[installer][OK]   an already-installed version is detected and left untouched"
+  if [[ "$status" -eq 0 && "$after_digest" == "$staged_digest" && "$before_digest" != "$after_digest" ]]; then
+    echo "[installer][OK]   same-version install replaces the incumbent with the requested artifact"
   else
-    echo "[installer][FAIL] existing-install short circuit failed status=$status output=${output:-<empty>}"
+    echo "[installer][FAIL] same-version replacement failed status=$status output=${output:-<empty>}"
     FAILURES=$((FAILURES + 1))
   fi
 
   # 3. --force reinstalls the same version, restoring the archive's bytes.
+  printf '# installed-marker\n' >>"$dest/fsfs"
+  before_digest=$(installer_file_digest "$dest/fsfs")
   status=0
   output=$("${base_cmd[@]}" --force 2>&1) || status=$?
   after_digest=$(installer_file_digest "$dest/fsfs")
@@ -595,6 +603,19 @@ check_installer_offline_e2e() {
   fi
 
   # 4. A corrupt checksum must abort without replacing the incumbent.
+  before_digest=$(installer_file_digest "$dest/fsfs")
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --version v9.9.9 \
+    --artifact-url "$archive" --checksum "$(printf '0%.0s' {1..64})" --dest "$dest" 2>&1) || status=$?
+  after_digest=$(installer_file_digest "$dest/fsfs")
+  if [[ "$status" -ne 0 && "$output" == *"Checksum mismatch"* && "$before_digest" == "$after_digest" ]]; then
+    echo "[installer][OK]   a same-version checksum mismatch preserves the incumbent"
+  else
+    echo "[installer][FAIL] same-version checksum gate failed status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
   installer_write_stub "$dest/fsfs" "1.0.0"
   before_digest=$(installer_file_digest "$dest/fsfs")
   status=0
