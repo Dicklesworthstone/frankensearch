@@ -301,9 +301,104 @@ fn exp_vec8_non_fused(input: f32x8) -> f32x8 {
     }))
 }
 
+// Adapted from Arm optimized-routines expf.c and exp2f_data.c at
+// f2e4faf58c6c671154f472a76eaaa977bb36c870. Modified to spell out the five
+// fused operations used by the validated GNU x86 producer, including range
+// reduction, rather than relying on compiler contraction or host libm.
+// The final f32 rounding is part of this scalar producer's arithmetic.
+//
+// MIT License
+// Copyright (c) 1999-2022, Arm Limited.
+// Copyright (c) 2017-2025, Arm Limited.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+#[inline]
+fn scalar_exp_fma(input: f32) -> f32 {
+    const TABLE: [u64; 32] = [
+        0x3ff0_0000_0000_0000,
+        0x3fef_d9b0_d315_8574,
+        0x3fef_b558_6cf9_890f,
+        0x3fef_9301_d012_5b51,
+        0x3fef_72b8_3c7d_517b,
+        0x3fef_5487_3168_b9aa,
+        0x3fef_387a_6e75_6238,
+        0x3fef_1e9d_f51f_dee1,
+        0x3fef_06fe_0a31_b715,
+        0x3fee_f1a7_373a_a9cb,
+        0x3fee_dea6_4c12_3422,
+        0x3fee_ce08_6061_892d,
+        0x3fee_bfda_d536_2a27,
+        0x3fee_b42b_569d_4f82,
+        0x3fee_ab07_dd48_5429,
+        0x3fee_a47e_b03a_5585,
+        0x3fee_a09e_667f_3bcd,
+        0x3fee_9f75_e8ec_5f74,
+        0x3fee_a114_73eb_0187,
+        0x3fee_a589_994c_ce13,
+        0x3fee_ace5_422a_a0db,
+        0x3fee_b737_b0cd_c5e5,
+        0x3fee_c491_82a3_f090,
+        0x3fee_d503_b23e_255d,
+        0x3fee_e89f_995a_d3ad,
+        0x3fee_ff76_f2fb_5e47,
+        0x3fef_199b_dd85_529c,
+        0x3fef_3720_dcef_9069,
+        0x3fef_5818_dcfb_a487,
+        0x3fef_7c97_337b_9b5f,
+        0x3fef_a4af_a2a4_90da,
+        0x3fef_d076_5b6e_4540,
+    ];
+    const INV_LN2_SCALED: f64 = f64::from_bits(0x4047_1547_652b_82fe);
+    const SHIFT: f64 = f64::from_bits(0x4338_0000_0000_0000);
+    const CUBIC: f64 = f64::from_bits(0x3ebc_6af8_4b91_2394);
+    const QUADRATIC: f64 = f64::from_bits(0x3f2e_bfce_50fa_c4f3);
+    const LINEAR: f64 = f64::from_bits(0x3f96_2e42_ff0c_52d6);
+
+    if input.is_nan() {
+        return input + input;
+    }
+    if input > f32::from_bits(0x42b1_7217) {
+        return f32::INFINITY;
+    }
+    if input < f32::from_bits(0xc2cf_f1b4) {
+        return 0.0;
+    }
+    let value = f64::from(input);
+    let shifted = INV_LN2_SCALED.mul_add(value, SHIFT);
+    let exponent_bits = shifted.to_bits();
+    let exponent = shifted - SHIFT;
+    let reduced = INV_LN2_SCALED.mul_add(value, -exponent);
+    let table_index = usize::from(exponent_bits.to_le_bytes()[0] & 31);
+    let scale = f64::from_bits(TABLE[table_index].wrapping_add(exponent_bits.wrapping_shl(47)));
+    let high = CUBIC.mul_add(reduced, QUADRATIC);
+    let low = LINEAR.mul_add(reduced, 1.0);
+    let polynomial = high.mul_add(reduced * reduced, low);
+    // The algorithm intentionally rounds its double-precision result once to f32.
+    #[allow(clippy::cast_possible_truncation)]
+    let rounded = (polynomial * scale) as f32;
+    rounded
+}
+
 /// In-place fused scale + numerically-stable softmax for one attention-score row.
 /// Computes `softmax(scale · row)` over `row` (one head's query position), using
-/// The 8-wide non-fused polynomial `exp` (~1-2 ULP) instead of scalar libm `expf`.
+/// the 8-wide non-fused polynomial `exp` (~1-2 ULP) and a scalar tail with
+/// explicit fused operations matching the qualified GNU producer.
 /// `scale > 0`, so the argmax (hence the stabilising max-subtraction) is
 /// unchanged by the scale: `exp(scale·(x − max)) == exp(scale·x)/exp(scale·max)`.
 fn softmax_row_fused(row: &mut [f32], scale: f32) {
@@ -348,7 +443,7 @@ fn softmax_row_fused(row: &mut [f32], scale: f32) {
     }
     let mut sum: f32 = sum_v.to_array().iter().sum();
     while i < n {
-        let e = ((row[i] - max_raw) * scale).exp();
+        let e = scalar_exp_fma((row[i] - max_raw) * scale);
         row[i] = e;
         sum += e;
         i += 1;
@@ -2344,6 +2439,104 @@ impl frankensearch_core::traits::Reranker for NativeReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Explicit producer qualification, not a promise about every GNU libc or
+    // x86 CPU. Run on the retained GNU x86 producer with its resolved expf
+    // implementation and executable provenance recorded by the RCH driver.
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "requires the qualified GNU x86 live expf producer"]
+    fn scalar_exp_matches_live_qualified_gnu_x86_producer() {
+        fn compare(input_bits: u32, sample: &str) {
+            let input = f32::from_bits(input_bits);
+            if !input.is_finite() {
+                return;
+            }
+            // Keep the oracle a runtime library operation, independent of
+            // the candidate implementation and its table/constants.
+            let expected = std::hint::black_box(input).exp().to_bits();
+            let observed = scalar_exp_fma(input).to_bits();
+            assert_eq!(
+                observed, expected,
+                "sample={sample} input_bits={input_bits:#010x} input={input:?} \
+                 candidate_bits={observed:#010x} oracle_bits={expected:#010x}",
+            );
+        }
+
+        // The conversion intentionally selects the nearest representable
+        // f32 input around a mathematical grid or reduction boundary.
+        #[allow(clippy::cast_possible_truncation)]
+        fn input_bits(value: f64) -> u32 {
+            (value as f32).to_bits()
+        }
+
+        // An odd additive stride traverses all u32 patterns before repeating.
+        // This bounded prefix spans signs, exponents and significands; the
+        // comparison helper excludes only non-finite inputs.
+        let mut bits = 0_u32;
+        for _ in 0..65_536 {
+            compare(bits, "finite-bit-stride");
+            bits = bits.wrapping_add(0x9e37_79b9);
+        }
+
+        // Dense practical stable-softmax range: [-128, 0] at exact 1/256
+        // spacing, including the subnormal-output and zero-output region.
+        for step in -32_768..=0 {
+            compare(input_bits(f64::from(step) / 256.0), "softmax-grid");
+        }
+
+        // Neighbors on both sides of every half-integer reduction boundary
+        // throughout the finite expf output range. Use a separate literal
+        // here so this sampling does not read the candidate's constants.
+        let reduction_scale = 32.0 / std::f64::consts::LN_2;
+        for integer in -4_800..=4_096 {
+            let center = input_bits((f64::from(integer) + 0.5) / reduction_scale);
+            for offset in -2..=2 {
+                compare(center.wrapping_add_signed(offset), "reduction-neighbor");
+            }
+        }
+
+        // Directly cover representable neighbors at both range thresholds,
+        // the normal/subnormal input boundary, signed zero, and the captured
+        // hard model input where promotion to f64 exp chooses another bit.
+        for center in [
+            0x42b1_7217_u32,
+            0xc2cf_f1b4,
+            0x0080_0000,
+            0x8080_0000,
+            0x0000_0000,
+            0x8000_0000,
+            0xc088_10e8,
+        ] {
+            for offset in -8..=8 {
+                compare(center.wrapping_add_signed(offset), "edge-neighbor");
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_exp_preserves_recorded_rounding_and_extremes() {
+        // Retained GNU FMA producer outputs, including a captured model input
+        // for which exp(f64(input)) rounded to f32 chooses the other adjacent bit.
+        for (input, expected) in [
+            (0x0000_0000, 0x3f80_0000),
+            (0x8000_0000, 0x3f80_0000),
+            (0x3f80_0000, 0x402d_f854),
+            (0xbf80_0000, 0x3ebc_5ab2),
+            (0xc088_10e8, 0x3c69_3931),
+            (0x42b1_7217, 0x7f7f_ff84),
+            (0x42b1_7218, 0x7f80_0000),
+            (0xc2cf_f1b4, 0x0000_0001),
+            (0xc2cf_f1b5, 0x0000_0000),
+            (0x7f80_0000, 0x7f80_0000),
+            (0xff80_0000, 0x0000_0000),
+        ] {
+            assert_eq!(scalar_exp_fma(f32::from_bits(input)).to_bits(), expected);
+        }
+        for input in [0x7fc0_0001, 0xffc0_0001, 0x7fa0_0001] {
+            assert!(scalar_exp_fma(f32::from_bits(input)).is_nan());
+        }
+    }
 
     #[test]
     fn non_fused_exp_preserves_exceptional_lanes() {
