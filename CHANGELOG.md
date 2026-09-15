@@ -86,9 +86,12 @@ identity repair below, also remain unreleased.
 - **Installer replacement now requires the requested binary version and a recoverable incumbent.**
   A checksummed archive with the wrong version is rejected even without
   `--verify`. If the incumbent cannot be backed up, installation stops before
-  replacement; a failed publication restores the backup. Regression checks
-  exercise wrong-version archives, backup failure, and partial publication.
-  [Identity and rollback repair](https://github.com/Dicklesworthstone/frankensearch/commit/d87f070c7331f9206c800ee398a931598f425d68).
+  replacement; a failed publication restores the backup. If restoration also
+  fails, the installer retains the recovery copy and reports its path.
+  Regression checks exercise wrong-version archives, backup failure, partial
+  publication, and failed restoration.
+  [Identity and rollback repair](https://github.com/Dicklesworthstone/frankensearch/commit/58a4fdd8fca04442649e2e0f3f5966a939ed847c);
+  [recovery-copy retention](https://github.com/Dicklesworthstone/frankensearch/commit/6f374010534f2d410bc09f1852aef789bacbd913).
 
 - **Native Int8 MiniLM passes its existing certificate on ARM64.** Fused vector
   exponential arithmetic on ARM changed attention values enough to reject the
