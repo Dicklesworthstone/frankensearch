@@ -16,15 +16,26 @@ is reconciled against Beads (no file deletion implied).
   tokenizer manager into the foreign-schema fixture before writing its retained
   document. Schema rejection and vector-preservation assertions remain unchanged.
 - [ ] Execute post-fix facade validation (initial baseline `f7c2e727`).
-  - [ ] `hash,lexical-tantivy`: focused `tantivy_builder_` library tests.
+  - [x] `hash,lexical-tantivy`: focused foreign-schema regression and full matrix.
     Strict RCH clean-overlay/no-overlay invocation admitted on `vmi1264463`
     at 17:07:28 UTC but exited 101 before compilation: missing sibling
     `fast_cmaes/Cargo.toml`. No tests ran. Dependency-aware strict RCH job
     `30022149863374855` on `am-release-css` transferred both roots and began
-    compilation at 17:09 UTC; result pending. Prior peer session 71871 timed
-    out before execution, so it supplies no post-fix test result.
+    compilation at 17:09 UTC. Cancelled via `rch cancel` after delayed Mail
+    41961 confirmed a duplicate; terminal 143, no test verdict from this run.
+    Prior peer session 71871 timed out before execution, also no test verdict.
+    Peer session 2151 finished at 17:11:53 UTC: fmt, all-target Clippy, one
+    focused foreign-schema test and all 144 matrix tests pass at `f7c2e727`.
+    PurpleBay inspected the retained receipt and matching terminal log:
+    `dependencies/facade-f7c2e727-tantivy-css-receipt.json` under the release-work
+    root below; log SHA256 `df9ba5638e3235786a11db36a0e5440659223215e9b0d36a31cd564c83ad7e9e`.
+    Counts are 2 + 54 + 24 + 42 + 22; two zero-test executables add no credit.
+    Receipt binds 1777 project files, 36 sibling files and emitted executables.
   - [ ] `hash,lexical-tantivy,quill`: the same focused tests.
-  - [ ] Complete remaining facade integration executables after focused success.
+    Peer session 74592 stopped at two Clippy errors in
+    `treasure_island_e2e.rs`; peer owns repair and rerun. Do not duplicate it.
+  - [x] Complete remaining Tantivy-only facade integration executables after
+    focused success (included in the 144 above).
   - [ ] Retain terminal result and artifact identity; report any failure without
     converting compilation, a filtered zero-test binary, or admission into a pass.
 - [x] Read retained x86 scalar-candidate receipt:
