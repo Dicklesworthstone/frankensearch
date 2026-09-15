@@ -269,11 +269,12 @@ check_installer_behavior() {
     echo "[installer][OK]   staged semantic provisioning failure preserves the destination path"
   fi
 
-  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" verify-staged "$success_executable" >/dev/null; then
-    echo "[installer][OK]   staged binary verification admits a runnable candidate"
-  else
-    echo "[installer][FAIL] staged binary verification rejected a runnable candidate"
+  # A runnable non-fsfs executable is not a valid release candidate.
+  if FSFS_INSTALL_CONTRACT_TEST=1 VERSION=v9.9.9 "$installer_shell" "$installer" verify-staged "$success_executable"; then
+    echo "[installer][FAIL] staged verification accepted a non-fsfs executable"
     FAILURES=$((FAILURES + 1))
+  else
+    echo "[installer][OK]   staged verification rejects a non-fsfs executable"
   fi
 
   if FSFS_INSTALL_CONTRACT_TEST=1 \
@@ -897,6 +898,63 @@ check_installer_rollback_e2e() {
   # An incumbent that works, reporting an older version.
   installer_write_stub "$dest/fsfs" "1.0.0"
   incumbent_digest=$(installer_file_digest "$dest/fsfs")
+
+  # Candidate identity is mandatory, including without --verify. A valid
+  # archive checksum does not prove that it contains the requested version.
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --lite --version v10.0.0 \
+    --artifact-url "$archive" --checksum "$digest" --dest "$dest" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"install.verify.version_mismatch"* ]] \
+    && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]]; then
+    echo "[installer][OK]   wrong-version archive preserves incumbent without --verify"
+  else
+    echo "[installer][FAIL] wrong-version archive status=$status output=$output"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # Fault injection affects only the filesystem operation being tested. The
+  # real installer must refuse a failed backup, and restore the real backup
+  # after a publication command has already damaged the destination.
+  local shim_dir="$work/io-faults" real_cp real_install fault
+  real_cp=$(command -v cp)
+  real_install=$(command -v install)
+  mkdir -p "$shim_dir"
+  cat >"$shim_dir/cp" <<'CP_FAULT'
+#!/usr/bin/env bash
+for target in "$@"; do :; done
+if [[ "${FSFS_IO_FAULT:-}" == backup && "$target" == *.incumbent ]]; then
+  exit 73
+fi
+exec "$FSFS_REAL_CP" "$@"
+CP_FAULT
+  cat >"$shim_dir/install" <<'INSTALL_FAULT'
+#!/usr/bin/env bash
+if [[ "${FSFS_IO_FAULT:-}" == publication && "$3" != *.incumbent ]]; then
+  printf 'partial publication\n' >"$4"
+  exit 73
+fi
+exec "$FSFS_REAL_INSTALL" "$@"
+INSTALL_FAULT
+  chmod 0755 "$shim_dir/cp" "$shim_dir/install"
+  for fault in backup publication; do
+    status=0
+    output=$(env NO_COLOR=1 "PATH=$shim_dir:$PATH" \
+      "FSFS_REAL_CP=$real_cp" "FSFS_REAL_INSTALL=$real_install" "FSFS_IO_FAULT=$fault" \
+      "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+      "$installer_shell" "$installer" --offline --lite --version v9.9.9 \
+      --artifact-url "$archive" --checksum "$digest" --dest "$dest" 2>&1) || status=$?
+    local expected_error="upgrade.apply.backup_failed"
+    [[ "$fault" != publication ]] || expected_error="upgrade.apply.rollback_triggered"
+    if [[ "$status" -ne 0 && "$output" == *"$expected_error"* ]] \
+      && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]] \
+      && "$dest/fsfs" version | grep -q '1\.0\.0'; then
+      echo "[installer][OK]   $fault failure preserves the working incumbent"
+    else
+      echo "[installer][FAIL] $fault failure status=$status output=$output"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
 
   # 1. Post-install validation fails only once the binary runs from the
   #    destination; the incumbent must come back.

@@ -285,10 +285,16 @@ classify_upgrade_path() {
 # incumbent is copied aside first and restored if that validation fails.
 back_up_incumbent() {
   local destination_binary="$1" backup_path="$2"
-  [ -f "$destination_binary" ] || return 0
-  cp -p "$destination_binary" "$backup_path" 2>/dev/null || {
-    warn "Could not stage a rollback copy of $destination_binary; a failed post-install check will not be able to restore it"
+  if [ ! -e "$destination_binary" ] && [ ! -L "$destination_binary" ]; then
     return 0
+  fi
+  if [ ! -f "$destination_binary" ]; then
+    err "upgrade.apply.backup_failed: $destination_binary is not a regular file; nothing was replaced"
+    return 1
+  fi
+  cp -p "$destination_binary" "$backup_path" || {
+    err "upgrade.apply.backup_failed: could not preserve $destination_binary; nothing was replaced"
+    return 1
   }
   info "Staged a rollback copy of the previous ${BINARY_NAME}"
 }
@@ -546,18 +552,19 @@ provision_default_semantic_models() {
 
 verify_staged_binary() {
   local staged_binary="$1" version_output=""
-
-  if version_output="$("$staged_binary" version 2>&1)" && [ -n "$version_output" ]; then
-    ok "Staged binary verification passed: $version_output"
-    return 0
+  if [ -z "$VERSION" ]; then
+    err "install.verify.version_mismatch: an expected version is required; nothing was replaced"
+    return 1
   fi
-
-  if version_output="$("$staged_binary" --version 2>&1)" && [ -n "$version_output" ]; then
-    ok "Staged binary verification passed (--version): $version_output"
-    return 0
+  if version_output="$("$staged_binary" version 2>&1)"; then
+    case "$version_output" in
+      "${BINARY_NAME} ${VERSION#v}"|"${BINARY_NAME} ${VERSION#v} (frankensearch ${VERSION#v})")
+        ok "Staged binary identity verified: $version_output"
+        return 0
+        ;;
+    esac
   fi
-
-  err "Staged binary failed version checks. The existing fsfs installation was not replaced."
+  err "install.verify.version_mismatch: candidate must report ${BINARY_NAME} ${VERSION#v}. The existing fsfs installation was not replaced."
   return 1
 }
 
@@ -1166,20 +1173,18 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
       exit 1
     fi
   fi
+  verify_staged_binary "$BIN" || exit 1
   if [ "$LITE" -eq 0 ]; then
     if ! provision_default_semantic_models "$BIN"; then
       exit 1
     fi
   fi
-  if [ "$VERIFY" -eq 1 ]; then
-    if ! verify_staged_binary "$BIN"; then
-      exit 1
-    fi
-  fi
-
   ROLLBACK_BACKUP="$TMP/${BINARY_NAME}.incumbent"
-  back_up_incumbent "$DEST/${BINARY_NAME}" "$ROLLBACK_BACKUP"
-  install_binary "$BIN" "$DEST/${BINARY_NAME}"
+  back_up_incumbent "$DEST/${BINARY_NAME}" "$ROLLBACK_BACKUP" || exit 1
+  if ! install_binary "$BIN" "$DEST/${BINARY_NAME}"; then
+    roll_back_incumbent "$ROLLBACK_BACKUP" "$DEST/${BINARY_NAME}" "binary publication failed" || true
+    exit 1
+  fi
   ok "Installed to $DEST/${BINARY_NAME} (source build)"
   maybe_add_path
   if [ "$VERIFY" -eq 1 ]; then
@@ -1266,21 +1271,19 @@ if [ ! -x "$BIN" ]; then
 fi
 [ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
 
+verify_staged_binary "$BIN" || exit 1
 if [ "$LITE" -eq 0 ]; then
   if ! provision_default_semantic_models "$BIN"; then
     exit 1
   fi
 fi
 
-if [ "$VERIFY" -eq 1 ]; then
-  if ! verify_staged_binary "$BIN"; then
-    exit 1
-  fi
-fi
-
 ROLLBACK_BACKUP="$TMP/${BINARY_NAME}.incumbent"
-back_up_incumbent "$DEST/${BINARY_NAME}" "$ROLLBACK_BACKUP"
-install_binary "$BIN" "$DEST/${BINARY_NAME}"
+back_up_incumbent "$DEST/${BINARY_NAME}" "$ROLLBACK_BACKUP" || exit 1
+if ! install_binary "$BIN" "$DEST/${BINARY_NAME}"; then
+  roll_back_incumbent "$ROLLBACK_BACKUP" "$DEST/${BINARY_NAME}" "binary publication failed" || true
+  exit 1
+fi
 ok "Installed to $DEST/${BINARY_NAME}"
 maybe_add_path
 
