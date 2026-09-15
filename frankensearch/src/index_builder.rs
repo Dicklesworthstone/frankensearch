@@ -2904,6 +2904,7 @@ mod tests {
             std::fs::create_dir(&lexical_path).unwrap();
             let template = TantivyIndex::in_memory().unwrap();
             let template_schema = template.index_handle().schema();
+            let tokenizers = template.index_handle().tokenizers().clone();
             let mut fields: Vec<_> = template_schema
                 .fields()
                 .map(|(_, entry)| entry.clone())
@@ -2918,7 +2919,8 @@ mod tests {
             }
             let schema = schema.build();
             let id = schema.get_field("id").unwrap();
-            let foreign = Index::create_in_dir(&lexical_path, schema).unwrap();
+            let mut foreign = Index::create_in_dir(&lexical_path, schema).unwrap();
+            foreign.set_tokenizers(tokenizers);
             let mut writer: IndexWriter = foreign.writer(50_000_000).unwrap();
             let mut document = TantivyDocument::default();
             document.add_text(id, "doc-retained");
