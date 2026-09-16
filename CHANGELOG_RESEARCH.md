@@ -1,5 +1,17 @@
 # Changelog research: fsfs 1.10.0 / FrankenSearch 0.5.0
 
+## September 16 supplement: actual ARM native qualification
+
+The native F32 limitation recorded on September 15 is superseded by actual
+ARM64 macOS execution of source `31acc37c68cfa3af987ebf64a257c3bd9b576e97`.
+The existing F32 certificate/batching/repeatability test and Int8 certificate
+test each pass once, with no failures or ignores. All 116 F32 checkpoints match
+the retained Linux x86 candidate. The changelog moves this result into Fixed,
+retains populated CASS acceptance as unresolved, and makes no release or
+performance claim. Commands, source and executable hashes, model barriers, and
+the original failed linker attempt are recorded in the September 16 entry of
+`docs/planning/UPGRADE_LOG.md` and its referenced release-work receipts.
+
 ## September 12 producer correction after registry publication
 
 `b62074148d7fd38029818e638aa31f7699dc93fd` corrects Potion's execution

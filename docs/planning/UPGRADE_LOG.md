@@ -1,5 +1,38 @@
 # Dependency Upgrade Log
 
+## 2026-09-16 — Native ARM F32 and Int8 qualification completed
+
+Source `31acc37c68cfa3af987ebf64a257c3bd9b576e97` now passes both existing
+native MiniLM certificate tests on actual ARM64 macOS. The F32 test executes
+its certificate, batching, and repeatability assertions; the Int8 certificate
+test passes separately. Each reports one passed test, zero failures, and zero
+ignored tests. All 116 retained F32 intermediate checkpoints match the previously
+qualified Linux x86 scalar candidate byte for byte. Neither certificate nor any
+numerical tolerance changed. Earlier failed ARM attempts below remain part of
+the history; they are superseded only for this qualified source and fixture.
+
+The executable was cross-compiled through normally admitted Linux RCH, using
+the genuine macOS 15.4 SDK, pinned nightly-2026-08-31, cargo-zigbuild 0.23.0,
+and a private checksum-verified Zig 0.15.2. Zig 0.14.1 reached final linking but
+failed because its SDK search paths were prefixed twice; that failed attempt
+is retained. The successful build preserves debug assertions and overflow
+checks. On the Mac, the exact ARM64 Mach-O hash and system-library dependencies
+were verified before execution; its existing code signature verifies. This is
+not a Developer ID signing or notarization claim.
+
+Retained evidence under `/data/release-work/frankensearch-release-20260912/`:
+
+- `darwin-sdk/native-build-receipt-zig0152.json`: source, compiler, and emitted
+  executable; SHA256 `f241dfec275a46c418626ddc3636a50c0bc33e9367ab8315ba2ee89eaf96f99d`.
+- `darwin-sdk/runtime-zig0152/receipt.json`: actual Mac commands and terminal
+  results, with executable and model hashes checked before and after.
+- `dependencies/native-arm-zig0152-trace-comparison.json`: all 116 checkpoint
+  comparisons, with no differing ordinals.
+
+This closes the ARM numerical qualification gap. Populated CASS consumer
+acceptance, the complete Quill audit, and the full release remain in progress.
+It establishes correctness, not an incumbent-relative performance improvement.
+
 ## 2026-09-12 — Stable dependency refresh (in progress)
 
 ### Follow-up qualification on September 13 (UTC)

@@ -9,13 +9,14 @@ Release history through [v1.10.0](https://github.com/Dicklesworthstone/frankense
 Scope window: the release reconstruction covers v1.9.1 → v1.10.0 and their 2026-09-08 publication records. The subsequent-change inventory covers Quill fixes, warm-daemon streaming, model-receipt reuse, executable acceptance, the GH #43/#46 indexing and loader work, and dependency qualification through 2026-09-13 (UTC). The 0.6.0 library family was published to crates.io on September 12; its plain git tag is not a GitHub Release, and the next fsfs binary release remains pending.
 
 A September 15 supplement covers installer profile switching, offline verification,
-and default-model provisioning.
+and default-model provisioning. September 16 qualification confirms the native
+F32 MiniLM repair on ARM64 macOS with the existing certificate unchanged.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased fsfs | Release preparation | 2026-09-09–15 | Progressive warm-daemon streaming, indexing cancellation and pressure checks, model reuse, doctor producer admission, and installer profile/offline fixes |
+| Unreleased fsfs | Release preparation | 2026-09-09–16 | Progressive warm-daemon streaming, indexing cancellation and pressure checks, model reuse, native MiniLM numerical fixes, doctor producer admission, and installer profile/offline fixes |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
 | [crates-v0.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0) | Library bundle | 2026-09-08 | All 13 publishable members and release evidence share v1.10.0 source; binary release retains latest routing |
@@ -98,10 +99,19 @@ identity repair below, also remain unreleased.
   registered producer certificate. The corrected vector implementation preserves
   the validated x86 arithmetic order. Real-model checks now produce identical
   final embeddings on both architectures, with the original certificate and
-  strict index admission retained. This fix remains unreleased; the separate
-  F32 profile and populated CASS consumer acceptance are still pending.
+  strict index admission retained. This fix remains unreleased; populated CASS
+  consumer acceptance is still pending.
   [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/8020489d55e9e8dba770db20098fb5cf523d0802);
   [paired qualification evidence](docs/planning/UPGRADE_LOG.md).
+
+- **Native F32 MiniLM now passes its existing certificate on ARM64 macOS ([#47](https://github.com/Dicklesworthstone/frankensearch/issues/47)).**
+  The scalar exponential repair preserves the validated arithmetic order across
+  x86 and ARM. Actual ARM execution passes the unchanged certificate, batching,
+  and repeatability assertions; all 116 retained intermediate checkpoints match
+  the Linux x86 candidate byte for byte. This establishes numerical correctness,
+  not a performance improvement or completed downstream integration.
+  [Scalar repair](https://github.com/Dicklesworthstone/frankensearch/commit/5953b314ffba14437fd5d5bf93d1f247f9fc7408);
+  [qualification record](docs/planning/UPGRADE_LOG.md).
 
 - **New Quill artifacts report the current engine version.** The 0.3.0 package had retained the 0.2.4 producer word in manifests, segment headers, and compaction identity inputs. The correction aligns that word with the crate version. The wire format is unchanged, and exact 0.2.4 and 0.2.3 manifest fixtures remain readable and byte-for-byte reproducible. This correction is not included in the September 12 crate archives. [Implementation and historical wire checks](https://github.com/Dicklesworthstone/frankensearch/commit/8738e50f888c49ceb69ba295b694355d662fede2).
 
@@ -136,7 +146,7 @@ identity repair below, also remain unreleased.
 
 ### Known limitations
 
-- **Native F32 MiniLM still awaits ARM64 qualification ([#47](https://github.com/Dicklesworthstone/frankensearch/issues/47)).** The Int8 correction above passes its unchanged certificate on both architectures. The separate F32 producer failed its ARM certificate before the subsequent scalar-exponential repair; that repair passes the existing x86 certificates but has not yet been qualified on ARM. Populated CASS native-consumer acceptance also remains pending. Standard full binaries use ONNX quality embeddings by default, and the native loader continues to reject mismatched numerical output. [Scalar repair](https://github.com/Dicklesworthstone/frankensearch/commit/5953b314ffba14437fd5d5bf93d1f247f9fc7408); [qualification record](docs/planning/UPGRADE_LOG.md).
+- **Populated CASS native-consumer acceptance remains pending ([#47](https://github.com/Dicklesworthstone/frankensearch/issues/47)).** The native F32 and Int8 certificate tests now pass on ARM64 macOS as well as Linux x86. Those producer checks do not establish the downstream CASS integration. Standard full binaries use ONNX quality embeddings by default, and the native loader continues to reject mismatched numerical output. [Qualification record](docs/planning/UPGRADE_LOG.md).
 
 ---
 
