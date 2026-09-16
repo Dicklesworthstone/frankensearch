@@ -39,10 +39,17 @@ F32 MiniLM repair on ARM64 macOS with the existing certificate unchanged.
 Changes on `main` after the 2026-09-08 publication. Library changes through
 [`dd093fb2`](https://github.com/Dicklesworthstone/frankensearch/commit/dd093fb230404ab08be2ed6f27776ed6c4796485)
 are included in the September 12 crate publication described below. fsfs CLI
-changes remain unreleased; fsfs is still 1.10.0. Gauntlet and release-checker
+changes remain unreleased; the published fsfs is still 1.10.0. Gauntlet and release-checker
 changes describe repository tooling, not published library capabilities.
 Library corrections after that publication, including the Potion dependency
 identity repair below, also remain unreleased.
+
+The release candidate advances fsfs to **1.11.0**, the facade to **0.6.1**,
+rerank to **0.4.1**, TUI and ops to **0.3.0**, and the other eight public
+component crates to **0.3.1**. Publication is pending. The embedder 0.3.1
+adapter changes stored producer identity again; rebuild older semantic indexes.
+Historical adapter identities remain rejected by strict admission, and the
+0.3.0 Quill manifest wire fixture remains reproducible alongside 0.2.4 and 0.2.3.
 
 ### Added
 

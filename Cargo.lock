@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "asupersync",
  "compact_str 0.10.0",
@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-durability"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "crc32fast",
  "criterion",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1818,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-fsfs"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "ahash",
  "asupersync",
@@ -1869,7 +1869,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-fusion"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "asupersync",
@@ -1893,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-index"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-lexical"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-ops"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "criterion",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-quill"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-rerank"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "asupersync",
  "bytemuck",
@@ -2045,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-storage"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "asupersync",
  "criterion",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-tui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "criterion",

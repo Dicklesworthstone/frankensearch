@@ -17514,12 +17514,12 @@ mod tests {
     fn empty_manifest_has_stable_wire_golden() -> TestResult {
         let manifest = Manifest::empty(1, 0x1122_3344_5566_7788, 0);
         let bytes = manifest.to_bytes()?;
-        // GOLDEN-CHANGE: the 0.3.0 package release advances producer metadata,
+        // GOLDEN-CHANGE: the 0.3.1 package release advances producer metadata,
         // not the wire format. Bytes 36..40 are `CURRENT_ENGINE_VERSION`
-        // (0.3.0 => `00 00 03 00`); the trailing CRC32 covers all prior bytes.
+        // (0.3.1 => `01 00 03 00`); the trailing CRC32 covers all prior bytes.
         let expected = hex_bytes(
             "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
-             00000300000000000000000000000000000000000000000060ef6eb6",
+             010003000000000000000000000000000000000000000000478a4b37",
         );
         assert_eq!(bytes, expected);
         assert_eq!(Manifest::from_bytes(&bytes)?, manifest);
@@ -17527,6 +17527,11 @@ mod tests {
         // Keep previous producers' exact wire images readable and writable;
         // only their engine-version word and the covering CRC differ.
         for (version, wire_hex) in [
+            (
+                pack_engine_version(0, 3, 0),
+                "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
+                 00000300000000000000000000000000000000000000000060ef6eb6",
+            ),
             (
                 pack_engine_version(0, 2, 4),
                 "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
