@@ -2385,9 +2385,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e8f5f200865b978bb4e81b2211da4bea559d058404fc3657c0c0b6d09c30219"
+checksum = "4339b6554fa751016e5bbd485d1199bf92f92b9b3b6c0c0895c02cd1b25890aa"
 dependencies = [
  "argon2",
  "asupersync",

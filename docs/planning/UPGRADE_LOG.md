@@ -16,17 +16,33 @@ checks do not exercise this repair path.
 
 The upstream owner reports passing four sparse-archive regressions with published
 core 0.4.0 and four sync/async consumer checks with facade 0.4.0 against the
-packaged pager fix (Agent Mail 42292). Our focused storage check and rebuilt
-artifact qualification are separate requirements and remain pending. An initial
+packaged pager fix (Agent Mail 42292). Our focused storage check passes all 351
+tests with no failures or ignores. Rebuilt release-artifact qualification remains
+pending. An initial
 RCH clean-overlay attempt stopped before compilation because it omitted the
 `fast_cmaes` sibling; the corrected attempt uses the established release layout
 with source and sibling hashes checked before and after execution.
+That attempt reached dependency compilation but hit RCH's 1,800-second limit
+before executing tests. Its log is retained as
+`dependencies/pager043-storage-validation.log` under the release work directory.
+The same source, lock, and target resumed with a 7,200-second limit and completed
+at 20:04:35 UTC on RCH worker `vmi1152480`. Source and sibling hashes matched
+before and after execution. The retained passing log is
+`dependencies/pager043-storage-validation-r2.log`, with receipt
+`pager043-storage-validation-receipt.json`. The lock SHA256 is
+`81dc8fcc785f1aebaf5e38aa0ab879cbf22a600dd384ae36a6dd6471105ca7ce`.
+The original timeout provides no storage-test verdict.
 
 The previous source `dc3ec1a4` completed all eleven ordinary quality stages and
 2,057 Quill tests across default and all-feature configurations. Its binaries
 still contain pager 0.4.0. Those receipts do not qualify the updated dependency.
-A separate upstream `db_size` investigation is being scoped before publication;
-the reported plan for a uniform 0.4.4 release is not yet a publication receipt.
+Upstream separately reproduced orphaned pages in savepoint/growth and composite
+UNIQUE-index churn tests at `00f2fb36c` (bd-u2kmg). The proposed `db_size` change
+failed both reproductions; its full savepoint target returned eight passes and
+one failure. Those results do not yet establish reproduction on this exact
+published 0.4.0/core plus 0.4.3/pager dependency graph. Publication remains held
+pending the corruption disposition and updated artifact qualification. The
+reported plan for a uniform 0.4.4 release is not a publication receipt.
 
 ## 2026-09-16 — Windows x86-64 ONNX producer qualification
 
