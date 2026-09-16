@@ -2579,7 +2579,9 @@ impl std::error::Error for PublicationLeaseBusy {}
 /// termination, the kernel releases it when the last descriptor closes, so
 /// there is no stale-lease recovery protocol. An inherited child lease cannot
 /// publish or release the creator's authority.
-/// Non-flock platforms fail closed rather than pretending exclusion.
+/// Windows uses the kernel byte-range lock behind [`std::fs::File::try_lock`],
+/// with no-delete-share handles retaining the root and lock identities. Other
+/// platforms fail closed rather than pretending exclusion.
 ///
 /// Holders must call [`Self::fence`] immediately before each publication
 /// boundary (bd-p6z6.3.1): the flock binds to an inode, not a pathname, so a
@@ -2588,16 +2590,72 @@ impl std::error::Error for PublicationLeaseBusy {}
 #[derive(Debug)]
 pub struct PublicationLease {
     lock_path: PathBuf,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     lock_file: std::fs::File,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     creator_pid: u32,
     #[cfg(unix)]
     lock_device: u64,
     #[cfg(unix)]
     lock_inode: u64,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     owner_record: String,
+    #[cfg(windows)]
+    root_identity: same_file::Handle,
+    #[cfg(windows)]
+    lock_identity: same_file::Handle,
+}
+
+#[cfg(windows)]
+fn open_windows_publication_handle(
+    path: &Path,
+    directory: bool,
+    create: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(!directory)
+        .create(create)
+        .truncate(false)
+        // Keep both the root and lock pathname stable while authority is held.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(
+            FILE_FLAG_OPEN_REPARSE_POINT
+                | if directory {
+                    FILE_FLAG_BACKUP_SEMANTICS
+                } else {
+                    0
+                },
+        )
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || if directory {
+            !metadata.is_dir()
+        } else {
+            !metadata.is_file()
+        }
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} must be a non-reparse {}",
+                path.display(),
+                if directory {
+                    "directory"
+                } else {
+                    "regular file"
+                }
+            ),
+        ));
+    }
+    Ok(file)
 }
 
 impl PublicationLease {
@@ -2682,12 +2740,71 @@ impl PublicationLease {
         Ok(lease)
     }
 
-    /// Non-Unix targets cannot provide flock exclusion semantics; fail closed.
+    /// Acquire Windows kernel exclusion and retain no-delete-share identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed busy refusal as Unix, or a filesystem error.
+    #[cfg(windows)]
+    pub fn acquire(index_root: &Path) -> frankensearch_core::SearchResult<Self> {
+        use std::fs::TryLockError;
+        use std::io::{Read, Seek, SeekFrom};
+
+        std::fs::create_dir_all(index_root)?;
+        let root_identity = same_file::Handle::from_file(open_windows_publication_handle(
+            index_root, true, false,
+        )?)?;
+        let lock_path = index_root.join(PUBLICATION_LOCK_FILE_NAME);
+        let mut lock_file = open_windows_publication_handle(&lock_path, false, true)?;
+        let lock_identity = same_file::Handle::from_file(lock_file.try_clone()?)?;
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                let mut recorded = String::new();
+                // Windows can deny reads of the locked range; PID is diagnostic,
+                // never the authority deciding whether a contender is admitted.
+                let owner_pid = lock_file
+                    .read_to_string(&mut recorded)
+                    .ok()
+                    .and_then(|_| recorded.split_whitespace().next()?.parse::<u32>().ok());
+                return Err(frankensearch_core::SearchError::SubsystemError {
+                    subsystem: "publication-lease",
+                    source: Box::new(PublicationLeaseBusy {
+                        lock_path,
+                        owner_pid,
+                    }),
+                });
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+        let mut lease = Self {
+            lock_path,
+            lock_file,
+            creator_pid: std::process::id(),
+            owner_record: format!(
+                "{} {}\n",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_secs())
+            ),
+            root_identity,
+            lock_identity,
+        };
+        lease.lock_file.set_len(0)?;
+        lease.lock_file.seek(SeekFrom::Start(0))?;
+        lease.lock_file.write_all(lease.owner_record.as_bytes())?;
+        lease.lock_file.sync_all()?;
+        lease.fence("publication-lease admission")?;
+        Ok(lease)
+    }
+
+    /// Targets without supported kernel exclusion fail closed.
     ///
     /// # Errors
     ///
     /// Always returns `SearchError::Io` with `ErrorKind::Unsupported`.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub fn acquire(index_root: &Path) -> frankensearch_core::SearchResult<Self> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -2769,13 +2886,66 @@ impl PublicationLease {
         Ok(())
     }
 
-    /// Non-Unix targets never construct a lease ([`Self::acquire`] fails
+    /// Recheck creator, no-follow pathname identities and the sealed record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a publication-lease error if authority changed, or an I/O error.
+    #[cfg(windows)]
+    pub fn fence(&self, boundary: &'static str) -> frankensearch_core::SearchResult<()> {
+        use std::os::windows::fs::FileExt;
+
+        let fenced = |detail: &str| frankensearch_core::SearchError::SubsystemError {
+            subsystem: "publication-lease",
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{boundary}: {detail} at {}", self.lock_path.display()),
+            )),
+        };
+        if self.creator_pid != std::process::id() {
+            return Err(fenced(
+                "publication lease belongs to another creator process",
+            ));
+        }
+        let root = self
+            .lock_path
+            .parent()
+            .ok_or_else(|| fenced("publication root is absent"))?;
+        let root_identity =
+            same_file::Handle::from_file(open_windows_publication_handle(root, true, false)?)?;
+        let lock_identity = same_file::Handle::from_file(open_windows_publication_handle(
+            &self.lock_path,
+            false,
+            false,
+        )?)?;
+        if root_identity != self.root_identity || lock_identity != self.lock_identity {
+            return Err(fenced("publication lock or root identity changed"));
+        }
+        let mut observed = vec![0; self.owner_record.len() + 1];
+        let mut offset = 0;
+        while offset < observed.len() {
+            let read = self
+                .lock_file
+                .seek_read(&mut observed[offset..], offset as u64)?;
+            if read == 0 {
+                break;
+            }
+            offset += read;
+        }
+        observed.truncate(offset);
+        if observed != self.owner_record.as_bytes() {
+            return Err(fenced("publication-lease owner record changed"));
+        }
+        Ok(())
+    }
+
+    /// Unsupported targets never construct a lease ([`Self::acquire`] fails
     /// closed), so fencing one fails closed for the same reason.
     ///
     /// # Errors
     ///
     /// Always returns `SearchError::Io` with `ErrorKind::Unsupported`.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub fn fence(&self, _boundary: &'static str) -> frankensearch_core::SearchResult<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -2796,6 +2966,13 @@ impl PublicationLease {
 
 impl Drop for PublicationLease {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.creator_pid == std::process::id() {
+            let _ = self.lock_file.set_len(0);
+            if let Err(error) = self.lock_file.unlock() {
+                warn!(%error, "publication lease explicit unlock failed; closing its handle");
+            }
+        }
         #[cfg(unix)]
         if self.creator_pid == std::process::id() {
             // Clear while still exclusive, then release the shared open file
@@ -2834,7 +3011,12 @@ mod tests {
                 let detail = source
                     .downcast_ref::<PublicationLeaseBusy>()
                     .expect("busy detail carries the typed refusal");
+                #[cfg(unix)]
                 assert_eq!(detail.owner_pid, Some(std::process::id()));
+                #[cfg(windows)]
+                if let Some(pid) = detail.owner_pid {
+                    assert_eq!(pid, std::process::id());
+                }
             }
             other => panic!("expected publication-lease busy error, got {other:?}"),
         }
@@ -2916,6 +3098,7 @@ mod tests {
             .expect("fence must pass while the lock inode and record are intact");
     }
 
+    #[cfg(unix)]
     #[test]
     fn publication_lease_fence_rejects_deleted_and_recreated_lock_file() {
         let root = tempfile::tempdir().expect("index root");
@@ -2947,6 +3130,7 @@ mod tests {
             .expect("second holder fences cleanly on its own inode");
     }
 
+    #[cfg(unix)]
     #[test]
     fn publication_lease_fence_rejects_tampered_owner_record() {
         let root = tempfile::tempdir().expect("index root");
@@ -2962,6 +3146,110 @@ mod tests {
             }
             other => panic!("expected publication-lease fence refusal, got {other:?}"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_lease_windows_kernel_prevents_replacement_and_record_write() {
+        let root = tempfile::tempdir().expect("parent");
+        let index = root.path().join("index");
+        let lease = PublicationLease::acquire(&index).expect("acquire");
+        let moved_lock = index.join("moved.lock");
+        std::fs::rename(lease.lock_path(), &moved_lock)
+            .expect_err("held no-delete-share lock cannot be replaced");
+        std::fs::rename(&index, root.path().join("moved-index"))
+            .expect_err("held root cannot be renamed");
+        let mut contender = OpenOptions::new()
+            .write(true)
+            .open(lease.lock_path())
+            .expect("open without truncation");
+        contender
+            .write_all(b"424242 7\n")
+            .expect_err("kernel byte-range lock rejects another handle's write");
+        drop(contender);
+        lease
+            .fence("after refused mutations")
+            .expect("authority and record intact");
+        let lock_path = lease.lock_path().to_path_buf();
+        drop(lease);
+        std::fs::rename(&lock_path, &moved_lock).expect("owner drop releases retained handles");
+        let next = PublicationLease::acquire(&index).expect("new lock can be admitted after drop");
+        next.fence("new owner").expect("new owner intact");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_lease_windows_excludes_real_child() {
+        const CHILD_ROOT: &str = "FSFS_TEST_PUBLICATION_LEASE_CHILD_ROOT";
+        const CHILD_PHASE: &str = "FSFS_TEST_PUBLICATION_LEASE_CHILD_PHASE";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            match std::env::var(CHILD_PHASE).expect("child phase").as_str() {
+                "busy" => {
+                    let error = PublicationLease::acquire(Path::new(&root))
+                        .expect_err("parent owns cross-process authority");
+                    match error {
+                        frankensearch_core::SearchError::SubsystemError { subsystem, source } => {
+                            assert_eq!(subsystem, "publication-lease");
+                            assert!(source.downcast_ref::<PublicationLeaseBusy>().is_some());
+                        }
+                        other => panic!("expected typed contention, got {other:?}"),
+                    }
+                }
+                "released" => {
+                    let lease = PublicationLease::acquire(Path::new(&root))
+                        .expect("parent released cross-process authority");
+                    lease
+                        .fence("child after release")
+                        .expect("child owns authority");
+                }
+                phase => panic!("unexpected child phase {phase}"),
+            }
+            return;
+        }
+        let root = tempfile::tempdir().expect("root");
+        let lease = PublicationLease::acquire(root.path()).expect("parent acquire");
+        let run_child = |phase| {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "lifecycle::tests::publication_lease_windows_excludes_real_child",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_ROOT, root.path())
+                    .env(CHILD_PHASE, phase)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("run real child");
+            let started = Instant::now();
+            while child.try_wait().expect("poll child").is_none() {
+                if started.elapsed() > Duration::from_secs(10) {
+                    child.kill().expect("terminate owned timed-out child");
+                    child.wait().expect("reap owned child");
+                    panic!("publication child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().expect("collect child output");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "child failed: stdout={stdout} stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "exact child test must execute once: {stdout}"
+            );
+        };
+        run_child("busy");
+        lease
+            .fence("after child refusal")
+            .expect("parent retained authority");
+        drop(lease);
+        run_child("released");
+        PublicationLease::acquire(root.path()).expect("release admits next owner");
     }
 
     // ── DaemonPhase ──

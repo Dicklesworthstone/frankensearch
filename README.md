@@ -72,6 +72,12 @@ Installer goals:
 - auto-configured model cache path
 - sane defaults for interactive usage
 
+The Windows x86-64 full archive requires the
+[Microsoft Visual C++ v14 x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
+Install the current supported x64 package if the required `MSVCP140` or
+`VCRUNTIME140` DLLs are missing. Keep the archive's `DirectML.dll` beside
+`fsfs.exe`; that runtime and its license are included in the archive.
+
 ## Cargo Install (Developer Path)
 
 `fsfs` currently builds from this workspace and uses the pinned nightly toolchain

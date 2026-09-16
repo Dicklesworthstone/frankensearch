@@ -125,6 +125,10 @@ tempfile = "3"
 ureq = { version = "3.4.1", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
+[target.'cfg(windows)'.dependencies]
+same-file = "1.0.6"
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 frankensearch = { path = "../../frankensearch", version = "0.6.1", default-features = false }
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)

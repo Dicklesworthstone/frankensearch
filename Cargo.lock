@@ -1854,6 +1854,7 @@ dependencies = [
  "pdf-extract",
  "proptest",
  "rustix 1.1.4",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1865,6 +1866,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
