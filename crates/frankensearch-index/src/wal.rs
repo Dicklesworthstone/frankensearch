@@ -933,6 +933,7 @@ fn quarantine_torn_wal_header(path: &Path, cause: SearchError) -> SearchResult<(
     let quarantine = stage_quarantine_path(path)?;
     fs::rename(path, &quarantine)?;
     drop(live);
+    #[cfg(unix)]
     crate::sync_parent_directory(path)?;
     warn!(
         path = %path.display(),
@@ -1280,6 +1281,7 @@ pub(crate) fn append_wal_batch(
             // file fsync alone does not guarantee the new sidecar survives a
             // crash on every filesystem, and a vanished sidecar silently
             // loses every acknowledged append.
+            #[cfg(unix)]
             crate::sync_parent_directory(wal_path)?;
         }
     }

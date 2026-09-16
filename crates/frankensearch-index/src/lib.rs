@@ -1441,6 +1441,7 @@ impl ValidatedFsviBytes {
                 ),
             ))
         })?;
+        #[cfg(unix)]
         sync_parent_directory(destination)?;
 
         after_main_sync()?;
@@ -1460,6 +1461,7 @@ impl ValidatedFsviBytes {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(SearchError::Io(error).into()),
         }
+        #[cfg(unix)]
         sync_parent_directory(&wal_path)?;
 
         before_final_reopen()?;
@@ -2231,6 +2233,7 @@ impl VectorIndex {
             path.disable_cleanup(true);
             return Err(SearchError::Io(error));
         }
+        #[cfg(unix)]
         sync_parent_directory(path)?;
 
         // The stale sidecar is already invalid (generation mismatch); remove
@@ -2245,6 +2248,7 @@ impl VectorIndex {
                  open() will reject it by generation"
             );
         } else {
+            #[cfg(unix)]
             sync_parent_directory(&wal_path)?;
         }
         Self::open(path)
@@ -3224,6 +3228,7 @@ impl VectorIndex {
 
             file.sync_all()?;
             fs::rename(&tmp_path, &self.path)?;
+            #[cfg(unix)]
             sync_parent_directory(&self.path)?;
             remove_durability_sidecar(&self.path);
             Ok(())
@@ -3684,6 +3689,7 @@ impl VectorIndex {
             // Durable removal needs the dirent update persisted: without the
             // parent sync a crash can resurrect the removed sidecar, whose
             // stale entries would replay over the post-delete state.
+            #[cfg(unix)]
             sync_parent_directory(&wal_path)?;
             return Ok(());
         }
@@ -3706,11 +3712,17 @@ impl VectorIndex {
         }
 
         match fs::rename(&tmp_path, &wal_path) {
-            Ok(()) => sync_parent_directory(&wal_path),
+            Ok(()) => {
+                #[cfg(unix)]
+                sync_parent_directory(&wal_path)?;
+                Ok(())
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 wal::remove_wal(&wal_path)?;
                 fs::rename(&tmp_path, &wal_path)?;
-                sync_parent_directory(&wal_path)
+                #[cfg(unix)]
+                sync_parent_directory(&wal_path)?;
+                Ok(())
             }
             Err(error) => {
                 let _ = wal::remove_wal(&tmp_path);
@@ -4229,6 +4241,7 @@ impl VectorIndexWriter {
                 }
             }
             fs::rename(&tmp_path, &self.path)?;
+            #[cfg(unix)]
             sync_parent_directory(&self.path)?;
             remove_durability_sidecar(&self.path);
             Ok(())
@@ -6270,17 +6283,11 @@ fn temporary_output_path(path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+#[cfg(unix)]
 pub(crate) fn sync_parent_directory(path: &Path) -> SearchResult<()> {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = path.parent() {
-            let dir = File::open(parent)?;
-            dir.sync_all()?;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
+    if let Some(parent) = path.parent() {
+        let dir = File::open(parent)?;
+        dir.sync_all()?;
     }
     Ok(())
 }

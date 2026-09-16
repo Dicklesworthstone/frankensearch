@@ -2435,6 +2435,7 @@ impl NativeHnsw {
                 ),
             ))
         })?;
+        #[cfg(unix)]
         sync_parent_directory(path)?;
         Ok(metadata)
     }
@@ -3537,7 +3538,9 @@ fn persist_native_hnsw_receipt(path: &Path, bytes: &[u8]) -> SearchResult<()> {
             ),
         ))
     })?;
-    sync_parent_directory(path)
+    #[cfg(unix)]
+    sync_parent_directory(path)?;
+    Ok(())
 }
 
 fn reject_non_regular_receipt_destination(path: &Path) -> SearchResult<()> {
@@ -3800,19 +3803,12 @@ fn ensure_same_open_file(
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> SearchResult<()> {
-    #[cfg(unix)]
-    {
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(SearchError::Io)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(SearchError::Io)
 }
 
 #[cfg(test)]

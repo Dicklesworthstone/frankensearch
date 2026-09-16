@@ -1068,7 +1068,7 @@ pub enum KeeperError {
         path: PathBuf,
         /// Generic durability-layer diagnosis.
         #[source]
-        source: SearchError,
+        source: Box<SearchError>,
     },
     /// A filesystem operation failed with path and operation context.
     #[error("keeper {operation} failed at {path}: {source}")]
@@ -5372,6 +5372,7 @@ impl KeeperWriter {
             let _guard = guard;
             admission.ensure_directory_identity()?;
             recover_writer_directory(&admission, schema, &protection)?;
+            #[cfg(not(windows))]
             sync_directory(&admission.directory)?;
             admission.ensure_directory_identity()
         })
@@ -7697,10 +7698,12 @@ fn reconcile_published_segment(
             path: published.clone(),
             source,
         })?;
+    #[cfg(not(windows))]
     sync_directory(&admission.directory)?;
     #[cfg(feature = "durability")]
     if let WriterProtection::Enabled { protector, .. } = protection {
         ensure_matching_durability_sidecar(admission, protector, &published, &actual)?;
+        #[cfg(not(windows))]
         sync_directory(&admission.directory)?;
     }
     #[cfg(not(feature = "durability"))]
@@ -7759,10 +7762,12 @@ fn reconcile_encoded_segment(
             path: published.clone(),
             source,
         })?;
+    #[cfg(not(windows))]
     sync_directory(&admission.directory)?;
     #[cfg(feature = "durability")]
     if let WriterProtection::Enabled { protector, .. } = protection {
         ensure_matching_durability_sidecar(admission, protector, &published, &actual)?;
+        #[cfg(not(windows))]
         sync_directory(&admission.directory)?;
     }
     #[cfg(not(feature = "durability"))]
@@ -9102,7 +9107,7 @@ fn recover_manifest_bytes(
         .map_err(|source_error| KeeperError::Durability {
             operation: "recover MANIFEST bytes",
             path: source.to_path_buf(),
-            source: source_error,
+            source: Box::new(source_error),
         })? {
         FileRecoveryOutcome::Recovered { bytes, .. } => {
             let witness = FileSourceWitness::from_bytes(&bytes);
@@ -9111,7 +9116,7 @@ fn recover_manifest_bytes(
                 .map_err(|source_error| KeeperError::Durability {
                     operation: "validate staged MANIFEST repair witness",
                     path: sidecar.clone(),
-                    source: source_error,
+                    source: Box::new(source_error),
                 })?
             {
                 return Err(KeeperError::Io {
@@ -9305,7 +9310,7 @@ fn recover_durable_segment(
             return Err(KeeperError::Durability {
                 operation: "recover segment bytes",
                 path,
-                source,
+                source: Box::new(source),
             });
         }
         Err(_) => {
@@ -9321,7 +9326,7 @@ fn recover_durable_segment(
             return Err(KeeperError::Durability {
                 operation: "validate staged segment repair witness",
                 path: sidecar,
-                source,
+                source: Box::new(source),
             });
         }
         Err(_) => false,
@@ -9600,14 +9605,14 @@ fn ensure_matching_durability_sidecar(
         .map_err(|source_error| KeeperError::Durability {
             operation: "regenerate durability sidecar",
             path: source.to_path_buf(),
-            source: source_error,
+            source: Box::new(source_error),
         })?;
     if !protector
         .sidecar_matches_witness(&sidecar, witness)
         .map_err(|source_error| KeeperError::Durability {
             operation: "verify regenerated durability sidecar",
             path: sidecar.clone(),
-            source: source_error,
+            source: Box::new(source_error),
         })?
     {
         return Err(KeeperError::Io {
@@ -10342,6 +10347,7 @@ fn install_recovered_bytes_portable(
             ),
         });
     }
+    #[cfg(unix)]
     sync_directory_best_effort(&admission.directory).map_err(|source| KeeperError::Io {
         operation: "fsync recovered-byte install directory",
         path: admission.directory.clone(),
@@ -10402,21 +10408,11 @@ fn create_probed_file(
     })
 }
 
-/// fsync a directory where the platform supports it (unix). On targets
-/// without directory fsync this is a documented no-op: every file-level
-/// fsync in the choreography already landed before the final link.
-#[cfg(feature = "durability")]
+/// fsync a directory on Unix after every file-level fsync has landed.
+#[cfg(all(feature = "durability", unix))]
 #[allow(dead_code)] // called only on Tier-2 targets and by host tests
 fn sync_directory_best_effort(directory: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(directory)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = directory;
-        Ok(())
-    }
+    File::open(directory)?.sync_all()
 }
 
 fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -11024,7 +11020,7 @@ fn validate_proposed_manifest_segments(
                 KeeperError::Durability {
                     operation: "preflight durable segment sidecar",
                     path: path.clone(),
-                    source,
+                    source: Box::new(source),
                 }
             })?;
             if !verification.healthy {
@@ -12407,7 +12403,9 @@ fn write_segment_retirement_receipts(
             },
         )?;
     }
-    sync_directory(directory)
+    #[cfg(not(windows))]
+    sync_directory(directory)?;
+    Ok(())
 }
 
 /// Install one receipt atomically, leaving the caller to fsync the directory.
@@ -12519,7 +12517,7 @@ where
                 .map_err(|source| KeeperError::Durability {
                     operation: "protect published segment",
                     path: published.to_path_buf(),
-                    source,
+                    source: Box::new(source),
                 })?;
             Ok(Some(result.sidecar_path))
         },
@@ -12600,6 +12598,7 @@ where
         source,
     })?;
     observe(SegmentPublishCheckpoint::SegmentRenamed, &published)?;
+    #[cfg(not(windows))]
     sync_directory(&directory)?;
     observe(SegmentPublishCheckpoint::DirectorySynced, &directory)?;
     if let Some(sidecar) = after_directory_sync(&pending, &published)? {
@@ -13868,7 +13867,7 @@ where
                 .map_err(|source| KeeperError::Durability {
                     operation: "protect temp MANIFEST",
                     path: temp_path,
-                    source,
+                    source: Box::new(source),
                 })?;
             prepare_manifest_sidecar_rotation(directory, rename_current, generation, protector)
         },
@@ -14008,6 +14007,7 @@ where
     })?;
     observe(PublishCheckpoint::TempMovedToCurrent, &current_path)?;
     before_directory_sync(&directory, &current_path)?;
+    #[cfg(not(windows))]
     sync_directory(&directory)?;
     observe(PublishCheckpoint::DirectorySynced, &directory)?;
 
@@ -14037,9 +14037,12 @@ fn prepare_manifest_sidecar_rotation(
         changed = retire_manifest_sidecar(directory, &current, &retired)? || changed;
     }
 
+    #[cfg(not(windows))]
     if changed {
         sync_directory(directory)?;
     }
+    #[cfg(windows)]
+    let _ = changed;
     if rename_current {
         let current_manifest = directory.join("MANIFEST");
         let current_bytes = std::fs::read(&current_manifest).map_err(|source| KeeperError::Io {
@@ -14055,9 +14058,13 @@ fn prepare_manifest_sidecar_rotation(
         if current_exists && !sidecar_matches {
             let retired =
                 directory.join(format!(".tmp-manifest-current-fec-{proposed_generation}"));
-            if retire_manifest_sidecar(directory, &current, &retired)? {
+            let retired = retire_manifest_sidecar(directory, &current, &retired)?;
+            #[cfg(not(windows))]
+            if retired {
                 sync_directory(directory)?;
             }
+            #[cfg(windows)]
+            let _ = retired;
         }
         if !sidecar_matches {
             protector
@@ -14065,7 +14072,7 @@ fn prepare_manifest_sidecar_rotation(
                 .map_err(|source| KeeperError::Durability {
                     operation: "protect prior MANIFEST before sidecar rotation",
                     path: current_manifest,
-                    source,
+                    source: Box::new(source),
                 })?;
         }
     }
@@ -14079,6 +14086,8 @@ fn complete_manifest_sidecar_rotation(
     previous_path: &Path,
     _: u64,
 ) -> Result<(), KeeperError> {
+    #[cfg(windows)]
+    let _ = directory;
     let current_sidecar = FileProtector::sidecar_path(current_path);
     if !regular_sidecar_exists(&current_sidecar)? {
         return Ok(());
@@ -14092,7 +14101,9 @@ fn complete_manifest_sidecar_rotation(
             source,
         }
     })?;
-    sync_directory(directory)
+    #[cfg(not(windows))]
+    sync_directory(directory)?;
+    Ok(())
 }
 
 #[cfg(feature = "durability")]
@@ -15117,6 +15128,8 @@ fn ensure_atomic_publish_supported(directory: &Path) -> Result<(), KeeperError> 
     })
 }
 
+// Windows publication renames use `atomicwrites` with MOVEFILE_WRITE_THROUGH;
+// callers omit the separate directory fsync there.
 #[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<(), KeeperError> {
     File::open(directory)
@@ -15126,13 +15139,6 @@ fn sync_directory(directory: &Path) -> Result<(), KeeperError> {
             path: directory.to_path_buf(),
             source,
         })
-}
-
-#[cfg(windows)]
-fn sync_directory(_: &Path) -> Result<(), KeeperError> {
-    // Every Windows rename in the publication choreography goes through
-    // `atomicwrites`, whose MoveFileExW call includes MOVEFILE_WRITE_THROUGH.
-    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -15967,6 +15973,7 @@ pub fn publish_current(
                 source,
             }
         })?;
+        #[cfg(not(windows))]
         sync_directory(lexical_root).map_err(|source| CurrentPointerError::Io {
             operation: "fsync CURRENT directory",
             path: lexical_root.to_path_buf(),
@@ -18413,13 +18420,24 @@ mod tests {
         std::fs::write(&pending_path, &mutated)?;
         assert_eq!(std::fs::metadata(&pending_path)?.len(), pending.file_len());
 
+        let error = publish_pending_segment_durable(pending, &protector)
+            .expect_err("changed segment bytes must fail durable publication");
         assert!(matches!(
-            publish_pending_segment_durable(pending, &protector),
-            Err(KeeperError::Durability {
+            &error,
+            KeeperError::Durability {
                 operation: "protect published segment",
                 ..
-            })
+            }
         ));
+        let source = std::error::Error::source(&error).expect("typed durability source");
+        assert!(source.downcast_ref::<Box<SearchError>>().is_some());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "keeper durability protect published segment failed at {}: {source}",
+                published.display()
+            )
+        );
         assert!(!pending_path.exists());
         assert_eq!(std::fs::read(&published)?, mutated);
         assert!(!sidecar.exists());
@@ -21259,6 +21277,7 @@ mod tests {
                     File::open(&temp_manifest)?.sync_all()?;
                 }
             }
+            #[cfg(not(windows))]
             if case_index == 3 {
                 sync_directory(directory.path())?;
             }
@@ -21737,6 +21756,7 @@ mod tests {
 
         write_manifest(&current_path, &durable_test_manifest(2, Vec::new()))?;
         File::open(&current_path)?.sync_all()?;
+        #[cfg(not(windows))]
         sync_directory(directory.path())?;
         let recovered = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
         assert_eq!(recovered.loaded_manifest().source, ManifestSource::Current);

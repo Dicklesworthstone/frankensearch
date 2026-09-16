@@ -2252,7 +2252,7 @@ pub mod authority_publisher {
 
             // From here on, every failure is CommitOutcomeUnknown: the attempt
             // frame is the durable witness that a slot byte may follow.
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             if platform::crash_point(platform::TestBoundary::BeforePublishAttemptFrame).is_err() {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
@@ -2261,13 +2261,13 @@ pub mod authority_publisher {
             {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             if platform::crash_point(platform::TestBoundary::AfterPublishAttemptFrame).is_err() {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
 
             permit.stage = AttemptStageV1::SlotWrite;
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             if platform::crash_point(platform::TestBoundary::BeforePublishSlotWrite).is_err() {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
@@ -2280,13 +2280,13 @@ pub mod authority_publisher {
             {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             if platform::crash_point(platform::TestBoundary::AfterPublishSlotWrite).is_err() {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
 
             permit.stage = AttemptStageV1::SlotReread;
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             if platform::crash_point(platform::TestBoundary::BeforePublishSlotReread).is_err() {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
@@ -2304,7 +2304,7 @@ pub mod authority_publisher {
             }
 
             permit.stage = AttemptStageV1::FloorAdvance;
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             if platform::crash_point(platform::TestBoundary::BeforePublishFloorAdvance).is_err() {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
@@ -2320,13 +2320,13 @@ pub mod authority_publisher {
                     }
                 }
             };
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             if platform::crash_point(platform::TestBoundary::AfterPublishFloorAdvance).is_err() {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
 
             permit.stage = AttemptStageV1::OwnerFrame;
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             if platform::crash_point(platform::TestBoundary::BeforePublishOwnerFrame).is_err() {
                 return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
             }
@@ -11561,11 +11561,26 @@ mod platform {
     use std::path::Path;
 
     #[derive(Clone)]
-    pub(super) enum RelativePath {}
-    pub(super) enum RootHandle {}
-    pub(super) enum FileHandle {}
-    pub(super) enum ControlHandle {}
-    pub(super) enum LockHandle {}
+    pub(super) struct RelativePath {
+        component_count: usize,
+    }
+    pub(super) struct RootHandle {
+        witness: GenerationRootObjectWitness,
+    }
+    pub(super) struct FileHandle {
+        _private: (),
+    }
+    pub(super) struct ControlHandle {
+        witness: GenerationRootObjectWitness,
+        bytes: std::sync::Arc<[u8]>,
+        sha256: [u8; 32],
+    }
+    pub(super) struct LockHandle {
+        witness: GenerationRootObjectWitness,
+        bytes: std::sync::Arc<[u8]>,
+        sha256: [u8; 32],
+        mode: GenerationRootLockMode,
+    }
 
     pub(super) struct AnchorImage {
         pub(super) bytes: std::sync::Arc<[u8]>,
@@ -11592,7 +11607,7 @@ mod platform {
     }
 
     pub(super) const fn relative_component_count(path: &RelativePath) -> usize {
-        match *path {}
+        path.component_count
     }
 
     pub(super) fn admit_root(_path: &Path) -> GenerationRootResult<RootHandle> {
@@ -11600,68 +11615,68 @@ mod platform {
     }
 
     pub(super) const fn root_witness(root: &RootHandle) -> GenerationRootObjectWitness {
-        match *root {}
+        root.witness
     }
 
-    pub(super) fn revalidate_root(root: &RootHandle) -> GenerationRootResult<()> {
-        match *root {}
+    pub(super) fn revalidate_root(_root: &RootHandle) -> GenerationRootResult<()> {
+        unsupported()
     }
 
     pub(super) fn admit_file(
-        root: &RootHandle,
+        _root: &RootHandle,
         _path: &RelativePath,
         _expectation: GenerationFileExpectation,
     ) -> GenerationRootResult<FileAdmission> {
-        match *root {}
+        unsupported()
     }
 
-    pub(super) fn sync_root_directory(root: &RootHandle) -> GenerationRootResult<()> {
-        match *root {}
+    pub(super) fn sync_root_directory(_root: &RootHandle) -> GenerationRootResult<()> {
+        unsupported()
     }
 
-    pub(super) fn inventory(root: &RootHandle) -> GenerationRootResult<Vec<GenerationRootEntry>> {
-        match *root {}
+    pub(super) fn inventory(_root: &RootHandle) -> GenerationRootResult<Vec<GenerationRootEntry>> {
+        unsupported()
     }
 
     pub(super) fn sync_file(
-        file: &FileHandle,
+        _file: &FileHandle,
         _expected: GenerationRootObjectWitness,
     ) -> GenerationRootResult<()> {
-        match *file {}
+        unsupported()
     }
 
     pub(super) fn admit_control_file(
-        root: &RootHandle,
+        _root: &RootHandle,
         _path: &RelativePath,
         _expectation: GenerationFileExpectation,
     ) -> GenerationRootResult<ControlHandle> {
-        match *root {}
+        unsupported()
     }
 
     pub(super) const fn control_witness(control: &ControlHandle) -> GenerationRootObjectWitness {
-        match *control {}
+        control.witness
     }
 
     pub(super) fn control_bytes(control: &ControlHandle) -> std::sync::Arc<[u8]> {
-        match *control {}
+        std::sync::Arc::clone(&control.bytes)
     }
 
     pub(super) const fn control_sha256(control: &ControlHandle) -> [u8; 32] {
-        match *control {}
+        control.sha256
     }
 
     pub(super) fn revalidate_anchor_set(
-        root: &RootHandle,
+        _root: &RootHandle,
         _lock: &ControlHandle,
         _authority: &ControlHandle,
     ) -> GenerationRootResult<()> {
-        match *root {}
+        unsupported()
     }
 
     pub(super) fn capture_anchor_image(
-        control: &ControlHandle,
+        _control: &ControlHandle,
     ) -> GenerationRootResult<AnchorImage> {
-        match *control {}
+        unsupported()
     }
 
     pub(super) fn anchor_images_match(left: &AnchorImage, right: &AnchorImage) -> bool {
@@ -11669,73 +11684,80 @@ mod platform {
     }
 
     pub(super) fn validate_anchor_image(
-        control: &ControlHandle,
+        _control: &ControlHandle,
         _expected: &AnchorImage,
     ) -> GenerationRootResult<()> {
-        match *control {}
+        unsupported()
     }
 
     pub(super) fn try_anchor_lock(
-        control: &ControlHandle,
+        _control: &ControlHandle,
         _mode: GenerationRootLockMode,
     ) -> GenerationRootResult<LockHandle> {
-        match *control {}
+        unsupported()
     }
 
     pub(super) fn try_lock(
-        control: &ControlHandle,
+        _control: &ControlHandle,
         _mode: GenerationRootLockMode,
     ) -> GenerationRootResult<LockHandle> {
-        match *control {}
+        unsupported()
     }
 
     pub(super) const fn lock_witness(lock: &LockHandle) -> GenerationRootObjectWitness {
-        match *lock {}
+        lock.witness
     }
 
     pub(super) fn lock_bytes(lock: &LockHandle) -> std::sync::Arc<[u8]> {
-        match *lock {}
+        std::sync::Arc::clone(&lock.bytes)
     }
 
     pub(super) const fn lock_sha256(lock: &LockHandle) -> [u8; 32] {
-        match *lock {}
+        lock.sha256
     }
 
     pub(super) const fn lock_mode(lock: &LockHandle) -> GenerationRootLockMode {
-        match *lock {}
+        lock.mode
     }
 
     pub(super) fn unlock(lock: LockHandle) -> GenerationRootResult<()> {
-        match lock {}
+        drop(lock.bytes);
+        unsupported()
     }
 
-    pub(super) fn sync_lock_file(lock: &LockHandle) -> GenerationRootResult<()> {
-        match *lock {}
+    pub(super) fn sync_lock_file(_lock: &LockHandle) -> GenerationRootResult<()> {
+        unsupported()
     }
 
     // The authority publisher is platform-independent code, so the fallback
     // module must carry every entry point it names, not only the ones the
     // root-admission path uses. Each is unreachable — a `RootHandle` can only
     // come from `admit_root`, which fails closed with `UnsupportedPlatform` —
-    // and the uninhabited handle types prove it to the compiler.
+    // and all handle fields are private to this module. The inhabited layouts
+    // keep borrowed accessors valid without manufacturing an admitted handle.
     pub(super) fn write_control_range(
-        control: &ControlHandle,
+        _control: &ControlHandle,
         _offset: u64,
         _bytes: &[u8],
     ) -> GenerationRootResult<()> {
-        match *control {}
+        unsupported()
     }
 
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "Matches the native mutable lock contract; unsupported platforms never admit a lock"
+    )]
     pub(super) fn write_lock_range(
         lock: &mut LockHandle,
         _offset: u64,
         _bytes: &[u8],
     ) -> GenerationRootResult<()> {
-        match *lock {}
+        let _ = lock;
+        unsupported()
     }
 
-    pub(super) fn read_lock_image(lock: &LockHandle) -> GenerationRootResult<Vec<u8>> {
-        match *lock {}
+    pub(super) fn read_lock_image(_lock: &LockHandle) -> GenerationRootResult<Vec<u8>> {
+        unsupported()
     }
 }
 

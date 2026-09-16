@@ -20024,10 +20024,12 @@ impl FtuiSession {
     }
 }
 
-// ftui-tty has no non-Unix backend. An uninhabited session makes successful
-// entry impossible, so callers use their existing ANSI rendering path.
+// ftui-tty has no non-Unix backend. Entry always refuses, so callers use
+// their existing ANSI rendering path; the private layout keeps references valid.
 #[cfg(not(unix))]
-enum FtuiSession {}
+struct FtuiSession {
+    error_kind: std::io::ErrorKind,
+}
 
 #[cfg(not(unix))]
 impl FtuiSession {
@@ -20041,12 +20043,24 @@ impl FtuiSession {
         })
     }
 
-    fn render(&mut self, _renderer: impl FnOnce(&mut Frame)) -> SearchResult<()> {
-        match *self {}
+    fn render(&self, _renderer: impl FnOnce(&mut Frame)) -> SearchResult<()> {
+        Err(SearchError::SubsystemError {
+            subsystem: "fsfs.tui.ftui",
+            source: Box::new(std::io::Error::new(
+                self.error_kind,
+                "the native terminal backend is only available on Unix",
+            )),
+        })
     }
 
-    fn poll_event(&mut self, _timeout: Duration) -> SearchResult<Option<Event>> {
-        match *self {}
+    fn poll_event(&self, _timeout: Duration) -> SearchResult<Option<Event>> {
+        Err(SearchError::SubsystemError {
+            subsystem: "fsfs.tui.ftui",
+            source: Box::new(std::io::Error::new(
+                self.error_kind,
+                "the native terminal backend is only available on Unix",
+            )),
+        })
     }
 }
 

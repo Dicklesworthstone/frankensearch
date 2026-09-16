@@ -132,6 +132,7 @@ fn map_immutable(file: &File) -> io::Result<Mmap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::Read;
 
     #[cfg(unix)]

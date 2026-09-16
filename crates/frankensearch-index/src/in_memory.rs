@@ -29,7 +29,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU64;
@@ -1832,6 +1834,7 @@ impl InMemoryVectorIndex {
     ///
     /// Returns source-vector decoding errors. Optional sidecar failures are
     /// deliberately contained as flat-scan fallback.
+    #[cfg(target_os = "linux")]
     pub fn from_admitted_v2_with_residual_sidecar_cache(
         source: &ValidatedFsviBytes,
         cache_dir: &Path,
@@ -2089,12 +2092,17 @@ impl InMemoryVectorIndex {
         Ok(Some(candidates))
     }
 
+    /// Load the admitted vectors without the Linux-only residual sidecar cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns source-vector decoding errors.
     #[cfg(not(target_os = "linux"))]
-    fn exact_residual_sidecar_cache_candidates(
-        &self,
+    pub fn from_admitted_v2_with_residual_sidecar_cache(
+        source: &ValidatedFsviBytes,
         _cache_dir: &Path,
-    ) -> SearchResult<Option<Vec<PathBuf>>> {
-        Ok(None)
+    ) -> SearchResult<Self> {
+        Self::from_admitted_v2(source)
     }
 
     /// Shared load path: read every live row (and any WAL tail) of an opened

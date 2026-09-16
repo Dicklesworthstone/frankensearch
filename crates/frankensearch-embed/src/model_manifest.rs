@@ -4,7 +4,9 @@
 //! it performs filesystem and hashing work only, and leaves transport/network
 //! to higher-level download orchestration.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
@@ -3227,7 +3229,9 @@ fn write_verification_marker_atomic(
     temporary
         .persist(model_dir.join(VERIFIED_MARKER_FILE))
         .map_err(|error| SearchError::from(error.error))?;
-    sync_directory(model_dir)
+    #[cfg(unix)]
+    sync_directory(model_dir)?;
+    Ok(())
 }
 
 fn capture_manifest_file_states_from_names<'a>(
@@ -3331,20 +3335,28 @@ fn sync_registered_artifacts<'a>(
     staged_dir: &Path,
     relative_paths: impl IntoIterator<Item = &'a str>,
 ) -> SearchResult<()> {
+    #[cfg(unix)]
     let mut parent_dirs = BTreeSet::<PathBuf>::new();
     for relative_path in relative_paths {
         let artifact_path = resolve_model_file_path(staged_dir, relative_path)?;
         File::open(&artifact_path)
             .and_then(|file| file.sync_all())
             .map_err(SearchError::from)?;
+        #[cfg(unix)]
         if let Some(parent) = artifact_path.parent() {
             parent_dirs.insert(parent.to_path_buf());
         }
     }
-    for parent in &parent_dirs {
-        sync_directory(parent)?;
+    // Windows has no portable directory fsync through std. Registered files
+    // still receive sync_all before their atomic publication on every platform.
+    #[cfg(unix)]
+    {
+        for parent in &parent_dirs {
+            sync_directory(parent)?;
+        }
+        sync_directory(staged_dir)?;
     }
-    sync_directory(staged_dir)
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3352,13 +3364,6 @@ fn sync_directory(path: &Path) -> SearchResult<()> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(SearchError::from)
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> SearchResult<()> {
-    // Windows does not expose a portable directory fsync through std. Every
-    // registered file is still synced before the atomic rename.
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3434,13 +3439,15 @@ fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult
         destination_parent.join(format!(".{stage_name}.installing.{timestamp}.{pid}"));
     fs::rename(staged_dir, &stage_target).map_err(SearchError::from)?;
     publication_boundary(PublicationBoundary::InstallingParentSync)?;
+    #[cfg(unix)]
     sync_directory(destination_parent)?;
 
     let backup_path = if destination_dir.exists() {
         let backup = destination_parent.join(format!("{stage_name}.backup.{timestamp}.{pid}"));
         fs::rename(destination_dir, &backup).map_err(SearchError::from)?;
-        let backup_sync = publication_boundary(PublicationBoundary::BackupParentSync)
-            .and_then(|()| sync_directory(destination_parent));
+        let backup_sync = publication_boundary(PublicationBoundary::BackupParentSync);
+        #[cfg(unix)]
+        let backup_sync = backup_sync.and_then(|()| sync_directory(destination_parent));
         if let Err(sync_error) = backup_sync {
             if let Err(rollback_error) = fs::rename(&backup, destination_dir) {
                 tracing::error!(
@@ -3448,6 +3455,7 @@ fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult
                     "model backup sync failed and the prior generation remains in its backup"
                 );
             } else {
+                #[cfg(unix)]
                 let _ = sync_directory(destination_parent);
             }
             return Err(sync_error);
@@ -3468,10 +3476,12 @@ fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult
                 "model publication failed and prior generation remains in its backup"
             );
         }
+        #[cfg(unix)]
         let _ = sync_directory(destination_parent);
         return Err(publish_error);
     }
     publication_boundary(PublicationBoundary::PublishedParentSync)?;
+    #[cfg(unix)]
     sync_directory(destination_parent)?;
     Ok(backup_path)
 }

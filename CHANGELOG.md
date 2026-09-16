@@ -88,6 +88,10 @@ Historical adapter identities remain rejected by strict admission, and the
 - **Windows builds no longer import the Unix-only native terminal backend.**
   Unsupported native-terminal entry selects the existing ANSI rendering path.
   Platform-specific persistence and signal code is compiled only where used.
+  Unsupported generation-root handles use private inhabited layouts, avoiding
+  invalid references to empty enums while retaining `UnsupportedPlatform` errors.
+  Unix directory syncing and memory advice retain their existing behavior;
+  Windows no longer compiles their no-op wrappers.
   The release also advances Quill's explicit producer word to 0.3.1 and its
   current oracle/profile identities while preserving historical receipts and
   wire fixtures. [Platform and producer repairs](https://github.com/Dicklesworthstone/frankensearch/commit/304f13ecfd337de4a9bef3f081ca9d483ba34430).

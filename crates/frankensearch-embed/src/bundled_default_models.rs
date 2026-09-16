@@ -138,10 +138,10 @@ fn materialize_default_semantic_models(
             })?;
         let model_dir = root.join(install_dir);
 
-        if bundled_receipt_allows_materialization_skip(&manifest, &model_dir) {
+        if bundled_receipt_allows_materialization_skip(manifest, &model_dir) {
             continue;
         }
-        if verify_and_record_materialized_model(&manifest, &model_dir).is_ok() {
+        if verify_and_record_materialized_model(manifest, &model_dir).is_ok() {
             continue;
         }
 
@@ -181,7 +181,7 @@ fn materialize_default_semantic_models(
             wrote_any_file = true;
         }
 
-        verify_and_record_materialized_model(&manifest, &model_dir)?;
+        verify_and_record_materialized_model(manifest, &model_dir)?;
         if wrote_any_file {
             models_written = models_written.saturating_add(1);
         }

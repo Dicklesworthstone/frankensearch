@@ -534,39 +534,37 @@ pub fn warm_up_mmap(
         return Ok(empty_result(&config.strategy));
     }
 
-    match &config.strategy {
-        WarmUpStrategy::None => Ok(empty_result(&WarmUpStrategy::None)),
+    let result = match &config.strategy {
+        WarmUpStrategy::None => return Ok(empty_result(&WarmUpStrategy::None)),
         WarmUpStrategy::Full => mmap_warm_up_full(mmap, config),
         WarmUpStrategy::Header => mmap_warm_up_header(mmap, header_end, config),
         WarmUpStrategy::Adaptive(ac) => {
             mmap_warm_up_adaptive(mmap, header_end, config, ac, heat_map)
         }
-    }
+    };
+    #[cfg(unix)]
+    let result = result?;
+    Ok(result)
 }
 
+#[cfg(unix)]
+type MmapWarmUpResult = Result<WarmUpResult, std::io::Error>;
+#[cfg(not(unix))]
+type MmapWarmUpResult = WarmUpResult;
+
+#[cfg(unix)]
 #[inline]
 fn advise_willneed(mmap: &memmap2::Mmap, offset: usize, len: usize) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        mmap.advise_range(memmap2::Advice::WillNeed, offset, len)?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (mmap, offset, len);
-        Ok(())
-    }
+    mmap.advise_range(memmap2::Advice::WillNeed, offset, len)
 }
 
-fn mmap_warm_up_full(
-    mmap: &memmap2::Mmap,
-    config: &WarmUpConfig,
-) -> Result<WarmUpResult, std::io::Error> {
+fn mmap_warm_up_full(mmap: &memmap2::Mmap, config: &WarmUpConfig) -> MmapWarmUpResult {
     let total_pages = pages_for_bytes(mmap.len());
     let max_pages = config.max_bytes / PAGE_SIZE;
     let budget_exhausted = total_pages > max_pages;
     let actual_bytes = (total_pages.min(max_pages) * PAGE_SIZE).min(mmap.len());
 
+    #[cfg(unix)]
     if actual_bytes > 0 {
         advise_willneed(mmap, 0, actual_bytes)?;
     }
@@ -574,23 +572,36 @@ fn mmap_warm_up_full(
     let pages_touched = pages_for_bytes(actual_bytes);
     debug!(target: "frankensearch.warmup", pages_touched, total_pages, budget_exhausted, "mmap full warm-up");
 
-    Ok(WarmUpResult {
-        pages_touched,
-        bytes_touched: actual_bytes,
-        strategy_name: "full".into(),
-        budget_exhausted,
-    })
+    #[cfg(unix)]
+    {
+        Ok(WarmUpResult {
+            pages_touched,
+            bytes_touched: actual_bytes,
+            strategy_name: "full".into(),
+            budget_exhausted,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        WarmUpResult {
+            pages_touched,
+            bytes_touched: actual_bytes,
+            strategy_name: "full".into(),
+            budget_exhausted,
+        }
+    }
 }
 
 fn mmap_warm_up_header(
     mmap: &memmap2::Mmap,
     header_end: usize,
     config: &WarmUpConfig,
-) -> Result<WarmUpResult, std::io::Error> {
+) -> MmapWarmUpResult {
     let header_bytes = header_end.min(mmap.len());
     let max_bytes = config.max_bytes.min(mmap.len());
     let actual = header_bytes.min(max_bytes);
 
+    #[cfg(unix)]
     if actual > 0 {
         advise_willneed(mmap, 0, actual)?;
     }
@@ -598,12 +609,24 @@ fn mmap_warm_up_header(
     let pages_touched = pages_for_bytes(actual);
     debug!(target: "frankensearch.warmup", pages_touched, header_bytes, "mmap header warm-up");
 
-    Ok(WarmUpResult {
-        pages_touched,
-        bytes_touched: actual,
-        strategy_name: "header".into(),
-        budget_exhausted: header_bytes > max_bytes,
-    })
+    #[cfg(unix)]
+    {
+        Ok(WarmUpResult {
+            pages_touched,
+            bytes_touched: actual,
+            strategy_name: "header".into(),
+            budget_exhausted: header_bytes > max_bytes,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        WarmUpResult {
+            pages_touched,
+            bytes_touched: actual,
+            strategy_name: "header".into(),
+            budget_exhausted: header_bytes > max_bytes,
+        }
+    }
 }
 
 fn mmap_warm_up_adaptive(
@@ -612,18 +635,8 @@ fn mmap_warm_up_adaptive(
     config: &WarmUpConfig,
     adaptive_config: &AdaptiveConfig,
     heat_map: Option<&HeatMap>,
-) -> Result<WarmUpResult, std::io::Error> {
-    let header_fallback = || {
-        warm_up_mmap(
-            mmap,
-            header_end,
-            &WarmUpConfig {
-                strategy: WarmUpStrategy::Header,
-                ..*config
-            },
-            None,
-        )
-    };
+) -> MmapWarmUpResult {
+    let header_fallback = || mmap_warm_up_header(mmap, header_end, config);
 
     let Some(heat_map) = heat_map else {
         return header_fallback();
@@ -641,6 +654,7 @@ fn mmap_warm_up_adaptive(
         let offset = page * PAGE_SIZE;
         let len = PAGE_SIZE.min(mmap.len().saturating_sub(offset));
         if len > 0 {
+            #[cfg(unix)]
             advise_willneed(mmap, offset, len)?;
             touched += 1;
         }
@@ -657,12 +671,24 @@ fn mmap_warm_up_adaptive(
         "mmap adaptive warm-up"
     );
 
-    Ok(WarmUpResult {
-        pages_touched: touched,
-        bytes_touched: touched * PAGE_SIZE,
-        strategy_name: "adaptive".into(),
-        budget_exhausted,
-    })
+    #[cfg(unix)]
+    {
+        Ok(WarmUpResult {
+            pages_touched: touched,
+            bytes_touched: touched * PAGE_SIZE,
+            strategy_name: "adaptive".into(),
+            budget_exhausted,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        WarmUpResult {
+            pages_touched: touched,
+            bytes_touched: touched * PAGE_SIZE,
+            strategy_name: "adaptive".into(),
+            budget_exhausted,
+        }
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
