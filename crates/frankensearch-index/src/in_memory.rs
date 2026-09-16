@@ -577,7 +577,7 @@ impl ExactResidualSidecar {
 
     /// Validate the fixed metadata that binds a sidecar header to its source.
     /// The caller separately validates the exact shape and whole-file digest.
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn header_matches_source(
         header: &[u8],
         source: &ResidualSourceBinding,
@@ -1955,7 +1955,7 @@ impl InMemoryVectorIndex {
         Ok(index)
     }
 
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn exact_residual_generation_cache_prefix(&self) -> SearchResult<String> {
         let source = self.residual_source_binding.as_ref().ok_or_else(|| {
             residual_sidecar_error(
