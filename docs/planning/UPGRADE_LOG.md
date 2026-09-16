@@ -1,5 +1,33 @@
 # Dependency Upgrade Log
 
+## 2026-09-16 — Pager repair update (qualification in progress)
+
+The release lock advances only `fsqlite-pager` from 0.4.0 to 0.4.3.
+The public sparse registry confirms that 0.4.3 is not yanked and has archive
+SHA256 `4339b6554fa751016e5bbd485d1199bf92f92b9b3b6c0c0895c02cd1b25890aa`.
+All other dependency versions remain unchanged.
+
+Upstream commit `4927ad6e167780716a3a954a78a98201ac48f763` reserves pending
+freelist repair for an actual writer and includes synthesized repair pages in
+commit/conflict prediction. Previously, a reader or no-op concurrent transaction
+could advertise pending writes without advancing the pager commit sequence.
+The faulty predicate is present in our former 0.4.0 lock. Healthy-database
+checks do not exercise this repair path.
+
+The upstream owner reports passing four sparse-archive regressions with published
+core 0.4.0 and four sync/async consumer checks with facade 0.4.0 against the
+packaged pager fix (Agent Mail 42292). Our focused storage check and rebuilt
+artifact qualification are separate requirements and remain pending. An initial
+RCH clean-overlay attempt stopped before compilation because it omitted the
+`fast_cmaes` sibling; the corrected attempt uses the established release layout
+with source and sibling hashes checked before and after execution.
+
+The previous source `dc3ec1a4` completed all eleven ordinary quality stages and
+2,057 Quill tests across default and all-feature configurations. Its binaries
+still contain pager 0.4.0. Those receipts do not qualify the updated dependency.
+A separate upstream `db_size` investigation is being scoped before publication;
+the reported plan for a uniform 0.4.4 release is not yet a publication receipt.
+
 ## 2026-09-16 — Windows x86-64 ONNX producer qualification
 
 The Windows full CLI now indexes after the publication-lease repair, but its
