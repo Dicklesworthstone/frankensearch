@@ -96,6 +96,23 @@ Historical adapter identities remain rejected by strict admission, and the
   current oracle/profile identities while preserving historical receipts and
   wire fixtures. [Platform and producer repairs](https://github.com/Dicklesworthstone/frankensearch/commit/304f13ecfd337de4a9bef3f081ca9d483ba34430).
 
+- **Windows indexing acquires a real cross-process publication lease.** The
+  previous non-Unix refusal prevented indexing even when the binary built and
+  started successfully. Windows now uses kernel byte-range locking and retains
+  root/lock handles that deny deletion and replacement. Five tests executed on
+  Windows cover contention, release, fencing, and refused mutations, including
+  a real child process. Cold indexing also succeeds. Unix locking is unchanged.
+  Windows full archives require the Microsoft Visual C++ v14 x64 runtime and
+  include DirectML beside the executable.
+  [Publication repair](https://github.com/Dicklesworthstone/frankensearch/commit/54a6fdc80af048496be71f0f5cdadc52f4bdf002).
+
+- **Windows ONNX models use measured Windows producer identities.** MiniLM,
+  Snowflake Arctic S, and Nomic v1.5 now carry separately qualified Windows
+  certificates instead of declaring Linux output bits. Actual Windows loader
+  tests pass for all three models and reject historical and foreign-platform
+  certificates. Existing Linux and macOS certificates are unchanged. Rebuild
+  semantic indexes when moving between these platform-specific producers.
+
 - **Reinstalling the same version honors the requested full/lite profile.**
   The installer stages and verifies the requested artifact instead of returning
   success based only on the incumbent's version. Version detection now matches

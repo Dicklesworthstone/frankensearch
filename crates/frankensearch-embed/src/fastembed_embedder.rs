@@ -998,6 +998,16 @@ mod tests {
                 "5693dd454b03d7c4ae3a96ea429eddbbaf60519e11ded361a26a1f221f996843"
             },
         );
+        assert_historical_certificate_refused(
+            "FASTEMBED_MINILM_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("minilm").unwrap(),
+            &ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+            if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+                "67cec04aef931fb5b5db8be074e92370c4f62e6f89ec45bec5ecd52a2444d6c3"
+            } else {
+                "26db12f2e6f084f991d61a29da7f6c66c1e70981b74f07cc73c7f235ee6c0142"
+            },
+        );
     }
 
     #[test]
@@ -1024,6 +1034,16 @@ mod tests {
                 "f9f9b1071d82dd22614086a7a0e05bcdc785ca3b04158c4f914e678c75fd6c8d"
             },
         );
+        assert_historical_certificate_refused(
+            "FASTEMBED_SNOWFLAKE_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("snowflake-arctic-s").unwrap(),
+            &ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+            if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+                "8ab295190de5eb629ef7920e3aec6d989c1b7f695b4f75baebfb716fb81b7f6c"
+            } else {
+                "01e4e1fb6c2e5e4234080ce5644d13cb08ddece97e6e31fa39d49083cea37c37"
+            },
+        );
     }
 
     #[test]
@@ -1042,6 +1062,16 @@ mod tests {
                 "dbb7e33fdb5ccb4864faf9ff425b35a83a2d9dcd4f8d736033d7f819e0c1e851"
             } else {
                 "7041b782516edfb91097d668443130d098bca7a035c8a85024150b5a09aebc67"
+            },
+        );
+        assert_historical_certificate_refused(
+            "FASTEMBED_NOMIC_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("nomic-embed").unwrap(),
+            &ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+            if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+                "dbb7e33fdb5ccb4864faf9ff425b35a83a2d9dcd4f8d736033d7f819e0c1e851"
+            } else {
+                "8b2d7421218d8ab9e6d0f9c3ea66b371be56324a5560c13e2b416c5064e51f05"
             },
         );
     }

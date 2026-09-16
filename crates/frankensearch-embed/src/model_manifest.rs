@@ -324,6 +324,7 @@ impl ModelArtifactManifestV1 {
             qualify_fastembed_platform(
                 execution,
                 "5693dd454b03d7c4ae3a96ea429eddbbaf60519e11ded361a26a1f221f996843",
+                "26db12f2e6f084f991d61a29da7f6c66c1e70981b74f07cc73c7f235ee6c0142",
             ),
         )
     }
@@ -451,6 +452,7 @@ impl ModelArtifactManifestV1 {
             qualify_fastembed_platform(
                 execution,
                 "f9f9b1071d82dd22614086a7a0e05bcdc785ca3b04158c4f914e678c75fd6c8d",
+                "01e4e1fb6c2e5e4234080ce5644d13cb08ddece97e6e31fa39d49083cea37c37",
             ),
         )
     }
@@ -472,6 +474,7 @@ impl ModelArtifactManifestV1 {
             qualify_fastembed_platform(
                 execution,
                 "7041b782516edfb91097d668443130d098bca7a035c8a85024150b5a09aebc67",
+                "8b2d7421218d8ab9e6d0f9c3ea66b371be56324a5560c13e2b416c5064e51f05",
             ),
         )
     }
@@ -1156,14 +1159,23 @@ fn storage_endianness(storage_format: &str) -> &'static str {
 // adapter's ordered first batch. The qualified platform has its own identity;
 // load_from_manifest still executes and checks the exact certificate before
 // returning an embedder. Other platforms retain the existing contract.
+// GOLDEN-CHANGE bd-dsbym/bd-2ba5: Windows x86-64's build of the same ORT
+// revision also has distinct, reproducible output bits. Fresh-process probes
+// and the 355-text paired semantic review are recorded in UPGRADE_LOG.md.
+// Register a separate producer; never admit its bits under a Linux identity.
 fn qualify_fastembed_platform(
     mut execution: ModelExecutionContractV1,
     macos_arm64_vectors_sha256: &str,
+    windows_x64_vectors_sha256: &str,
 ) -> ModelExecutionContractV1 {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         "ort-1.28.0-da9b5e3-macos-aarch64-cpu-f32-host-default-intra-threads-v1"
             .clone_into(&mut execution.numeric_profile);
         macos_arm64_vectors_sha256.clone_into(&mut execution.golden_vectors.vectors_sha256);
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "ort-1.28.0-da9b5e3-windows-x86_64-cpu-f32-host-default-intra-threads-v1"
+            .clone_into(&mut execution.numeric_profile);
+        windows_x64_vectors_sha256.clone_into(&mut execution.golden_vectors.vectors_sha256);
     }
     execution
 }
@@ -4308,10 +4320,10 @@ mod tests {
         );
     }
 
-    // Reconstruct the pre-refresh producer without changing any artifact,
-    // numeric contract, preprocessing, or output certificate. The exact
-    // historical hashes below therefore continue to constrain every other
-    // field while the current producer names its actual dependencies.
+    // Reconstruct the pre-refresh producer without changing any artifact or
+    // preprocessing. Windows previously declared the Linux numeric contract;
+    // retain those historical hashes rather than rewriting them to the newly
+    // qualified Windows output. Current owning-loader tests check the new bits.
     fn before_dependency_refresh(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
         let current = manifest.freeze().unwrap().fingerprint;
         manifest = before_adapter_release(manifest);
@@ -4321,6 +4333,31 @@ mod tests {
                 "tokenizers-0.23.1+safetensors-0.7.0-static-table-v1",
             ),
             "fastembed-onnx" => {
+                if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+                    let (windows, linux) = match manifest.logical_model_id.as_str() {
+                        "all-minilm-l6-v2" => (
+                            "26db12f2e6f084f991d61a29da7f6c66c1e70981b74f07cc73c7f235ee6c0142",
+                            "67cec04aef931fb5b5db8be074e92370c4f62e6f89ec45bec5ecd52a2444d6c3",
+                        ),
+                        "snowflake-arctic-embed-s" => (
+                            "01e4e1fb6c2e5e4234080ce5644d13cb08ddece97e6e31fa39d49083cea37c37",
+                            "8ab295190de5eb629ef7920e3aec6d989c1b7f695b4f75baebfb716fb81b7f6c",
+                        ),
+                        "nomic-embed-text-v1.5" => (
+                            "8b2d7421218d8ab9e6d0f9c3ea66b371be56324a5560c13e2b416c5064e51f05",
+                            "dbb7e33fdb5ccb4864faf9ff425b35a83a2d9dcd4f8d736033d7f819e0c1e851",
+                        ),
+                        model => panic!("unclassified Windows ONNX producer: {model}"),
+                    };
+                    assert_eq!(manifest.execution.golden_vectors.vectors_sha256, windows);
+                    assert_eq!(
+                        manifest.execution.numeric_profile,
+                        "ort-1.28.0-da9b5e3-windows-x86_64-cpu-f32-host-default-intra-threads-v1"
+                    );
+                    linux.clone_into(&mut manifest.execution.golden_vectors.vectors_sha256);
+                    "ort-2.0.0-rc.13-cpu-f32-host-default-intra-threads-v1"
+                        .clone_into(&mut manifest.execution.numeric_profile);
+                }
                 assert!(
                     manifest
                         .execution

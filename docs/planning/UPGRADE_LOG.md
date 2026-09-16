@@ -1,5 +1,56 @@
 # Dependency Upgrade Log
 
+## 2026-09-16 — Windows x86-64 ONNX producer qualification
+
+The Windows full CLI now indexes after the publication-lease repair, but its
+quality loader refuses the Linux ONNX certificate. Model artifacts verify.
+Fresh production-shaped probes on Windows and Linux report ORT 1.28.0,
+revision `da9b5e3`; the platform builds produce different f32 bits. Two fresh
+processes per model reproduce each platform's four-text normalized batch.
+All three Linux certificates reproduce the existing registry exactly.
+
+**GOLDEN-CHANGE bd-dsbym / bd-2ba5:** register a separate Windows x86-64
+numeric profile,
+`ort-1.28.0-da9b5e3-windows-x86_64-cpu-f32-host-default-intra-threads-v1`.
+Linux and macOS certificates, model bytes, tokenization, pooling, normalization,
+and exact constructor admission remain unchanged. Historical Windows manifests
+declared the Linux contract; their fixture hashes are reconstructed unchanged.
+The new identity cannot silently reuse a foreign producer's vector generation.
+
+| Model | Windows normalized four-text batch SHA256 | Minimum paired cosine | Maximum component difference |
+|---|---|---|---|
+| MiniLM | `26db12f2e6f084f991d61a29da7f6c66c1e70981b74f07cc73c7f235ee6c0142` | 0.9999999999995901 | 1.5647e-7 |
+| Snowflake Arctic S | `01e4e1fb6c2e5e4234080ce5644d13cb08ddece97e6e31fa39d49083cea37c37` | 0.9999999999998943 | 1.0431e-7 |
+| Nomic v1.5 | `8b2d7421218d8ab9e6d0f9c3ea66b371be56324a5560c13e2b416c5064e51f05` | 0.9999999999995814 | 1.3784e-7 |
+
+Semantic review compares 339 Treasure Island passages and 16 queries using the
+same corpus as the earlier Mac qualification. Corpus JSON SHA256 is
+`9f75dd77d26e393c195c7b098cfd0031d69441c612f9db12a29f6fef99c0a381`.
+A diagnostic Python f16 document quantization / f64 accumulation calculation
+returns identical ordered top-10 lists for all 16 queries under each model.
+Mean nDCG@10 is identical across platforms: 0.267848928855, 0.221664612396,
+and 0.453100816876 respectively. This is bounded numerical and reference-ranking
+evidence, not production-index execution or a performance result.
+
+The probe uses FastEmbed 6.0.3 and only registry package identities from the
+current workspace lock. Both executables were built through RCH with
+nightly-2026-08-31. Windows PE SHA256 is
+`1675c964d8547083acc1639ba31d3b511e19749fd13c8e45644dd9ae61ae2c91`;
+Linux ELF SHA256 is
+`680d3a3f40251c448dd175745eeed03c92966fc66643429c7da532c5ab846954`.
+Source, lock, build receipts, raw vectors, and paired comparison receipts are
+retained under
+`/data/release-work/frankensearch-release-20260912/windows-onnx-platform-probe/`.
+The actual Windows owning-loader executable passes all three real-model
+certificate tests, including rejection of historical and foreign-platform
+certificates. The unchanged historical manifest fixture also passes. The test
+PE SHA256 is
+`cc22ea415a9a37b273b228079da057c82ec8aed9a6da860aa106182bf6dc5bf8`;
+native execution receipts are retained in `windows-onnx-qualified-native-tests/`
+under the same release work directory. The full Windows cold
+index/search/rerank/doctor gate and Linux regression execution remain pending;
+these measurements alone do not qualify a release artifact.
+
 ## 2026-09-16 — Native ARM F32 and Int8 qualification completed
 
 Source `31acc37c68cfa3af987ebf64a257c3bd9b576e97` now passes both existing

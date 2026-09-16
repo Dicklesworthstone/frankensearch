@@ -654,3 +654,29 @@ and `crates-v0.5.0` as the newest GitHub Releases. The September 12
 `frankensearch-v0.6.0` remains a plain tag associated with the existing crates.io
 publication. This supplement adds unreleased behavior notes without inventing
 a new release or claiming complete September 14–15 history coverage.
+
+### September 16 Windows runtime follow-through
+
+Reviewed `54a6fdc80af048496be71f0f5cdadc52f4bdf002` against the retained
+Windows failure and the actual native regression executable. The original full
+binary stopped indexing at the unsupported publication lease. The corrected
+binary indexes successfully; five publication tests pass, including separate
+child contention and post-release acquisition. Full search still returned
+Initial because the ONNX constructor rejected the executing output certificate.
+This is recorded as a failed full runtime gate, not a passing semantic release.
+
+The prior September 7 ONNX platform probe was recovered from the Mac release
+worktree and rebuilt through RCH with FastEmbed 6.0.3, the current workspace's
+registry package identities, and nightly-2026-08-31. On Windows and Linux, two
+fresh processes per model reproduce their platform certificates. All three
+Linux values match their existing registered certificates. Raw vectors for 355
+texts per model and diagnostic f16 ranking comparisons are retained under
+`/data/release-work/frankensearch-release-20260912/windows-onnx-platform-probe/`.
+The ranking comparison is a Python reference calculation, not a production
+index execution or a performance claim. The actual Windows owning-loader
+executable subsequently passed all three real-model tests, including historical
+and foreign-platform certificate rejection, and the historical manifest fixture
+passed separately. PE SHA256 is
+`cc22ea415a9a37b273b228079da057c82ec8aed9a6da860aa106182bf6dc5bf8`;
+receipts are retained in `windows-onnx-qualified-native-tests/`. Linux regression
+execution and the full CLI gate remain required before release qualification.
