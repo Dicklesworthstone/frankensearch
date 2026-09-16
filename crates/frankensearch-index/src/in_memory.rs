@@ -4104,6 +4104,7 @@ mod tests {
         dir
     }
 
+    #[cfg(target_os = "linux")]
     fn write_new_owned_file(path: &Path, bytes: &[u8]) {
         use std::io::Write as _;
 

@@ -1179,6 +1179,7 @@ fn append_batch_reaches_the_lexical_arm_and_delete_removes_it_everywhere() {
 /// The registered model cache, when it carries both semantic tiers and the
 /// ms-marco cross-encoder weights (`fsfs download-models ms-marco-minilm-l-6-v2`).
 /// `None` means the real-model rerank lane must skip, never fake a pass.
+#[cfg(unix)]
 fn registered_model_cache_with_reranker() -> Option<PathBuf> {
     let root = std::env::var_os("FRANKENSEARCH_MODEL_DIR")
         .map(PathBuf::from)

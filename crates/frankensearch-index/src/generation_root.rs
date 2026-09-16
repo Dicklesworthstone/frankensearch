@@ -6675,14 +6675,14 @@ impl QualifiedGenerationControlFile {
 
     /// Clone the exact descriptor-admitted control-file image.
     #[must_use]
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn bytes(&self) -> Arc<[u8]> {
         platform::control_bytes(&self.inner)
     }
 
     /// SHA-256 of the exact descriptor-admitted control-file image.
     #[must_use]
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn sha256(&self) -> [u8; 32] {
         platform::control_sha256(&self.inner)
     }
@@ -6695,7 +6695,7 @@ impl QualifiedGenerationControlFile {
     /// Returns [`GenerationRootErrorKind::LockContended`] rather than
     /// blocking. Route replacement, process-identity drift, and all normal
     /// file-admission errors remain fail-closed.
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     #[cfg_attr(target_os = "macos", allow(clippy::unused_self))]
     fn try_lock(&self, mode: GenerationRootLockMode) -> GenerationRootResult<GenerationRootLock> {
         #[cfg(target_os = "macos")]
@@ -6775,12 +6775,12 @@ enum GenerationRootLockMode {
 /// Operations that revalidate, synchronize, or unlock in a child fail with
 /// [`GenerationRootErrorKind::ForkedProcess`].
 #[must_use = "holding this guard keeps the kernel lock acquired"]
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 struct GenerationRootLock {
     inner: platform::LockHandle,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 impl GenerationRootLock {
     /// Object/metadata witness bound to this lock.
     ///
@@ -6837,7 +6837,7 @@ impl GenerationRootLock {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 impl fmt::Debug for GenerationRootLock {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

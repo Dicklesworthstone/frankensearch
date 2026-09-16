@@ -24188,6 +24188,7 @@ mod tests {
             && std::io::IsTerminal::is_terminal(&std::io::stdin());
         assert!(!interactive_terminal || std::env::var_os("FSFS_ALLOW_TTY_TEST").is_some());
     }
+    #[cfg(unix)]
     use std::io::ErrorKind;
     #[cfg(unix)]
     use std::io::{BufRead as _, Read as _, Write as _};
@@ -27182,6 +27183,7 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
     fn reserve_unique_test_dir(label: &str) -> std::io::Result<PathBuf> {
         loop {
             let path = unique_test_dir(label);

@@ -4033,7 +4033,7 @@ fn embedded_release_profile_retains_semantic_loaders() {
     eprintln!(
         "embedded-models is a supported release profile; the stock-default quickstart contract is exercised without this feature"
     );
-    assert!(cfg!(feature = "semantic-loaders"));
+    const { assert!(cfg!(feature = "semantic-loaders")) };
 }
 
 #[cfg(feature = "embedded-models")]
