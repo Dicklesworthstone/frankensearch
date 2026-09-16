@@ -77,6 +77,21 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ### Fixed
 
+- **Embedded-model builds extract defaults in a child before loading inference models.**
+  The first macOS ARM run previously retained the embedded weight pages after
+  extraction and exceeded the default 2 GiB indexing memory limit. The CLI now
+  waits for extraction and full verification to finish in a separate process;
+  warm verified caches skip that process. Status and doctor remain observational,
+  child failure propagates, and the memory limit is unchanged. Final platform
+  qualification is pending. [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/304f13ecfd337de4a9bef3f081ca9d483ba34430).
+
+- **Windows builds no longer import the Unix-only native terminal backend.**
+  Unsupported native-terminal entry selects the existing ANSI rendering path.
+  Platform-specific persistence and signal code is compiled only where used.
+  The release also advances Quill's explicit producer word to 0.3.1 and its
+  current oracle/profile identities while preserving historical receipts and
+  wire fixtures. [Platform and producer repairs](https://github.com/Dicklesworthstone/frankensearch/commit/304f13ecfd337de4a9bef3f081ca9d483ba34430).
+
 - **Reinstalling the same version honors the requested full/lite profile.**
   The installer stages and verifies the requested artifact instead of returning
   success based only on the incumbent's version. Version detection now matches
