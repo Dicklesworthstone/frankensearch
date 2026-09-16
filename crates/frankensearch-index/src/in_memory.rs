@@ -48,7 +48,9 @@ use crate::search::{ClassifiedHits, PARALLEL_CHUNK_SIZE, SearchParams};
 use crate::simd::{dot_4bit_prepared, dot_i8_i8, dot_product_f16_f32, prepare_4bit_query};
 use crate::{FsviV2Witness, ValidatedFsviBytes, VectorIndex};
 
+#[cfg(any(test, target_os = "linux"))]
 const EXACT_RESIDUAL_SIDECAR_MAGIC: [u8; 8] = *b"FSRSIDX1";
+#[cfg(any(test, target_os = "linux"))]
 const EXACT_RESIDUAL_SIDECAR_VERSION: u32 = 2;
 const EXACT_RESIDUAL_BLOCK: usize = 32;
 const EXACT_RESIDUAL_LANES: usize = 8;
