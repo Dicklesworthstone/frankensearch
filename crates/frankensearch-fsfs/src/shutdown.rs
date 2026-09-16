@@ -2,8 +2,11 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+#[cfg(not(windows))]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(test, not(windows)))]
+use std::time::Instant;
 
 use asupersync::Cx;
 use asupersync::types::CancelKind;
@@ -12,19 +15,13 @@ use frankensearch_core::SearchError;
 use frankensearch_core::SearchResult;
 #[cfg(not(windows))]
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(not(windows))]
 type SignalHandle = signal_hook::iterator::Handle;
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy)]
-struct SignalHandle;
-use tracing::{debug, info, warn};
-
-#[cfg(windows)]
-impl SignalHandle {
-    fn close(self) {}
-}
+#[cfg(any(test, not(windows)))]
+use tracing::debug;
+use tracing::{info, warn};
 
 /// Time window where a second `SIGINT` forces immediate exit.
 pub const FORCE_EXIT_WINDOW: Duration = Duration::from_secs(3);
@@ -68,11 +65,14 @@ pub enum ShutdownReason {
 pub struct ShutdownCoordinator {
     shutdown_state: AtomicU8,
     shutdown_reason: Mutex<Option<ShutdownReason>>,
+    #[cfg(any(test, not(windows)))]
     first_sigint_at: Mutex<Option<Instant>>,
     reload_requested: AtomicBool,
     diagnostics_dump_count: AtomicU64,
     signal_registration_active: AtomicBool,
+    #[cfg(not(windows))]
     signal_handle: Mutex<Option<SignalHandle>>,
+    #[cfg(not(windows))]
     signal_listener_thread: Mutex<Option<thread::JoinHandle<()>>>,
     cancellation_contexts: Mutex<Vec<Weak<Cx>>>,
 }
@@ -89,11 +89,14 @@ impl ShutdownCoordinator {
         Self {
             shutdown_state: AtomicU8::new(ShutdownState::Running.as_u8()),
             shutdown_reason: Mutex::new(None),
+            #[cfg(any(test, not(windows)))]
             first_sigint_at: Mutex::new(None),
             reload_requested: AtomicBool::new(false),
             diagnostics_dump_count: AtomicU64::new(0),
             signal_registration_active: AtomicBool::new(false),
+            #[cfg(not(windows))]
             signal_handle: Mutex::new(None),
+            #[cfg(not(windows))]
             signal_listener_thread: Mutex::new(None),
             cancellation_contexts: Mutex::new(Vec::new()),
         }
@@ -168,19 +171,22 @@ impl ShutdownCoordinator {
 
     /// Stop the signal listener thread and clear registration state.
     pub fn stop_signal_listener(&self) {
-        let signal_handle = lock_or_recover(&self.signal_handle).take();
-        if let Some(handle) = signal_handle {
-            handle.close();
-        }
-
-        let listener_thread = lock_or_recover(&self.signal_listener_thread).take();
-        if let Some(listener_thread) = listener_thread
-            && let Err(error) = listener_thread.join()
+        #[cfg(not(windows))]
         {
-            warn!(
-                ?error,
-                "fsfs signal listener thread panicked while stopping"
-            );
+            let signal_handle = lock_or_recover(&self.signal_handle).take();
+            if let Some(handle) = signal_handle {
+                handle.close();
+            }
+
+            let listener_thread = lock_or_recover(&self.signal_listener_thread).take();
+            if let Some(listener_thread) = listener_thread
+                && let Err(error) = listener_thread.join()
+            {
+                warn!(
+                    ?error,
+                    "fsfs signal listener thread panicked while stopping"
+                );
+            }
         }
 
         self.signal_registration_active
@@ -284,6 +290,7 @@ impl ShutdownCoordinator {
         self.diagnostics_dump_count.load(Ordering::Acquire)
     }
 
+    #[cfg(any(test, not(windows)))]
     fn handle_signal(&self, signal: i32) {
         match signal {
             SIGINT => self.handle_sigint(),
@@ -311,6 +318,7 @@ impl ShutdownCoordinator {
         }
     }
 
+    #[cfg(any(test, not(windows)))]
     fn handle_sigint(&self) {
         let now = Instant::now();
         match self.state() {
@@ -335,6 +343,7 @@ impl ShutdownCoordinator {
         }
     }
 
+    #[cfg(any(test, not(windows)))]
     fn promote_force_exit(&self) {
         self.shutdown_state
             .store(ShutdownState::ForceExit.as_u8(), Ordering::Release);
@@ -373,7 +382,9 @@ mod tests {
     use std::time::Duration;
 
     use asupersync::test_utils::run_test_with_cx;
-    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    #[cfg(not(windows))]
+    use signal_hook::consts::signal::{SIGHUP, SIGQUIT};
+    use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
     use super::{ShutdownCoordinator, ShutdownReason, ShutdownState};
 
@@ -465,6 +476,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn sighup_requests_reload_without_shutdown() {
         let coordinator = ShutdownCoordinator::new();
         coordinator.process_signal_for_test(SIGHUP);
@@ -479,6 +491,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn sigquit_increments_diagnostics_counter_without_shutdown() {
         let coordinator = ShutdownCoordinator::new();
         coordinator.process_signal_for_test(SIGQUIT);
@@ -508,7 +521,7 @@ mod tests {
     #[test]
     fn shutdown_reason_overrides_prior_reload_reason() {
         let coordinator = ShutdownCoordinator::new();
-        coordinator.process_signal_for_test(SIGHUP);
+        coordinator.request_config_reload();
         coordinator.process_signal_for_test(SIGTERM);
 
         assert!(coordinator.is_shutting_down());

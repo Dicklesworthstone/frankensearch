@@ -495,7 +495,9 @@ const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v4";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v3";
 const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v1";
+#[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
+#[cfg(unix)]
 const FSFS_DAEMON_REQUEST_MAX_BYTES: usize = 1 << 20; // 1 MiB
 const FSFS_DAEMON_RESPONSE_MAX_BYTES: usize = 4 << 20; // 4 MiB
 // Each search publishes an attestation and at most two phases. The socket
@@ -508,22 +510,29 @@ const FSFS_DAEMON_STREAM_MAX_BYTES: usize = 2 * FSFS_DAEMON_RESPONSE_MAX_BYTES +
 #[cfg(unix)]
 const FSFS_DAEMON_MAX_CLIENTS: usize = 16;
 const FSFS_DAEMON_MAX_CACHE_ENTRIES: usize = 8;
+#[cfg(unix)]
 const FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS: u64 = 5_000;
 /// Idle-accept poll cadence for the shutdown-aware serve loop (bd-egkb).
+#[cfg(unix)]
 const FSFS_SERVE_ACCEPT_POLL_MS: u64 = 50;
 /// Accept poll while a client was seen recently: interactive and scripted
 /// callers issue queries back to back, and every one of them would otherwise
 /// wait out most of the idle poll.
+#[cfg(unix)]
 const FSFS_SERVE_ACCEPT_HOT_POLL_MS: u64 = 1;
 /// How long after the last accepted connection the fast poll stays in force.
+#[cfg(unix)]
 const FSFS_SERVE_ACCEPT_HOT_WINDOW_MS: u64 = 2_000;
+#[cfg(unix)]
 const FSFS_DAEMON_CONNECT_MAX_ATTEMPTS: usize = 80;
+#[cfg(unix)]
 const FSFS_DAEMON_CONNECT_RETRY_DELAY_MS: u64 = 25;
 /// Default idle lifetime of an auto-spawned query daemon. The daemon detaches
 /// from the `fsfs search` that spawned it (so the second search is fast) and
 /// exits on its own after this long without a client, so it can never
 /// accumulate as an orphan. `fsfs serve --daemon --idle-timeout-ms 0` opts
 /// out for a deliberately persistent daemon.
+#[cfg(unix)]
 const FSFS_DAEMON_IDLE_TIMEOUT_MS: u64 = 600_000;
 
 /// Execute an executable this process just wrote (an updated binary, a
@@ -932,6 +941,7 @@ struct SearchCacheKey {
     rerank_model: Option<String>,
 }
 
+#[cfg(unix)]
 type SharedSearchServeState = Arc<
     asupersync::sync::Mutex<(
         SearchExecutionResources,
@@ -6963,6 +6973,7 @@ impl FsfsRuntime {
         drop(blocking_pool);
     }
 
+    #[cfg(unix)]
     fn search_daemon_error(reason: impl Into<String>) -> SearchError {
         SearchError::InvalidConfig {
             field: "cli.daemon".to_owned(),
@@ -7583,6 +7594,13 @@ impl FsfsRuntime {
             .await
     }
 
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_async_trait_impl,
+            reason = "Keeps the common awaited daemon interface; unsupported transports fail immediately"
+        )
+    )]
     async fn search_payloads_via_daemon_with_sink(
         &self,
         cx: &Cx,
@@ -11105,6 +11123,7 @@ impl FsfsRuntime {
             .await?;
 
         publication_lease.fence("append-batch WAL publication")?;
+        #[cfg(unix)]
         self.quiesce_query_daemon("append-batch")?;
         if let Some((quality_embedder, _)) = quality.as_ref() {
             let mut quality_index = Self::open_vector_index_for_mutation(&quality_vector_path)?;
@@ -11284,6 +11303,7 @@ impl FsfsRuntime {
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         publication_lease.fence("delete WAL publication")?;
+        #[cfg(unix)]
         self.quiesce_query_daemon("delete")?;
         let mut index = Self::open_vector_index_for_mutation(&vector_path)?;
         let ids = &self.cli_input.delete_ids;
@@ -11404,6 +11424,7 @@ impl FsfsRuntime {
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         publication_lease.fence("explicit vector compaction")?;
+        #[cfg(unix)]
         self.quiesce_query_daemon("compact")?;
         // A generation whose bytes drifted from its RaptorQ sidecar is
         // restored before it is merged; unrepairable damage is a typed error.
@@ -11606,6 +11627,7 @@ impl FsfsRuntime {
                 // exclusivity (lock file substituted); abort rather than
                 // compact alongside a possible second publisher.
                 publication_lease.fence("daemon vector compaction")?;
+                #[cfg(unix)]
                 if let Err(error) = self.quiesce_query_daemon("daemon vector compaction") {
                     warn!(error = %error, "daemon: query daemon quiesce failed; compaction may be refused");
                 }
@@ -11664,6 +11686,7 @@ impl FsfsRuntime {
                     "daemon: quality-tier WAL changed, triggering compaction"
                 );
                 publication_lease.fence("daemon quality vector compaction")?;
+                #[cfg(unix)]
                 if let Err(error) = self.quiesce_query_daemon("daemon quality vector compaction") {
                     warn!(error = %error, "daemon: query daemon quiesce failed; compaction may be refused");
                 }
@@ -11835,11 +11858,6 @@ impl FsfsRuntime {
             reason,
             "query daemon did not exit within the quiesce budget; the mutation may be refused by the map lock"
         );
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn quiesce_query_daemon(&self, _reason: &str) -> SearchResult<()> {
         Ok(())
     }
 
@@ -20043,7 +20061,11 @@ impl FtuiSession {
         })
     }
 
-    fn render(&self, _renderer: impl FnOnce(&mut Frame)) -> SearchResult<()> {
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "Matches the native mutable terminal contract; non-Unix entry always refuses"
+    )]
+    fn render(&mut self, _renderer: impl FnOnce(&mut Frame)) -> SearchResult<()> {
         Err(SearchError::SubsystemError {
             subsystem: "fsfs.tui.ftui",
             source: Box::new(std::io::Error::new(
@@ -20053,7 +20075,11 @@ impl FtuiSession {
         })
     }
 
-    fn poll_event(&self, _timeout: Duration) -> SearchResult<Option<Event>> {
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "Matches the native mutable terminal contract; non-Unix entry always refuses"
+    )]
+    fn poll_event(&mut self, _timeout: Duration) -> SearchResult<Option<Event>> {
         Err(SearchError::SubsystemError {
             subsystem: "fsfs.tui.ftui",
             source: Box::new(std::io::Error::new(
@@ -24162,9 +24188,9 @@ mod tests {
             && std::io::IsTerminal::is_terminal(&std::io::stdin());
         assert!(!interactive_terminal || std::env::var_os("FSFS_ALLOW_TTY_TEST").is_some());
     }
+    use std::io::ErrorKind;
     #[cfg(unix)]
-    use std::io::{BufRead as _, Read as _};
-    use std::io::{ErrorKind, Write as _};
+    use std::io::{BufRead as _, Read as _, Write as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -24257,19 +24283,20 @@ mod tests {
     use fsqlite::AsyncConnection as Connection;
     use fsqlite_types::value::SqliteValue;
 
+    #[cfg(unix)]
+    use super::FSFS_DAEMON_REQUEST_MAX_BYTES;
     use super::{
         ContextPreviewFormat, EmbedderAvailability, ExplainSessionHit,
-        FSFS_DAEMON_REQUEST_MAX_BYTES, FSFS_SEARCH_SNIPPET_HEAD_LIMIT,
-        FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
-        FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MS,
-        FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS, FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
-        FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS, FSFS_TUI_QUALITY_DEBOUNCE_MS,
-        FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
-        FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus, FsfsFlushAck, FsfsFlushRequest,
-        FsfsIndexStatus, FsfsModelStatus, FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload,
-        IndexStoragePaths, IndexingBatchEmbeddingOutcome, InterfaceMode, LiveIngestPipeline,
-        LiveVectorSink, SearchCacheRecord, SearchDashboardState, SearchExecutionFlags,
-        SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
+        FSFS_SEARCH_SNIPPET_HEAD_LIMIT, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MS, FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS,
+        FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS, FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
+        FSFS_TUI_QUALITY_DEBOUNCE_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
+        FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
+        FsfsFlushAck, FsfsFlushRequest, FsfsIndexStatus, FsfsModelStatus, FsfsRuntime,
+        FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, IndexingBatchEmbeddingOutcome,
+        InterfaceMode, LiveIngestPipeline, LiveVectorSink, SearchCacheRecord, SearchDashboardState,
+        SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
         SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
         VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
         degradation_controller_config_for_profile, detect_context_preview_format,
@@ -29610,6 +29637,7 @@ mod tests {
     /// and `TMPDIR` alone can exceed that (macOS `/var/folders/...`, a deep
     /// CI workspace), which silently turned these tests red off the gate
     /// host. Bind where the daemon binds: the runtime dir, else `/tmp`.
+    #[cfg(unix)]
     fn short_socket_tempdir() -> tempfile::TempDir {
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
@@ -29621,6 +29649,7 @@ mod tests {
             .expect("short socket tempdir")
     }
 
+    #[cfg(unix)]
     fn connect_socket_with_retry(path: &Path) -> std::os::unix::net::UnixStream {
         for _ in 0..200 {
             match std::os::unix::net::UnixStream::connect(path) {
