@@ -92,6 +92,11 @@ const ORACLE_V8_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "1b67c0cb5cdeb6edeb8fa94
 // and observation contract are unchanged. v8 remains exact archival evidence.
 const ORACLE_V9_LEXICAL_PACKAGE_VERSION: &str = "0.3.0";
 const ORACLE_V9_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "347be73ebad6d0172df99ec78c394e2095ece8a4";
+// v10 binds the 0.3.1 release wrapper. The lexical crate diff from 347be73e
+// to cf000487 changes only Cargo.toml's package version; its observation
+// implementation and Tantivy artifact are unchanged. v9 remains archive-only.
+const ORACLE_V10_LEXICAL_PACKAGE_VERSION: &str = "0.3.1";
+const ORACLE_V10_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "cf00048774c579a6e182a980ea5ec0f6b4c267a5";
 const LOCKED_TANTIVY_VERSION: &str = env!("QUILL_ORACLE_TANTIVY_VERSION");
 const LOCKED_TANTIVY_SOURCE: &str = env!("QUILL_ORACLE_TANTIVY_SOURCE");
 const LOCKED_TANTIVY_CHECKSUM_SHA256: &str = env!("QUILL_ORACLE_TANTIVY_CHECKSUM_SHA256");
@@ -111,6 +116,8 @@ const ORACLE_V8_DEPENDENCY_CONTRACT_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/oracle-dependency-contract/v8\0";
 const ORACLE_V9_DEPENDENCY_CONTRACT_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/oracle-dependency-contract/v9\0";
+const ORACLE_V10_DEPENDENCY_CONTRACT_HASH_DOMAIN: &[u8] =
+    b"frankensearch/quill/oracle-dependency-contract/v10\0";
 /// Exact `frankensearch-lexical` crate version resolved by this build.
 pub const FRANKENSEARCH_LEXICAL_CRATE_VERSION: &str = env!("FRANKENSEARCH_LEXICAL_CRATE_VERSION");
 const QUIVER_DIFFERENTIAL_FIXTURE_ID: &str = "quiver-postings-bitpack-scalar-wide-v1";
@@ -135,7 +142,7 @@ pub struct OracleVersionContract {
 }
 
 impl OracleVersionContract {
-    /// Validate the self-contained current (v9) dependency record without
+    /// Validate the self-contained current (v10) dependency record without
     /// consulting the current checkout, executable, manifest, or lockfile.
     ///
     /// # Errors
@@ -148,7 +155,7 @@ impl OracleVersionContract {
 
     /// Validate an exact historical dependency record while inspecting a
     /// committed, decode-only witness. This admits only the frozen v2 through
-    /// v8 records in addition to the current v9 record; it never authorizes
+    /// v9 records in addition to the current v10 record; it never authorizes
     /// creation or admission under an old dependency.
     pub(crate) fn validate_retained_structure(&self) -> Result<(), GauntletError> {
         self.validate_structure(true)
@@ -205,13 +212,20 @@ impl OracleVersionContract {
             && self.lexical_package_version == ORACLE_V8_LEXICAL_PACKAGE_VERSION
             && self.lexical_contract_audit_revision == ORACLE_V8_LEXICAL_CONTRACT_AUDIT_REVISION;
         let matches_v9 = self.schema_version == 9
-            && self.tantivy_version == CURRENT_ORACLE_TANTIVY_VERSION
+            && self.tantivy_version == ORACLE_V8_TANTIVY_VERSION
             && self.tantivy_source == ORACLE_V8_TANTIVY_SOURCE
             && self.tantivy_checksum_sha256 == ORACLE_V8_TANTIVY_CHECKSUM_SHA256
             && self.lexical_package == ORACLE_V8_LEXICAL_PACKAGE
             && self.lexical_package_version == ORACLE_V9_LEXICAL_PACKAGE_VERSION
             && self.lexical_contract_audit_revision == ORACLE_V9_LEXICAL_CONTRACT_AUDIT_REVISION;
-        if !(matches_v9
+        let matches_v10 = self.schema_version == 10
+            && self.tantivy_version == CURRENT_ORACLE_TANTIVY_VERSION
+            && self.tantivy_source == ORACLE_V8_TANTIVY_SOURCE
+            && self.tantivy_checksum_sha256 == ORACLE_V8_TANTIVY_CHECKSUM_SHA256
+            && self.lexical_package == ORACLE_V8_LEXICAL_PACKAGE
+            && self.lexical_package_version == ORACLE_V10_LEXICAL_PACKAGE_VERSION
+            && self.lexical_contract_audit_revision == ORACLE_V10_LEXICAL_CONTRACT_AUDIT_REVISION;
+        if !(matches_v10
             || permit_retained_historical
                 && (matches_v2
                     || matches_v3
@@ -219,7 +233,8 @@ impl OracleVersionContract {
                     || matches_v5
                     || matches_v6
                     || matches_v7
-                    || matches_v8))
+                    || matches_v8
+                    || matches_v9))
             || !is_lower_hex(&self.tantivy_checksum_sha256, 64)
             || !is_lower_hex(&self.lexical_contract_audit_revision, 40)
         {
@@ -231,7 +246,7 @@ impl OracleVersionContract {
         Ok(())
     }
 
-    /// Validate that this v9 record describes the exact dependency resolved by
+    /// Validate that this v10 record describes the exact dependency resolved by
     /// the current producer build.
     pub(crate) fn validate_current_dependency(&self) -> Result<(), GauntletError> {
         self.validate_stored_structure()?;
@@ -269,6 +284,7 @@ impl OracleVersionContract {
             7 => ORACLE_V7_DEPENDENCY_CONTRACT_HASH_DOMAIN,
             8 => ORACLE_V8_DEPENDENCY_CONTRACT_HASH_DOMAIN,
             9 => ORACLE_V9_DEPENDENCY_CONTRACT_HASH_DOMAIN,
+            10 => ORACLE_V10_DEPENDENCY_CONTRACT_HASH_DOMAIN,
             _ => unreachable!("validated oracle dependency contract has an unknown schema"),
         };
         let mut hasher = Sha256::new();
@@ -911,7 +927,7 @@ mod tests {
         assert_eq!(contract.lexical_contract_audit_revision.len(), 40);
         contract
             .validate_stored_structure()
-            .expect("stored v9 contract is self-contained");
+            .expect("stored v10 contract is self-contained");
         contract
             .validate_current_dependency()
             .expect("stored contract matches current lock resolution");
@@ -1231,14 +1247,73 @@ mod tests {
     }
 
     #[test]
-    fn current_v9_oracle_contract_identity_is_pinned() {
+    fn retained_v9_oracle_contract_is_exact_but_never_current() {
+        let contract = OracleVersionContract {
+            schema_version: 9,
+            tantivy_version: ORACLE_V8_TANTIVY_VERSION.to_owned(),
+            tantivy_source: ORACLE_V8_TANTIVY_SOURCE.to_owned(),
+            tantivy_checksum_sha256: ORACLE_V8_TANTIVY_CHECKSUM_SHA256.to_owned(),
+            lexical_package: ORACLE_V8_LEXICAL_PACKAGE.to_owned(),
+            lexical_package_version: ORACLE_V9_LEXICAL_PACKAGE_VERSION.to_owned(),
+            lexical_contract_audit_revision: ORACLE_V9_LEXICAL_CONTRACT_AUDIT_REVISION.to_owned(),
+        };
+        contract.validate_retained_structure().expect("retained v9");
+        assert!(contract.validate_stored_structure().is_err());
+        assert!(contract.validate_current_dependency().is_err());
+        assert_eq!(
+            contract.identity_sha256().expect("retained identity"),
+            "eb81f46da35c3250da4273c25b68834261311d48b453a8b481410b0e2004104f",
+            "v9 retains the original 0.3.0 wrapper identity",
+        );
+        let encoded = serde_json::to_value(&contract).expect("serialize v9");
+        for (field, value) in [
+            ("schema_version", serde_json::json!(10)),
+            ("tantivy_version", serde_json::json!("0.26.1")),
+            (
+                "tantivy_source",
+                serde_json::json!("git+https://example.invalid/tantivy"),
+            ),
+            ("tantivy_checksum_sha256", serde_json::json!("0".repeat(64))),
+            ("lexical_package", serde_json::json!("lookalike-lexical")),
+            (
+                "lexical_package_version",
+                serde_json::json!(ORACLE_V10_LEXICAL_PACKAGE_VERSION),
+            ),
+            (
+                "lexical_contract_audit_revision",
+                serde_json::json!(ORACLE_V10_LEXICAL_CONTRACT_AUDIT_REVISION),
+            ),
+        ] {
+            let mut mutated = encoded.clone();
+            mutated[field] = value;
+            let mutated: OracleVersionContract = serde_json::from_value(mutated).unwrap();
+            assert!(
+                mutated.validate_retained_structure().is_err(),
+                "v9 accepted {field}"
+            );
+            assert!(mutated.identity_sha256().is_err(), "v9 hashed {field}");
+            assert!(
+                mutated.validate_current_dependency().is_err(),
+                "v9 admitted {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_v10_oracle_contract_identity_is_pinned() {
         let contract = oracle_version_contract().expect("valid oracle contract");
-        assert_eq!(contract.schema_version, 9);
+        assert_eq!(contract.schema_version, 10);
         assert_eq!(
             contract.identity_sha256().expect("current identity"),
-            "eb81f46da35c3250da4273c25b68834261311d48b453a8b481410b0e2004104f",
-            "v9 binds the 0.3.0 wrapper without relabeling any historical record",
+            "122d5b694c66dd359af3e2c670a06e046e1cd39b4a2488f455413ea15e21b0ed",
+            "v10 binds 0.3.1 without changing any archived identity",
         );
+        let mut relabeled = contract.clone();
+        relabeled.schema_version = 9;
+        assert!(relabeled.validate_retained_structure().is_err());
+        relabeled = contract;
+        relabeled.lexical_package_version = ORACLE_V9_LEXICAL_PACKAGE_VERSION.to_owned();
+        assert!(relabeled.validate_current_dependency().is_err());
     }
 
     #[test]

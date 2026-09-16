@@ -48,6 +48,20 @@ pub fn ensure_default_semantic_models(
     ensure_materialized_semantic_models(&root, &manifests)
 }
 
+/// Inspect the bundled defaults without writing files or reading embedded weights.
+///
+/// A current receipt for every default model permits semantic execution without
+/// another materialization process, including on a read-only model cache.
+///
+/// # Errors
+///
+/// Returns an error if the explicit model root cannot be resolved.
+pub fn default_semantic_models_are_materialized(model_root: &Path) -> SearchResult<bool> {
+    let root = resolve_install_root(Some(model_root))?;
+    let manifests = [ModelManifest::potion_128m(), ModelManifest::minilm_v2()];
+    Ok(cached_materialization_summary(&root, &manifests)?.is_some())
+}
+
 fn ensure_materialized_semantic_models(
     root: &Path,
     manifests: &[ModelManifest],

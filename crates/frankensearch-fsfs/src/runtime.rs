@@ -12,18 +12,21 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
-use asupersync::fs::{
-    read as async_file_read, read_to_string as async_file_read_to_string,
-    remove_file as async_file_remove,
-};
-use asupersync::runtime::{RuntimeBuilder, spawn_blocking};
+#[cfg(unix)]
+use asupersync::fs::remove_file as async_file_remove;
+use asupersync::fs::{read as async_file_read, read_to_string as async_file_read_to_string};
+#[cfg(unix)]
+use asupersync::runtime::RuntimeBuilder;
+use asupersync::runtime::spawn_blocking;
 use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
@@ -39,6 +42,8 @@ use frankensearch_embed::FastEmbedEmbedder;
 use frankensearch_embed::HashEmbedder;
 #[cfg(feature = "semantic-support")]
 use frankensearch_embed::Model2VecEmbedder;
+#[cfg(feature = "embedded-models")]
+use frankensearch_embed::bundled_default_models::default_semantic_models_are_materialized;
 #[cfg(feature = "embedded-models")]
 use frankensearch_embed::ensure_default_semantic_models;
 use frankensearch_embed::{
@@ -59,20 +64,25 @@ use frankensearch_storage::{
     EmbeddingVectorSink, IngestRequest, IngestResult, JobQueueConfig, PersistentJobQueue,
     PipelineConfig, Storage, StorageBackedJobRunner, StorageConfig as PipelineStorageConfig,
 };
+#[cfg(unix)]
 use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
 use ftui_core::event::{Event, KeyCode, Modifiers};
 use ftui_extras::markdown::{
     MarkdownDetection, MarkdownRenderer, MarkdownTheme, is_likely_markdown,
 };
 use ftui_layout::{Constraint, Flex};
+#[cfg(unix)]
 use ftui_render::buffer::Buffer;
 use ftui_render::cell::PackedRgba;
+#[cfg(unix)]
 use ftui_render::diff::BufferDiff;
 use ftui_render::frame::Frame;
+#[cfg(unix)]
 use ftui_render::grapheme_pool::GraphemePool;
 use ftui_style::Style;
 use ftui_text::search::search_ascii_case_insensitive;
 use ftui_text::{Line, Span, Text, WrapMode};
+#[cfg(unix)]
 use ftui_tty::{TtyBackend, TtySessionOptions};
 use ftui_widgets::{
     Widget,
@@ -4676,7 +4686,13 @@ pub struct FsfsRuntime {
     quality_load_gate: Arc<asupersync::sync::Mutex<QualityEmbedderSlot>>,
     #[cfg(feature = "rerank")]
     native_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
+    #[cfg(feature = "embedded-models")]
+    bundled_model_materializer: Option<PathBuf>,
 }
+
+/// Private CLI entry point used to extract embedded weights in a short-lived process.
+#[cfg(feature = "embedded-models")]
+pub const BUNDLED_MODEL_MATERIALIZER_FLAG: &str = "--internal-materialize-bundled-models";
 
 impl FsfsRuntime {
     #[must_use]
@@ -4691,7 +4707,20 @@ impl FsfsRuntime {
             )),
             #[cfg(feature = "rerank")]
             native_blocking_pool: None,
+            #[cfg(feature = "embedded-models")]
+            bundled_model_materializer: None,
         }
+    }
+
+    /// Use the supplied fsfs executable to materialize embedded weights before loading them.
+    ///
+    /// The CLI supplies its own executable explicitly. Library callers retain
+    /// in-process materialization unless they opt into this process boundary.
+    #[cfg(feature = "embedded-models")]
+    #[must_use]
+    pub fn with_bundled_model_materializer(mut self, executable: PathBuf) -> Self {
+        self.bundled_model_materializer = Some(executable);
+        self
     }
 
     /// Attach the caller's existing pool for native quality and reranking.
@@ -6535,6 +6564,8 @@ impl FsfsRuntime {
         cx: &Cx,
         shutdown: Option<&ShutdownCoordinator>,
     ) -> SearchResult<()> {
+        #[cfg(not(unix))]
+        let _ = shutdown;
         #[cfg(unix)]
         if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
             return self.run_search_serve_socket_command(cx, shutdown).await;
@@ -15867,6 +15898,37 @@ impl FsfsRuntime {
     #[cfg(feature = "embedded-models")]
     fn prepare_bundled_semantic_models_for_execution(&self) -> SearchResult<()> {
         let model_root = PathBuf::from(&self.config.indexing.model_dir);
+        if let Some(executable) = &self.bundled_model_materializer {
+            if default_semantic_models_are_materialized(&model_root)? {
+                return Ok(());
+            }
+            // Reading include_bytes weights faults their pages into this process.
+            // Extract in a child and reap it before loading inference models, so
+            // a first-run install does not retain those pages in the parent RSS.
+            let status = std::process::Command::new(executable)
+                .arg(BUNDLED_MODEL_MATERIALIZER_FLAG)
+                .arg(&model_root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .status()?;
+            if !status.success() {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "fsfs.bundled_model_materializer",
+                    source: Box::new(std::io::Error::other(format!(
+                        "bundled model materializer exited with {status}"
+                    ))),
+                });
+            }
+            if !default_semantic_models_are_materialized(&model_root)? {
+                return Err(SearchError::InvalidConfig {
+                    field: "bundled_models.materializer_receipts".to_owned(),
+                    value: model_root.display().to_string(),
+                    reason: "materializer exited without current verified bundled models"
+                        .to_owned(),
+                });
+            }
+            return Ok(());
+        }
         let summary = ensure_default_semantic_models(Some(&model_root))?;
         if summary.models_written > 0 {
             info!(
@@ -19902,12 +19964,14 @@ impl Drop for TerminalRenderGuard {
     }
 }
 
+#[cfg(unix)]
 struct FtuiSession {
     backend: TtyBackend,
     grapheme_pool: GraphemePool,
     previous_buffer: Option<Buffer>,
 }
 
+#[cfg(unix)]
 impl FtuiSession {
     fn enter() -> SearchResult<Self> {
         let options = TtySessionOptions {
@@ -19918,14 +19982,8 @@ impl FtuiSession {
                 ..BackendFeatures::default()
             },
         };
-        #[cfg(unix)]
         let backend = TtyBackend::open(80, 24, options)
             .map_err(|error| tui_subsystem_error("fsfs.tui.ftui", error.to_string()))?;
-        #[cfg(not(unix))]
-        let backend = {
-            let _ = options;
-            TtyBackend::new(80, 24)
-        };
         Ok(Self {
             backend,
             grapheme_pool: GraphemePool::new(),
@@ -19966,6 +20024,33 @@ impl FtuiSession {
     }
 }
 
+// ftui-tty has no non-Unix backend. An uninhabited session makes successful
+// entry impossible, so callers use their existing ANSI rendering path.
+#[cfg(not(unix))]
+enum FtuiSession {}
+
+#[cfg(not(unix))]
+impl FtuiSession {
+    fn enter() -> SearchResult<Self> {
+        Err(SearchError::SubsystemError {
+            subsystem: "fsfs.tui.ftui",
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the native terminal backend is only available on Unix",
+            )),
+        })
+    }
+
+    fn render(&mut self, _renderer: impl FnOnce(&mut Frame)) -> SearchResult<()> {
+        match *self {}
+    }
+
+    fn poll_event(&mut self, _timeout: Duration) -> SearchResult<Option<Event>> {
+        match *self {}
+    }
+}
+
+#[cfg(unix)]
 fn tui_subsystem_error(subsystem: &'static str, message: String) -> SearchError {
     SearchError::SubsystemError {
         subsystem,
@@ -24000,6 +24085,24 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::future::{Future, poll_fn};
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_native_terminal_selects_ansi_fallback() {
+        let Err(frankensearch_core::SearchError::SubsystemError { subsystem, source }) =
+            super::FtuiSession::enter()
+        else {
+            panic!("a non-Unix native terminal must not report successful entry");
+        };
+        assert_eq!(subsystem, "fsfs.tui.ftui");
+        assert_eq!(
+            source
+                .downcast_ref::<std::io::Error>()
+                .expect("terminal entry preserves its typed I/O error")
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
 
     #[test]
     fn interactive_model_provisioning_offers_only_on_a_table_tty_with_missing_models() {
@@ -35679,11 +35782,13 @@ mod tests {
         let mut config = FsfsConfig::default();
         config.indexing.model_dir = absent_model_root.display().to_string();
         config.storage.db_path = temp.path().join("absent.db").display().to_string();
-        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
-            command: CliCommand::Status,
-            index_dir: Some(absent_index_root.clone()),
-            ..CliInput::default()
-        });
+        let runtime = FsfsRuntime::new(config)
+            .with_bundled_model_materializer(temp.path().join("missing-executable"))
+            .with_cli_input(CliInput {
+                command: CliCommand::Status,
+                index_dir: Some(absent_index_root.clone()),
+                ..CliInput::default()
+            });
 
         for _ in 0..2 {
             runtime
@@ -35725,11 +35830,13 @@ mod tests {
         let mut config = FsfsConfig::default();
         config.indexing.model_dir = corrupt_model_root.display().to_string();
         config.storage.db_path = temp.path().join("corrupt.db").display().to_string();
-        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
-            command: CliCommand::Doctor,
-            index_dir: Some(corrupt_index_root.clone()),
-            ..CliInput::default()
-        });
+        let runtime = FsfsRuntime::new(config)
+            .with_bundled_model_materializer(temp.path().join("missing-executable"))
+            .with_cli_input(CliInput {
+                command: CliCommand::Doctor,
+                index_dir: Some(corrupt_index_root.clone()),
+                ..CliInput::default()
+            });
         for _ in 0..2 {
             runtime
                 .collect_status_payload()
@@ -35762,6 +35869,26 @@ mod tests {
 
     #[test]
     #[cfg(feature = "embedded-models")]
+    fn bundled_materializer_spawn_failure_does_not_fall_back_to_parent_extraction() {
+        let temp = tempfile::tempdir().expect("private materializer fixture");
+        let model_root = temp.path().join("models");
+        let mut config = FsfsConfig::default();
+        config.indexing.model_dir = model_root.display().to_string();
+        let runtime = FsfsRuntime::new(config)
+            .with_bundled_model_materializer(temp.path().join("missing-executable"));
+
+        let error = runtime
+            .prepare_bundled_semantic_models_for_execution()
+            .expect_err("missing materializer must fail before inference");
+        assert!(matches!(error, SearchError::Io(_)));
+        assert!(
+            !model_root.exists(),
+            "failed child must not extract in parent"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-models")]
     fn bundled_semantic_models_materialize_once_at_execution() {
         let temp = tempfile::tempdir().expect("tempdir");
         let model_root = temp.path().join("models");
@@ -35779,6 +35906,8 @@ mod tests {
         verify_dir_cached(&quality_manifest, &model_root.join("all-MiniLM-L6-v2"))
             .expect("quality model has a current verified receipt");
         let first_install = verified_model_install_snapshot(&model_root);
+        let runtime =
+            runtime.with_bundled_model_materializer(temp.path().join("missing-executable"));
 
         runtime
             .resolve_quality_embedder()

@@ -31,6 +31,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU64;
 
 use ahash::AHashMap;
@@ -40,6 +41,7 @@ use frankensearch_core::generation::EmbeddingSpaceIdentityV1;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use half::f16;
 use rayon::prelude::*;
+#[cfg(any(test, target_os = "linux"))]
 use sha2::{Digest, Sha256};
 
 use crate::search::{ClassifiedHits, PARALLEL_CHUNK_SIZE, SearchParams};
@@ -66,22 +68,27 @@ const EXACT_RESIDUAL_ADAPTIVE_PROBE_GROUPS: usize = 32;
 /// Bound generation-name collision retries while publishing an optional cache
 /// artifact. Discovery has separate fixed entry and comparison budgets; if
 /// either is exhausted, the optional cache simply remains unavailable.
+#[cfg(target_os = "linux")]
 const EXACT_RESIDUAL_CACHE_ATTEMPTS: usize = 64;
 /// Bound every optional-cache directory walk, including unrelated entries.
 /// Reaching this fixed limit rejects the cache as unavailable for this open;
 /// publication is skipped rather than making an unbounded directory a source
 /// of source-derived allocation or I/O.
+#[cfg(target_os = "linux")]
 const EXACT_RESIDUAL_CACHE_DIRECTORY_ENTRY_LIMIT: usize = 256;
 /// Bound the number of descriptor-stream comparisons after a candidate passes
 /// the fixed-header admission. This remains above the prior sixty-four-entry
 /// regression while preventing a cache full of tiny corrupt siblings from
 /// turning a product open into unbounded repeated work.
+#[cfg(target_os = "linux")]
 const EXACT_RESIDUAL_CACHE_COMPARISON_CANDIDATE_LIMIT: usize = 128;
 /// Bound the total bytes that descriptor-stream comparison can read during one
 /// product open. The cap admits one maximum-sized sidecar, but never 1024 of
 /// them. Exhaustion is an optional-cache miss and skips publication.
+#[cfg(target_os = "linux")]
 const EXACT_RESIDUAL_CACHE_COMPARISON_BYTE_BUDGET: usize = EXACT_RESIDUAL_SIDECAR_MAX_BYTES;
 
+#[cfg(target_os = "linux")]
 static EXACT_RESIDUAL_CACHE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -167,6 +174,7 @@ fn exact_residual_sidecar_build_count() -> usize {
 struct ExactResidualLayout {
     groups: usize,
     blocks: usize,
+    #[cfg(any(test, target_os = "linux"))]
     permutation_len: usize,
     centroid_len: usize,
     residual_len: usize,
@@ -174,6 +182,7 @@ struct ExactResidualLayout {
     lane_len: usize,
     #[cfg(test)]
     payload_bytes: usize,
+    #[cfg(any(test, target_os = "linux"))]
     encoded_bytes: usize,
 }
 
@@ -217,6 +226,7 @@ struct ResidualQueryTransform {
     f32_flat_envelope_is_finite: bool,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExactResidualPublication {
     Published,
@@ -290,6 +300,7 @@ impl ExactResidualLayout {
         Ok(Self {
             groups,
             blocks,
+            #[cfg(any(test, target_os = "linux"))]
             permutation_len,
             centroid_len,
             residual_len,
@@ -297,6 +308,7 @@ impl ExactResidualLayout {
             lane_len,
             #[cfg(test)]
             payload_bytes,
+            #[cfg(any(test, target_os = "linux"))]
             encoded_bytes,
         })
     }
@@ -333,6 +345,7 @@ impl ResidualSourceBinding {
 /// beat the current exact cutoff.
 #[derive(Clone, Debug)]
 struct ExactResidualSidecar {
+    #[cfg(any(test, target_os = "linux"))]
     source: ResidualSourceBinding,
     count: usize,
     dimension: usize,
@@ -368,6 +381,7 @@ impl ExactResidualSidecar {
             && self.lanes == EXACT_RESIDUAL_LANES
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     fn validated_layout(&self) -> SearchResult<ExactResidualLayout> {
         let layout = ExactResidualLayout::for_shape(self.count, self.dimension)?;
         if self.permutation.len() != layout.permutation_len
@@ -561,6 +575,7 @@ impl ExactResidualSidecar {
 
     /// Validate the fixed metadata that binds a sidecar header to its source.
     /// The caller separately validates the exact shape and whole-file digest.
+    #[cfg(any(test, target_os = "linux"))]
     fn header_matches_source(
         header: &[u8],
         source: &ResidualSourceBinding,
@@ -716,11 +731,13 @@ fn write_exact_residual_sidecar_stream(
         .map_err(|error| residual_sidecar_error("publish", &error.to_string()))
 }
 
+#[cfg(any(test, target_os = "linux"))]
 struct SidecarCursor<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 impl<'a> SidecarCursor<'a> {
     const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
@@ -1234,17 +1251,6 @@ fn publish_exact_residual_sidecar(
 ) -> SearchResult<ExactResidualPublication> {
     let capability = acquire_exact_residual_sidecar_publication(path)?;
     publish_exact_residual_sidecar_with_capability(capability, sidecar)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn publish_exact_residual_sidecar(
-    _path: &Path,
-    _sidecar: &ExactResidualSidecar,
-) -> SearchResult<ExactResidualPublication> {
-    Err(residual_sidecar_error(
-        "platform",
-        "exact residual sidecar publication requires Linux descriptor APIs",
-    ))
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -1925,6 +1931,7 @@ impl InMemoryVectorIndex {
             Ok(ExactResidualPublication::DestinationExists) => {}
             Err(_) => return Ok(index),
         }
+        #[cfg(target_os = "linux")]
         for _ in 0..EXACT_RESIDUAL_CACHE_ATTEMPTS {
             let Ok(candidate) = index.next_exact_residual_sidecar_cache_path(cache_dir) else {
                 break;
@@ -1941,9 +1948,12 @@ impl InMemoryVectorIndex {
                 Err(_) => break,
             }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = sidecar;
         Ok(index)
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     fn exact_residual_generation_cache_prefix(&self) -> SearchResult<String> {
         let source = self.residual_source_binding.as_ref().ok_or_else(|| {
             residual_sidecar_error(
@@ -1982,6 +1992,7 @@ impl InMemoryVectorIndex {
         Ok(prefix)
     }
 
+    #[cfg(target_os = "linux")]
     fn next_exact_residual_sidecar_cache_path(&self, cache_dir: &Path) -> SearchResult<PathBuf> {
         let prefix = self.exact_residual_generation_cache_prefix()?;
         let nonce = EXACT_RESIDUAL_CACHE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2384,6 +2395,10 @@ impl InMemoryVectorIndex {
                 "exact residual sidecars require an admitted FSVI v2 source generation",
             )
         })?;
+        // Every platform requires source admission; persistence retains the
+        // binding only where the descriptor-based codec is supported.
+        #[cfg(not(any(test, target_os = "linux")))]
+        let _ = source;
         let count = self.record_count();
         let dimension = self.dimension;
         let layout = ExactResidualLayout::for_shape(count, dimension)?;
@@ -2515,6 +2530,7 @@ impl InMemoryVectorIndex {
             }
         }
         Ok(ExactResidualSidecar {
+            #[cfg(any(test, target_os = "linux"))]
             source,
             count,
             dimension,

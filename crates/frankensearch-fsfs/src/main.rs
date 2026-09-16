@@ -126,6 +126,23 @@ fn main() {
 
 #[allow(clippy::too_many_lines)]
 fn run(args: Vec<String>) -> SearchResult<()> {
+    #[cfg(feature = "embedded-models")]
+    if args
+        .first()
+        .is_some_and(|arg| arg == frankensearch_fsfs::runtime::BUNDLED_MODEL_MATERIALIZER_FLAG)
+    {
+        if args.len() != 2 || args[1].is_empty() {
+            return Err(SearchError::InvalidConfig {
+                field: "bundled_models.materializer_arguments".to_owned(),
+                value: args.len().to_string(),
+                reason: "the bundled model materializer requires exactly one model directory"
+                    .to_owned(),
+            });
+        }
+        frankensearch_embed::ensure_default_semantic_models(Some(Path::new(&args[1])))?;
+        return Ok(());
+    }
+
     let mut cli_input = parse_cli_args(args)?;
     let env_map = current_unicode_environment();
     apply_cli_env_overrides(&mut cli_input, &env_map)?;
@@ -232,6 +249,8 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     }
     let cli_quiet = runtime_cli_input.quiet;
     let app_runtime = FsfsRuntime::new(resolved_config).with_cli_input(runtime_cli_input);
+    #[cfg(feature = "embedded-models")]
+    let app_runtime = app_runtime.with_bundled_model_materializer(std::env::current_exe()?);
     let interface_mode = match command {
         CliCommand::Tui => InterfaceMode::Tui,
         _ => InterfaceMode::Cli,

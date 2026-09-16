@@ -4035,3 +4035,83 @@ fn embedded_release_profile_retains_semantic_loaders() {
     );
     assert!(cfg!(feature = "semantic-loaders"));
 }
+
+#[cfg(feature = "embedded-models")]
+#[test]
+fn embedded_materializer_child_verifies_models_and_observers_leave_cache_absent() {
+    use frankensearch_embed::bundled_default_models::default_semantic_models_are_materialized;
+    use frankensearch_fsfs::runtime::BUNDLED_MODEL_MATERIALIZER_FLAG;
+    use std::process::{Command, Stdio};
+
+    let root = tempfile::tempdir().expect("private materializer fixture");
+    let models = root.path().join("models");
+    let binary = env!("CARGO_BIN_EXE_fsfs");
+    for command in ["status", "doctor"] {
+        let output = Command::new(binary)
+            .args([command, "--format", "json", "--index-dir"])
+            .arg(root.path().join("index"))
+            .env("FRANKENSEARCH_MODEL_DIR", &models)
+            .env("FRANKENSEARCH_OFFLINE", "1")
+            .env("FRANKENSEARCH_ALLOW_DOWNLOAD", "0")
+            .env("FRANKENSEARCH_CHECK_UPDATES", "0")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run real observer CLI");
+        assert!(
+            output.status.success(),
+            "{command} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!models.exists(), "{command} materialized bundled models");
+    }
+    let output = Command::new(binary)
+        .arg(BUNDLED_MODEL_MATERIALIZER_FLAG)
+        .arg(&models)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the real materializer child");
+    assert!(
+        output.status.success(),
+        "materializer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "child polluted the command output"
+    );
+    assert!(default_semantic_models_are_materialized(&models).unwrap());
+    for (manifest, directory) in [
+        (
+            frankensearch_embed::ModelManifest::potion_128m(),
+            "potion-multilingual-128M",
+        ),
+        (
+            frankensearch_embed::ModelManifest::minilm_v2(),
+            "all-MiniLM-L6-v2",
+        ),
+    ] {
+        for file in manifest.files {
+            frankensearch_embed::model_manifest::verify_file_sha256(
+                &models.join(directory).join(file.name),
+                &file.sha256,
+                file.size,
+            )
+            .expect("materialized bytes match the published model manifest");
+        }
+    }
+}
+
+#[cfg(feature = "embedded-models")]
+#[test]
+fn embedded_materializer_child_propagates_unwritable_model_root() {
+    let root = tempfile::tempdir().expect("private materializer failure fixture");
+    let obstruction = root.path().join("not-a-directory");
+    std::fs::write(&obstruction, b"preserve this file").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fsfs"))
+        .arg(frankensearch_fsfs::runtime::BUNDLED_MODEL_MATERIALIZER_FLAG)
+        .arg(&obstruction)
+        .output()
+        .expect("run materializer against a real filesystem obstruction");
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read(obstruction).unwrap(), b"preserve this file");
+}

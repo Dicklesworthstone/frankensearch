@@ -1,3 +1,4 @@
+#[cfg(not(windows))]
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -6,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::types::CancelKind;
-use frankensearch_core::{SearchError, SearchResult};
+#[cfg(not(windows))]
+use frankensearch_core::SearchError;
+use frankensearch_core::SearchResult;
 #[cfg(not(windows))]
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 #[cfg(windows)]

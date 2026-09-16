@@ -97,7 +97,7 @@ pub const WRITER_LOCK_RECORD_BYTES: usize = 36;
 ///
 /// The build-time assertion in this module's tests intentionally forces this
 /// value to change when `Cargo.toml` changes.
-pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 3, 0);
+pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 3, 1);
 
 const MANIFEST_MIN_BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 /// v2 images carry the additional `last_publish_unix_s` word after `flags`.
@@ -9680,6 +9680,7 @@ enum RecoveredByteInstallCheckpoint {
     /// The recovered-byte temp file was written and fsynced.
     TempSynced,
     /// The descriptor-bound ready link was created and the directory fsynced.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     StagingSynced,
     /// Immediately before the atomic link/exchange into the canonical name.
     BeforeAtomicInstall,
@@ -9688,6 +9689,7 @@ enum RecoveredByteInstallCheckpoint {
     /// A detected substitution was rolled back by the reverse exchange.
     AfterRollback,
     /// The rollback directory fsync completed.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     AfterRollbackSync,
     /// The replaced corrupt authority was retired to its no-replace quarantine.
     AfterCorruptRetirement,
