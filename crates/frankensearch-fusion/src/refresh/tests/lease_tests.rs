@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::task::{Context, Poll, Wake, Waker};
 
@@ -15,6 +16,49 @@ enum BatchBehavior {
     InvalidPartial,
     Failed,
     Cancelled,
+    Scripted(Arc<BatchScript>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchAction {
+    Pass,
+    Pending,
+    Fail,
+    Empty,
+    MissingMiddle,
+    Extra,
+}
+
+struct BatchScript {
+    calls: Mutex<Vec<Vec<String>>>,
+    actions: Vec<(usize, BatchAction)>,
+}
+
+impl BatchScript {
+    fn shared(action: BatchAction, at: usize) -> Arc<Self> {
+        Self::sequence(&[(at, action)])
+    }
+
+    fn sequence(actions: &[(usize, BatchAction)]) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            actions: actions.to_vec(),
+        })
+    }
+
+    fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.lock().expect("batch log lock").clone()
+    }
+
+    fn record(&self, texts: &[&str]) -> BatchAction {
+        let mut calls = self.calls.lock().expect("batch log lock");
+        let index = calls.len();
+        calls.push(texts.iter().map(|text| (*text).to_owned()).collect());
+        self.actions
+            .iter()
+            .find_map(|(at, action)| (*at == index).then_some(*action))
+            .unwrap_or(BatchAction::Pass)
+    }
 }
 
 struct ControlledEmbedder {
@@ -43,6 +87,31 @@ impl Embedder for ControlledEmbedder {
     ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
         Box::pin(async move {
             match &self.behavior {
+                BatchBehavior::Scripted(script) => {
+                    // record() releases the log mutex before any suspension.
+                    match script.record(texts) {
+                        BatchAction::Pass => self.inner.embed_batch_bound(cx, texts).await,
+                        BatchAction::Pending => std::future::pending().await,
+                        BatchAction::Fail => Err(SearchError::EmbeddingFailed {
+                            model: "scripted-embedder".into(),
+                            source: Box::new(std::io::Error::other("scripted batch failure")),
+                        }),
+                        BatchAction::Empty => Ok(Vec::new()),
+                        BatchAction::MissingMiddle => {
+                            let mut output = self.inner.embed_batch_bound(cx, texts).await?;
+                            if !output.is_empty() {
+                                let middle = output.len() / 2;
+                                let _ = output.remove(middle);
+                            }
+                            Ok(output)
+                        }
+                        BatchAction::Extra => {
+                            let mut output = self.inner.embed_batch_bound(cx, texts).await?;
+                            output.extend(self.inner.embed_batch_bound(cx, texts).await?);
+                            Ok(output)
+                        }
+                    }
+                }
                 BatchBehavior::Pending => std::future::pending().await,
                 BatchBehavior::Gated(ready) => {
                     // Tests explicitly re-poll after opening the gate. No
@@ -59,14 +128,15 @@ impl Embedder for ControlledEmbedder {
                 }
                 BatchBehavior::InvalidPartial => {
                     let mut output = self.inner.embed_batch_bound(cx, texts).await?;
-                    let _ = output.pop();
-                    // One job gets an embedding retry; the remaining record
-                    // passes bind-time validation but fails the writer's
-                    // producer/space join, forcing the rebuild failure path.
+                    // Keep cardinality valid so this still exercises a per-row
+                    // bind failure followed by a distinct rebuild failure.
                     for bound in &mut output {
                         bound.identity = StubEmbedder::new("foreign-space", DIMENSION)
                             .identity_bundle()
                             .clone();
+                    }
+                    if let Some(first) = output.first_mut() {
+                        first.identity.storage.format.clear();
                     }
                     Ok(output)
                 }
@@ -117,7 +187,9 @@ impl Wake for NoopWake {
     fn wake(self: Arc<Self>) {}
 }
 
-fn poll_once(future: Pin<&mut impl Future<Output = SearchResult<usize>>>) -> Poll<SearchResult<usize>> {
+fn poll_once<T>(
+    future: Pin<&mut impl Future<Output = SearchResult<T>>>,
+) -> Poll<SearchResult<T>> {
     let waker = Waker::from(Arc::new(NoopWake));
     future.poll(&mut Context::from_waker(&waker))
 }
@@ -492,4 +564,648 @@ fn fast_provider_cancellation_does_not_consume_retry_budget() {
 #[test]
 fn quality_provider_cancellation_does_not_publish_a_fast_only_replacement() {
     assert_provider_cancellation_retains_work(true);
+}
+
+fn queue_with_batches(capacity: usize, batch_size: usize, max_retries: u32) -> Arc<EmbeddingQueue> {
+    Arc::new(EmbeddingQueue::new(
+        EmbeddingQueueConfig {
+            capacity,
+            batch_size,
+            max_retries,
+        },
+        Box::new(DefaultCanonicalizer::default()),
+    ))
+}
+
+fn submit_documents(queue: &EmbeddingQueue, ids: &[&str]) {
+    for id in ids {
+        submit(queue, id, &format!("payload {id}"));
+    }
+}
+
+fn batch_sizes(script: &BatchScript) -> Vec<usize> {
+    script.calls().iter().map(Vec::len).collect()
+}
+
+#[test]
+fn cycle_bounds_both_model_calls_without_splitting_publication() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = temp_index_dir("bounded-refresh-both-tiers");
+        let queue = queue_with_batches(5, 2, 3);
+        submit_documents(&queue, &["a", "b", "c", "d", "e"]);
+        let cache = make_cache_with_quality(&dir, DIMENSION, DIMENSION);
+        let fast = BatchScript::shared(BatchAction::Pass, 0);
+        let quality = BatchScript::shared(BatchAction::Pass, 0);
+        let worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Scripted(fast.clone()),
+            )),
+            cache.clone(),
+        )
+        .with_quality_embedder(Arc::new(ControlledEmbedder::new(
+            "stub-quality",
+            BatchBehavior::Scripted(quality.clone()),
+        )));
+
+        assert_eq!(worker.run_cycle(&cx).await.expect("bounded cycle"), 5);
+        assert_eq!(batch_sizes(&fast), [2, 2, 1]);
+        assert_eq!(fast.calls(), quality.calls());
+        assert_eq!(
+            fast.calls().concat(),
+            ["payload a", "payload b", "payload c", "payload d", "payload e"]
+        );
+        assert_eq!(cache.current().doc_count(), 5);
+        assert_eq!(queue.outstanding_count(), 0);
+        assert_eq!(queue.metrics().total_batches.load(Ordering::Relaxed), 1);
+        assert_eq!(queue.metrics().total_succeeded.load(Ordering::Relaxed), 5);
+        assert_eq!(worker.metrics().index_rebuilds.load(Ordering::Relaxed), 1);
+    });
+}
+
+#[test]
+fn inference_batch_limit_and_cycle_budget_are_independent() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = temp_index_dir("bounded-refresh-cycle-budget");
+        let queue = queue_with_batches(5, 2, 3);
+        submit_documents(&queue, &["a", "b", "c", "d", "e"]);
+        let cache = make_cache(&dir, DIMENSION);
+        let script = BatchScript::shared(BatchAction::Pass, 0);
+        let worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir).with_max_docs_per_cycle(3),
+            queue.clone(),
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Scripted(script.clone()),
+            )),
+            cache.clone(),
+        );
+
+        assert_eq!(worker.run_cycle(&cx).await.expect("bounded cycle"), 3);
+        assert_eq!(batch_sizes(&script), [2, 1]);
+        assert_eq!(cache.current().doc_count(), 3);
+        let jobs = queue.drain_batch_up_to(5);
+        let ids: Vec<&str> = jobs.iter().map(|job| job.doc_id.as_str()).collect();
+        assert_eq!(ids, ["d", "e"]);
+        assert!(jobs.iter().all(|job| job.retry_count == 0));
+    });
+}
+
+#[test]
+fn zero_inference_batch_size_preserves_work_before_admission() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = temp_index_dir("bounded-refresh-zero-budget");
+        let queue = queue_with_batches(1, 0, 3);
+        submit_documents(&queue, &["a"]);
+        let cache = make_cache(&dir, DIMENSION);
+        let before = cache.current();
+        let script = BatchScript::shared(BatchAction::Pass, 0);
+        let worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Scripted(script.clone()),
+            )),
+            cache.clone(),
+        );
+
+        let error = worker.run_cycle(&cx).await.expect_err("zero batch size");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, .. } if field == "embedding_queue.batch_size"
+        ));
+        assert!(script.calls().is_empty());
+        assert!(Arc::ptr_eq(&before, &cache.current()));
+        assert_eq!(queue.metrics().total_batches.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.in_flight_count(), 0);
+        let jobs = queue.drain_batch_up_to(1);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].retry_count, 0);
+    });
+}
+
+#[test]
+fn failed_inference_chunk_does_not_retry_healthy_chunks() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = temp_index_dir("bounded-refresh-isolated-failure");
+        let queue = queue_with_batches(6, 2, 3);
+        submit_documents(&queue, &["a", "b", "c", "d", "e", "f"]);
+        let cache = make_cache(&dir, DIMENSION);
+        let script = BatchScript::shared(BatchAction::Fail, 1);
+        let worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Scripted(script.clone()),
+            )),
+            cache.clone(),
+        );
+
+        assert_eq!(
+            worker.run_cycle(&cx).await.expect("healthy chunks publish"),
+            4
+        );
+        assert_eq!(batch_sizes(&script), [2, 2, 2]);
+        assert_eq!(cache.current().doc_count(), 4);
+        assert_eq!(queue.metrics().total_succeeded.load(Ordering::Relaxed), 4);
+        assert_eq!(worker.metrics().docs_failed.load(Ordering::Relaxed), 2);
+        let jobs = queue.drain_batch_up_to(6);
+        let ids: Vec<&str> = jobs.iter().map(|job| job.doc_id.as_str()).collect();
+        assert_eq!(ids, ["c", "d"]);
+        assert!(jobs.iter().all(|job| job.retry_count == 1));
+    });
+}
+
+fn assert_later_chunk_cancellation_restores_all_unpublished_work(quality_pending: bool) {
+    asupersync::test_utils::run_test_with_cx(move |cx| async move {
+        let dir = temp_index_dir("bounded-refresh-later-cancellation");
+        let queue = queue_with_batches(5, 2, 3);
+        submit_documents(&queue, &["a", "b", "c", "d", "e"]);
+        let cache = if quality_pending {
+            make_cache_with_quality(&dir, DIMENSION, DIMENSION)
+        } else {
+            make_cache(&dir, DIMENSION)
+        };
+        let fast = BatchScript::shared(
+            if quality_pending {
+                BatchAction::Pass
+            } else {
+                BatchAction::Pending
+            },
+            1,
+        );
+        let quality = BatchScript::shared(BatchAction::Pending, 1);
+        let mut worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Scripted(fast.clone()),
+            )),
+            cache.clone(),
+        );
+        if quality_pending {
+            worker = worker.with_quality_embedder(Arc::new(ControlledEmbedder::new(
+                "stub-quality",
+                BatchBehavior::Scripted(quality.clone()),
+            )));
+        }
+
+        let mut cycle = Box::pin(worker.run_cycle(&cx));
+        assert!(poll_once(cycle.as_mut()).is_pending());
+        assert_eq!(batch_sizes(&fast), [2, 2]);
+        if quality_pending {
+            assert_eq!(batch_sizes(&quality), [2, 2]);
+        }
+        assert_eq!(queue.in_flight_count(), 5);
+        assert_eq!(cache.current().doc_count(), 0);
+        assert_eq!(queue.metrics().total_succeeded.load(Ordering::Relaxed), 0);
+        drop(cycle);
+
+        assert_eq!(queue.in_flight_count(), 0);
+        let jobs = queue.drain_batch_up_to(5);
+        let ids: Vec<&str> = jobs.iter().map(|job| job.doc_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c", "d", "e"]);
+        assert!(jobs.iter().all(|job| job.retry_count == 0));
+        assert_eq!(worker.metrics().index_rebuilds.load(Ordering::Relaxed), 0);
+    });
+}
+
+#[test]
+fn later_fast_chunk_cancellation_restores_earlier_successful_chunks() {
+    assert_later_chunk_cancellation_restores_all_unpublished_work(false);
+}
+
+#[test]
+fn later_quality_chunk_cancellation_restores_earlier_successful_chunks() {
+    assert_later_chunk_cancellation_restores_all_unpublished_work(true);
+}
+
+fn assert_malformed_batch_is_not_published(
+    action: BatchAction,
+    malformed_quality: bool,
+    max_retries: u32,
+) {
+    asupersync::test_utils::run_test_with_cx(move |cx| async move {
+        let dir = temp_index_dir("refresh-batch-cardinality");
+        let queue = queue_with_batches(6, 2, max_retries);
+        submit_documents(&queue, &["a", "b", "c", "d", "e", "f"]);
+        let cache = if malformed_quality {
+            make_cache_with_quality(&dir, DIMENSION, DIMENSION)
+        } else {
+            make_cache(&dir, DIMENSION)
+        };
+        let fast = BatchScript::shared(
+            if malformed_quality {
+                BatchAction::Pass
+            } else {
+                action
+            },
+            1,
+        );
+        let quality = BatchScript::shared(action, 1);
+        let mut worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Scripted(fast.clone()),
+            )),
+            cache.clone(),
+        );
+        if malformed_quality {
+            worker = worker.with_quality_embedder(Arc::new(ControlledEmbedder::new(
+                "stub-quality",
+                BatchBehavior::Scripted(quality.clone()),
+            )));
+        }
+
+        assert_eq!(
+            worker.run_cycle(&cx).await.expect("healthy chunks publish"),
+            4
+        );
+        assert_eq!(batch_sizes(&fast), [2, 2, 2]);
+        if malformed_quality {
+            assert_eq!(fast.calls(), quality.calls());
+        }
+        assert_eq!(cache.current().doc_count(), 4);
+        assert_eq!(worker.metrics().docs_failed.load(Ordering::Relaxed), 2);
+        assert_eq!(worker.metrics().index_rebuilds.load(Ordering::Relaxed), 1);
+        assert_eq!(worker.metrics().rebuild_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.metrics().total_succeeded.load(Ordering::Relaxed), 4);
+        assert_eq!(queue.in_flight_count(), 0);
+        let jobs = queue.drain_batch_up_to(6);
+        if max_retries == 0 {
+            assert!(jobs.is_empty());
+            assert_eq!(queue.metrics().total_failed.load(Ordering::Relaxed), 2);
+        } else {
+            let ids: Vec<&str> = jobs.iter().map(|job| job.doc_id.as_str()).collect();
+            assert_eq!(ids, ["c", "d"]);
+            assert!(jobs.iter().all(|job| job.retry_count == 1));
+        }
+    });
+}
+
+#[test]
+fn malformed_fast_batch_counts_do_not_publish_a_positional_prefix() {
+    for action in [
+        BatchAction::Empty,
+        BatchAction::MissingMiddle,
+        BatchAction::Extra,
+    ] {
+        assert_malformed_batch_is_not_published(action, false, 3);
+    }
+}
+
+#[test]
+fn malformed_quality_batch_counts_do_not_acknowledge_fast_only_success() {
+    for action in [
+        BatchAction::Empty,
+        BatchAction::MissingMiddle,
+        BatchAction::Extra,
+    ] {
+        assert_malformed_batch_is_not_published(action, true, 3);
+    }
+}
+
+#[test]
+fn malformed_batch_retry_exhaustion_does_not_resurrect_rejected_work() {
+    for quality in [false, true] {
+        assert_malformed_batch_is_not_published(BatchAction::MissingMiddle, quality, 0);
+    }
+}
+
+#[test]
+fn cancellation_after_a_malformed_chunk_preserves_each_retry_decision() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = temp_index_dir("refresh-malformed-then-cancelled");
+        let queue = queue_with_batches(6, 2, 3);
+        submit_documents(&queue, &["a", "b", "c", "d", "e", "f"]);
+        let cache = make_cache(&dir, DIMENSION);
+        let script = BatchScript::sequence(&[
+            (0, BatchAction::MissingMiddle),
+            (1, BatchAction::Pending),
+        ]);
+        let worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Scripted(script.clone()),
+            )),
+            cache.clone(),
+        );
+
+        let mut cycle = Box::pin(worker.run_cycle(&cx));
+        assert!(poll_once(cycle.as_mut()).is_pending());
+        assert_eq!(batch_sizes(&script), [2, 2]);
+        assert_eq!(queue.pending_count(), 2);
+        assert_eq!(queue.in_flight_count(), 4);
+        assert_eq!(queue.outstanding_count(), 6);
+        drop(cycle);
+
+        assert_eq!(queue.in_flight_count(), 0);
+        assert_eq!(cache.current().doc_count(), 0);
+        assert_eq!(queue.metrics().total_succeeded.load(Ordering::Relaxed), 0);
+        let jobs = queue.drain_batch_up_to(6);
+        let ids: Vec<&str> = jobs.iter().map(|job| job.doc_id.as_str()).collect();
+        assert_eq!(ids, ["c", "d", "e", "f", "a", "b"]);
+        for job in &jobs {
+            let expected_retries = u32::from(matches!(job.doc_id.as_str(), "a" | "b"));
+            assert_eq!(job.retry_count, expected_retries);
+        }
+        assert_eq!(queue.metrics().total_retryable.load(Ordering::Relaxed), 2);
+        assert_eq!(worker.metrics().docs_failed.load(Ordering::Relaxed), 2);
+        assert_eq!(worker.metrics().rebuild_failures.load(Ordering::Relaxed), 0);
+    });
+}
+
+fn staged_jobs(ids: &[&str]) -> Vec<EmbeddingJob> {
+    let queue = queue_with_batches(ids.len(), 2, 3);
+    submit_documents(&queue, ids);
+    queue.drain_batch_up_to(ids.len())
+}
+
+fn assert_staging_left_queue_untouched(queue: &EmbeddingQueue) {
+    assert_eq!(queue.pending_count(), 1);
+    assert_eq!(queue.in_flight_count(), 0);
+    assert_eq!(queue.metrics().total_batches.load(Ordering::Relaxed), 0);
+    assert_eq!(queue.metrics().total_succeeded.load(Ordering::Relaxed), 0);
+    assert_eq!(queue.metrics().total_retryable.load(Ordering::Relaxed), 0);
+    assert_eq!(queue.metrics().total_failed.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn later_staging_attempt_preserves_prior_artifact_paths_and_bytes() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = temp_index_dir("staging-retained-attempts");
+        let queue = queue_with_batches(8, 2, 3);
+        submit_documents(&queue, &["still-pending"]);
+        let cache = make_cache_with_quality(&dir, DIMENSION, DIMENSION);
+        let canonical_fast = std::fs::read(dir.join(VECTOR_INDEX_FAST_FILENAME)).unwrap();
+        let canonical_quality = std::fs::read(dir.join(VECTOR_INDEX_QUALITY_FILENAME)).unwrap();
+        let worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(StubEmbedder::new("stub-fast", DIMENSION)),
+            cache.clone(),
+        )
+        .with_quality_embedder(Arc::new(StubEmbedder::new("stub-quality", DIMENSION)));
+
+        let first = worker
+            .stage_identity_bound_generation(&cx, &staged_jobs(&["first"]))
+            .await
+            .expect("first stage");
+        let first_fast = std::fs::read(&first.fast_path).unwrap();
+        let first_quality_path = first.quality_path.as_ref().expect("first quality path");
+        let first_quality = std::fs::read(first_quality_path).unwrap();
+        let second = worker
+            .stage_identity_bound_generation(&cx, &staged_jobs(&["second"]))
+            .await
+            .expect("second stage");
+
+        assert_ne!(first.fast_path.parent(), second.fast_path.parent());
+        assert_eq!(first.fast_path.parent(), first_quality_path.parent());
+        assert_eq!(std::fs::read(&first.fast_path).unwrap(), first_fast);
+        assert_eq!(std::fs::read(first_quality_path).unwrap(), first_quality);
+        for (stage, expected) in [(&first, "first"), (&second, "second")] {
+            for owner in [stage.fast_admitted_owner(), stage.quality_admitted_owner()] {
+                let owner = owner.expect("retained admitted owner");
+                assert_eq!(owner.record_count(), 1);
+                assert_eq!(owner.row(0).expect("admitted row").doc_id(), expected);
+            }
+            assert!(matches!(
+                worker.publish_staged_canonical(stage),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "refresh.canonical_publication"
+            ));
+        }
+        assert_eq!(cache.current().doc_count(), 0);
+        assert_eq!(
+            std::fs::read(dir.join(VECTOR_INDEX_FAST_FILENAME)).unwrap(),
+            canonical_fast
+        );
+        assert_eq!(
+            std::fs::read(dir.join(VECTOR_INDEX_QUALITY_FILENAME)).unwrap(),
+            canonical_quality
+        );
+        assert_staging_left_queue_untouched(&queue);
+    });
+}
+
+#[test]
+fn staging_preserves_legacy_flat_artifacts_without_reusing_them() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = temp_index_dir("staging-legacy-flat");
+        let queue = queue_with_batches(8, 2, 3);
+        submit_documents(&queue, &["still-pending"]);
+        let cache = make_cache(&dir, DIMENSION);
+        let root = dir.join(STAGED_V2_DIR_NAME);
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy_fast = root.join(VECTOR_INDEX_FAST_FILENAME);
+        let legacy_quality = root.join(VECTOR_INDEX_QUALITY_FILENAME);
+        std::fs::write(&legacy_fast, b"retained legacy fast artifact").unwrap();
+        std::fs::write(&legacy_quality, b"retained legacy quality artifact").unwrap();
+        let worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(StubEmbedder::new("stub-fast", DIMENSION)),
+            cache,
+        );
+
+        let staged = worker
+            .stage_identity_bound_generation(&cx, &staged_jobs(&["new-document"]))
+            .await
+            .expect("stage does not need to touch legacy artifacts");
+        let attempt = staged.fast_path.parent().expect("attempt directory");
+        assert_eq!(attempt.parent(), Some(root.as_path()));
+        assert_eq!(
+            std::fs::read(legacy_fast).unwrap(),
+            b"retained legacy fast artifact"
+        );
+        assert_eq!(
+            std::fs::read(legacy_quality).unwrap(),
+            b"retained legacy quality artifact"
+        );
+        assert_eq!(staged.index.doc_count(), 1);
+        assert_staging_left_queue_untouched(&queue);
+    });
+}
+
+#[test]
+fn strict_staging_bounds_both_model_calls_without_consuming_queued_work() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = temp_index_dir("staging-bounded-inference");
+        let queue = queue_with_batches(8, 2, 3);
+        submit_documents(&queue, &["still-pending"]);
+        let cache = make_cache_with_quality(&dir, DIMENSION, DIMENSION);
+        let fast = BatchScript::sequence(&[]);
+        let quality = BatchScript::sequence(&[]);
+        let worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Scripted(fast.clone()),
+            )),
+            cache.clone(),
+        )
+        .with_quality_embedder(Arc::new(ControlledEmbedder::new(
+            "stub-quality",
+            BatchBehavior::Scripted(quality.clone()),
+        )));
+
+        let staged = worker
+            .stage_identity_bound_generation(&cx, &staged_jobs(&["a", "b", "c", "d", "e"]))
+            .await
+            .expect("all strict chunks stage together");
+        assert_eq!(batch_sizes(&fast), [2, 2, 1]);
+        assert_eq!(fast.calls(), quality.calls());
+        for owner in [staged.fast_admitted_owner(), staged.quality_admitted_owner()] {
+            let owner = owner.expect("admitted tier");
+            let mut ids = (0..owner.record_count())
+                .map(|index| owner.row(index).expect("row").doc_id().to_owned())
+                .collect::<Vec<_>>();
+            ids.sort();
+            assert_eq!(ids, ["a", "b", "c", "d", "e"]);
+        }
+        assert_eq!(cache.current().doc_count(), 0);
+        assert_staging_left_queue_untouched(&queue);
+    });
+}
+
+fn assert_dropped_staging_does_not_write(quality_pending: bool) {
+    asupersync::test_utils::run_test_with_cx(move |cx| async move {
+        let dir = temp_index_dir("staging-dropped-later-chunk");
+        let queue = queue_with_batches(8, 2, 3);
+        submit_documents(&queue, &["still-pending"]);
+        let cache = make_cache_with_quality(&dir, DIMENSION, DIMENSION);
+        let fast = BatchScript::shared(
+            if quality_pending {
+                BatchAction::Pass
+            } else {
+                BatchAction::Pending
+            },
+            1,
+        );
+        let quality = BatchScript::shared(BatchAction::Pending, 1);
+        let worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Scripted(fast.clone()),
+            )),
+            cache.clone(),
+        )
+        .with_quality_embedder(Arc::new(ControlledEmbedder::new(
+            "stub-quality",
+            BatchBehavior::Scripted(quality.clone()),
+        )));
+        let jobs = staged_jobs(&["a", "b", "c", "d", "e"]);
+        let mut future = Box::pin(worker.stage_identity_bound_generation(&cx, &jobs));
+        assert!(poll_once(future.as_mut()).is_pending());
+        assert_eq!(batch_sizes(&fast), [2, 2]);
+        assert_eq!(
+            batch_sizes(&quality),
+            if quality_pending { vec![2, 2] } else { vec![2] }
+        );
+        assert!(!dir.join(STAGED_V2_DIR_NAME).exists());
+        drop(future);
+        assert!(!dir.join(STAGED_V2_DIR_NAME).exists());
+        assert_eq!(cache.current().doc_count(), 0);
+        assert!(jobs.iter().all(|job| job.retry_count == 0));
+        assert_staging_left_queue_untouched(&queue);
+    });
+}
+
+#[test]
+fn dropped_later_fast_staging_chunk_leaves_no_partial_generation() {
+    assert_dropped_staging_does_not_write(false);
+}
+
+#[test]
+fn dropped_later_quality_staging_chunk_leaves_no_partial_generation() {
+    assert_dropped_staging_does_not_write(true);
+}
+
+#[test]
+fn malformed_later_staging_chunk_never_writes_a_successful_prefix() {
+    for malformed_quality in [false, true] {
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let dir = temp_index_dir("staging-malformed-later-chunk");
+            let queue = queue_with_batches(8, 2, 3);
+            submit_documents(&queue, &["still-pending"]);
+            let cache = make_cache_with_quality(&dir, DIMENSION, DIMENSION);
+            let fast = BatchScript::shared(
+                if malformed_quality {
+                    BatchAction::Pass
+                } else {
+                    BatchAction::MissingMiddle
+                },
+                1,
+            );
+            let quality = BatchScript::shared(BatchAction::MissingMiddle, 1);
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                Arc::new(ControlledEmbedder::new(
+                    "stub-fast",
+                    BatchBehavior::Scripted(fast.clone()),
+                )),
+                cache.clone(),
+            )
+            .with_quality_embedder(Arc::new(ControlledEmbedder::new(
+                "stub-quality",
+                BatchBehavior::Scripted(quality),
+            )));
+            let error = worker
+                .stage_identity_bound_generation(&cx, &staged_jobs(&["a", "b", "c", "d", "e"]))
+                .await
+                .expect_err("strict count mismatch invalidates the whole attempt");
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, .. } if field == "refresh.staged_embedding"
+            ));
+            assert_eq!(batch_sizes(&fast), [2, 2]);
+            assert!(!dir.join(STAGED_V2_DIR_NAME).exists());
+            assert_eq!(cache.current().doc_count(), 0);
+            assert_staging_left_queue_untouched(&queue);
+        });
+    }
+}
+
+#[test]
+fn zero_staging_batch_size_fails_before_inference_or_staging_files() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = temp_index_dir("staging-zero-batch");
+        let queue = queue_with_batches(8, 0, 3);
+        submit_documents(&queue, &["still-pending"]);
+        let cache = make_cache(&dir, DIMENSION);
+        let calls = BatchScript::sequence(&[]);
+        let worker = RefreshWorker::new(
+            RefreshWorkerConfig::new(&dir),
+            queue.clone(),
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Scripted(calls.clone()),
+            )),
+            cache,
+        );
+        let error = worker
+            .stage_identity_bound_generation(&cx, &staged_jobs(&["a"]))
+            .await
+            .expect_err("zero batch size is invalid");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, .. } if field == "embedding_queue.batch_size"
+        ));
+        assert!(calls.calls().is_empty());
+        assert!(!dir.join(STAGED_V2_DIR_NAME).exists());
+        assert_staging_left_queue_untouched(&queue);
+    });
 }
