@@ -143,7 +143,10 @@ impl Drop for EmbeddingBatch<'_> {
         // entry must not cause an unacknowledged job to disappear.
         for job in self.jobs.drain(..).rev() {
             if !active.unacknowledged.remove(&job.doc_id)
-                || state.jobs.iter().any(|pending| pending.doc_id == job.doc_id)
+                || state
+                    .jobs
+                    .iter()
+                    .any(|pending| pending.doc_id == job.doc_id)
             {
                 continue;
             }
@@ -349,7 +352,10 @@ mod tests {
         let queue = queue(1);
         submit(&queue, "a", "first");
         let batch = queue.lease_batch();
-        assert_eq!(queue.requeue(batch.jobs()[0].clone()), JobOutcome::Retryable);
+        assert_eq!(
+            queue.requeue(batch.jobs()[0].clone()),
+            JobOutcome::Retryable
+        );
         assert_eq!(queue.in_flight_count(), 0);
         assert_eq!(queue.pending_count(), 1);
         drop(batch);
@@ -382,7 +388,10 @@ mod tests {
         submit(&queue, "a", "first");
         submit(&queue, "b", "second");
         let batch = queue.lease_batch();
-        assert_eq!(queue.requeue(batch.jobs()[0].clone()), JobOutcome::Retryable);
+        assert_eq!(
+            queue.requeue(batch.jobs()[0].clone()),
+            JobOutcome::Retryable
+        );
         assert_eq!(batch.retry_unacknowledged(), 0);
         assert_eq!(queue.metrics().total_retryable.load(Ordering::Relaxed), 2);
         drop(batch);

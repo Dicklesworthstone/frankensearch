@@ -1,6 +1,6 @@
 //! Index refresh worker (asupersync background task).
 //!
-//! [`RefreshWorker`] periodically leases jobs from the [`EmbeddingQueue`],
+//! [`RefreshWorker`] periodically drains the [`EmbeddingQueue`],
 //! embeds documents in batches, and rebuilds the vector index. It runs as an
 //! asupersync task within a structured concurrency region.
 //!
@@ -59,9 +59,8 @@
 //!
 //! # Lifecycle
 //!
-//! Cancellation during inference restores unacknowledged jobs without spending
-//! retry budget. Once synchronous publication starts, it completes before jobs
-//! are acknowledged. Dropping a suspended cycle provides the same recovery.
+//! The worker loops until the parent `Cx` is cancelled. On cancellation it
+//! finishes the current batch before exiting.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -825,11 +824,9 @@ impl std::fmt::Debug for StagedIdentityBoundGeneration {
 ///
 /// # Cancellation
 ///
-/// The worker checks cancellation before leasing, after embedding awaits and
-/// before publication. Provider cancellation is not a retryable embedding
-/// failure or permission to publish a fast-only replacement. Dropping a
-/// suspended cycle restores its unacknowledged leased jobs. The synchronous
-/// rebuild/cache publication section finishes before jobs are acknowledged.
+/// The worker checks `cx.is_cancel_requested()` at each cycle boundary.
+/// When cancelled, it finishes the current batch (no half-written index)
+/// before returning.
 pub struct RefreshWorker {
     config: RefreshWorkerConfig,
     queue: Arc<EmbeddingQueue>,
@@ -945,81 +942,45 @@ impl RefreshWorker {
         }
     }
 
-    /// Check cancellation only outside the synchronous publication section.
-    fn check_refresh_cancellation(cx: &Cx, phase: &str) -> SearchResult<()> {
-        if cx.checkpoint().is_err() || cx.is_cancel_requested() {
-            return Err(SearchError::Cancelled {
-                phase: phase.to_owned(),
-                reason: cx.cancel_reason().map_or_else(
-                    || "refresh checkpoint interrupted".to_owned(),
-                    |reason| reason.to_string(),
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    fn superseded_cache_publication() -> SearchError {
-        SearchError::InvalidConfig {
-            field: "refresh.cache_publication".to_owned(),
-            value: "superseded".to_owned(),
-            reason: "the cached snapshot changed during this refresh; \
-                     pending work was not acknowledged"
-                .to_owned(),
-        }
-    }
-
-    /// Bound each model call independently of the cycle's publication budget.
-    fn inference_batch_size(&self) -> SearchResult<usize> {
-        let size = self.queue.config().batch_size;
-        if size == 0 {
-            return Err(SearchError::InvalidConfig {
-                field: "embedding_queue.batch_size".to_owned(),
-                value: "0".to_owned(),
-                reason: "must be greater than zero".to_owned(),
-            });
-        }
-        Ok(size)
-    }
-
     /// Run a single refresh cycle.
     ///
-    /// Returns the number of documents successfully embedded and installed in
-    /// the cache, or an error if admission, rebuilding or installation failed.
-    /// Unacknowledged jobs remain reserved until installation succeeds; dropping
-    /// this future restores them without consuming retry budget.
+    /// Returns the number of documents successfully embedded, or an error
+    /// if the cycle was refused or the index rebuild itself failed.
     ///
     /// # Errors
     ///
-    /// Returns identity-admission, index creation/writing and cache publication
-    /// errors, or cancellation without consuming retry budget. Individual
-    /// embedding failures use the queue's normal retry policy.
+    /// Returns identity-admission and index creation/writing errors. Embedding
+    /// failures for individual documents are handled via retry (requeue) and
+    /// do not cause the cycle to fail.
     pub async fn run_cycle(&self, cx: &Cx) -> SearchResult<usize> {
-        Self::check_refresh_cancellation(cx, "refresh.run_cycle")?;
-        // Preserve the pre-drain refusal: a permanent admission/publication
-        // barrier must not consume work or retry budget, or start inference.
+        // Avoid opening the index on idle polls, but refuse any inadmissible
+        // or currently-unpublishable replacement BEFORE draining work: a
+        // permanent refusal (identityless v1, foreign space/producer, missing
+        // composite generation authority) must not consume retry budget or
+        // eventually drop the queued documents.
         if self.queue.is_empty() {
             return Ok(0);
         }
-        // Reject an invalid inference budget before reserving jobs or doing I/O.
-        self.inference_batch_size()?;
         self.ensure_canonical_cycle_admissible()?;
 
-        // One reservation covers the complete cycle, including both embedding
-        // awaits and publication. No queue mutex is held across any of them.
-        let batch = self
-            .queue
-            .lease_batch_up_to(self.config.max_docs_per_cycle);
-        if batch.is_empty() {
+        // Drain at most `max_docs_per_cycle` jobs from the queue.
+        let mut all_jobs = Vec::new();
+        let batch_limit = self.config.max_docs_per_cycle;
+
+        while all_jobs.len() < batch_limit {
+            let remaining = batch_limit - all_jobs.len();
+            let batch = self.queue.drain_batch_up_to(remaining);
+            if batch.is_empty() {
+                break;
+            }
+            all_jobs.extend(batch);
+        }
+
+        if all_jobs.is_empty() {
             return Ok(0);
         }
 
-        // A competing cycle may have finished between the first admission check
-        // and our lease acquisition. Never use that earlier classification to
-        // overwrite a generation that has since become non-bootstrap.
-        self.ensure_canonical_cycle_admissible()?;
-        let expected = self.cache.current();
-        let total_jobs = batch.len();
+        let total_jobs = all_jobs.len();
         debug!(
             target: "frankensearch.refresh",
             jobs = total_jobs,
@@ -1027,12 +988,10 @@ impl RefreshWorker {
         );
 
         // Embed all documents, identity-bound at the embedder boundary.
-        let embedded = self.embed_batch(cx, batch.jobs()).await?;
-        Self::check_refresh_cancellation(cx, "refresh.before_publication")?;
+        let embedded = self.embed_batch(cx, &all_jobs).await;
 
         if embedded.is_empty() {
-            // All embeddings failed — nothing to index. Their explicit retry
-            // decisions already released their reservations.
+            // All embeddings failed — nothing to index.
             warn!(
                 target: "frankensearch.refresh",
                 jobs = total_jobs,
@@ -1043,15 +1002,7 @@ impl RefreshWorker {
 
         let embedded_count = embedded.len();
 
-        // Refuse an already-obsolete cycle before touching canonical files.
-        // A second, atomic check at installation handles a race during rebuild.
-        if !Arc::ptr_eq(&expected, &self.cache.current()) {
-            return Err(Self::superseded_cache_publication());
-        }
-
-        // Rebuilding and cache installation are synchronous. Once this section
-        // starts, finish it before acknowledging jobs; never suspend between
-        // installing the accepted snapshot and recording its content hashes.
+        // Rebuild the index.
         let rebuild_start = Instant::now();
         match self.rebuild_index(&embedded) {
             Ok(new_index) => {
@@ -1060,39 +1011,18 @@ impl RefreshWorker {
                 self.metrics
                     .rebuild_time_us
                     .fetch_add(rebuild_us, Ordering::Relaxed);
-
-                // Another cache reload/replacement can run during inference.
-                // Preserve its snapshot rather than unconditionally replacing
-                // it with this older cycle's candidate. This is an in-process
-                // cache fence, not durable composite-generation authority.
-                let installed = self
-                    .cache
-                    .replace_if_current(&expected, new_index)
-                    .and_then(|replaced| {
-                        replaced
-                            .then_some(())
-                            .ok_or_else(Self::superseded_cache_publication)
-                    });
-                if let Err(error) = installed {
-                    self.metrics
-                        .rebuild_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    error!(
-                        target: "frankensearch.refresh",
-                        error = %error,
-                        "cache publication refused; retaining unacknowledged jobs"
-                    );
-                    // Contract refusal and a lost publication race are not
-                    // embedding failures. Lease drop restores these jobs with
-                    // their original retry counts and no successful hash entry.
-                    return Err(error);
-                }
-
                 self.metrics.index_rebuilds.fetch_add(1, Ordering::Relaxed);
+
+                // Record all embedded hashes so the queue can skip unchanged docs.
                 for record in &embedded {
                     self.queue
                         .record_embedded(&record.doc_id, &record.content_hash);
                 }
+
+                // Atomically swap the cached index; a replacement that would
+                // change the cache's path/topology/identity contract is a
+                // typed rejection that keeps the prior index installed.
+                self.cache.replace(new_index)?;
 
                 info!(
                     target: "frankensearch.refresh",
@@ -1108,10 +1038,13 @@ impl RefreshWorker {
                     .rebuild_failures
                     .fetch_add(1, Ordering::Relaxed);
 
-                // Missing/invalid embeddings may already have received a retry
-                // outcome. Retry only still-owned jobs, exactly once, using the
-                // reserved capacity even when new producers filled the queue.
-                let dropped_requeues = batch.retry_unacknowledged();
+                // Requeue all jobs so they aren't lost.
+                let mut dropped_requeues = 0usize;
+                for job in all_jobs {
+                    if !self.requeue_job(job, "index_rebuild_failed") {
+                        dropped_requeues = dropped_requeues.saturating_add(1);
+                    }
+                }
                 if dropped_requeues > 0 {
                     self.metrics.docs_failed.fetch_add(
                         u64::try_from(dropped_requeues).unwrap_or(u64::MAX),
@@ -1131,36 +1064,12 @@ impl RefreshWorker {
         }
     }
 
-    /// Embed one cycle in bounded model calls, preserving submission order.
+    /// Embed a batch of jobs using the fast (and optionally quality)
+    /// embedder, binding every output to its producing identity.
     ///
-    /// The cycle keeps one lease across all chunks and publishes once. A failed
-    /// chunk decides only its own retries; healthy chunks remain unacknowledged
-    /// until publication, including when a later chunk is cancelled. The queue's
-    /// batch size bounds inference independently of `max_docs_per_cycle`.
-    async fn embed_batch(
-        &self,
-        cx: &Cx,
-        jobs: &[EmbeddingJob],
-    ) -> SearchResult<Vec<RefreshRecord>> {
-        let batch_size = self.inference_batch_size()?;
-        let mut records = Vec::with_capacity(jobs.len());
-        for chunk in jobs.chunks(batch_size) {
-            Self::check_refresh_cancellation(cx, "refresh.before_batch")?;
-            records.extend(self.embed_inference_batch(cx, chunk).await?);
-        }
-        Ok(records)
-    }
-
-    /// Embed one bounded batch, binding every output to its producing identity.
-    ///
-    /// Ordinary failures are requeued for retry. Cancellation propagates
-    /// without retrying or degrading a cancelled quality call to fast-only;
-    /// the owning cycle's lease restores unfinished work.
-    async fn embed_inference_batch(
-        &self,
-        cx: &Cx,
-        jobs: &[EmbeddingJob],
-    ) -> SearchResult<Vec<RefreshRecord>> {
+    /// Failed embeddings are requeued for retry. Returns only the
+    /// successfully embedded, identity-bound records.
+    async fn embed_batch(&self, cx: &Cx, jobs: &[EmbeddingJob]) -> Vec<RefreshRecord> {
         let embed_start = Instant::now();
 
         // Collect texts for batch embedding.
@@ -1170,11 +1079,8 @@ impl RefreshWorker {
         // embedder fails here typed (`embedder.identity`), which also means
         // it can no longer publish provenance-free vectors through this
         // worker — that is the C4-write bound-carrier contract.
-        let fast_result = self.fast_embedder.embed_batch_bound(cx, &texts).await;
-        Self::check_refresh_cancellation(cx, "refresh.fast_embedding")?;
-        let fast_bound = match fast_result {
+        let fast_bound = match self.fast_embedder.embed_batch_bound(cx, &texts).await {
             Ok(embeddings) => embeddings,
-            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
             Err(e) => {
                 warn!(
                     target: "frankensearch.refresh",
@@ -1199,26 +1105,17 @@ impl RefreshWorker {
                     u64::try_from(jobs.len()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
                 );
-                return Ok(Vec::new());
+                return Vec::new();
             }
         };
-        if self.reject_malformed_batch(jobs, fast_bound.len(), "fast") {
-            return Ok(Vec::new());
-        }
+        let mut fast_bound: Vec<Option<IdentityBoundEmbedding>> =
+            fast_bound.into_iter().map(Some).collect();
 
         // Quality-tier identity-bound embedding (optional).
         let mut quality_bound: Option<Vec<Option<IdentityBoundEmbedding>>> =
             if let Some(ref quality) = self.quality_embedder {
-                let result = quality.embed_batch_bound(cx, &texts).await;
-                Self::check_refresh_cancellation(cx, "refresh.quality_embedding")?;
-                match result {
-                    Ok(embeddings) => {
-                        if self.reject_malformed_batch(jobs, embeddings.len(), "quality") {
-                            return Ok(Vec::new());
-                        }
-                        Some(embeddings.into_iter().map(Some).collect())
-                    }
-                    Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                match quality.embed_batch_bound(cx, &texts).await {
+                    Ok(embeddings) => Some(embeddings.into_iter().map(Some).collect()),
                     Err(e) => {
                         warn!(
                             target: "frankensearch.refresh",
@@ -1237,10 +1134,28 @@ impl RefreshWorker {
             .embed_time_us
             .fetch_add(embed_us, Ordering::Relaxed);
 
-        // Positional association is admissible only after exact cardinality
-        // checks. A short response may have omitted a MIDDLE input, not a suffix.
+        // Assemble records.
         let mut records = Vec::with_capacity(jobs.len());
-        for (i, (job, fast_ib)) in jobs.iter().zip(fast_bound).enumerate() {
+        for (i, job) in jobs.iter().enumerate() {
+            let Some(fast_ib) = fast_bound.get_mut(i).and_then(Option::take) else {
+                // Embedder returned fewer vectors than inputs — skip this doc
+                // and requeue so it can be retried next cycle.
+                warn!(
+                    target: "frankensearch.refresh",
+                    doc_id = %job.doc_id,
+                    expected = jobs.len(),
+                    "fast embedder returned fewer bound vectors than inputs, requeueing"
+                );
+                if !self.requeue_job(job.clone(), "fast_batch_missing_vector") {
+                    warn!(
+                        target: "frankensearch.refresh",
+                        doc_id = %job.doc_id,
+                        "failed to requeue job after fast embedder returned fewer vectors than expected"
+                    );
+                }
+                self.metrics.docs_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
             let fast_embedding = match into_bound_query(fast_ib) {
                 Ok(bound) => bound,
                 Err(e) => {
@@ -1296,45 +1211,7 @@ impl RefreshWorker {
             .total_embed_time_us
             .fetch_add(embed_us, Ordering::Relaxed);
 
-        Ok(records)
-    }
-
-    /// Reject the whole inference chunk if positional correspondence is unknown.
-    ///
-    /// Missing or extra outputs cannot be assigned to input documents safely.
-    /// Retry this chunk only, including malformed quality responses: silently
-    /// publishing fast-only here would acknowledge work whose quality output
-    /// never satisfied the batch contract. Cancellation is checked before this
-    /// method, so it never spends retry budget for a cancelled model call.
-    fn reject_malformed_batch(
-        &self,
-        jobs: &[EmbeddingJob],
-        returned: usize,
-        tier: &'static str,
-    ) -> bool {
-        if returned == jobs.len() {
-            return false;
-        }
-
-        let mut dropped_requeues = 0usize;
-        for job in jobs {
-            if !self.requeue_job(job.clone(), "batch_cardinality_mismatch") {
-                dropped_requeues = dropped_requeues.saturating_add(1);
-            }
-        }
-        self.metrics.docs_failed.fetch_add(
-            u64::try_from(jobs.len()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        warn!(
-            target: "frankensearch.refresh",
-            tier,
-            expected = jobs.len(),
-            returned,
-            dropped_requeues,
-            "discarding malformed embedding batch before associating vectors with documents"
-        );
-        true
+        records
     }
 
     fn requeue_job(&self, job: EmbeddingJob, reason: &'static str) -> bool {
@@ -1616,27 +1493,9 @@ impl RefreshWorker {
         cx: &Cx,
         jobs: &[EmbeddingJob],
     ) -> SearchResult<Vec<RefreshRecord>> {
-        let batch_size = self.inference_batch_size()?;
-        let mut records = Vec::with_capacity(jobs.len());
-        for chunk in jobs.chunks(batch_size) {
-            Self::check_refresh_cancellation(cx, "refresh.staged_before_batch")?;
-            records.extend(self.embed_staged_batch_strict(cx, chunk).await?);
-        }
-        Ok(records)
-    }
-
-    /// Strict inference for one bounded chunk. A failure invalidates the
-    /// whole staging attempt; no prefix is written or acknowledged.
-    async fn embed_staged_batch_strict(
-        &self,
-        cx: &Cx,
-        jobs: &[EmbeddingJob],
-    ) -> SearchResult<Vec<RefreshRecord>> {
         let embed_start = Instant::now();
         let texts: Vec<&str> = jobs.iter().map(|j| j.canonical_text.as_str()).collect();
-        let fast_result = self.fast_embedder.embed_batch_bound(cx, &texts).await;
-        Self::check_refresh_cancellation(cx, "refresh.staged_fast_embedding")?;
-        let fast_bound = fast_result?;
+        let fast_bound = self.fast_embedder.embed_batch_bound(cx, &texts).await?;
         if fast_bound.len() != jobs.len() {
             return Err(SearchError::InvalidConfig {
                 field: "refresh.staged_embedding".to_owned(),
@@ -1650,9 +1509,7 @@ impl RefreshWorker {
         }
         let quality_bound = match &self.quality_embedder {
             Some(quality) => {
-                let quality_result = quality.embed_batch_bound(cx, &texts).await;
-                Self::check_refresh_cancellation(cx, "refresh.staged_quality_embedding")?;
-                let bound = quality_result?;
+                let bound = quality.embed_batch_bound(cx, &texts).await?;
                 if bound.len() != jobs.len() {
                     return Err(SearchError::InvalidConfig {
                         field: "refresh.staged_embedding".to_owned(),
@@ -1694,39 +1551,6 @@ impl RefreshWorker {
         Ok(records)
     }
 
-    /// Allocate a fresh non-canonical attempt directory without reusing or
-    /// removing any prior artifact. Exclusive directory creation handles
-    /// collisions; the nonce is uniqueness material, not an authority token.
-    /// Failed attempts are retained for explicit cleanup, never deleted here.
-    fn allocate_staging_directory(&self) -> SearchResult<PathBuf> {
-        let root = self.config.index_dir.join(STAGED_V2_DIR_NAME);
-        std::fs::create_dir_all(&root).map_err(SearchError::Io)?;
-        for attempt in 0_u64..16 {
-            let nonce = generation_nonce(&self.config.index_dir, "staged-directory", attempt);
-            let path = root.join(format!("attempt-{}", fingerprint_hex(&nonce)));
-            let result = {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt as _;
-                    std::fs::DirBuilder::new().mode(0o700).create(&path)
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::create_dir(&path)
-                }
-            };
-            match result {
-                Ok(()) => return Ok(path),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(SearchError::Io(error)),
-            }
-        }
-        Err(SearchError::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate an unused staging directory after 16 attempts",
-        )))
-    }
-
     /// Stage the typed identity-bound replacement generation — the merge
     /// that replaces the former blanket refusal (bd-9xuj T2 C4-write).
     ///
@@ -1740,10 +1564,8 @@ impl RefreshWorker {
     /// [`require_same_producer`]), merges the carried live rows with the new
     /// records (new wins per `doc_id`; tombstoned rows are never
     /// resurrected), and writes the replacement via
-    /// [`VectorIndex::create_v2`] into a fresh attempt directory under
-    /// non-canonical `v2-staged/`. Prior attempts and legacy flat staging
-    /// files are never overwritten or removed. The staged pair is re-admitted
-    /// through
+    /// [`VectorIndex::create_v2`] into the non-canonical `v2-staged/`
+    /// directory. The staged pair is then re-admitted through
     /// [`TwoTierIndex::open_admitted_v2_with_paths`], so the returned
     /// generation's identity is proven from its own header bytes.
     ///
@@ -1751,9 +1573,6 @@ impl RefreshWorker {
     /// drained, no content hash is recorded, and the canonical generation's
     /// bytes are not modified. Canonical installation is a separate,
     /// currently-refused step ([`Self::publish_staged_canonical`]).
-    /// Failed attempts may leave isolated files; cleanup is explicit and is
-    /// not part of this operation. Per-attempt isolation is not canonical
-    /// publication authority or a garbage-collection policy.
     ///
     /// # Errors
     ///
@@ -1765,8 +1584,6 @@ impl RefreshWorker {
         cx: &Cx,
         jobs: &[EmbeddingJob],
     ) -> SearchResult<StagedIdentityBoundGeneration> {
-        Self::check_refresh_cancellation(cx, "refresh.staged_before_admission")?;
-        self.inference_batch_size()?;
         // 1+3 (merged in r2). Gates over the existing canonical generation
         //    (typed refusals, fast-first, identical to the canonical lane)
         //    AND exact admission of the existing attested tiers in the same
@@ -1784,7 +1601,6 @@ impl RefreshWorker {
 
         // 2. Harvest identity-bound records (strict; no queue interaction).
         let records = self.embed_jobs_bound_strict(cx, jobs).await?;
-        Self::check_refresh_cancellation(cx, "refresh.staged_before_merge")?;
 
         // 4. Per-embedding seam verification (C1r2 verifiers): each bound
         //    embedding must be the same producer as the identity being
@@ -1901,10 +1717,12 @@ impl RefreshWorker {
         }
 
         // 6. Write the staged replacement via the production v2 writer.
-        Self::check_refresh_cancellation(cx, "refresh.staged_before_write")?;
-        let staged_dir = self.allocate_staging_directory()?;
+        let staged_dir = self.config.index_dir.join(STAGED_V2_DIR_NAME);
+        std::fs::create_dir_all(&staged_dir).map_err(SearchError::Io)?;
         let staged_fast = staged_dir.join(VECTOR_INDEX_FAST_FILENAME);
         let staged_quality = staged_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let _ = std::fs::remove_file(&staged_fast);
+        let _ = std::fs::remove_file(&staged_quality);
 
         // Both staged tiers carry ONE publication nonce, the successor of
         // the admitted destination pair's (mirroring the v1 publish_tier
@@ -2058,8 +1876,6 @@ mod tests {
     use super::*;
     use crate::cache::SentinelFileDetector;
     use crate::queue::{EmbeddingQueueConfig, EmbeddingRequest, JobOutcome};
-
-    mod lease_tests;
 
     // -- Stub embedders for tests ----------------------------------------------
 
