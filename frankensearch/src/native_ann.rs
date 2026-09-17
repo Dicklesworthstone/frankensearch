@@ -23,6 +23,8 @@ use frankensearch_index::{FsviV2Witness, ValidatedFsviBytes, dot_product_f32_f32
 
 use crate::{Cx, Embedder, SearchError, SearchResult, VectorHit};
 
+mod hybrid;
+
 /// A native ANN retrieval arm bound to one immutable, admitted vector owner.
 ///
 /// Fields are private: callers cannot pair another owner's document lookup or
@@ -722,7 +724,6 @@ mod tests {
     fn invalid_parameters_do_not_produce_a_retrieval_handle() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let owner = owner(&rows(), 1, QuantizationFormat::F32);
-            let index = NativeAnnIndex::build(&cx, owner, HnswParams::default(), 7).unwrap();
             let params = HnswParams {
                 ef_search: 0,
                 ..HnswParams::default()
