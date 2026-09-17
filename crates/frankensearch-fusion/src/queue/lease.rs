@@ -99,6 +99,7 @@ impl<'a> EmbeddingBatch<'a> {
     /// producers from crowding these retries out. Returns the number receiving
     /// `Failed` (retry exhaustion or supersession by a newer pending submission).
     /// Dropping the lease without calling this method does not consume retries.
+    #[must_use]
     pub fn retry_unacknowledged(&self) -> usize {
         let mut failed = 0;
         for (index, job) in self.jobs.iter().enumerate() {
@@ -143,7 +144,10 @@ impl Drop for EmbeddingBatch<'_> {
         // entry must not cause an unacknowledged job to disappear.
         for job in self.jobs.drain(..).rev() {
             if !active.unacknowledged.remove(&job.doc_id)
-                || state.jobs.iter().any(|pending| pending.doc_id == job.doc_id)
+                || state
+                    .jobs
+                    .iter()
+                    .any(|pending| pending.doc_id == job.doc_id)
             {
                 continue;
             }
@@ -154,6 +158,7 @@ impl Drop for EmbeddingBatch<'_> {
         }
         debug_assert!(active.unacknowledged.is_empty());
         debug_assert!(state.jobs.len() <= self.queue.config.capacity);
+        drop(state);
     }
 }
 
@@ -188,6 +193,7 @@ impl EmbeddingQueue {
             token: Arc::clone(&token),
             unacknowledged,
         });
+        drop(state);
         self.metrics.total_batches.fetch_add(1, Ordering::Relaxed);
         EmbeddingBatch {
             queue: self,
@@ -284,12 +290,7 @@ mod tests {
     #[test]
     fn dropped_suspended_future_returns_its_batch() {
         use std::future::Future;
-        use std::task::{Context, Wake, Waker};
-
-        struct NoopWake;
-        impl Wake for NoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
+        use std::task::{Context, Waker};
 
         let queue = queue(2);
         submit(&queue, "a", "first");
@@ -300,8 +301,7 @@ mod tests {
             std::future::pending::<()>().await;
             drop(batch);
         });
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         assert!(future.as_mut().poll(&mut context).is_pending());
         assert_eq!(queue.in_flight_count(), 2);
         assert_eq!(queue.pending_count(), 0);
@@ -349,7 +349,10 @@ mod tests {
         let queue = queue(1);
         submit(&queue, "a", "first");
         let batch = queue.lease_batch();
-        assert_eq!(queue.requeue(batch.jobs()[0].clone()), JobOutcome::Retryable);
+        assert_eq!(
+            queue.requeue(batch.jobs()[0].clone()),
+            JobOutcome::Retryable
+        );
         assert_eq!(queue.in_flight_count(), 0);
         assert_eq!(queue.pending_count(), 1);
         drop(batch);
@@ -382,7 +385,10 @@ mod tests {
         submit(&queue, "a", "first");
         submit(&queue, "b", "second");
         let batch = queue.lease_batch();
-        assert_eq!(queue.requeue(batch.jobs()[0].clone()), JobOutcome::Retryable);
+        assert_eq!(
+            queue.requeue(batch.jobs()[0].clone()),
+            JobOutcome::Retryable
+        );
         assert_eq!(batch.retry_unacknowledged(), 0);
         assert_eq!(queue.metrics().total_retryable.load(Ordering::Relaxed), 2);
         drop(batch);

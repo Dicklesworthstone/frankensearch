@@ -2454,10 +2454,13 @@ mod tests {
 
     #[test]
     fn crc32_of_known_data() {
-        let crc = crc32_of(b"hello");
-        assert_ne!(crc, 0);
-        // Same input should produce same CRC
-        assert_eq!(crc, crc32_of(b"hello"));
+        // Fixed IEEE CRC-32 values, independently checked with zlib, detect
+        // polynomial/initialization drift that repeat-call equality cannot.
+        assert_eq!(crc32_of(b""), 0);
+        assert_eq!(crc32_of(b"hello"), 0x3610_a686);
+        assert_eq!(crc32_of(b"123456789"), 0xcbf4_3926);
+        let all_bytes: Vec<u8> = (u8::MIN..=u8::MAX).collect();
+        assert_eq!(crc32_of(&all_bytes), 0x2905_8c73);
     }
 
     #[test]

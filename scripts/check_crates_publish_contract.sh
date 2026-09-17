@@ -17,8 +17,8 @@ CENSUS_SCHEMA_VERSION="frankensearch-crates-registry-census-v1"
 # only; bump these literals deliberately, together with the lockfile, the
 # fresh-process contract pin in frankensearch-embed, and docs/planning/UPGRADE_LOG.md.
 AUDITED_ASUPERSYNC_VERSION="0.5.0"
-AUDITED_FSQLITE_FAMILY_VERSION="0.4.0"
-AUDITED_FSQLITE_PAGER_VERSION="0.4.3"
+AUDITED_FSQLITE_FAMILY_VERSION="0.4.4"
+AUDITED_FSQLITE_PAGER_VERSION="0.4.4"
 USER_AGENT="frankensearch-publish-contract/1.0 (https://github.com/Dicklesworthstone/frankensearch)"
 
 usage() {
@@ -617,14 +617,18 @@ run_self_test() {
   # The immediately preceding audited versions remain invalid for this
   # candidate, even with coherent registry sources and no duplicate packages.
   local prior_family prior_receipt prior_code
-  for prior_family in asupersync fsqlite pager-old pager-unreviewed; do
+  for prior_family in asupersync fsqlite family-previous pager-old pager-previous pager-unreviewed; do
     prior_receipt="${temp_dir}/receipt-prior-${prior_family}.json"
     if [[ "$prior_family" == "asupersync" ]]; then
       write_registry_universe_lock "${source_root}/Cargo.lock" "0.4.10"
       prior_code="DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID"
-    elif [[ "$prior_family" == "pager-old" || "$prior_family" == "pager-unreviewed" ]]; then
+    elif [[ "$prior_family" == "family-previous" ]]; then
+      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.4.0" "0.4.3"
+      prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
+    elif [[ "$prior_family" == pager-* ]]; then
       local rejected_pager="0.4.0"
-      [[ "$prior_family" != "pager-unreviewed" ]] || rejected_pager="0.4.4"
+      [[ "$prior_family" != "pager-previous" ]] || rejected_pager="0.4.3"
+      [[ "$prior_family" != "pager-unreviewed" ]] || rejected_pager="0.4.5"
       write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "$AUDITED_FSQLITE_FAMILY_VERSION" "$rejected_pager"
       prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
     else
@@ -703,7 +707,7 @@ run_self_test() {
   # ── Rule 3: fsqlite family source and coherence ─────────────────────────
 
   # one member sourced from git
-  write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "$AUDITED_FSQLITE_FAMILY_VERSION" "0.4.3" \
+  write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "$AUDITED_FSQLITE_FAMILY_VERSION" "$AUDITED_FSQLITE_PAGER_VERSION" \
     'git+https://github.com/Dicklesworthstone/frankensqlite?rev=0000000000000000000000000000000000000000#0000000000000000000000000000000000000000'
 
   if bash "$script_path" \
@@ -927,10 +931,10 @@ PY
       "Remove the fsqlite* entries from [patch.*] and regenerate Cargo.lock from the registry."
   fi
 
-  # Rule 3: registry-only audited versions. The bd-dsbym pager repair advances
-  # only fsqlite-pager to 0.4.3 (UPGRADE_LOG 2026-09-16); every other member
-  # remains pinned to the family version. This identity check does not waive
-  # the separate corruption-repair and release-artifact qualification holds.
+  # Rule 3: registry-only audited versions. The coherent 0.4.4 release passes
+  # both unchanged corruption keepers and all four focused consumer suites
+  # (UPGRADE_LOG 2026-09-17). This exact identity check does not waive combined
+  # dependency, platform, or release-artifact qualification.
   mapfile -t fsqlite_lock_entries < <(
     awk '
       BEGIN { RS = ""; FS = "\\n" }

@@ -4895,7 +4895,9 @@ impl FsfsRuntime {
     /// config.
     #[must_use]
     pub fn default_index_storage_paths(&self) -> IndexStoragePaths {
-        let index_root = PathBuf::from(&self.config.storage.index_dir);
+        let index_root = self
+            .resolve_status_index_root()
+            .unwrap_or_else(|_| PathBuf::from(&self.config.storage.index_dir));
         let db_path = self
             .resolve_storage_db_path()
             .unwrap_or_else(|_| PathBuf::from(&self.config.storage.db_path));
@@ -13460,6 +13462,12 @@ impl FsfsRuntime {
     fn resolve_status_index_root(&self) -> SearchResult<PathBuf> {
         if let Some(path) = self.cli_input.index_dir.as_deref() {
             return absolutize_path(path);
+        }
+
+        // Index/watch commands can name a project outside the working directory.
+        // Their catalog and lifecycle accounting must follow that same index.
+        if self.cli_input.target_path.is_some() {
+            return self.resolve_index_root(&self.resolve_target_root()?);
         }
 
         let configured = PathBuf::from(&self.config.storage.index_dir);
@@ -30705,6 +30713,48 @@ mod tests {
     }
 
     #[test]
+    fn runtime_default_storage_paths_follow_explicit_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        fs::create_dir(&project).expect("project directory");
+        let project = fs::canonicalize(project).expect("canonical project");
+
+        for command in [CliCommand::Index, CliCommand::Watch] {
+            for (configured, override_dir, expected) in [
+                (
+                    ".frankensearch".to_owned(),
+                    None,
+                    project.join(".frankensearch"),
+                ),
+                ("custom-index".to_owned(), None, project.join("custom-index")),
+                (
+                    temp.path().join("absolute-index").display().to_string(),
+                    None,
+                    temp.path().join("absolute-index"),
+                ),
+                (
+                    "custom-index".to_owned(),
+                    Some(temp.path().join("override-index")),
+                    temp.path().join("override-index"),
+                ),
+            ] {
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = configured;
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    command,
+                    target_path: Some(project.clone()),
+                    index_dir: override_dir,
+                    ..CliInput::default()
+                });
+                let paths = runtime.default_index_storage_paths();
+                assert_eq!(paths.catalog_files, vec![expected.join("catalog.db")]);
+                assert_eq!(paths.vector_index_roots, vec![expected.join("vector")]);
+                assert_eq!(paths.lexical_index_roots, vec![expected.join("lexical")]);
+            }
+        }
+    }
+
+    #[test]
     fn runtime_resolve_index_budget_prefers_storage_override() {
         let mut config = FsfsConfig::default();
         config.storage.disk_budget_bytes = Some(42_000);
@@ -38975,6 +39025,58 @@ mod tests {
             super::download_failure_reason(""),
             "asset download failed".to_owned()
         );
+    }
+
+    #[test]
+    fn pdf_font_resources_are_scoped_to_each_page() {
+        use std::fmt::Write as _;
+
+        // Both pages draw byte 0x41 using /F0, but their independent font
+        // dictionaries map it to different Unicode characters. Caching /F0
+        // across pages used to silently turn the second page's B into A.
+        let stream =
+            |body: &str| format!("<< /Length {} >>\nstream\n{body}\nendstream", body.len());
+        let cmap = |unicode: &str| {
+            stream(&format!(
+                "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+                 /CMapName /PageFont def\n/CMapType 2 def\n\
+                 1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+                 1 beginbfchar\n<41> <{unicode}>\nendbfchar\n\
+                 endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend"
+            ))
+        };
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F0 5 0 R >> >> /Contents 7 0 R >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F0 6 0 R >> >> /Contents 8 0 R >>".to_owned(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode 9 0 R >>".to_owned(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode 10 0 R >>".to_owned(),
+            stream("BT /F0 12 Tf 20 100 Td <41> Tj ET"),
+            stream("BT /F0 12 Tf 20 100 Td <41> Tj ET"),
+            cmap("0041"),
+            cmap("0042"),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            writeln!(pdf, "{} 0 obj\n{object}\nendobj", index + 1).unwrap();
+        }
+        let xref = pdf.len();
+        pdf.push_str("xref\n0 11\n0000000000 65535 f \n");
+        for offset in offsets {
+            writeln!(pdf, "{offset:010} 00000 n ").unwrap();
+        }
+        writeln!(
+            pdf,
+            "trailer\n<< /Size 11 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
+        )
+        .unwrap();
+        let text = super::try_extract_pdf_text(pdf.as_bytes(), Path::new("two-page-fonts.pdf"))
+            .expect("valid digital PDF must extract text");
+        assert_eq!(text.split_whitespace().collect::<String>(), "AB");
     }
 
     #[test]

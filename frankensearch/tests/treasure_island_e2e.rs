@@ -1303,11 +1303,11 @@ mod lexical {
     }
 
     /// Bounded Long John Silver layout diagnostic from extra checkout
-    /// frankensearch-ljs-diagnostic-a9fd79b6. Ignored: needs extra upstream
-    /// scorer-trace features. Does not change ExactRepair acceptance.
-    #[cfg(feature = "lexical-tantivy")]
+    /// frankensearch-ljs-diagnostic-a9fd79b6. Requires the facade's
+    /// `pruning-conformance` feature. Does not change ExactRepair acceptance.
+    #[cfg(feature = "pruning-conformance")]
     #[test]
-    #[ignore = "bounded source-bound LJS arithmetic diagnostic; extra upstream trace features required"]
+    #[ignore = "bounded source-bound LJS arithmetic diagnostic"]
     fn ljs_physical_layout_diagnostic() {
         use frankensearch::lexical_tantivy::tantivy_crate::query::QueryParser;
         use frankensearch::quill::argus::{ScorerTraceSink, ScorerTraceSinkGuard, UnionTraceEvent};
@@ -1465,6 +1465,7 @@ mod lexical {
             let quill = build_quill_index(&cx, &tmp.path().join("quill"), &documents).await;
             let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &documents).await;
 
+            let mut mismatches = Vec::new();
             for query in FAMILY {
                 let tantivy_hits = public_observation(&tantivy, &cx, query, LIMIT).await;
                 assert!(
@@ -1472,11 +1473,14 @@ mod lexical {
                     "{query:?}: the Long John Silver family must never be vacuous"
                 );
                 let quill_hits = public_observation(&quill, &cx, query, LIMIT).await;
-                assert_eq!(
-                    quill_hits, tantivy_hits,
-                    "{query:?}: public Quill must match Tantivy in document order and exact f32 score bits"
-                );
+                if quill_hits != tantivy_hits {
+                    mismatches.push((query, quill_hits, tantivy_hits));
+                }
             }
+            assert!(
+                mismatches.is_empty(),
+                "public Quill must match Tantivy in document order and exact f32 score bits; (query, Quill, Tantivy): {mismatches:#?}"
+            );
         });
     }
 
