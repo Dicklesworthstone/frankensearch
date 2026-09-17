@@ -566,7 +566,7 @@ impl<'a> QuillLexicalBackend<'a> {
     /// Each upsert probes Quill's published IDHASH. An equal IDMAP content
     /// witness is skipped only when the index has no uncommitted changes and
     /// this flush has not already mutated that identifier. Otherwise an upsert
-    /// is staged, preserving the order of repeated updates and delete barriers.
+    /// is submitted, preserving the order of repeated updates and delete barriers.
     /// Truly unchanged documents retain their original Q1 docids.
     ///
     /// # Errors
@@ -607,9 +607,7 @@ impl<'a> QuillLexicalBackend<'a> {
                         let can_skip = !mutated_ids.contains(&document.id)
                             && !self.index.has_uncommitted_changes();
                         match self.index.document_witness(&document.id)? {
-                            Some(witness)
-                                if can_skip && witness.content_hash == candidate_hash =>
-                            {
+                            Some(witness) if can_skip && witness.content_hash == candidate_hash => {
                                 stats.unchanged = stats.unchanged.saturating_add(1);
                                 continue;
                             }
@@ -649,7 +647,8 @@ impl<'a> QuillLexicalBackend<'a> {
         if !documents.is_empty() {
             LexicalWrite::index_documents(self.index, cx, &documents).await?;
         }
-        // As before, successful trailing upserts are staged, not committed.
+        // Quill may publish replacements here; new rows can remain staged.
+        // The caller still owns the final commit barrier for pending writes.
         progress.acknowledge_through(progress.actions().len());
         Ok(stats)
     }

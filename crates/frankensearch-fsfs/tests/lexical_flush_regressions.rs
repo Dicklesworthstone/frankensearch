@@ -2,6 +2,7 @@
 
 use asupersync::Cx;
 use asupersync::test_utils::run_test_with_cx;
+use frankensearch_core::LexicalWrite;
 use frankensearch_quill::{QuillConfig, QuillIndex, SegmentStatsProvider};
 
 use frankensearch_fsfs::config::IngestionClass;
@@ -32,7 +33,7 @@ async fn seed(cx: &Cx, index: &QuillIndex) {
         .apply_initial(&[upsert("doc", 1, "alpha original body")])
         .expect("plan seed");
     pipeline.backend_mut().flush(cx).await.expect("stage seed");
-    index.commit(cx).await.expect("publish seed");
+    LexicalWrite::commit(index, cx).await.expect("publish seed");
 }
 
 fn assert_restored(cx: &Cx, index: &QuillIndex) {
@@ -89,24 +90,29 @@ fn same_batch_restore_must_not_be_skipped_against_old_published_hash() {
 }
 
 #[test]
-fn prior_uncommitted_flush_must_not_authorize_a_stale_hash_skip() {
+fn prior_published_replacement_can_be_restored_through_a_fresh_adapter() {
     run_test_with_cx(|cx| async move {
         let index = index();
         seed(&cx, &index).await;
         let mut first = LexicalPipeline::new(QuillLexicalBackend::new(&index));
         first
             .apply_incremental(&[upsert("doc", 2, "beta replacement body")])
-            .expect("plan uncommitted replacement");
+            .expect("plan replacement");
         first
             .backend_mut()
             .flush(&cx)
             .await
-            .expect("stage replacement");
-        assert!(index.has_uncommitted_changes());
+            .expect("publish replacement");
+        // Replacing a published row commits Quill's replacement manifest.
+        // Unlike inserting a new row, this does not leave pending writes.
+        assert!(!index.has_uncommitted_changes());
+        assert_eq!(
+            index.search_doc_ids(&cx, "beta", 10).expect("replacement")[0].document_id,
+            "doc"
+        );
         drop(first);
 
-        // A fresh adapter must also see that the index has pending writes;
-        // tracking only this adapter's current batch is insufficient.
+        // A fresh adapter must compare against the newly published witness.
         let mut second = LexicalPipeline::new(QuillLexicalBackend::new(&index));
         second
             .apply_incremental(&[upsert("doc", 3, "alpha original body")])
@@ -120,6 +126,55 @@ fn prior_uncommitted_flush_must_not_authorize_a_stale_hash_skip() {
         assert_eq!(stats.changed, 1);
         index.commit(&cx).await.expect("publish restoration");
         assert_restored(&cx, &index);
+    });
+}
+
+#[test]
+fn prior_uncommitted_insert_survives_resume_through_a_fresh_adapter() {
+    run_test_with_cx(|cx| async move {
+        let index = index();
+        seed(&cx, &index).await;
+        let mut first = LexicalPipeline::new(QuillLexicalBackend::new(&index));
+        first
+            .apply_incremental(&[upsert("other", 1, "gamma pending body")])
+            .expect("plan unpublished insertion");
+        first
+            .backend_mut()
+            .flush(&cx)
+            .await
+            .expect("stage insertion");
+        assert!(index.has_uncommitted_changes());
+        assert!(
+            index
+                .document_witness("other")
+                .expect("unpublished row")
+                .is_none()
+        );
+        drop(first);
+
+        let mut second = LexicalPipeline::new(QuillLexicalBackend::new(&index));
+        second
+            .apply_incremental(&[upsert("doc", 2, "alpha original body")])
+            .expect("plan published row resume");
+        second
+            .backend_mut()
+            .flush_resumable(&cx)
+            .await
+            .expect("resume with pending writes");
+        index.commit(&cx).await.expect("publish both rows");
+        assert_eq!(
+            index.search_doc_ids(&cx, "alpha", 10).expect("original")[0].document_id,
+            "doc"
+        );
+        assert_eq!(
+            index
+                .search_doc_ids(&cx, "gamma", 10)
+                .expect("prior insertion")[0]
+                .document_id,
+            "other"
+        );
+        assert_eq!(index.segment_stats().expect("live stats").live_docs, 2);
+        assert_eq!(second.backend().pending_len(), 0);
     });
 }
 

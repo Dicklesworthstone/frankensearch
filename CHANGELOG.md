@@ -11,8 +11,8 @@ Scope window: the release reconstruction covers v1.9.1 → v1.10.0 and their 202
 A September 15 supplement covers installer profile switching, offline verification,
 and default-model provisioning. September 16 qualification confirms the native
 F32 MiniLM repair on ARM64 macOS with the existing certificate unchanged.
-A September 17 supplement records the lexical-flush retry fix and pager 0.4.3
-adoption. Separate reproduced SQLite corruption still blocks publication.
+A September 17 supplement records lexical-flush retry and resume-ordering fixes
+and pager 0.4.3 adoption. Separate reproduced SQLite corruption still blocks publication.
 
 ## Version Timeline
 
@@ -78,6 +78,14 @@ Historical adapter identities remain rejected by strict admission, and the
 - **The executable quickstart gate requires both search tiers and actual progressive results.** The Linux DSR lane builds and installs into a private root, checks executable byte identity, and requires ranked hybrid and vector-only results, Initial/Refined records, authoritative generation artifacts, and the model receipts actually admitted by the loaders. Eighteen failure controls cover model, result, generation, lifecycle and provenance failures. Supplied binaries retain an explicitly unknown source revision; the checker revision cannot qualify them as a source-bound release build. [Gate and receipt wiring](https://github.com/Dicklesworthstone/frankensearch/commit/3d1c2fddb09641153cc7d66a61f835751a4b1538); [isolated Cargo discovery](https://github.com/Dicklesworthstone/frankensearch/commit/8789e0449eb01e3e6250cc4358eef003366d4ff9).
 
 ### Fixed
+
+- **Resumable lexical indexing preserves change-then-restore ordering.**
+  Updating a document from A to B and back to A within one flush no longer
+  mistakes the final A for an unchanged published row and leaves B indexed.
+  Published content hashes authorize a skip only when that identifier has not
+  already changed in the batch and the index has no pending writes. Clean,
+  unchanged documents retain their published document IDs.
+  [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/9135a6288be4bc340d4717618bede9d0b9031653).
 
 - **Failed or cancelled lexical flushes retain their unacknowledged actions.**
   The Quill adapter previously removed the entire pending queue before awaiting

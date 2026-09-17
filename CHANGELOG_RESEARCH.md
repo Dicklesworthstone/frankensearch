@@ -2,6 +2,27 @@
 
 ## September 17 supplement: lexical retry and pager qualification limits
 
+Follow-through also covers the resumable-ordering implementation
+`9135a6288be4bc340d4717618bede9d0b9031653` and integration tests in
+`1bf70fd4c267dcafa789903318ffcdd65e0cc9a0`. The author had no Rust toolchain.
+RCH on `vmi1152480` first executed four passing tests and one failed fixture
+precondition: Quill publishes replacements of existing rows immediately, so
+that fixture could not establish the pending-write state it claimed. The
+corrected test verifies published replacement then restoration through a fresh
+adapter. A sixth test creates a real pending insertion and verifies that both
+documents survive resuming through another adapter. All six integration tests
+and all 36 lexical unit tests pass, with one existing unit-test ignore.
+The first failure remains in `lexical-ordering-3c9785c0-failure-receipt.json`;
+the final run uses `lexical-ordering-3c9785c0-r3-spec.json`, frozen merge
+`3c9785c0`, and explicit formatting/comment/test overlays. All-target fsfs
+Clippy passes with warnings denied. The intermediate run's Clippy failure
+exceeded the compiler's future-type recursion limit in the seed helper;
+using the existing boxed `LexicalWrite::commit` interface fixes it without
+suppressing a lint or changing the underlying commit operation. Both failed
+attempts are retained. The final receipt is
+`lexical-ordering-3c9785c0-r3-receipt.json` under the release work directory.
+These are focused checks, not full release qualification.
+
 This narrow supplement covers `db13bc1c4391e62d5a81c35a2c2f3735c3c2c19a`
 (lexical queue ownership) and `05aca4de38f7560de94dc41b3bd8d28eff4bfb6d`
 (pager-only lock update), with the corrected blocker record in `76a9e327`.
@@ -30,8 +51,12 @@ Upstream Mail 42321 and its raw savepoint/churn logs independently report
 zero passed and one failed for each unchanged orphan-page keeper on published
 facade/core 0.4.0 plus pager 0.4.3, with before/after production-source and
 executable receipts. The changelog records both outcomes and keeps publication
-pending. The native-WRITE reclamation hypothesis sent upstream is not a tested
-repair and is not described as delivered functionality.
+pending. Upstream repair `e21d008b40476d13ce49aedeb1a51fb2bef0850c` now keeps
+native-reader abandoned pages in the durable reclamation path. Its live gate
+on `62d802014` plus that patch reports 1,004 pager tests and nine savepoint
+tests passing, but remaining corruption arms are nonterminal and the repair
+is not yet published. These upstream direct-Cargo results do not substitute
+for the required RCH checks of exact and fresh public dependency graphs.
 
 Live GitHub release metadata on September 17 still lists `v1.10.0` and
 `crates-v0.5.0` from September 8 as the newest binary and bundle releases.
