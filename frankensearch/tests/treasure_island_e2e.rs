@@ -1302,6 +1302,57 @@ mod lexical {
         });
     }
 
+    /// Empty title postings can collapse an unfielded term's nested union.
+    /// Compare public lenient scoring on the same single-segment document order,
+    /// both without title matches and with a title match preserving the group.
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn public_empty_title_union_collapse_matches_single_segment_tantivy() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for title in ["neutral", "gamma"] {
+                let documents = Vec::from([
+                    IndexableDocument::new("all", "alpha alpha beta gamma"),
+                    IndexableDocument::new("pair", "alpha beta beta").with_title(title),
+                    IndexableDocument::new("last", "gamma gamma gamma"),
+                    IndexableDocument::new("none", "neutral filler"),
+                ]);
+                let tmp = tempfile::tempdir().expect("differential directory");
+                let quill = QuillIndex::create(
+                    &cx,
+                    &tmp.path().join("quill"),
+                    QuillConfig {
+                        deterministic_ingest: true,
+                        ..QuillConfig::default()
+                    },
+                )
+                .await
+                .expect("single-segment Quill");
+                let tantivy = TantivyIndex::in_memory_single_threaded_oracle()
+                    .expect("single-segment Tantivy");
+                LexicalWrite::index_documents(&quill, &cx, &documents)
+                    .await
+                    .expect("index Quill");
+                LexicalWrite::commit(&quill, &cx).await.expect("commit Quill");
+                LexicalWrite::index_documents(&tantivy, &cx, &documents)
+                    .await
+                    .expect("index Tantivy");
+                LexicalWrite::commit(&tantivy, &cx)
+                    .await
+                    .expect("commit Tantivy");
+                for query in ["alpha beta gamma", "(alpha OR beta) gamma"] {
+                    let expected = public_observation(&tantivy, &cx, query, 4).await;
+                    assert!(expected.iter().any(|(id, _)| id == "all"));
+                    assert!(expected.iter().all(|(id, _)| id != "none"));
+                    assert_eq!(
+                        public_observation(&quill, &cx, query, 4).await,
+                        expected,
+                        "title={title:?}, query={query:?}: empty-title collapse must preserve public score bits and order"
+                    );
+                }
+            }
+        });
+    }
+
     /// Bounded Long John Silver layout diagnostic from extra checkout
     /// frankensearch-ljs-diagnostic-a9fd79b6. Requires the facade's
     /// `pruning-conformance` feature. Does not change ExactRepair acceptance.
