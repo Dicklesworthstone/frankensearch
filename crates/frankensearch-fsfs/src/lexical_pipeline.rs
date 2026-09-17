@@ -6,7 +6,7 @@
 //! - explicit update/delete behavior on change and reclassification
 //! - measurable throughput/latency target contracts
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use asupersync::Cx;
 use compact_str::CompactString;
@@ -522,7 +522,8 @@ pub struct QuillResumeStats {
     pub absent: u64,
     /// Durable IDMAP hash matched; the existing docid was preserved.
     pub unchanged: u64,
-    /// Durable IDMAP hash differed; an upsert was staged.
+    /// A published row required an upsert: its hash differed, or pending
+    /// mutations made the published hash unsafe to use for a no-op decision.
     pub changed: u64,
     /// A stale durable identifier was tombstoned.
     pub deleted: u64,
@@ -563,8 +564,10 @@ impl<'a> QuillLexicalBackend<'a> {
     /// Flush planned actions while preserving exact durable rows on restart.
     ///
     /// Each upsert probes Quill's published IDHASH. An equal IDMAP content
-    /// witness is skipped, a mismatch is upserted, and a miss is inserted.
-    /// Unchanged documents therefore retain their original Q1 docids.
+    /// witness is skipped only when the index has no uncommitted changes and
+    /// this flush has not already mutated that identifier. Otherwise an upsert
+    /// is staged, preserving the order of repeated updates and delete barriers.
+    /// Truly unchanged documents retain their original Q1 docids.
     ///
     /// # Errors
     ///
@@ -578,6 +581,7 @@ impl<'a> QuillLexicalBackend<'a> {
         let mut progress = FlushProgress::new(&mut self.pending);
         let mut documents = Vec::new();
         let mut stats = QuillResumeStats::default();
+        let mut mutated_ids = HashSet::new();
 
         for offset in 0..progress.actions().len() {
             lexical_flush_checkpoint(cx)?;
@@ -597,8 +601,15 @@ impl<'a> QuillLexicalBackend<'a> {
                     document.metadata = metadata;
                     if resumable {
                         let candidate_hash = indexable_document_content_hash(&document)?;
+                        // A published witness cannot describe a preceding
+                        // change still in this batch or an uncommitted flush.
+                        // In particular A -> B -> A is not an unchanged A.
+                        let can_skip = !mutated_ids.contains(&document.id)
+                            && !self.index.has_uncommitted_changes();
                         match self.index.document_witness(&document.id)? {
-                            Some(witness) if witness.content_hash == candidate_hash => {
+                            Some(witness)
+                                if can_skip && witness.content_hash == candidate_hash =>
+                            {
                                 stats.unchanged = stats.unchanged.saturating_add(1);
                                 continue;
                             }
@@ -609,6 +620,7 @@ impl<'a> QuillLexicalBackend<'a> {
                                 stats.absent = stats.absent.saturating_add(1);
                             }
                         }
+                        mutated_ids.insert(document.id.clone());
                     }
                     documents.push(document);
                 }
@@ -625,6 +637,9 @@ impl<'a> QuillLexicalBackend<'a> {
                     progress.acknowledge_through(offset);
                     if self.index.delete_document(cx, &doc_id).await? {
                         stats.deleted = stats.deleted.saturating_add(1);
+                    }
+                    if resumable {
+                        mutated_ids.insert(doc_id);
                     }
                     progress.acknowledge_through(offset + 1);
                 }
