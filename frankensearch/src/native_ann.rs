@@ -25,10 +25,12 @@ use crate::{Cx, Embedder, SearchError, SearchResult, VectorHit};
 
 mod fallback;
 mod hybrid;
+mod shards;
 
 use fallback::NativeBackend;
 pub use fallback::{NativeExactReason, NativeRetrievalMode};
 pub use hybrid::{NativePhaseCandidates, NativeProgressiveSearch, NativeSearchPhase};
+pub use shards::{NativeShardHit, NativeShardRow, NativeShardSet};
 
 /// A native ANN retrieval arm bound to one immutable, admitted vector owner.
 ///
