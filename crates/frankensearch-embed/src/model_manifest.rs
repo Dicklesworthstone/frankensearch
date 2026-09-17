@@ -71,7 +71,7 @@ pub const MODEL_CONFORMANCE_TEXTS_V1: [&str; 4] = [
     "naive cafe Tokyo",
 ];
 
-/// Pinned adapter-level token budget passed to `FastEmbed` 6.0.3.
+/// Pinned adapter-level token budget passed to `FastEmbed` 7.0.1.
 #[cfg(feature = "fastembed")]
 pub(crate) const FASTEMBED_MAX_LENGTH_V1: usize = 512;
 /// Exact truncation and padding policy imposed by the pinned `FastEmbed` adapter.
@@ -291,10 +291,10 @@ impl ModelArtifactManifestV1 {
         let execution = ModelExecutionContractV1 {
             backend: "fastembed-onnx".to_owned(),
             implementation_revision: format!(
-                "frankensearch-embed-{}+fastembed-6.0.3",
+                "frankensearch-embed-{}+fastembed-7.0.1",
                 env!("CARGO_PKG_VERSION")
             ),
-            protocol_revision: "fastembed-6.0.3+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
+            protocol_revision: "fastembed-7.0.1+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
             numeric_profile: "ort-2.0.0-rc.13-cpu-f32-host-default-intra-threads-v1".to_owned(),
             weights_format: "onnx-opset-pinned-v1".to_owned(),
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
@@ -1188,10 +1188,10 @@ fn fastembed_execution_contract(
     Ok(ModelExecutionContractV1 {
         backend: "fastembed-onnx".to_owned(),
         implementation_revision: format!(
-            "frankensearch-embed-{}+fastembed-6.0.3:{model_id}",
+            "frankensearch-embed-{}+fastembed-7.0.1:{model_id}",
             env!("CARGO_PKG_VERSION")
         ),
-        protocol_revision: "fastembed-6.0.3+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
+        protocol_revision: "fastembed-7.0.1+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
         numeric_profile: "ort-2.0.0-rc.13-cpu-f32-host-default-intra-threads-v1".to_owned(),
         weights_format: "onnx-opset-pinned-v1".to_owned(),
         tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
@@ -4320,12 +4320,99 @@ mod tests {
         );
     }
 
+    // Preserve the immediately preceding dependency identity independently of
+    // adapter package version and every platform's numerical certificate.
+    fn before_fastembed_7(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        if manifest.execution.backend == "fastembed-onnx" {
+            assert!(
+                manifest
+                    .execution
+                    .implementation_revision
+                    .contains("+fastembed-7.0.1")
+            );
+            manifest.execution.implementation_revision = manifest
+                .execution
+                .implementation_revision
+                .replacen("+fastembed-7.0.1", "+fastembed-6.0.3", 1);
+            assert_eq!(
+                manifest.execution.protocol_revision,
+                "fastembed-7.0.1+ort-2.0.0-rc.13-user-defined-onnx-v1"
+            );
+            manifest.execution.protocol_revision =
+                "fastembed-6.0.3+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned();
+        }
+        manifest
+    }
+
+    #[test]
+    fn fastembed_7_changes_producer_identity_without_changing_space_or_vectors() {
+        use frankensearch_core::generation::ProducerCompatibilityErrorV1;
+
+        for current in [
+            ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+            ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+            ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+        ] {
+            let previous = before_fastembed_7(current.clone());
+            assert!(
+                previous
+                    .execution
+                    .implementation_revision
+                    .starts_with("frankensearch-embed-0.3.1+fastembed-6.0.3")
+            );
+            assert_eq!(current.artifacts, previous.artifacts);
+            assert_eq!(
+                current.execution.input_contract,
+                previous.execution.input_contract
+            );
+            assert_eq!(
+                current.execution.golden_vectors,
+                previous.execution.golden_vectors
+            );
+            assert_eq!(
+                current.space_contract_fingerprint().unwrap(),
+                previous.space_contract_fingerprint().unwrap()
+            );
+            let current_identity = current
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            let previous_identity = previous
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            assert_ne!(current_identity.producer, previous_identity.producer);
+            assert_ne!(
+                current_identity.fingerprint(),
+                previous_identity.fingerprint()
+            );
+            current_identity
+                .verify_exact_producer_with(&current_identity)
+                .unwrap();
+            assert_eq!(
+                current_identity.verify_exact_producer_with(&previous_identity),
+                Err(ProducerCompatibilityErrorV1::CertificateRequired)
+            );
+            assert_ne!(
+                current.freeze().unwrap().fingerprint,
+                previous.freeze().unwrap().fingerprint
+            );
+            let mut restored = previous;
+            restored.execution.implementation_revision = restored
+                .execution
+                .implementation_revision
+                .replacen("+fastembed-6.0.3", "+fastembed-7.0.1", 1);
+            restored.execution.protocol_revision =
+                "fastembed-7.0.1+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned();
+            assert_eq!(restored, current, "no other manifest field may drift");
+        }
+    }
+
     // Reconstruct the pre-refresh producer without changing any artifact or
     // preprocessing. Windows previously declared the Linux numeric contract;
     // retain those historical hashes rather than rewriting them to the newly
     // qualified Windows output. Current owning-loader tests check the new bits.
     fn before_dependency_refresh(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
         let current = manifest.freeze().unwrap().fingerprint;
+        manifest = before_fastembed_7(manifest);
         manifest = before_adapter_release(manifest);
         let (current_protocol, previous_protocol) = match manifest.execution.backend.as_str() {
             "model2vec-native" => (
