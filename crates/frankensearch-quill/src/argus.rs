@@ -6230,8 +6230,28 @@ impl<'a> BufferedUnionScorer<'a> {
             let offset = usize::try_from(u64::from(doc) - u64::from(window_start))
                 .map_err(|_| ArgusError::CursorInvariant("union offset does not fit usize"))?;
             let mut score = 0.0_f32;
-            for scorer in &mut self.active[..pivot_len] {
-                score += scorer.score()?;
+            // Index-addressed on purpose: the pruning-conformance trace below
+            // re-borrows `self` (`trace`/`trace_ordinal`) while the loop walks
+            // `self.active`, so `iter_mut()` cannot coexist; under default
+            // features the index still addresses the pivot prefix.
+            #[allow(clippy::needless_range_loop)]
+            for index in 0..pivot_len {
+                let contribution = self.active[index].score()?;
+                #[cfg(feature = "pruning-conformance")]
+                let accumulator = score;
+                score += contribution;
+                #[cfg(feature = "pruning-conformance")]
+                self.trace(UnionTraceEvent::Add(UnionAddTrace {
+                    refill_ordinal: self.trace_refill_ordinal,
+                    window_start,
+                    fill_path: UnionFillPath::TantivyTopDocsTerm,
+                    child_construction_ordinal: self.trace_ordinal(index),
+                    runtime_index: index,
+                    doc,
+                    accumulator_bits: accumulator.to_bits(),
+                    contribution_bits: contribution.to_bits(),
+                    result_bits: score.to_bits(),
+                }));
             }
             self.score_window[offset] = Some(finite_score(score, doc)?);
 
