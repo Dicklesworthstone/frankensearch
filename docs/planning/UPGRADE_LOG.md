@@ -195,7 +195,26 @@ The executed Mach-O SHA-256 is
 `cd3b76353cad3415855e1be9a015088e5b2455a1a177633d55a4da707d6bb39c`;
 the hash-verified receipt is
 `dependencies/darwin-fastembed701-native-results/receipt.json`.
-Windows and final product gates remain pending.
+The RCH-built Windows executable also passes all three unchanged certificates
+in separate native processes on `SURFACEBOOKJE` (1/0/0 each). Its SHA-256 is
+`d24feb3aff72353faa6447ab8441f235e67c2c05d6ebf20169d8372398a6b629`;
+the receipt and hash-verified logs are in
+`dependencies/windows-fastembed701-certificates-only-results/`. This numerical
+result does not clear the separate Windows promotion failures below or the
+remaining product gates.
+
+The first native Windows manifest run passed 115 tests, failed eight, and
+retained one existing ignore. Seven failures arise during model promotion:
+staged artifacts were opened read-only before `sync_all`, but Windows'
+[`FlushFileBuffers`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
+requires write access. The staged-file handle now requests write access on
+Windows without truncation or creation; the flush remains required. The other
+failure expected the portable-name error for a drive-prefixed path, although
+Windows correctly rejects it earlier as rooted. The test now requires that
+specific Windows error while preserving rejection and redaction assertions.
+The repaired native manifest suite still requires a rebuild; RCH refused the
+submission after its worker queue timed out. The first failure is retained in
+`dependencies/windows-fastembed701-native-results-r1/`.
 
 ### Standalone fuzz lock consistency
 
@@ -216,6 +235,23 @@ explicit guard drops, a `must_use` annotation and the standard no-op waker
 resolve them without lint suppressions. All 52 queue tests pass on the final
 source, including cancellation recovery. The full runtime suites remain active;
 these compiler and focused-test results do not constitute release clearance.
+
+### Runtime gate finding: catalog follows the explicit project target
+
+The combined workspace run passed 2,111 fsfs tests but failed the watcher
+shutdown test with `PermissionDenied`. The same executable passes that test
+from the checkout root and fails from Cargo's package working directory.
+The retained syscall trace identifies `mkdir` against the package directory's
+`.frankensearch`, rather than the requested project's index. This is an existing
+path-resolution defect exposed by the permission-restricted gate, not evidence
+of a SQLite regression. The original failure and exact executable are retained
+in `dependencies/refresh-watch-cwd-diagnostic/`.
+
+Explicit target resolution now applies to the default catalog and lifecycle
+storage paths. New coverage checks Index and Watch with default, configured
+relative, configured absolute, and CLI-overridden index directories. The
+unchanged watcher test, new path regressions, static checks and full runtime
+gate are being rerun. No permission requirement or assertion is relaxed.
 
 ## 2026-09-16 — Pager repair update (qualification in progress)
 
