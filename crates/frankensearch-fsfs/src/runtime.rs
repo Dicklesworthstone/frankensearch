@@ -4895,7 +4895,9 @@ impl FsfsRuntime {
     /// config.
     #[must_use]
     pub fn default_index_storage_paths(&self) -> IndexStoragePaths {
-        let index_root = PathBuf::from(&self.config.storage.index_dir);
+        let index_root = self
+            .resolve_status_index_root()
+            .unwrap_or_else(|_| PathBuf::from(&self.config.storage.index_dir));
         let db_path = self
             .resolve_storage_db_path()
             .unwrap_or_else(|_| PathBuf::from(&self.config.storage.db_path));
@@ -13460,6 +13462,12 @@ impl FsfsRuntime {
     fn resolve_status_index_root(&self) -> SearchResult<PathBuf> {
         if let Some(path) = self.cli_input.index_dir.as_deref() {
             return absolutize_path(path);
+        }
+
+        // Index/watch commands can name a project outside the working directory.
+        // Their catalog and lifecycle accounting must follow that same index.
+        if self.cli_input.target_path.is_some() {
+            return self.resolve_index_root(&self.resolve_target_root()?);
         }
 
         let configured = PathBuf::from(&self.config.storage.index_dir);
@@ -30702,6 +30710,48 @@ mod tests {
             paths.embedding_cache_roots,
             vec![PathBuf::from("/tmp/fsfs-index/cache")]
         );
+    }
+
+    #[test]
+    fn runtime_default_storage_paths_follow_explicit_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        fs::create_dir(&project).expect("project directory");
+        let project = fs::canonicalize(project).expect("canonical project");
+
+        for command in [CliCommand::Index, CliCommand::Watch] {
+            for (configured, override_dir, expected) in [
+                (
+                    ".frankensearch".to_owned(),
+                    None,
+                    project.join(".frankensearch"),
+                ),
+                ("custom-index".to_owned(), None, project.join("custom-index")),
+                (
+                    temp.path().join("absolute-index").display().to_string(),
+                    None,
+                    temp.path().join("absolute-index"),
+                ),
+                (
+                    "custom-index".to_owned(),
+                    Some(temp.path().join("override-index")),
+                    temp.path().join("override-index"),
+                ),
+            ] {
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = configured;
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    command,
+                    target_path: Some(project.clone()),
+                    index_dir: override_dir,
+                    ..CliInput::default()
+                });
+                let paths = runtime.default_index_storage_paths();
+                assert_eq!(paths.catalog_files, vec![expected.join("catalog.db")]);
+                assert_eq!(paths.vector_index_roots, vec![expected.join("vector")]);
+                assert_eq!(paths.lexical_index_roots, vec![expected.join("lexical")]);
+            }
+        }
     }
 
     #[test]

@@ -1303,11 +1303,11 @@ mod lexical {
     }
 
     /// Bounded Long John Silver layout diagnostic from extra checkout
-    /// frankensearch-ljs-diagnostic-a9fd79b6. Ignored: needs extra upstream
-    /// scorer-trace features. Does not change ExactRepair acceptance.
-    #[cfg(feature = "lexical-tantivy")]
+    /// frankensearch-ljs-diagnostic-a9fd79b6. Requires the facade's
+    /// `pruning-conformance` feature. Does not change ExactRepair acceptance.
+    #[cfg(feature = "pruning-conformance")]
     #[test]
-    #[ignore = "bounded source-bound LJS arithmetic diagnostic; extra upstream trace features required"]
+    #[ignore = "bounded source-bound LJS arithmetic diagnostic"]
     fn ljs_physical_layout_diagnostic() {
         use frankensearch::lexical_tantivy::tantivy_crate::query::QueryParser;
         use frankensearch::quill::argus::{ScorerTraceSink, ScorerTraceSinkGuard, UnionTraceEvent};
