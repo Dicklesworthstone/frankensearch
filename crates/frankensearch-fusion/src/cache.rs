@@ -319,25 +319,99 @@ impl IndexOpenSpec {
     }
 }
 
+/// Identity observations from the retained object, never a second path open.
+/// Legacy labels can reject an obvious mismatch but cannot attest a space.
+#[derive(Debug, Clone, Copy)]
+struct TierCacheIdentity<'a> {
+    tier: &'static str,
+    embedder: Option<&'a str>,
+    revision: Option<&'a str>,
+    space: Option<&'a str>,
+    attested: bool,
+}
+
+impl<'a> TierCacheIdentity<'a> {
+    fn fast(index: &'a TwoTierIndex) -> Self {
+        Self {
+            tier: "fast",
+            embedder: Some(index.fast_embedder_id()),
+            revision: Some(index.fast_embedder_revision()),
+            space: index.fast_space_fingerprint_hex(),
+            attested: index.fast_identity_is_attested(),
+        }
+    }
+
+    fn quality(index: &'a TwoTierIndex) -> Self {
+        Self {
+            tier: "quality",
+            embedder: index.quality_embedder_id(),
+            revision: index.quality_embedder_revision(),
+            space: index.quality_space_fingerprint_hex(),
+            attested: index.quality_identity_is_attested(),
+        }
+    }
+
+    fn validate_replacement(self, candidate: Self) -> SearchResult<()> {
+        if let Some(expected) = self.space
+            && candidate.space != Some(expected)
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "index_cache.replace".to_owned(),
+                value: candidate.space.unwrap_or("<none>").to_owned(),
+                reason: format!(
+                    "replacement {} tier lives in a different embedding space than the retained index",
+                    self.tier
+                ),
+            });
+        }
+        if self.attested && !candidate.attested {
+            return Err(SearchError::InvalidConfig {
+                field: "index_cache.replace".to_owned(),
+                value: self.tier.to_owned(),
+                reason: "replacement drops the identity attestation the retained index carries"
+                    .to_owned(),
+            });
+        }
+        // Preserve the existing identity-enrichment bootstrap contract: an
+        // empty legacy seed can be replaced by its first declared generation.
+        // When neither object has a space fingerprint, compare BOTH labels on
+        // BOTH tiers. Equal labels reject obvious drift but never attest space.
+        if self.space.is_none()
+            && candidate.space.is_none()
+            && (self.embedder != candidate.embedder || self.revision != candidate.revision)
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "index_cache.replace".to_owned(),
+                value: self.tier.to_owned(),
+                reason: format!(
+                    "replacement {} model identifier or revision differs from the retained legacy tier and no space fingerprint is available",
+                    self.tier
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Cached, atomically-replaceable wrapper around [`TwoTierIndex`].
 ///
-/// Uses [`Arc`] + [`RwLock`] for lock-free reads and atomic replacement.
-/// Readers hold an `Arc` clone and are never blocked by a concurrent refresh.
+/// Uses [`Arc`] + [`RwLock`] for snapshot reads and atomic replacement.
+/// Readers hold an `Arc` clone while a refresh prepares its replacement.
 ///
 /// # Usage pattern
 ///
 /// ```rust,ignore
 /// let cache = IndexCache::open(dir, config, detector)?;
 ///
-/// // Read path (cheap, non-blocking):
+/// // Read path (cheap snapshot acquisition):
 /// let index = cache.current();
 /// let hits = index.search_fast(&query, 10)?;
 ///
 /// // Check staleness:
 /// if cache.is_stale()? {
-///     // Rebuild and replace atomically:
+///     // Rebuild and conditionally replace the snapshot we started from:
 ///     let new_index = TwoTierIndex::open(&dir, config)?;
-///     cache.replace(new_index)?;
+///     let installed = cache.replace_if_current(&index, new_index)?;
 /// }
 /// ```
 #[derive(Debug)]
@@ -446,7 +520,8 @@ impl IndexCache {
     ///
     /// Returns an `Arc<TwoTierIndex>` that remains valid even if the cache
     /// is refreshed concurrently. Readers holding this reference will continue
-    /// to use the old index until they drop it.
+    /// to use the old index until they drop it. The same snapshot is an
+    /// optimistic replacement token for [`Self::replace_if_current`].
     #[must_use]
     pub fn current(&self) -> Arc<TwoTierIndex> {
         self.read_index().clone()
@@ -455,40 +530,74 @@ impl IndexCache {
     /// Atomically replace the cached index with a new one.
     ///
     /// Existing readers holding `Arc<TwoTierIndex>` from [`current()`](Self::current)
-    /// are unaffected. The old index is dropped when its last `Arc` reference
-    /// goes out of scope. This does not rebind the cache's original directory
-    /// or explicit-path contract; a later [`reload`](Self::reload) always
-    /// reopens that retained contract.
+    /// are unaffected. This does not rebind the cache's original directory or
+    /// explicit-path contract. Use [`Self::replace_if_current`] for a rebuild
+    /// derived from an earlier snapshot: this unconditional operation does not
+    /// establish which concurrent legacy rebuild is newer.
     ///
     /// # Errors
     ///
-    /// The replacement is validated against the retained index before the
-    /// swap and rejected with [`SearchError::InvalidConfig`] when it would
-    /// change what this cache stands for (bd-8utj): a different fast or
-    /// quality artifact path (absolute, cwd-independent), a different tier
-    /// topology (fast-only vs fast+quality), a different embedding-space
-    /// fingerprint under the same tier, a loss of identity attestation, or a
-    /// different embedder revision when no fingerprint is available to compare.
-    /// On rejection the prior index stays installed and in-flight readers are
-    /// unaffected.
+    /// Rejects changes to retained artifact paths, tier topology, embedding
+    /// spaces, or identity attestation with [`SearchError::InvalidConfig`].
+    /// When both versions of a tier lack a space fingerprint, their model
+    /// identifiers and revisions must match, including for the quality tier.
+    /// These legacy checks reject obvious drift; they do not attest the old
+    /// vectors. Existing identity-enrichment bootstrap behavior is retained.
+    /// Rejection preserves the installed index and in-flight reader snapshots.
     pub fn replace(&self, new_index: TwoTierIndex) -> SearchResult<()> {
+        self.replace_inner(None, new_index).map(|_| ())
+    }
+
+    /// Replace the index only if `expected` is still the installed snapshot.
+    ///
+    /// Capture `expected` with [`Self::current`] before preparing a candidate.
+    /// The pointer comparison, contract validation and swap share one write
+    /// lock. Holding the `Arc` prevents allocation reuse from creating an ABA
+    /// match. A lost race returns `Ok(false)` without installing or validating
+    /// the obsolete candidate; its files are not changed or deleted.
+    ///
+    /// This is an in-process cache fence, not durable generation-publication
+    /// authority. Readers of the superseded snapshot remain valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns path-resolution errors and, when `expected` is current, the
+    /// validation errors of [`Self::replace`]. Every error leaves the installed
+    /// snapshot unchanged.
+    pub fn replace_if_current(
+        &self,
+        expected: &Arc<TwoTierIndex>,
+        new_index: TwoTierIndex,
+    ) -> SearchResult<bool> {
+        self.replace_inner(Some(expected), new_index)
+    }
+
+    fn replace_inner(
+        &self,
+        expected: Option<&Arc<TwoTierIndex>>,
+        new_index: TwoTierIndex,
+    ) -> SearchResult<bool> {
         let current_dir = std::env::current_dir()?;
         let new_count = new_index.doc_count();
-        let old_count = {
+        let candidate = Arc::new(new_index);
+        let retired = {
             let mut guard = self.write_index();
-            Self::validate_replacement(&guard, &new_index, &current_dir)?;
-            let old_count = guard.doc_count();
-            *guard = Arc::new(new_index);
-            old_count
+            if expected.is_some_and(|snapshot| !Arc::ptr_eq(&guard, snapshot)) {
+                return Ok(false);
+            }
+            Self::validate_replacement(&guard, &candidate, &current_dir)?;
+            std::mem::replace(&mut *guard, candidate)
         };
         debug!(
             target: "frankensearch.cache",
             state_dir = %self.state_dir.display(),
-            old_count,
+            old_count = retired.doc_count(),
             new_count,
             "replaced cached index"
         );
-        Ok(())
+        // Dropping a large retired index must not hold the publication lock.
+        drop(retired);
+        Ok(true)
     }
 
     fn validate_replacement(
@@ -523,70 +632,43 @@ impl IndexCache {
             ));
         }
 
-        for (
-            tier,
-            current_fingerprint,
-            candidate_fingerprint,
-            current_attested,
-            candidate_attested,
-        ) in [
-            (
-                "fast",
-                current.fast_space_fingerprint_hex(),
-                candidate.fast_space_fingerprint_hex(),
-                current.fast_identity_is_attested(),
-                candidate.fast_identity_is_attested(),
-            ),
-            (
-                "quality",
-                current.quality_space_fingerprint_hex(),
-                candidate.quality_space_fingerprint_hex(),
-                current.quality_identity_is_attested(),
-                candidate.quality_identity_is_attested(),
-            ),
-        ] {
-            if let Some(expected) = current_fingerprint {
-                if candidate_fingerprint != Some(expected) {
-                    return Err(reject(
-                        candidate_fingerprint.unwrap_or("<none>").to_owned(),
-                        if tier == "fast" {
-                            "replacement fast tier lives in a different embedding space than the retained index"
-                        } else {
-                            "replacement quality tier lives in a different embedding space than the retained index"
-                        },
-                    ));
-                }
-            }
-            if current_attested && !candidate_attested {
-                return Err(reject(
-                    tier.to_owned(),
-                    "replacement drops the identity attestation the retained index carries",
-                ));
-            }
-        }
-        if current.fast_space_fingerprint_hex().is_none()
-            && candidate.fast_space_fingerprint_hex().is_none()
-            && current.fast_embedder_revision() != candidate.fast_embedder_revision()
-        {
-            return Err(reject(
-                candidate.fast_embedder_revision().to_owned(),
-                "replacement fast embedder revision differs from the retained index and no space fingerprint is available to prove compatibility",
-            ));
-        }
+        TierCacheIdentity::fast(current).validate_replacement(TierCacheIdentity::fast(candidate))?;
+        TierCacheIdentity::quality(current)
+            .validate_replacement(TierCacheIdentity::quality(candidate))?;
         Ok(())
     }
 
-    /// Reload the index from disk and atomically replace the cached version.
+    /// Reload the index from disk and conditionally replace the cached version.
+    ///
+    /// Disk I/O occurs outside the cache lock. The snapshot is captured before
+    /// opening the candidate, so a slow reload cannot overwrite a replacement
+    /// installed while that I/O was in progress.
     ///
     /// # Errors
     ///
-    /// Returns errors from the constructor represented by this cache's original
-    /// directory or explicit-path contract, or the validation errors of
-    /// [`replace`](Self::replace) when the on-disk index no longer matches the
-    /// retained contract.
+    /// Returns constructor or replacement-validation errors. A concurrent
+    /// replacement returns [`SearchError::InvalidConfig`] with field
+    /// `index_cache.reload` and value `superseded`; retry against the current
+    /// snapshot. No failure changes the installed cache entry.
     pub fn reload(&self) -> SearchResult<()> {
-        let new_index = self.open_spec.open(self.config.clone())?;
-        self.replace(new_index)
+        self.reload_with(|_| self.open_spec.open(self.config.clone()))
+    }
+
+    fn reload_with(
+        &self,
+        load: impl FnOnce(&TwoTierIndex) -> SearchResult<TwoTierIndex>,
+    ) -> SearchResult<()> {
+        let expected = self.current();
+        let candidate = load(&expected)?;
+        if !self.replace_if_current(&expected, candidate)? {
+            return Err(SearchError::InvalidConfig {
+                field: "index_cache.reload".to_owned(),
+                value: "superseded".to_owned(),
+                reason: "the cached snapshot changed while its replacement was loading; retry against the current snapshot"
+                    .to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Check whether the current index is stale.
@@ -1349,5 +1431,195 @@ mod tests {
             .expect("read")
             .expect("exists");
         assert_eq!(read.source_count, 0);
+    }
+
+    #[test]
+    fn replace_checks_legacy_model_and_revision_for_both_tiers() {
+        for tier in ["fast", "quality"] {
+            for (model, revision) in [("foreign-model", "v1"), ("potion-128M", "v2")] {
+                let dir = temp_dir("cache-both-tier-identities");
+                write_fast_index(&dir, &sample_records());
+                write_index(&dir.join(VECTOR_INDEX_QUALITY_FILENAME), &sample_records());
+                let cache = IndexCache::open(
+                    &dir,
+                    TwoTierConfig::default(),
+                    Box::new(SentinelFileDetector::new()),
+                )
+                .expect("open two-tier cache");
+                let retained = cache.current();
+                let staged = dir.join("replacement.fsvi");
+                let mut writer = VectorIndex::create_with_revision(
+                    &staged,
+                    model,
+                    revision,
+                    4,
+                    Quantization::F16,
+                )
+                .expect("create replacement");
+                for (id, vector) in sample_records() {
+                    writer.write_record(id, &vector).expect("write replacement");
+                }
+                writer.finish().expect("finish replacement");
+                let target = dir.join(if tier == "fast" {
+                    VECTOR_INDEX_FAST_FILENAME
+                } else {
+                    VECTOR_INDEX_QUALITY_FILENAME
+                });
+                std::fs::rename(&staged, &target).expect("install test candidate");
+                let bytes_before = std::fs::read(&target).expect("candidate bytes");
+                let candidate = TwoTierIndex::open(&dir, TwoTierConfig::default())
+                    .expect("open same-shape different-identity candidate");
+                let error = cache
+                    .replace(candidate)
+                    .expect_err("identity drift must reject");
+                assert!(is_replace_rejection(&error), "{tier}: {error:?}");
+                assert!(Arc::ptr_eq(&retained, &cache.current()));
+                assert!(is_replace_rejection(
+                    &cache.reload().expect_err("reload must reject")
+                ));
+                assert!(Arc::ptr_eq(&retained, &cache.current()));
+                assert_eq!(
+                    std::fs::read(&target).expect("candidate retained"),
+                    bytes_before
+                );
+                assert_eq!(retained.fast_embedder_id(), "potion-128M");
+                assert_eq!(retained.quality_embedder_id(), Some("potion-128M"));
+                assert_eq!(retained.quality_embedder_revision(), Some("v1"));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_identity_enrichment_preserves_the_existing_bootstrap_contract() {
+        for tier in ["fast", "quality"] {
+            let seed = TierCacheIdentity {
+                tier,
+                embedder: Some("stub-model"),
+                revision: Some(""),
+                space: None,
+                attested: false,
+            };
+            let declared = TierCacheIdentity {
+                revision: Some("declared-bundle-fingerprint"),
+                space: Some("declared-space-fingerprint"),
+                ..seed
+            };
+            seed.validate_replacement(declared)
+                .expect("initial declaration is not legacy revision drift");
+            let lost_identity = TierCacheIdentity {
+                space: None,
+                ..declared
+            };
+            assert!(is_replace_rejection(
+                &declared
+                    .validate_replacement(lost_identity)
+                    .expect_err("identity cannot disappear after enrichment")
+            ));
+        }
+    }
+
+    #[test]
+    fn conditional_replace_has_one_winner_for_a_shared_snapshot() {
+        let dir = temp_dir("cache-conditional-race");
+        let records = sample_records();
+        write_fast_index(&dir, &records);
+        let cache = IndexCache::open(
+            &dir,
+            TwoTierConfig::default(),
+            Box::new(SentinelFileDetector::new()),
+        )
+        .expect("cache");
+        let expected = cache.current();
+        write_fast_index(&dir, &records[..1]);
+        let first = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("first candidate");
+        write_fast_index(&dir, &records[..2]);
+        let second = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("second candidate");
+        let start = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                start.wait();
+                cache
+                    .replace_if_current(&expected, first)
+                    .expect("first attempt")
+            });
+            let right = scope.spawn(|| {
+                start.wait();
+                cache
+                    .replace_if_current(&expected, second)
+                    .expect("second attempt")
+            });
+            (
+                left.join().expect("first worker"),
+                right.join().expect("second worker"),
+            )
+        });
+        assert_ne!(outcomes.0, outcomes.1, "exactly one conditional writer wins");
+        assert_eq!(cache.current().doc_count(), if outcomes.0 { 1 } else { 2 });
+        assert_eq!(expected.doc_count(), 3, "old readers retain their snapshot");
+    }
+
+    #[test]
+    fn reload_cannot_overwrite_a_replacement_installed_during_open() {
+        let dir = temp_dir("cache-superseded-reload");
+        let records = sample_records();
+        write_fast_index(&dir, &records);
+        let cache = IndexCache::open(
+            &dir,
+            TwoTierConfig::default(),
+            Box::new(SentinelFileDetector::new()),
+        )
+        .expect("cache");
+        let original = cache.current();
+        let stale = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("slow candidate");
+        write_fast_index(&dir, &records[..1]);
+        let newer = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("newer candidate");
+        // Deterministic interleaving at the real loader boundary; no sleeps.
+        let error = cache
+            .reload_with(|observed| {
+                assert!(std::ptr::eq(observed, original.as_ref()));
+                cache.replace(newer).expect("concurrent publication");
+                Ok(stale)
+            })
+            .expect_err("a superseded reload must not win");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { ref field, ref value, .. }
+                if field == "index_cache.reload" && value == "superseded"
+        ));
+        assert_eq!(cache.current().doc_count(), 1);
+        assert_eq!(original.doc_count(), 3);
+        cache.reload().expect("fresh retry");
+        assert_eq!(cache.current().doc_count(), 1);
+    }
+
+    #[test]
+    fn conditional_replacement_validates_current_candidates_without_swapping_on_error() {
+        let dir = temp_dir("cache-conditional-validation");
+        write_fast_index(&dir, &sample_records());
+        let cache = IndexCache::open(
+            &dir,
+            TwoTierConfig::default(),
+            Box::new(SentinelFileDetector::new()),
+        )
+        .expect("cache");
+        let expected = cache.current();
+        let foreign_dir = temp_dir("cache-conditional-foreign");
+        write_fast_index(&foreign_dir, &sample_records());
+        let foreign = TwoTierIndex::open(&foreign_dir, TwoTierConfig::default()).expect("foreign");
+        let error = cache
+            .replace_if_current(&expected, foreign)
+            .expect_err("current token does not bypass contract validation");
+        assert!(is_replace_rejection(&error));
+        assert!(Arc::ptr_eq(&expected, &cache.current()));
+
+        cache.reload().expect("advance snapshot");
+        let installed = cache.current();
+        let foreign = TwoTierIndex::open(&foreign_dir, TwoTierConfig::default()).expect("foreign");
+        assert!(
+            !cache
+                .replace_if_current(&expected, foreign)
+                .expect("stale token")
+        );
+        assert!(Arc::ptr_eq(&installed, &cache.current()));
     }
 }
