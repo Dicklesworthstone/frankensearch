@@ -104,7 +104,7 @@ impl NativeAnnIndex {
     }
 }
 
-fn admit_pair(
+pub(super) fn admit_pair(
     cx: &Cx,
     fast: &NativeAnnIndex,
     fast_embedder: &dyn Embedder,
@@ -144,7 +144,7 @@ fn admit_pair(
     Ok(fast_is_hash)
 }
 
-async fn checked_lexical(
+pub(super) async fn checked_lexical(
     cx: &Cx,
     lexical: &dyn LexicalRead,
     text: &str,
@@ -157,7 +157,7 @@ async fn checked_lexical(
     Ok(batch)
 }
 
-async fn refined_winners(
+pub(super) async fn refined_winners(
     cx: &Cx,
     lexical: &dyn LexicalRead,
     batch: &LexicalCandidateBatch,
