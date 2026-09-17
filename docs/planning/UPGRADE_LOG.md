@@ -24,9 +24,16 @@ This release includes both pending-freelist writer attribution and the
 abandoned-page reclamation repair. Before publication, applying only the latter
 repair to our former exact dependency graph passed both unchanged corruption
 keepers through RCH. That source-only result is retained separately from the
-new published-package qualification, which is in progress alongside actual
-storage, durability, ops, and fsfs tests. The earlier failing executions remain
-recorded below; rebuilt release artifacts still require final qualification.
+published-package qualification. Both unchanged corruption keepers now pass
+1/0/0 through RCH on `vmi1152480` using the coherent registry-only 0.4.4 graph.
+Storage passes 351 tests and durability passes 160, both without failures or
+ignores. Ops passes 827 with no failures and one existing ignore. Their logs,
+executable hashes, and source barriers are retained in
+`dependencies/sqlite044-stage-evidence/receipt.json`. The fsfs library stage
+passes 2,111 tests with no failures and 14 existing ignores. All four stages
+finished successfully with unchanged source barriers. The earlier failing
+executions remain recorded below; the combined dependency refresh and rebuilt
+release artifacts still require final qualification.
 
 Research, registry/archive provenance, the complete dependency census, and
 per-update receipts are retained under
@@ -40,7 +47,15 @@ pass the existing real-model certificates before adoption.
 The refreshed advisory database identifies existing Rustls 0.23.43 as affected
 by [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html).
 The compatible 0.23.45 security update is added to this campaign; both
-Asupersync and ureq permit it. This finding predates the SQLite update.
+Asupersync and ureq permit it. This finding predates the SQLite update. The
+isolated Rustls lock update clears the vulnerability finding; actual TLS and
+workspace consumer checks are qualified separately. A registry-only harness
+using the fsfs ureq configuration passes a verified HTTPS request to the fixed
+Rustls 0.23.45 metadata endpoint on crates.io through RCH worker `ovh-a`.
+The test validates the response identity and non-yanked version. It passes
+1/0/0 with ureq 3.4.1 and again after the ureq update below. These are real TLS
+transport checks, not adversarial TLS conformance or whole-workspace results.
+Broader consumer validation remains pending.
 
 The inherited `lru` 0.16.4 soundness warning remains visible. Its only parent,
 the latest published Tantivy 0.26.2, requires the 0.16 series; the fixed 0.18.2
@@ -49,6 +64,122 @@ is incompatible with that requirement. The inspected Tantivy cache uses
 precondition is absent in that call path. This is a bounded exposure review,
 not a claim that the dependency is fixed. Existing unmaintained warnings for
 `bincode`, `paste`, and `ttf-parser` are retained without audit suppression.
+
+### ureq: 3.4.1 → 3.4.2
+
+The fsfs requirement and lock now select 3.4.2; its required protocol dependency
+advances from 0.6.2 to 0.6.4. Published changes fix network-path redirects,
+connection-pool compatibility, and address retry behavior without changing the
+APIs used here. Defaults and JSON support are unchanged. The verified HTTPS
+test passes through RCH using the patched Rustls transport; the result and
+source receipt are in `dependencies/ureq0342-tls-controller.log` under the
+release work directory. The executed test binary has SHA-256
+`f822f6dfa99fd8f53c181a09faf8f40b3c52e36324a6599c851f2b7f5261b2bf`.
+This request does not exercise each redirect or pooling corner case; final
+workspace and platform validation remain required.
+
+### pdf-extract: 0.12.0 → 0.12.1
+
+The patch clears font resources between PDF pages. A new fsfs regression uses
+two pages that both name `/F0`, with distinct ToUnicode mappings. The matching
+dependency-only probe reproduces 0.12.0 extracting `AA` where the document
+requires `AB`. The first assertion incorrectly assumed page whitespace; the
+corrected assertion still fails on the old package. The 0.12.1 positive control
+uses that identical corrected source and passes 1/0/0 on `vmi1152480`.
+The source receipts confirm identical test bytes across the failing old version
+and passing new version. Initial critical-memory and queue-timeout refusals
+remain excluded attempts, with no local fallback. The before/after receipts
+are retained in `dependencies/pdf-upgrade-source-receipts.json`; the successful
+test executable SHA-256 is
+`100dccfb7e1225d016c6ddcd36c9c0fa4af8288b0aed1fc1d9eb8616989abef1`.
+The matching fsfs integration test still awaits the final workspace gate.
+
+### crc32fast: 1.5.1 → 1.5.2
+
+The patch processes remaining whole 16-byte chunks in the software baseline
+instead of falling back immediately to its byte loop. An RCH dependency probe passes
+the IEEE reference values for empty input, `hello`, `123456789`, and all 256
+byte values, including incremental chunks of 1, 15, 16, 17 and 64 bytes.
+The test passes 1/0/0 on `vmi1152480`; its executable SHA-256 is
+`454917a53b58d6b77991b95018b3b0546e4e42f910ddaadfb40a7d0df6c14c55`.
+The index WAL test now uses fixed reference values instead of comparing two
+calls to the same implementation. All 49 actual WAL tests also pass through
+RCH, with no failures or ignores. Their receipt is
+`dependencies/crc152-wal-receipt.json`. These runs do not prove that the software
+fallback was selected.
+The earlier queue timeout executed no test and is retained as an excluded run.
+
+### wide: 1.7.0 → 1.7.1
+
+The patch fixes unsigned lane sign-bit extraction in the portable bitmask
+fallback. The actual index SIMD suite passes 41/0/0 through RCH on
+`vmi1152480`, including scalar/vector parity and f16 conversions. Its executed
+binary SHA-256 is
+`d75a7d830d97e833d01ea0d5a66f80dbdfbb04d4056f2d72e4e6719c4b6d87f5`;
+`dependencies/wide171-receipt.json` records the source and command. Two initial
+checkout setup failures ran no tests. This is native x86 compatibility evidence,
+not proof of every fallback backend or a performance improvement.
+
+### rustix: 1.1.4 → 1.1.5
+
+All five direct requirements and both locks now select the patch. Its private
+runtime-module rename has no project call sites, and its Rust 1.65 minimum is
+below the project toolchain. A real Linux filesystem probe passes descriptor-
+relative creation, data/directory sync, rename publication, symlink refusal,
+exclusive lock contention, unlock/reacquisition, and descriptor identity checks.
+RCH reports 1/0/0; executable SHA-256:
+`6124e0cc453340902150ccb9e1695bff37ca38c4d1c23f5636fc64664990a62e`.
+This dependency-level probe does not replace generation-root, fsfs lease,
+macOS, or non-Unix compilation gates on the final graph.
+
+### Crossbeam Channel: 0.5.16 → 0.5.17
+
+The published patch repairs leaked-selection ownership, capacity overflow,
+and consumed-timer timeout handling. A real bounded channel probe receives
+all 256 values from four producers exactly once through `Select`; a consumed
+`at()` timer correctly returns `Timeout` from a subsequent zero-duration receive.
+The RCH test passes 1/0/0 with Crossbeam Utils still at 0.8.22, isolating this
+update. Receipt: `dependencies/crossbeam-channel0517-receipt.json`.
+This is functional evidence, not a sanitizer proof of every ownership path.
+
+### Crossbeam Utils: 0.8.22 → 0.8.23
+
+The patch repairs leaked `ShardedLockWriteGuard` storage and improves
+ThreadSanitizer target detection. A real four-thread lock test passes 1/0/0,
+preserving all 400 writes and allowing write acquisition after a reader that
+blocked `try_write` is released. The final exclusive reacquisition and
+`into_inner` retain the expected value. Receipt:
+`dependencies/crossbeam-utils0823-receipt.json`. This ordinary execution does
+not certify Stacked Borrows or sanitizer behavior.
+
+### Zerocopy and derive: 0.8.56 → 0.8.57
+
+Both exact-coupled packages advance together in both locks. The upstream
+padded-bool regression passes through RCH: an invalid bool conversion returns
+all eight source bytes unchanged, including destination padding; a valid zero
+conversion succeeds. Receipt: `dependencies/zerocopy0857-receipt.json`.
+This is ordinary native regression execution, not a Miri certification.
+
+### FastEmbed: 6.0.3 → 7.0.1 (qualification running)
+
+Published dependency requirements and features are unchanged. The existing
+builder-based constructors accommodate the new session configuration field.
+The inference/tokenization refactor requires fresh numerical qualification.
+The current implementation/protocol identities now name 7.0.1, while a separate
+reconstruction step preserves the prior 6.0.3 identity and every older frozen
+fingerprint. A three-model regression checks exact reconstruction, unchanged
+artifacts/input/space/certificates, changed producer fingerprints and refusal
+of the previous producer without explicit compatibility admission. No numeric
+golden is changed. Manifest history and the three real Linux model certificates
+are running through RCH; macOS/Windows and final product gates remain pending.
+
+### Standalone fuzz lock consistency
+
+The independently rooted Quill fuzz workspace failed `cargo metadata --locked`
+because four local path packages still recorded version 0.3.0. Their lock
+entries now match source version 0.3.1. The subsequent CRC, Wide, Rustix and
+Crossbeam updates are also resolved explicitly in this separate lock.
+Locked metadata resolution passes; remote compilation is still pending.
 
 ## 2026-09-16 — Pager repair update (qualification in progress)
 

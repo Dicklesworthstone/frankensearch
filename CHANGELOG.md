@@ -12,7 +12,8 @@ A September 15 supplement covers installer profile switching, offline verificati
 and default-model provisioning. September 16 qualification confirms the native
 F32 MiniLM repair on ARM64 macOS with the existing certificate unchanged.
 A September 17 supplement records lexical-flush retry and resume-ordering fixes
-and pager 0.4.3 adoption. Separate reproduced SQLite corruption still blocks publication.
+and FrankenSQLite 0.4.4 adoption. Both previously failing SQLite corruption
+regressions now pass; combined-source and rebuilt-artifact qualification remain pending.
 
 ## Version Timeline
 
@@ -61,7 +62,9 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ### Changed
 
-- **FrankenTUI 0.7.0, wide 1.7.0, crc32fast 1.5.1, and TOML 1.1.6.** The terminal framework, SIMD, checksum, and configuration updates pass their affected consumer suites. The Wide update also passes the real native F32 MiniLM certificate, batching, and repeatability check on x86. These checks establish compatibility, not a measured speedup. Full release qualification remains pending; see the [upgrade log](docs/planning/UPGRADE_LOG.md).
+- **HTTP transport updates to ureq 3.4.2 and Rustls 0.23.45.** The Rustls update addresses [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html); ureq also updates redirect and connection handling. Verified HTTPS requests pass through the updated transport. Combined-source release checks remain pending; see the [upgrade log](docs/planning/UPGRADE_LOG.md).
+
+- **FrankenTUI 0.7.0, wide 1.7.1, crc32fast 1.5.2, and TOML 1.1.6.** The terminal framework and configuration updates pass their affected consumer suites. The latest SIMD and checksum patches pass the index SIMD and WAL suites. These checks establish compatibility, not a measured speedup. Full release qualification remains pending; see the [upgrade log](docs/planning/UPGRADE_LOG.md).
 
 - **Model producer identities name the updated Tokenizers and FastEmbed dependencies.** Tokenizers 0.23.2 and FastEmbed 6.0.3 pass the existing Potion, MiniLM, Snowflake, and Nomic conformance checks without changing their vector certificates. Historical manifest fingerprints remain covered. The corrected producer identities require rebuilding semantic indexes made by the prior producers. The initial Asupersync 0.4.11 attempt failed the caller-visible shadow latency guard; the published family subsequently moved to 0.5.0 with the shadow execution changes described below. Earlier dependency checks do not qualify that later combined graph. See the [dependency qualification record](docs/planning/UPGRADE_LOG.md).
 
@@ -79,6 +82,8 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ### Fixed
 
+- **PDF text extraction respects each page's font resources.** Updating `pdf-extract` to 0.12.1 prevents a reused font name such as `/F0` from carrying the previous page's Unicode mapping into the next page. The same two-page regression fails with the old dependency and passes with the update; the fsfs wrapper test is included in the pending combined-source gate.
+
 - **Resumable lexical indexing preserves change-then-restore ordering.**
   Updating a document from A to B and back to A within one flush no longer
   mistakes the final A for an unchanged published row and leaves B indexed.
@@ -95,14 +100,14 @@ Historical adapter identities remain rejected by strict admission, and the
   require the caller's commit; this queue is not a durable journal.
   [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/db13bc1c4391e62d5a81c35a2c2f3735c3c2c19a).
 
-- **The candidate selects FrankenSQLite pager 0.4.3 for the pending-freelist
-  repair panic fix.** Other resolved SQLite members remain at 0.4.0. The focused
-  storage suite passes 351 tests, but two unchanged upstream corruption
-  regressions also fail on this exact dependency graph: orphaned pages after
-  savepoint rollback/growth and UNIQUE-constraint churn. Those failures still
-  block the release; the pager update is not a complete recovery fix.
-  [Dependency update](https://github.com/Dicklesworthstone/frankensearch/commit/05aca4de38f7560de94dc41b3bd8d28eff4bfb6d);
-  [qualification and blocker evidence](docs/planning/UPGRADE_LOG.md).
+- **FrankenSQLite 0.4.4 includes the pending-freelist transaction and abandoned-page
+  recovery fixes.** All twenty resolved SQLite packages now use 0.4.4, and all
+  ten direct requirements enforce that minimum. The unchanged savepoint/growth
+  and UNIQUE-index churn regressions pass against the published registry graph;
+  both failed with the former 0.4.0 family plus pager 0.4.3. These focused results
+  do not replace the pending fsfs and rebuilt-artifact release checks.
+  [Dependency update](https://github.com/Dicklesworthstone/frankensearch/commit/e90b9e9b2edde2fb7eaea3a65c8baf7cbbc4fc9c);
+  [qualification and historical failures](docs/planning/UPGRADE_LOG.md).
 
 - **Embedded-model builds extract defaults in a child before loading inference models.**
   The first macOS ARM run previously retained the embedded weight pages after
