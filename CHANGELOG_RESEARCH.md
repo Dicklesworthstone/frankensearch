@@ -743,3 +743,42 @@ passed separately. PE SHA256 is
 `cc22ea415a9a37b273b228079da057c82ec8aed9a6da860aa106182bf6dc5bf8`;
 receipts are retained in `windows-onnx-qualified-native-tests/`. Linux regression
 execution and the full CLI gate remain required before release qualification.
+
+### September 17 published SQLite repair
+
+Reviewed the ten manifest floors and twenty lock entries in
+`e90b9e9b2edde2fb7eaea3a65c8baf7cbbc4fc9c`. Published facade, core, pager,
+types, and FTS5 archive checksums and production sources match upstream tag
+`v0.4.4` at `9d3d98778a372aba95d76d05c5c974ac0238c96a`. Their internal
+requirements also floor SQLite at 0.4.4. The unchanged savepoint/growth and
+composite UNIQUE churn tests each pass 1/0/0 through RCH on vmi1152480, using
+only registry packages. Their executable hashes are respectively
+`87439b4142e7453e4c4b8da4a17d46df7297927f6b1cc47decef1d8aa058c0b0` and
+`1715c97c913b97fb555907979bf411474c6e50915b1eddd2383bad3fd38c8ca1`.
+Source barriers pass before and after each run. Logs are retained under
+`/data/release-work/frankensearch-release-20260912/sqlite044-validation-r2/`
+on that worker and in the local dependency controller log.
+
+The worker uses source `5c6e6516` plus the SQLite manifest/lock overlay;
+later queue/refresh commits are not covered by these focused results.
+Consumer suites finished with 3,449 passes, no failures and 15 existing ignores:
+storage 351, durability 160, ops 827 and fsfs 2,111. The final receipt and four
+hash-verified logs are retained in `dependencies/sqlite044-stage-evidence/`.
+The combined graph and new binaries require release qualification. Live GitHub release metadata on September 17
+still reports `v1.10.0` and `crates-v0.5.0` as the newest published releases.
+This supplement does not claim a new frankensearch release or complete
+coverage of the concurrently arriving queue/refresh workstream.
+
+The subsequent direct dependency refresh includes FastEmbed 7.0.1. Its
+manifest-history suite passes 126 tests with one existing ignore, and all three
+existing Linux ONNX certificates pass in separate processes. Historical hashes
+and numerical certificates were not regenerated. Executable SHA-256 is
+`598e23d5100d0fae94de2f5bfd6ef8355d51fa7f2c6ac3c6b33511125984af5a`;
+the receipt and hash-verified stage logs are in
+`dependencies/fastembed701-stage-evidence/` under the same release work directory.
+The subsequent RCH cross-build passes native execution on `Mac-mini-max`:
+126 manifest tests with one existing ignore and all three unchanged macOS
+certificates. Mach-O SHA-256 is
+`cd3b76353cad3415855e1be9a015088e5b2455a1a177633d55a4da707d6bb39c`;
+the receipt is `dependencies/darwin-fastembed701-native-results/receipt.json`.
+This does not yet qualify Windows or the combined release.
