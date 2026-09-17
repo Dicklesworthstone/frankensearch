@@ -16,12 +16,15 @@ use tracing::debug;
 
 use crate::config::IngestionClass;
 
+mod flush_queue;
+use flush_queue::FlushProgress;
+
 /// Default expected throughput for initial lexical indexing (docs/sec).
 pub const TARGET_INITIAL_DOCS_PER_SECOND: u32 = 20_000;
 /// Default expected throughput for incremental lexical updates (updates/sec).
-pub const TARGET_INCREMENTAL_UPDATES_PER_SECOND: u32 = 5_000;
-/// Default expected p95 latency budget for incremental updates.
 pub const TARGET_INCREMENTAL_P95_LATENCY_MS: u32 = 25;
+/// Default expected throughput for incremental lexical updates (updates/sec).
+pub const TARGET_INCREMENTAL_UPDATES_PER_SECOND: u32 = 5_000;
 
 /// Performance contract for lexical indexing workloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,6 +547,12 @@ impl<'a> QuillLexicalBackend<'a> {
     /// Contiguous upserts share one `index_documents` call. Deletes form
     /// ordering barriers so repeated document ids retain planner order.
     ///
+    /// Errors, cancellation, and dropping the future retain unacknowledged
+    /// actions in planner order. A failed backend call may have partially
+    /// applied its batch, so retry is at-least-once, not exactly-once. A
+    /// successful flush still requires the caller's normal commit barrier;
+    /// this in-memory queue is not a durable journal.
+    ///
     /// # Errors
     ///
     /// Returns the typed Quill failure converted to the workspace search error.
@@ -565,18 +574,16 @@ impl<'a> QuillLexicalBackend<'a> {
     }
 
     async fn flush_inner(&mut self, cx: &Cx, resumable: bool) -> SearchResult<QuillResumeStats> {
-        cx.checkpoint().map_err(|error| SearchError::Cancelled {
-            phase: "fsfs.lexical.flush".to_owned(),
-            reason: cx
-                .cancel_reason()
-                .map_or_else(|| error.to_string(), |reason| reason.to_string()),
-        })?;
-        let actions = std::mem::take(&mut self.pending);
+        lexical_flush_checkpoint(cx)?;
+        let mut progress = FlushProgress::new(&mut self.pending);
         let mut documents = Vec::new();
         let mut stats = QuillResumeStats::default();
 
-        for action in actions {
-            match action {
+        for offset in 0..progress.actions().len() {
+            lexical_flush_checkpoint(cx)?;
+            // Keep the original action until its write is acknowledged. In
+            // particular, dropping this future at an await must not lose work.
+            match progress.actions()[offset].clone() {
                 LexicalAction::Upsert {
                     doc_id,
                     title,
@@ -613,9 +620,13 @@ impl<'a> QuillLexicalBackend<'a> {
                     if self.index.has_uncommitted_changes() {
                         LexicalWrite::commit(self.index, cx).await?;
                     }
+                    // The upsert prefix has crossed its publication barrier.
+                    // A failed delete must retain itself, not replay that prefix.
+                    progress.acknowledge_through(offset);
                     if self.index.delete_document(cx, &doc_id).await? {
                         stats.deleted = stats.deleted.saturating_add(1);
                     }
+                    progress.acknowledge_through(offset + 1);
                 }
                 LexicalAction::Skip { .. } => {}
             }
@@ -623,8 +634,19 @@ impl<'a> QuillLexicalBackend<'a> {
         if !documents.is_empty() {
             LexicalWrite::index_documents(self.index, cx, &documents).await?;
         }
+        // As before, successful trailing upserts are staged, not committed.
+        progress.acknowledge_through(progress.actions().len());
         Ok(stats)
     }
+}
+
+fn lexical_flush_checkpoint(cx: &Cx) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: "fsfs.lexical.flush".to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
 }
 
 fn chunks_into_index_content(chunks: Vec<LexicalChunk>) -> String {
