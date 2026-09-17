@@ -12,8 +12,11 @@ use crate::{Cx, Embedder, ScoreSource, ScoredResult, SearchResult};
 
 mod progressive;
 mod refinement;
+mod sharded;
 
 pub use progressive::{NativePhaseCandidates, NativeProgressiveSearch, NativeSearchPhase};
+pub use sharded::{NativeShardedProgressiveSearch, NativeShardedResult, NativeShardedSearchPhase};
+
 impl NativeAnnIndex {
     /// Execute native hybrid retrieval and return hydrated final winners.
     ///
