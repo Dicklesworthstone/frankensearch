@@ -28,7 +28,6 @@ pub mod fingerprint;
 pub mod generation;
 pub mod graph;
 pub mod host_adapter;
-pub mod metrics;
 pub mod metrics_eval;
 pub mod observability_lint;
 pub mod parsed_query;
