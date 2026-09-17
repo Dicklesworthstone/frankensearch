@@ -18,6 +18,7 @@ CENSUS_SCHEMA_VERSION="frankensearch-crates-registry-census-v1"
 # fresh-process contract pin in frankensearch-embed, and docs/planning/UPGRADE_LOG.md.
 AUDITED_ASUPERSYNC_VERSION="0.5.0"
 AUDITED_FSQLITE_FAMILY_VERSION="0.4.0"
+AUDITED_FSQLITE_PAGER_VERSION="0.4.3"
 USER_AGENT="frankensearch-publish-contract/1.0 (https://github.com/Dicklesworthstone/frankensearch)"
 
 usage() {
@@ -208,10 +209,12 @@ run_source_cleanliness_self_test() {
 }
 
 # Positive dependency-universe lockfile: one registry Asupersync identity plus
-# a three-member fsqlite family, all at the audited versions.
+# a four-member fsqlite family, including the independently qualified pager.
 write_registry_universe_lock() {
   local fixture_asupersync="${2:-$AUDITED_ASUPERSYNC_VERSION}"
   local fixture_fsqlite="${3:-$AUDITED_FSQLITE_FAMILY_VERSION}"
+  local fixture_pager="${4:-$AUDITED_FSQLITE_PAGER_VERSION}"
+  local fixture_pager_source="${5:-registry+https://github.com/rust-lang/crates.io-index}"
   printf '%s\n' \
     'version = 4' \
     '' \
@@ -233,7 +236,12 @@ write_registry_universe_lock() {
     '[[package]]' \
     'name = "fsqlite-types"' \
     "version = \"${fixture_fsqlite}\"" \
-    'source = "registry+https://github.com/rust-lang/crates.io-index"' >"$1"
+    'source = "registry+https://github.com/rust-lang/crates.io-index"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite-pager"' \
+    "version = \"${fixture_pager}\"" \
+    "source = \"${fixture_pager_source}\"" >"$1"
 }
 
 run_self_test() {
@@ -609,11 +617,16 @@ run_self_test() {
   # The immediately preceding audited versions remain invalid for this
   # candidate, even with coherent registry sources and no duplicate packages.
   local prior_family prior_receipt prior_code
-  for prior_family in asupersync fsqlite; do
+  for prior_family in asupersync fsqlite pager-old pager-unreviewed; do
     prior_receipt="${temp_dir}/receipt-prior-${prior_family}.json"
     if [[ "$prior_family" == "asupersync" ]]; then
       write_registry_universe_lock "${source_root}/Cargo.lock" "0.4.10"
       prior_code="DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID"
+    elif [[ "$prior_family" == "pager-old" || "$prior_family" == "pager-unreviewed" ]]; then
+      local rejected_pager="0.4.0"
+      [[ "$prior_family" != "pager-unreviewed" ]] || rejected_pager="0.4.4"
+      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "$AUDITED_FSQLITE_FAMILY_VERSION" "$rejected_pager"
+      prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
     else
       write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.3.18"
       prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
@@ -690,13 +703,8 @@ run_self_test() {
   # ── Rule 3: fsqlite family source and coherence ─────────────────────────
 
   # one member sourced from git
-  write_registry_universe_lock "${source_root}/Cargo.lock"
-  printf '%s\n' \
-    '' \
-    '[[package]]' \
-    'name = "fsqlite-pager"' \
-    "version = \"${AUDITED_FSQLITE_FAMILY_VERSION}\"" \
-    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=0000000000000000000000000000000000000000#0000000000000000000000000000000000000000"' >>"${source_root}/Cargo.lock"
+  write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "$AUDITED_FSQLITE_FAMILY_VERSION" "0.4.3" \
+    'git+https://github.com/Dicklesworthstone/frankensqlite?rev=0000000000000000000000000000000000000000#0000000000000000000000000000000000000000'
 
   if bash "$script_path" \
     --mode gate \
@@ -722,7 +730,7 @@ run_self_test() {
     '' \
     '[[package]]' \
     'name = "fsqlite-wal"' \
-    'version = "0.3.1"' \
+    'version = "0.4.3"' \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' >>"${source_root}/Cargo.lock"
 
   if bash "$script_path" \
@@ -740,7 +748,7 @@ run_self_test() {
 
   jq -e '
     .blocker_codes == ["DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"]
-    and (.blockers[0].message | contains("fsqlite-wal@0.3.1"))
+    and (.blockers[0].message | contains("fsqlite-wal@0.4.3"))
   ' "$mixed_family_receipt" >/dev/null
 
   # both rules at once: stale Asupersync plus a git-sourced family
@@ -919,11 +927,10 @@ PY
       "Remove the fsqlite* entries from [patch.*] and regenerate Cargo.lock from the registry."
   fi
 
-  # Rule 3: every fsqlite* lock entry is registry-sourced at the ONE audited
-  # family version. Upstream's internal pins are caret, so a selective
-  # `cargo update -p fsqlite` can leave sub-crates behind (0.3.1/0.3.7 split
-  # observed 2026-08-21); a mixed family is rejected here, not discovered at
-  # runtime.
+  # Rule 3: registry-only audited versions. The bd-dsbym pager repair advances
+  # only fsqlite-pager to 0.4.3 (UPGRADE_LOG 2026-09-16); every other member
+  # remains pinned to the family version. This identity check does not waive
+  # the separate corruption-repair and release-artifact qualification holds.
   mapfile -t fsqlite_lock_entries < <(
     awk '
       BEGIN { RS = ""; FS = "\\n" }
@@ -957,8 +964,12 @@ PY
     fsqlite_version="${fsqlite_lock_entry#*|}"
     fsqlite_version="${fsqlite_version%%|*}"
     fsqlite_source="${fsqlite_lock_entry##*|}"
+    local expected_fsqlite_version="$AUDITED_FSQLITE_FAMILY_VERSION"
+    if [[ "$fsqlite_package" == "fsqlite-pager" ]]; then
+      expected_fsqlite_version="$AUDITED_FSQLITE_PAGER_VERSION"
+    fi
     if [[ "$fsqlite_source" != "$registry_source" ]] \
-      || [[ "$fsqlite_version" != "$AUDITED_FSQLITE_FAMILY_VERSION" ]]; then
+      || [[ "$fsqlite_version" != "$expected_fsqlite_version" ]]; then
       invalid_fsqlite_entries+=("${fsqlite_package}@${fsqlite_version}|${fsqlite_source:-<no-source>}")
     fi
   done
@@ -970,8 +981,8 @@ PY
       "" \
       "fsqlite" \
       "bd-rnb6l" \
-      "Cargo.lock must resolve every fsqlite* package from ${registry_source} at the audited family version ${AUDITED_FSQLITE_FAMILY_VERSION}; invalid entries: ${fsqlite_lock_csv}." \
-      "Move the whole fsqlite family together (cargo update -p <every fsqlite* member>) so no sub-crate is left on another version, or bump AUDITED_FSQLITE_FAMILY_VERSION deliberately."
+      "Cargo.lock must resolve fsqlite-pager at ${AUDITED_FSQLITE_PAGER_VERSION} and every other fsqlite* package at ${AUDITED_FSQLITE_FAMILY_VERSION}, all from ${registry_source}; invalid entries: ${fsqlite_lock_csv}." \
+      "Restore the audited per-package registry versions; change these pins only with dependency qualification evidence."
   fi
 }
 
