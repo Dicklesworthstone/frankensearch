@@ -632,7 +632,8 @@ impl IndexCache {
             ));
         }
 
-        TierCacheIdentity::fast(current).validate_replacement(TierCacheIdentity::fast(candidate))?;
+        TierCacheIdentity::fast(current)
+            .validate_replacement(TierCacheIdentity::fast(candidate))?;
         TierCacheIdentity::quality(current)
             .validate_replacement(TierCacheIdentity::quality(candidate))?;
         Ok(())
@@ -1553,7 +1554,10 @@ mod tests {
                 right.join().expect("second worker"),
             )
         });
-        assert_ne!(outcomes.0, outcomes.1, "exactly one conditional writer wins");
+        assert_ne!(
+            outcomes.0, outcomes.1,
+            "exactly one conditional writer wins"
+        );
         assert_eq!(cache.current().doc_count(), if outcomes.0 { 1 } else { 2 });
         assert_eq!(expected.doc_count(), 3, "old readers retain their snapshot");
     }
