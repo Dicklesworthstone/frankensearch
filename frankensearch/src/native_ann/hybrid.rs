@@ -8,9 +8,45 @@ use frankensearch_core::{BoundQueryEmbedding, FusedHit, LexicalCandidateBatch, L
 use frankensearch_fusion::{RrfConfig, candidate_count, rrf_fuse_for_vector_lane};
 
 use super::{NativeAnnIndex, checkpoint, invalid};
-use crate::{Cx, Embedder, SearchResult};
+use crate::{Cx, Embedder, ScoreSource, ScoredResult, SearchResult};
 
 impl NativeAnnIndex {
+    /// Execute native hybrid retrieval and return hydrated final winners.
+    ///
+    /// Eager metadata is reused from the original lexical candidates. Deferred
+    /// metadata is requested only for the winning lexical documents, with the
+    /// exact snapshot context returned by that candidate search. No new search,
+    /// reader reopen, or current-generation metadata lookup is performed here.
+    /// Vector-only winners have no lexical metadata to hydrate.
+    ///
+    /// Fused rank order, native row indices and lexical scores are preserved.
+    /// This single-tier convenience API treats its retained vector owner as
+    /// the fast retrieval lane; it does not execute quality-tier refinement.
+    /// Hash-only hits are labelled [`ScoreSource::HashControl`]; their raw
+    /// control scores are not placed in semantic `fast_score` fields. Use
+    /// [`Self::search_hybrid_candidates`] to retain the explicit hash scores and
+    /// per-source ranks, which [`ScoredResult`] cannot represent separately.
+    /// Execution and cross-reader generation requirements are the same as for
+    /// [`Self::search_hybrid_candidates`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates retrieval, hydration and cancellation errors. A partially
+    /// hydrated result set is never returned after failure or cancellation.
+    pub async fn search_hybrid_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        lexical: &dyn LexicalRead,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let (hits, batch) = self
+            .search_hybrid_candidates(cx, embedder, lexical, text, k)
+            .await?;
+        hydrate_winners(cx, lexical, hits, &batch).await
+    }
+
     /// Search the native graph and a read-only lexical backend, then fuse ranks.
     ///
     /// Inference and lexical retrieval are polled concurrently in this future;
@@ -105,6 +141,84 @@ impl NativeAnnIndex {
     }
 }
 
+/// Only the private path can pair fused winners with a hydration batch. Public
+/// callers cannot pass a fresh batch to this helper and silently lose the pin.
+async fn hydrate_winners(
+    cx: &Cx,
+    lexical: &dyn LexicalRead,
+    hits: Vec<FusedHit>,
+    batch: &LexicalCandidateBatch,
+) -> SearchResult<Vec<ScoredResult>> {
+    checkpoint(cx, "native_ann.hybrid_materialize")?;
+    let mut results = Vec::with_capacity(hits.len());
+    for hit in hits {
+        checkpoint(cx, "native_ann.hybrid_winner")?;
+        results.push(materialize_winner(hit, batch)?);
+    }
+    if batch.is_deferred() && results.iter().any(|result| result.lexical_score.is_some()) {
+        checkpoint(cx, "native_ann.hybrid_before_hydration")?;
+        let response = lexical
+            .hydrate_candidates(cx, batch.context(), &mut results)
+            .await;
+        checkpoint(cx, "native_ann.hybrid_after_hydration")?;
+        response?;
+    }
+    checkpoint(cx, "native_ann.hybrid_results_complete")?;
+    Ok(results)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "ScoredResult exposes f32; fusion retains f64 until this final checked conversion"
+)]
+fn materialize_winner(hit: FusedHit, batch: &LexicalCandidateBatch) -> SearchResult<ScoredResult> {
+    let metadata = if let Some(rank) = hit.lexical_rank {
+        let candidate = batch
+            .results()
+            .get(rank)
+            .filter(|candidate| candidate.doc_id == hit.doc_id)
+            .ok_or_else(|| {
+                invalid(
+                    "lexical_rank",
+                    "batch-mismatch",
+                    "fused lexical rank must resolve to the original scoring candidate",
+                )
+            })?;
+        candidate.metadata.clone()
+    } else {
+        None
+    };
+    let score = hit.rrf_score as f32;
+    if !score.is_finite() {
+        return Err(invalid(
+            "fused_score",
+            "non-finite",
+            "fused score must remain finite at the public result precision",
+        ));
+    }
+    let source = if hit.in_both_sources {
+        ScoreSource::Hybrid
+    } else if hit.lexical_rank.is_some() {
+        ScoreSource::Lexical
+    } else if hit.hash_rank.is_some() {
+        ScoreSource::HashControl
+    } else {
+        ScoreSource::SemanticFast
+    };
+    Ok(ScoredResult {
+        doc_id: hit.doc_id,
+        score,
+        source,
+        index: hit.semantic_index,
+        fast_score: hit.semantic_score,
+        quality_score: None,
+        lexical_score: hit.lexical_score,
+        rerank_score: None,
+        explanation: None,
+        metadata,
+    })
+}
+
 fn validate_lexical(cx: &Cx, batch: &LexicalCandidateBatch) -> SearchResult<()> {
     checkpoint(cx, "native_ann.hybrid_lexical_batch")?;
     for result in batch.results() {
@@ -174,7 +288,7 @@ mod tests {
         ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
     };
     use frankensearch_core::traits::{IdentityBoundEmbedding, ModelCategory, SearchFuture};
-    use frankensearch_core::{LexicalHydrationContext, ScoreSource, ScoredResult};
+    use frankensearch_core::LexicalHydrationContext;
     use frankensearch_index::native_hnsw::HnswParams;
     use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
 
@@ -252,11 +366,29 @@ mod tests {
         }
     }
 
+    enum BatchMode {
+        Deferred,
+        Eager,
+        Foreign,
+    }
+
+    enum HydrationReply {
+        Correct,
+        Cancelled,
+        Pending,
+    }
+
     struct Lexical {
         calls: AtomicUsize,
         cancelled: bool,
         pending: bool,
-        snapshot: Arc<()>,
+        snapshot: Arc<usize>,
+        latest_generation: AtomicUsize,
+        batch_mode: BatchMode,
+        hydration_reply: HydrationReply,
+        hydrations: AtomicUsize,
+        hydrated_docs: AtomicUsize,
+        hydration_drops: AtomicUsize,
     }
 
     impl Lexical {
@@ -265,7 +397,13 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 cancelled: false,
                 pending: false,
-                snapshot: Arc::new(()),
+                snapshot: Arc::new(1),
+                latest_generation: AtomicUsize::new(1),
+                batch_mode: BatchMode::Deferred,
+                hydration_reply: HydrationReply::Correct,
+                hydrations: AtomicUsize::new(0),
+                hydrated_docs: AtomicUsize::new(0),
+                hydration_drops: AtomicUsize::new(0),
             }
         }
     }
@@ -316,13 +454,57 @@ mod tests {
             limit: usize,
         ) -> SearchFuture<'a, LexicalCandidateBatch> {
             Box::pin(async move {
+                let mut results = self.search(cx, text, limit).await?;
+                self.latest_generation.store(2, Ordering::SeqCst);
+                if matches!(self.batch_mode, BatchMode::Eager) {
+                    for result in &mut results {
+                        result.metadata = Some(Arc::new(serde_json::json!({
+                            "snapshot": *self.snapshot,
+                        })));
+                    }
+                    return Ok(LexicalCandidateBatch::eager(results));
+                }
+                let snapshot = if matches!(self.batch_mode, BatchMode::Foreign) {
+                    Arc::new(99_usize)
+                } else {
+                    Arc::clone(&self.snapshot)
+                };
                 Ok(LexicalCandidateBatch::deferred(
-                    self.search(cx, text, limit).await?,
-                    LexicalHydrationContext::new(
-                        "native-hybrid-test",
-                        Box::new(Arc::clone(&self.snapshot)),
-                    ),
+                    results,
+                    LexicalHydrationContext::new("native-hybrid-test", Box::new(snapshot)),
                 ))
+            })
+        }
+
+        fn hydrate_candidates<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            context: Option<&'a LexicalHydrationContext>,
+            results: &'a mut [ScoredResult],
+        ) -> SearchFuture<'a, ()> {
+            Box::pin(async move {
+                self.hydrations.fetch_add(1, Ordering::SeqCst);
+                let _guard = DropCount(&self.hydration_drops);
+                let snapshot = context
+                    .and_then(LexicalHydrationContext::downcast_ref::<Arc<usize>>)
+                    .filter(|snapshot| Arc::ptr_eq(snapshot, &self.snapshot))
+                    .ok_or_else(|| invalid("hydration", "foreign", "foreign scoring snapshot"))?;
+                for result in results {
+                    if result.lexical_score.is_some() {
+                        result.metadata = Some(Arc::new(serde_json::json!({
+                            "snapshot": **snapshot,
+                        })));
+                        self.hydrated_docs.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                match self.hydration_reply {
+                    HydrationReply::Correct => Ok(()),
+                    HydrationReply::Cancelled => Err(SearchError::Cancelled {
+                        phase: "test.hydration".to_owned(),
+                        reason: "cancelled after partial hydration".to_owned(),
+                    }),
+                    HydrationReply::Pending => std::future::pending().await,
+                }
             })
         }
 
@@ -496,6 +678,173 @@ mod tests {
                     Err(SearchError::InvalidConfig { .. })
                 ));
             }
+        });
+    }
+
+    #[test]
+    fn hybrid_text_hydrates_only_winners_from_the_scoring_snapshot() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, false);
+            let provider = Provider::new(false);
+            let lexical = Lexical::new();
+            let results = index
+                .search_hybrid_text(&cx, &provider, &lexical, "query", 1)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            let winner = &results[0];
+            assert_eq!(winner.doc_id, "beta");
+            assert_eq!(winner.source, ScoreSource::Hybrid);
+            assert_eq!(winner.index, Some(1));
+            assert_eq!(winner.lexical_score, Some(10.0));
+            assert!(winner.fast_score.is_none() && winner.quality_score.is_none());
+            assert!((winner.score - (1.0_f32 / 61.0 + 1.0 / 62.0)).abs() < 1e-7);
+            assert_eq!(winner.metadata.as_deref().unwrap()["snapshot"], 1);
+            assert_eq!(lexical.latest_generation.load(Ordering::SeqCst), 2);
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.hydrated_docs.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+        });
+    }
+
+    #[test]
+    fn eager_metadata_is_reused_and_hash_only_results_stay_nonsemantic() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, false);
+            let provider = Provider::new(false);
+            let mut lexical = Lexical::new();
+            lexical.batch_mode = BatchMode::Eager;
+            let results = index
+                .search_hybrid_text(&cx, &provider, &lexical, "query", 3)
+                .await
+                .unwrap();
+            assert_eq!(results[0].metadata.as_deref().unwrap()["snapshot"], 1);
+            assert_eq!(results[1].metadata.as_deref().unwrap()["snapshot"], 1);
+            let vector_only = &results[2];
+            assert_eq!(vector_only.doc_id, "gamma");
+            assert_eq!(vector_only.source, ScoreSource::HashControl);
+            assert_eq!(vector_only.index, Some(2));
+            assert!(vector_only.metadata.is_none());
+            assert!(vector_only.fast_score.is_none());
+            assert!(vector_only.lexical_score.is_none());
+            assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn foreign_hydration_context_is_an_error_not_a_new_search() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, false);
+            let provider = Provider::new(false);
+            let mut lexical = Lexical::new();
+            lexical.batch_mode = BatchMode::Foreign;
+            let error = index
+                .search_hybrid_text(&cx, &provider, &lexical, "query", 2)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
+                if field == "native_ann.hydration"));
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.hydrated_docs.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn hydration_cancellation_does_not_return_partially_hydrated_success() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, false);
+            let provider = Provider::new(false);
+            let mut lexical = Lexical::new();
+            lexical.hydration_reply = HydrationReply::Cancelled;
+            let error = index
+                .search_hybrid_text(&cx, &provider, &lexical, "query", 2)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { ref phase, .. }
+                if phase == "test.hydration"));
+            assert_eq!(lexical.hydrated_docs.load(Ordering::SeqCst), 2);
+            assert_eq!(lexical.hydration_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+            assert_eq!(index.live_count(), 3);
+        });
+    }
+
+    #[test]
+    fn dropping_pending_hydration_releases_the_pin_and_owned_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, false);
+            let provider = Provider::new(false);
+            let mut lexical = Lexical::new();
+            lexical.hydration_reply = HydrationReply::Pending;
+            let mut future = Box::pin(index.search_hybrid_text(
+                &cx, &provider, &lexical, "query", 2,
+            ));
+            let waker = Waker::from(Arc::new(NoopWake));
+            assert!(matches!(
+                future.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Pending
+            ));
+            assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
+            drop(future);
+            assert_eq!(lexical.hydration_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+            assert_eq!(index.live_count(), 3);
+        });
+    }
+
+    #[test]
+    fn text_noops_skip_hydration_and_empty_native_owners_hydrate_lexical_hits() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, true);
+            let provider = Provider::new(true);
+            let lexical = Lexical::new();
+            assert!(
+                index
+                    .search_hybrid_text(&cx, &provider, &lexical, "query", 0)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 0);
+            let results = index
+                .search_hybrid_text(&cx, &provider, &lexical, "query", 2)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|result| {
+                result.source == ScoreSource::Lexical
+                    && result.index.is_none()
+                    && result.fast_score.is_none()
+                    && result.metadata.is_some()
+            }));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(lexical.hydrated_docs.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn duplicate_lexical_ids_keep_the_winning_candidates_metadata_arc() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, false);
+            let lexical = Lexical::new();
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity()).unwrap();
+            let original = Arc::new(serde_json::json!({"winner": "first"}));
+            let mut first = lexical_result("beta", 10.0);
+            first.metadata = Some(Arc::clone(&original));
+            let mut duplicate = lexical_result("beta", 1.0);
+            duplicate.metadata = Some(Arc::new(serde_json::json!({"winner": "second"})));
+            let batch = LexicalCandidateBatch::eager(vec![first, duplicate]);
+            let hits = index
+                .fuse_candidates(&cx, &query, &batch, 1, None, &RrfConfig::default())
+                .unwrap();
+            let results = hydrate_winners(&cx, &lexical, hits, &batch).await.unwrap();
+            assert_eq!(results[0].doc_id, "beta");
+            assert!(Arc::ptr_eq(results[0].metadata.as_ref().unwrap(), &original));
+            assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 0);
         });
     }
 }
