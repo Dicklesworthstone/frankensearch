@@ -729,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_accepts_shift_modified_characters() {
+    fn palette_accepts_shift_text_but_ignores_super_shortcuts() {
         let mut shell = AppShell::new(ShellConfig::default());
         let open = InputEvent::Key(
             ftui_core::event::KeyCode::Char('p'),
@@ -743,6 +743,15 @@ mod tests {
         );
         let _ = shell.handle_input(&shifted);
 
+        assert_eq!(shell.palette.query(), "A");
+
+        let shortcut = InputEvent::Key(
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::SUPER,
+        );
+        let _ = shell.handle_input(&shortcut);
+
+        assert_eq!(shell.palette.state(), &PaletteState::Open);
         assert_eq!(shell.palette.query(), "A");
     }
 
