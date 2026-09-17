@@ -1,5 +1,55 @@
 # Dependency Upgrade Log
 
+## 2026-09-17 — Published FrankenSQLite 0.4.4 and stable dependency refresh
+
+The direct registry census covers 68 packages across 17 manifests, including
+target, build, development, and standalone fuzz dependencies. It identifies
+six remaining non-SQLite updates: `pdf-extract` 0.12.1, `ureq` 3.4.2,
+`crc32fast` 1.5.2, `wide` 1.7.1, `rustix` 1.1.5, and `fastembed` 7.0.1.
+Each update is researched and tested separately. Registry renames, local path
+dependencies, and the transitive prerelease ORT dependency remain deliberate.
+
+### FrankenSQLite: 0.4.0 family / pager 0.4.3 → uniform 0.4.4
+
+All ten direct SQLite requirements in storage, durability, fsfs, and ops now
+require at least 0.4.4. The lock advances twenty SQLite packages and no unrelated
+package versions. The published facade, core, pager, types, and FTS5 archives
+match their registry checksums and the production sources at tag
+[`v0.4.4`](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.4.4),
+commit `9d3d98778a372aba95d76d05c5c974ac0238c96a`. Their internal SQLite
+requirements also have a 0.4.4 floor, so a downstream lock cannot retain the
+broken older pager. No path patch or source replacement is used.
+
+This release includes both pending-freelist writer attribution and the
+abandoned-page reclamation repair. Before publication, applying only the latter
+repair to our former exact dependency graph passed both unchanged corruption
+keepers through RCH. That source-only result is retained separately from the
+new published-package qualification, which is in progress alongside actual
+storage, durability, ops, and fsfs tests. The earlier failing executions remain
+recorded below; rebuilt release artifacts still require final qualification.
+
+Research, registry/archive provenance, the complete dependency census, and
+per-update receipts are retained under
+`/data/release-work/frankensearch-release-20260912/dependencies/` and the parent
+release work directory. FastEmbed 7 changes inference construction and
+tokenization, so its upgrade must preserve historical producer identities and
+pass the existing real-model certificates before adoption.
+
+### Security audit during qualification
+
+The refreshed advisory database identifies existing Rustls 0.23.43 as affected
+by [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html).
+The compatible 0.23.45 security update is added to this campaign; both
+Asupersync and ureq permit it. This finding predates the SQLite update.
+
+The inherited `lru` 0.16.4 soundness warning remains visible. Its only parent,
+the latest published Tantivy 0.26.2, requires the 0.16 series; the fixed 0.18.2
+is incompatible with that requirement. The inspected Tantivy cache uses
+`usize` keys and does not call `pop`, so the advisory's panicking-key-destructor
+precondition is absent in that call path. This is a bounded exposure review,
+not a claim that the dependency is fixed. Existing unmaintained warnings for
+`bincode`, `paste`, and `ttf-parser` are retained without audit suppression.
+
 ## 2026-09-16 — Pager repair update (qualification in progress)
 
 The release lock advances only `fsqlite-pager` from 0.4.0 to 0.4.3.
