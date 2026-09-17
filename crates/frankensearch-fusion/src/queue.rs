@@ -21,6 +21,10 @@ use frankensearch_core::{SearchError, SearchResult};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
+mod lease;
+pub use lease::EmbeddingBatch;
+use lease::ActiveLease;
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -28,7 +32,7 @@ use tracing::{debug, warn};
 /// Configuration for the embedding job queue.
 #[derive(Debug, Clone)]
 pub struct EmbeddingQueueConfig {
-    /// Maximum number of pending jobs. Default: 1000.
+    /// Maximum queued plus unacknowledged leased jobs. Default: 1000.
     pub capacity: usize,
     /// Maximum batch size for processing. Default: 32.
     pub batch_size: usize,
@@ -161,6 +165,8 @@ struct QueueState {
     jobs: VecDeque<EmbeddingJob>,
     /// Tracks which `doc_ids` are currently in the queue (for dedup).
     pending_ids: HashMap<String, usize>,
+    /// Reserved ownership of the active cancellation-safe batch.
+    lease: Option<ActiveLease>,
     /// Content hashes of recently embedded documents (for skip-unchanged).
     known_hashes: HashMap<String, KnownHashEntry>,
     /// Approximate LRU queue for pruning known content hashes.
@@ -184,14 +190,20 @@ struct KnownHashEntry {
 ///
 /// # Backpressure
 ///
-/// When the queue is at capacity, [`submit`](Self::submit) returns
-/// [`SearchError::QueueFull`]. Callers should back off and retry.
+/// When queued plus unacknowledged leased jobs reach capacity,
+/// [`submit`](Self::submit) returns [`SearchError::QueueFull`]. Callers should
+/// back off and retry. Prefer [`Self::lease_batch`] for async processing so
+/// cancellation cannot relinquish ownership of an unfinished batch.
 ///
 /// # Dedup
 ///
 /// If a document with the same `doc_id` is already pending, the new
 /// request replaces it (latest text wins). If the content hash matches
 /// a previously embedded version, the job is skipped entirely.
+/// Draining a job invalidates that document's remembered hash: its old
+/// committed content cannot authorize a no-op while a replacement is in flight.
+/// The single writer must finish publishing a batch before recording its
+/// hashes and processing the next batch.
 pub struct EmbeddingQueue {
     config: EmbeddingQueueConfig,
     state: Mutex<QueueState>,
@@ -216,6 +228,7 @@ impl EmbeddingQueue {
             state: Mutex::new(QueueState {
                 jobs: VecDeque::with_capacity(config.capacity),
                 pending_ids: HashMap::new(),
+                lease: None,
                 known_hashes: HashMap::new(),
                 known_hash_order: VecDeque::new(),
                 sequence: 0,
@@ -365,10 +378,11 @@ impl EmbeddingQueue {
             return Ok(JobOutcome::SkippedUnchanged);
         }
 
-        // Check capacity
-        if state.jobs.len() >= self.config.capacity {
+        // Include reserved slots so cancelled batches can always return.
+        let pending = state.outstanding_count();
+        if pending >= self.config.capacity {
             return Err(SearchError::QueueFull {
-                pending: state.jobs.len(),
+                pending,
                 capacity: self.config.capacity,
             });
         }
@@ -404,12 +418,19 @@ impl EmbeddingQueue {
         }
 
         let mut state = self.lock_state();
+        if state.lease.is_some() {
+            return Vec::new();
+        }
         let count = state.jobs.len().min(limit);
         let mut batch = Vec::with_capacity(count);
 
         for _ in 0..count {
             if let Some(job) = state.jobs.pop_front() {
                 state.pending_ids.remove(&job.doc_id);
+                // Once a replacement can reach the writer, the historical
+                // committed hash is no longer a safe skip witness. Otherwise
+                // A -> drain B -> submit A loses the restoration while B runs.
+                state.known_hashes.remove(&job.doc_id);
                 batch.push(job);
             }
         }
@@ -429,7 +450,9 @@ impl EmbeddingQueue {
 
     /// Drain up to `batch_size` jobs from the queue.
     ///
-    /// Returns an empty vec if no jobs are pending.
+    /// Returns an empty vec if no jobs are pending or a lease is active.
+    /// This transfers ownership without drop recovery; async consumers should
+    /// prefer [`Self::lease_batch`].
     #[must_use]
     pub fn drain_batch(&self) -> Vec<EmbeddingJob> {
         self.drain_with_limit(self.config.batch_size)
@@ -438,7 +461,8 @@ impl EmbeddingQueue {
     /// Drain at most `limit` jobs from the queue.
     ///
     /// Useful for consumers that want to cap how many documents they
-    /// process without re-enqueuing already fetched work.
+    /// process without re-enqueuing already fetched work. Returns empty while
+    /// a lease is active; prefer [`Self::lease_batch_up_to`] for async work.
     #[must_use]
     pub fn drain_batch_up_to(&self, limit: usize) -> Vec<EmbeddingJob> {
         self.drain_with_limit(limit)
@@ -446,12 +470,16 @@ impl EmbeddingQueue {
 
     /// Re-enqueue a failed job for retry (increments retry count).
     ///
-    /// If the job has exceeded `max_retries`, it is not re-enqueued and
-    /// `JobOutcome::Failed` is returned.
+    /// If the job has reached `max_retries`, it is not re-enqueued and
+    /// `JobOutcome::Failed` is returned. A leased job relinquishes its reserved
+    /// slot under the same lock as the retry decision, so unrelated producers
+    /// cannot consume that slot between release and requeue.
     pub fn requeue(&self, mut job: EmbeddingJob) -> JobOutcome {
-        job.retry_count += 1;
+        let mut state = self.lock_state();
+        state.release_leased_job(&job.doc_id);
 
-        if job.retry_count > self.config.max_retries {
+        // Test before incrementing, including when max_retries is u32::MAX.
+        if job.retry_count >= self.config.max_retries {
             warn!(
                 target: "frankensearch.queue",
                 doc_id = %job.doc_id,
@@ -461,11 +489,10 @@ impl EmbeddingQueue {
             self.metrics.record(JobOutcome::Failed);
             return JobOutcome::Failed;
         }
+        job.retry_count += 1;
 
-        let mut state = self.lock_state();
-
-        // If queue is full, drop the retry (backpressure)
-        if state.jobs.len() >= self.config.capacity {
+        // Unleased retries retain their existing backpressure policy.
+        if state.outstanding_count() >= self.config.capacity {
             warn!(
                 target: "frankensearch.queue",
                 doc_id = %job.doc_id,
@@ -512,10 +539,13 @@ impl EmbeddingQueue {
 
     /// Record that a document was successfully embedded with a given content hash.
     ///
+    /// Call only after the single writer has successfully published the batch.
     /// Future submissions with the same `doc_id` and hash will be skipped.
+    /// A matching leased job is acknowledged and its capacity released.
     pub fn record_embedded(&self, doc_id: &str, content_hash: &str) {
         let mut state = self.lock_state();
         self.record_known_hash_locked(&mut state, doc_id, content_hash);
+        state.release_leased_job(doc_id);
         self.metrics.record(JobOutcome::Succeeded);
     }
 
@@ -821,6 +851,73 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, JobOutcome::Succeeded);
         assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[test]
+    fn restored_content_is_queued_while_replacement_is_in_flight() {
+        let queue = make_queue(10);
+        queue.submit(request("doc", "Original text")).unwrap();
+        let original = queue.drain_batch().pop().unwrap();
+        queue.record_embedded(&original.doc_id, &original.content_hash);
+
+        queue.submit(request("doc", "Replacement text")).unwrap();
+        let replacement = queue.drain_batch().pop().unwrap();
+        assert_eq!(
+            queue.submit(request("doc", "Original text")).unwrap(),
+            JobOutcome::Succeeded,
+            "the historical hash must not suppress an in-flight restoration"
+        );
+        queue.record_embedded(&replacement.doc_id, &replacement.content_hash);
+
+        let restored = queue.drain_batch().pop().unwrap();
+        assert_eq!(restored.content_hash, original.content_hash);
+        assert_eq!(restored.canonical_text, original.canonical_text);
+        queue.record_embedded(&restored.doc_id, &restored.content_hash);
+        assert_eq!(
+            queue.submit(request("doc", "Original text")).unwrap(),
+            JobOutcome::SkippedUnchanged
+        );
+    }
+
+    #[test]
+    fn restoration_replaces_pending_text_without_cancelling_in_flight_work() {
+        let queue = make_queue(10);
+        queue.submit(request("doc", "Original text")).unwrap();
+        let original = queue.drain_batch().pop().unwrap();
+        queue.record_embedded(&original.doc_id, &original.content_hash);
+        queue.submit(request("doc", "In flight text")).unwrap();
+        let in_flight = queue.drain_batch().pop().unwrap();
+
+        queue.submit(request("doc", "Intermediate text")).unwrap();
+        assert_eq!(
+            queue.submit(request("doc", "Original text")).unwrap(),
+            JobOutcome::Succeeded
+        );
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(queue.requeue(in_flight), JobOutcome::Failed);
+        let restored = queue.drain_batch().pop().unwrap();
+        assert_eq!(restored.content_hash, original.content_hash);
+        assert_eq!(restored.retry_count, 0);
+    }
+
+    #[test]
+    fn draining_one_document_preserves_other_documents_dedup_witnesses() {
+        let queue = make_queue(10);
+        queue.submit(request("changing", "Original text")).unwrap();
+        queue.submit(request("stable", "Stable text")).unwrap();
+        for job in queue.drain_batch() {
+            queue.record_embedded(&job.doc_id, &job.content_hash);
+        }
+        queue.submit(request("changing", "Replacement text")).unwrap();
+        let _in_flight = queue.drain_batch();
+        assert_eq!(
+            queue.submit(request("stable", "Stable text")).unwrap(),
+            JobOutcome::SkippedUnchanged
+        );
+        assert_eq!(
+            queue.submit(request("changing", "Original text")).unwrap(),
+            JobOutcome::Succeeded
+        );
     }
 
     // ── Empty text skipping ─────────────────────────────────────────
