@@ -39,10 +39,17 @@ still contain pager 0.4.0. Those receipts do not qualify the updated dependency.
 Upstream separately reproduced orphaned pages in savepoint/growth and composite
 UNIQUE-index churn tests at `00f2fb36c` (bd-u2kmg). The proposed `db_size` change
 failed both reproductions; its full savepoint target returned eight passes and
-one failure. Those results do not yet establish reproduction on this exact
-published 0.4.0/core plus 0.4.3/pager dependency graph. Publication remains held
-pending the corruption disposition and updated artifact qualification. The
-reported plan for a uniform 0.4.4 release is not a publication receipt.
+one failure. A subsequent normal RCH run on `am-release-css` reproduces both
+failures on our exact published 0.4.0/core plus 0.4.3/pager dependency graph:
+the savepoint test reports orphan page 1672, and the UNIQUE-index churn test
+reports orphan pages 4–12 through stock SQLite. Each test returns zero passes,
+one failure, and no ignores. Production archive comparisons, resolved dependency
+checks, and source checks before and after execution pass. Logs and executable
+identities are retained under
+`/data/projects/fsqlite_pager_release_swiftstork_20260916/target/orphan-keepers-swiftstork-20260916-r1/`.
+Publication remains held pending a verified corruption repair and updated
+artifact qualification. The reported plan for a uniform 0.4.4 release is not a
+publication receipt.
 
 ## 2026-09-16 — Windows x86-64 ONNX producer qualification
 
