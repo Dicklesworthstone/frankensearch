@@ -24,6 +24,7 @@ use frankensearch_index::{FsviV2Witness, ValidatedFsviBytes, dot_product_f32_f32
 use crate::{Cx, Embedder, SearchError, SearchResult, VectorHit};
 
 mod hybrid;
+pub use hybrid::{NativePhaseCandidates, NativeProgressiveSearch, NativeSearchPhase};
 
 /// A native ANN retrieval arm bound to one immutable, admitted vector owner.
 ///
