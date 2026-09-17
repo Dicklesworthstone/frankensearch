@@ -11,12 +11,14 @@ Scope window: the release reconstruction covers v1.9.1 → v1.10.0 and their 202
 A September 15 supplement covers installer profile switching, offline verification,
 and default-model provisioning. September 16 qualification confirms the native
 F32 MiniLM repair on ARM64 macOS with the existing certificate unchanged.
+A September 17 supplement records the lexical-flush retry fix and pager 0.4.3
+adoption. Separate reproduced SQLite corruption still blocks publication.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased fsfs | Release preparation | 2026-09-09–16 | Progressive warm-daemon streaming, indexing cancellation and pressure checks, model reuse, native MiniLM numerical fixes, doctor producer admission, and installer profile/offline fixes |
+| Unreleased fsfs | Release preparation | 2026-09-09–17 | Progressive warm-daemon streaming, indexing cancellation and pressure checks, model reuse, native MiniLM numerical fixes, doctor producer admission, installer profile/offline fixes, and lexical-flush retry retention |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
 | [crates-v0.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0) | Library bundle | 2026-09-08 | All 13 publishable members and release evidence share v1.10.0 source; binary release retains latest routing |
@@ -76,6 +78,23 @@ Historical adapter identities remain rejected by strict admission, and the
 - **The executable quickstart gate requires both search tiers and actual progressive results.** The Linux DSR lane builds and installs into a private root, checks executable byte identity, and requires ranked hybrid and vector-only results, Initial/Refined records, authoritative generation artifacts, and the model receipts actually admitted by the loaders. Eighteen failure controls cover model, result, generation, lifecycle and provenance failures. Supplied binaries retain an explicitly unknown source revision; the checker revision cannot qualify them as a source-bound release build. [Gate and receipt wiring](https://github.com/Dicklesworthstone/frankensearch/commit/3d1c2fddb09641153cc7d66a61f835751a4b1538); [isolated Cargo discovery](https://github.com/Dicklesworthstone/frankensearch/commit/8789e0449eb01e3e6250cc4358eef003366d4ff9).
 
 ### Fixed
+
+- **Failed or cancelled lexical flushes retain their unacknowledged actions.**
+  The Quill adapter previously removed the entire pending queue before awaiting
+  backend writes. It now removes only the successfully acknowledged prefix,
+  preserving the remaining order when a write fails or a suspended flush is
+  dropped. Retries remain at-least-once, and successful trailing upserts still
+  require the caller's commit; this queue is not a durable journal.
+  [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/db13bc1c4391e62d5a81c35a2c2f3735c3c2c19a).
+
+- **The candidate selects FrankenSQLite pager 0.4.3 for the pending-freelist
+  repair panic fix.** Other resolved SQLite members remain at 0.4.0. The focused
+  storage suite passes 351 tests, but two unchanged upstream corruption
+  regressions also fail on this exact dependency graph: orphaned pages after
+  savepoint rollback/growth and UNIQUE-constraint churn. Those failures still
+  block the release; the pager update is not a complete recovery fix.
+  [Dependency update](https://github.com/Dicklesworthstone/frankensearch/commit/05aca4de38f7560de94dc41b3bd8d28eff4bfb6d);
+  [qualification and blocker evidence](docs/planning/UPGRADE_LOG.md).
 
 - **Embedded-model builds extract defaults in a child before loading inference models.**
   The first macOS ARM run previously retained the embedded weight pages after

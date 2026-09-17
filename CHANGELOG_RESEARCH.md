@@ -1,5 +1,43 @@
 # Changelog research: fsfs 1.10.0 / FrankenSearch 0.5.0
 
+## September 17 supplement: lexical retry and pager qualification limits
+
+This narrow supplement covers `db13bc1c4391e62d5a81c35a2c2f3735c3c2c19a`
+(lexical queue ownership) and `05aca4de38f7560de94dc41b3bd8d28eff4bfb6d`
+(pager-only lock update), with the corrected blocker record in `76a9e327`.
+Reviewed the actual diffs and Quill write/delete publication boundaries.
+The lexical commit's author explicitly reported no Rust execution. Subsequent
+RCH validation on frozen `5aaa0352` passes all 2,110 fsfs library tests, with
+14 existing ignores, and all-target Clippy with warnings denied. The initial
+run had one permission-fixture failure because root could still read a mode-000
+directory; the unchanged executable passes after dropping DAC override
+capabilities. Source and sibling hashes match before and after execution.
+The retained receipt is `lexical-base-dac-receipt.json` under the September 12
+release work directory; no full release clearance is inferred from this check.
+
+The follow-through regression drives the public Quill backend with a malformed
+empty-ID upsert after a completed upsert/delete barrier and before another valid
+action. All 36 lexical tests pass with one existing ignore, including retention
+across repeated ordinary and resumable flush failures. A negative control with
+the byte-identical pre-fix `flush_inner` body fails the new test because the
+pending queue is empty instead of retaining the two-action suffix. Both runs
+use RCH, with unchanged dependencies and source/ELF receipts; the expected
+negative-control failure is not counted as a passing product test. All-target
+fsfs Clippy also passes with warnings denied after adding the regression.
+
+The retained pager storage receipt reports 351 passed, zero failed/ignored.
+Upstream Mail 42321 and its raw savepoint/churn logs independently report
+zero passed and one failed for each unchanged orphan-page keeper on published
+facade/core 0.4.0 plus pager 0.4.3, with before/after production-source and
+executable receipts. The changelog records both outcomes and keeps publication
+pending. The native-WRITE reclamation hypothesis sent upstream is not a tested
+repair and is not described as delivered functionality.
+
+Live GitHub release metadata on September 17 still lists `v1.10.0` and
+`crates-v0.5.0` from September 8 as the newest binary and bundle releases.
+Live registry metadata still lists pager 0.4.3 and facade/core 0.4.2.
+This supplement does not claim complete September 17 commit coverage.
+
 ## September 16 supplement: actual ARM native qualification
 
 The native F32 limitation recorded on September 15 is superseded by actual

@@ -21,7 +21,7 @@ use flush_queue::FlushProgress;
 
 /// Default expected throughput for initial lexical indexing (docs/sec).
 pub const TARGET_INITIAL_DOCS_PER_SECOND: u32 = 20_000;
-/// Default expected throughput for incremental lexical updates (updates/sec).
+/// Target p95 latency for incremental lexical updates (milliseconds).
 pub const TARGET_INCREMENTAL_P95_LATENCY_MS: u32 = 25;
 /// Default expected throughput for incremental lexical updates (updates/sec).
 pub const TARGET_INCREMENTAL_UPDATES_PER_SECOND: u32 = 5_000;
@@ -911,8 +911,8 @@ mod tests {
     use frankensearch_quill::{QuillConfig, QuillIndex, SegmentStatsProvider};
 
     use super::{
-        InMemoryLexicalBackend, LexicalAction, LexicalChunkPolicy, LexicalMutation,
-        LexicalPerformanceTargets, LexicalPipeline, QuillLexicalBackend,
+        InMemoryLexicalBackend, LexicalAction, LexicalChunkPolicy, LexicalIndexBackend,
+        LexicalMutation, LexicalPerformanceTargets, LexicalPipeline, QuillLexicalBackend,
         TARGET_INCREMENTAL_P95_LATENCY_MS, TARGET_INCREMENTAL_UPDATES_PER_SECOND,
         TARGET_INITIAL_DOCS_PER_SECOND, chunks_into_index_content, tokenize_lexical,
     };
@@ -1058,6 +1058,83 @@ mod tests {
                 "cancel before drain must leave pending actions in place"
             );
         });
+    }
+
+    #[test]
+    fn quill_flush_retains_rejected_suffix_after_published_delete() {
+        for resumable in [false, true] {
+            run_test_with_cx(move |cx| async move {
+                let index = QuillIndex::in_memory(QuillConfig {
+                    max_ingest_shards: 1,
+                    deterministic_ingest: true,
+                    ..QuillConfig::default()
+                })
+                .expect("create in-memory Quill index");
+                let mut pipeline = LexicalPipeline::new(QuillLexicalBackend::new(&index));
+                let class = IngestionClass::FullSemanticLexical;
+                pipeline
+                    .apply_initial(&[
+                        LexicalMutation::upsert("published", 1, class, "alpha", "initial"),
+                        LexicalMutation::delete("published", 2, class, "removed"),
+                    ])
+                    .expect("plan mixed batch");
+                // Exercise the public backend boundary directly: the planner
+                // rejects empty IDs itself, but the backend queues actions and
+                // learns about this rejection from the real Quill write call.
+                pipeline
+                    .backend_mut()
+                    .apply(LexicalAction::Upsert {
+                        doc_id: String::new(),
+                        revision: 1,
+                        title: None,
+                        metadata: std::collections::HashMap::new(),
+                        chunks: LexicalChunkPolicy::default().chunk_text("invalid"),
+                    })
+                    .expect("queue malformed backend action");
+                pipeline
+                    .apply_incremental(&[LexicalMutation::upsert(
+                        "later", 1, class, "beta", "initial",
+                    )])
+                    .expect("queue later valid action");
+                let rejected_suffix = pipeline.backend().pending[2..].to_vec();
+
+                for _ in 0..2 {
+                    let result = if resumable {
+                        pipeline
+                            .backend_mut()
+                            .flush_resumable(&cx)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        pipeline.backend_mut().flush(&cx).await
+                    };
+                    let error = result.expect_err("Quill must reject an empty document ID");
+                    assert!(
+                        error.to_string().contains("document id must be nonempty"),
+                        "expected actual Quill admission failure, got {error:?}"
+                    );
+                    assert_eq!(
+                        pipeline.backend().pending,
+                        rejected_suffix,
+                        "retain the rejected suffix in order on initial failure and retry"
+                    );
+                    assert_eq!(
+                        index
+                            .segment_stats()
+                            .expect("read published stats")
+                            .live_docs,
+                        0,
+                        "the earlier delete is published and the rejected rows remain absent"
+                    );
+                    assert!(
+                        index
+                            .search_doc_ids(&cx, "alpha", 10)
+                            .expect("query deleted row")
+                            .is_empty()
+                    );
+                }
+            });
+        }
     }
 
     #[test]
