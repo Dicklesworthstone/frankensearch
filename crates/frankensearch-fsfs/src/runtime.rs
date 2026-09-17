@@ -30726,7 +30726,11 @@ mod tests {
                     None,
                     project.join(".frankensearch"),
                 ),
-                ("custom-index".to_owned(), None, project.join("custom-index")),
+                (
+                    "custom-index".to_owned(),
+                    None,
+                    project.join("custom-index"),
+                ),
                 (
                     temp.path().join("absolute-index").display().to_string(),
                     None,

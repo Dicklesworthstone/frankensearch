@@ -75,11 +75,7 @@ impl NativeAnnIndex {
     /// # Errors
     ///
     /// Propagates cancellation and native graph/receipt admission or I/O errors.
-    pub fn load(
-        cx: &Cx,
-        owner: Arc<ValidatedFsviBytes>,
-        graph_path: &Path,
-    ) -> SearchResult<Self> {
+    pub fn load(cx: &Cx, owner: Arc<ValidatedFsviBytes>, graph_path: &Path) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.load")?;
         let (graph, receipt) = ValidatedNativeHnsw::load(Arc::clone(&owner), graph_path)?;
         let default_ef_search = usize::try_from(receipt.params.ef_search).map_err(|_| {
@@ -109,11 +105,7 @@ impl NativeAnnIndex {
     ///
     /// Propagates cancellation before writing, path validation, and graph or
     /// receipt persistence errors. A partial pair is rejected on subsequent load.
-    pub fn save(
-        &self,
-        cx: &Cx,
-        graph_path: &Path,
-    ) -> SearchResult<NativeHnswGenerationReceiptV2> {
+    pub fn save(&self, cx: &Cx, graph_path: &Path) -> SearchResult<NativeHnswGenerationReceiptV2> {
         checkpoint(cx, "native_ann.save")?;
         self.graph.save(graph_path)
     }
@@ -274,7 +266,11 @@ impl NativeAnnIndex {
                 }
                 let index = candidate.physical_row();
                 let row = usize::try_from(index).map_err(|_| {
-                    invalid("physical_row", "out-of-range", "source row does not fit usize")
+                    invalid(
+                        "physical_row",
+                        "out-of-range",
+                        "source row does not fit usize",
+                    )
                 })?;
                 let vector = self.owner.vector_at_f32(row)?;
                 let score = dot_product_f32_f32(&vector, query.vector())?;
@@ -400,7 +396,7 @@ mod tests {
     use frankensearch_index::{FsviV2IdentityBinding, VectorIndex};
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
 
     #[derive(Clone, Copy)]
     enum Reply {
@@ -475,7 +471,7 @@ mod tests {
             Ok(&self.identity)
         }
 
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "native-ann-test-provider"
         }
 
@@ -498,12 +494,6 @@ mod tests {
         fn category(&self) -> ModelCategory {
             ModelCategory::HashEmbedder
         }
-    }
-
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
     }
 
     fn identity() -> EmbeddingIdentityBundleV1 {
@@ -558,8 +548,9 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for format in [QuantizationFormat::F16, QuantizationFormat::F32] {
                 let owner = owner(&rows(), 1, format);
-                let index = NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 7)
-                    .expect("native graph");
+                let index =
+                    NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 7)
+                        .expect("native graph");
                 let query = query([1.0, 0.0, 0.0, 0.0]);
                 let mut exact = owner
                     .search_top_k(query.vector(), owner.live_count(), None)
@@ -585,10 +576,14 @@ mod tests {
             let index = NativeAnnIndex::build(&cx, owner, HnswParams::default(), 7).unwrap();
             let query = query([1.0, 0.0, 0.0, 0.0]);
             let hits = index
-                .search_filtered(&cx, &query, 2, Some(1), |id| matches!(id, "gamma" | "delta"))
+                .search_filtered(&cx, &query, 2, Some(1), |id| {
+                    matches!(id, "gamma" | "delta")
+                })
                 .unwrap();
             assert_eq!(
-                hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+                hits.iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
                 ["gamma", "delta"]
             );
             let one = index
@@ -694,7 +689,10 @@ mod tests {
             drop(owner);
             drop(dir);
             assert!(weak.upgrade().is_some());
-            assert_eq!(loaded.search(&cx, &query, 1, None).unwrap()[0].doc_id, "alpha");
+            assert_eq!(
+                loaded.search(&cx, &query, 1, None).unwrap()[0].doc_id,
+                "alpha"
+            );
             drop(loaded);
             assert!(weak.upgrade().is_none());
         });
@@ -779,8 +777,14 @@ mod tests {
             let owner = owner(&rows(), 1, QuantizationFormat::F32);
             let index = NativeAnnIndex::build(&cx, owner, HnswParams::default(), 7).unwrap();
             for (reply, expected_field) in [
-                (Reply::ForeignSpace, "query_embedding.native_ann.space_identity"),
-                (Reply::ForeignProducer, "query_embedding.native_ann.producer_conformance"),
+                (
+                    Reply::ForeignSpace,
+                    "query_embedding.native_ann.space_identity",
+                ),
+                (
+                    Reply::ForeignProducer,
+                    "query_embedding.native_ann.producer_conformance",
+                ),
             ] {
                 let embedder = ProbeEmbedder::new(reply);
                 let filter_calls = AtomicUsize::new(0);
@@ -829,9 +833,10 @@ mod tests {
                 NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 7).unwrap();
             let embedder = ProbeEmbedder::new(Reply::Pending);
             let mut future = Box::pin(index.search_text(&cx, &embedder, "horizontal", 1, None));
-            let waker = Waker::from(Arc::new(NoopWake));
             assert!(matches!(
-                future.as_mut().poll(&mut Context::from_waker(&waker)),
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Pending
             ));
             drop(future);
@@ -856,9 +861,7 @@ mod tests {
             let index = NativeAnnIndex::build(&cx, owner, HnswParams::default(), 7).unwrap();
             let embedder = ProbeEmbedder::new(Reply::Correct);
             let hits = index
-                .search_text_filtered(&cx, &embedder, "horizontal", 1, Some(1), |id| {
-                    id == "delta"
-                })
+                .search_text_filtered(&cx, &embedder, "horizontal", 1, Some(1), |id| id == "delta")
                 .await
                 .unwrap();
             assert_eq!(hits.len(), 1);
@@ -907,7 +910,10 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(
                 error,
-                SearchError::DimensionMismatch { expected: 4, found: 3 }
+                SearchError::DimensionMismatch {
+                    expected: 4,
+                    found: 3
+                }
             ));
             assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
         });

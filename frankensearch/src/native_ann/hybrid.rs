@@ -55,14 +55,8 @@ impl NativeAnnIndex {
             // a provider-failure fallback and still requires lexical success.
             let batch = lexical.search_candidates(cx, text, budget).await?;
             validate_lexical(cx, &batch)?;
-            let hits = rrf_fuse_for_vector_lane(
-                batch.results(),
-                &[],
-                k,
-                0,
-                &RrfConfig::default(),
-                false,
-            );
+            let hits =
+                rrf_fuse_for_vector_lane(batch.results(), &[], k, 0, &RrfConfig::default(), false);
             checkpoint(cx, "native_ann.hybrid_complete")?;
             return Ok((hits, batch));
         }
@@ -101,7 +95,10 @@ impl NativeAnnIndex {
         self.admit_identity(query.identity())?;
         validate_lexical(cx, batch)?;
         let vectors = self.search(cx, query, candidate_count(k, 0, 3), ef)?;
-        let is_hash = matches!(query.identity().space.kind, EmbeddingSpaceKindV1::HashControl);
+        let is_hash = matches!(
+            query.identity().space.kind,
+            EmbeddingSpaceKindV1::HashControl
+        );
         let hits = rrf_fuse_for_vector_lane(batch.results(), &vectors, k, 0, config, is_hash);
         checkpoint(cx, "native_ann.hybrid_complete")?;
         Ok(hits)
@@ -171,7 +168,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Wake, Waker};
+    use std::task::{Context, Waker};
 
     use frankensearch_core::generation::{
         ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
@@ -235,7 +232,7 @@ mod tests {
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
             Ok(&self.identity)
         }
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "native-hybrid-provider"
         }
         fn model_name(&self) -> &str {
@@ -362,11 +359,6 @@ mod tests {
         NativeAnnIndex::build(cx, owner, HnswParams::default(), 7).unwrap()
     }
 
-    struct NoopWake;
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     #[test]
     fn native_hybrid_fuses_actual_ranks_and_retains_lexical_snapshot() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -379,7 +371,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+                hits.iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
                 ["beta", "alpha", "gamma"]
             );
             assert!(hits[0].in_both_sources);
@@ -423,12 +417,12 @@ mod tests {
             let provider = Provider::new(true);
             let mut lexical = Lexical::new();
             lexical.pending = true;
-            let mut future = Box::pin(index.search_hybrid_candidates(
-                &cx, &provider, &lexical, "query", 2,
-            ));
-            let waker = Waker::from(Arc::new(NoopWake));
+            let mut future =
+                Box::pin(index.search_hybrid_candidates(&cx, &provider, &lexical, "query", 2));
             assert!(matches!(
-                future.as_mut().poll(&mut Context::from_waker(&waker)),
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Pending
             ));
             assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
@@ -436,7 +430,11 @@ mod tests {
             assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
             let ready = Provider::new(false);
             assert_eq!(
-                index.search_text(&cx, &ready, "query", 1, None).await.unwrap()[0].doc_id,
+                index
+                    .search_text(&cx, &ready, "query", 1, None)
+                    .await
+                    .unwrap()[0]
+                    .doc_id,
                 "alpha"
             );
         });

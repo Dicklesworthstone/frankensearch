@@ -3351,7 +3351,12 @@ fn sync_registered_artifacts<'a>(
     let mut parent_dirs = BTreeSet::<PathBuf>::new();
     for relative_path in relative_paths {
         let artifact_path = resolve_model_file_path(staged_dir, relative_path)?;
-        File::open(&artifact_path)
+        // Windows FlushFileBuffers requires a handle with write access, even
+        // when only flushing bytes already written to the staged artifact.
+        File::options()
+            .read(true)
+            .write(cfg!(windows))
+            .open(&artifact_path)
             .and_then(|file| file.sync_all())
             .map_err(SearchError::from)?;
         #[cfg(unix)]
@@ -4973,7 +4978,14 @@ mod tests {
             "model.onnx ",
         ] {
             let error = validate_model_file_name(name).unwrap_err();
-            assert!(error.to_string().contains("canonical portable"));
+            // Windows recognizes the drive prefix before the portable-name
+            // check; other hosts reject its colon in the portable-name check.
+            let reason = if cfg!(windows) && name == "C:/model.safetensors" {
+                "relative path without root"
+            } else {
+                "canonical portable"
+            };
+            assert!(error.to_string().contains(reason), "{name}: {error}");
             assert!(!error.to_string().contains(name));
         }
     }

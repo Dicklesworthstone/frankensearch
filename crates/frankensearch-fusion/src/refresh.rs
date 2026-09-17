@@ -1007,9 +1007,7 @@ impl RefreshWorker {
 
         // One reservation covers the complete cycle, including both embedding
         // awaits and publication. No queue mutex is held across any of them.
-        let batch = self
-            .queue
-            .lease_batch_up_to(self.config.max_docs_per_cycle);
+        let batch = self.queue.lease_batch_up_to(self.config.max_docs_per_cycle);
         if batch.is_empty() {
             return Ok(0);
         }
