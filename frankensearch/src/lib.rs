@@ -335,6 +335,9 @@ pub use frankensearch_index::{
     TwoTierIndexPaths, VectorIndex, VectorIndexWriter,
 };
 
+pub mod native_ann;
+pub use native_ann::NativeAnnIndex;
+
 #[cfg(feature = "ann")]
 pub use frankensearch_index::{AnnSearchStats, HnswConfig, HnswIndex, HnswLoadDisposition};
 
