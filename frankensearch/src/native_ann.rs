@@ -1,6 +1,6 @@
 //! Typed, owner-retaining access to the in-tree native HNSW engine.
 //!
-//! This is an opt-in single-tier retrieval arm, not a replacement for the
+//! This is an opt-in retained-owner retrieval arm, not a replacement for the
 //! default two-tier searcher or a composite-generation publisher. Both build
 //! and load require already-admitted FSVI v2 bytes. Every query joins the
 //! retained artifact's space, producer and input fingerprints before graph
@@ -23,7 +23,11 @@ use frankensearch_index::{FsviV2Witness, ValidatedFsviBytes, dot_product_f32_f32
 
 use crate::{Cx, Embedder, SearchError, SearchResult, VectorHit};
 
+mod fallback;
 mod hybrid;
+
+use fallback::NativeBackend;
+pub use fallback::{NativeExactReason, NativeRetrievalMode};
 pub use hybrid::{NativePhaseCandidates, NativeProgressiveSearch, NativeSearchPhase};
 
 /// A native ANN retrieval arm bound to one immutable, admitted vector owner.
@@ -36,7 +40,7 @@ pub use hybrid::{NativePhaseCandidates, NativeProgressiveSearch, NativeSearchPha
 #[derive(Debug)]
 pub struct NativeAnnIndex {
     owner: Arc<ValidatedFsviBytes>,
-    graph: ValidatedNativeHnsw,
+    graph: NativeBackend,
     default_ef_search: usize,
 }
 
@@ -62,7 +66,7 @@ impl NativeAnnIndex {
         checkpoint(cx, "native_ann.build_complete")?;
         Ok(Self {
             owner,
-            graph,
+            graph: NativeBackend::Ann(Box::new(graph)),
             default_ef_search: params.ef_search,
         })
     }
@@ -89,7 +93,7 @@ impl NativeAnnIndex {
         checkpoint(cx, "native_ann.load_complete")?;
         Ok(Self {
             owner,
-            graph,
+            graph: NativeBackend::Ann(Box::new(graph)),
             default_ef_search,
         })
     }
@@ -106,9 +110,17 @@ impl NativeAnnIndex {
     ///
     /// Propagates cancellation before writing, path validation, and graph or
     /// receipt persistence errors. A partial pair is rejected on subsequent load.
+    /// Exact-only handles return a typed error without starting any writes.
     pub fn save(&self, cx: &Cx, graph_path: &Path) -> SearchResult<NativeHnswGenerationReceiptV2> {
         checkpoint(cx, "native_ann.save")?;
-        self.graph.save(graph_path)
+        match &self.graph {
+            NativeBackend::Ann(graph) => graph.save(graph_path),
+            NativeBackend::Exact(_) => Err(invalid(
+                "save",
+                "exact-only",
+                "exact retrieval has no graph to save; build a native graph explicitly",
+            )),
+        }
     }
 
     /// Embed text for this exact retained retrieval arm, with no fallback.
@@ -198,6 +210,8 @@ impl NativeAnnIndex {
     /// are rescored against the retained owner and sorted by score descending,
     /// then document id. A full-physical-row beam examines every live row;
     /// smaller beams remain approximate and make no certified recall claim.
+    /// An explicitly selected exact backend ignores `ef` and scans every live
+    /// row. Inspect [`Self::retrieval_mode`] to distinguish the execution modes.
     ///
     /// # Errors
     ///
@@ -250,6 +264,9 @@ impl NativeAnnIndex {
         if target == 0 {
             return Ok(Vec::new());
         }
+        let NativeBackend::Ann(graph) = &self.graph else {
+            return self.search_exact_filtered(cx, query, target, &accept);
+        };
         let physical_rows = self.owner.record_count();
         let mut width = ef
             .unwrap_or(self.default_ef_search)
@@ -257,7 +274,7 @@ impl NativeAnnIndex {
             .min(physical_rows);
         loop {
             checkpoint(cx, "native_ann.search_window")?;
-            let candidates = self.graph.search(query.vector(), width, Some(width))?;
+            let candidates = graph.search(query.vector(), width, Some(width))?;
             checkpoint(cx, "native_ann.search_candidates")?;
             let mut hits = Vec::with_capacity(candidates.len());
             for candidate in candidates {
@@ -320,7 +337,7 @@ impl NativeAnnIndex {
     /// Witness for the exact immutable owner retained by this retrieval arm.
     #[must_use]
     pub fn owner_witness(&self) -> &FsviV2Witness {
-        self.graph.owner_witness()
+        self.owner.witness()
     }
 
     fn admit_identity(&self, identity: &EmbeddingIdentityBundleV1) -> SearchResult<()> {
