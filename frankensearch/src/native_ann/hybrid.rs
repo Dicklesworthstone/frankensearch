@@ -10,6 +10,8 @@ use frankensearch_fusion::{RrfConfig, candidate_count, rrf_fuse_for_vector_lane}
 use super::{NativeAnnIndex, checkpoint, invalid};
 use crate::{Cx, Embedder, ScoreSource, ScoredResult, SearchResult};
 
+mod refinement;
+
 impl NativeAnnIndex {
     /// Execute native hybrid retrieval and return hydrated final winners.
     ///
