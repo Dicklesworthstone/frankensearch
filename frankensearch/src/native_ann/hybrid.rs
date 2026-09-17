@@ -284,11 +284,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Waker};
 
+    use frankensearch_core::LexicalHydrationContext;
     use frankensearch_core::generation::{
         ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
     };
     use frankensearch_core::traits::{IdentityBoundEmbedding, ModelCategory, SearchFuture};
-    use frankensearch_core::LexicalHydrationContext;
     use frankensearch_index::native_hnsw::HnswParams;
     use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
 
@@ -778,12 +778,11 @@ mod tests {
             let provider = Provider::new(false);
             let mut lexical = Lexical::new();
             lexical.hydration_reply = HydrationReply::Pending;
-            let mut future = Box::pin(index.search_hybrid_text(
-                &cx, &provider, &lexical, "query", 2,
-            ));
-            let waker = Waker::from(Arc::new(NoopWake));
+            let mut future =
+                Box::pin(index.search_hybrid_text(&cx, &provider, &lexical, "query", 2));
+            let waker = Waker::noop();
             assert!(matches!(
-                future.as_mut().poll(&mut Context::from_waker(&waker)),
+                future.as_mut().poll(&mut Context::from_waker(waker)),
                 Poll::Pending
             ));
             assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 1);
@@ -843,7 +842,10 @@ mod tests {
                 .unwrap();
             let results = hydrate_winners(&cx, &lexical, hits, &batch).await.unwrap();
             assert_eq!(results[0].doc_id, "beta");
-            assert!(Arc::ptr_eq(results[0].metadata.as_ref().unwrap(), &original));
+            assert!(Arc::ptr_eq(
+                results[0].metadata.as_ref().unwrap(),
+                &original
+            ));
             assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 0);
         });
     }
