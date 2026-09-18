@@ -42,6 +42,7 @@ pub struct NativeQuillSnapshot {
     fast: Arc<NativeAnnIndex>,
     lexical: FencedQuillRead,
     vector_receipt: ExactComponentReceiptV1,
+    quality: Option<(Arc<NativeAnnIndex>, ExactComponentReceiptV1)>,
 }
 
 impl NativeQuillSnapshot {
@@ -90,7 +91,129 @@ impl NativeQuillSnapshot {
         let lexical = FencedQuillRead { index: lexical, snapshot, receipt };
         lexical.check_current()?;
         checkpoint(cx, "native_ann.quill.admitted")?;
-        Ok(Self { fast, lexical, vector_receipt })
+        Ok(Self { fast, lexical, vector_receipt, quality: None })
+    }
+
+    /// Compose a selected quality owner with this already-admitted source cut.
+    ///
+    /// The returned view shares the immutable fast/lexical owners. Failure leaves
+    /// this view unchanged. The quality owner must cover the same complete live
+    /// document set and bind the same full artifact generation as the fast tier.
+    /// Its embedding space and dimension may differ; query-time admission checks
+    /// each producer separately and the existing native cross-tier input policy.
+    /// This method performs no inference, graph construction, or filesystem I/O.
+    ///
+    /// # Errors
+    ///
+    /// Rejects selected-witness substitution, generation/document-set/checkpoint
+    /// disagreement, superseded lexical publication, and cancellation.
+    pub fn with_quality(
+        &self,
+        cx: &Cx,
+        quality: Arc<NativeAnnIndex>,
+        expected_quality: &FsviV2Witness,
+        source_checkpoint: SourceCheckpointV1,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.quill.quality_admit")?;
+        self.lexical.check_current()?;
+        if quality.owner_witness() != expected_quality {
+            return Err(invalid("quill.quality", "witness-mismatch", "quality owner differs from its selected complete FSVI witness"));
+        }
+        if quality.owner_witness().generation != self.fast.owner_witness().generation {
+            return Err(invalid("quill.quality", "generation-mismatch", "fast and quality must bind the same full artifact generation"));
+        }
+        let receipt = native_receipt(cx, &quality, source_checkpoint)?;
+        join_docsets(&receipt, &self.lexical.receipt)?;
+        self.lexical.check_current()?;
+        checkpoint(cx, "native_ann.quill.quality_admitted")?;
+        let mut view = self.clone();
+        view.quality = Some((quality, receipt));
+        Ok(view)
+    }
+
+    /// The independently admitted quality component, when explicitly attached.
+    #[must_use]
+    pub fn quality_receipt(&self) -> Option<&ExactComponentReceiptV1> {
+        self.quality.as_ref().map(|(_, receipt)| receipt)
+    }
+
+    fn quality_index(&self) -> SearchResult<&NativeAnnIndex> {
+        self.quality.as_ref().map(|(index, _)| index.as_ref()).ok_or_else(|| {
+            invalid("quill.quality", "missing", "quality retrieval requires an explicitly admitted quality owner")
+        })
+    }
+
+    /// Retrieve quality candidates directly, without running the fast embedder.
+    ///
+    /// # Errors
+    ///
+    /// Requires an admitted quality component and current lexical publication;
+    /// propagates native identity, retrieval, hydration, and cancellation errors.
+    pub async fn search_quality_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        checkpoint(cx, "native_ann.quill.quality_search")?;
+        self.lexical.check_current()?;
+        self.quality_index()?
+            .search_hybrid_quality_text(cx, embedder, &self.lexical, text, k).await
+    }
+
+    /// Independently retrieve both admitted tiers and fuse their candidate union.
+    ///
+    /// Quality may promote a document absent from the fast candidate window.
+    /// The existing native union/blend policy retains each model's raw score;
+    /// lexical ranking and hydration use the fenced publication exclusively.
+    ///
+    /// # Errors
+    ///
+    /// Missing quality, mixed publication, identity/provider/retrieval/hydration
+    /// failures, and cancellation are errors, not fast-only success.
+    pub async fn search_refined_text(
+        &self,
+        cx: &Cx,
+        fast_embedder: &dyn Embedder,
+        quality_embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        checkpoint(cx, "native_ann.quill.refined_search")?;
+        self.lexical.check_current()?;
+        self.fast.search_hybrid_refined_text(
+            cx, fast_embedder, (self.quality_index()?, quality_embedder),
+            &self.lexical, text, k,
+        ).await
+    }
+
+    /// Prepare fast-then-quality retrieval over the admitted three-reader bundle.
+    ///
+    /// Only the requested second phase runs quality inference. Once the initial
+    /// lexical batch has passed its fence, refinement and optional reranking may
+    /// finish on that original pin even if the writer publishes another view.
+    /// No phase reacquires a lexical snapshot or repeats the lexical query.
+    /// `search_progressive` remains the explicitly fast-only convenience method.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing quality owner, superseded publication, invalid query
+    /// budget, per-tier identity mismatch, or cancellation before provider work.
+    pub fn search_progressive_with_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast_embedder: &'a dyn Embedder,
+        quality_embedder: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.quill.quality_progressive")?;
+        self.lexical.check_current()?;
+        self.fast.search_hybrid_progressive(
+            cx, fast_embedder, Some((self.quality_index()?, quality_embedder)),
+            &self.lexical, text, k,
+        )
     }
 
     /// The authenticated vector component, derived from retained native rows.
@@ -465,6 +588,220 @@ mod tests {
             assert!(matches!(view.search_text(&cx, &provider, "common", 2).await, Err(SearchError::Cancelled { .. })));
             assert!(matches!(fixture.admit(&cx), Err(SearchError::Cancelled { .. })));
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    fn quality_provider() -> Provider {
+        Provider {
+            identity: EmbeddingIdentityBundleV1::explicit_test_model("quill-quality", 2),
+            ready: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn native_rows(
+        cx: &Cx,
+        provider: &Provider,
+        rows: &[(&str, [f32; 2])],
+        generation: ArtifactGenerationIdentityV1,
+        ann: bool,
+    ) -> Arc<NativeAnnIndex> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tier.fsvi");
+        let mut identity = provider.identity.clone();
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.quantization = QuantizationFormat::F32;
+        identity.storage.endianness = "little-endian".to_owned();
+        let binding = FsviV2IdentityBinding::new(generation, identity.freeze().unwrap()).unwrap();
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
+        for (id, values) in rows { writer.write_record(id, values).unwrap(); }
+        writer.finish().unwrap();
+        let bytes: Arc<[u8]> = std::fs::read(path).unwrap().into();
+        let owner = Arc::new(ValidatedFsviBytes::from_arc(bytes, &binding).unwrap());
+        Arc::new(if ann {
+            NativeAnnIndex::build(cx, owner, frankensearch_index::native_hnsw::HnswParams::default(), 7).unwrap()
+        } else {
+            NativeAnnIndex::exact(cx, owner).unwrap()
+        })
+    }
+
+    fn attach_quality(cx: &Cx, fixture: &Fixture, provider: &Provider) -> NativeQuillSnapshot {
+        let quality = native_rows(cx, provider,
+            &[("alpha", [0.0, 1.0]), ("beta", [1.0, 0.0])],
+            fixture.fast.owner_witness().generation, true);
+        fixture.admit(cx).unwrap().with_quality(cx, Arc::clone(&quality), quality.owner_witness(), source_cut()).unwrap()
+    }
+
+    #[test]
+    fn composed_quality_retrieves_a_winner_outside_the_fast_candidate_window() {
+        use super::super::NativeSearchPhase;
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new();
+            let quality_provider = quality_provider();
+            let dir = tempfile::tempdir().unwrap();
+            let lexical_path = dir.path().join("lexical");
+            let writer = QuillIndex::create(&cx, &lexical_path, config()).await.unwrap();
+            let docs: Vec<_> = ["a", "b", "c", "z"].into_iter()
+                .map(|id| IndexableDocument::new(id, "common")).collect();
+            writer.upsert_documents(&cx, &docs).await.unwrap();
+            writer.commit(&cx).await.unwrap();
+            drop(writer);
+            let lexical = Arc::new(QuillIndex::open(&cx, &lexical_path, config()).await.unwrap());
+            let receipt = lexical.search_snapshot().unwrap().keeper_snapshot()
+                .exact_lexical_component_receipt(source_cut()).unwrap();
+            let generation = ArtifactGenerationIdentityV1::new(7, [0x34; 16]).unwrap();
+            let fast_index = native_rows(&cx, &fast,
+                &[("a", [1.0, 0.0]), ("b", [0.9, 0.1]), ("c", [0.8, 0.2]), ("z", [0.0, 1.0])],
+                generation, false);
+            let quality = native_rows(&cx, &quality_provider,
+                &[("a", [0.2, 0.8]), ("b", [0.1, 0.9]), ("c", [0.0, 1.0]), ("z", [1.0, 0.0])],
+                generation, true);
+            let view = NativeQuillSnapshot::admit(&cx, Arc::clone(&fast_index), fast_index.owner_witness(), lexical, &receipt, source_cut()).unwrap()
+                .with_quality(&cx, Arc::clone(&quality), quality.owner_witness(), source_cut()).unwrap();
+            assert_eq!(view.quality_receipt().unwrap().docset_digest, view.vector_receipt().docset_digest);
+            let query = frankensearch_core::BoundQueryEmbedding::new(vec![1.0, 0.0], fast.identity.clone()).unwrap();
+            assert!(fast_index.search(&cx, &query, 3, None).unwrap().iter().all(|hit| hit.doc_id != "z"));
+            let mut stream = view.search_progressive_with_quality(&cx, &fast, &quality_provider, "unmatched", 1).unwrap();
+            let NativeSearchPhase::Initial { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("initial"); };
+            assert_eq!(results[0].doc_id, "a");
+            assert_eq!(quality_provider.calls.load(Ordering::SeqCst), 0);
+            let NativeSearchPhase::Refined { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("refined"); };
+            assert_eq!(results[0].doc_id, "z");
+            assert_eq!(quality_provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+            assert!(stream.next_phase().await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn composed_quality_refinement_hydrates_old_metadata_after_publication() {
+        use super::super::NativeSearchPhase;
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new();
+            let quality = quality_provider();
+            let fixture = fixture(&cx, &fast, &["alpha", "beta"]).await;
+            let view = attach_quality(&cx, &fixture, &quality);
+            let expected = fixture.lexical.search_results(&cx, "common", 2).unwrap();
+            let mut stream = view.search_progressive_with_quality(&cx, &fast, &quality, "common", 2).unwrap();
+            assert!(matches!(stream.next_phase().await.unwrap(), Some(NativeSearchPhase::Initial { .. })));
+            fixture.lexical.upsert_documents(&cx, &[
+                IndexableDocument::new("alpha", "common changed").with_metadata("version", "new"),
+                IndexableDocument::new("beta", "common changed").with_metadata("version", "new"),
+            ]).await.unwrap();
+            let NativeSearchPhase::Refined { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("refined"); };
+            for hit in results {
+                let old = expected.iter().find(|old| old.doc_id == hit.doc_id).unwrap();
+                assert_eq!(hit.metadata.as_deref(), old.metadata.as_deref());
+                assert!(hit.metadata.is_some());
+            }
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+            assert!(view.search_refined_text(&cx, &fast, &quality, "common", 2).await.is_err());
+            assert!(view.search_quality_text(&cx, &quality, "common", 0).await.is_err());
+        });
+    }
+
+    #[test]
+    fn quality_admission_checks_full_witness_generation_docset_and_source_cut() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new();
+            let quality = quality_provider();
+            let fixture = fixture(&cx, &fast, &["alpha", "beta"]).await;
+            let base = fixture.admit(&cx).unwrap();
+            for case in 0..5 {
+                let mut generation = fixture.fast.owner_witness().generation;
+                let mut cut = source_cut();
+                if case == 1 { generation.sequence += 1; }
+                if case == 2 { generation.nonce[0] ^= 1; }
+                if case == 4 { cut = SourceCheckpointV1::derive(&CommitRange { low: 1, high: 8 }); }
+                let second = if case == 3 { "gamma" } else { "beta" };
+                let candidate = native_rows(&cx, &quality, &[("alpha", [0.0, 1.0]), (second, [1.0, 0.0])], generation, false);
+                let mut expected = candidate.owner_witness().clone();
+                if case == 0 { expected.whole_image_sha256[0] ^= 1; }
+                assert!(base.with_quality(&cx, candidate, &expected, cut).is_err(), "case {case}");
+                assert!(base.quality_receipt().is_none());
+            }
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            assert!(base.search_text(&cx, &fast, "common", 2).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn missing_quality_and_foreign_query_producer_never_degrade_to_fast_success() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new();
+            let quality = quality_provider();
+            let fixture = fixture(&cx, &fast, &["alpha", "beta"]).await;
+            let base = fixture.admit(&cx).unwrap();
+            let view = attach_quality(&cx, &fixture, &quality);
+            for k in [0, 2] {
+                assert!(base.search_refined_text(&cx, &fast, &quality, "common", k).await.is_err());
+                assert!(base.search_quality_text(&cx, &quality, "common", k).await.is_err());
+                assert!(base.search_progressive_with_quality(&cx, &fast, &quality, "common", k).is_err());
+                assert!(view.search_refined_text(&cx, &fast, &fast, "common", k).await.is_err());
+                assert!(view.search_progressive_with_quality(&cx, &fast, &fast, "common", k).is_err());
+            }
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn quality_primary_skips_fast_inference_and_refined_collect_matches_progressive() {
+        use super::super::NativeSearchPhase;
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new();
+            let quality = quality_provider();
+            let fixture = fixture(&cx, &fast, &["alpha", "beta"]).await;
+            let view = attach_quality(&cx, &fixture, &quality);
+            let primary = view.search_quality_text(&cx, &quality, "unmatched", 1).await.unwrap();
+            assert_eq!(primary[0].doc_id, "beta");
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            let eager = view.search_refined_text(&cx, &fast, &quality, "common", 2).await.unwrap();
+            let mut stream = view.search_progressive_with_quality(&cx, &fast, &quality, "common", 2).unwrap();
+            assert!(stream.next_phase().await.unwrap().is_some());
+            let NativeSearchPhase::Refined { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("refined"); };
+            assert_eq!(serde_json::to_value(results).unwrap(), serde_json::to_value(eager).unwrap());
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    #[test]
+    fn dropping_pending_composed_quality_releases_batch_and_does_not_retry() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new();
+            let quality = quality_provider();
+            let fixture = fixture(&cx, &fast, &["alpha", "beta"]).await;
+            let view = attach_quality(&cx, &fixture, &quality);
+            quality.ready.store(false, Ordering::SeqCst);
+            let references = Arc::strong_count(view.lexical_snapshot());
+            let mut stream = view.search_progressive_with_quality(&cx, &fast, &quality, "common", 2).unwrap();
+            assert!(stream.next_phase().await.unwrap().is_some());
+            assert!(Arc::strong_count(view.lexical_snapshot()) > references);
+            let mut future = Box::pin(stream.next_phase());
+            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            drop(future);
+            assert!(stream.is_finished());
+            assert!(stream.next_phase().await.unwrap().is_none());
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(view.lexical_snapshot()), references);
+        });
+    }
+
+    #[test]
+    fn composed_quality_cancellation_is_terminal_and_starts_no_late_inference() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new();
+            let quality = quality_provider();
+            let fixture = fixture(&cx, &fast, &["alpha", "beta"]).await;
+            let view = attach_quality(&cx, &fixture, &quality);
+            let mut stream = view.search_progressive_with_quality(&cx, &fast, &quality, "common", 2).unwrap();
+            assert!(stream.next_phase().await.unwrap().is_some());
+            cx.cancel_with(asupersync::CancelKind::User, Some("quality composition cancelled"));
+            assert!(matches!(stream.next_phase().await, Err(SearchError::Cancelled { .. })));
+            assert!(stream.is_finished());
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
         });
     }
 }
