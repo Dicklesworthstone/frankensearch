@@ -63,7 +63,7 @@ impl NativeShardHit {
 /// includes every document in an external corpus, nor bind a lexical reader.
 /// It never discovers paths, changes files, publishes a generation or spawns
 /// work. The caller owns the CPU/blocking lane for per-shard graph traversal.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NativeShardSet {
     shards: Vec<Arc<NativeAnnIndex>>,
     live_count: usize,
@@ -71,6 +71,119 @@ pub struct NativeShardSet {
 }
 
 impl NativeShardSet {
+    /// Install a fully admitted successor only if the current inventory matches.
+    ///
+    /// Prepare `candidate` independently with [`Self::open_published`] or
+    /// [`Self::admit`], then use this short, synchronous commit boundary under
+    /// the caller's writer serialization. The comparison includes EVERY current
+    /// witness, in order; a stale refresh cannot overwrite a newer selection.
+    /// No files are opened or changed here.
+    ///
+    /// A successor must have a strictly higher generation sequence and retain
+    /// the same space, producer, input contract and dimension. Repartitioning,
+    /// explicit source deletions, storage changes and ANN/exact changes are
+    /// permitted. Model migrations require a separately opened search handle,
+    /// rather than silently making this handle's configured embedder stale.
+    ///
+    /// Clone this set BEFORE replacement to retain a read snapshot: cloning
+    /// shares the exact immutable owners and graphs, not their vector slabs.
+    /// Results' shard coordinates belong to the snapshot that returned them.
+    /// This is an in-process replacement, not durable publication or a durable
+    /// rollback floor, and does not independently refresh a lexical reader.
+    ///
+    /// # Errors
+    ///
+    /// On cancellation, stale expected-current evidence, a non-newer candidate
+    /// or an identity change, this set is left untouched. A final checkpoint
+    /// precedes the swap; successful installation is not then reported cancelled.
+    pub fn try_replace(
+        &mut self,
+        cx: &Cx,
+        expected_current: &[FsviV2Witness],
+        candidate: Self,
+    ) -> SearchResult<()> {
+        self.validate_replacement(cx, expected_current, candidate.owner_witnesses().next())?;
+        checkpoint(cx, "native_ann.shards.replace_commit")?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Reopen a selected successor and replace this entire set on success.
+    ///
+    /// Checks the expected-current inventory and successor identity BEFORE
+    /// file access, then runs the complete published-vector/optional-graph
+    /// admission path. A failure in a later shard or graph cannot leave a
+    /// mixture of old and new partitions installed. No paths are remembered
+    /// from an earlier open and no implicit generation discovery occurs.
+    ///
+    /// For a live service that must keep a writer lock short, prepare the
+    /// candidate with [`Self::open_published`] outside that lock and install
+    /// with [`Self::try_replace`]. This convenience method is synchronous;
+    /// it neither spawns work nor owns the caller's scheduling or locks.
+    ///
+    /// # Errors
+    ///
+    /// Preserves [`Self::open_published`]'s typed FSVI failures; replacement
+    /// refusals use [`FsviAdmissionError::Index`]. All failures retain this set.
+    pub fn try_replace_published(
+        &mut self,
+        cx: &Cx,
+        expected_current: &[FsviV2Witness],
+        expected_next: &[FsviV2Witness],
+        artifacts: &[(PathBuf, FsviV2IdentityBinding, Option<PathBuf>)],
+    ) -> Result<(), FsviAdmissionError> {
+        self.validate_replacement(cx, expected_current, expected_next.first())?;
+        let candidate = Self::open_published(cx, expected_next, artifacts)?;
+        self.try_replace(cx, expected_current, candidate)?;
+        Ok(())
+    }
+
+    fn validate_replacement(
+        &self,
+        cx: &Cx,
+        expected_current: &[FsviV2Witness],
+        next: Option<&FsviV2Witness>,
+    ) -> SearchResult<()> {
+        checkpoint(cx, "native_ann.shards.replace_admission")?;
+        if expected_current.len() != self.shards.len() {
+            return Err(invalid(
+                "shards.replace.expected_current", "cardinality",
+                "replacement requires the complete current shard inventory",
+            ));
+        }
+        for (shard, expected) in self.shards.iter().zip(expected_current) {
+            checkpoint(cx, "native_ann.shards.replace_current")?;
+            if shard.owner_witness() != expected {
+                return Err(invalid(
+                    "shards.replace.expected_current", "stale",
+                    "the current exact ordered inventory differs from the refresh's expectation",
+                ));
+            }
+        }
+        let next = next.ok_or_else(|| invalid(
+            "shards.inventory", "empty-successor",
+            "a successor must retain at least one identity-bearing shard, even for an empty corpus",
+        ))?;
+        let current = self.shards[0].owner_witness();
+        if next.generation.sequence <= current.generation.sequence {
+            return Err(invalid(
+                "shards.replace.generation", "not-newer",
+                "replacement requires a strictly higher generation sequence; same-sequence nonce changes are not successors",
+            ));
+        }
+        if next.space_fingerprint != current.space_fingerprint
+            || next.producer_fingerprint != current.producer_fingerprint
+            || next.input_fingerprint != current.input_fingerprint
+            || next.dimension != current.dimension
+        {
+            return Err(invalid(
+                "shards.replace.identity", "changed",
+                "live replacement must preserve space, producer, input and dimension; open a separate handle for a model migration",
+            ));
+        }
+        Ok(())
+    }
+
     /// Reopen an exact published shard inventory after a process restart.
     ///
     /// Each artifact is `(vector_path, identity_binding, optional_graph_path)`
@@ -929,6 +1042,196 @@ mod published_tests {
                     if field == "native_ann.shards.paths"));
             second.0 = root.join("absent.fsvi");
             assert!(NativeShardSet::open_published(&cx, &[a, b], &[first, second]).is_err());
+        });
+    }
+
+    #[test]
+    fn replacement_switches_the_whole_set_while_cloned_readers_keep_old_owners() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (a, first) = fixture(&cx, &root, "old-a", 1, QuantizationFormat::F16,
+                &[("a", [1.0, 0.0], true)], true);
+            let (b, second) = fixture(&cx, &root, "old-b", 1, QuantizationFormat::F32,
+                &[("b", [0.5, 0.5], true)], false);
+            let old_expected = [a, b];
+            let mut current = NativeShardSet::open_published(&cx, &old_expected, &[first, second]).unwrap();
+            let retained = current.clone();
+            assert!(Arc::ptr_eq(&retained.shards[0], &current.shards[0]));
+            let before = retained.search(&cx, &query(), 2, None).unwrap();
+            let (next, artifact) = fixture(&cx, &root, "successor", 2, QuantizationFormat::F32,
+                &[("new", [0.75, 0.25], true)], false);
+            current.try_replace_published(&cx, &old_expected, std::slice::from_ref(&next),
+                std::slice::from_ref(&artifact)).unwrap();
+            assert_eq!((current.shard_count(), current.live_count()), (1, 1));
+            assert_eq!(current.search(&cx, &query(), 2, None).unwrap()[0].doc_id, "new");
+            assert_eq!(retained.search(&cx, &query(), 2, None).unwrap(), before);
+            assert_eq!(retained.owner_witnesses().cloned().collect::<Vec<_>>(), old_expected);
+            assert!(!Arc::ptr_eq(&retained.shards[0], &current.shards[0]));
+            let reopened = NativeShardSet::open_published(&cx, &[next], &[artifact]).unwrap();
+            assert_eq!(current.search(&cx, &query(), 2, None).unwrap(),
+                reopened.search(&cx, &query(), 2, None).unwrap());
+        });
+    }
+
+    #[test]
+    fn stale_expected_current_checks_every_partition_before_candidate_io() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (a, first) = fixture(&cx, &root, "a", 1, QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)], false);
+            let (b, second) = fixture(&cx, &root, "b", 1, QuantizationFormat::F32,
+                &[("b", [0.5, 0.5], true)], false);
+            let expected = [a, b];
+            let mut current = NativeShardSet::open_published(&cx, &expected, &[first, second]).unwrap();
+            let before = current.search(&cx, &query(), 2, None).unwrap();
+            let mut stale = expected.clone();
+            stale[1].whole_image_sha256[0] ^= 1;
+            // The absent successor would otherwise fail its own cardinality
+            // validation. Exact error attribution proves stale-current ran first.
+            assert!(matches!(current.try_replace_published(&cx, &stale, &[], &[]),
+                Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, ref value, .. }))
+                    if field == "native_ann.shards.replace.expected_current" && value == "stale"));
+            assert!(matches!(current.try_replace_published(&cx, &expected[..1], &[], &[]),
+                Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, ref value, .. }))
+                    if field == "native_ann.shards.replace.expected_current" && value == "cardinality"));
+            assert_eq!(current.search(&cx, &query(), 2, None).unwrap(), before);
+            assert_eq!(current.owner_witnesses().cloned().collect::<Vec<_>>(), expected);
+        });
+    }
+
+    #[test]
+    fn rollback_and_same_sequence_nonce_twins_refuse_before_opening_files() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (witness, artifact) = fixture(&cx, &root, "current", 2, QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)], false);
+            let expected = [witness];
+            let mut current = NativeShardSet::open_published(&cx, &expected, &[artifact]).unwrap();
+            for generation in [
+                ArtifactGenerationIdentityV1::new(1, [0x73; 16]).unwrap(),
+                ArtifactGenerationIdentityV1::new(2, [0x74; 16]).unwrap(),
+                expected[0].generation,
+            ] {
+                let mut next = expected[0].clone();
+                next.generation = generation;
+                assert!(matches!(current.try_replace_published(&cx, &expected, &[next], &[]),
+                    Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, .. }))
+                        if field == "native_ann.shards.replace.generation"));
+            }
+            assert_eq!(current.owner_witnesses().cloned().collect::<Vec<_>>(), expected);
+            assert_eq!(current.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "a");
+        });
+    }
+
+    #[test]
+    fn a_bad_later_vector_or_graph_never_partially_replaces_the_live_inventory() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (old, artifact) = fixture(&cx, &root, "old", 1, QuantizationFormat::F32,
+                &[("old", [1.0, 0.0], true)], true);
+            let expected = [old];
+            let mut current = NativeShardSet::open_published(&cx, &expected, &[artifact]).unwrap();
+            let retained = current.clone();
+            let (a, first) = fixture(&cx, &root, "next-a", 2, QuantizationFormat::F32,
+                &[("a", [0.75, 0.25], true)], true);
+            let (b, mut second) = fixture(&cx, &root, "next-b", 2, QuantizationFormat::F32,
+                &[("b", [0.5, 0.5], true)], false);
+            second.2 = Some(root.join("invalid-graph.txt"));
+            let next = [a, b];
+            let mut artifacts = [first, second];
+            // Both mandatory vectors admit; a non-recoverable graph config
+            // error occurs only after the first graph has already loaded.
+            assert!(current.try_replace_published(&cx, &expected, &next, &artifacts).is_err());
+            assert!(Arc::ptr_eq(&retained.shards[0], &current.shards[0]));
+            artifacts[1].2 = None;
+            std::fs::write(&artifacts[1].0, b"corrupted mandatory second vector").unwrap();
+            assert!(current.try_replace_published(&cx, &expected, &next, &artifacts).is_err());
+            assert!(Arc::ptr_eq(&retained.shards[0], &current.shards[0]));
+            assert_eq!(current.owner_witnesses().cloned().collect::<Vec<_>>(), expected);
+            assert_eq!(current.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "old");
+        });
+    }
+
+    #[test]
+    fn a_prepared_candidate_cannot_overwrite_an_intervening_refresh() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (old, first) = fixture(&cx, &root, "gen-1", 1, QuantizationFormat::F32,
+                &[("old", [1.0, 0.0], true)], false);
+            let expected_old = [old];
+            let mut current = NativeShardSet::open_published(&cx, &expected_old, &[first]).unwrap();
+            let (second, a) = fixture(&cx, &root, "gen-2", 2, QuantizationFormat::F32,
+                &[("second", [0.75, 0.25], true)], false);
+            let (third, b) = fixture(&cx, &root, "gen-3", 3, QuantizationFormat::F32,
+                &[("third", [0.5, 0.5], true)], false);
+            let expected_second = [second];
+            let prepared_second = NativeShardSet::open_published(&cx, &expected_second, &[a]).unwrap();
+            let prepared_third = NativeShardSet::open_published(&cx, &[third], &[b]).unwrap();
+            current.try_replace(&cx, &expected_old, prepared_second).unwrap();
+            assert!(matches!(current.try_replace(&cx, &expected_old, prepared_third.clone()),
+                Err(SearchError::InvalidConfig { ref field, .. })
+                    if field == "native_ann.shards.replace.expected_current"));
+            assert_eq!(current.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "second");
+            current.try_replace(&cx, &expected_second, prepared_third).unwrap();
+            assert_eq!(current.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "third");
+        });
+    }
+
+    #[test]
+    fn independently_valid_new_producer_requires_a_separate_search_handle() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (old, artifact) = fixture(&cx, &root, "old", 1, QuantizationFormat::F32,
+                &[("old", [1.0, 0.0], true)], false);
+            let mut identity = artifact.1.frozen_identity().identity.clone();
+            identity.producer.backend = "new-producer".to_owned();
+            identity.validate().unwrap();
+            let new_query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity.clone()).unwrap();
+            let binding = FsviV2IdentityBinding::new(
+                ArtifactGenerationIdentityV1::new(2, [0x73; 16]).unwrap(),
+                identity.freeze().unwrap(),
+            ).unwrap();
+            let path = root.join("different-producer.fsvi");
+            let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
+            writer.write_record("new", &[1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
+            let witness = ValidatedFsviBytes::from_arc(bytes, &binding).unwrap().witness().clone();
+            let candidate = NativeShardSet::open_published(&cx, &[witness], &[(path, binding, None)]).unwrap();
+            assert_eq!(candidate.search(&cx, &new_query, 1, None).unwrap()[0].doc_id, "new");
+            let expected = [old];
+            let mut current = NativeShardSet::open_published(&cx, &expected, &[artifact]).unwrap();
+            assert!(matches!(current.try_replace(&cx, &expected, candidate),
+                Err(SearchError::InvalidConfig { ref field, .. })
+                    if field == "native_ann.shards.replace.identity"));
+            assert_eq!(current.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "old");
+        });
+    }
+
+    #[test]
+    fn explicit_delete_all_installs_a_new_identity_bearing_empty_generation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (old, first) = fixture(&cx, &root, "live", 1, QuantizationFormat::F32,
+                &[("old", [1.0, 0.0], true)], false);
+            let expected = [old];
+            let mut current = NativeShardSet::open_published(&cx, &expected, &[first]).unwrap();
+            let retained = current.clone();
+            let (empty, next) = fixture(&cx, &root, "empty", 2, QuantizationFormat::F16, &[], false);
+            current.try_replace_published(&cx, &expected, &[empty], &[next]).unwrap();
+            assert_eq!((current.shard_count(), current.live_count()), (1, 0));
+            assert!(current.search(&cx, &query(), 1, None).unwrap().is_empty());
+            assert_eq!(retained.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "old");
+            let foreign = BoundQueryEmbedding::new(vec![1.0, 0.0],
+                EmbeddingIdentityBundleV1::explicit_test_model("foreign", 2)).unwrap();
+            assert!(current.search(&cx, &foreign, 0, None).is_err());
         });
     }
 }
