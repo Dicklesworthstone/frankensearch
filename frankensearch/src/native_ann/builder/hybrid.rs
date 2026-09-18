@@ -1,0 +1,158 @@
+//! Native build-to-query integration with a privately owned Quill lexical arm.
+
+use std::sync::Arc;
+
+use frankensearch_quill::{QuillConfig, QuillIndex};
+
+use super::{NativeBuiltIndex, NativeIndexBuilder};
+use crate::native_ann::NativeProgressiveSearch;
+use crate::{Cx, LexicalRead, LexicalWrite, Reranker, ScoredResult, SearchResult};
+use super::super::{checkpoint, invalid};
+
+impl NativeIndexBuilder {
+    /// Build native fast/quality vectors and Quill from the same owned documents.
+    ///
+    /// All arms are required and must finish before any hybrid handle is returned.
+    /// Quill uses deterministic single-shard bulk ingest and is finalized once.
+    /// Its writer is kept private: the returned object cannot update just lexical
+    /// content while retaining vectors from an older document version.
+    ///
+    /// This consumes the prepared content exactly as [`Self::build`] does and
+    /// adds native lexical indexing of the complete original documents. It does
+    /// not adopt an existing lexical directory or accept an unrelated reader.
+    /// The source cohort is retained for final cross-encoder input. No CURRENT
+    /// pointer or durable composite-generation manifest is published.
+    ///
+    /// # Errors
+    /// Propagates vector build, lexical create/index/finalize, membership and
+    /// cancellation errors. Failures may leave an unselected directory but never
+    /// produce a partial hybrid success or overwrite an older generation.
+    pub async fn build_hybrid(self, cx: &Cx) -> SearchResult<NativeBuiltHybridIndex> {
+        let vectors = self.build(cx).await?;
+        checkpoint(cx, "native_ann.builder.lexical_start")?;
+        let path = vectors.directory.join("lexical");
+        std::fs::create_dir(&path)?;
+        let response = QuillIndex::create(cx, &path, QuillConfig {
+            bulk_load_mode: true,
+            deterministic_ingest: true,
+            max_ingest_shards: 1,
+            ..QuillConfig::default()
+        }).await;
+        checkpoint(cx, "native_ann.builder.lexical_created")?;
+        let lexical = response?;
+        for document in vectors.documents.iter() {
+            checkpoint(cx, "native_ann.builder.lexical_document")?;
+            let response = LexicalWrite::index_document(&lexical, cx, document).await;
+            checkpoint(cx, "native_ann.builder.lexical_document_complete")?;
+            response?;
+        }
+        let response = lexical.finish_bulk_load(cx).await;
+        checkpoint(cx, "native_ann.builder.lexical_finalized")?;
+        response?;
+        if LexicalRead::doc_count(&lexical)? != vectors.documents.len() {
+            return Err(invalid("builder.lexical_membership", "cardinality", "Quill must contain the complete source cohort"));
+        }
+        let source = Arc::clone(&vectors.documents);
+        let text = Box::new(move |id: &str| {
+            source.binary_search_by(|document| document.id.as_str().cmp(id))
+                .ok().map(|position| source[position].content.clone())
+        });
+        checkpoint(cx, "native_ann.builder.hybrid_complete")?;
+        Ok(NativeBuiltHybridIndex { vectors, lexical, text })
+    }
+}
+
+/// Complete process-local native hybrid generation built from one source cohort.
+///
+/// Vector tiers retain their producing models; Quill is not exposed for mutation.
+/// Every progressive phase borrows this same object. Final reranking resolves
+/// text from its owned source documents, not a closure over mutable/current files.
+/// This enforces build-time cohort ownership, not a durable cross-process
+/// publication protocol or an attestation for externally supplied artifacts.
+/// Keep the output directory trusted and immutable; there is no reload here.
+pub struct NativeBuiltHybridIndex {
+    vectors: NativeBuiltIndex,
+    lexical: QuillIndex,
+    text: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
+}
+
+impl NativeBuiltHybridIndex {
+    /// Read-only native tiers and exact source documents used for this build.
+    #[must_use]
+    pub const fn vectors(&self) -> &NativeBuiltIndex { &self.vectors }
+
+    /// Read-only lexical access. No writer, commit or replacement API is exposed.
+    #[must_use]
+    pub fn lexical(&self) -> &dyn LexicalRead { &self.lexical }
+
+    /// Fast-plus-lexical search with the producing model and pinned hydration.
+    ///
+    /// # Errors
+    /// Propagates native hybrid admission, inference, lexical and cancellation errors.
+    pub async fn search(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<ScoredResult>> {
+        let fast = self.vectors.fast();
+        fast.index().search_hybrid_text(cx, fast.embedder(), &self.lexical, text, k).await
+    }
+
+    /// Independent fast and quality retrieval, blended with lexical candidates.
+    /// A generation built without quality performs its declared fast-only search;
+    /// a configured quality failure never triggers an inference fallback here.
+    ///
+    /// # Errors
+    /// Propagates all configured retrieval and hydration errors.
+    pub async fn search_refined(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<ScoredResult>> {
+        let fast = self.vectors.fast();
+        match self.vectors.quality() {
+            Some(quality) => fast.index().search_hybrid_refined_text(
+                cx, fast.embedder(), (quality.index(), quality.embedder()), &self.lexical, text, k,
+            ).await,
+            None => self.search(cx, text, k).await,
+        }
+    }
+
+    /// Primary quality-plus-lexical retrieval without running the fast model.
+    ///
+    /// # Errors
+    /// Refuses a missing quality tier; otherwise propagates native quality errors.
+    pub async fn search_quality(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<ScoredResult>> {
+        checkpoint(cx, "native_ann.builder.quality_query")?;
+        let quality = self.vectors.quality().ok_or_else(|| {
+            invalid("builder.quality", "absent", "quality-primary search requires a built quality tier")
+        })?;
+        quality.index().search_hybrid_quality_text(cx, quality.embedder(), &self.lexical, text, k).await
+    }
+
+    /// Prepare the existing lazy native phase sequence without provider work.
+    ///
+    /// # Errors
+    /// Refuses invalid query topology, identity, candidate budget or cancellation.
+    pub fn progressive<'a>(&'a self, cx: &'a Cx, text: &'a str, k: usize) -> SearchResult<NativeProgressiveSearch<'a>> {
+        let fast = self.vectors.fast();
+        fast.index().search_hybrid_progressive(
+            cx, fast.embedder(), self.vectors.quality().map(|quality| (quality.index(), quality.embedder())),
+            &self.lexical, text, k,
+        )
+    }
+
+    /// Prepare lazy native retrieval and cross-encoder reranking using the EXACT
+    /// source content from this build. The caller supplies only the reranker,
+    /// never a "latest text" resolver that could silently change document versions.
+    /// `window` may exceed the displayed `k` so undisplayed candidates can win.
+    /// Text resolution and inference begin only when the final phase is requested.
+    ///
+    /// # Errors
+    /// Combines [`Self::progressive`] admission and native rerank configuration errors.
+    pub fn progressive_with_reranker<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        reranker: &'a dyn Reranker,
+        window: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.progressive(cx, text, k)?.with_reranker(reranker, self.text.as_ref(), window)
+    }
+}
+
+#[cfg(test)]
+mod tests;

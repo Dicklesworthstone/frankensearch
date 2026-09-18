@@ -27,6 +27,11 @@ use frankensearch_index::native_hnsw::HnswParams;
 use super::{NativeAnnIndex, checkpoint, invalid};
 use crate::{Cx, Embedder, IndexableDocument, SearchResult, VectorHit};
 
+#[cfg(feature = "quill")]
+mod hybrid;
+#[cfg(feature = "quill")]
+pub use hybrid::NativeBuiltHybridIndex;
+
 /// Persisted vector precision; neither option changes the producing model.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum NativeBuildPrecision {
