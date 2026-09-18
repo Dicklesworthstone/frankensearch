@@ -11,21 +11,28 @@
 //! for other processes. A failure or dropped future may leave an incomplete
 //! directory for diagnostics; directory existence is NOT a completion receipt.
 //! Only a successful returned handle represents a complete source/vector cohort.
+//! Explicit `NativeBuiltIndex::seal_for_reopen` persists that cohort under a
+//! caller-retained receipt; reopening never discovers or selects a generation.
 //! Filesystem and graph work is synchronous on the polling execution lane; use
 //! the caller's blocking lane for large builds. No task or runtime is spawned.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use frankensearch_core::generation::{
     ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
 };
 use frankensearch_core::traits::IdentityBoundEmbedding;
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex, VectorIndexWriter};
-use frankensearch_index::native_hnsw::HnswParams;
+use frankensearch_index::native_hnsw::{HnswParams, NativeHnswGenerationReceiptV2};
 
 use super::{NativeAnnIndex, checkpoint, invalid};
 use crate::{Cx, Embedder, IndexableDocument, SearchResult, VectorHit};
+
+mod snapshot;
+pub use snapshot::NativeReopenLimits;
 
 #[cfg(feature = "quill")]
 mod hybrid;
@@ -33,7 +40,8 @@ mod hybrid;
 pub use hybrid::NativeBuiltHybridIndex;
 
 /// Persisted vector precision; neither option changes the producing model.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeBuildPrecision {
     /// Preserve the model's f32 outputs.
     #[default]
@@ -238,8 +246,9 @@ impl NativeIndexBuilder {
     /// failures never remove a document, drop quality, or return a partial cohort.
     /// Empty cohorts produce explicitly empty admitted indexes without inference.
     /// There is no filesystem completion marker or discovery fallback: consumers
-    /// must retain this successful handle or publish its exact bindings/witnesses
-    /// through their own trusted generation selector. Failed directories are not
+    /// must retain this successful handle, retain its explicit `seal_for_reopen`
+    /// receipt, or publish its exact witnesses through their own trusted selector.
+    /// Failed directories are not
     /// automatically deleted and are never overwritten by a subsequent attempt.
     ///
     /// # Errors
@@ -296,9 +305,12 @@ impl NativeIndexBuilder {
 pub struct NativeBuiltTier {
     index: NativeAnnIndex,
     embedder: Arc<dyn Embedder>,
+    producer_identity: EmbeddingIdentityBundleV1,
+    precision: NativeBuildPrecision,
     binding: FsviV2IdentityBinding,
     vector_path: PathBuf,
     graph_path: Option<PathBuf>,
+    graph_receipt: Option<NativeHnswGenerationReceiptV2>,
 }
 
 impl NativeBuiltTier {
@@ -330,8 +342,9 @@ impl NativeBuiltTier {
 ///
 /// Source text, IDs, metadata and vector handles are immutable through this API.
 /// Holding this object protects queries from later changes to the source files.
-/// It is process-local build provenance, not a persisted composite manifest or
-/// an attestation of arbitrary independently opened lexical readers.
+/// An explicitly selected source/vector seal can restore this cohort after
+/// restart. It is not composite lexical/vector publication authority or an
+/// attestation of arbitrary independently opened lexical readers.
 pub struct NativeBuiltIndex {
     directory: PathBuf,
     documents: Arc<[IndexableDocument]>,
@@ -371,6 +384,30 @@ fn finish_tier(
     let bytes: Arc<[u8]> = std::fs::read(&vector_path)?.into();
     let owner = Arc::new(ValidatedFsviBytes::from_arc(bytes, &binding)
         .map_err(|error| invalid("builder.vector_admission", "rejected", &error.to_string()))?);
+    validate_source_membership(cx, &owner, documents)?;
+    let (index, graph_path, graph_receipt) = match plan.retrieval {
+        NativeBuildRetrieval::Exact => (NativeAnnIndex::exact(cx, owner)?, None, None),
+        NativeBuildRetrieval::Hnsw { params, seed } => {
+            let index = NativeAnnIndex::build(cx, owner, params, seed)?;
+            let graph_path = vector_path.with_extension("fshnsw");
+            let receipt = index.save(cx, &graph_path)?;
+            (index, Some(graph_path), Some(receipt))
+        }
+    };
+    index.admit_identity(plan.embedder.identity()?)?;
+    Ok(NativeBuiltTier {
+        index, embedder: plan.embedder, producer_identity: plan.identity,
+        precision: plan.precision, binding, vector_path, graph_path, graph_receipt,
+    })
+}
+
+/// Shared by initial build and selected reopen. `documents` has already been
+/// admitted as strictly increasing by ID; physical FSVI order is independent.
+fn validate_source_membership(
+    cx: &Cx,
+    owner: &ValidatedFsviBytes,
+    documents: &[IndexableDocument],
+) -> SearchResult<()> {
     if owner.record_count() != documents.len() || owner.live_count() != documents.len() {
         return Err(invalid("builder.source_join", "cardinality", "admitted vector membership must equal the complete source cohort"));
     }
@@ -388,17 +425,7 @@ fn finish_tier(
             return Err(invalid("builder.source_join", "duplicate-or-deleted", "every source document must map to exactly one live vector row"));
         }
     }
-    let (index, graph_path) = match plan.retrieval {
-        NativeBuildRetrieval::Exact => (NativeAnnIndex::exact(cx, owner)?, None),
-        NativeBuildRetrieval::Hnsw { params, seed } => {
-            let index = NativeAnnIndex::build(cx, owner, params, seed)?;
-            let graph_path = vector_path.with_extension("fshnsw");
-            index.save(cx, &graph_path)?;
-            (index, Some(graph_path))
-        }
-    };
-    index.admit_identity(plan.embedder.identity()?)?;
-    Ok(NativeBuiltTier { index, embedder: plan.embedder, binding, vector_path, graph_path })
+    Ok(())
 }
 
 #[cfg(test)]
