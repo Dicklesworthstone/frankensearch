@@ -2,11 +2,15 @@
 
 use frankensearch_core::LexicalCandidateBatch;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
+use frankensearch_core::traits::Reranker;
 use frankensearch_fusion::{RrfConfig, rrf_fuse_for_vector_lane};
 
 use super::refinement::{admit_pair, checked_lexical, refined_winners};
 use super::{NativeAnnIndex, checkpoint, hydrate_winners, invalid, join_sources};
 use crate::{Cx, Embedder, LexicalRead, ScoredResult, SearchError, SearchResult, VectorHit};
+
+pub(super) mod rerank;
+use rerank::RerankRequest;
 
 impl NativeAnnIndex {
     /// Prepare native progressive search without starting inference or retrieval.
@@ -14,7 +18,8 @@ impl NativeAnnIndex {
     /// The first `next_phase` retrieves this fast owner plus lexical candidates.
     /// Only a second call starts independent retrieval from the optional quality
     /// owner. Stopping after initial results starts no quality inference. With
-    /// no quality arm, the stream yields exactly one initial phase. Direct
+    /// no quality arm, the stream yields one initial phase unless an optional
+    /// [`NativeProgressiveSearch::with_reranker`] stage is attached. Direct
     /// quality-only retrieval remains [`Self::search_hybrid_quality_text`].
     ///
     /// Generation, producer, space-kind and document-ID joins use the same
@@ -45,6 +50,7 @@ impl NativeAnnIndex {
             lexical,
             text,
             k,
+            reranker: None,
             budget: k.checked_mul(3).ok_or_else(|| {
                 invalid(
                     "progressive.candidate_budget",
@@ -94,6 +100,22 @@ pub enum NativeSearchPhase {
         /// Failure in admission, quality retrieval, fusion, or hydration.
         error: SearchError,
     },
+    /// Final cross-encoder ordering of the retained retrieval candidate window.
+    Reranked {
+        /// At most the requested `k` winners, with original retrieval evidence.
+        results: Vec<ScoredResult>,
+        /// Counts from the retrieval phase, not cross-encoder model calls.
+        candidates: NativePhaseCandidates,
+        /// Number of candidate documents that had text and were scored.
+        evaluated: usize,
+    },
+    /// Non-cancellation rerank failure; the last displayed results remain valid.
+    RerankFailed {
+        /// The previous displayed page, unchanged by the failed rerank.
+        previous_results: Vec<ScoredResult>,
+        /// Model availability, response admission, or inference failure.
+        error: SearchError,
+    },
 }
 
 struct PendingRefinement {
@@ -102,9 +124,18 @@ struct PendingRefinement {
     initial_results: Vec<ScoredResult>,
 }
 
+struct PendingRerank {
+    results: Vec<ScoredResult>,
+    candidates: NativePhaseCandidates,
+    // Retain the scoring snapshot through text resolution and model inference.
+    // The caller's text resolver must itself select the same document versions.
+    _batch: LexicalCandidateBatch,
+}
+
 enum State {
     Initial,
     Refine(PendingRefinement),
+    Rerank(PendingRerank),
     Done,
 }
 
@@ -131,10 +162,55 @@ pub struct NativeProgressiveSearch<'a> {
     text: &'a str,
     k: usize,
     budget: usize,
+    reranker: Option<RerankRequest<'a>>,
     state: State,
 }
 
-impl NativeProgressiveSearch<'_> {
+impl<'a> NativeProgressiveSearch<'a> {
+    /// Add a lazy final cross-encoder stage before requesting the first phase.
+    ///
+    /// `top_k` bounds the rerank window, independently of the displayed page.
+    /// Retrieval budgets expand to three times `max(k, top_k)` so reranking can
+    /// promote candidates outside the initial page. Enabling this option may
+    /// therefore change initial fusion relative to a smaller, unreranked query.
+    /// Only requesting the final phase resolves text or calls the reranker;
+    /// abandoning earlier phases incurs no cross-encoder inference.
+    ///
+    /// `text_fn` must resolve text from the same document versions as retrieval,
+    /// for example by capturing the consumer's immutable source snapshot. This
+    /// API retains the lexical scoring pin, but cannot prove the provenance of
+    /// an arbitrary closure. Missing text skips that candidate. When no text is
+    /// available, the final `next_phase` returns `None`, not a fabricated rerank.
+    ///
+    /// A failed quality refinement still permits reranking the retained initial
+    /// pool. Inference is caller-owned and cancellation/drop is terminal. Raw
+    /// retrieval scores and their explanations are preserved; `rerank_score`
+    /// records the new ordering signal. No model is downloaded or substituted.
+    ///
+    /// # Errors
+    ///
+    /// Refuses zero/overflowing budgets, cancellation, or configuration after
+    /// a phase has started. Model availability is checked only at the final phase.
+    pub fn with_reranker(
+        mut self,
+        reranker: &'a dyn Reranker,
+        text_fn: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
+        top_k: usize,
+    ) -> SearchResult<Self> {
+        checkpoint(self.cx, "native_ann.rerank_configuration")?;
+        if !matches!(self.state, State::Initial) || top_k == 0 {
+            return Err(invalid(
+                "rerank.configuration", "started-or-empty-window",
+                "attach a positive rerank window before requesting any phase",
+            ));
+        }
+        self.budget = self.k.max(top_k).checked_mul(3).ok_or_else(|| {
+            invalid("rerank.candidate_budget", "overflow", "rerank retrieval budget must fit usize")
+        })?;
+        self.reranker = Some(RerankRequest { reranker, text: text_fn, limit: top_k });
+        Ok(self)
+    }
+
     /// Whether every phase finished or a polled phase was abandoned.
     #[must_use]
     pub const fn is_finished(&self) -> bool {
@@ -146,8 +222,9 @@ impl NativeProgressiveSearch<'_> {
     /// # Errors
     ///
     /// Initial failures and any cancellation propagate directly. After initial
-    /// success, other refinement failures produce `RefinementFailed` carrying
-    /// the original results. Every error leaves this stream finished.
+    /// success, other stage failures carry the preceding results. Optional
+    /// reranking follows quality success or non-cancellation failure. Every
+    /// returned `Err` leaves this stream finished.
     pub async fn next_phase(&mut self) -> SearchResult<Option<NativeSearchPhase>> {
         // Own the phase before the first suspension. Cancellation by dropping
         // this future cannot leave a runnable copy of the work in the stream.
@@ -155,6 +232,7 @@ impl NativeProgressiveSearch<'_> {
             State::Done => Ok(None),
             State::Initial => self.initial().await.map(Some),
             State::Refine(pending) => self.refine(pending).await.map(Some),
+            State::Rerank(pending) => self.rerank(pending).await,
         }
     }
 
@@ -195,12 +273,12 @@ impl NativeProgressiveSearch<'_> {
         let fused = rrf_fuse_for_vector_lane(
             batch.results(),
             &fast,
-            self.k,
+            self.result_window(),
             0,
             &RrfConfig::default(),
             is_hash,
         );
-        let results = hydrate_winners(self.cx, self.lexical, fused, &batch).await?;
+        let mut results = hydrate_winners(self.cx, self.lexical, fused, &batch).await?;
         checkpoint(self.cx, "native_ann.progressive_initial_complete")?;
         if self.quality.is_some() {
             self.state = State::Refine(PendingRefinement {
@@ -208,22 +286,31 @@ impl NativeProgressiveSearch<'_> {
                 batch,
                 initial_results: results.clone(),
             });
+            results.truncate(self.k);
+        } else {
+            results = self.finish_retrieval(results, candidates, batch);
         }
         Ok(NativeSearchPhase::Initial { results, candidates })
     }
 
-    async fn refine(&self, pending: PendingRefinement) -> SearchResult<NativeSearchPhase> {
+    async fn refine(&mut self, pending: PendingRefinement) -> SearchResult<NativeSearchPhase> {
         match self.refined_results(&pending).await {
-            Ok((results, candidates)) => Ok(NativeSearchPhase::Refined { results, candidates }),
+            Ok((results, candidates)) => {
+                let results = self.finish_retrieval(results, candidates, pending.batch);
+                Ok(NativeSearchPhase::Refined { results, candidates })
+            }
             Err(error) => {
                 checkpoint(self.cx, "native_ann.progressive_failure")?;
                 if matches!(error, SearchError::Cancelled { .. }) {
                     return Err(error);
                 }
-                Ok(NativeSearchPhase::RefinementFailed {
-                    initial_results: pending.initial_results,
-                    error,
-                })
+                let candidates = NativePhaseCandidates {
+                    fast: pending.fast.len(), quality: 0, lexical: pending.batch.results().len(),
+                };
+                let initial_results = self.finish_retrieval(
+                    pending.initial_results, candidates, pending.batch,
+                );
+                Ok(NativeSearchPhase::RefinementFailed { initial_results, error })
             }
         }
     }
@@ -254,12 +341,57 @@ impl NativeProgressiveSearch<'_> {
             &pending.batch,
             &pending.fast,
             &quality_hits,
-            self.k,
+            self.result_window(),
             is_hash,
         )
         .await?;
         checkpoint(self.cx, "native_ann.progressive_refined_complete")?;
         Ok((results, candidates))
+    }
+
+    fn result_window(&self) -> usize {
+        self.reranker.map_or(self.k, |request| self.k.max(request.limit))
+    }
+
+    fn finish_retrieval(
+        &mut self,
+        mut results: Vec<ScoredResult>,
+        candidates: NativePhaseCandidates,
+        batch: LexicalCandidateBatch,
+    ) -> Vec<ScoredResult> {
+        if self.reranker.is_some() && !results.is_empty() {
+            let displayed = results.iter().take(self.k).cloned().collect();
+            self.state = State::Rerank(PendingRerank { results, candidates, _batch: batch });
+            displayed
+        } else {
+            results.truncate(self.k);
+            results
+        }
+    }
+
+    async fn rerank(&self, pending: PendingRerank) -> SearchResult<Option<NativeSearchPhase>> {
+        let request = self.reranker.as_ref().ok_or_else(|| {
+            invalid("rerank.configuration", "missing", "a queued rerank must retain its provider")
+        })?;
+        match request.plan(self.cx, self.text, &pending.results).await {
+            Ok(Some(plan)) => {
+                let evaluated = plan.evaluated;
+                let mut results = plan.apply(pending.results, |result| result);
+                results.truncate(self.k);
+                checkpoint(self.cx, "native_ann.rerank_complete")?;
+                Ok(Some(NativeSearchPhase::Reranked { results, candidates: pending.candidates, evaluated }))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                checkpoint(self.cx, "native_ann.rerank_failure")?;
+                if matches!(error, SearchError::Cancelled { .. }) {
+                    return Err(error);
+                }
+                let mut previous_results = pending.results;
+                previous_results.truncate(self.k);
+                Ok(Some(NativeSearchPhase::RerankFailed { previous_results, error }))
+            }
+        }
     }
 }
 
@@ -961,6 +1093,295 @@ mod tests {
             ));
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
             assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+        });
+    }
+
+    #[derive(Clone, Copy)]
+    enum RerankReply {
+        Winner,
+        Failed,
+        Pending,
+        Cancelled,
+        CancelWithScores,
+        DuplicateRank,
+        ForeignId,
+        OutOfRange,
+        MissingScore,
+        NonFinite,
+        NonFiniteLogit,
+        Unavailable,
+    }
+
+    struct CrossEncoder {
+        reply: RerankReply,
+        calls: AtomicUsize,
+        drops: AtomicUsize,
+    }
+
+    impl CrossEncoder {
+        fn new(reply: RerankReply) -> Self {
+            Self { reply, calls: AtomicUsize::new(0), drops: AtomicUsize::new(0) }
+        }
+    }
+
+    impl Reranker for CrossEncoder {
+        fn rerank<'a>(
+            &'a self,
+            cx: &'a Cx,
+            _query: &'a str,
+            documents: &'a [frankensearch_core::traits::RerankDocument],
+        ) -> SearchFuture<'a, Vec<frankensearch_core::traits::RerankScore>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _guard = DropCount(&self.drops);
+                let mut scores: Vec<_> = documents.iter().enumerate().map(|(rank, doc)| {
+                    assert_eq!(doc.text, format!("version-one:{}", doc.doc_id));
+                    frankensearch_core::traits::RerankScore {
+                        doc_id: doc.doc_id.clone(),
+                        score: if doc.doc_id == "near" { 0.9 } else { 0.1 },
+                        original_rank: rank,
+                        raw_logit: None,
+                    }
+                }).collect();
+                match self.reply {
+                    RerankReply::Winner => {}
+                    RerankReply::Pending => return std::future::pending().await,
+                    RerankReply::Failed => return Err(invalid("test.reranker", "failed", "model failed")),
+                    RerankReply::Cancelled => return Err(SearchError::Cancelled {
+                        phase: "test.reranker".to_owned(), reason: "model cancelled".to_owned(),
+                    }),
+                    RerankReply::CancelWithScores => {
+                        cx.cancel_with(asupersync::CancelKind::User, Some("native rerank finished after cancellation"));
+                    }
+                    RerankReply::DuplicateRank => scores[1] = scores[0].clone(),
+                    RerankReply::ForeignId => scores[0].doc_id = "foreign".to_owned(),
+                    RerankReply::OutOfRange => scores[0].original_rank = documents.len(),
+                    RerankReply::MissingScore => { let _ = scores.pop(); }
+                    RerankReply::NonFinite => scores[0].score = f32::INFINITY,
+                    RerankReply::NonFiniteLogit => scores[0].raw_logit = Some(f32::NAN),
+                    RerankReply::Unavailable => panic!("unavailable model must not run"),
+                }
+                // The admission boundary must use original_rank, not output order.
+                scores.reverse();
+                Ok(scores)
+            })
+        }
+
+        fn id(&self) -> &str { "native-test-cross-encoder" }
+        fn model_name(&self) -> &str { self.id() }
+        fn is_available(&self) -> bool { !matches!(self.reply, RerankReply::Unavailable) }
+    }
+
+    fn source_text(id: &str) -> Option<String> {
+        Some(format!("version-one:{id}"))
+    }
+
+    #[test]
+    fn rerank_is_lazy_and_can_promote_a_candidate_outside_the_displayed_page() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let index = fast_index(&cx, &fast);
+            let lexical = Lexical::new(&["z-fast", "middle", "near"]);
+            let model = CrossEncoder::new(RerankReply::Winner);
+            let text_calls = AtomicUsize::new(0);
+            let text = |id: &str| { text_calls.fetch_add(1, Ordering::SeqCst); source_text(id) };
+            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap().with_reranker(&model, &text, 3).unwrap();
+            let NativeSearchPhase::Initial { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("initial") };
+            assert_eq!(results[0].doc_id, "z-fast");
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(text_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
+            let State::Rerank(pending) = &stream.state else { panic!("retained rerank pool") };
+            let original = pending.results.iter().find(|hit| hit.doc_id == "near").unwrap().clone();
+            let NativeSearchPhase::Reranked { results, evaluated, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("reranked") };
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].doc_id, "near");
+            assert_eq!(results[0].rerank_score, Some(0.9));
+            assert_eq!(results[0].source, ScoreSource::Reranked);
+            assert_eq!(results[0].score.to_bits(), original.score.to_bits());
+            assert_eq!(results[0].fast_score, original.fast_score);
+            assert_eq!(results[0].index, original.index);
+            assert!(Arc::ptr_eq(results[0].metadata.as_ref().unwrap(), original.metadata.as_ref().unwrap()));
+            assert_eq!(evaluated, 3);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(text_calls.load(Ordering::SeqCst), 3);
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+            assert!(stream.next_phase().await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn rerank_follows_refinement_without_requerying_or_changing_the_snapshot() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let quality = Provider::new("quality", 3);
+            let index = fast_index(&cx, &fast);
+            let qindex = quality_index(&cx, &quality);
+            let lexical = Lexical::new(&["z-fast", "middle", "near", "a-quality"]);
+            let model = CrossEncoder::new(RerankReply::Winner);
+            let mut stream = index.search_hybrid_progressive(&cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1)
+                .unwrap().with_reranker(&model, &source_text, 4).unwrap();
+            assert!(matches!(stream.next_phase().await.unwrap(), Some(NativeSearchPhase::Initial { .. })));
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            assert!(matches!(stream.next_phase().await.unwrap(), Some(NativeSearchPhase::Refined { .. })));
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
+            lexical.current_generation.store(42, Ordering::SeqCst);
+            let NativeSearchPhase::Reranked { results, evaluated, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("rerank after refinement") };
+            assert_eq!(results[0].doc_id, "near");
+            assert!(results[0].fast_score.is_some() && results[0].quality_score.is_some());
+            assert_eq!(results[0].metadata.as_deref().unwrap()["generation"], 1);
+            assert_eq!(evaluated, 4);
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+        });
+    }
+
+    #[test]
+    fn failed_quality_still_allows_explicit_reranking_of_the_valid_initial_pool() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let mut quality = Provider::new("quality", 3);
+            quality.reply = Reply::Failed;
+            let index = fast_index(&cx, &fast);
+            let qindex = quality_index(&cx, &quality);
+            let lexical = Lexical::new(&[]);
+            let model = CrossEncoder::new(RerankReply::Winner);
+            let mut stream = index.search_hybrid_progressive(&cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1)
+                .unwrap().with_reranker(&model, &source_text, 3).unwrap();
+            let NativeSearchPhase::Initial { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("initial") };
+            let expected = serde_json::to_value(results).unwrap();
+            let NativeSearchPhase::RefinementFailed { initial_results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("failure must be exposed") };
+            assert_eq!(serde_json::to_value(initial_results).unwrap(), expected);
+            let NativeSearchPhase::Reranked { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("independent final stage") };
+            assert_eq!(results[0].doc_id, "near");
+            assert!(results[0].quality_score.is_none());
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn malformed_rerank_responses_never_publish_partial_or_cross_document_scores() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let index = fast_index(&cx, &fast);
+            for reply in [RerankReply::DuplicateRank, RerankReply::ForeignId, RerankReply::OutOfRange,
+                RerankReply::MissingScore, RerankReply::NonFinite, RerankReply::NonFiniteLogit, RerankReply::Failed] {
+                let lexical = Lexical::new(&["z-fast", "middle", "near"]);
+                let model = CrossEncoder::new(reply);
+                let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 2)
+                    .unwrap().with_reranker(&model, &source_text, 3).unwrap();
+                let NativeSearchPhase::Initial { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("initial") };
+                let metadata = Arc::clone(results[0].metadata.as_ref().unwrap());
+                let expected = serde_json::to_value(results).unwrap();
+                let NativeSearchPhase::RerankFailed { previous_results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("must fail atomically") };
+                assert!(Arc::ptr_eq(previous_results[0].metadata.as_ref().unwrap(), &metadata));
+                assert_eq!(serde_json::to_value(previous_results).unwrap(), expected);
+                assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+                assert!(stream.next_phase().await.unwrap().is_none());
+                assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn pending_rerank_drop_releases_provider_and_snapshot_without_retrying() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let index = fast_index(&cx, &fast);
+            let lexical = Lexical::new(&["z-fast"]);
+            let model = CrossEncoder::new(RerankReply::Pending);
+            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap().with_reranker(&model, &source_text, 3).unwrap();
+            assert!(stream.next_phase().await.unwrap().is_some());
+            drop(stream.next_phase()); // An unpolled final future is still inert.
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert!(!stream.is_finished());
+            let mut future = Box::pin(stream.next_phase());
+            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
+            drop(future);
+            assert_eq!(model.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+            assert!(stream.is_finished());
+            assert!(stream.next_phase().await.unwrap().is_none());
+            assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn reranker_cancellation_is_not_a_successful_fallback_phase() {
+        for reply in [RerankReply::Cancelled, RerankReply::CancelWithScores] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let fast = Provider::new("fast", 2);
+                let index = fast_index(&cx, &fast);
+                let lexical = Lexical::new(&["z-fast"]);
+                let model = CrossEncoder::new(reply);
+                let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                    .unwrap().with_reranker(&model, &source_text, 3).unwrap();
+                assert!(stream.next_phase().await.unwrap().is_some());
+                assert!(matches!(stream.next_phase().await, Err(SearchError::Cancelled { .. })));
+                assert!(stream.is_finished());
+                assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+                assert!(stream.next_phase().await.unwrap().is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn missing_text_is_skipped_without_false_scores_or_a_false_reranked_phase() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let index = fast_index(&cx, &fast);
+            let lexical = Lexical::new(&[]);
+            let model = CrossEncoder::new(RerankReply::Winner);
+            let only_near = |id: &str| (id == "near").then(|| format!("version-one:{id}"));
+            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 4)
+                .unwrap().with_reranker(&model, &only_near, 3).unwrap();
+            assert!(stream.next_phase().await.unwrap().is_some());
+            let NativeSearchPhase::Reranked { results, evaluated, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("one scored document") };
+            assert_eq!(evaluated, 1);
+            assert_eq!(results.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(), ["near", "z-fast", "middle", "a-quality"]);
+            assert!(results[1..].iter().all(|hit| hit.rerank_score.is_none() && hit.source != ScoreSource::Reranked));
+            let no_text = |_: &str| None;
+            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap().with_reranker(&model, &no_text, 3).unwrap();
+            assert!(stream.next_phase().await.unwrap().is_some());
+            assert!(stream.next_phase().await.unwrap().is_none());
+            assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn rerank_configuration_and_zero_result_requests_start_no_model_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let index = fast_index(&cx, &fast);
+            let lexical = Lexical::new(&[]);
+            let model = CrossEncoder::new(RerankReply::Unavailable);
+            for budget in [0, usize::MAX] {
+                assert!(index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                    .unwrap().with_reranker(&model, &source_text, budget).is_err());
+            }
+            let mut empty = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 0)
+                .unwrap().with_reranker(&model, &source_text, 3).unwrap();
+            assert!(matches!(empty.next_phase().await.unwrap(), Some(NativeSearchPhase::Initial { .. })));
+            assert!(empty.next_phase().await.unwrap().is_none());
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1).unwrap();
+            assert!(stream.next_phase().await.unwrap().is_some());
+            assert!(stream.with_reranker(&model, &source_text, 3).is_err());
+            let mut unavailable = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap().with_reranker(&model, &source_text, 3).unwrap();
+            assert!(unavailable.next_phase().await.unwrap().is_some());
+            assert!(matches!(unavailable.next_phase().await.unwrap(), Some(NativeSearchPhase::RerankFailed { error: SearchError::RerankerUnavailable { .. }, .. })));
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
         });
     }
 }
