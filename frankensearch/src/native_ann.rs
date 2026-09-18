@@ -26,6 +26,11 @@ use crate::{Cx, Embedder, SearchError, SearchResult, VectorHit};
 mod fallback;
 mod hybrid;
 mod shards;
+#[cfg(feature = "quill")]
+mod quill;
+
+#[cfg(feature = "quill")]
+pub use quill::NativeQuillSnapshot;
 
 use fallback::NativeBackend;
 pub use fallback::{NativeExactReason, NativeRetrievalMode};
