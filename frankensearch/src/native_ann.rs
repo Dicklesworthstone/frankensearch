@@ -23,6 +23,9 @@ use frankensearch_index::{FsviV2Witness, ValidatedFsviBytes, dot_product_f32_f32
 
 use crate::{Cx, Embedder, SearchError, SearchResult, VectorHit};
 
+/// Build identity-bound native generations directly from source documents.
+pub mod builder;
+
 mod fallback;
 mod hybrid;
 mod shards;
