@@ -2,10 +2,13 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use frankensearch_core::{BoundQueryEmbedding, DocId};
-use frankensearch_index::FsviV2Witness;
+use frankensearch_index::{
+    FsviAdmissionError, FsviV2IdentityBinding, FsviV2Witness, ValidatedFsviBytes,
+};
 
 use super::{NativeAnnIndex, NativeRetrievalMode, checkpoint, invalid};
 use crate::{Cx, Embedder, SearchResult};
@@ -68,6 +71,115 @@ pub struct NativeShardSet {
 }
 
 impl NativeShardSet {
+    /// Reopen an exact published shard inventory after a process restart.
+    ///
+    /// Each artifact is `(vector_path, identity_binding, optional_graph_path)`
+    /// at the same position as its independently selected expected witness.
+    /// Paths must be absolute; no discovery, current-directory rebinding,
+    /// conventional filename copying, or artifact repair occurs. The caller
+    /// must select `expected` through its trusted generation authority, not
+    /// derive it from the files being opened.
+    ///
+    /// Every mandatory vector image is reopened through
+    /// [`ValidatedFsviBytes::reopen_exact`]. The entire vector inventory and
+    /// disjoint physical membership are admitted BEFORE any graph is opened.
+    /// Thus a bad or missing vector can never be hidden by optional ANN
+    /// recovery. A supplied graph uses [`NativeAnnIndex::load_or_exact`]; an
+    /// omitted graph explicitly selects exact retrieval. Inspect
+    /// [`Self::retrieval_modes`] for each partition's realized mode.
+    ///
+    /// Successful queries retain the admitted images even if the paths are
+    /// subsequently replaced. This is a read-only reopen, not a publisher or
+    /// a cross-file atomic snapshot: the expected witnesses prove the selected
+    /// byte images, not external-corpus completeness or lexical authority.
+    /// Filesystem admission has the platform restrictions of `reopen_exact`.
+    /// Run this synchronous operation on the caller's blocking/CPU lane.
+    ///
+    /// # Errors
+    ///
+    /// Preserves typed reindex, upgrade and snapshot-rejection outcomes from
+    /// mandatory FSVI admission. Configuration, partition, graph and
+    /// cancellation errors are returned as [`FsviAdmissionError::Index`].
+    /// No partially opened set or partially successful query is returned.
+    pub fn open_published(
+        cx: &Cx,
+        expected: &[FsviV2Witness],
+        artifacts: &[(PathBuf, FsviV2IdentityBinding, Option<PathBuf>)],
+    ) -> Result<Self, FsviAdmissionError> {
+        checkpoint(cx, "native_ann.shards.open")?;
+        if expected.is_empty() || expected.len() != artifacts.len() {
+            return Err(invalid(
+                "shards.inventory", "cardinality",
+                "a nonempty expected inventory must match every declared artifact",
+            ).into());
+        }
+        let reference = &expected[0];
+        let mut images = BTreeSet::new();
+        // Reject self-contradictory selection before opening even the first
+        // file. Actual bytes must still pass exact admission below.
+        for (witness, (path, binding, graph)) in expected.iter().zip(artifacts) {
+            checkpoint(cx, "native_ann.shards.open_spec")?;
+            if !path.is_absolute() || graph.as_ref().is_some_and(|path| !path.is_absolute()) {
+                return Err(invalid(
+                    "shards.paths", "relative",
+                    "vector and optional graph paths must be explicit absolute paths",
+                ).into());
+            }
+            if !images.insert(witness.whole_image_sha256) {
+                return Err(invalid(
+                    "shards.inventory", "duplicate-image",
+                    "the selected inventory must not repeat a physical shard image",
+                ).into());
+            }
+            if witness.generation != reference.generation
+                || binding.generation() != witness.generation
+            {
+                return Err(invalid(
+                    "shards.generation", "mismatch",
+                    "each declared binding and expected shard must name the same generation",
+                ).into());
+            }
+            if witness.space_fingerprint != reference.space_fingerprint
+                || witness.producer_fingerprint != reference.producer_fingerprint
+                || witness.input_fingerprint != reference.input_fingerprint
+                || witness.dimension != reference.dimension
+            {
+                return Err(invalid(
+                    "shards.identity", "mismatch",
+                    "expected partitions must agree on space, producer, input and dimension",
+                ).into());
+            }
+        }
+        let mut shards = Vec::with_capacity(expected.len());
+        for (witness, (path, binding, _)) in expected.iter().zip(artifacts) {
+            checkpoint(cx, "native_ann.shards.open_vector")?;
+            let opened = ValidatedFsviBytes::reopen_exact(path, binding, witness);
+            // The failed-open path needs a checkpoint too: coincident
+            // cancellation must not disappear behind an I/O or identity error.
+            checkpoint(cx, "native_ann.shards.open_vector_complete")?;
+            let owner = Arc::new(opened?);
+            shards.push(Arc::new(NativeAnnIndex::exact(cx, owner)?));
+        }
+        let mut admitted = Self::admit(cx, expected, shards)?;
+        for (shard, (_, _, graph)) in admitted.shards.iter_mut().zip(artifacts) {
+            if let Some(path) = graph {
+                checkpoint(cx, "native_ann.shards.open_graph")?;
+                let opened = NativeAnnIndex::load_or_exact(cx, Arc::clone(&shard.owner), path)?;
+                *shard = Arc::new(opened);
+            }
+        }
+        checkpoint(cx, "native_ann.shards.open_complete")?;
+        Ok(admitted)
+    }
+
+    /// Exact admitted witnesses in shard order, without reopening any paths.
+    ///
+    /// These describe this retained set. They are not a substitute for trusted
+    /// selection of a future generation's expected inventory.
+    pub fn owner_witnesses(&self) -> impl ExactSizeIterator<Item = &FsviV2Witness> + '_ {
+        self.shards.iter().map(|shard| shard.owner_witness())
+    }
+
     /// Admit all shards before making a searchable set available.
     ///
     /// Obtain `expected` from the caller's selected immutable inventory, not
@@ -585,5 +697,238 @@ mod merge_tests {
                 assert_eq!(actual, sorted[..target]);
             }
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod published_tests {
+    use super::*;
+    use frankensearch_core::generation::{
+        ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+    };
+    use frankensearch_index::native_hnsw::HnswParams;
+    use frankensearch_index::{FsviSnapshotRejectionReason, VectorIndex};
+    use crate::native_ann::NativeExactReason;
+    use crate::SearchError;
+
+    type Artifact = (PathBuf, FsviV2IdentityBinding, Option<PathBuf>);
+
+    fn fixture(
+        cx: &Cx,
+        root: &std::path::Path,
+        name: &str,
+        generation: u64,
+        format: QuantizationFormat,
+        rows: &[(&str, [f32; 2], bool)],
+        ann: bool,
+    ) -> (FsviV2Witness, Artifact) {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("reopen-native", 2);
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.quantization = format;
+        identity.storage.endianness = "little-endian".to_owned();
+        let binding = FsviV2IdentityBinding::new(
+            ArtifactGenerationIdentityV1::new(generation, [0x73; 16]).unwrap(),
+            identity.freeze().unwrap(),
+        ).unwrap();
+        let path = root.join(format!("{name}.fsvi"));
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
+        for &(id, vector, live) in rows {
+            if live {
+                writer.write_record(id, &vector).unwrap();
+            } else {
+                writer.write_tombstone_record(id, &vector).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+        let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
+        let owner = Arc::new(ValidatedFsviBytes::from_arc(bytes, &binding).unwrap());
+        let witness = owner.witness().clone();
+        let graph = ann.then(|| {
+            let graph = root.join(format!("{name}.fshnsw"));
+            NativeAnnIndex::build(cx, owner, HnswParams::default(), 7)
+                .unwrap().save(cx, &graph).unwrap();
+            graph
+        });
+        (witness, (path, binding, graph))
+    }
+
+    fn query() -> BoundQueryEmbedding {
+        BoundQueryEmbedding::new(
+            vec![1.0, 0.0],
+            EmbeddingIdentityBundleV1::explicit_test_model("reopen-native", 2),
+        ).unwrap()
+    }
+
+    #[test]
+    fn restart_reopens_mixed_storage_and_backends_without_rebuilding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (a, first) = fixture(&cx, &root, "fast-a", 1, QuantizationFormat::F16,
+                &[("dead", [1.0, 0.0], false), ("a", [0.5, 0.5], true)], true);
+            let (b, second) = fixture(&cx, &root, "fast-b", 1, QuantizationFormat::F32,
+                &[("b", [0.75, 0.25], true)], false);
+            let expected = [a, b];
+            let artifacts = [first, second];
+            let before: Vec<_> = artifacts.iter().map(|item| std::fs::read(&item.0).unwrap()).collect();
+            let opened = NativeShardSet::open_published(&cx, &expected, &artifacts).unwrap();
+            let hits = opened.search(&cx, &query(), 2, None).unwrap();
+            assert_eq!(hits[0].row, NativeShardRow { shard: 1, physical_row: 0 });
+            assert_eq!(hits[1].row, NativeShardRow { shard: 0, physical_row: 1 });
+            assert_eq!(opened.owner_witnesses().cloned().collect::<Vec<_>>(), expected);
+            assert_eq!(opened.retrieval_modes().collect::<Vec<_>>(), [
+                NativeRetrievalMode::Ann,
+                NativeRetrievalMode::Exact { reason: NativeExactReason::Requested },
+            ]);
+            drop(opened);
+            let reopened = NativeShardSet::open_published(&cx, &expected, &artifacts).unwrap();
+            assert_eq!(reopened.search(&cx, &query(), 2, None).unwrap(), hits);
+            for (artifact, bytes) in artifacts.iter().zip(before) {
+                assert_eq!(std::fs::read(&artifact.0).unwrap(), bytes);
+            }
+            assert_eq!((reopened.live_count(), reopened.physical_count()), (2, 3));
+        });
+    }
+
+    #[test]
+    fn absent_optional_graph_is_explicit_exact_and_creates_no_sidecar() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (witness, mut artifact) = fixture(&cx, &root, "one", 1,
+                QuantizationFormat::F32, &[("a", [1.0, 0.0], true)], false);
+            let graph = root.join("missing.fshnsw");
+            artifact.2 = Some(graph.clone());
+            let set = NativeShardSet::open_published(&cx, &[witness], &[artifact]).unwrap();
+            assert_eq!(set.retrieval_modes().collect::<Vec<_>>(), [
+                NativeRetrievalMode::Exact { reason: NativeExactReason::SidecarMissing },
+            ]);
+            assert_eq!(set.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "a");
+            assert!(!graph.exists());
+            assert!(!root.join("missing.fshnsw.receipt").exists());
+        });
+    }
+
+    #[test]
+    fn stale_graph_does_not_rebind_its_old_vectors_or_mask_mandatory_drift() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (_, old) = fixture(&cx, &root, "old", 1, QuantizationFormat::F32,
+                &[("old", [1.0, 0.0], true)], true);
+            let (witness, mut new) = fixture(&cx, &root, "new", 2, QuantizationFormat::F32,
+                &[("new", [0.5, 0.5], true)], false);
+            new.2 = old.2;
+            let graph = new.2.as_ref().unwrap().clone();
+            let before = std::fs::read(&graph).unwrap();
+            let set = NativeShardSet::open_published(&cx, std::slice::from_ref(&witness),
+                std::slice::from_ref(&new)).unwrap();
+            assert_eq!(set.retrieval_modes().collect::<Vec<_>>(), [
+                NativeRetrievalMode::Exact { reason: NativeExactReason::SidecarRejected },
+            ]);
+            assert_eq!(set.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "new");
+            assert_eq!(std::fs::read(&graph).unwrap(), before);
+            let (_, substitute) = fixture(&cx, &root, "substitute", 2, QuantizationFormat::F32,
+                &[("new", [0.0, 1.0], true)], false);
+            new.0 = substitute.0;
+            assert!(matches!(NativeShardSet::open_published(&cx, &[witness], &[new]),
+                Err(FsviAdmissionError::SnapshotRejected(rejected))
+                    if rejected.reason == FsviSnapshotRejectionReason::WitnessMismatch));
+            // The already returned snapshot still owns the original bytes.
+            assert_eq!(set.search(&cx, &query(), 1, None).unwrap()[0].score, 0.5);
+        });
+    }
+
+    #[test]
+    fn every_mandatory_partition_is_admitted_before_any_graph() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (a, mut first) = fixture(&cx, &root, "a", 1, QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)], false);
+            let (b, mut second) = fixture(&cx, &root, "b", 1, QuantizationFormat::F32,
+                &[("b", [0.0, 1.0], true)], false);
+            // This graph path is an invalid native basename. Getting its
+            // configuration error would prove graphs ran before vector admission.
+            first.2 = Some(root.join("wrong-extension.txt"));
+            let (_, substituted) = fixture(&cx, &root, "b-substitute", 1, QuantizationFormat::F32,
+                &[("b", [1.0, 0.0], true)], false);
+            second.0 = substituted.0;
+            assert!(matches!(NativeShardSet::open_published(&cx, &[a, b], &[first, second]),
+                Err(FsviAdmissionError::SnapshotRejected(rejected))
+                    if rejected.reason == FsviSnapshotRejectionReason::WitnessMismatch));
+        });
+    }
+
+    #[test]
+    fn adjacent_wal_is_not_recovered_as_an_optional_graph_failure() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (witness, mut artifact) = fixture(&cx, &root, "wal", 1, QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)], false);
+            let wal = frankensearch_index::wal_path_for(&artifact.0);
+            std::fs::write(&wal, []).unwrap();
+            artifact.2 = Some(root.join("missing.fshnsw"));
+            assert!(matches!(NativeShardSet::open_published(&cx, &[witness], &[artifact]),
+                Err(FsviAdmissionError::SnapshotRejected(rejected))
+                    if rejected.reason == FsviSnapshotRejectionReason::PublishedWalPresent));
+            assert!(wal.exists());
+        });
+    }
+
+    #[test]
+    fn physical_overlap_is_rejected_before_optional_graph_loading() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (a, mut first) = fixture(&cx, &root, "live", 1, QuantizationFormat::F32,
+                &[("same", [1.0, 0.0], true)], false);
+            let (b, second) = fixture(&cx, &root, "dead", 1, QuantizationFormat::F32,
+                &[("same", [0.0, 1.0], false)], false);
+            first.2 = Some(root.join("invalid.txt"));
+            assert!(matches!(NativeShardSet::open_published(&cx, &[a, b], &[first, second]),
+                Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, .. }))
+                    if field == "native_ann.shards.membership"));
+        });
+    }
+
+    #[test]
+    fn empty_corpus_reopens_with_its_identity_and_no_query_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (witness, artifact) = fixture(&cx, &root, "empty", 1,
+                QuantizationFormat::F32, &[], false);
+            let set = NativeShardSet::open_published(&cx, &[witness], &[artifact]).unwrap();
+            assert_eq!(set.live_count(), 0);
+            assert!(set.search(&cx, &query(), 1, None).unwrap().is_empty());
+            let foreign = BoundQueryEmbedding::new(vec![1.0, 0.0],
+                EmbeddingIdentityBundleV1::explicit_test_model("foreign", 2)).unwrap();
+            assert!(set.search(&cx, &foreign, 0, None).is_err());
+        });
+    }
+
+    #[test]
+    fn missing_partition_and_relative_path_are_not_silently_dropped() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (a, first) = fixture(&cx, &root, "a", 1, QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)], false);
+            let (b, mut second) = fixture(&cx, &root, "b", 1, QuantizationFormat::F32,
+                &[("b", [0.0, 1.0], true)], false);
+            assert!(matches!(NativeShardSet::open_published(&cx, &[a.clone(), b.clone()],
+                std::slice::from_ref(&first)),
+                Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, .. }))
+                    if field == "native_ann.shards.inventory"));
+            second.0 = PathBuf::from("relative.fsvi");
+            assert!(matches!(NativeShardSet::open_published(&cx, &[b.clone()],
+                std::slice::from_ref(&second)),
+                Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, .. }))
+                    if field == "native_ann.shards.paths"));
+            second.0 = root.join("absent.fsvi");
+            assert!(NativeShardSet::open_published(&cx, &[a, b], &[first, second]).is_err());
+        });
     }
 }
