@@ -193,3 +193,73 @@ fn required_vector_failure_never_creates_a_lexical_only_hybrid_success() {
         assert!(!path.join("lexical").exists());
     });
 }
+
+#[test]
+fn completed_hybrid_releases_writer_lease_but_keeps_its_original_publication() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hybrid");
+        let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+        let index = builder(&path, &fast).build_hybrid(&cx).await.unwrap();
+        let original = index.lexical().search(&cx, "vertical", 10).await.unwrap();
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0].doc_id, "b");
+
+        // This acquisition fails while a QuillIndex writer remains retained.
+        // A successful hybrid build must instead keep a read-only publication.
+        let writer = QuillIndex::open(&cx, path.join("lexical"), QuillConfig::default())
+            .await.expect("serving hybrid must not own the writer lease");
+        LexicalWrite::index_document(
+            &writer, &cx, &crate::IndexableDocument::new("new", "newpublication"),
+        ).await.unwrap();
+        LexicalWrite::commit(&writer, &cx).await.unwrap();
+        assert_eq!(LexicalRead::doc_count(&writer).unwrap(), 6);
+        assert_eq!(index.lexical().doc_count().unwrap(), 5);
+        assert!(index.lexical().search(&cx, "newpublication", 10).await.unwrap().is_empty());
+        assert_eq!(index.lexical().search(&cx, "vertical", 10).await.unwrap()[0].doc_id, "b");
+        assert_eq!(index.search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
+    });
+}
+
+#[test]
+fn read_only_hybrid_pins_survive_a_later_lexical_publication_between_phases() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hybrid");
+        let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+        let quality = Arc::new(Provider::new("quality", 3, Reply::Correct));
+        let index = builder(&path, &fast).with_quality_embedder(quality.clone()).unwrap()
+            .build_hybrid(&cx).await.unwrap();
+        let reranker = RerankProbe::default();
+        let mut stream = index.progressive_with_reranker(&cx, "vertical", 1, &reranker, 5).unwrap();
+        assert!(matches!(stream.next_phase().await.unwrap(), Some(NativeSearchPhase::Initial { .. })));
+        let writer = QuillIndex::open(&cx, path.join("lexical"), QuillConfig::default())
+            .await.expect("read-only serving releases the writer lease");
+        LexicalWrite::index_document(
+            &writer, &cx, &crate::IndexableDocument::new("new", "vertical vertical vertical"),
+        ).await.unwrap();
+        LexicalWrite::commit(&writer, &cx).await.unwrap();
+        let Some(NativeSearchPhase::Refined { results, .. }) = stream.next_phase().await.unwrap() else { panic!("refined"); };
+        assert_eq!(results[0].doc_id, "b");
+        let Some(NativeSearchPhase::Reranked { results, .. }) = stream.next_phase().await.unwrap() else { panic!("reranked"); };
+        assert_eq!(results[0].doc_id, "b");
+        let texts = reranker.documents.lock().unwrap();
+        assert!(texts.iter().all(|document| document.doc_id != "new"));
+        assert_eq!(texts.iter().find(|document| document.doc_id == "b").unwrap().text, "vertical");
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(quality.queries.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn empty_hybrid_reopens_its_sealed_lexical_publication_without_embedding() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+        let index = NativeIndexBuilder::new(dir.path().join("empty"), generation(), fast.clone())
+            .unwrap().build_hybrid(&cx).await.unwrap();
+        assert_eq!(index.lexical().doc_count().unwrap(), 0);
+        assert!(index.search(&cx, "vertical", 10).await.unwrap().is_empty());
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
+    });
+}

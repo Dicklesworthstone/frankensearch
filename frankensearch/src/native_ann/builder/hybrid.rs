@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use frankensearch_quill::{QuillConfig, QuillIndex};
+use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
 
 use super::{NativeBuiltIndex, NativeIndexBuilder};
 use crate::native_ann::NativeProgressiveSearch;
@@ -14,8 +14,9 @@ impl NativeIndexBuilder {
     ///
     /// All arms are required and must finish before any hybrid handle is returned.
     /// Quill uses deterministic single-shard bulk ingest and is finalized once.
-    /// Its writer is kept private: the returned object cannot update just lexical
-    /// content while retaining vectors from an older document version.
+    /// Before returning, open a read-only Quill publication while the private
+    /// writer still holds its lease, then release that writer. Serving never
+    /// retains a writer lease or refreshes lexical independently of the vectors.
     ///
     /// This consumes the prepared content exactly as [`Self::build`] does and
     /// adds native lexical indexing of the complete original documents. It does
@@ -52,19 +53,21 @@ impl NativeIndexBuilder {
         if LexicalRead::doc_count(&lexical)? != vectors.documents.len() {
             return Err(invalid("builder.lexical_membership", "cardinality", "Quill must contain the complete source cohort"));
         }
-        let source = Arc::clone(&vectors.documents);
-        let text = Box::new(move |id: &str| {
-            source.binary_search_by(|document| document.id.as_str().cmp(id))
-                .ok().map(|position| source[position].content.clone())
-        });
-        checkpoint(cx, "native_ann.builder.hybrid_complete")?;
-        Ok(NativeBuiltHybridIndex { vectors, lexical, text })
+        // The writer remains alive until the reader has admitted its sealed
+        // publication. Another writer cannot publish between finalize and open.
+        let response = QuillSearchIndex::open(cx, &path, QuillConfig::default()).await;
+        checkpoint(cx, "native_ann.builder.lexical_reader")?;
+        let reader = response?;
+        let built = NativeBuiltHybridIndex::from_readers(cx, vectors, reader)?;
+        drop(lexical);
+        Ok(built)
     }
 }
 
 /// Complete process-local native hybrid generation built from one source cohort.
 ///
-/// Vector tiers retain their producing models; Quill is not exposed for mutation.
+/// Vector tiers retain their producing models; Quill is read-only and never
+/// exposed for independent refresh. No writer lease is retained after building.
 /// Every progressive phase borrows this same object. Final reranking resolves
 /// text from its owned source documents, not a closure over mutable/current files.
 /// This enforces build-time cohort ownership, not a durable cross-process
@@ -72,11 +75,26 @@ impl NativeIndexBuilder {
 /// Keep the output directory trusted and immutable; there is no reload here.
 pub struct NativeBuiltHybridIndex {
     vectors: NativeBuiltIndex,
-    lexical: QuillIndex,
+    lexical: QuillSearchIndex,
     text: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
 }
 
 impl NativeBuiltHybridIndex {
+    // Both callers are private, completed build/reopen paths. Do not expose an
+    // arbitrary lexical+vector constructor that could bypass cohort admission.
+    fn from_readers(cx: &Cx, vectors: NativeBuiltIndex, lexical: QuillSearchIndex) -> SearchResult<Self> {
+        if LexicalRead::doc_count(&lexical)? != vectors.documents.len() {
+            return Err(invalid("builder.lexical_membership", "cardinality", "the sealed lexical reader must contain the complete source cohort"));
+        }
+        let source = Arc::clone(&vectors.documents);
+        let text = Box::new(move |id: &str| {
+            source.binary_search_by(|document| document.id.as_str().cmp(id))
+                .ok().map(|position| source[position].content.clone())
+        });
+        checkpoint(cx, "native_ann.builder.hybrid_complete")?;
+        Ok(Self { vectors, lexical, text })
+    }
+
     /// Read-only native tiers and exact source documents used for this build.
     #[must_use]
     pub const fn vectors(&self) -> &NativeBuiltIndex { &self.vectors }
