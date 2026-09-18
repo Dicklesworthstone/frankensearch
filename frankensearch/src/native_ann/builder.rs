@@ -37,7 +37,7 @@ pub use snapshot::NativeReopenLimits;
 #[cfg(feature = "quill")]
 mod hybrid;
 #[cfg(feature = "quill")]
-pub use hybrid::NativeBuiltHybridIndex;
+pub use hybrid::{NativeBuiltHybridIndex, NativeHybridReopenLimits};
 
 /// Persisted vector precision; neither option changes the producing model.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]

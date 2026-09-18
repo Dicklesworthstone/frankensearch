@@ -9,6 +9,10 @@ use crate::native_ann::NativeProgressiveSearch;
 use crate::{Cx, LexicalRead, LexicalWrite, Reranker, ScoredResult, SearchResult};
 use super::super::{checkpoint, invalid};
 
+mod snapshot;
+use snapshot::LexicalSeal;
+pub use snapshot::NativeHybridReopenLimits;
+
 impl NativeIndexBuilder {
     /// Build native fast/quality vectors and Quill from the same owned documents.
     ///
@@ -55,10 +59,13 @@ impl NativeIndexBuilder {
         }
         // The writer remains alive until the reader has admitted its sealed
         // publication. Another writer cannot publish between finalize and open.
+        // Capture bytes here, NOT at a later seal: a newer publication on disk
+        // must never be blessed as belonging to these retained source vectors.
+        let seal = LexicalSeal::capture(cx, &path, lexical.search_snapshot()?.keeper_generation())?;
         let response = QuillSearchIndex::open(cx, &path, QuillConfig::default()).await;
         checkpoint(cx, "native_ann.builder.lexical_reader")?;
         let reader = response?;
-        let built = NativeBuiltHybridIndex::from_readers(cx, vectors, reader)?;
+        let built = NativeBuiltHybridIndex::from_readers(cx, vectors, reader, seal)?;
         drop(lexical);
         Ok(built)
     }
@@ -72,18 +79,24 @@ impl NativeIndexBuilder {
 /// text from its owned source documents, not a closure over mutable/current files.
 /// This enforces build-time cohort ownership, not a durable cross-process
 /// publication protocol or an attestation for externally supplied artifacts.
-/// Keep the output directory trusted and immutable; there is no reload here.
+/// [`Self::seal_for_reopen`] selects this exact lexical/source/vector cohort for
+/// [`Self::open_selected`]. Keep its directory trusted and immutable throughout
+/// sealing, reopening and the lifetime of Quill's mapped readers. An independent
+/// writer's append-only publication does not refresh an already-retained view.
 pub struct NativeBuiltHybridIndex {
     vectors: NativeBuiltIndex,
     lexical: QuillSearchIndex,
+    lexical_seal: LexicalSeal,
     text: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
 }
 
 impl NativeBuiltHybridIndex {
     // Both callers are private, completed build/reopen paths. Do not expose an
     // arbitrary lexical+vector constructor that could bypass cohort admission.
-    fn from_readers(cx: &Cx, vectors: NativeBuiltIndex, lexical: QuillSearchIndex) -> SearchResult<Self> {
-        if LexicalRead::doc_count(&lexical)? != vectors.documents.len() {
+    fn from_readers(cx: &Cx, vectors: NativeBuiltIndex, lexical: QuillSearchIndex, lexical_seal: LexicalSeal) -> SearchResult<Self> {
+        if LexicalRead::doc_count(&lexical)? != vectors.documents.len()
+            || lexical.keeper_generation() != lexical_seal.generation()
+        {
             return Err(invalid("builder.lexical_membership", "cardinality", "the sealed lexical reader must contain the complete source cohort"));
         }
         let source = Arc::clone(&vectors.documents);
@@ -92,7 +105,7 @@ impl NativeBuiltHybridIndex {
                 .ok().map(|position| source[position].content.clone())
         });
         checkpoint(cx, "native_ann.builder.hybrid_complete")?;
-        Ok(Self { vectors, lexical, text })
+        Ok(Self { vectors, lexical, lexical_seal, text })
     }
 
     /// Read-only native tiers and exact source documents used for this build.

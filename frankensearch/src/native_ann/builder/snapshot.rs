@@ -72,7 +72,7 @@ impl Default for NativeReopenLimits {
 }
 
 impl NativeReopenLimits {
-    fn validate(self) -> SearchResult<()> {
+    pub(super) fn validate(self) -> SearchResult<()> {
         if self.max_source_bytes < SOURCE_HEADER.len() as u64
             || self.max_document_bytes == 0
             || self.max_document_bytes.checked_add(1).is_none()
@@ -86,23 +86,23 @@ impl NativeReopenLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Artifact {
-    byte_len: u64,
-    sha256: [u8; 32],
+pub(super) struct Artifact {
+    pub(super) byte_len: u64,
+    pub(super) sha256: [u8; 32],
 }
 
 impl Artifact {
-    fn receipt(self) -> GenerationComponentReceiptV1 {
+    pub(super) fn receipt(self) -> GenerationComponentReceiptV1 {
         GenerationComponentReceiptV1 { byte_len: self.byte_len, sha256: self.sha256 }
     }
 
-    fn validate(self) -> SearchResult<()> {
+    pub(super) fn validate(self) -> SearchResult<()> {
         self.receipt().validate().map_err(|_| rejected("receipt", "invalid artifact receipt"))
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
+    pub(super) fn from_bytes(bytes: &[u8]) -> Self {
         Self { byte_len: bytes.len() as u64, sha256: Sha256::digest(bytes).into() }
     }
 }
@@ -438,7 +438,7 @@ fn read_sources(cx: &Cx, path: &Path, expected: Artifact, count: usize, limits: 
     Ok(documents)
 }
 
-fn read_selected(cx: &Cx, path: &Path, expected: Artifact, limit: u64) -> SearchResult<Vec<u8>> {
+pub(super) fn read_selected(cx: &Cx, path: &Path, expected: Artifact, limit: u64) -> SearchResult<Vec<u8>> {
     expected.validate()?;
     if expected.byte_len > limit || usize::try_from(expected.byte_len).is_err() {
         return Err(rejected("artifact_size", "selected artifact exceeds its input or platform limit"));
@@ -453,7 +453,7 @@ fn read_selected(cx: &Cx, path: &Path, expected: Artifact, limit: u64) -> Search
     Ok(output)
 }
 
-fn verify_selected(cx: &Cx, path: &Path, expected: Artifact) -> SearchResult<()> {
+pub(super) fn verify_selected(cx: &Cx, path: &Path, expected: Artifact) -> SearchResult<()> {
     read_and_verify(cx, path, expected, |_| Ok(()))
 }
 
@@ -486,7 +486,7 @@ where F: FnMut(&[u8]) -> SearchResult<()> {
     Ok(())
 }
 
-fn checked_directory(path: &Path) -> SearchResult<PathBuf> {
+pub(super) fn checked_directory(path: &Path) -> SearchResult<PathBuf> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(rejected("directory", "native snapshot requires a real immutable directory"));
@@ -494,7 +494,7 @@ fn checked_directory(path: &Path) -> SearchResult<PathBuf> {
     Ok(std::fs::canonicalize(path)?)
 }
 
-fn open_regular(path: &Path) -> SearchResult<File> {
+pub(super) fn open_regular(path: &Path) -> SearchResult<File> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(rejected("file", "native snapshot artifacts must be regular non-symlink files"));
@@ -506,7 +506,7 @@ fn open_regular(path: &Path) -> SearchResult<File> {
     Ok(file)
 }
 
-fn ensure_absent(path: &Path) -> SearchResult<()> {
+pub(super) fn ensure_absent(path: &Path) -> SearchResult<()> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -514,7 +514,7 @@ fn ensure_absent(path: &Path) -> SearchResult<()> {
     }
 }
 
-fn create_private_new(path: &Path) -> SearchResult<File> {
+pub(super) fn create_private_new(path: &Path) -> SearchResult<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -525,14 +525,14 @@ fn create_private_new(path: &Path) -> SearchResult<File> {
     Ok(options.open(path)?)
 }
 
-fn require_seal_platform() -> SearchResult<()> {
+pub(super) fn require_seal_platform() -> SearchResult<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     { Ok(()) }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     { Err(rejected("platform", "native snapshot sealing requires Linux/macOS directory durability")) }
 }
 
-fn sync_directory(path: &Path) -> SearchResult<()> {
+pub(super) fn sync_directory(path: &Path) -> SearchResult<()> {
     require_seal_platform()?;
     File::open(path)?.sync_all()?;
     Ok(())
