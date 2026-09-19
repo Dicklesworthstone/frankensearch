@@ -28,9 +28,9 @@ pub mod builder;
 
 mod fallback;
 mod hybrid;
-mod shards;
 #[cfg(feature = "quill")]
 mod quill;
+mod shards;
 
 #[cfg(feature = "quill")]
 pub use quill::NativeQuillSnapshot;

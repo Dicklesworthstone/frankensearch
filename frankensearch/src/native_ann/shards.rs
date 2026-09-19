@@ -37,7 +37,9 @@ impl NativeShardHit {
     /// Score descending, then document ID and physical location ascending.
     #[must_use]
     pub fn cmp_rank(&self, other: &Self) -> Ordering {
-        other.score.total_cmp(&self.score)
+        other
+            .score
+            .total_cmp(&self.score)
             .then_with(|| self.doc_id.cmp(&other.doc_id))
             .then_with(|| self.row.shard.cmp(&other.row.shard))
             .then_with(|| self.row.physical_row.cmp(&other.row.physical_row))
@@ -147,7 +149,8 @@ impl NativeShardSet {
         checkpoint(cx, "native_ann.shards.replace_admission")?;
         if expected_current.len() != self.shards.len() {
             return Err(invalid(
-                "shards.replace.expected_current", "cardinality",
+                "shards.replace.expected_current",
+                "cardinality",
                 "replacement requires the complete current shard inventory",
             ));
         }
@@ -155,7 +158,8 @@ impl NativeShardSet {
             checkpoint(cx, "native_ann.shards.replace_current")?;
             if shard.owner_witness() != expected {
                 return Err(invalid(
-                    "shards.replace.expected_current", "stale",
+                    "shards.replace.expected_current",
+                    "stale",
                     "the current exact ordered inventory differs from the refresh's expectation",
                 ));
             }
@@ -167,7 +171,8 @@ impl NativeShardSet {
         let current = self.shards[0].owner_witness();
         if next.generation.sequence <= current.generation.sequence {
             return Err(invalid(
-                "shards.replace.generation", "not-newer",
+                "shards.replace.generation",
+                "not-newer",
                 "replacement requires a strictly higher generation sequence; same-sequence nonce changes are not successors",
             ));
         }
@@ -177,7 +182,8 @@ impl NativeShardSet {
             || next.dimension != current.dimension
         {
             return Err(invalid(
-                "shards.replace.identity", "changed",
+                "shards.replace.identity",
+                "changed",
                 "live replacement must preserve space, producer, input and dimension; open a separate handle for a model migration",
             ));
         }
@@ -222,9 +228,11 @@ impl NativeShardSet {
         checkpoint(cx, "native_ann.shards.open")?;
         if expected.is_empty() || expected.len() != artifacts.len() {
             return Err(invalid(
-                "shards.inventory", "cardinality",
+                "shards.inventory",
+                "cardinality",
                 "a nonempty expected inventory must match every declared artifact",
-            ).into());
+            )
+            .into());
         }
         let reference = &expected[0];
         let mut images = BTreeSet::new();
@@ -234,23 +242,29 @@ impl NativeShardSet {
             checkpoint(cx, "native_ann.shards.open_spec")?;
             if !path.is_absolute() || graph.as_ref().is_some_and(|path| !path.is_absolute()) {
                 return Err(invalid(
-                    "shards.paths", "relative",
+                    "shards.paths",
+                    "relative",
                     "vector and optional graph paths must be explicit absolute paths",
-                ).into());
+                )
+                .into());
             }
             if !images.insert(witness.whole_image_sha256) {
                 return Err(invalid(
-                    "shards.inventory", "duplicate-image",
+                    "shards.inventory",
+                    "duplicate-image",
                     "the selected inventory must not repeat a physical shard image",
-                ).into());
+                )
+                .into());
             }
             if witness.generation != reference.generation
                 || binding.generation() != witness.generation
             {
                 return Err(invalid(
-                    "shards.generation", "mismatch",
+                    "shards.generation",
+                    "mismatch",
                     "each declared binding and expected shard must name the same generation",
-                ).into());
+                )
+                .into());
             }
             if witness.space_fingerprint != reference.space_fingerprint
                 || witness.producer_fingerprint != reference.producer_fingerprint
@@ -258,9 +272,11 @@ impl NativeShardSet {
                 || witness.dimension != reference.dimension
             {
                 return Err(invalid(
-                    "shards.identity", "mismatch",
+                    "shards.identity",
+                    "mismatch",
                     "expected partitions must agree on space, producer, input and dimension",
-                ).into());
+                )
+                .into());
             }
         }
         let mut shards = Vec::with_capacity(expected.len());
@@ -312,7 +328,8 @@ impl NativeShardSet {
         checkpoint(cx, "native_ann.shards.admission")?;
         if shards.is_empty() || shards.len() != expected.len() {
             return Err(invalid(
-                "shards.inventory", "cardinality",
+                "shards.inventory",
+                "cardinality",
                 "a nonempty exact ordered shard inventory is required",
             ));
         }
@@ -326,19 +343,22 @@ impl NativeShardSet {
             let actual = shard.owner_witness();
             if actual != expected {
                 return Err(invalid(
-                    "shards.inventory", "witness-mismatch",
+                    "shards.inventory",
+                    "witness-mismatch",
                     "each shard must match the expected whole-image witness at its exact position",
                 ));
             }
             if !seen_images.insert(actual.whole_image_sha256) {
                 return Err(invalid(
-                    "shards.inventory", "duplicate-image",
+                    "shards.inventory",
+                    "duplicate-image",
                     "the selected inventory must not repeat an identical physical shard image",
                 ));
             }
             if actual.generation != reference.generation {
                 return Err(invalid(
-                    "shards.generation", "mismatch",
+                    "shards.generation",
+                    "mismatch",
                     "all partitions must belong to the same complete artifact generation",
                 ));
             }
@@ -348,15 +368,24 @@ impl NativeShardSet {
                 || actual.dimension != reference.dimension
             {
                 return Err(invalid(
-                    "shards.identity", "mismatch",
+                    "shards.identity",
+                    "mismatch",
                     "partitions must agree on space, producer, input contract and dimension",
                 ));
             }
             live_count = live_count.checked_add(shard.live_count()).ok_or_else(|| {
-                invalid("shards.live_count", "overflow", "live row count must fit usize")
+                invalid(
+                    "shards.live_count",
+                    "overflow",
+                    "live row count must fit usize",
+                )
             })?;
             physical_count = physical_count.checked_add(shard.len()).ok_or_else(|| {
-                invalid("shards.physical_count", "overflow", "physical row count must fit usize")
+                invalid(
+                    "shards.physical_count",
+                    "overflow",
+                    "physical row count must fit usize",
+                )
             })?;
         }
         let mut partition_by_document: BTreeMap<String, usize> = BTreeMap::new();
@@ -369,14 +398,19 @@ impl NativeShardSet {
                     .is_some_and(|previous| previous != ordinal)
                 {
                     return Err(invalid(
-                        "shards.membership", "overlap",
+                        "shards.membership",
+                        "overlap",
                         "physical document identities must not overlap across shard partitions",
                     ));
                 }
             }
         }
         checkpoint(cx, "native_ann.shards.admitted")?;
-        Ok(Self { shards, live_count, physical_count })
+        Ok(Self {
+            shards,
+            live_count,
+            physical_count,
+        })
     }
 
     /// Number of retained partitions, including empty partitions.
@@ -468,10 +502,16 @@ impl NativeShardSet {
                 let hit = NativeShardHit {
                     doc_id: candidate.doc_id,
                     score: candidate.score,
-                    row: NativeShardRow { shard: ordinal, physical_row: candidate.index },
+                    row: NativeShardRow {
+                        shard: ordinal,
+                        physical_row: candidate.index,
+                    },
                 };
                 if winners.len() == target {
-                    if winners.peek().is_some_and(|worst| hit.cmp_rank(&worst.0) != Ordering::Less) {
+                    if winners
+                        .peek()
+                        .is_some_and(|worst| hit.cmp_rank(&worst.0) != Ordering::Less)
+                    {
                         continue;
                     }
                     let _ = winners.pop();
@@ -502,7 +542,8 @@ impl NativeShardSet {
         k: usize,
         ef: Option<usize>,
     ) -> SearchResult<Vec<NativeShardHit>> {
-        self.search_text_filtered(cx, embedder, text, k, ef, |_| true).await
+        self.search_text_filtered(cx, embedder, text, k, ef, |_| true)
+            .await
     }
 
     /// Text retrieval with the same stable predicate as [`Self::search_filtered`].
@@ -536,14 +577,20 @@ impl NativeShardSet {
 // cmp_rank puts better hits first, so the heap's maximum is the worst winner.
 struct RankedHit(NativeShardHit);
 impl PartialEq for RankedHit {
-    fn eq(&self, other: &Self) -> bool { self.cmp(other) == Ordering::Equal }
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
 }
 impl Eq for RankedHit {}
 impl PartialOrd for RankedHit {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 impl Ord for RankedHit {
-    fn cmp(&self, other: &Self) -> Ordering { self.0.cmp_rank(&other.0) }
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp_rank(&other.0)
+    }
 }
 
 #[cfg(test)]
@@ -552,13 +599,13 @@ mod tests {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+    use crate::SearchError;
     use frankensearch_core::generation::{
         ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
     };
     use frankensearch_core::traits::{IdentityBoundEmbedding, ModelCategory, SearchFuture};
-    use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
     use frankensearch_index::native_hnsw::HnswParams;
-    use crate::SearchError;
+    use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
 
     fn identity() -> EmbeddingIdentityBundleV1 {
         EmbeddingIdentityBundleV1::explicit_test_model("native-shards", 2)
@@ -581,22 +628,31 @@ mod tests {
         let binding = FsviV2IdentityBinding::new(
             ArtifactGenerationIdentityV1::new(generation, [0x55; 16]).unwrap(),
             bundle.freeze().unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
         for &(id, vector, live) in rows {
-            if live { writer.write_record(id, &vector).unwrap(); }
-            else { writer.write_tombstone_record(id, &vector).unwrap(); }
+            if live {
+                writer.write_record(id, &vector).unwrap();
+            } else {
+                writer.write_tombstone_record(id, &vector).unwrap();
+            }
         }
         writer.finish().unwrap();
         let bytes: Arc<[u8]> = std::fs::read(path).unwrap().into();
         let owner = Arc::new(ValidatedFsviBytes::from_arc(bytes, &binding).unwrap());
         Arc::new(if ann {
             NativeAnnIndex::build(cx, owner, HnswParams::default(), 7).unwrap()
-        } else { NativeAnnIndex::exact(cx, owner).unwrap() })
+        } else {
+            NativeAnnIndex::exact(cx, owner).unwrap()
+        })
     }
 
     fn admit(cx: &Cx, shards: Vec<Arc<NativeAnnIndex>>) -> NativeShardSet {
-        let expected: Vec<_> = shards.iter().map(|shard| shard.owner_witness().clone()).collect();
+        let expected: Vec<_> = shards
+            .iter()
+            .map(|shard| shard.owner_witness().clone())
+            .collect();
         NativeShardSet::admit(cx, &expected, shards).unwrap()
     }
 
@@ -604,55 +660,130 @@ mod tests {
         BoundQueryEmbedding::new(vec![1.0, 0.0], identity()).unwrap()
     }
 
-    struct Provider { identity: EmbeddingIdentityBundleV1, calls: AtomicUsize, cancel: bool }
+    struct Provider {
+        identity: EmbeddingIdentityBundleV1,
+        calls: AtomicUsize,
+        cancel: bool,
+    }
     impl Provider {
         fn new() -> Self {
-            Self { identity: identity(), calls: AtomicUsize::new(0), cancel: false }
+            Self {
+                identity: identity(),
+                calls: AtomicUsize::new(0),
+                cancel: false,
+            }
         }
     }
     impl Embedder for Provider {
         fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             Box::pin(async { Ok(vec![1.0, 0.0]) })
         }
-        fn embed_bound<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, IdentityBoundEmbedding> {
+        fn embed_bound<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _text: &'a str,
+        ) -> SearchFuture<'a, IdentityBoundEmbedding> {
             Box::pin(async move {
                 self.calls.fetch_add(1, AtomicOrdering::SeqCst);
                 if self.cancel {
-                    return Err(SearchError::Cancelled { phase: "test.provider".to_owned(), reason: "cancelled".to_owned() });
+                    return Err(SearchError::Cancelled {
+                        phase: "test.provider".to_owned(),
+                        reason: "cancelled".to_owned(),
+                    });
                 }
-                Ok(IdentityBoundEmbedding { values: vec![1.0, 0.0], identity: self.identity.clone() })
+                Ok(IdentityBoundEmbedding {
+                    values: vec![1.0, 0.0],
+                    identity: self.identity.clone(),
+                })
             })
         }
-        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> { Ok(&self.identity) }
-        fn id(&self) -> &'static str { "native-shards-test" }
-        fn model_name(&self) -> &str { self.id() }
-        fn dimension(&self) -> usize { 2 }
-        fn is_ready(&self) -> bool { true }
-        fn is_semantic(&self) -> bool { false }
-        fn category(&self) -> ModelCategory { ModelCategory::HashEmbedder }
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+        fn id(&self) -> &'static str {
+            "native-shards-test"
+        }
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn is_semantic(&self) -> bool {
+            false
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
     }
 
     #[test]
     fn global_top_k_matches_the_full_union_for_mixed_storage_and_backends() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for ann in [false, true] {
-                let a = partition(&cx, &identity(), &[("dead", [1.0, 0.0], false), ("a", [0.7, 0.3], true), ("c", [0.2, 0.8], true)], 1, QuantizationFormat::F16, ann);
-                let b = partition(&cx, &identity(), &[("b", [0.9, 0.1], true), ("d", [-0.1, 0.9], true)], 1, QuantizationFormat::F32, false);
+                let a = partition(
+                    &cx,
+                    &identity(),
+                    &[
+                        ("dead", [1.0, 0.0], false),
+                        ("a", [0.7, 0.3], true),
+                        ("c", [0.2, 0.8], true),
+                    ],
+                    1,
+                    QuantizationFormat::F16,
+                    ann,
+                );
+                let b = partition(
+                    &cx,
+                    &identity(),
+                    &[("b", [0.9, 0.1], true), ("d", [-0.1, 0.9], true)],
+                    1,
+                    QuantizationFormat::F32,
+                    false,
+                );
                 let set = admit(&cx, vec![a, b]);
                 let mut exact = Vec::new();
                 for (ordinal, shard) in set.shards.iter().enumerate() {
                     for hit in shard.search(&cx, &query(), usize::MAX, Some(100)).unwrap() {
-                        exact.push(NativeShardHit { doc_id: hit.doc_id, score: hit.score, row: NativeShardRow { shard: ordinal, physical_row: hit.index } });
+                        exact.push(NativeShardHit {
+                            doc_id: hit.doc_id,
+                            score: hit.score,
+                            row: NativeShardRow {
+                                shard: ordinal,
+                                physical_row: hit.index,
+                            },
+                        });
                     }
                 }
                 exact.sort_unstable_by(NativeShardHit::cmp_rank);
                 for k in [0, 1, 2, 3, 4, usize::MAX] {
-                    assert_eq!(set.search(&cx, &query(), k, Some(100)).unwrap(), exact[..k.min(exact.len())]);
+                    assert_eq!(
+                        set.search(&cx, &query(), k, Some(100)).unwrap(),
+                        exact[..k.min(exact.len())]
+                    );
                 }
                 let hits = set.search(&cx, &query(), 2, None).unwrap();
-                assert_eq!(hits[0].row, NativeShardRow { shard: 1, physical_row: 0 });
-                assert_eq!(hits[1].row, NativeShardRow { shard: 0, physical_row: 1 });
-                assert_eq!((set.shard_count(), set.live_count(), set.physical_count()), (2, 4, 5));
+                assert_eq!(
+                    hits[0].row,
+                    NativeShardRow {
+                        shard: 1,
+                        physical_row: 0
+                    }
+                );
+                assert_eq!(
+                    hits[1].row,
+                    NativeShardRow {
+                        shard: 0,
+                        physical_row: 1
+                    }
+                );
+                assert_eq!(
+                    (set.shard_count(), set.live_count(), set.physical_count()),
+                    (2, 4, 5)
+                );
                 assert!(set.shard(2).is_none());
                 assert_eq!(set.retrieval_modes().len(), 2);
             }
@@ -662,22 +793,64 @@ mod tests {
     #[test]
     fn filters_expand_each_partition_before_global_selection() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let a = partition(&cx, &identity(), &[("reject-a", [1.0, 0.0], true), ("keep-a", [0.2, 0.8], true)], 1, QuantizationFormat::F32, true);
-            let b = partition(&cx, &identity(), &[("reject-b", [0.9, 0.1], true), ("keep-b", [0.1, 0.9], true)], 1, QuantizationFormat::F32, true);
+            let a = partition(
+                &cx,
+                &identity(),
+                &[("reject-a", [1.0, 0.0], true), ("keep-a", [0.2, 0.8], true)],
+                1,
+                QuantizationFormat::F32,
+                true,
+            );
+            let b = partition(
+                &cx,
+                &identity(),
+                &[("reject-b", [0.9, 0.1], true), ("keep-b", [0.1, 0.9], true)],
+                1,
+                QuantizationFormat::F32,
+                true,
+            );
             let set = admit(&cx, vec![a, b]);
             let calls = Cell::new(0); // This synchronous predicate is deliberately not Sync.
-            let hits = set.search_filtered(&cx, &query(), 2, Some(1), |id| { calls.set(calls.get() + 1); id.starts_with("keep-") }).unwrap();
-            assert_eq!(hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(), ["keep-a", "keep-b"]);
+            let hits = set
+                .search_filtered(&cx, &query(), 2, Some(1), |id| {
+                    calls.set(calls.get() + 1);
+                    id.starts_with("keep-")
+                })
+                .unwrap();
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["keep-a", "keep-b"]
+            );
             assert!(calls.get() > 0);
-            assert!(set.search_filtered(&cx, &query(), 2, None, |_| false).unwrap().is_empty());
+            assert!(
+                set.search_filtered(&cx, &query(), 2, None, |_| false)
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
     #[test]
     fn equal_scores_use_document_order_not_partition_order() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let z = partition(&cx, &identity(), &[("z", [1.0, 0.0], true)], 1, QuantizationFormat::F32, false);
-            let a = partition(&cx, &identity(), &[("a", [1.0, 0.0], true)], 1, QuantizationFormat::F32, false);
+            let z = partition(
+                &cx,
+                &identity(),
+                &[("z", [1.0, 0.0], true)],
+                1,
+                QuantizationFormat::F32,
+                false,
+            );
+            let a = partition(
+                &cx,
+                &identity(),
+                &[("a", [1.0, 0.0], true)],
+                1,
+                QuantizationFormat::F32,
+                false,
+            );
             let set = admit(&cx, vec![z, a]);
             assert_eq!(set.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "a");
         });
@@ -686,12 +859,40 @@ mod tests {
     #[test]
     fn exact_inventory_rejects_missing_reordered_and_substituted_shards() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let a = partition(&cx, &identity(), &[("a", [1.0, 0.0], true)], 1, QuantizationFormat::F32, false);
-            let b = partition(&cx, &identity(), &[("b", [0.0, 1.0], true)], 1, QuantizationFormat::F32, false);
-            let replacement = partition(&cx, &identity(), &[("a", [0.0, 1.0], true)], 1, QuantizationFormat::F32, false);
+            let a = partition(
+                &cx,
+                &identity(),
+                &[("a", [1.0, 0.0], true)],
+                1,
+                QuantizationFormat::F32,
+                false,
+            );
+            let b = partition(
+                &cx,
+                &identity(),
+                &[("b", [0.0, 1.0], true)],
+                1,
+                QuantizationFormat::F32,
+                false,
+            );
+            let replacement = partition(
+                &cx,
+                &identity(),
+                &[("a", [0.0, 1.0], true)],
+                1,
+                QuantizationFormat::F32,
+                false,
+            );
             let expected = [a.owner_witness().clone(), b.owner_witness().clone()];
-            for shards in [vec![Arc::clone(&a)], vec![Arc::clone(&b), Arc::clone(&a)], vec![replacement, Arc::clone(&b)], vec![Arc::clone(&a), Arc::clone(&a)]] {
-                assert!(matches!(NativeShardSet::admit(&cx, &expected, shards), Err(SearchError::InvalidConfig { ref field, .. }) if field == "native_ann.shards.inventory"));
+            for shards in [
+                vec![Arc::clone(&a)],
+                vec![Arc::clone(&b), Arc::clone(&a)],
+                vec![replacement, Arc::clone(&b)],
+                vec![Arc::clone(&a), Arc::clone(&a)],
+            ] {
+                assert!(
+                    matches!(NativeShardSet::admit(&cx, &expected, shards), Err(SearchError::InvalidConfig { ref field, .. }) if field == "native_ann.shards.inventory")
+                );
             }
             assert!(NativeShardSet::admit(&cx, &[], Vec::new()).is_err());
             assert_eq!(a.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "a");
@@ -701,13 +902,37 @@ mod tests {
     #[test]
     fn independently_valid_shards_must_share_generation_and_producer() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let a = partition(&cx, &identity(), &[("a", [1.0, 0.0], true)], 1, QuantizationFormat::F32, false);
+            let a = partition(
+                &cx,
+                &identity(),
+                &[("a", [1.0, 0.0], true)],
+                1,
+                QuantizationFormat::F32,
+                false,
+            );
             let mut foreign = identity();
             foreign.producer.backend = "different-producer".to_owned();
-            for (identity, generation, field) in [(identity(), 2, "native_ann.shards.generation"), (foreign, 1, "native_ann.shards.identity"), (EmbeddingIdentityBundleV1::explicit_test_model("other-space", 2), 1, "native_ann.shards.identity")] {
-                let b = partition(&cx, &identity, &[("b", [0.0, 1.0], true)], generation, QuantizationFormat::F32, false);
+            for (identity, generation, field) in [
+                (identity(), 2, "native_ann.shards.generation"),
+                (foreign, 1, "native_ann.shards.identity"),
+                (
+                    EmbeddingIdentityBundleV1::explicit_test_model("other-space", 2),
+                    1,
+                    "native_ann.shards.identity",
+                ),
+            ] {
+                let b = partition(
+                    &cx,
+                    &identity,
+                    &[("b", [0.0, 1.0], true)],
+                    generation,
+                    QuantizationFormat::F32,
+                    false,
+                );
                 let expected = [a.owner_witness().clone(), b.owner_witness().clone()];
-                assert!(matches!(NativeShardSet::admit(&cx, &expected, vec![Arc::clone(&a), b]), Err(SearchError::InvalidConfig { field: actual, .. }) if actual == field));
+                assert!(
+                    matches!(NativeShardSet::admit(&cx, &expected, vec![Arc::clone(&a), b]), Err(SearchError::InvalidConfig { field: actual, .. }) if actual == field)
+                );
             }
         });
     }
@@ -715,11 +940,27 @@ mod tests {
     #[test]
     fn overlapping_live_or_tombstoned_partitions_are_not_deduplicated_or_resurrected() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let a = partition(&cx, &identity(), &[("same", [1.0, 0.0], true)], 1, QuantizationFormat::F32, false);
+            let a = partition(
+                &cx,
+                &identity(),
+                &[("same", [1.0, 0.0], true)],
+                1,
+                QuantizationFormat::F32,
+                false,
+            );
             for live in [true, false] {
-                let b = partition(&cx, &identity(), &[("same", [0.0, 1.0], live)], 1, QuantizationFormat::F32, false);
+                let b = partition(
+                    &cx,
+                    &identity(),
+                    &[("same", [0.0, 1.0], live)],
+                    1,
+                    QuantizationFormat::F32,
+                    false,
+                );
                 let expected = [a.owner_witness().clone(), b.owner_witness().clone()];
-                assert!(matches!(NativeShardSet::admit(&cx, &expected, vec![Arc::clone(&a), b]), Err(SearchError::InvalidConfig { ref field, .. }) if field == "native_ann.shards.membership"));
+                assert!(
+                    matches!(NativeShardSet::admit(&cx, &expected, vec![Arc::clone(&a), b]), Err(SearchError::InvalidConfig { ref field, .. }) if field == "native_ann.shards.membership")
+                );
             }
         });
     }
@@ -728,10 +969,20 @@ mod tests {
     fn text_embeds_once_even_when_the_first_partition_is_empty() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let a = partition(&cx, &identity(), &[], 1, QuantizationFormat::F32, false);
-            let b = partition(&cx, &identity(), &[("b", [1.0, 0.0], true)], 1, QuantizationFormat::F32, true);
+            let b = partition(
+                &cx,
+                &identity(),
+                &[("b", [1.0, 0.0], true)],
+                1,
+                QuantizationFormat::F32,
+                true,
+            );
             let set = admit(&cx, vec![a, b]);
             let provider = Provider::new();
-            let hits = set.search_text(&cx, &provider, "query", 1, None).await.unwrap();
+            let hits = set
+                .search_text(&cx, &provider, "query", 1, None)
+                .await
+                .unwrap();
             assert_eq!(hits[0].doc_id, "b");
             assert_eq!(hits[0].row.shard, 1);
             assert_eq!(provider.calls.load(AtomicOrdering::SeqCst), 1);
@@ -742,17 +993,38 @@ mod tests {
     fn zero_work_queries_still_refuse_foreign_identities_without_filter_calls() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for rows in [vec![], vec![("a", [1.0, 0.0], true)]] {
-                let set = admit(&cx, vec![partition(&cx, &identity(), &rows, 1, QuantizationFormat::F32, false)]);
+                let set = admit(
+                    &cx,
+                    vec![partition(
+                        &cx,
+                        &identity(),
+                        &rows,
+                        1,
+                        QuantizationFormat::F32,
+                        false,
+                    )],
+                );
                 let mut foreign = identity();
                 foreign.producer.backend = "foreign".to_owned();
                 let query = BoundQueryEmbedding::new(vec![1.0, 0.0], foreign).unwrap();
                 let calls = Cell::new(0);
                 for k in [0, 1] {
-                    assert!(set.search_filtered(&cx, &query, k, None, |_| { calls.set(calls.get() + 1); true }).is_err());
+                    assert!(
+                        set.search_filtered(&cx, &query, k, None, |_| {
+                            calls.set(calls.get() + 1);
+                            true
+                        })
+                        .is_err()
+                    );
                 }
                 assert_eq!(calls.get(), 0);
                 let provider = Provider::new();
-                assert!(set.search_text(&cx, &provider, "query", 0, None).await.unwrap().is_empty());
+                assert!(
+                    set.search_text(&cx, &provider, "query", 0, None)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
                 assert_eq!(provider.calls.load(AtomicOrdering::SeqCst), 0);
             }
         });
@@ -761,13 +1033,22 @@ mod tests {
     #[test]
     fn selected_owners_survive_caller_drop_and_no_fallback_masks_provider_cancellation() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let a = partition(&cx, &identity(), &[("a", [1.0, 0.0], true)], 1, QuantizationFormat::F32, false);
+            let a = partition(
+                &cx,
+                &identity(),
+                &[("a", [1.0, 0.0], true)],
+                1,
+                QuantizationFormat::F32,
+                false,
+            );
             let weak = Arc::downgrade(&a);
             let set = admit(&cx, vec![a]);
             assert!(weak.upgrade().is_some());
             let mut provider = Provider::new();
             provider.cancel = true;
-            assert!(matches!(set.search_text(&cx, &provider, "query", 1, None).await, Err(SearchError::Cancelled { ref phase, .. }) if phase == "test.provider"));
+            assert!(
+                matches!(set.search_text(&cx, &provider, "query", 1, None).await, Err(SearchError::Cancelled { ref phase, .. }) if phase == "test.provider")
+            );
             assert_eq!(provider.calls.load(AtomicOrdering::SeqCst), 1);
             assert_eq!(set.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "a");
             drop(set);
@@ -784,21 +1065,29 @@ mod merge_tests {
     fn bounded_heap_matches_sorted_union_across_orders_limits_and_signed_zero() {
         let values = [-2.0_f32, -0.0, 0.0, 1.0, 1.0, 3.0];
         for rotation in 0..values.len() {
-            let input: Vec<_> = (0..values.len()).map(|offset| {
-                let i = (rotation + offset) % values.len();
-                NativeShardHit {
-                    doc_id: format!("doc-{i}").into(),
-                    score: values[i],
-                    row: NativeShardRow { shard: i % 3, physical_row: u32::try_from(i / 3).unwrap() },
-                }
-            }).collect();
+            let input: Vec<_> = (0..values.len())
+                .map(|offset| {
+                    let i = (rotation + offset) % values.len();
+                    NativeShardHit {
+                        doc_id: format!("doc-{i}").into(),
+                        score: values[i],
+                        row: NativeShardRow {
+                            shard: i % 3,
+                            physical_row: u32::try_from(i / 3).unwrap(),
+                        },
+                    }
+                })
+                .collect();
             let mut sorted = input.clone();
             sorted.sort_unstable_by(NativeShardHit::cmp_rank);
             for target in 1..=values.len() {
                 let mut heap: BinaryHeap<RankedHit> = BinaryHeap::new();
                 for hit in input.iter().cloned() {
                     if heap.len() == target {
-                        if heap.peek().is_some_and(|worst| hit.cmp_rank(&worst.0) != Ordering::Less) {
+                        if heap
+                            .peek()
+                            .is_some_and(|worst| hit.cmp_rank(&worst.0) != Ordering::Less)
+                        {
                             continue;
                         }
                         let _ = heap.pop();
@@ -816,13 +1105,13 @@ mod merge_tests {
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod published_tests {
     use super::*;
+    use crate::SearchError;
+    use crate::native_ann::NativeExactReason;
     use frankensearch_core::generation::{
         ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
     };
     use frankensearch_index::native_hnsw::HnswParams;
     use frankensearch_index::{FsviSnapshotRejectionReason, VectorIndex};
-    use crate::native_ann::NativeExactReason;
-    use crate::SearchError;
 
     type Artifact = (PathBuf, FsviV2IdentityBinding, Option<PathBuf>);
 
@@ -836,13 +1125,14 @@ mod published_tests {
         ann: bool,
     ) -> (FsviV2Witness, Artifact) {
         let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("reopen-native", 2);
-        identity.storage.format = "fsvi-v2".to_owned();
+        "fsvi-v2".clone_into(&mut identity.storage.format);
         identity.storage.quantization = format;
-        identity.storage.endianness = "little-endian".to_owned();
+        "little-endian".clone_into(&mut identity.storage.endianness);
         let binding = FsviV2IdentityBinding::new(
             ArtifactGenerationIdentityV1::new(generation, [0x73; 16]).unwrap(),
             identity.freeze().unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let path = root.join(format!("{name}.fsvi"));
         let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
         for &(id, vector, live) in rows {
@@ -859,7 +1149,9 @@ mod published_tests {
         let graph = ann.then(|| {
             let graph = root.join(format!("{name}.fshnsw"));
             NativeAnnIndex::build(cx, owner, HnswParams::default(), 7)
-                .unwrap().save(cx, &graph).unwrap();
+                .unwrap()
+                .save(cx, &graph)
+                .unwrap();
             graph
         });
         (witness, (path, binding, graph))
@@ -869,7 +1161,8 @@ mod published_tests {
         BoundQueryEmbedding::new(
             vec![1.0, 0.0],
             EmbeddingIdentityBundleV1::explicit_test_model("reopen-native", 2),
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     #[test]
@@ -877,22 +1170,59 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (a, first) = fixture(&cx, &root, "fast-a", 1, QuantizationFormat::F16,
-                &[("dead", [1.0, 0.0], false), ("a", [0.5, 0.5], true)], true);
-            let (b, second) = fixture(&cx, &root, "fast-b", 1, QuantizationFormat::F32,
-                &[("b", [0.75, 0.25], true)], false);
+            let (a, first) = fixture(
+                &cx,
+                &root,
+                "fast-a",
+                1,
+                QuantizationFormat::F16,
+                &[("dead", [1.0, 0.0], false), ("a", [0.5, 0.5], true)],
+                true,
+            );
+            let (b, second) = fixture(
+                &cx,
+                &root,
+                "fast-b",
+                1,
+                QuantizationFormat::F32,
+                &[("b", [0.75, 0.25], true)],
+                false,
+            );
             let expected = [a, b];
             let artifacts = [first, second];
-            let before: Vec<_> = artifacts.iter().map(|item| std::fs::read(&item.0).unwrap()).collect();
+            let before: Vec<_> = artifacts
+                .iter()
+                .map(|item| std::fs::read(&item.0).unwrap())
+                .collect();
             let opened = NativeShardSet::open_published(&cx, &expected, &artifacts).unwrap();
             let hits = opened.search(&cx, &query(), 2, None).unwrap();
-            assert_eq!(hits[0].row, NativeShardRow { shard: 1, physical_row: 0 });
-            assert_eq!(hits[1].row, NativeShardRow { shard: 0, physical_row: 1 });
-            assert_eq!(opened.owner_witnesses().cloned().collect::<Vec<_>>(), expected);
-            assert_eq!(opened.retrieval_modes().collect::<Vec<_>>(), [
-                NativeRetrievalMode::Ann,
-                NativeRetrievalMode::Exact { reason: NativeExactReason::Requested },
-            ]);
+            assert_eq!(
+                hits[0].row,
+                NativeShardRow {
+                    shard: 1,
+                    physical_row: 0
+                }
+            );
+            assert_eq!(
+                hits[1].row,
+                NativeShardRow {
+                    shard: 0,
+                    physical_row: 1
+                }
+            );
+            assert_eq!(
+                opened.owner_witnesses().cloned().collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                opened.retrieval_modes().collect::<Vec<_>>(),
+                [
+                    NativeRetrievalMode::Ann,
+                    NativeRetrievalMode::Exact {
+                        reason: NativeExactReason::Requested
+                    },
+                ]
+            );
             drop(opened);
             let reopened = NativeShardSet::open_published(&cx, &expected, &artifacts).unwrap();
             assert_eq!(reopened.search(&cx, &query(), 2, None).unwrap(), hits);
@@ -908,14 +1238,24 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (witness, mut artifact) = fixture(&cx, &root, "one", 1,
-                QuantizationFormat::F32, &[("a", [1.0, 0.0], true)], false);
+            let (witness, mut artifact) = fixture(
+                &cx,
+                &root,
+                "one",
+                1,
+                QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)],
+                false,
+            );
             let graph = root.join("missing.fshnsw");
             artifact.2 = Some(graph.clone());
             let set = NativeShardSet::open_published(&cx, &[witness], &[artifact]).unwrap();
-            assert_eq!(set.retrieval_modes().collect::<Vec<_>>(), [
-                NativeRetrievalMode::Exact { reason: NativeExactReason::SidecarMissing },
-            ]);
+            assert_eq!(
+                set.retrieval_modes().collect::<Vec<_>>(),
+                [NativeRetrievalMode::Exact {
+                    reason: NativeExactReason::SidecarMissing
+                },]
+            );
             assert_eq!(set.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "a");
             assert!(!graph.exists());
             assert!(!root.join("missing.fshnsw.receipt").exists());
@@ -927,26 +1267,56 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (_, old) = fixture(&cx, &root, "old", 1, QuantizationFormat::F32,
-                &[("old", [1.0, 0.0], true)], true);
-            let (witness, mut new) = fixture(&cx, &root, "new", 2, QuantizationFormat::F32,
-                &[("new", [0.5, 0.5], true)], false);
+            let (_, old) = fixture(
+                &cx,
+                &root,
+                "old",
+                1,
+                QuantizationFormat::F32,
+                &[("old", [1.0, 0.0], true)],
+                true,
+            );
+            let (witness, mut new) = fixture(
+                &cx,
+                &root,
+                "new",
+                2,
+                QuantizationFormat::F32,
+                &[("new", [0.5, 0.5], true)],
+                false,
+            );
             new.2 = old.2;
             let graph = new.2.as_ref().unwrap().clone();
             let before = std::fs::read(&graph).unwrap();
-            let set = NativeShardSet::open_published(&cx, std::slice::from_ref(&witness),
-                std::slice::from_ref(&new)).unwrap();
-            assert_eq!(set.retrieval_modes().collect::<Vec<_>>(), [
-                NativeRetrievalMode::Exact { reason: NativeExactReason::SidecarRejected },
-            ]);
+            let set = NativeShardSet::open_published(
+                &cx,
+                std::slice::from_ref(&witness),
+                std::slice::from_ref(&new),
+            )
+            .unwrap();
+            assert_eq!(
+                set.retrieval_modes().collect::<Vec<_>>(),
+                [NativeRetrievalMode::Exact {
+                    reason: NativeExactReason::SidecarRejected
+                },]
+            );
             assert_eq!(set.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "new");
             assert_eq!(std::fs::read(&graph).unwrap(), before);
-            let (_, substitute) = fixture(&cx, &root, "substitute", 2, QuantizationFormat::F32,
-                &[("new", [0.0, 1.0], true)], false);
+            let (_, substitute) = fixture(
+                &cx,
+                &root,
+                "substitute",
+                2,
+                QuantizationFormat::F32,
+                &[("new", [0.0, 1.0], true)],
+                false,
+            );
             new.0 = substitute.0;
-            assert!(matches!(NativeShardSet::open_published(&cx, &[witness], &[new]),
+            assert!(
+                matches!(NativeShardSet::open_published(&cx, &[witness], &[new]),
                 Err(FsviAdmissionError::SnapshotRejected(rejected))
-                    if rejected.reason == FsviSnapshotRejectionReason::WitnessMismatch));
+                    if rejected.reason == FsviSnapshotRejectionReason::WitnessMismatch)
+            );
             // The already returned snapshot still owns the original bytes.
             assert_eq!(set.search(&cx, &query(), 1, None).unwrap()[0].score, 0.5);
         });
@@ -957,19 +1327,42 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (a, mut first) = fixture(&cx, &root, "a", 1, QuantizationFormat::F32,
-                &[("a", [1.0, 0.0], true)], false);
-            let (b, mut second) = fixture(&cx, &root, "b", 1, QuantizationFormat::F32,
-                &[("b", [0.0, 1.0], true)], false);
+            let (a, mut first) = fixture(
+                &cx,
+                &root,
+                "a",
+                1,
+                QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)],
+                false,
+            );
+            let (b, mut second) = fixture(
+                &cx,
+                &root,
+                "b",
+                1,
+                QuantizationFormat::F32,
+                &[("b", [0.0, 1.0], true)],
+                false,
+            );
             // This graph path is an invalid native basename. Getting its
             // configuration error would prove graphs ran before vector admission.
             first.2 = Some(root.join("wrong-extension.txt"));
-            let (_, substituted) = fixture(&cx, &root, "b-substitute", 1, QuantizationFormat::F32,
-                &[("b", [1.0, 0.0], true)], false);
+            let (_, substituted) = fixture(
+                &cx,
+                &root,
+                "b-substitute",
+                1,
+                QuantizationFormat::F32,
+                &[("b", [1.0, 0.0], true)],
+                false,
+            );
             second.0 = substituted.0;
-            assert!(matches!(NativeShardSet::open_published(&cx, &[a, b], &[first, second]),
+            assert!(
+                matches!(NativeShardSet::open_published(&cx, &[a, b], &[first, second]),
                 Err(FsviAdmissionError::SnapshotRejected(rejected))
-                    if rejected.reason == FsviSnapshotRejectionReason::WitnessMismatch));
+                    if rejected.reason == FsviSnapshotRejectionReason::WitnessMismatch)
+            );
         });
     }
 
@@ -978,14 +1371,23 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (witness, mut artifact) = fixture(&cx, &root, "wal", 1, QuantizationFormat::F32,
-                &[("a", [1.0, 0.0], true)], false);
+            let (witness, mut artifact) = fixture(
+                &cx,
+                &root,
+                "wal",
+                1,
+                QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)],
+                false,
+            );
             let wal = frankensearch_index::wal_path_for(&artifact.0);
             std::fs::write(&wal, []).unwrap();
             artifact.2 = Some(root.join("missing.fshnsw"));
-            assert!(matches!(NativeShardSet::open_published(&cx, &[witness], &[artifact]),
+            assert!(
+                matches!(NativeShardSet::open_published(&cx, &[witness], &[artifact]),
                 Err(FsviAdmissionError::SnapshotRejected(rejected))
-                    if rejected.reason == FsviSnapshotRejectionReason::PublishedWalPresent));
+                    if rejected.reason == FsviSnapshotRejectionReason::PublishedWalPresent)
+            );
             assert!(wal.exists());
         });
     }
@@ -995,14 +1397,30 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (a, mut first) = fixture(&cx, &root, "live", 1, QuantizationFormat::F32,
-                &[("same", [1.0, 0.0], true)], false);
-            let (b, second) = fixture(&cx, &root, "dead", 1, QuantizationFormat::F32,
-                &[("same", [0.0, 1.0], false)], false);
+            let (a, mut first) = fixture(
+                &cx,
+                &root,
+                "live",
+                1,
+                QuantizationFormat::F32,
+                &[("same", [1.0, 0.0], true)],
+                false,
+            );
+            let (b, second) = fixture(
+                &cx,
+                &root,
+                "dead",
+                1,
+                QuantizationFormat::F32,
+                &[("same", [0.0, 1.0], false)],
+                false,
+            );
             first.2 = Some(root.join("invalid.txt"));
-            assert!(matches!(NativeShardSet::open_published(&cx, &[a, b], &[first, second]),
+            assert!(
+                matches!(NativeShardSet::open_published(&cx, &[a, b], &[first, second]),
                 Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, .. }))
-                    if field == "native_ann.shards.membership"));
+                    if field == "native_ann.shards.membership")
+            );
         });
     }
 
@@ -1011,13 +1429,16 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (witness, artifact) = fixture(&cx, &root, "empty", 1,
-                QuantizationFormat::F32, &[], false);
+            let (witness, artifact) =
+                fixture(&cx, &root, "empty", 1, QuantizationFormat::F32, &[], false);
             let set = NativeShardSet::open_published(&cx, &[witness], &[artifact]).unwrap();
             assert_eq!(set.live_count(), 0);
             assert!(set.search(&cx, &query(), 1, None).unwrap().is_empty());
-            let foreign = BoundQueryEmbedding::new(vec![1.0, 0.0],
-                EmbeddingIdentityBundleV1::explicit_test_model("foreign", 2)).unwrap();
+            let foreign = BoundQueryEmbedding::new(
+                vec![1.0, 0.0],
+                EmbeddingIdentityBundleV1::explicit_test_model("foreign", 2),
+            )
+            .unwrap();
             assert!(set.search(&cx, &foreign, 0, None).is_err());
         });
     }
@@ -1027,19 +1448,37 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (a, first) = fixture(&cx, &root, "a", 1, QuantizationFormat::F32,
-                &[("a", [1.0, 0.0], true)], false);
-            let (b, mut second) = fixture(&cx, &root, "b", 1, QuantizationFormat::F32,
-                &[("b", [0.0, 1.0], true)], false);
-            assert!(matches!(NativeShardSet::open_published(&cx, &[a.clone(), b.clone()],
+            let (a, first) = fixture(
+                &cx,
+                &root,
+                "a",
+                1,
+                QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)],
+                false,
+            );
+            let (b, mut second) = fixture(
+                &cx,
+                &root,
+                "b",
+                1,
+                QuantizationFormat::F32,
+                &[("b", [0.0, 1.0], true)],
+                false,
+            );
+            assert!(
+                matches!(NativeShardSet::open_published(&cx, &[a.clone(), b.clone()],
                 std::slice::from_ref(&first)),
                 Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, .. }))
-                    if field == "native_ann.shards.inventory"));
+                    if field == "native_ann.shards.inventory")
+            );
             second.0 = PathBuf::from("relative.fsvi");
-            assert!(matches!(NativeShardSet::open_published(&cx, &[b.clone()],
+            assert!(
+                matches!(NativeShardSet::open_published(&cx, std::slice::from_ref(&b),
                 std::slice::from_ref(&second)),
                 Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, .. }))
-                    if field == "native_ann.shards.paths"));
+                    if field == "native_ann.shards.paths")
+            );
             second.0 = root.join("absent.fsvi");
             assert!(NativeShardSet::open_published(&cx, &[a, b], &[first, second]).is_err());
         });
@@ -1050,27 +1489,63 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (a, first) = fixture(&cx, &root, "old-a", 1, QuantizationFormat::F16,
-                &[("a", [1.0, 0.0], true)], true);
-            let (b, second) = fixture(&cx, &root, "old-b", 1, QuantizationFormat::F32,
-                &[("b", [0.5, 0.5], true)], false);
+            let (a, first) = fixture(
+                &cx,
+                &root,
+                "old-a",
+                1,
+                QuantizationFormat::F16,
+                &[("a", [1.0, 0.0], true)],
+                true,
+            );
+            let (b, second) = fixture(
+                &cx,
+                &root,
+                "old-b",
+                1,
+                QuantizationFormat::F32,
+                &[("b", [0.5, 0.5], true)],
+                false,
+            );
             let old_expected = [a, b];
-            let mut current = NativeShardSet::open_published(&cx, &old_expected, &[first, second]).unwrap();
+            let mut current =
+                NativeShardSet::open_published(&cx, &old_expected, &[first, second]).unwrap();
             let retained = current.clone();
             assert!(Arc::ptr_eq(&retained.shards[0], &current.shards[0]));
             let before = retained.search(&cx, &query(), 2, None).unwrap();
-            let (next, artifact) = fixture(&cx, &root, "successor", 2, QuantizationFormat::F32,
-                &[("new", [0.75, 0.25], true)], false);
-            current.try_replace_published(&cx, &old_expected, std::slice::from_ref(&next),
-                std::slice::from_ref(&artifact)).unwrap();
+            let (next, artifact) = fixture(
+                &cx,
+                &root,
+                "successor",
+                2,
+                QuantizationFormat::F32,
+                &[("new", [0.75, 0.25], true)],
+                false,
+            );
+            current
+                .try_replace_published(
+                    &cx,
+                    &old_expected,
+                    std::slice::from_ref(&next),
+                    std::slice::from_ref(&artifact),
+                )
+                .unwrap();
             assert_eq!((current.shard_count(), current.live_count()), (1, 1));
-            assert_eq!(current.search(&cx, &query(), 2, None).unwrap()[0].doc_id, "new");
+            assert_eq!(
+                current.search(&cx, &query(), 2, None).unwrap()[0].doc_id,
+                "new"
+            );
             assert_eq!(retained.search(&cx, &query(), 2, None).unwrap(), before);
-            assert_eq!(retained.owner_witnesses().cloned().collect::<Vec<_>>(), old_expected);
+            assert_eq!(
+                retained.owner_witnesses().cloned().collect::<Vec<_>>(),
+                old_expected
+            );
             assert!(!Arc::ptr_eq(&retained.shards[0], &current.shards[0]));
             let reopened = NativeShardSet::open_published(&cx, &[next], &[artifact]).unwrap();
-            assert_eq!(current.search(&cx, &query(), 2, None).unwrap(),
-                reopened.search(&cx, &query(), 2, None).unwrap());
+            assert_eq!(
+                current.search(&cx, &query(), 2, None).unwrap(),
+                reopened.search(&cx, &query(), 2, None).unwrap()
+            );
         });
     }
 
@@ -1079,25 +1554,47 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (a, first) = fixture(&cx, &root, "a", 1, QuantizationFormat::F32,
-                &[("a", [1.0, 0.0], true)], false);
-            let (b, second) = fixture(&cx, &root, "b", 1, QuantizationFormat::F32,
-                &[("b", [0.5, 0.5], true)], false);
+            let (a, first) = fixture(
+                &cx,
+                &root,
+                "a",
+                1,
+                QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)],
+                false,
+            );
+            let (b, second) = fixture(
+                &cx,
+                &root,
+                "b",
+                1,
+                QuantizationFormat::F32,
+                &[("b", [0.5, 0.5], true)],
+                false,
+            );
             let expected = [a, b];
-            let mut current = NativeShardSet::open_published(&cx, &expected, &[first, second]).unwrap();
+            let mut current =
+                NativeShardSet::open_published(&cx, &expected, &[first, second]).unwrap();
             let before = current.search(&cx, &query(), 2, None).unwrap();
             let mut stale = expected.clone();
             stale[1].whole_image_sha256[0] ^= 1;
             // The absent successor would otherwise fail its own cardinality
             // validation. Exact error attribution proves stale-current ran first.
-            assert!(matches!(current.try_replace_published(&cx, &stale, &[], &[]),
+            assert!(
+                matches!(current.try_replace_published(&cx, &stale, &[], &[]),
                 Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, ref value, .. }))
-                    if field == "native_ann.shards.replace.expected_current" && value == "stale"));
-            assert!(matches!(current.try_replace_published(&cx, &expected[..1], &[], &[]),
+                    if field == "native_ann.shards.replace.expected_current" && value == "stale")
+            );
+            assert!(
+                matches!(current.try_replace_published(&cx, &expected[..1], &[], &[]),
                 Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, ref value, .. }))
-                    if field == "native_ann.shards.replace.expected_current" && value == "cardinality"));
+                    if field == "native_ann.shards.replace.expected_current" && value == "cardinality")
+            );
             assert_eq!(current.search(&cx, &query(), 2, None).unwrap(), before);
-            assert_eq!(current.owner_witnesses().cloned().collect::<Vec<_>>(), expected);
+            assert_eq!(
+                current.owner_witnesses().cloned().collect::<Vec<_>>(),
+                expected
+            );
         });
     }
 
@@ -1106,8 +1603,15 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (witness, artifact) = fixture(&cx, &root, "current", 2, QuantizationFormat::F32,
-                &[("a", [1.0, 0.0], true)], false);
+            let (witness, artifact) = fixture(
+                &cx,
+                &root,
+                "current",
+                2,
+                QuantizationFormat::F32,
+                &[("a", [1.0, 0.0], true)],
+                false,
+            );
             let expected = [witness];
             let mut current = NativeShardSet::open_published(&cx, &expected, &[artifact]).unwrap();
             for generation in [
@@ -1117,12 +1621,20 @@ mod published_tests {
             ] {
                 let mut next = expected[0].clone();
                 next.generation = generation;
-                assert!(matches!(current.try_replace_published(&cx, &expected, &[next], &[]),
+                assert!(
+                    matches!(current.try_replace_published(&cx, &expected, &[next], &[]),
                     Err(FsviAdmissionError::Index(SearchError::InvalidConfig { ref field, .. }))
-                        if field == "native_ann.shards.replace.generation"));
+                        if field == "native_ann.shards.replace.generation")
+                );
             }
-            assert_eq!(current.owner_witnesses().cloned().collect::<Vec<_>>(), expected);
-            assert_eq!(current.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "a");
+            assert_eq!(
+                current.owner_witnesses().cloned().collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                current.search(&cx, &query(), 1, None).unwrap()[0].doc_id,
+                "a"
+            );
         });
     }
 
@@ -1131,28 +1643,63 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (old, artifact) = fixture(&cx, &root, "old", 1, QuantizationFormat::F32,
-                &[("old", [1.0, 0.0], true)], true);
+            let (old, artifact) = fixture(
+                &cx,
+                &root,
+                "old",
+                1,
+                QuantizationFormat::F32,
+                &[("old", [1.0, 0.0], true)],
+                true,
+            );
             let expected = [old];
             let mut current = NativeShardSet::open_published(&cx, &expected, &[artifact]).unwrap();
             let retained = current.clone();
-            let (a, first) = fixture(&cx, &root, "next-a", 2, QuantizationFormat::F32,
-                &[("a", [0.75, 0.25], true)], true);
-            let (b, mut second) = fixture(&cx, &root, "next-b", 2, QuantizationFormat::F32,
-                &[("b", [0.5, 0.5], true)], false);
+            let (a, first) = fixture(
+                &cx,
+                &root,
+                "next-a",
+                2,
+                QuantizationFormat::F32,
+                &[("a", [0.75, 0.25], true)],
+                true,
+            );
+            let (b, mut second) = fixture(
+                &cx,
+                &root,
+                "next-b",
+                2,
+                QuantizationFormat::F32,
+                &[("b", [0.5, 0.5], true)],
+                false,
+            );
             second.2 = Some(root.join("invalid-graph.txt"));
             let next = [a, b];
             let mut artifacts = [first, second];
             // Both mandatory vectors admit; a non-recoverable graph config
             // error occurs only after the first graph has already loaded.
-            assert!(current.try_replace_published(&cx, &expected, &next, &artifacts).is_err());
+            assert!(
+                current
+                    .try_replace_published(&cx, &expected, &next, &artifacts)
+                    .is_err()
+            );
             assert!(Arc::ptr_eq(&retained.shards[0], &current.shards[0]));
             artifacts[1].2 = None;
             std::fs::write(&artifacts[1].0, b"corrupted mandatory second vector").unwrap();
-            assert!(current.try_replace_published(&cx, &expected, &next, &artifacts).is_err());
+            assert!(
+                current
+                    .try_replace_published(&cx, &expected, &next, &artifacts)
+                    .is_err()
+            );
             assert!(Arc::ptr_eq(&retained.shards[0], &current.shards[0]));
-            assert_eq!(current.owner_witnesses().cloned().collect::<Vec<_>>(), expected);
-            assert_eq!(current.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "old");
+            assert_eq!(
+                current.owner_witnesses().cloned().collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                current.search(&cx, &query(), 1, None).unwrap()[0].doc_id,
+                "old"
+            );
         });
     }
 
@@ -1161,24 +1708,58 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (old, first) = fixture(&cx, &root, "gen-1", 1, QuantizationFormat::F32,
-                &[("old", [1.0, 0.0], true)], false);
+            let (old, first) = fixture(
+                &cx,
+                &root,
+                "gen-1",
+                1,
+                QuantizationFormat::F32,
+                &[("old", [1.0, 0.0], true)],
+                false,
+            );
             let expected_old = [old];
             let mut current = NativeShardSet::open_published(&cx, &expected_old, &[first]).unwrap();
-            let (second, a) = fixture(&cx, &root, "gen-2", 2, QuantizationFormat::F32,
-                &[("second", [0.75, 0.25], true)], false);
-            let (third, b) = fixture(&cx, &root, "gen-3", 3, QuantizationFormat::F32,
-                &[("third", [0.5, 0.5], true)], false);
+            let (second, a) = fixture(
+                &cx,
+                &root,
+                "gen-2",
+                2,
+                QuantizationFormat::F32,
+                &[("second", [0.75, 0.25], true)],
+                false,
+            );
+            let (third, b) = fixture(
+                &cx,
+                &root,
+                "gen-3",
+                3,
+                QuantizationFormat::F32,
+                &[("third", [0.5, 0.5], true)],
+                false,
+            );
             let expected_second = [second];
-            let prepared_second = NativeShardSet::open_published(&cx, &expected_second, &[a]).unwrap();
+            let prepared_second =
+                NativeShardSet::open_published(&cx, &expected_second, &[a]).unwrap();
             let prepared_third = NativeShardSet::open_published(&cx, &[third], &[b]).unwrap();
-            current.try_replace(&cx, &expected_old, prepared_second).unwrap();
-            assert!(matches!(current.try_replace(&cx, &expected_old, prepared_third.clone()),
+            current
+                .try_replace(&cx, &expected_old, prepared_second)
+                .unwrap();
+            assert!(
+                matches!(current.try_replace(&cx, &expected_old, prepared_third.clone()),
                 Err(SearchError::InvalidConfig { ref field, .. })
-                    if field == "native_ann.shards.replace.expected_current"));
-            assert_eq!(current.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "second");
-            current.try_replace(&cx, &expected_second, prepared_third).unwrap();
-            assert_eq!(current.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "third");
+                    if field == "native_ann.shards.replace.expected_current")
+            );
+            assert_eq!(
+                current.search(&cx, &query(), 1, None).unwrap()[0].doc_id,
+                "second"
+            );
+            current
+                .try_replace(&cx, &expected_second, prepared_third)
+                .unwrap();
+            assert_eq!(
+                current.search(&cx, &query(), 1, None).unwrap()[0].doc_id,
+                "third"
+            );
         });
     }
 
@@ -1187,8 +1768,15 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (old, artifact) = fixture(&cx, &root, "old", 1, QuantizationFormat::F32,
-                &[("old", [1.0, 0.0], true)], false);
+            let (old, artifact) = fixture(
+                &cx,
+                &root,
+                "old",
+                1,
+                QuantizationFormat::F32,
+                &[("old", [1.0, 0.0], true)],
+                false,
+            );
             let mut identity = artifact.1.frozen_identity().identity.clone();
             identity.producer.backend = "new-producer".to_owned();
             identity.validate().unwrap();
@@ -1196,21 +1784,32 @@ mod published_tests {
             let binding = FsviV2IdentityBinding::new(
                 ArtifactGenerationIdentityV1::new(2, [0x73; 16]).unwrap(),
                 identity.freeze().unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             let path = root.join("different-producer.fsvi");
             let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
             writer.write_record("new", &[1.0, 0.0]).unwrap();
             writer.finish().unwrap();
             let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
-            let witness = ValidatedFsviBytes::from_arc(bytes, &binding).unwrap().witness().clone();
-            let candidate = NativeShardSet::open_published(&cx, &[witness], &[(path, binding, None)]).unwrap();
-            assert_eq!(candidate.search(&cx, &new_query, 1, None).unwrap()[0].doc_id, "new");
+            let witness = ValidatedFsviBytes::from_arc(bytes, &binding)
+                .unwrap()
+                .witness()
+                .clone();
+            let candidate =
+                NativeShardSet::open_published(&cx, &[witness], &[(path, binding, None)]).unwrap();
+            assert_eq!(
+                candidate.search(&cx, &new_query, 1, None).unwrap()[0].doc_id,
+                "new"
+            );
             let expected = [old];
             let mut current = NativeShardSet::open_published(&cx, &expected, &[artifact]).unwrap();
             assert!(matches!(current.try_replace(&cx, &expected, candidate),
                 Err(SearchError::InvalidConfig { ref field, .. })
                     if field == "native_ann.shards.replace.identity"));
-            assert_eq!(current.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "old");
+            assert_eq!(
+                current.search(&cx, &query(), 1, None).unwrap()[0].doc_id,
+                "old"
+            );
         });
     }
 
@@ -1219,18 +1818,34 @@ mod published_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (old, first) = fixture(&cx, &root, "live", 1, QuantizationFormat::F32,
-                &[("old", [1.0, 0.0], true)], false);
+            let (old, first) = fixture(
+                &cx,
+                &root,
+                "live",
+                1,
+                QuantizationFormat::F32,
+                &[("old", [1.0, 0.0], true)],
+                false,
+            );
             let expected = [old];
             let mut current = NativeShardSet::open_published(&cx, &expected, &[first]).unwrap();
             let retained = current.clone();
-            let (empty, next) = fixture(&cx, &root, "empty", 2, QuantizationFormat::F16, &[], false);
-            current.try_replace_published(&cx, &expected, &[empty], &[next]).unwrap();
+            let (empty, next) =
+                fixture(&cx, &root, "empty", 2, QuantizationFormat::F16, &[], false);
+            current
+                .try_replace_published(&cx, &expected, &[empty], &[next])
+                .unwrap();
             assert_eq!((current.shard_count(), current.live_count()), (1, 0));
             assert!(current.search(&cx, &query(), 1, None).unwrap().is_empty());
-            assert_eq!(retained.search(&cx, &query(), 1, None).unwrap()[0].doc_id, "old");
-            let foreign = BoundQueryEmbedding::new(vec![1.0, 0.0],
-                EmbeddingIdentityBundleV1::explicit_test_model("foreign", 2)).unwrap();
+            assert_eq!(
+                retained.search(&cx, &query(), 1, None).unwrap()[0].doc_id,
+                "old"
+            );
+            let foreign = BoundQueryEmbedding::new(
+                vec![1.0, 0.0],
+                EmbeddingIdentityBundleV1::explicit_test_model("foreign", 2),
+            )
+            .unwrap();
             assert!(current.search(&cx, &foreign, 0, None).is_err());
         });
     }

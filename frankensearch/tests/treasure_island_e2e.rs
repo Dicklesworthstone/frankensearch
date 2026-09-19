@@ -1332,7 +1332,9 @@ mod lexical {
                 LexicalWrite::index_documents(&quill, &cx, &documents)
                     .await
                     .expect("index Quill");
-                LexicalWrite::commit(&quill, &cx).await.expect("commit Quill");
+                LexicalWrite::commit(&quill, &cx)
+                    .await
+                    .expect("commit Quill");
                 LexicalWrite::index_documents(&tantivy, &cx, &documents)
                     .await
                     .expect("index Tantivy");

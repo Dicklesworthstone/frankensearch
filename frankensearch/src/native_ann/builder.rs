@@ -25,8 +25,10 @@ use frankensearch_core::generation::{
     ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
 };
 use frankensearch_core::traits::IdentityBoundEmbedding;
-use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex, VectorIndexWriter};
 use frankensearch_index::native_hnsw::{HnswParams, NativeHnswGenerationReceiptV2};
+use frankensearch_index::{
+    FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex, VectorIndexWriter,
+};
 
 use super::{NativeAnnIndex, checkpoint, invalid};
 use crate::{Cx, Embedder, IndexableDocument, SearchResult, VectorHit};
@@ -77,16 +79,28 @@ impl TierPlan {
         let identity = embedder.identity()?.clone();
         identity.validate()?;
         if usize::try_from(identity.space.dimension).ok() != Some(embedder.dimension()) {
-            return Err(invalid("builder.dimension", "mismatch", "provider dimension disagrees with its identity"));
+            return Err(invalid(
+                "builder.dimension",
+                "mismatch",
+                "provider dimension disagrees with its identity",
+            ));
         }
-        Ok(Self { embedder, identity, precision: NativeBuildPrecision::F32, retrieval: NativeBuildRetrieval::Exact })
+        Ok(Self {
+            embedder,
+            identity,
+            precision: NativeBuildPrecision::F32,
+            retrieval: NativeBuildRetrieval::Exact,
+        })
     }
 
-    fn binding(&self, generation: &ArtifactGenerationIdentityV1) -> SearchResult<FsviV2IdentityBinding> {
+    fn binding(
+        &self,
+        generation: &ArtifactGenerationIdentityV1,
+    ) -> SearchResult<FsviV2IdentityBinding> {
         self.admit(self.embedder.identity()?)?;
         let mut identity = self.identity.clone();
-        identity.storage.format = "fsvi-v2".to_owned();
-        identity.storage.endianness = "little-endian".to_owned();
+        "fsvi-v2".clone_into(&mut identity.storage.format);
+        "little-endian".clone_into(&mut identity.storage.endianness);
         identity.storage.quantization = match self.precision {
             NativeBuildPrecision::F32 => QuantizationFormat::F32,
             NativeBuildPrecision::F16 => QuantizationFormat::F16,
@@ -101,7 +115,11 @@ impl TierPlan {
         // the persisted storage encoding in the FSVI binding. A copied model
         // name, dimension, or golden-vector certificate is not sufficient.
         if identity.fingerprint() != self.identity.fingerprint() {
-            return Err(invalid("builder.producer", "changed", "batch provider changed its frozen identity"));
+            return Err(invalid(
+                "builder.producer",
+                "changed",
+                "batch provider changed its frozen identity",
+            ));
         }
         Ok(())
     }
@@ -119,7 +137,11 @@ impl TierPlan {
         checkpoint(cx, "native_ann.builder.after_batch")?;
         let response = response?;
         if response.len() != documents.len() {
-            return Err(invalid("builder.batch", "cardinality", "one bound embedding is required per input document"));
+            return Err(invalid(
+                "builder.batch",
+                "cardinality",
+                "one bound embedding is required per input document",
+            ));
         }
         // Validate the entire returned batch before writing ANY row from it.
         for bound in &response {
@@ -136,8 +158,14 @@ impl TierPlan {
     fn admit_output(&self, bound: &IdentityBoundEmbedding) -> SearchResult<()> {
         bound.validate()?;
         self.admit(&bound.identity)?;
-        if bound.values.len() != self.embedder.dimension() || bound.values.iter().any(|v| !v.is_finite()) {
-            return Err(invalid("builder.output", "invalid", "embedding dimensions and finite values must match the frozen producer"));
+        if bound.values.len() != self.embedder.dimension()
+            || bound.values.iter().any(|v| !v.is_finite())
+        {
+            return Err(invalid(
+                "builder.output",
+                "invalid",
+                "embedding dimensions and finite values must match the frozen producer",
+            ));
         }
         Ok(())
     }
@@ -172,10 +200,21 @@ impl NativeIndexBuilder {
         fast: Arc<dyn Embedder>,
     ) -> SearchResult<Self> {
         let directory = directory.as_ref();
-        let directory = if directory.is_absolute() { directory.to_path_buf() } else { std::env::current_dir()?.join(directory) };
+        let directory = if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(directory)
+        };
         let fast = TierPlan::new(fast)?;
         fast.binding(&generation)?;
-        Ok(Self { directory, generation, fast, quality: None, batch_size: 64, documents: Vec::new() })
+        Ok(Self {
+            directory,
+            generation,
+            fast,
+            quality: None,
+            batch_size: 64,
+            documents: Vec::new(),
+        })
     }
 
     /// Add an independently dimensioned quality model; it may not change document
@@ -188,7 +227,11 @@ impl NativeIndexBuilder {
         if self.fast.identity.input.doc_id_semantics != quality.identity.input.doc_id_semantics
             || self.fast.identity.space.kind != quality.identity.space.kind
         {
-            return Err(invalid("builder.quality", "incompatible", "both tiers require one document-ID contract and semantic/control kind"));
+            return Err(invalid(
+                "builder.quality",
+                "incompatible",
+                "both tiers require one document-ID contract and semantic/control kind",
+            ));
         }
         self.quality = Some(quality);
         Ok(self)
@@ -200,7 +243,11 @@ impl NativeIndexBuilder {
     /// Rejects zero, before filesystem or model work.
     pub fn with_batch_size(mut self, batch_size: usize) -> SearchResult<Self> {
         if batch_size == 0 {
-            return Err(invalid("builder.batch_size", "0", "batch size must be positive"));
+            return Err(invalid(
+                "builder.batch_size",
+                "0",
+                "batch size must be positive",
+            ));
         }
         self.batch_size = batch_size;
         Ok(self)
@@ -208,7 +255,11 @@ impl NativeIndexBuilder {
 
     /// Select fast storage and exact/native retrieval without changing the model.
     #[must_use]
-    pub fn with_fast_storage(mut self, precision: NativeBuildPrecision, retrieval: NativeBuildRetrieval) -> Self {
+    pub fn with_fast_storage(
+        mut self,
+        precision: NativeBuildPrecision,
+        retrieval: NativeBuildRetrieval,
+    ) -> Self {
         self.fast.precision = precision;
         self.fast.retrieval = retrieval;
         self
@@ -218,8 +269,18 @@ impl NativeIndexBuilder {
     ///
     /// # Errors
     /// Rejects configuration of an absent quality tier.
-    pub fn with_quality_storage(mut self, precision: NativeBuildPrecision, retrieval: NativeBuildRetrieval) -> SearchResult<Self> {
-        let quality = self.quality.as_mut().ok_or_else(|| invalid("builder.quality", "absent", "configure the quality provider first"))?;
+    pub fn with_quality_storage(
+        mut self,
+        precision: NativeBuildPrecision,
+        retrieval: NativeBuildRetrieval,
+    ) -> SearchResult<Self> {
+        let quality = self.quality.as_mut().ok_or_else(|| {
+            invalid(
+                "builder.quality",
+                "absent",
+                "configure the quality provider first",
+            )
+        })?;
         quality.precision = precision;
         quality.retrieval = retrieval;
         Ok(self)
@@ -260,11 +321,19 @@ impl NativeIndexBuilder {
         for (position, doc) in self.documents.iter().enumerate() {
             checkpoint(cx, "native_ann.builder.source")?;
             if doc.id.is_empty() || (position > 0 && self.documents[position - 1].id == doc.id) {
-                return Err(invalid("builder.documents", "empty-or-duplicate-id", "source document IDs must be nonempty and unique"));
+                return Err(invalid(
+                    "builder.documents",
+                    "empty-or-duplicate-id",
+                    "source document IDs must be nonempty and unique",
+                ));
             }
         }
         let fast_binding = self.fast.binding(&self.generation)?;
-        let quality_binding = self.quality.as_ref().map(|tier| tier.binding(&self.generation)).transpose()?;
+        let quality_binding = self
+            .quality
+            .as_ref()
+            .map(|tier| tier.binding(&self.generation))
+            .transpose()?;
         for tier in std::iter::once(&self.fast).chain(self.quality.iter()) {
             if let NativeBuildRetrieval::Hnsw { params, .. } = tier.retrieval {
                 params.validate()?;
@@ -278,8 +347,10 @@ impl NativeIndexBuilder {
         let fast_path = directory.join("fast.fsvi");
         let quality_path = directory.join("quality.fsvi");
         let mut fast_writer = VectorIndex::create_v2(&fast_path, fast_binding.clone())?;
-        let mut quality_writer = quality_binding.as_ref()
-            .map(|binding| VectorIndex::create_v2(&quality_path, binding.clone())).transpose()?;
+        let mut quality_writer = quality_binding
+            .as_ref()
+            .map(|binding| VectorIndex::create_v2(&quality_path, binding.clone()))
+            .transpose()?;
         for batch in self.documents.chunks(self.batch_size) {
             self.fast.write_batch(cx, &mut fast_writer, batch).await?;
             if let (Some(tier), Some(writer)) = (&self.quality, &mut quality_writer) {
@@ -288,15 +359,34 @@ impl NativeIndexBuilder {
         }
         checkpoint(cx, "native_ann.builder.finish_vectors")?;
         fast_writer.finish()?;
-        if let Some(writer) = quality_writer { writer.finish()?; }
+        if let Some(writer) = quality_writer {
+            writer.finish()?;
+        }
         let fast = finish_tier(cx, self.fast, fast_binding, fast_path, &self.documents)?;
         let quality = match (self.quality, quality_binding) {
-            (Some(tier), Some(binding)) => Some(finish_tier(cx, tier, binding, quality_path, &self.documents)?),
+            (Some(tier), Some(binding)) => Some(finish_tier(
+                cx,
+                tier,
+                binding,
+                quality_path,
+                &self.documents,
+            )?),
             (None, None) => None,
-            _ => return Err(invalid("builder.quality", "inconsistent", "quality plan and binding must travel together")),
+            _ => {
+                return Err(invalid(
+                    "builder.quality",
+                    "inconsistent",
+                    "quality plan and binding must travel together",
+                ));
+            }
         };
         checkpoint(cx, "native_ann.builder.complete")?;
-        Ok(NativeBuiltIndex { directory, documents: self.documents.into(), fast, quality })
+        Ok(NativeBuiltIndex {
+            directory,
+            documents: self.documents.into(),
+            fast,
+            quality,
+        })
     }
 }
 
@@ -316,25 +406,37 @@ pub struct NativeBuiltTier {
 impl NativeBuiltTier {
     /// The admitted native/exact index; no vector pathname is reopened by search.
     #[must_use]
-    pub const fn index(&self) -> &NativeAnnIndex { &self.index }
+    pub const fn index(&self) -> &NativeAnnIndex {
+        &self.index
+    }
     /// Provider used to produce every stored row.
     #[must_use]
-    pub fn embedder(&self) -> &dyn Embedder { self.embedder.as_ref() }
+    pub fn embedder(&self) -> &dyn Embedder {
+        self.embedder.as_ref()
+    }
     /// Exact persisted v2 identity binding for a caller-owned reopen specification.
     #[must_use]
-    pub const fn binding(&self) -> &FsviV2IdentityBinding { &self.binding }
+    pub const fn binding(&self) -> &FsviV2IdentityBinding {
+        &self.binding
+    }
     /// Newly created vector artifact.
     #[must_use]
-    pub fn vector_path(&self) -> &Path { &self.vector_path }
+    pub fn vector_path(&self) -> &Path {
+        &self.vector_path
+    }
     /// Persisted native graph, absent for explicitly exact construction.
     #[must_use]
-    pub fn graph_path(&self) -> Option<&Path> { self.graph_path.as_deref() }
+    pub fn graph_path(&self) -> Option<&Path> {
+        self.graph_path.as_deref()
+    }
     /// Query with the retained producing provider.
     ///
     /// # Errors
     /// Propagates native text-search admission, inference and cancellation errors.
     pub async fn search(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<VectorHit>> {
-        self.index.search_text(cx, self.embedder(), text, k, None).await
+        self.index
+            .search_text(cx, self.embedder(), text, k, None)
+            .await
     }
 }
 
@@ -355,21 +457,31 @@ pub struct NativeBuiltIndex {
 impl NativeBuiltIndex {
     /// Directory exclusively created by this successful build.
     #[must_use]
-    pub fn directory(&self) -> &Path { &self.directory }
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
     /// Required fast tier.
     #[must_use]
-    pub const fn fast(&self) -> &NativeBuiltTier { &self.fast }
+    pub const fn fast(&self) -> &NativeBuiltTier {
+        &self.fast
+    }
     /// Quality tier, present only when explicitly configured and fully built.
     #[must_use]
-    pub const fn quality(&self) -> Option<&NativeBuiltTier> { self.quality.as_ref() }
+    pub const fn quality(&self) -> Option<&NativeBuiltTier> {
+        self.quality.as_ref()
+    }
     /// Exact source cohort in canonical document-ID order.
     #[must_use]
-    pub fn documents(&self) -> &[IndexableDocument] { &self.documents }
+    pub fn documents(&self) -> &[IndexableDocument] {
+        &self.documents
+    }
     /// Resolve the input document from the retained cohort, not current storage.
     #[must_use]
     pub fn document(&self, id: &str) -> Option<&IndexableDocument> {
-        self.documents.binary_search_by(|doc| doc.id.as_str().cmp(id))
-            .ok().map(|position| &self.documents[position])
+        self.documents
+            .binary_search_by(|doc| doc.id.as_str().cmp(id))
+            .ok()
+            .map(|position| &self.documents[position])
     }
 }
 
@@ -382,8 +494,10 @@ fn finish_tier(
 ) -> SearchResult<NativeBuiltTier> {
     checkpoint(cx, "native_ann.builder.admit_vectors")?;
     let bytes: Arc<[u8]> = std::fs::read(&vector_path)?.into();
-    let owner = Arc::new(ValidatedFsviBytes::from_arc(bytes, &binding)
-        .map_err(|error| invalid("builder.vector_admission", "rejected", &error.to_string()))?);
+    let owner = Arc::new(
+        ValidatedFsviBytes::from_arc(bytes, &binding)
+            .map_err(|error| invalid("builder.vector_admission", "rejected", &error.to_string()))?,
+    );
     validate_source_membership(cx, &owner, documents)?;
     let (index, graph_path, graph_receipt) = match plan.retrieval {
         NativeBuildRetrieval::Exact => (NativeAnnIndex::exact(cx, owner)?, None, None),
@@ -396,8 +510,14 @@ fn finish_tier(
     };
     index.admit_identity(plan.embedder.identity()?)?;
     Ok(NativeBuiltTier {
-        index, embedder: plan.embedder, producer_identity: plan.identity,
-        precision: plan.precision, binding, vector_path, graph_path, graph_receipt,
+        index,
+        embedder: plan.embedder,
+        producer_identity: plan.identity,
+        precision: plan.precision,
+        binding,
+        vector_path,
+        graph_path,
+        graph_receipt,
     })
 }
 
@@ -409,7 +529,11 @@ fn validate_source_membership(
     documents: &[IndexableDocument],
 ) -> SearchResult<()> {
     if owner.record_count() != documents.len() || owner.live_count() != documents.len() {
-        return Err(invalid("builder.source_join", "cardinality", "admitted vector membership must equal the complete source cohort"));
+        return Err(invalid(
+            "builder.source_join",
+            "cardinality",
+            "admitted vector membership must equal the complete source cohort",
+        ));
     }
     // FSVI sorts its physical rows by (document hash, document ID), NOT by
     // lexical ID order. Resolve each admitted row back to the canonical source
@@ -419,10 +543,21 @@ fn validate_source_membership(
     for physical in 0..owner.record_count() {
         checkpoint(cx, "native_ann.builder.source_join")?;
         let row = owner.row(physical)?;
-        let position = documents.binary_search_by(|doc| doc.id.as_str().cmp(row.doc_id()))
-            .map_err(|_| invalid("builder.source_join", "document-id", "admitted vector row is absent from the source cohort"))?;
+        let position = documents
+            .binary_search_by(|doc| doc.id.as_str().cmp(row.doc_id()))
+            .map_err(|_| {
+                invalid(
+                    "builder.source_join",
+                    "document-id",
+                    "admitted vector row is absent from the source cohort",
+                )
+            })?;
         if !row.flags().is_live() || std::mem::replace(&mut seen[position], true) {
-            return Err(invalid("builder.source_join", "duplicate-or-deleted", "every source document must map to exactly one live vector row"));
+            return Err(invalid(
+                "builder.source_join",
+                "duplicate-or-deleted",
+                "every source document must map to exactly one live vector row",
+            ));
         }
     }
     Ok(())

@@ -200,14 +200,23 @@ impl<'a> NativeProgressiveSearch<'a> {
         checkpoint(self.cx, "native_ann.rerank_configuration")?;
         if !matches!(self.state, State::Initial) || top_k == 0 {
             return Err(invalid(
-                "rerank.configuration", "started-or-empty-window",
+                "rerank.configuration",
+                "started-or-empty-window",
                 "attach a positive rerank window before requesting any phase",
             ));
         }
         self.budget = self.k.max(top_k).checked_mul(3).ok_or_else(|| {
-            invalid("rerank.candidate_budget", "overflow", "rerank retrieval budget must fit usize")
+            invalid(
+                "rerank.candidate_budget",
+                "overflow",
+                "rerank retrieval budget must fit usize",
+            )
         })?;
-        self.reranker = Some(RerankRequest { reranker, text: text_fn, limit: top_k });
+        self.reranker = Some(RerankRequest {
+            reranker,
+            text: text_fn,
+            limit: top_k,
+        });
         Ok(self)
     }
 
@@ -290,14 +299,20 @@ impl<'a> NativeProgressiveSearch<'a> {
         } else {
             results = self.finish_retrieval(results, candidates, batch);
         }
-        Ok(NativeSearchPhase::Initial { results, candidates })
+        Ok(NativeSearchPhase::Initial {
+            results,
+            candidates,
+        })
     }
 
     async fn refine(&mut self, pending: PendingRefinement) -> SearchResult<NativeSearchPhase> {
         match self.refined_results(&pending).await {
             Ok((results, candidates)) => {
                 let results = self.finish_retrieval(results, candidates, pending.batch);
-                Ok(NativeSearchPhase::Refined { results, candidates })
+                Ok(NativeSearchPhase::Refined {
+                    results,
+                    candidates,
+                })
             }
             Err(error) => {
                 checkpoint(self.cx, "native_ann.progressive_failure")?;
@@ -305,12 +320,16 @@ impl<'a> NativeProgressiveSearch<'a> {
                     return Err(error);
                 }
                 let candidates = NativePhaseCandidates {
-                    fast: pending.fast.len(), quality: 0, lexical: pending.batch.results().len(),
+                    fast: pending.fast.len(),
+                    quality: 0,
+                    lexical: pending.batch.results().len(),
                 };
-                let initial_results = self.finish_retrieval(
-                    pending.initial_results, candidates, pending.batch,
-                );
-                Ok(NativeSearchPhase::RefinementFailed { initial_results, error })
+                let initial_results =
+                    self.finish_retrieval(pending.initial_results, candidates, pending.batch);
+                Ok(NativeSearchPhase::RefinementFailed {
+                    initial_results,
+                    error,
+                })
             }
         }
     }
@@ -350,7 +369,8 @@ impl<'a> NativeProgressiveSearch<'a> {
     }
 
     fn result_window(&self) -> usize {
-        self.reranker.map_or(self.k, |request| self.k.max(request.limit))
+        self.reranker
+            .map_or(self.k, |request| self.k.max(request.limit))
     }
 
     fn finish_retrieval(
@@ -361,7 +381,11 @@ impl<'a> NativeProgressiveSearch<'a> {
     ) -> Vec<ScoredResult> {
         if self.reranker.is_some() && !results.is_empty() {
             let displayed = results.iter().take(self.k).cloned().collect();
-            self.state = State::Rerank(PendingRerank { results, candidates, _batch: batch });
+            self.state = State::Rerank(PendingRerank {
+                results,
+                candidates,
+                _batch: batch,
+            });
             displayed
         } else {
             results.truncate(self.k);
@@ -371,7 +395,11 @@ impl<'a> NativeProgressiveSearch<'a> {
 
     async fn rerank(&self, pending: PendingRerank) -> SearchResult<Option<NativeSearchPhase>> {
         let request = self.reranker.as_ref().ok_or_else(|| {
-            invalid("rerank.configuration", "missing", "a queued rerank must retain its provider")
+            invalid(
+                "rerank.configuration",
+                "missing",
+                "a queued rerank must retain its provider",
+            )
         })?;
         match request.plan(self.cx, self.text, &pending.results).await {
             Ok(Some(plan)) => {
@@ -379,7 +407,11 @@ impl<'a> NativeProgressiveSearch<'a> {
                 let mut results = plan.apply(pending.results, |result| result);
                 results.truncate(self.k);
                 checkpoint(self.cx, "native_ann.rerank_complete")?;
-                Ok(Some(NativeSearchPhase::Reranked { results, candidates: pending.candidates, evaluated }))
+                Ok(Some(NativeSearchPhase::Reranked {
+                    results,
+                    candidates: pending.candidates,
+                    evaluated,
+                }))
             }
             Ok(None) => Ok(None),
             Err(error) => {
@@ -389,7 +421,10 @@ impl<'a> NativeProgressiveSearch<'a> {
                 }
                 let mut previous_results = pending.results;
                 previous_results.truncate(self.k);
-                Ok(Some(NativeSearchPhase::RerankFailed { previous_results, error }))
+                Ok(Some(NativeSearchPhase::RerankFailed {
+                    previous_results,
+                    error,
+                }))
             }
         }
     }
@@ -721,18 +756,42 @@ mod tests {
             let quality_index = quality_index(&cx, &quality);
             let lexical = Lexical::new(&[]);
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 1)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
                 .unwrap();
             assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
-            let NativeSearchPhase::Initial { results, candidates } = stream.next_phase().await.unwrap().unwrap() else {
+            let NativeSearchPhase::Initial {
+                results,
+                candidates,
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("expected initial phase");
             };
             assert_eq!(results[0].doc_id, "z-fast");
-            assert_eq!(candidates, NativePhaseCandidates { fast: 3, quality: 0, lexical: 0 });
+            assert_eq!(
+                candidates,
+                NativePhaseCandidates {
+                    fast: 3,
+                    quality: 0,
+                    lexical: 0
+                }
+            );
             assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
-            let State::Refine(pending) = &stream.state else { panic!("missing retained pool") };
+            let State::Refine(pending) = &stream.state else {
+                panic!("missing retained pool")
+            };
             assert!(pending.fast.iter().all(|hit| hit.doc_id != "a-quality"));
-            let NativeSearchPhase::Refined { results, candidates } = stream.next_phase().await.unwrap().unwrap() else {
+            let NativeSearchPhase::Refined {
+                results,
+                candidates,
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("expected independent refinement");
             };
             assert_eq!(results[0].doc_id, "a-quality");
@@ -740,7 +799,14 @@ mod tests {
             assert!(results[0].fast_score.is_none());
             assert_eq!(results[0].source, ScoreSource::SemanticQuality);
             assert_eq!(results[0].index, Some(0)); // quality owner's row, not the fast row 3
-            assert_eq!(candidates, NativePhaseCandidates { fast: 3, quality: 3, lexical: 0 });
+            assert_eq!(
+                candidates,
+                NativePhaseCandidates {
+                    fast: 3,
+                    quality: 3,
+                    lexical: 0
+                }
+            );
             assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
             assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
@@ -759,9 +825,19 @@ mod tests {
             let quality_index = quality_index(&cx, &quality);
             let lexical = Lexical::new(&["z-fast"]);
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 1)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
                 .unwrap();
-            assert!(matches!(stream.next_phase().await.unwrap(), Some(NativeSearchPhase::Initial { .. })));
+            assert!(matches!(
+                stream.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::Initial { .. })
+            ));
             assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
             drop(stream);
             assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
@@ -780,17 +856,32 @@ mod tests {
             let quality_index = quality_index(&cx, &quality);
             let lexical = Lexical::new(&["z-fast"]);
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 1)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
                 .unwrap();
-            let NativeSearchPhase::Initial { results, .. } = stream.next_phase().await.unwrap().unwrap() else {
+            let NativeSearchPhase::Initial { results, .. } =
+                stream.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("expected initial");
             };
             let expected = serde_json::to_value(results).unwrap();
-            let NativeSearchPhase::RefinementFailed { initial_results, error } = stream.next_phase().await.unwrap().unwrap() else {
+            let NativeSearchPhase::RefinementFailed {
+                initial_results,
+                error,
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("provider failure must be explicit");
             };
             assert_eq!(serde_json::to_value(initial_results).unwrap(), expected);
-            assert!(matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "native_ann.test.provider"));
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "native_ann.test.provider")
+            );
             assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
             assert!(stream.next_phase().await.unwrap().is_none());
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
@@ -807,10 +898,19 @@ mod tests {
             let quality_index = quality_index(&cx, &quality);
             let lexical = Lexical::new(&[]);
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 1)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
                 .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
-            assert!(matches!(stream.next_phase().await, Err(SearchError::Cancelled { ref phase, .. }) if phase == "test.provider"));
+            assert!(
+                matches!(stream.next_phase().await, Err(SearchError::Cancelled { ref phase, .. }) if phase == "test.provider")
+            );
             assert!(stream.is_finished());
             assert!(stream.next_phase().await.unwrap().is_none());
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
@@ -828,11 +928,23 @@ mod tests {
             let quality_index = quality_index(&cx, &quality);
             let lexical = Lexical::new(&["z-fast"]);
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 1)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
                 .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
             let mut future = Box::pin(stream.next_phase());
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
             assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
             drop(future);
@@ -850,8 +962,14 @@ mod tests {
             let fast = Provider::new("fast", 2);
             let index = fast_index(&cx, &fast);
             let lexical = Lexical::new(&[]);
-            let mut empty = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 0).unwrap();
-            let NativeSearchPhase::Initial { results, candidates } = empty.next_phase().await.unwrap().unwrap() else {
+            let mut empty = index
+                .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 0)
+                .unwrap();
+            let NativeSearchPhase::Initial {
+                results,
+                candidates,
+            } = empty.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("zero k yields an empty initial phase");
             };
             assert!(results.is_empty());
@@ -859,8 +977,12 @@ mod tests {
             assert!(empty.next_phase().await.unwrap().is_none());
             assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
             assert_eq!(lexical.calls.load(Ordering::SeqCst), 0);
-            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1).unwrap();
-            let NativeSearchPhase::Initial { results, .. } = stream.next_phase().await.unwrap().unwrap() else {
+            let mut stream = index
+                .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap();
+            let NativeSearchPhase::Initial { results, .. } =
+                stream.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("fast-only phase");
             };
             assert_eq!(results[0].doc_id, "z-fast");
@@ -879,18 +1001,44 @@ mod tests {
             let quality_index = quality_index(&cx, &quality);
             let lexical = Lexical::new(&["a-quality", "z-fast"]);
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 2)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    2,
+                )
                 .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
             lexical.current_generation.store(42, Ordering::SeqCst);
-            let NativeSearchPhase::Refined { results, .. } = stream.next_phase().await.unwrap().unwrap() else {
+            let NativeSearchPhase::Refined { results, .. } =
+                stream.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("expected refined");
             };
             assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
             assert_eq!(lexical.current_generation.load(Ordering::SeqCst), 42);
-            assert!(results.iter().all(|hit| hit.metadata.as_deref().unwrap()["generation"] == 1));
-            let eager = fast_index.search_hybrid_refined_text(&cx, &fast, (&quality_index, &quality), &lexical, "query", 2).await.unwrap();
-            assert_eq!(serde_json::to_value(results).unwrap(), serde_json::to_value(eager).unwrap());
+            assert!(
+                results
+                    .iter()
+                    .all(|hit| hit.metadata.as_deref().unwrap()["generation"] == 1)
+            );
+            let eager = fast_index
+                .search_hybrid_refined_text(
+                    &cx,
+                    &fast,
+                    (&quality_index, &quality),
+                    &lexical,
+                    "query",
+                    2,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(results).unwrap(),
+                serde_json::to_value(eager).unwrap()
+            );
             assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
         });
     }
@@ -904,15 +1052,28 @@ mod tests {
             let quality_index = quality_index(&cx, &quality);
             let lexical = Lexical::new(&[]);
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 1)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
                 .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
             quality.advertise_foreign.store(true, Ordering::SeqCst);
-            let NativeSearchPhase::RefinementFailed { initial_results, error } = stream.next_phase().await.unwrap().unwrap() else {
+            let NativeSearchPhase::RefinementFailed {
+                initial_results,
+                error,
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("changed producer must not be admitted");
             };
             assert_eq!(initial_results[0].doc_id, "z-fast");
-            assert!(matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "query_embedding.native_ann.producer_conformance"));
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "query_embedding.native_ann.producer_conformance")
+            );
             assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
             assert!(stream.is_finished());
         });
@@ -926,9 +1087,16 @@ mod tests {
             let index = fast_index(&cx, &fast);
             let mut lexical = Lexical::new(&[]);
             lexical.pending_search = true;
-            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1).unwrap();
+            let mut stream = index
+                .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap();
             let mut future = Box::pin(stream.next_phase());
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
             assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
             assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
             drop(future);
@@ -946,7 +1114,12 @@ mod tests {
             let fast = Provider::new("fast", 2);
             let quality = Provider::new("quality", 3);
             let fast_index = fast_index(&cx, &fast);
-            let foreign_index = native_index(&cx, &quality, ArtifactGenerationIdentityV1::new(1, [0x62; 16]).unwrap(), &[]);
+            let foreign_index = native_index(
+                &cx,
+                &quality,
+                ArtifactGenerationIdentityV1::new(1, [0x62; 16]).unwrap(),
+                &[],
+            );
             let lexical = Lexical::new(&[]);
             for k in [0, 1] {
                 assert!(matches!(
@@ -974,11 +1147,23 @@ mod tests {
             let mut lexical = Lexical::new(&["a-quality", "z-fast"]);
             lexical.refinement_hydration = Reply::Pending;
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 2)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    2,
+                )
                 .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
             let mut future = Box::pin(stream.next_phase());
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
             assert_eq!(lexical.hydration_calls.load(Ordering::SeqCst), 2);
             assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
             drop(future);
@@ -999,14 +1184,27 @@ mod tests {
             let quality_index = quality_index(&cx, &quality);
             let lexical = Lexical::new(&[]);
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 1)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
                 .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
-            let NativeSearchPhase::RefinementFailed { initial_results, error } = stream.next_phase().await.unwrap().unwrap() else {
+            let NativeSearchPhase::RefinementFailed {
+                initial_results,
+                error,
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("substituted producer must fail");
             };
             assert_eq!(initial_results[0].doc_id, "z-fast");
-            assert!(matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "query_embedding.native_ann.producer_conformance"));
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "query_embedding.native_ann.producer_conformance")
+            );
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
             assert!(stream.next_phase().await.unwrap().is_none());
         });
@@ -1022,10 +1220,19 @@ mod tests {
             let mut lexical = Lexical::new(&["a-quality", "z-fast"]);
             lexical.refinement_hydration = Reply::Cancelled;
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 2)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    2,
+                )
                 .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
-            assert!(matches!(stream.next_phase().await, Err(SearchError::Cancelled { ref phase, .. }) if phase == "test.hydration"));
+            assert!(
+                matches!(stream.next_phase().await, Err(SearchError::Cancelled { ref phase, .. }) if phase == "test.hydration")
+            );
             assert_eq!(lexical.hydration_calls.load(Ordering::SeqCst), 2);
             assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
             assert!(stream.next_phase().await.unwrap().is_none());
@@ -1042,14 +1249,27 @@ mod tests {
             let quality_index = quality_index(&cx, &quality);
             let lexical = Lexical::new(&[]);
             let mut stream = fast_index
-                .search_hybrid_progressive(&cx, &fast, Some((&quality_index, &quality)), &lexical, "query", 1)
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_index, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
                 .unwrap();
-            let NativeSearchPhase::Initial { results, candidates } = stream.next_phase().await.unwrap().unwrap() else {
+            let NativeSearchPhase::Initial {
+                results,
+                candidates,
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("initial phase");
             };
             assert!(results.is_empty());
             assert_eq!(candidates.fast, 0);
-            let NativeSearchPhase::Refined { results, .. } = stream.next_phase().await.unwrap().unwrap() else {
+            let NativeSearchPhase::Refined { results, .. } =
+                stream.next_phase().await.unwrap().unwrap()
+            else {
                 panic!("quality must retrieve independently");
             };
             assert_eq!(results[0].doc_id, "a-quality");
@@ -1120,7 +1340,11 @@ mod tests {
 
     impl CrossEncoder {
         fn new(reply: RerankReply) -> Self {
-            Self { reply, calls: AtomicUsize::new(0), drops: AtomicUsize::new(0) }
+            Self {
+                reply,
+                calls: AtomicUsize::new(0),
+                drops: AtomicUsize::new(0),
+            }
         }
     }
 
@@ -1134,29 +1358,43 @@ mod tests {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let _guard = DropCount(&self.drops);
-                let mut scores: Vec<_> = documents.iter().enumerate().map(|(rank, doc)| {
-                    assert_eq!(doc.text, format!("version-one:{}", doc.doc_id));
-                    frankensearch_core::traits::RerankScore {
-                        doc_id: doc.doc_id.clone(),
-                        score: if doc.doc_id == "near" { 0.9 } else { 0.1 },
-                        original_rank: rank,
-                        raw_logit: None,
-                    }
-                }).collect();
+                let mut scores: Vec<_> = documents
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, doc)| {
+                        assert_eq!(doc.text, format!("version-one:{}", doc.doc_id));
+                        frankensearch_core::traits::RerankScore {
+                            doc_id: doc.doc_id.clone(),
+                            score: if doc.doc_id == "near" { 0.9 } else { 0.1 },
+                            original_rank: rank,
+                            raw_logit: None,
+                        }
+                    })
+                    .collect();
                 match self.reply {
                     RerankReply::Winner => {}
                     RerankReply::Pending => return std::future::pending().await,
-                    RerankReply::Failed => return Err(invalid("test.reranker", "failed", "model failed")),
-                    RerankReply::Cancelled => return Err(SearchError::Cancelled {
-                        phase: "test.reranker".to_owned(), reason: "model cancelled".to_owned(),
-                    }),
+                    RerankReply::Failed => {
+                        return Err(invalid("test.reranker", "failed", "model failed"));
+                    }
+                    RerankReply::Cancelled => {
+                        return Err(SearchError::Cancelled {
+                            phase: "test.reranker".to_owned(),
+                            reason: "model cancelled".to_owned(),
+                        });
+                    }
                     RerankReply::CancelWithScores => {
-                        cx.cancel_with(asupersync::CancelKind::User, Some("native rerank finished after cancellation"));
+                        cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("native rerank finished after cancellation"),
+                        );
                     }
                     RerankReply::DuplicateRank => scores[1] = scores[0].clone(),
                     RerankReply::ForeignId => scores[0].doc_id = "foreign".to_owned(),
                     RerankReply::OutOfRange => scores[0].original_rank = documents.len(),
-                    RerankReply::MissingScore => { let _ = scores.pop(); }
+                    RerankReply::MissingScore => {
+                        let _ = scores.pop();
+                    }
                     RerankReply::NonFinite => scores[0].score = f32::INFINITY,
                     RerankReply::NonFiniteLogit => scores[0].raw_logit = Some(f32::NAN),
                     RerankReply::Unavailable => panic!("unavailable model must not run"),
@@ -1167,11 +1405,23 @@ mod tests {
             })
         }
 
-        fn id(&self) -> &str { "native-test-cross-encoder" }
-        fn model_name(&self) -> &str { self.id() }
-        fn is_available(&self) -> bool { !matches!(self.reply, RerankReply::Unavailable) }
+        // `Reranker::id` declares `-> &str`; a trait impl cannot narrow that to
+        // `&'static str`, which is what clippy's suggestion would do.
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn id(&self) -> &str {
+            "native-test-cross-encoder"
+        }
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+        fn is_available(&self) -> bool {
+            !matches!(self.reply, RerankReply::Unavailable)
+        }
     }
 
+    // Fed to with_reranker as `&dyn Fn(&str) -> Option<String>`, so the Option
+    // is required by the callback type rather than incidental.
+    #[allow(clippy::unnecessary_wraps)]
     fn source_text(id: &str) -> Option<String> {
         Some(format!("version-one:{id}"))
     }
@@ -1184,17 +1434,39 @@ mod tests {
             let lexical = Lexical::new(&["z-fast", "middle", "near"]);
             let model = CrossEncoder::new(RerankReply::Winner);
             let text_calls = AtomicUsize::new(0);
-            let text = |id: &str| { text_calls.fetch_add(1, Ordering::SeqCst); source_text(id) };
-            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
-                .unwrap().with_reranker(&model, &text, 3).unwrap();
-            let NativeSearchPhase::Initial { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("initial") };
+            let text = |id: &str| {
+                text_calls.fetch_add(1, Ordering::SeqCst);
+                source_text(id)
+            };
+            let mut stream = index
+                .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap()
+                .with_reranker(&model, &text, 3)
+                .unwrap();
+            let NativeSearchPhase::Initial { results, .. } =
+                stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("initial")
+            };
             assert_eq!(results[0].doc_id, "z-fast");
             assert_eq!(model.calls.load(Ordering::SeqCst), 0);
             assert_eq!(text_calls.load(Ordering::SeqCst), 0);
             assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
-            let State::Rerank(pending) = &stream.state else { panic!("retained rerank pool") };
-            let original = pending.results.iter().find(|hit| hit.doc_id == "near").unwrap().clone();
-            let NativeSearchPhase::Reranked { results, evaluated, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("reranked") };
+            let State::Rerank(pending) = &stream.state else {
+                panic!("retained rerank pool")
+            };
+            let original = pending
+                .results
+                .iter()
+                .find(|hit| hit.doc_id == "near")
+                .unwrap()
+                .clone();
+            let NativeSearchPhase::Reranked {
+                results, evaluated, ..
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("reranked")
+            };
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].doc_id, "near");
             assert_eq!(results[0].rerank_score, Some(0.9));
@@ -1202,7 +1474,10 @@ mod tests {
             assert_eq!(results[0].score.to_bits(), original.score.to_bits());
             assert_eq!(results[0].fast_score, original.fast_score);
             assert_eq!(results[0].index, original.index);
-            assert!(Arc::ptr_eq(results[0].metadata.as_ref().unwrap(), original.metadata.as_ref().unwrap()));
+            assert!(Arc::ptr_eq(
+                results[0].metadata.as_ref().unwrap(),
+                original.metadata.as_ref().unwrap()
+            ));
             assert_eq!(evaluated, 3);
             assert_eq!(model.calls.load(Ordering::SeqCst), 1);
             assert_eq!(text_calls.load(Ordering::SeqCst), 3);
@@ -1222,15 +1497,36 @@ mod tests {
             let qindex = quality_index(&cx, &quality);
             let lexical = Lexical::new(&["z-fast", "middle", "near", "a-quality"]);
             let model = CrossEncoder::new(RerankReply::Winner);
-            let mut stream = index.search_hybrid_progressive(&cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1)
-                .unwrap().with_reranker(&model, &source_text, 4).unwrap();
-            assert!(matches!(stream.next_phase().await.unwrap(), Some(NativeSearchPhase::Initial { .. })));
+            let mut stream = index
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&qindex, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
+                .unwrap()
+                .with_reranker(&model, &source_text, 4)
+                .unwrap();
+            assert!(matches!(
+                stream.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::Initial { .. })
+            ));
             assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
-            assert!(matches!(stream.next_phase().await.unwrap(), Some(NativeSearchPhase::Refined { .. })));
+            assert!(matches!(
+                stream.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::Refined { .. })
+            ));
             assert_eq!(model.calls.load(Ordering::SeqCst), 0);
             assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
             lexical.current_generation.store(42, Ordering::SeqCst);
-            let NativeSearchPhase::Reranked { results, evaluated, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("rerank after refinement") };
+            let NativeSearchPhase::Reranked {
+                results, evaluated, ..
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("rerank after refinement")
+            };
             assert_eq!(results[0].doc_id, "near");
             assert!(results[0].fast_score.is_some() && results[0].quality_score.is_some());
             assert_eq!(results[0].metadata.as_deref().unwrap()["generation"], 1);
@@ -1252,13 +1548,36 @@ mod tests {
             let qindex = quality_index(&cx, &quality);
             let lexical = Lexical::new(&[]);
             let model = CrossEncoder::new(RerankReply::Winner);
-            let mut stream = index.search_hybrid_progressive(&cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1)
-                .unwrap().with_reranker(&model, &source_text, 3).unwrap();
-            let NativeSearchPhase::Initial { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("initial") };
+            let mut stream = index
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&qindex, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
+                .unwrap()
+                .with_reranker(&model, &source_text, 3)
+                .unwrap();
+            let NativeSearchPhase::Initial { results, .. } =
+                stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("initial")
+            };
             let expected = serde_json::to_value(results).unwrap();
-            let NativeSearchPhase::RefinementFailed { initial_results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("failure must be exposed") };
+            let NativeSearchPhase::RefinementFailed {
+                initial_results, ..
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("failure must be exposed")
+            };
             assert_eq!(serde_json::to_value(initial_results).unwrap(), expected);
-            let NativeSearchPhase::Reranked { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("independent final stage") };
+            let NativeSearchPhase::Reranked { results, .. } =
+                stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("independent final stage")
+            };
             assert_eq!(results[0].doc_id, "near");
             assert!(results[0].quality_score.is_none());
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
@@ -1271,17 +1590,39 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let fast = Provider::new("fast", 2);
             let index = fast_index(&cx, &fast);
-            for reply in [RerankReply::DuplicateRank, RerankReply::ForeignId, RerankReply::OutOfRange,
-                RerankReply::MissingScore, RerankReply::NonFinite, RerankReply::NonFiniteLogit, RerankReply::Failed] {
+            for reply in [
+                RerankReply::DuplicateRank,
+                RerankReply::ForeignId,
+                RerankReply::OutOfRange,
+                RerankReply::MissingScore,
+                RerankReply::NonFinite,
+                RerankReply::NonFiniteLogit,
+                RerankReply::Failed,
+            ] {
                 let lexical = Lexical::new(&["z-fast", "middle", "near"]);
                 let model = CrossEncoder::new(reply);
-                let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 2)
-                    .unwrap().with_reranker(&model, &source_text, 3).unwrap();
-                let NativeSearchPhase::Initial { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("initial") };
+                let mut stream = index
+                    .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 2)
+                    .unwrap()
+                    .with_reranker(&model, &source_text, 3)
+                    .unwrap();
+                let NativeSearchPhase::Initial { results, .. } =
+                    stream.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("initial")
+                };
                 let metadata = Arc::clone(results[0].metadata.as_ref().unwrap());
                 let expected = serde_json::to_value(results).unwrap();
-                let NativeSearchPhase::RerankFailed { previous_results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("must fail atomically") };
-                assert!(Arc::ptr_eq(previous_results[0].metadata.as_ref().unwrap(), &metadata));
+                let NativeSearchPhase::RerankFailed {
+                    previous_results, ..
+                } = stream.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("must fail atomically")
+                };
+                assert!(Arc::ptr_eq(
+                    previous_results[0].metadata.as_ref().unwrap(),
+                    &metadata
+                ));
                 assert_eq!(serde_json::to_value(previous_results).unwrap(), expected);
                 assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
                 assert!(stream.next_phase().await.unwrap().is_none());
@@ -1297,14 +1638,22 @@ mod tests {
             let index = fast_index(&cx, &fast);
             let lexical = Lexical::new(&["z-fast"]);
             let model = CrossEncoder::new(RerankReply::Pending);
-            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
-                .unwrap().with_reranker(&model, &source_text, 3).unwrap();
+            let mut stream = index
+                .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap()
+                .with_reranker(&model, &source_text, 3)
+                .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
             drop(stream.next_phase()); // An unpolled final future is still inert.
             assert_eq!(model.calls.load(Ordering::SeqCst), 0);
             assert!(!stream.is_finished());
             let mut future = Box::pin(stream.next_phase());
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
             assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
             drop(future);
             assert_eq!(model.drops.load(Ordering::SeqCst), 1);
@@ -1323,10 +1672,16 @@ mod tests {
                 let index = fast_index(&cx, &fast);
                 let lexical = Lexical::new(&["z-fast"]);
                 let model = CrossEncoder::new(reply);
-                let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
-                    .unwrap().with_reranker(&model, &source_text, 3).unwrap();
+                let mut stream = index
+                    .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                    .unwrap()
+                    .with_reranker(&model, &source_text, 3)
+                    .unwrap();
                 assert!(stream.next_phase().await.unwrap().is_some());
-                assert!(matches!(stream.next_phase().await, Err(SearchError::Cancelled { .. })));
+                assert!(matches!(
+                    stream.next_phase().await,
+                    Err(SearchError::Cancelled { .. })
+                ));
                 assert!(stream.is_finished());
                 assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
                 assert!(stream.next_phase().await.unwrap().is_none());
@@ -1342,16 +1697,37 @@ mod tests {
             let lexical = Lexical::new(&[]);
             let model = CrossEncoder::new(RerankReply::Winner);
             let only_near = |id: &str| (id == "near").then(|| format!("version-one:{id}"));
-            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 4)
-                .unwrap().with_reranker(&model, &only_near, 3).unwrap();
+            let mut stream = index
+                .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 4)
+                .unwrap()
+                .with_reranker(&model, &only_near, 3)
+                .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
-            let NativeSearchPhase::Reranked { results, evaluated, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("one scored document") };
+            let NativeSearchPhase::Reranked {
+                results, evaluated, ..
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("one scored document")
+            };
             assert_eq!(evaluated, 1);
-            assert_eq!(results.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(), ["near", "z-fast", "middle", "a-quality"]);
-            assert!(results[1..].iter().all(|hit| hit.rerank_score.is_none() && hit.source != ScoreSource::Reranked));
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["near", "z-fast", "middle", "a-quality"]
+            );
+            assert!(
+                results[1..]
+                    .iter()
+                    .all(|hit| hit.rerank_score.is_none() && hit.source != ScoreSource::Reranked)
+            );
             let no_text = |_: &str| None;
-            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
-                .unwrap().with_reranker(&model, &no_text, 3).unwrap();
+            let mut stream = index
+                .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap()
+                .with_reranker(&model, &no_text, 3)
+                .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
             assert!(stream.next_phase().await.unwrap().is_none());
             assert_eq!(model.calls.load(Ordering::SeqCst), 1);
@@ -1366,21 +1742,43 @@ mod tests {
             let lexical = Lexical::new(&[]);
             let model = CrossEncoder::new(RerankReply::Unavailable);
             for budget in [0, usize::MAX] {
-                assert!(index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
-                    .unwrap().with_reranker(&model, &source_text, budget).is_err());
+                assert!(
+                    index
+                        .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                        .unwrap()
+                        .with_reranker(&model, &source_text, budget)
+                        .is_err()
+                );
             }
-            let mut empty = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 0)
-                .unwrap().with_reranker(&model, &source_text, 3).unwrap();
-            assert!(matches!(empty.next_phase().await.unwrap(), Some(NativeSearchPhase::Initial { .. })));
+            let mut empty = index
+                .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 0)
+                .unwrap()
+                .with_reranker(&model, &source_text, 3)
+                .unwrap();
+            assert!(matches!(
+                empty.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::Initial { .. })
+            ));
             assert!(empty.next_phase().await.unwrap().is_none());
             assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
-            let mut stream = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1).unwrap();
+            let mut stream = index
+                .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
             assert!(stream.with_reranker(&model, &source_text, 3).is_err());
-            let mut unavailable = index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
-                .unwrap().with_reranker(&model, &source_text, 3).unwrap();
+            let mut unavailable = index
+                .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                .unwrap()
+                .with_reranker(&model, &source_text, 3)
+                .unwrap();
             assert!(unavailable.next_phase().await.unwrap().is_some());
-            assert!(matches!(unavailable.next_phase().await.unwrap(), Some(NativeSearchPhase::RerankFailed { error: SearchError::RerankerUnavailable { .. }, .. })));
+            assert!(matches!(
+                unavailable.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::RerankFailed {
+                    error: SearchError::RerankerUnavailable { .. },
+                    ..
+                })
+            ));
             assert_eq!(model.calls.load(Ordering::SeqCst), 0);
         });
     }

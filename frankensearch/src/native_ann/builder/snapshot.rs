@@ -19,18 +19,16 @@ use std::sync::Arc;
 use frankensearch_core::generation::{
     ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, GenerationComponentReceiptV1,
 };
+use frankensearch_index::native_hnsw::{NativeHnswGenerationReceiptV2, ValidatedNativeHnsw};
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
-use frankensearch_index::native_hnsw::{
-    NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::super::fallback::NativeBackend;
+use super::super::{NativeAnnIndex, checkpoint, invalid};
 use super::{
     NativeBuildPrecision, NativeBuiltIndex, NativeBuiltTier, TierPlan, validate_source_membership,
 };
-use super::super::{NativeAnnIndex, checkpoint, invalid};
-use super::super::fallback::NativeBackend;
 use crate::{Cx, Embedder, IndexableDocument, SearchError, SearchResult};
 
 const SNAPSHOT_FILE: &str = "native.snapshot.json";
@@ -95,15 +93,23 @@ pub(super) struct Artifact {
 
 impl Artifact {
     pub(super) fn receipt(self) -> GenerationComponentReceiptV1 {
-        GenerationComponentReceiptV1 { byte_len: self.byte_len, sha256: self.sha256 }
+        GenerationComponentReceiptV1 {
+            byte_len: self.byte_len,
+            sha256: self.sha256,
+        }
     }
 
     pub(super) fn validate(self) -> SearchResult<()> {
-        self.receipt().validate().map_err(|_| rejected("receipt", "invalid artifact receipt"))
+        self.receipt()
+            .validate()
+            .map_err(|_| rejected("receipt", "invalid artifact receipt"))
     }
 
     pub(super) fn from_bytes(bytes: &[u8]) -> Self {
-        Self { byte_len: bytes.len() as u64, sha256: Sha256::digest(bytes).into() }
+        Self {
+            byte_len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+        }
     }
 }
 
@@ -124,7 +130,10 @@ impl SavedTier {
         Self {
             producer: tier.producer_identity.clone(),
             precision: tier.precision,
-            vector: Artifact { byte_len: witness.byte_len, sha256: witness.whole_image_sha256 },
+            vector: Artifact {
+                byte_len: witness.byte_len,
+                sha256: witness.whole_image_sha256,
+            },
             graph: tier.graph_receipt.clone(),
         }
     }
@@ -185,12 +194,17 @@ impl NativeBuiltIndex {
             schema: SNAPSHOT_SCHEMA.to_owned(),
             generation: self.fast.index.owner_witness().generation,
             documents: self.documents.len() as u64,
-            source, fast, quality,
+            source,
+            fast,
+            quality,
         };
         let bytes = serde_json::to_vec(&snapshot)
             .map_err(|_| rejected("encoding", "could not encode native snapshot descriptor"))?;
         if bytes.len() as u64 > SNAPSHOT_MAX_BYTES {
-            return Err(rejected("descriptor_size", "native descriptor exceeds the format bound"));
+            return Err(rejected(
+                "descriptor_size",
+                "native descriptor exceeds the format bound",
+            ));
         }
         checkpoint(cx, "native_ann.snapshot.seal_commit")?;
         let mut file = create_private_new(&directory.join(SNAPSHOT_FILE))?;
@@ -227,7 +241,14 @@ impl NativeBuiltIndex {
         fast: Arc<dyn Embedder>,
         quality: Option<Arc<dyn Embedder>>,
     ) -> SearchResult<Self> {
-        Self::open_selected_with_limits(cx, directory, expected, fast, quality, NativeReopenLimits::default())
+        Self::open_selected_with_limits(
+            cx,
+            directory,
+            expected,
+            fast,
+            quality,
+            NativeReopenLimits::default(),
+        )
     }
 
     /// [`Self::open_selected`] with explicit per-artifact/source input ceilings.
@@ -244,10 +265,18 @@ impl NativeBuiltIndex {
     ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.snapshot.open_start")?;
         limits.validate()?;
-        let expected = Artifact { byte_len: expected.byte_len, sha256: expected.sha256 };
+        let expected = Artifact {
+            byte_len: expected.byte_len,
+            sha256: expected.sha256,
+        };
         expected.validate()?;
         let directory = checked_directory(directory.as_ref())?;
-        let bytes = read_selected(cx, &directory.join(SNAPSHOT_FILE), expected, SNAPSHOT_MAX_BYTES)?;
+        let bytes = read_selected(
+            cx,
+            &directory.join(SNAPSHOT_FILE),
+            expected,
+            SNAPSHOT_MAX_BYTES,
+        )?;
         let saved: Snapshot = serde_json::from_slice(&bytes)
             .map_err(|_| rejected("schema", "malformed native snapshot descriptor"))?;
         if saved.schema != SNAPSHOT_SCHEMA {
@@ -257,35 +286,78 @@ impl NativeBuiltIndex {
         let count = usize::try_from(saved.documents)
             .map_err(|_| rejected("documents", "document count does not fit this platform"))?;
         if count > limits.max_documents || saved.quality.is_some() != quality.is_some() {
-            return Err(rejected("topology", "document limit or required quality-provider topology disagrees"));
+            return Err(rejected(
+                "topology",
+                "document limit or required quality-provider topology disagrees",
+            ));
         }
         // Freeze/admit both providers BEFORE source/vector/graph allocation.
         let fast_plan = saved.fast.plan(fast)?;
         let quality_plan = match (&saved.quality, quality) {
             (Some(tier), Some(provider)) => Some(tier.plan(provider)?),
             (None, None) => None,
-            _ => return Err(rejected("topology", "quality descriptor and provider must travel together")),
+            _ => {
+                return Err(rejected(
+                    "topology",
+                    "quality descriptor and provider must travel together",
+                ));
+            }
         };
         if let Some(quality) = &quality_plan {
             if fast_plan.identity.input.doc_id_semantics != quality.identity.input.doc_id_semantics
                 || fast_plan.identity.space.kind != quality.identity.space.kind
             {
-                return Err(rejected("topology", "tier source contracts or semantic/control kinds differ"));
+                return Err(rejected(
+                    "topology",
+                    "tier source contracts or semantic/control kinds differ",
+                ));
             }
         }
-        let documents = read_sources(cx, &directory.join(SOURCE_FILE), saved.source, count, limits)?;
+        let documents = read_sources(
+            cx,
+            &directory.join(SOURCE_FILE),
+            saved.source,
+            count,
+            limits,
+        )?;
         let fast_binding = fast_plan.binding(&saved.generation)?;
-        let fast = open_tier(cx, directory.join("fast.fsvi"), fast_binding, &saved.fast, fast_plan, &documents, limits)?;
+        let fast = open_tier(
+            cx,
+            directory.join("fast.fsvi"),
+            fast_binding,
+            &saved.fast,
+            fast_plan,
+            &documents,
+            limits,
+        )?;
         let quality = match (&saved.quality, quality_plan) {
             (Some(tier), Some(plan)) => {
                 let binding = plan.binding(&saved.generation)?;
-                Some(open_tier(cx, directory.join("quality.fsvi"), binding, tier, plan, &documents, limits)?)
+                Some(open_tier(
+                    cx,
+                    directory.join("quality.fsvi"),
+                    binding,
+                    tier,
+                    plan,
+                    &documents,
+                    limits,
+                )?)
             }
             (None, None) => None,
-            _ => return Err(rejected("topology", "quality plan disappeared during admission")),
+            _ => {
+                return Err(rejected(
+                    "topology",
+                    "quality plan disappeared during admission",
+                ));
+            }
         };
         checkpoint(cx, "native_ann.snapshot.open_complete")?;
-        Ok(Self { directory, documents: documents.into(), fast, quality })
+        Ok(Self {
+            directory,
+            documents: documents.into(),
+            fast,
+            quality,
+        })
     }
 }
 
@@ -321,20 +393,28 @@ fn open_tier(
     limits: NativeReopenLimits,
 ) -> SearchResult<NativeBuiltTier> {
     // The caller constructs this path from fixed role names, never JSON paths.
-    let bytes: Arc<[u8]> = read_selected(cx, &vector_path, saved.vector, limits.max_vector_bytes)?.into();
-    let owner = Arc::new(ValidatedFsviBytes::from_arc(bytes, &binding)
-        .map_err(|_| rejected("vector", "selected vector image failed v2 admission"))?);
+    let bytes: Arc<[u8]> =
+        read_selected(cx, &vector_path, saved.vector, limits.max_vector_bytes)?.into();
+    let owner = Arc::new(
+        ValidatedFsviBytes::from_arc(bytes, &binding)
+            .map_err(|_| rejected("vector", "selected vector image failed v2 admission"))?,
+    );
     validate_source_membership(cx, &owner, documents)?;
     let (index, graph_path) = match &saved.graph {
         None => (NativeAnnIndex::exact(cx, owner)?, None),
         Some(expected) => {
             let path = vector_path.with_extension("fshnsw");
-            expected.validate().map_err(|_| rejected("graph", "invalid selected native graph receipt"))?;
+            expected
+                .validate()
+                .map_err(|_| rejected("graph", "invalid selected native graph receipt"))?;
             if expected.graph_byte_len > limits.max_graph_bytes
                 || open_regular(&path)?.metadata()?.len() != expected.graph_byte_len
                 || open_regular(&graph_receipt_path(&path))?.metadata()?.len() > SNAPSHOT_MAX_BYTES
             {
-                return Err(rejected("graph_size", "selected native graph exceeds its receipt or input limit"));
+                return Err(rejected(
+                    "graph_size",
+                    "selected native graph exceeds its receipt or input limit",
+                ));
             }
             checkpoint(cx, "native_ann.snapshot.graph_load")?;
             let (graph, observed) = ValidatedNativeHnsw::load(Arc::clone(&owner), &path)?;
@@ -342,24 +422,42 @@ fn open_tier(
             same_graph_receipt(expected, &observed)?;
             let default_ef_search = usize::try_from(observed.params.ef_search)
                 .map_err(|_| rejected("graph", "selected search width does not fit usize"))?;
-            (NativeAnnIndex { owner, graph: NativeBackend::Ann(Box::new(graph)), default_ef_search }, Some(path))
+            (
+                NativeAnnIndex {
+                    owner,
+                    graph: NativeBackend::Ann(Box::new(graph)),
+                    default_ef_search,
+                },
+                Some(path),
+            )
         }
     };
     index.admit_identity(plan.embedder.identity()?)?;
     Ok(NativeBuiltTier {
-        index, embedder: plan.embedder, producer_identity: plan.identity,
-        precision: plan.precision, binding, vector_path, graph_path,
+        index,
+        embedder: plan.embedder,
+        producer_identity: plan.identity,
+        precision: plan.precision,
+        binding,
+        vector_path,
+        graph_path,
         graph_receipt: saved.graph.clone(),
     })
 }
 
-fn same_graph_receipt(expected: &NativeHnswGenerationReceiptV2, observed: &NativeHnswGenerationReceiptV2) -> SearchResult<()> {
+fn same_graph_receipt(
+    expected: &NativeHnswGenerationReceiptV2,
+    observed: &NativeHnswGenerationReceiptV2,
+) -> SearchResult<()> {
     let expected = serde_json::to_vec(expected)
         .map_err(|_| rejected("graph", "could not encode selected graph receipt"))?;
     let observed = serde_json::to_vec(observed)
         .map_err(|_| rejected("graph", "could not encode observed graph receipt"))?;
     if expected != observed {
-        return Err(rejected("graph", "loaded graph differs from the exact selected native receipt"));
+        return Err(rejected(
+            "graph",
+            "loaded graph differs from the exact selected native receipt",
+        ));
     }
     Ok(())
 }
@@ -380,7 +478,9 @@ fn write_sources(cx: &Cx, path: &Path, documents: &[IndexableDocument]) -> Searc
         checkpoint(cx, "native_ann.snapshot.write_source")?;
         let encoded = serde_json::to_vec(document)
             .map_err(|_| rejected("source", "source document serialization failed"))?;
-        byte_len = byte_len.checked_add(encoded.len() as u64).and_then(|n| n.checked_add(1))
+        byte_len = byte_len
+            .checked_add(encoded.len() as u64)
+            .and_then(|n| n.checked_add(1))
             .ok_or_else(|| rejected("source_size", "source byte count overflowed"))?;
         output.write_all(&encoded)?;
         output.write_all(b"\n")?;
@@ -389,14 +489,26 @@ fn write_sources(cx: &Cx, path: &Path, documents: &[IndexableDocument]) -> Searc
     }
     output.flush()?;
     output.get_ref().sync_all()?;
-    Ok(Artifact { byte_len, sha256: hash.finalize().into() })
+    Ok(Artifact {
+        byte_len,
+        sha256: hash.finalize().into(),
+    })
 }
 
-fn read_sources(cx: &Cx, path: &Path, expected: Artifact, count: usize, limits: NativeReopenLimits) -> SearchResult<Vec<IndexableDocument>> {
+fn read_sources(
+    cx: &Cx,
+    path: &Path,
+    expected: Artifact,
+    count: usize,
+    limits: NativeReopenLimits,
+) -> SearchResult<Vec<IndexableDocument>> {
     expected.validate()?;
     let file = open_regular(path)?;
     if expected.byte_len > limits.max_source_bytes || file.metadata()?.len() != expected.byte_len {
-        return Err(rejected("source_size", "source bytes disagree with the selected receipt or limit"));
+        return Err(rejected(
+            "source_size",
+            "source bytes disagree with the selected receipt or limit",
+        ));
     }
     let mut input = BufReader::new(file);
     let mut header = [0_u8; SOURCE_HEADER.len()];
@@ -412,40 +524,70 @@ fn read_sources(cx: &Cx, path: &Path, expected: Artifact, count: usize, limits: 
     loop {
         checkpoint(cx, "native_ann.snapshot.read_source")?;
         encoded.clear();
-        (&mut input).take(limits.max_document_bytes + 1).read_until(b'\n', &mut encoded)?;
-        if encoded.is_empty() { break; }
-        observed = observed.checked_add(encoded.len() as u64)
+        (&mut input)
+            .take(limits.max_document_bytes + 1)
+            .read_until(b'\n', &mut encoded)?;
+        if encoded.is_empty() {
+            break;
+        }
+        observed = observed
+            .checked_add(encoded.len() as u64)
             .ok_or_else(|| rejected("source_size", "source byte count overflowed"))?;
-        if observed > expected.byte_len || encoded.len() as u64 > limits.max_document_bytes
-            || encoded.last() != Some(&b'\n') || documents.len() >= count
+        if observed > expected.byte_len
+            || encoded.len() as u64 > limits.max_document_bytes
+            || encoded.last() != Some(&b'\n')
+            || documents.len() >= count
         {
-            return Err(rejected("source_size", "source line, byte count or document count exceeds the selected bound"));
+            return Err(rejected(
+                "source_size",
+                "source line, byte count or document count exceeds the selected bound",
+            ));
         }
         hash.update(&encoded);
         let document: IndexableDocument = serde_json::from_slice(&encoded)
             .map_err(|_| rejected("source", "invalid encoded source document"))?;
-        if document.id.is_empty() || documents.last().is_some_and(|previous| previous.id.as_str() >= document.id.as_str()) {
-            return Err(rejected("source_order", "source identifiers must be strictly increasing and nonempty"));
+        if document.id.is_empty()
+            || documents
+                .last()
+                .is_some_and(|previous| previous.id.as_str() >= document.id.as_str())
+        {
+            return Err(rejected(
+                "source_order",
+                "source identifiers must be strictly increasing and nonempty",
+            ));
         }
-        documents.try_reserve(1)
+        documents
+            .try_reserve(1)
             .map_err(|_| rejected("allocation", "cannot retain selected source documents"))?;
         documents.push(document);
     }
     let sha256: [u8; 32] = hash.finalize().into();
     if observed != expected.byte_len || sha256 != expected.sha256 || documents.len() != count {
-        return Err(rejected("source_receipt", "source bytes or membership differ from the selected snapshot"));
+        return Err(rejected(
+            "source_receipt",
+            "source bytes or membership differ from the selected snapshot",
+        ));
     }
     Ok(documents)
 }
 
-pub(super) fn read_selected(cx: &Cx, path: &Path, expected: Artifact, limit: u64) -> SearchResult<Vec<u8>> {
+pub(super) fn read_selected(
+    cx: &Cx,
+    path: &Path,
+    expected: Artifact,
+    limit: u64,
+) -> SearchResult<Vec<u8>> {
     expected.validate()?;
     if expected.byte_len > limit || usize::try_from(expected.byte_len).is_err() {
-        return Err(rejected("artifact_size", "selected artifact exceeds its input or platform limit"));
+        return Err(rejected(
+            "artifact_size",
+            "selected artifact exceeds its input or platform limit",
+        ));
     }
     let mut output = Vec::new();
     read_and_verify(cx, path, expected, |bytes| {
-        output.try_reserve(bytes.len())
+        output
+            .try_reserve(bytes.len())
             .map_err(|_| rejected("allocation", "cannot retain selected artifact"))?;
         output.extend_from_slice(bytes);
         Ok(())
@@ -458,30 +600,44 @@ pub(super) fn verify_selected(cx: &Cx, path: &Path, expected: Artifact) -> Searc
 }
 
 fn read_and_verify<F>(cx: &Cx, path: &Path, expected: Artifact, mut consume: F) -> SearchResult<()>
-where F: FnMut(&[u8]) -> SearchResult<()> {
+where
+    F: FnMut(&[u8]) -> SearchResult<()>,
+{
     expected.validate()?;
     let mut input = open_regular(path)?;
     if input.metadata()?.len() != expected.byte_len {
-        return Err(rejected("artifact_size", "artifact byte length differs from its selected receipt"));
+        return Err(rejected(
+            "artifact_size",
+            "artifact byte length differs from its selected receipt",
+        ));
     }
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut hash = Sha256::new();
     let mut observed = 0_u64;
     loop {
         checkpoint(cx, "native_ann.snapshot.artifact_chunk")?;
         let read = input.read(&mut buffer)?;
-        if read == 0 { break; }
-        observed = observed.checked_add(read as u64)
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(read as u64)
             .ok_or_else(|| rejected("artifact_size", "artifact byte count overflowed"))?;
         if observed > expected.byte_len {
-            return Err(rejected("artifact_size", "artifact grew beyond its selected receipt"));
+            return Err(rejected(
+                "artifact_size",
+                "artifact grew beyond its selected receipt",
+            ));
         }
         hash.update(&buffer[..read]);
         consume(&buffer[..read])?;
     }
     let sha256: [u8; 32] = hash.finalize().into();
     if observed != expected.byte_len || sha256 != expected.sha256 {
-        return Err(rejected("artifact_receipt", "artifact bytes differ from their selected receipt"));
+        return Err(rejected(
+            "artifact_receipt",
+            "artifact bytes differ from their selected receipt",
+        ));
     }
     Ok(())
 }
@@ -489,7 +645,10 @@ where F: FnMut(&[u8]) -> SearchResult<()> {
 pub(super) fn checked_directory(path: &Path) -> SearchResult<PathBuf> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(rejected("directory", "native snapshot requires a real immutable directory"));
+        return Err(rejected(
+            "directory",
+            "native snapshot requires a real immutable directory",
+        ));
     }
     Ok(std::fs::canonicalize(path)?)
 }
@@ -497,11 +656,17 @@ pub(super) fn checked_directory(path: &Path) -> SearchResult<PathBuf> {
 pub(super) fn open_regular(path: &Path) -> SearchResult<File> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(rejected("file", "native snapshot artifacts must be regular non-symlink files"));
+        return Err(rejected(
+            "file",
+            "native snapshot artifacts must be regular non-symlink files",
+        ));
     }
     let file = File::open(path)?;
     if !file.metadata()?.is_file() {
-        return Err(rejected("file", "opened native snapshot artifact is not a regular file"));
+        return Err(rejected(
+            "file",
+            "opened native snapshot artifact is not a regular file",
+        ));
     }
     Ok(file)
 }
@@ -510,7 +675,10 @@ pub(super) fn ensure_absent(path: &Path) -> SearchResult<()> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
-        Ok(_) => Err(rejected("existing_seal", "an existing snapshot or partial source seal cannot be overwritten")),
+        Ok(_) => Err(rejected(
+            "existing_seal",
+            "an existing snapshot or partial source seal cannot be overwritten",
+        )),
     }
 }
 
@@ -525,11 +693,21 @@ pub(super) fn create_private_new(path: &Path) -> SearchResult<File> {
     Ok(options.open(path)?)
 }
 
+// cfg-gated: Ok(()) on linux/macos, Err elsewhere. Clippy only sees the
+// branch it compiled, so the Result is load-bearing on other platforms.
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn require_seal_platform() -> SearchResult<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    { Ok(()) }
+    {
+        Ok(())
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    { Err(rejected("platform", "native snapshot sealing requires Linux/macOS directory durability")) }
+    {
+        Err(rejected(
+            "platform",
+            "native snapshot sealing requires Linux/macOS directory durability",
+        ))
+    }
 }
 
 pub(super) fn sync_directory(path: &Path) -> SearchResult<()> {

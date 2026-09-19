@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
 
+use super::super::{checkpoint, invalid};
 use super::{NativeBuiltIndex, NativeIndexBuilder};
 use crate::native_ann::NativeProgressiveSearch;
 use crate::{Cx, LexicalRead, LexicalWrite, Reranker, ScoredResult, SearchResult};
-use super::super::{checkpoint, invalid};
 
 mod snapshot;
 use snapshot::LexicalSeal;
@@ -37,12 +37,17 @@ impl NativeIndexBuilder {
         checkpoint(cx, "native_ann.builder.lexical_start")?;
         let path = vectors.directory.join("lexical");
         std::fs::create_dir(&path)?;
-        let response = QuillIndex::create(cx, &path, QuillConfig {
-            bulk_load_mode: true,
-            deterministic_ingest: true,
-            max_ingest_shards: 1,
-            ..QuillConfig::default()
-        }).await;
+        let response = QuillIndex::create(
+            cx,
+            &path,
+            QuillConfig {
+                bulk_load_mode: true,
+                deterministic_ingest: true,
+                max_ingest_shards: 1,
+                ..QuillConfig::default()
+            },
+        )
+        .await;
         checkpoint(cx, "native_ann.builder.lexical_created")?;
         let lexical = response?;
         for document in vectors.documents.iter() {
@@ -55,7 +60,11 @@ impl NativeIndexBuilder {
         checkpoint(cx, "native_ann.builder.lexical_finalized")?;
         response?;
         if LexicalRead::doc_count(&lexical)? != vectors.documents.len() {
-            return Err(invalid("builder.lexical_membership", "cardinality", "Quill must contain the complete source cohort"));
+            return Err(invalid(
+                "builder.lexical_membership",
+                "cardinality",
+                "Quill must contain the complete source cohort",
+            ));
         }
         // The writer remains alive until the reader has admitted its sealed
         // publication. Another writer cannot publish between finalize and open.
@@ -93,28 +102,48 @@ pub struct NativeBuiltHybridIndex {
 impl NativeBuiltHybridIndex {
     // Both callers are private, completed build/reopen paths. Do not expose an
     // arbitrary lexical+vector constructor that could bypass cohort admission.
-    fn from_readers(cx: &Cx, vectors: NativeBuiltIndex, lexical: QuillSearchIndex, lexical_seal: LexicalSeal) -> SearchResult<Self> {
+    fn from_readers(
+        cx: &Cx,
+        vectors: NativeBuiltIndex,
+        lexical: QuillSearchIndex,
+        lexical_seal: LexicalSeal,
+    ) -> SearchResult<Self> {
         if LexicalRead::doc_count(&lexical)? != vectors.documents.len()
             || lexical.keeper_generation() != lexical_seal.generation()
         {
-            return Err(invalid("builder.lexical_membership", "cardinality", "the sealed lexical reader must contain the complete source cohort"));
+            return Err(invalid(
+                "builder.lexical_membership",
+                "cardinality",
+                "the sealed lexical reader must contain the complete source cohort",
+            ));
         }
         let source = Arc::clone(&vectors.documents);
         let text = Box::new(move |id: &str| {
-            source.binary_search_by(|document| document.id.as_str().cmp(id))
-                .ok().map(|position| source[position].content.clone())
+            source
+                .binary_search_by(|document| document.id.as_str().cmp(id))
+                .ok()
+                .map(|position| source[position].content.clone())
         });
         checkpoint(cx, "native_ann.builder.hybrid_complete")?;
-        Ok(Self { vectors, lexical, lexical_seal, text })
+        Ok(Self {
+            vectors,
+            lexical,
+            lexical_seal,
+            text,
+        })
     }
 
     /// Read-only native tiers and exact source documents used for this build.
     #[must_use]
-    pub const fn vectors(&self) -> &NativeBuiltIndex { &self.vectors }
+    pub const fn vectors(&self) -> &NativeBuiltIndex {
+        &self.vectors
+    }
 
     /// Read-only lexical access. No writer, commit or replacement API is exposed.
     #[must_use]
-    pub fn lexical(&self) -> &dyn LexicalRead { &self.lexical }
+    pub fn lexical(&self) -> &dyn LexicalRead {
+        &self.lexical
+    }
 
     /// Fast-plus-lexical search with the producing model and pinned hydration.
     ///
@@ -122,7 +151,9 @@ impl NativeBuiltHybridIndex {
     /// Propagates native hybrid admission, inference, lexical and cancellation errors.
     pub async fn search(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<ScoredResult>> {
         let fast = self.vectors.fast();
-        fast.index().search_hybrid_text(cx, fast.embedder(), &self.lexical, text, k).await
+        fast.index()
+            .search_hybrid_text(cx, fast.embedder(), &self.lexical, text, k)
+            .await
     }
 
     /// Independent fast and quality retrieval, blended with lexical candidates.
@@ -131,12 +162,26 @@ impl NativeBuiltHybridIndex {
     ///
     /// # Errors
     /// Propagates all configured retrieval and hydration errors.
-    pub async fn search_refined(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<ScoredResult>> {
+    pub async fn search_refined(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
         let fast = self.vectors.fast();
         match self.vectors.quality() {
-            Some(quality) => fast.index().search_hybrid_refined_text(
-                cx, fast.embedder(), (quality.index(), quality.embedder()), &self.lexical, text, k,
-            ).await,
+            Some(quality) => {
+                fast.index()
+                    .search_hybrid_refined_text(
+                        cx,
+                        fast.embedder(),
+                        (quality.index(), quality.embedder()),
+                        &self.lexical,
+                        text,
+                        k,
+                    )
+                    .await
+            }
             None => self.search(cx, text, k).await,
         }
     }
@@ -145,23 +190,46 @@ impl NativeBuiltHybridIndex {
     ///
     /// # Errors
     /// Refuses a missing quality tier; otherwise propagates native quality errors.
-    pub async fn search_quality(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<ScoredResult>> {
+    pub async fn search_quality(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.builder.quality_query")?;
         let quality = self.vectors.quality().ok_or_else(|| {
-            invalid("builder.quality", "absent", "quality-primary search requires a built quality tier")
+            invalid(
+                "builder.quality",
+                "absent",
+                "quality-primary search requires a built quality tier",
+            )
         })?;
-        quality.index().search_hybrid_quality_text(cx, quality.embedder(), &self.lexical, text, k).await
+        quality
+            .index()
+            .search_hybrid_quality_text(cx, quality.embedder(), &self.lexical, text, k)
+            .await
     }
 
     /// Prepare the existing lazy native phase sequence without provider work.
     ///
     /// # Errors
     /// Refuses invalid query topology, identity, candidate budget or cancellation.
-    pub fn progressive<'a>(&'a self, cx: &'a Cx, text: &'a str, k: usize) -> SearchResult<NativeProgressiveSearch<'a>> {
+    pub fn progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
         let fast = self.vectors.fast();
         fast.index().search_hybrid_progressive(
-            cx, fast.embedder(), self.vectors.quality().map(|quality| (quality.index(), quality.embedder())),
-            &self.lexical, text, k,
+            cx,
+            fast.embedder(),
+            self.vectors
+                .quality()
+                .map(|quality| (quality.index(), quality.embedder())),
+            &self.lexical,
+            text,
+            k,
         )
     }
 
@@ -181,7 +249,8 @@ impl NativeBuiltHybridIndex {
         reranker: &'a dyn Reranker,
         window: usize,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        self.progressive(cx, text, k)?.with_reranker(reranker, self.text.as_ref(), window)
+        self.progressive(cx, text, k)?
+            .with_reranker(reranker, self.text.as_ref(), window)
     }
 }
 

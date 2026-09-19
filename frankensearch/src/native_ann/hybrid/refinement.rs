@@ -168,8 +168,14 @@ pub(super) async fn refined_winners(
 ) -> SearchResult<Vec<ScoredResult>> {
     checkpoint(cx, "native_ann.tiered_blend")?;
     let vectors = blend_two_tier(fast_hits, quality_hits, 0.7);
-    let hits =
-        rrf_fuse_for_vector_lane(batch.results(), &vectors, k, 0, &RrfConfig::default(), is_hash);
+    let hits = rrf_fuse_for_vector_lane(
+        batch.results(),
+        &vectors,
+        k,
+        0,
+        &RrfConfig::default(),
+        is_hash,
+    );
     let mut results = hydrate_winners(cx, lexical, hits, batch).await?;
     let fast: BTreeMap<_, _> = fast_hits
         .iter()
@@ -403,7 +409,12 @@ mod tests {
                 };
                 let results = fast_index
                     .search_hybrid_refined_text(
-                        &cx, &fast, (&quality_index, &quality), &lexical, "query", 1,
+                        &cx,
+                        &fast,
+                        (&quality_index, &quality),
+                        &lexical,
+                        "query",
+                        1,
                     )
                     .await
                     .unwrap();
@@ -424,7 +435,12 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let provider = Provider::new("quality", vec![0.0, 1.0], true);
             let owner = index(
-                &cx, &provider, &[("late", &[0.0, 0.75])], 1, 7, QuantizationFormat::F32,
+                &cx,
+                &provider,
+                &[("late", &[0.0, 0.75])],
+                1,
+                7,
+                QuantizationFormat::F32,
             );
             let results = owner
                 .search_hybrid_quality_text(&cx, &provider, &Lexical::default(), "query", 1)
@@ -442,7 +458,14 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let fast = Provider::new("fast", vec![1.0, 0.0], true);
             let quality = Provider::new("quality", vec![0.0, 1.0], true);
-            let a = index(&cx, &fast, &[("fast", &[1.0, 0.0])], 1, 7, QuantizationFormat::F32);
+            let a = index(
+                &cx,
+                &fast,
+                &[("fast", &[1.0, 0.0])],
+                1,
+                7,
+                QuantizationFormat::F32,
+            );
             let b = index(
                 &cx,
                 &quality,
@@ -453,7 +476,12 @@ mod tests {
             );
             let results = a
                 .search_hybrid_refined_text(
-                    &cx, &fast, (&b, &quality), &Lexical::default(), "query", 3,
+                    &cx,
+                    &fast,
+                    (&b, &quality),
+                    &Lexical::default(),
+                    "query",
+                    3,
                 )
                 .await
                 .unwrap();
@@ -477,11 +505,23 @@ mod tests {
             let a = index(&cx, &fast, &[], 1, 7, QuantizationFormat::F32);
             let lexical = Lexical::default();
             for (generation, nonce) in [(2, 7), (1, 8)] {
-                let b = index(&cx, &quality, &[], generation, nonce, QuantizationFormat::F32);
+                let b = index(
+                    &cx,
+                    &quality,
+                    &[],
+                    generation,
+                    nonce,
+                    QuantizationFormat::F32,
+                );
                 for k in [0, 1] {
                     let error = a
                         .search_hybrid_refined_text(
-                            &cx, &fast, (&b, &quality), &lexical, "query", k,
+                            &cx,
+                            &fast,
+                            (&b, &quality),
+                            &lexical,
+                            "query",
+                            k,
                         )
                         .await
                         .unwrap_err();
@@ -507,11 +547,23 @@ mod tests {
             let fast = Provider::new("fast", vec![1.0, 0.0], true);
             let mut quality = Provider::new("quality", vec![0.0, 1.0], true);
             let a = index(&cx, &fast, &fast_rows(), 1, 7, QuantizationFormat::F32);
-            let b = index(&cx, &quality, &[("late", &[0.0, 1.0])], 1, 7, QuantizationFormat::F32);
+            let b = index(
+                &cx,
+                &quality,
+                &[("late", &[0.0, 1.0])],
+                1,
+                7,
+                QuantizationFormat::F32,
+            );
             quality.substitute = true;
             let error = a
                 .search_hybrid_refined_text(
-                    &cx, &fast, (&b, &quality), &Lexical::default(), "query", 1,
+                    &cx,
+                    &fast,
+                    (&b, &quality),
+                    &Lexical::default(),
+                    "query",
+                    1,
                 )
                 .await
                 .unwrap_err();
@@ -527,10 +579,22 @@ mod tests {
             let fast = Provider::new("fast", vec![1.0, 0.0], true);
             let quality = Provider::new("quality", vec![0.0, 1.0], true);
             let a = index(&cx, &fast, &[], 1, 7, QuantizationFormat::F32);
-            let b = index(&cx, &quality, &[("late", &[0.0, 0.75])], 1, 7, QuantizationFormat::F32);
+            let b = index(
+                &cx,
+                &quality,
+                &[("late", &[0.0, 0.75])],
+                1,
+                7,
+                QuantizationFormat::F32,
+            );
             let results = a
                 .search_hybrid_refined_text(
-                    &cx, &fast, (&b, &quality), &Lexical::default(), "query", 1,
+                    &cx,
+                    &fast,
+                    (&b, &quality),
+                    &Lexical::default(),
+                    "query",
+                    1,
                 )
                 .await
                 .unwrap();
@@ -548,10 +612,22 @@ mod tests {
             let fast = Provider::new("fast-control", vec![1.0, 0.0], false);
             let quality = Provider::new("quality-control", vec![0.0, 1.0], false);
             let a = index(&cx, &fast, &fast_rows(), 1, 7, QuantizationFormat::F32);
-            let b = index(&cx, &quality, &[("late", &[0.0, 1.0])], 1, 7, QuantizationFormat::F32);
+            let b = index(
+                &cx,
+                &quality,
+                &[("late", &[0.0, 1.0])],
+                1,
+                7,
+                QuantizationFormat::F32,
+            );
             let results = a
                 .search_hybrid_refined_text(
-                    &cx, &fast, (&b, &quality), &Lexical::default(), "query", 4,
+                    &cx,
+                    &fast,
+                    (&b, &quality),
+                    &Lexical::default(),
+                    "query",
+                    4,
                 )
                 .await
                 .unwrap();
@@ -565,7 +641,12 @@ mod tests {
             let mixed = index(&cx, &semantic, &[], 1, 7, QuantizationFormat::F32);
             let error = a
                 .search_hybrid_refined_text(
-                    &cx, &fast, (&mixed, &semantic), &Lexical::default(), "query", 0,
+                    &cx,
+                    &fast,
+                    (&mixed, &semantic),
+                    &Lexical::default(),
+                    "query",
+                    0,
                 )
                 .await
                 .unwrap_err();
@@ -581,17 +662,30 @@ mod tests {
             let fast = Provider::new("fast", vec![1.0, 0.0], true);
             let quality = Provider::new("quality", vec![0.0, 1.0], true);
             let a = index(
-                &cx, &fast, &[("shared", &[0.5, 0.5])],
-                1, 7, QuantizationFormat::F32,
+                &cx,
+                &fast,
+                &[("shared", &[0.5, 0.5])],
+                1,
+                7,
+                QuantizationFormat::F32,
             );
             let b = index(
-                &cx, &quality, &[("shared", &[0.0, 0.75])],
-                1, 7, QuantizationFormat::F32,
+                &cx,
+                &quality,
+                &[("shared", &[0.0, 0.75])],
+                1,
+                7,
+                QuantizationFormat::F32,
             );
             let original = a.search_text(&cx, &fast, "query", 1, None).await.unwrap();
             let results = a
                 .search_hybrid_refined_text(
-                    &cx, &fast, (&b, &quality), &Lexical::default(), "query", 1,
+                    &cx,
+                    &fast,
+                    (&b, &quality),
+                    &Lexical::default(),
+                    "query",
+                    1,
                 )
                 .await
                 .unwrap();

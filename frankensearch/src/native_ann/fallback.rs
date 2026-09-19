@@ -93,10 +93,10 @@ impl NativeAnnIndex {
         checkpoint(cx, "native_ann.optional_load_complete")?;
         match loaded {
             Ok(index) => Ok(index),
-            Err(error) => match recovery_reason(&error) {
-                Some(reason) => Ok(Self::exact_with_reason(owner, reason)),
-                None => Err(error),
-            },
+            Err(error) => recovery_reason(&error).map_or_else(
+                || Err(error),
+                |reason| Ok(Self::exact_with_reason(owner, reason)),
+            ),
         }
     }
 
@@ -156,7 +156,10 @@ impl NativeAnnIndex {
             }
             if heap.len() == target
                 && heap.peek().is_some_and(|worst| {
-                    worst.0.score.total_cmp(&score)
+                    worst
+                        .0
+                        .score
+                        .total_cmp(&score)
                         .then_with(|| row.doc_id().cmp(worst.0.doc_id.as_str()))
                         != Ordering::Less
                 })
@@ -165,7 +168,11 @@ impl NativeAnnIndex {
             }
             let hit = RankedHit(VectorHit {
                 index: u32::try_from(physical).map_err(|_| {
-                    invalid("physical_row", "out-of-range", "source row does not fit u32")
+                    invalid(
+                        "physical_row",
+                        "out-of-range",
+                        "source row does not fit u32",
+                    )
                 })?,
                 score,
                 doc_id: row.doc_id().into(),
@@ -194,7 +201,7 @@ fn recovery_reason(error: &SearchError) -> Option<NativeExactReason> {
     }
 }
 
-/// cmp_rank orders better hits first, so the max-heap exposes its WORST hit.
+/// `cmp_rank` orders better hits first, so the max-heap exposes its WORST hit.
 struct RankedHit(VectorHit);
 
 impl PartialEq for RankedHit {
@@ -283,14 +290,19 @@ mod tests {
             for format in [QuantizationFormat::F16, QuantizationFormat::F32] {
                 let owner = owner(format, 1, &rows());
                 let exact = NativeAnnIndex::exact(&cx, Arc::clone(&owner)).unwrap();
-                let ann = NativeAnnIndex::build(
-                    &cx, Arc::clone(&owner), HnswParams::default(), 7,
-                ).unwrap();
+                let ann = NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 7)
+                    .unwrap();
                 for values in [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]] {
                     let query = query(values);
-                    let mut oracle = owner.search_top_k(query.vector(), owner.live_count(), None).unwrap();
+                    let mut oracle = owner
+                        .search_top_k(query.vector(), owner.live_count(), None)
+                        .unwrap();
                     oracle.sort_unstable_by(VectorHit::cmp_rank);
-                    assert_eq!(ann.search(&cx, &query, usize::MAX, Some(owner.record_count())).unwrap(), oracle);
+                    assert_eq!(
+                        ann.search(&cx, &query, usize::MAX, Some(owner.record_count()))
+                            .unwrap(),
+                        oracle
+                    );
                     for k in [0, 1, 2, 3, 4, usize::MAX] {
                         let expected = &oracle[..k.min(oracle.len())];
                         for ef in [None, Some(0), Some(1), Some(usize::MAX)] {
@@ -299,9 +311,12 @@ mod tests {
                     }
                 }
                 assert_eq!(exact.owner_witness(), owner.witness());
-                assert_eq!(exact.retrieval_mode(), NativeRetrievalMode::Exact {
-                    reason: NativeExactReason::Requested,
-                });
+                assert_eq!(
+                    exact.retrieval_mode(),
+                    NativeRetrievalMode::Exact {
+                        reason: NativeExactReason::Requested,
+                    }
+                );
             }
         });
     }
@@ -312,13 +327,25 @@ mod tests {
             let owner = owner(QuantizationFormat::F32, 1, &rows());
             let exact = NativeAnnIndex::exact(&cx, owner).unwrap();
             let calls = Cell::new(0);
-            let hits = exact.search_filtered(&cx, &query([1.0, 0.0]), 2, Some(1), |id| {
-                calls.set(calls.get() + 1);
-                matches!(id, "vertical" | "negative")
-            }).unwrap();
-            assert_eq!(hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(), ["vertical", "negative"]);
+            let hits = exact
+                .search_filtered(&cx, &query([1.0, 0.0]), 2, Some(1), |id| {
+                    calls.set(calls.get() + 1);
+                    matches!(id, "vertical" | "negative")
+                })
+                .unwrap();
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["vertical", "negative"]
+            );
             assert_eq!(calls.get(), 4); // Tombstones never reach the predicate.
-            assert!(exact.search_filtered(&cx, &query([1.0, 0.0]), 2, None, |_| false).unwrap().is_empty());
+            assert!(
+                exact
+                    .search_filtered(&cx, &query([1.0, 0.0]), 2, None, |_| false)
+                    .unwrap()
+                    .is_empty()
+            );
             let tied = exact.search(&cx, &query([1.0, 0.0]), 1, None).unwrap();
             assert_eq!(tied[0].doc_id, "a-tie");
             assert_eq!(tied[0].index, 2);
@@ -334,14 +361,20 @@ mod tests {
             assert!(NativeAnnIndex::load(&cx, Arc::clone(&owner), &path).is_err());
             let weak = Arc::downgrade(&owner);
             let recovered = NativeAnnIndex::load_or_exact(&cx, Arc::clone(&owner), &path).unwrap();
-            assert_eq!(recovered.retrieval_mode(), NativeRetrievalMode::Exact {
-                reason: NativeExactReason::SidecarMissing,
-            });
+            assert_eq!(
+                recovered.retrieval_mode(),
+                NativeRetrievalMode::Exact {
+                    reason: NativeExactReason::SidecarMissing,
+                }
+            );
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
             drop(owner);
             drop(dir);
             assert!(weak.upgrade().is_some());
-            assert_eq!(recovered.search(&cx, &query([1.0, 0.0]), 1, None).unwrap()[0].doc_id, "a-tie");
+            assert_eq!(
+                recovered.search(&cx, &query([1.0, 0.0]), 1, None).unwrap()[0].doc_id,
+                "a-tie"
+            );
             drop(recovered);
             assert!(weak.upgrade().is_none());
         });
@@ -353,7 +386,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().canonicalize().unwrap().join("valid.fshnsw");
             let owner = owner(QuantizationFormat::F32, 1, &rows());
-            let original = NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 7).unwrap();
+            let original =
+                NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 7).unwrap();
             original.save(&cx, &path).unwrap();
             let graph_before = std::fs::read(&path).unwrap();
             let receipt_path = dir.path().join("valid.fshnsw.receipt");
@@ -361,7 +395,10 @@ mod tests {
             let loaded = NativeAnnIndex::load_or_exact(&cx, owner, &path).unwrap();
             assert_eq!(loaded.retrieval_mode(), NativeRetrievalMode::Ann);
             let query = query([1.0, 0.0]);
-            assert_eq!(loaded.search(&cx, &query, 3, None).unwrap(), original.search(&cx, &query, 3, None).unwrap());
+            assert_eq!(
+                loaded.search(&cx, &query, 3, None).unwrap(),
+                original.search(&cx, &query, 3, None).unwrap()
+            );
             assert_eq!(std::fs::read(&path).unwrap(), graph_before);
             assert_eq!(std::fs::read(receipt_path).unwrap(), receipt_before);
         });
@@ -373,9 +410,15 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().canonicalize().unwrap().join("stale.fshnsw");
             let old = owner(QuantizationFormat::F32, 1, &rows());
-            NativeAnnIndex::build(&cx, old, HnswParams::default(), 7).unwrap().save(&cx, &path).unwrap();
+            NativeAnnIndex::build(&cx, old, HnswParams::default(), 7)
+                .unwrap()
+                .save(&cx, &path)
+                .unwrap();
             let receipt_path = dir.path().join("stale.fshnsw.receipt");
-            let before = (std::fs::read(&path).unwrap(), std::fs::read(&receipt_path).unwrap());
+            let before = (
+                std::fs::read(&path).unwrap(),
+                std::fs::read(&receipt_path).unwrap(),
+            );
             // Same IDs and dimensions, but another generation and changed vectors.
             let mut successor_rows = rows();
             successor_rows[1].1 = [0.0, 1.0];
@@ -383,13 +426,26 @@ mod tests {
             successor_rows[3].1 = [1.0, 0.0];
             let successor = owner(QuantizationFormat::F32, 2, &successor_rows);
             assert!(NativeAnnIndex::load(&cx, Arc::clone(&successor), &path).is_err());
-            let recovered = NativeAnnIndex::load_or_exact(&cx, Arc::clone(&successor), &path).unwrap();
-            assert_eq!(recovered.retrieval_mode(), NativeRetrievalMode::Exact {
-                reason: NativeExactReason::SidecarRejected,
-            });
+            let recovered =
+                NativeAnnIndex::load_or_exact(&cx, Arc::clone(&successor), &path).unwrap();
+            assert_eq!(
+                recovered.retrieval_mode(),
+                NativeRetrievalMode::Exact {
+                    reason: NativeExactReason::SidecarRejected,
+                }
+            );
             assert_eq!(recovered.owner_witness(), successor.witness());
-            assert_eq!(recovered.search(&cx, &query([1.0, 0.0]), 1, None).unwrap()[0].doc_id, "vertical");
-            assert_eq!((std::fs::read(&path).unwrap(), std::fs::read(receipt_path).unwrap()), before);
+            assert_eq!(
+                recovered.search(&cx, &query([1.0, 0.0]), 1, None).unwrap()[0].doc_id,
+                "vertical"
+            );
+            assert_eq!(
+                (
+                    std::fs::read(&path).unwrap(),
+                    std::fs::read(receipt_path).unwrap()
+                ),
+                before
+            );
         });
     }
 
@@ -399,15 +455,24 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().canonicalize().unwrap().join("broken.fshnsw");
             let owner = owner(QuantizationFormat::F32, 1, &rows());
-            NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 7).unwrap().save(&cx, &path).unwrap();
+            NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 7)
+                .unwrap()
+                .save(&cx, &path)
+                .unwrap();
             std::fs::write(&path, b"broken").unwrap();
             let receipt_path = dir.path().join("broken.fshnsw.receipt");
             let receipt = std::fs::read(&receipt_path).unwrap();
             let recovered = NativeAnnIndex::load_or_exact(&cx, owner, &path).unwrap();
-            assert_eq!(recovered.retrieval_mode(), NativeRetrievalMode::Exact {
-                reason: NativeExactReason::SidecarRejected,
-            });
-            assert_eq!(recovered.search(&cx, &query([1.0, 0.0]), 1, None).unwrap()[0].doc_id, "a-tie");
+            assert_eq!(
+                recovered.retrieval_mode(),
+                NativeRetrievalMode::Exact {
+                    reason: NativeExactReason::SidecarRejected,
+                }
+            );
+            assert_eq!(
+                recovered.search(&cx, &query([1.0, 0.0]), 1, None).unwrap()[0].doc_id,
+                "a-tie"
+            );
             assert_eq!(std::fs::read(path).unwrap(), b"broken");
             assert_eq!(std::fs::read(receipt_path).unwrap(), receipt);
         });
@@ -416,14 +481,21 @@ mod tests {
     #[test]
     fn exact_identity_admission_precedes_zero_k_and_all_predicate_calls() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let exact = NativeAnnIndex::exact(&cx, owner(QuantizationFormat::F32, 1, &rows())).unwrap();
-            let foreign = BoundQueryEmbedding::new(vec![1.0, 0.0], EmbeddingIdentityBundleV1::explicit_test_model("foreign", 2)).unwrap();
+            let exact =
+                NativeAnnIndex::exact(&cx, owner(QuantizationFormat::F32, 1, &rows())).unwrap();
+            let foreign = BoundQueryEmbedding::new(
+                vec![1.0, 0.0],
+                EmbeddingIdentityBundleV1::explicit_test_model("foreign", 2),
+            )
+            .unwrap();
             let calls = Cell::new(0);
             for k in [0, 1] {
-                let error = exact.search_filtered(&cx, &foreign, k, None, |_| {
-                    calls.set(calls.get() + 1);
-                    true
-                }).unwrap_err();
+                let error = exact
+                    .search_filtered(&cx, &foreign, k, None, |_| {
+                        calls.set(calls.get() + 1);
+                        true
+                    })
+                    .unwrap_err();
                 assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
                     if field == "query_embedding.native_ann.space_identity"));
             }
@@ -435,10 +507,17 @@ mod tests {
     fn exact_handles_never_implicitly_build_or_save_a_graph() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().canonicalize().unwrap().join("not-written.fshnsw");
-            let exact = NativeAnnIndex::exact(&cx, owner(QuantizationFormat::F32, 1, &rows())).unwrap();
-            assert!(matches!(exact.save(&cx, &path), Err(SearchError::InvalidConfig { ref field, .. })
-                if field == "native_ann.save"));
+            let path = dir
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("not-written.fshnsw");
+            let exact =
+                NativeAnnIndex::exact(&cx, owner(QuantizationFormat::F32, 1, &rows())).unwrap();
+            assert!(
+                matches!(exact.save(&cx, &path), Err(SearchError::InvalidConfig { ref field, .. })
+                if field == "native_ann.save")
+            );
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
             assert_eq!(exact.live_count(), 4);
         });
@@ -447,15 +526,34 @@ mod tests {
     #[test]
     fn recovery_policy_does_not_swallow_cancellation_or_invalid_configuration() {
         for error in [
-            SearchError::Cancelled { phase: "test".to_owned(), reason: "stop".to_owned() },
+            SearchError::Cancelled {
+                phase: "test".to_owned(),
+                reason: "stop".to_owned(),
+            },
             invalid("path", "invalid", "caller error"),
-            SearchError::DimensionMismatch { expected: 2, found: 3 },
+            SearchError::DimensionMismatch {
+                expected: 2,
+                found: 3,
+            },
         ] {
             assert_eq!(recovery_reason(&error), None);
         }
-        assert_eq!(recovery_reason(&SearchError::IndexNotFound { path: "missing.fshnsw".into() }), Some(NativeExactReason::SidecarMissing));
-        assert_eq!(recovery_reason(&SearchError::Io(std::io::Error::from(ErrorKind::NotFound))), Some(NativeExactReason::SidecarMissing));
-        assert_eq!(recovery_reason(&SearchError::Io(std::io::Error::from(ErrorKind::PermissionDenied))), Some(NativeExactReason::SidecarUnreadable));
+        assert_eq!(
+            recovery_reason(&SearchError::IndexNotFound {
+                path: "missing.fshnsw".into()
+            }),
+            Some(NativeExactReason::SidecarMissing)
+        );
+        assert_eq!(
+            recovery_reason(&SearchError::Io(std::io::Error::from(ErrorKind::NotFound))),
+            Some(NativeExactReason::SidecarMissing)
+        );
+        assert_eq!(
+            recovery_reason(&SearchError::Io(std::io::Error::from(
+                ErrorKind::PermissionDenied
+            ))),
+            Some(NativeExactReason::SidecarUnreadable)
+        );
     }
 
     struct Provider {
@@ -466,7 +564,11 @@ mod tests {
 
     impl Provider {
         fn new(cancelled: bool) -> Self {
-            Self { identity: identity(), calls: AtomicUsize::new(0), cancelled }
+            Self {
+                identity: identity(),
+                calls: AtomicUsize::new(0),
+                cancelled,
+            }
         }
     }
 
@@ -475,31 +577,62 @@ mod tests {
             Box::pin(async move {
                 self.calls.fetch_add(1, AtomicOrdering::SeqCst);
                 if self.cancelled {
-                    return Err(SearchError::Cancelled { phase: "test.provider".to_owned(), reason: "stop".to_owned() });
+                    return Err(SearchError::Cancelled {
+                        phase: "test.provider".to_owned(),
+                        reason: "stop".to_owned(),
+                    });
                 }
                 Ok(vec![1.0, 0.0])
             })
         }
-        fn embed_bound<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, IdentityBoundEmbedding> {
-            Box::pin(async move { Ok(IdentityBoundEmbedding {
-                values: self.embed(cx, text).await?, identity: self.identity.clone(),
-            }) })
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+            Box::pin(async move {
+                Ok(IdentityBoundEmbedding {
+                    values: self.embed(cx, text).await?,
+                    identity: self.identity.clone(),
+                })
+            })
         }
-        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> { Ok(&self.identity) }
-        fn id(&self) -> &'static str { "native-exact-fallback" }
-        fn model_name(&self) -> &str { self.id() }
-        fn dimension(&self) -> usize { 2 }
-        fn is_ready(&self) -> bool { true }
-        fn is_semantic(&self) -> bool { false }
-        fn category(&self) -> ModelCategory { ModelCategory::HashEmbedder }
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+        fn id(&self) -> &'static str {
+            "native-exact-fallback"
+        }
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn is_semantic(&self) -> bool {
+            false
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
     }
 
     struct EmptyLexical;
     impl LexicalRead for EmptyLexical {
-        fn search<'a>(&'a self, _cx: &'a Cx, _text: &'a str, _limit: usize) -> SearchFuture<'a, Vec<ScoredResult>> {
+        fn search<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _text: &'a str,
+            _limit: usize,
+        ) -> SearchFuture<'a, Vec<ScoredResult>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn doc_count(&self) -> SearchResult<usize> { Ok(0) }
+        fn doc_count(&self) -> SearchResult<usize> {
+            Ok(0)
+        }
     }
 
     #[test]
@@ -512,14 +645,33 @@ mod tests {
             let quality_provider = Provider::new(false);
             let lexical = EmptyLexical;
             for (fast, quality) in [(&exact, &ann), (&ann, &exact)] {
-                let mut phases = fast.search_hybrid_progressive(
-                    &cx, &fast_provider, Some((quality, &quality_provider)), &lexical, "query", 1,
-                ).unwrap();
-                let NativeSearchPhase::Initial { results, .. } = phases.next_phase().await.unwrap().unwrap() else { panic!("initial") };
+                let mut phases = fast
+                    .search_hybrid_progressive(
+                        &cx,
+                        &fast_provider,
+                        Some((quality, &quality_provider)),
+                        &lexical,
+                        "query",
+                        1,
+                    )
+                    .unwrap();
+                let NativeSearchPhase::Initial { results, .. } =
+                    phases.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("initial")
+                };
                 assert_eq!(results[0].doc_id, "a-tie");
-                let NativeSearchPhase::Refined { results, .. } = phases.next_phase().await.unwrap().unwrap() else { panic!("refined") };
+                let NativeSearchPhase::Refined { results, .. } =
+                    phases.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("refined")
+                };
                 assert_eq!(results[0].doc_id, "a-tie");
-                assert!(results.iter().all(|hit| hit.source == crate::ScoreSource::HashControl));
+                assert!(
+                    results
+                        .iter()
+                        .all(|hit| hit.source == crate::ScoreSource::HashControl)
+                );
                 assert!(phases.next_phase().await.unwrap().is_none());
             }
             assert_eq!(fast_provider.calls.load(AtomicOrdering::SeqCst), 2);
@@ -530,14 +682,24 @@ mod tests {
     #[test]
     fn exact_text_cancellation_is_not_retried_and_empty_owners_skip_inference() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let exact = NativeAnnIndex::exact(&cx, owner(QuantizationFormat::F32, 1, &rows())).unwrap();
+            let exact =
+                NativeAnnIndex::exact(&cx, owner(QuantizationFormat::F32, 1, &rows())).unwrap();
             let provider = Provider::new(true);
-            assert!(matches!(exact.search_text(&cx, &provider, "query", 1, None).await,
-                Err(SearchError::Cancelled { ref phase, .. }) if phase == "test.provider"));
+            assert!(
+                matches!(exact.search_text(&cx, &provider, "query", 1, None).await,
+                Err(SearchError::Cancelled { ref phase, .. }) if phase == "test.provider")
+            );
             assert_eq!(provider.calls.load(AtomicOrdering::SeqCst), 1);
             for rows in [Vec::new(), vec![("dead", [1.0, 0.0], false)]] {
-                let empty = NativeAnnIndex::exact(&cx, owner(QuantizationFormat::F32, 1, &rows)).unwrap();
-                assert!(empty.search_text(&cx, &provider, "query", 10, None).await.unwrap().is_empty());
+                let empty =
+                    NativeAnnIndex::exact(&cx, owner(QuantizationFormat::F32, 1, &rows)).unwrap();
+                assert!(
+                    empty
+                        .search_text(&cx, &provider, "query", 10, None)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
                 assert_eq!(empty.live_count(), 0);
             }
             assert_eq!(provider.calls.load(AtomicOrdering::SeqCst), 1);

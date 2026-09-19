@@ -51,14 +51,18 @@ impl RerankRequest<'_> {
             checkpoint(cx, "native_ann.rerank_text")?;
             if !seen.insert(candidate.doc_id.as_str()) {
                 return Err(invalid(
-                    "rerank.candidates", "duplicate-id",
+                    "rerank.candidates",
+                    "duplicate-id",
                     "reranking requires unique candidate document identities",
                 ));
             }
             let text = (self.text)(candidate.doc_id.as_str());
             checkpoint(cx, "native_ann.rerank_text_complete")?;
             if let Some(text) = text {
-                documents.push(RerankDocument { doc_id: candidate.doc_id.to_string(), text });
+                documents.push(RerankDocument {
+                    doc_id: candidate.doc_id.to_string(),
+                    text,
+                });
                 positions.push(position);
             }
         }
@@ -72,7 +76,8 @@ impl RerankRequest<'_> {
         let response = response?;
         if response.len() != documents.len() {
             return Err(invalid(
-                "rerank.response", "cardinality",
+                "rerank.response",
+                "cardinality",
                 "the reranker must return exactly one score for each submitted document",
             ));
         }
@@ -81,30 +86,44 @@ impl RerankRequest<'_> {
         for score in response {
             checkpoint(cx, "native_ann.rerank_admission")?;
             let Some(document) = documents.get(score.original_rank) else {
-                return Err(invalid("rerank.response", "rank-range", "rerank rank is outside its input batch"));
+                return Err(invalid(
+                    "rerank.response",
+                    "rank-range",
+                    "rerank rank is outside its input batch",
+                ));
             };
             if seen_ranks[score.original_rank] || score.doc_id != document.doc_id {
                 return Err(invalid(
-                    "rerank.response", "identity-permutation",
+                    "rerank.response",
+                    "identity-permutation",
                     "returned ranks must be a permutation of the exact submitted document identities",
                 ));
             }
             if !score.score.is_finite() || score.raw_logit.is_some_and(|value| !value.is_finite()) {
-                return Err(invalid("rerank.response", "non-finite", "rerank scores and supplied logits must be finite"));
+                return Err(invalid(
+                    "rerank.response",
+                    "non-finite",
+                    "rerank scores and supplied logits must be finite",
+                ));
             }
             seen_ranks[score.original_rank] = true;
             scores[positions[score.original_rank]] = Some(score.score);
         }
         let mut order: Vec<_> = (0..candidates.len()).collect();
         order.sort_unstable_by(|&left, &right| match (scores[left], scores[right]) {
-            (Some(a), Some(b)) => b.total_cmp(&a)
+            (Some(a), Some(b)) => b
+                .total_cmp(&a)
                 .then_with(|| candidates[left].doc_id.cmp(&candidates[right].doc_id)),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (None, None) => left.cmp(&right),
         });
         checkpoint(cx, "native_ann.rerank_plan_complete")?;
-        Ok(Some(RerankPlan { order, scores, evaluated: documents.len() }))
+        Ok(Some(RerankPlan {
+            order,
+            scores,
+            evaluated: documents.len(),
+        }))
     }
 }
 
@@ -122,7 +141,9 @@ impl RerankPlan {
         let mut ordered = Vec::with_capacity(candidates.len());
         for position in self.order {
             // order is a private, complete permutation constructed above.
-            let mut candidate = candidates[position].take().expect("admitted rerank permutation");
+            let mut candidate = candidates[position]
+                .take()
+                .expect("admitted rerank permutation");
             if let Some(score) = self.scores[position] {
                 let result = result(&mut candidate);
                 result.rerank_score = Some(score);

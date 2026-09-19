@@ -16,12 +16,12 @@ use frankensearch_quill::{QuillConfig, QuillSearchIndex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::NativeBuiltHybridIndex;
-use super::super::{NativeBuiltIndex, NativeReopenLimits};
 use super::super::snapshot::{
-    Artifact, checked_directory, create_private_new, ensure_absent, open_regular,
-    read_selected, require_seal_platform, sync_directory, verify_selected,
+    Artifact, checked_directory, create_private_new, ensure_absent, open_regular, read_selected,
+    require_seal_platform, sync_directory, verify_selected,
 };
+use super::super::{NativeBuiltIndex, NativeReopenLimits};
+use super::NativeBuiltHybridIndex;
 use crate::native_ann::{checkpoint, invalid};
 use crate::{Cx, Embedder, SearchError, SearchResult};
 
@@ -60,8 +60,10 @@ impl Default for NativeHybridReopenLimits {
 impl NativeHybridReopenLimits {
     fn validate(self) -> SearchResult<()> {
         self.vectors.validate()?;
-        if self.max_lexical_files == 0 || self.max_lexical_files > MAX_FILES
-            || self.max_lexical_file_bytes == 0 || self.max_lexical_bytes == 0
+        if self.max_lexical_files == 0
+            || self.max_lexical_files > MAX_FILES
+            || self.max_lexical_file_bytes == 0
+            || self.max_lexical_bytes == 0
         {
             return Err(rejected("limits", "invalid lexical input limits"));
         }
@@ -96,10 +98,17 @@ impl LexicalSeal {
         let mut files = Vec::new();
         let mut total = 0_u64;
         for name in names {
-            let remaining = limits.max_lexical_bytes.checked_sub(total)
+            let remaining = limits
+                .max_lexical_bytes
+                .checked_sub(total)
                 .ok_or_else(|| rejected("size", "lexical byte count exceeds the build limit"))?;
-            let bytes = fingerprint_file(cx, &directory.join(&name), remaining.min(limits.max_lexical_file_bytes))?;
-            total = total.checked_add(bytes.byte_len)
+            let bytes = fingerprint_file(
+                cx,
+                &directory.join(&name),
+                remaining.min(limits.max_lexical_file_bytes),
+            )?;
+            total = total
+                .checked_add(bytes.byte_len)
                 .ok_or_else(|| rejected("size", "lexical byte count overflowed"))?;
             files.push(LexicalFile { name, bytes });
         }
@@ -111,7 +120,10 @@ impl LexicalSeal {
     fn validate(&self, limits: NativeHybridReopenLimits) -> SearchResult<()> {
         limits.validate()?;
         if self.files.is_empty() || self.files.len() > limits.max_lexical_files {
-            return Err(rejected("inventory", "lexical inventory exceeds its file-count bound"));
+            return Err(rejected(
+                "inventory",
+                "lexical inventory exceeds its file-count bound",
+            ));
         }
         let mut previous: Option<&str> = None;
         let mut total = 0_u64;
@@ -119,28 +131,53 @@ impl LexicalSeal {
         for file in &self.files {
             validate_name(&file.name)?;
             if previous.is_some_and(|name| name >= file.name.as_str()) {
-                return Err(rejected("inventory", "lexical names must be unique and ordered"));
+                return Err(rejected(
+                    "inventory",
+                    "lexical names must be unique and ordered",
+                ));
             }
             previous = Some(&file.name);
             manifest |= file.name == "MANIFEST";
             file.bytes.validate()?;
-            total = total.checked_add(file.bytes.byte_len)
+            total = total
+                .checked_add(file.bytes.byte_len)
                 .ok_or_else(|| rejected("size", "lexical byte count overflowed"))?;
-            if file.bytes.byte_len > limits.max_lexical_file_bytes || total > limits.max_lexical_bytes {
-                return Err(rejected("size", "selected lexical input exceeds its limits"));
+            if file.bytes.byte_len > limits.max_lexical_file_bytes
+                || total > limits.max_lexical_bytes
+            {
+                return Err(rejected(
+                    "size",
+                    "selected lexical input exceeds its limits",
+                ));
             }
         }
         if !manifest {
-            return Err(rejected("manifest", "a finalized primary MANIFEST is required"));
+            return Err(rejected(
+                "manifest",
+                "a finalized primary MANIFEST is required",
+            ));
         }
         Ok(())
     }
 
-    fn verify(&self, cx: &Cx, directory: &Path, limits: NativeHybridReopenLimits, sync: bool) -> SearchResult<()> {
+    fn verify(
+        &self,
+        cx: &Cx,
+        directory: &Path,
+        limits: NativeHybridReopenLimits,
+        sync: bool,
+    ) -> SearchResult<()> {
         self.validate(limits)?;
         let names = lexical_names(cx, directory, limits.max_lexical_files)?;
-        if !names.iter().map(String::as_str).eq(self.files.iter().map(|file| file.name.as_str())) {
-            return Err(rejected("inventory", "lexical artifacts differ from the selected inventory"));
+        if !names
+            .iter()
+            .map(String::as_str)
+            .eq(self.files.iter().map(|file| file.name.as_str()))
+        {
+            return Err(rejected(
+                "inventory",
+                "lexical artifacts differ from the selected inventory",
+            ));
         }
         for file in &self.files {
             let path = directory.join(&file.name);
@@ -197,13 +234,19 @@ impl NativeBuiltHybridIndex {
         self.lexical_seal.verify(cx, &lexical_path, limits, false)?;
         let saved = HybridSnapshot {
             schema: HYBRID_SCHEMA.to_owned(),
-            vectors: Artifact { byte_len: vectors.byte_len, sha256: vectors.sha256 },
+            vectors: Artifact {
+                byte_len: vectors.byte_len,
+                sha256: vectors.sha256,
+            },
             lexical: self.lexical_seal.clone(),
         };
         let bytes = serde_json::to_vec(&saved)
             .map_err(|_| rejected("encoding", "could not encode hybrid descriptor"))?;
         if bytes.len() as u64 > MAX_DESCRIPTOR_BYTES {
-            return Err(rejected("size", "hybrid descriptor exceeds its format bound"));
+            return Err(rejected(
+                "size",
+                "hybrid descriptor exceeds its format bound",
+            ));
         }
         checkpoint(cx, "native_ann.hybrid_snapshot.seal_commit")?;
         let mut file = create_private_new(&directory.join(HYBRID_FILE))?;
@@ -241,7 +284,15 @@ impl NativeBuiltHybridIndex {
         fast: Arc<dyn Embedder>,
         quality: Option<Arc<dyn Embedder>>,
     ) -> SearchResult<Self> {
-        Self::open_selected_with_limits(cx, directory, expected, fast, quality, NativeHybridReopenLimits::default()).await
+        Self::open_selected_with_limits(
+            cx,
+            directory,
+            expected,
+            fast,
+            quality,
+            NativeHybridReopenLimits::default(),
+        )
+        .await
     }
 
     /// Selected hybrid reopening with explicit source/vector and lexical limits.
@@ -264,8 +315,16 @@ impl NativeBuiltHybridIndex {
         checkpoint(cx, "native_ann.hybrid_snapshot.open_start")?;
         limits.validate()?;
         let directory = checked_directory(directory.as_ref())?;
-        let receipt = Artifact { byte_len: expected.byte_len, sha256: expected.sha256 };
-        let bytes = read_selected(cx, &directory.join(HYBRID_FILE), receipt, MAX_DESCRIPTOR_BYTES)?;
+        let receipt = Artifact {
+            byte_len: expected.byte_len,
+            sha256: expected.sha256,
+        };
+        let bytes = read_selected(
+            cx,
+            &directory.join(HYBRID_FILE),
+            receipt,
+            MAX_DESCRIPTOR_BYTES,
+        )?;
         let saved: HybridSnapshot = serde_json::from_slice(&bytes)
             .map_err(|_| rejected("schema", "malformed hybrid snapshot descriptor"))?;
         if saved.schema != HYBRID_SCHEMA {
@@ -276,7 +335,12 @@ impl NativeBuiltHybridIndex {
         let lexical_path = checked_directory(&directory.join("lexical"))?;
         saved.lexical.verify(cx, &lexical_path, limits, false)?;
         let vectors = NativeBuiltIndex::open_selected_with_limits(
-            cx, &directory, &saved.vectors.receipt(), fast, quality, limits.vectors,
+            cx,
+            &directory,
+            &saved.vectors.receipt(),
+            fast,
+            quality,
+            limits.vectors,
         )?;
         let response = QuillSearchIndex::open(cx, &lexical_path, QuillConfig::default()).await;
         checkpoint(cx, "native_ann.hybrid_snapshot.lexical_opened")?;
@@ -287,10 +351,19 @@ impl NativeBuiltHybridIndex {
 }
 
 fn validate_name(name: &str) -> SearchResult<()> {
-    if name.is_empty() || name.len() > 255 || name == "." || name == ".." || name == "LOCK"
-        || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    if name.is_empty()
+        || name.len() > 255
+        || name == "."
+        || name == ".."
+        || name == "LOCK"
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
-        return Err(rejected("name", "lexical artifacts must have safe single-component ASCII names"));
+        return Err(rejected(
+            "name",
+            "lexical artifacts must have safe single-component ASCII names",
+        ));
     }
     Ok(())
 }
@@ -305,11 +378,16 @@ fn lexical_names(cx: &Cx, directory: &Path, limit: usize) -> SearchResult<Vec<St
             // QuillSearchIndex does not read writer-admission LOCK state.
             continue;
         }
-        let name = entry.file_name().into_string()
+        let name = entry
+            .file_name()
+            .into_string()
             .map_err(|_| rejected("name", "lexical filename is not UTF-8"))?;
         validate_name(&name)?;
         if names.len() >= limit || !entry.file_type()?.is_file() {
-            return Err(rejected("inventory", "lexical file count or file type is not admissible"));
+            return Err(rejected(
+                "inventory",
+                "lexical file count or file type is not admissible",
+            ));
         }
         names.push(name);
     }
@@ -329,8 +407,11 @@ fn fingerprint_file(cx: &Cx, path: &Path, limit: u64) -> SearchResult<Artifact> 
     loop {
         checkpoint(cx, "native_ann.hybrid_snapshot.capture_chunk")?;
         let read = file.read(&mut buffer)?;
-        if read == 0 { break; }
-        observed = observed.checked_add(read as u64)
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(read as u64)
             .ok_or_else(|| rejected("size", "lexical byte count overflowed"))?;
         if observed > byte_len {
             return Err(rejected("size", "lexical file grew during capture"));
@@ -340,7 +421,10 @@ fn fingerprint_file(cx: &Cx, path: &Path, limit: u64) -> SearchResult<Artifact> 
     if observed != byte_len {
         return Err(rejected("size", "lexical file changed during capture"));
     }
-    Ok(Artifact { byte_len, sha256: hash.finalize().into() })
+    Ok(Artifact {
+        byte_len,
+        sha256: hash.finalize().into(),
+    })
 }
 
 fn rejected(field: &str, reason: &str) -> SearchError {
