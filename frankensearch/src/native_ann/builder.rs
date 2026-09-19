@@ -49,6 +49,10 @@ pub use hybrid::{NativeBuiltHybridIndex, NativeHybridReopenLimits};
 #[cfg(feature = "quill")]
 pub mod live;
 
+/// Caller-clock deadlines for complete native hybrid queries.
+#[cfg(feature = "quill")]
+pub mod deadline;
+
 /// Persisted vector precision; neither option changes the producing model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
