@@ -40,6 +40,8 @@ impl NativeAnnIndex {
     ///
     /// Propagates retrieval, hydration and cancellation errors. A partially
     /// hydrated result set is never returned after failure or cancellation.
+    /// A hydration backend that rewrites identities, ordering, scores or row
+    /// provenance is rejected; only metadata may cross this boundary.
     pub async fn search_hybrid_text(
         &self,
         cx: &Cx,
@@ -162,16 +164,94 @@ async fn hydrate_winners(
         checkpoint(cx, "native_ann.hybrid_winner")?;
         results.push(materialize_winner(hit, batch)?);
     }
-    if batch.is_deferred() && results.iter().any(|result| result.lexical_score.is_some()) {
-        checkpoint(cx, "native_ann.hybrid_before_hydration")?;
-        let response = lexical
-            .hydrate_candidates(cx, batch.context(), &mut results)
-            .await;
-        checkpoint(cx, "native_ann.hybrid_after_hydration")?;
-        response?;
-    }
+    hydrate_results(cx, lexical, &mut results, batch).await?;
     checkpoint(cx, "native_ann.hybrid_results_complete")?;
     Ok(results)
+}
+
+/// Metadata is the only backend-owned part of a materialized winner. Keep the
+/// retrieval envelopes private until the complete hydration response is checked.
+/// A failed, cancelled or dropped call leaves every original result untouched.
+async fn hydrate_results(
+    cx: &Cx,
+    lexical: &dyn LexicalRead,
+    results: &mut [ScoredResult],
+    batch: &LexicalCandidateBatch,
+) -> SearchResult<()> {
+    checkpoint(cx, "native_ann.hybrid_before_hydration")?;
+    if !batch.is_deferred() {
+        return Ok(());
+    }
+    let mut staged = Vec::new();
+    for result in results.iter().filter(|result| result.lexical_score.is_some()) {
+        checkpoint(cx, "native_ann.hybrid_stage_hydration")?;
+        staged.push(result.clone());
+    }
+    if staged.is_empty() {
+        return Ok(());
+    }
+    // Do not even expose vector-only winners to the lexical backend. Its pin
+    // authenticates the lexical scoring batch, not arbitrary vector documents.
+    let response = lexical
+        .hydrate_candidates(cx, batch.context(), &mut staged)
+        .await;
+    checkpoint(cx, "native_ann.hybrid_after_hydration")?;
+    response?;
+    for (expected, actual) in results
+        .iter()
+        .filter(|result| result.lexical_score.is_some())
+        .zip(&staged)
+    {
+        checkpoint(cx, "native_ann.hybrid_admit_hydration")?;
+        validate_hydrated_result(expected, actual)?;
+    }
+    checkpoint(cx, "native_ann.hybrid_commit_hydration")?;
+    // The provider receives a slice, so cardinality cannot change. Select by
+    // the ORIGINAL envelopes, never by fields supplied back by that provider.
+    for (result, hydrated) in results
+        .iter_mut()
+        .filter(|result| result.lexical_score.is_some())
+        .zip(staged)
+    {
+        result.metadata = hydrated.metadata;
+    }
+    Ok(())
+}
+
+fn validate_hydrated_result(expected: &ScoredResult, actual: &ScoredResult) -> SearchResult<()> {
+    // Exhaustive destructuring makes new result fields require an explicit
+    // ownership decision here. These envelopes come only from materialize_winner,
+    // which has not attached an explanation or run a reranker yet.
+    let ScoredResult {
+        doc_id,
+        score,
+        source,
+        index,
+        fast_score,
+        quality_score,
+        lexical_score,
+        rerank_score,
+        explanation,
+        metadata: _,
+    } = actual;
+    debug_assert!(expected.explanation.is_none());
+    if doc_id != &expected.doc_id
+        || score.to_bits() != expected.score.to_bits()
+        || source != &expected.source
+        || index != &expected.index
+        || fast_score.map(f32::to_bits) != expected.fast_score.map(f32::to_bits)
+        || quality_score.map(f32::to_bits) != expected.quality_score.map(f32::to_bits)
+        || lexical_score.map(f32::to_bits) != expected.lexical_score.map(f32::to_bits)
+        || rerank_score.map(f32::to_bits) != expected.rerank_score.map(f32::to_bits)
+        || explanation.is_some()
+    {
+        return Err(invalid(
+            "hydration.provenance",
+            "mutated-result",
+            "metadata hydration must preserve document identities, rank order, scores and row provenance",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(
@@ -383,6 +463,12 @@ mod tests {
         Correct,
         Cancelled,
         Pending,
+        AllSubmitted,
+        CancelContext,
+        Rewrite {
+            after: usize,
+            change: fn(&mut [ScoredResult]),
+        },
     }
 
     struct Lexical {
@@ -485,19 +571,21 @@ mod tests {
 
         fn hydrate_candidates<'a>(
             &'a self,
-            _cx: &'a Cx,
+            cx: &'a Cx,
             context: Option<&'a LexicalHydrationContext>,
             results: &'a mut [ScoredResult],
         ) -> SearchFuture<'a, ()> {
             Box::pin(async move {
-                self.hydrations.fetch_add(1, Ordering::SeqCst);
+                let call = self.hydrations.fetch_add(1, Ordering::SeqCst);
                 let _guard = DropCount(&self.hydration_drops);
                 let snapshot = context
                     .and_then(LexicalHydrationContext::downcast_ref::<Arc<usize>>)
                     .filter(|snapshot| Arc::ptr_eq(snapshot, &self.snapshot))
                     .ok_or_else(|| invalid("hydration", "foreign", "foreign scoring snapshot"))?;
-                for result in results {
-                    if result.lexical_score.is_some() {
+                for result in results.iter_mut() {
+                    if result.lexical_score.is_some()
+                        || matches!(self.hydration_reply, HydrationReply::AllSubmitted)
+                    {
                         result.metadata = Some(Arc::new(serde_json::json!({
                             "snapshot": **snapshot,
                         })));
@@ -505,12 +593,22 @@ mod tests {
                     }
                 }
                 match self.hydration_reply {
-                    HydrationReply::Correct => Ok(()),
+                    HydrationReply::Correct | HydrationReply::AllSubmitted => Ok(()),
                     HydrationReply::Cancelled => Err(SearchError::Cancelled {
                         phase: "test.hydration".to_owned(),
                         reason: "cancelled after partial hydration".to_owned(),
                     }),
                     HydrationReply::Pending => std::future::pending().await,
+                    HydrationReply::CancelContext => {
+                        cx.set_cancel_requested(true);
+                        Ok(())
+                    }
+                    HydrationReply::Rewrite { after, change } => {
+                        if call >= after {
+                            change(results);
+                        }
+                        Ok(())
+                    }
                 }
             })
         }
@@ -856,6 +954,231 @@ mod tests {
                 &original
             ));
             assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    fn assert_hydration_refusal(error: SearchError) {
+        assert!(matches!(error, SearchError::InvalidConfig { ref field, ref value, .. }
+            if field == "native_ann.hydration.provenance" && value == "mutated-result"));
+    }
+
+    #[test]
+    fn hydration_rejects_every_retrieval_field_rewrite_before_committing_metadata() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            type Rewrite = fn(&mut [ScoredResult]);
+            let changes: &[(&str, Rewrite)] = &[
+                ("document", |rows| rows[1].doc_id = "foreign".into()),
+                ("order", |rows| rows.swap(0, 1)),
+                ("row", |rows| rows[1].index = Some(u32::MAX)),
+                ("score", |rows| rows[1].score = f32::NAN),
+                ("source", |rows| rows[1].source = ScoreSource::HashControl),
+                ("fast", |rows| rows[1].fast_score = Some(0.0)),
+                ("quality", |rows| rows[1].quality_score = Some(0.0)),
+                ("lexical presence", |rows| rows[1].lexical_score = None),
+                ("lexical bits", |rows| rows[1].lexical_score = Some(0.0)),
+                ("rerank", |rows| rows[1].rerank_score = Some(1.0)),
+                ("explanation", |rows| {
+                    rows[1].explanation = Some(
+                        serde_json::from_value(serde_json::json!({
+                            "components": [], "final_score": 1.0,
+                            "phase": "Initial", "rank_movement": null
+                        }))
+                        .unwrap(),
+                    );
+                }),
+            ];
+            for &(name, change) in changes {
+                let mut lexical = Lexical::new();
+                lexical.hydration_reply = HydrationReply::Rewrite { after: 0, change };
+                let batch = lexical.search_candidates(&cx, "query", 2).await.unwrap();
+                let original_metadata = Arc::new(serde_json::json!({"untouched": true}));
+                let mut first = lexical_result("beta", 10.0);
+                first.metadata = Some(Arc::clone(&original_metadata));
+                let mut results = vec![first, lexical_result("alpha", -0.0)];
+                let before = serde_json::to_value(&results).unwrap();
+                let error = hydrate_results(&cx, &lexical, &mut results, &batch)
+                    .await
+                    .expect_err(name);
+                assert_hydration_refusal(error);
+                assert_eq!(serde_json::to_value(&results).unwrap(), before, "{name}");
+                assert!(Arc::ptr_eq(
+                    results[0].metadata.as_ref().unwrap(),
+                    &original_metadata
+                ));
+                assert_eq!(
+                    results[1].lexical_score.unwrap().to_bits(),
+                    (-0.0_f32).to_bits()
+                );
+                assert_eq!(lexical.hydrated_docs.load(Ordering::SeqCst), 2);
+                assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn hydration_never_submits_vector_only_winners() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, false);
+            let provider = Provider::new(false);
+            let mut lexical = Lexical::new();
+            // This backend hydrates everything it receives. Vector-only hits
+            // must be inaccessible, rather than relying on a backend-side filter.
+            lexical.hydration_reply = HydrationReply::AllSubmitted;
+            let results = index
+                .search_hybrid_text(&cx, &provider, &lexical, "query", 3)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 3);
+            assert!(results[0].metadata.is_some() && results[1].metadata.is_some());
+            assert_eq!(results[2].doc_id, "gamma");
+            assert_eq!(results[2].source, ScoreSource::HashControl);
+            assert_eq!(results[2].index, Some(0));
+            assert!(results[2].metadata.is_none() && results[2].fast_score.is_none());
+            assert_eq!(lexical.hydrated_docs.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn hydration_cancellation_and_pending_drop_leave_original_envelopes_untouched() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut lexical = Lexical::new();
+            let batch = lexical.search_candidates(&cx, "query", 2).await.unwrap();
+            let mut results = vec![
+                lexical_result("beta", 10.0),
+                lexical_result("alpha", 5.0),
+            ];
+            let before = serde_json::to_value(&results).unwrap();
+            lexical.hydration_reply = HydrationReply::Cancelled;
+            assert!(matches!(
+                hydrate_results(&cx, &lexical, &mut results, &batch).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(serde_json::to_value(&results).unwrap(), before);
+            lexical.hydration_reply = HydrationReply::Pending;
+            let mut future = Box::pin(hydrate_results(&cx, &lexical, &mut results, &batch));
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(future);
+            assert_eq!(serde_json::to_value(&results).unwrap(), before);
+            assert_eq!(lexical.hydration_drops.load(Ordering::SeqCst), 2);
+            lexical.hydration_reply = HydrationReply::CancelContext;
+            assert!(matches!(
+                hydrate_results(&cx, &lexical, &mut results, &batch).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(serde_json::to_value(&results).unwrap(), before);
+            assert_eq!(lexical.hydration_drops.load(Ordering::SeqCst), 3);
+            cx.set_cancel_requested(false);
+        });
+    }
+
+    #[test]
+    fn single_and_sharded_public_apis_reject_hydration_row_substitution() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = Arc::new(index(&cx, false));
+            let expected = [index.owner_witness().clone()];
+            let shards = crate::native_ann::NativeShardSet::admit(
+                &cx,
+                &expected,
+                vec![Arc::clone(&index)],
+            )
+            .unwrap();
+            let provider = Provider::new(false);
+            let mut lexical = Lexical::new();
+            lexical.hydration_reply = HydrationReply::Rewrite {
+                after: 0,
+                change: |rows| rows[1].index = Some(u32::MAX),
+            };
+            for response in [
+                index
+                    .search_hybrid_text(&cx, &provider, &lexical, "query", 3)
+                    .await,
+                index
+                    .search_hybrid_quality_text(&cx, &provider, &lexical, "query", 3)
+                    .await,
+                index
+                    .search_hybrid_refined_text(
+                        &cx,
+                        &provider,
+                        (&index, &provider),
+                        &lexical,
+                        "query",
+                        3,
+                    )
+                    .await,
+            ] {
+                assert_hydration_refusal(response.unwrap_err());
+            }
+            for response in [
+                shards
+                    .search_hybrid_text(&cx, &provider, &lexical, "query", 3)
+                    .await,
+                shards
+                    .search_hybrid_quality_text(&cx, &provider, &lexical, "query", 3)
+                    .await,
+                shards
+                    .search_hybrid_refined_text(
+                        &cx,
+                        &provider,
+                        (&shards, &provider),
+                        &lexical,
+                        "query",
+                        3,
+                    )
+                    .await,
+            ] {
+                assert_hydration_refusal(response.unwrap_err());
+            }
+            assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 6);
+        });
+    }
+
+    #[test]
+    fn progressive_hydration_refusal_preserves_the_initial_page() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, false);
+            let provider = Provider::new(false);
+            let mut lexical = Lexical::new();
+            lexical.hydration_reply = HydrationReply::Rewrite {
+                after: 1,
+                change: |rows| rows[1].doc_id = "foreign".into(),
+            };
+            let mut stream = index
+                .search_hybrid_progressive(
+                    &cx,
+                    &provider,
+                    Some((&index, &provider)),
+                    &lexical,
+                    "query",
+                    3,
+                )
+                .unwrap();
+            let NativeSearchPhase::Initial { results, .. } =
+                stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("initial phase");
+            };
+            let before = serde_json::to_value(&results).unwrap();
+            let NativeSearchPhase::RefinementFailed {
+                initial_results,
+                error,
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("failed hydration must not become successful refinement");
+            };
+            assert_hydration_refusal(error);
+            assert_eq!(serde_json::to_value(&initial_results).unwrap(), before);
+            assert!(Arc::ptr_eq(
+                results[0].metadata.as_ref().unwrap(),
+                initial_results[0].metadata.as_ref().unwrap(),
+            ));
+            assert!(stream.is_finished() && stream.next_phase().await.unwrap().is_none());
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 2);
         });
     }
 }
