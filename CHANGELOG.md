@@ -235,10 +235,19 @@ Library-family version bump covering the native ANN work that landed after
 durability, embed, index, lexical, fusion, Quill and storage 0.3.1.
 `frankensearch-quill-gauntlet` remains `publish = false`.
 
-**Publication status at the time of writing: NOT YET PUBLISHED.** These versions
-exist in-tree only; crates.io still serves the 0.6.0 family. This entry records
-the source changes, not a verified publication. No cross-platform binary
-qualification is claimed, and the fsfs binary release remains pending.
+**Published to crates.io on 2026-09-19**, tagged `frankensearch-v0.6.1` at
+`7cc86150`. No cross-platform binary qualification is claimed, and the fsfs binary
+release remains pending.
+
+> **Known defect in this release.** 0.6.1 shipped with **4 failing tests in
+> `native_ann`**, the module it introduces. Row provenance is reported
+> incorrectly: the shard is right but the row index is too high. `doc_id`, scores,
+> tier classification and ordering are unaffected — the defect is in the
+> positional provenance (`index`, `NativeShardRow`) that a caller would use to map
+> a hit back to its source row. Diagnosis and scope:
+> [#53](https://github.com/Dicklesworthstone/frankensearch/issues/53); tracking:
+> [#52](https://github.com/Dicklesworthstone/frankensearch/issues/52).
+> A 0.6.2 is deliberately withheld until that suite is green.
 
 ### Delivered capability: native ANN retrieval over sealed source cohorts
 
