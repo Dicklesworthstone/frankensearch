@@ -18,6 +18,9 @@ use super::live::{NativeHybridResults, NativeLiveHybridIndex};
 use super::{NativeBuiltHybridIndex, checkpoint, invalid};
 use crate::{Cx, ScoredResult, SearchError, SearchResult};
 
+mod progressive;
+pub use progressive::NativeDeadlineProgressiveSearch;
+
 /// A single absolute query deadline in an explicitly retained timer domain.
 ///
 /// Cloning shares the same expiry; it does not grant another budget. This bounds
@@ -265,7 +268,7 @@ mod tests {
         assert!(query.as_mut().poll(&mut Context::from_waker(&first_waker)).is_pending());
         assert!(query.as_mut().poll(&mut Context::from_waker(&second_waker)).is_pending());
         assert_eq!(deadline.timer.pending_count(), 1);
-        clock.advance(Duration::from_millis(10));
+        clock.advance(10_000_000);
         let _ = deadline.timer.process_timers();
         assert_eq!(first.0.load(Ordering::SeqCst), 0);
         assert!(second.0.load(Ordering::SeqCst) > 0);
@@ -302,7 +305,7 @@ mod tests {
         for cancelled in [false, true] {
             let (clock, deadline) = clock(&cx, Duration::from_millis(10));
             let mut query = Box::pin(deadline.run(&cx, async {
-                clock.advance(Duration::from_millis(11));
+                clock.advance(11_000_000);
                 if cancelled {
                     Err(SearchError::Cancelled {
                         phase: "test.provider".to_owned(),
@@ -336,6 +339,13 @@ mod tests {
         let clock = Arc::new(VirtualClock::starting_at(Time::from_nanos(u64::MAX - 1)));
         let timer = TimerDriverHandle::with_virtual_clock(clock);
         assert!(NativeSearchDeadline::with_timer(&cx, timer, Duration::from_nanos(2)).is_err());
+    }
+
+    #[test]
+    fn a_context_without_time_cannot_start_an_ambient_timer() {
+        let cx = Cx::detached_cancel_context();
+        assert!(matches!(NativeSearchDeadline::after(&cx, Duration::from_secs(1)),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "native_ann.deadline.timer"));
     }
 
     #[test]
