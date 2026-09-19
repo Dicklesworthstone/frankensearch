@@ -20,6 +20,7 @@ regressions now pass; combined-source and rebuilt-artifact qualification remain 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | Unreleased fsfs | Release preparation | 2026-09-09–17 | Progressive warm-daemon streaming, indexing cancellation and pressure checks, model reuse, native MiniLM numerical fixes, doctor producer admission, installer profile/offline fixes, and lexical-flush retry retention |
+| frankensearch 0.6.1 | Library family, version bump in-tree (unpublished at time of writing) | 2026-09-18 | Native ANN over sealed source cohorts, progressive lazy reranking, optional Tantivy lexical arm, cancellation-safe embedding leases, NEON/x86 reranker bit parity, Windows publication leases |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
 | [crates-v0.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0) | Library bundle | 2026-09-08 | All 13 publishable members and release evidence share v1.10.0 source; binary release retains latest routing |
@@ -224,6 +225,87 @@ Historical adapter identities remain rejected by strict admission, and the
 ### Known limitations
 
 - **Populated CASS native-consumer acceptance remains pending ([#47](https://github.com/Dicklesworthstone/frankensearch/issues/47)).** The native F32 and Int8 certificate tests now pass on ARM64 macOS as well as Linux x86. Those producer checks do not establish the downstream CASS integration. Standard full binaries use ONNX quality embeddings by default, and the native loader continues to reject mismatched numerical output. [Qualification record](docs/planning/UPGRADE_LOG.md).
+
+---
+
+## frankensearch 0.6.1 — 2026-09-18
+
+Library-family version bump covering the native ANN work that landed after
+0.6.0: facade 0.6.1, rerank 0.4.1, fsfs 1.11.0, ops and TUI 0.3.0, and core,
+durability, embed, index, lexical, fusion, Quill and storage 0.3.1.
+`frankensearch-quill-gauntlet` remains `publish = false`.
+
+**Publication status at the time of writing: NOT YET PUBLISHED.** These versions
+exist in-tree only; crates.io still serves the 0.6.0 family. This entry records
+the source changes, not a verified publication. No cross-platform binary
+qualification is claimed, and the fsfs binary release remains pending.
+
+### Delivered capability: native ANN retrieval over sealed source cohorts
+
+- **Identity-bound FSVI generations built from source documents.** A generation
+  is constructed against the producer identity that made it, so vectors cannot
+  be silently reused across producers. [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/6852e79a830c402ea4e55eb79eda3373c618dfc3).
+- **Progressive retrieval with lazy cross-encoder reranking.** Candidates are
+  pinned first and the cross-encoder runs only over the retained window, so the
+  reranker cost follows the window rather than the candidate pool.
+  [Progressive retrieval](https://github.com/Dicklesworthstone/frankensearch/commit/bba8e2098e4c537415f17c65ef8343d99b60c0a9);
+  [sharded tiers and lazy quality refinement](https://github.com/Dicklesworthstone/frankensearch/commit/733cb7152c915f6f5147b7ea4a1796186032e38f).
+- **Shard generations can be replaced without losing retained readers.** An
+  in-flight reader keeps serving from the generation it opened while a
+  replacement is published. [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/cb13593a8a1c3c5f73fb9f467282771ee92ff459).
+- **Quill source/vector cohorts seal and reopen without re-embedding.** A
+  selected cohort can be sealed, reopened and searched without recomputing its
+  embeddings.
+
+### Lexical backend
+
+- **Optional Tantivy lexical backend beside Quill.** Tantivy becomes a selectable
+  lexical arm rather than a replacement; the writer is created after embedding
+  and never clobbers vectors. [Backend](https://github.com/Dicklesworthstone/frankensearch/commit/b8e74dcad237c46bb2bc078e87546b9f1c0d1118).
+
+### Cancellation and durability
+
+- **Cancellation-safe embedding batch leases.** A cancelled refresh restores its
+  leased jobs instead of publishing a fast-only index, and cancellation is
+  honoured at refresh-cycle boundaries. [Leases](https://github.com/Dicklesworthstone/frankensearch/commit/105d00904cbfa2608708e9be65b9b9a820dd7311).
+- **The generation root is locked until durable publication.** The lock is held
+  across publication so a partially written generation cannot be observed as
+  complete. [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/5eb12fe4fcde53654c8451f94dda039bec5f185a).
+- Durable anti-rollback floor publication is serialized.
+
+### Reranker numerical parity across architectures
+
+- **A non-fused `f32x8` exponential so NEON matches the x86 producer bit for
+  bit.** Fused multiply-add made ARM64 and x86 disagree in the last bits of
+  reranker scores, which breaks producer-certificate attestation for a model
+  indexed on one architecture and served on another.
+  [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/8020489d55e9e8dba770db20098fb5cf523d0802).
+
+### Windows
+
+- **Publication leases use byte-range locks and no-delete shares**, so a
+  published generation cannot be unlinked from under a reader.
+  [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/54a6fdc80af048496be71f0f5cdadc52f4bdf002).
+- Unix-only daemon sockets, signal listener fields and directory fsync are now
+  correctly cfg-gated, and native-only test helpers are scoped to the platforms
+  that support them.
+
+### Installer
+
+- Incumbent installations are preserved and candidate versions must match
+  exactly; a same-version full/lite change now replaces rather than performing a
+  substring no-op; a failed rollback retains its recovery copy; and provisioning
+  covers only the default semantic model pair.
+
+### Repository gate
+
+- `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo fmt --all --check` pass again. The clippy failures were 15 errors
+  confined to `frankensearch/src/native_ann`, alongside 497 rustfmt diffs across
+  16 files in the same module. Four suppressions are recorded at their sites with
+  the constraint that forces them: a trait impl cannot narrow `-> &str` to
+  `-> &'static str`, a callback-typed function cannot drop its `Option`, and a
+  cfg-gated platform check returns `Err` on the platforms clippy did not compile.
 
 ---
 
