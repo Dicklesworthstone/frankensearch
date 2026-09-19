@@ -3323,7 +3323,9 @@ pub mod authority_publisher {
             let guard = root
                 .try_exclusive_anchor_guard()
                 .expect("child takes the exclusive lock");
-            println!("LOCKED");
+            // With one test thread, libtest leaves its test-name prefix on
+            // stdout without a newline. Keep the readiness marker standalone.
+            println!("\nLOCKED");
             std::io::Write::flush(&mut std::io::stdout()).expect("flush");
             std::thread::sleep(std::time::Duration::from_secs(120));
             drop(guard);

@@ -11118,7 +11118,8 @@ mod tests {
         };
         let (_lease, _identity) =
             acquire_family_lease(Path::new(&path)).expect("helper acquires family lease");
-        println!("lease-ready");
+        // Separate the exact readiness marker from libtest's test-name prefix.
+        println!("\nlease-ready");
         std::io::stdout().flush().expect("flush helper readiness");
         let mut release = Vec::new();
         std::io::stdin()
@@ -11172,7 +11173,8 @@ mod tests {
         if std::env::var_os("QUILL_PERF_TEST_INHERITED_LEASE_CHILD").is_none() {
             return;
         }
-        println!("inherited-lease-ready");
+        // The parent requires a standalone line, including with one test thread.
+        println!("\ninherited-lease-ready");
         std::io::stdout().flush().expect("flush helper readiness");
         let mut release = Vec::new();
         std::io::stdin()

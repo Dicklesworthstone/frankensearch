@@ -1,5 +1,49 @@
 # Dependency Upgrade Log
 
+## 2026-09-18 — Dependency qualification follow-through
+
+The repaired Windows model promotion path passes 123 manifest tests, with no
+failures and one existing ignore, on SurfaceBookJE. MiniLM, Snowflake, and Nomic
+each pass their unchanged numerical certificate in a fresh process. The RCH-built
+test executable has SHA-256
+`20f1b5f8e038d2e1089767a533cb4fd79cc78bb91bd7eef6f639bd3e04984651`.
+Verified receipts and log hashes are in the release work directory under
+`dependencies/windows-fastembed701-repair-native-results`.
+
+The explicit-target catalog tests (2), original watcher regression (1), and
+refresh-lease tests (27) pass on the frozen `865e91bd` qualification snapshot.
+That broader run stops at an ANN fixture assertion: FSVI sorts physical rows by
+document hash, so `gamma` occupies row 0 rather than insertion position 2.
+The corrected assertion also checks that physical row 0 contains `gamma`;
+metadata, ranking, and hash-control assertions remain unchanged. The corrected
+ANN hybrid/refinement tests pass 22/0/0. The broader run passes all 78 facade
+tests, 1,131 core tests, 160 durability tests, 497 embedding tests, 2,113 fsfs
+tests, and 1,029 fusion tests, before stopping at two index child-process tests.
+Existing ignores remain unchanged.
+
+Both index failures came from the lock-holder readiness protocol: with one
+test thread, libtest prefixes `LOCKED` with the test name on the same stdout
+line. A remote probe of the exact failing executable confirmed that the child
+acquired the lock but emitted no standalone marker. The child now emits a
+leading newline; the parents' exact marker checks and all lock assertions are
+unchanged. With that repair, the full workspace library stage passes 8,046
+top-level tests with zero failures and 59 existing ignores; nested child-test
+summaries are excluded from that total. Both original lock tests pass. The
+bounded Quill stage also passes 59 tests (39 witness, 12 typed-query replay,
+and 8 native integration tests). The full Quill stage stalled in two additional
+lease-helper handshakes before the outer remote timeout. Its retained executable
+reproduces the same prefixed readiness-line defect. Both helper markers now
+start on their own line, preserving the exact parent checks and lease assertions.
+Full Quill and the remaining fsfs integration, facade, and real-model E2E stages
+are rerunning as separate remote jobs.
+
+On `f4f7564e` with the refinement formatting correction, RCH reports passing
+workspace formatting, check, Clippy, Windows cross-target guard, and facade
+all-feature/all-target checks. The final static rerun also passes after the
+physical-row and lock-marker test corrections. Receipts are retained under
+`dependencies/refresh-f4f7564e-static-r2-evidence`. These scoped results do not
+clear the independent Quill exact-parity gate or qualify release artifacts.
+
 ## 2026-09-17 — Published FrankenSQLite 0.4.4 and stable dependency refresh
 
 The direct registry census covers 68 packages across 17 manifests, including

@@ -731,7 +731,9 @@ mod tests {
             let vector_only = &results[2];
             assert_eq!(vector_only.doc_id, "gamma");
             assert_eq!(vector_only.source, ScoreSource::HashControl);
-            assert_eq!(vector_only.index, Some(2));
+            // FSVI sorts physical rows by document hash, not insertion order.
+            assert_eq!(index.owner.row(0).unwrap().doc_id(), "gamma");
+            assert_eq!(vector_only.index, Some(0));
             assert!(vector_only.metadata.is_none());
             assert!(vector_only.fast_score.is_none());
             assert!(vector_only.lexical_score.is_none());
