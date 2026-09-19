@@ -1300,8 +1300,9 @@ mod tests {
             if std::env::var_os(CHILD_ENV).is_none() {
                 return;
             }
+            // Keep the JSON line separate from libtest's single-thread prefix.
             println!(
-                "{}",
+                "\n{}",
                 replay_receipt().expect("fresh process must emit a receipt")
             );
         }
