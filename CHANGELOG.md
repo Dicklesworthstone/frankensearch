@@ -241,12 +241,35 @@ release remains pending.
 
 > **Known defect in this release.** 0.6.1 shipped with **4 failing tests in
 > `native_ann`**, the module it introduces. Row provenance is reported
-> incorrectly: the shard is right but the row index is too high. `doc_id`, scores,
-> tier classification and ordering are unaffected — the defect is in the
-> positional provenance (`index`, `NativeShardRow`) that a caller would use to map
-> a hit back to its source row. Diagnosis and scope:
-> [#53](https://github.com/Dicklesworthstone/frankensearch/issues/53); tracking:
-> [#52](https://github.com/Dicklesworthstone/frankensearch/issues/52).
+> incorrectly: **the shard is always correct; the row *within* the shard is wrong.**
+> `doc_id`, scores, tier classification and ordering are unaffected — the defect is
+> confined to the positional provenance (`index`, `NativeShardRow`) a caller would
+> use to map a hit back to its source row.
+>
+> **The offset is NOT uniform, and not uniformly in one direction.** Measured
+> deltas (observed − expected):
+>
+> | test | observed | expected | delta |
+> |---|---|---|---|
+> | `hybrid::progressive::…lazy_refinement…` | `Some(2)` | `Some(0)` | **+2** |
+> | `hybrid::sharded::…final_permutation…` | `physical_row 1` | `0` | +1 |
+> | `hybrid::sharded::…shared_winners…` | `physical_row 1` | `0` | +1 |
+> | `shards::…global_top_k…` | `physical_row 1` | `0` | +1 |
+> | `hybrid::…eager_metadata…` (fixed upstream after 0.6.1) | `Some(0)` | `Some(2)` | **−2** |
+>
+> **A blanket "subtract one" fix is wrong**: it would leave the `+2` case off by
+> one and make the `−2` case worse. A single root cause remains plausible — the
+> observable delta may vary with pool size and permutation — but do not assume a
+> constant offset.
+>
+> **Consumers can build against 0.6.1.** Independently verified: the published
+> `.crate` sha256 matches the lockfile, 214 registry sources / zero git sources,
+> and consumer code naming `NativeAnnIndex`, `search_hybrid_progressive`,
+> `ScoredResult.index`, `ScoreSource`, `SearchPhase` and `SearchError` passes
+> `cargo check --locked`. The failures are in test code; 0.6.2 is not an emergency.
+>
+> Diagnosis and scope: [#53](https://github.com/Dicklesworthstone/frankensearch/issues/53);
+> tracking: [#52](https://github.com/Dicklesworthstone/frankensearch/issues/52).
 > A 0.6.2 is deliberately withheld until that suite is green.
 
 ### Delivered capability: native ANN retrieval over sealed source cohorts
