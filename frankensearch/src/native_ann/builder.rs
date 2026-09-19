@@ -45,6 +45,10 @@ mod hybrid;
 #[cfg(feature = "quill")]
 pub use hybrid::{NativeBuiltHybridIndex, NativeHybridReopenLimits};
 
+/// Live whole-cohort serving and stale-safe installation of native hybrid updates.
+#[cfg(feature = "quill")]
+pub mod live;
+
 /// Persisted vector precision; neither option changes the producing model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,11 +108,11 @@ impl TierPlan {
         self.admit(self.embedder.identity()?)?;
         let mut identity = self.identity.clone();
         "fsvi-v2".clone_into(&mut identity.storage.format);
-        "little-endian".clone_into(&mut identity.storage.endianness);
         identity.storage.quantization = match self.precision {
             NativeBuildPrecision::F32 => QuantizationFormat::F32,
             NativeBuildPrecision::F16 => QuantizationFormat::F16,
         };
+        "little-endian".clone_into(&mut identity.storage.endianness);
         FsviV2IdentityBinding::new(*generation, identity.freeze()?)
             .map_err(|error| invalid("builder.binding", "rejected", &error.to_string()))
     }
