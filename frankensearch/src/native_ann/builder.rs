@@ -53,6 +53,10 @@ pub mod live;
 #[cfg(feature = "quill")]
 pub mod deadline;
 
+/// Source-scoped candidate retrieval over a complete retained hybrid cohort.
+#[cfg(feature = "quill")]
+pub mod scope;
+
 /// Persisted vector precision; neither option changes the producing model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

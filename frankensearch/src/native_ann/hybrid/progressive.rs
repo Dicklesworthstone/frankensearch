@@ -1,5 +1,7 @@
 //! Lazy native refinement over the same retained fast and lexical candidates.
 
+use std::collections::BTreeSet;
+
 use frankensearch_core::LexicalCandidateBatch;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::traits::Reranker;
@@ -51,6 +53,7 @@ impl NativeAnnIndex {
             text,
             k,
             reranker: None,
+            allowed_documents: None,
             budget: k.checked_mul(3).ok_or_else(|| {
                 invalid(
                     "progressive.candidate_budget",
@@ -163,10 +166,56 @@ pub struct NativeProgressiveSearch<'a> {
     k: usize,
     budget: usize,
     reranker: Option<RerankRequest<'a>>,
+    // Installed only by the built-cohort scope adapter, together with its
+    // filtered lexical reader. None preserves the ordinary unscoped path.
+    allowed_documents: Option<&'a BTreeSet<String>>,
     state: State,
 }
 
 impl<'a> NativeProgressiveSearch<'a> {
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn with_allowed_documents(
+        mut self,
+        allowed: &'a BTreeSet<String>,
+    ) -> SearchResult<Self> {
+        checkpoint(self.cx, "native_ann.scope.configure")?;
+        if !matches!(self.state, State::Initial) {
+            return Err(invalid(
+                "scope.configuration",
+                "started",
+                "scope membership must be frozen before the first phase",
+            ));
+        }
+        self.allowed_documents = Some(allowed);
+        Ok(self)
+    }
+
+    async fn search_tier(
+        &self,
+        index: &NativeAnnIndex,
+        embedder: &dyn Embedder,
+    ) -> SearchResult<Vec<VectorHit>> {
+        match self.allowed_documents {
+            Some(allowed) => {
+                index
+                    .search_text_filtered(
+                        self.cx,
+                        embedder,
+                        self.text,
+                        self.budget.min(allowed.len()),
+                        None,
+                        |id| allowed.contains(id),
+                    )
+                    .await
+            }
+            None => {
+                index
+                    .search_text(self.cx, embedder, self.text, self.budget, None)
+                    .await
+            }
+        }
+    }
+
     /// Add a lazy final cross-encoder stage before requesting the first phase.
     ///
     /// `top_k` bounds the rerank window, independently of the displayed page.
@@ -269,8 +318,7 @@ impl<'a> NativeProgressiveSearch<'a> {
         }
         let (fast, batch) = join_sources(
             self.cx,
-            self.fast
-                .search_text(self.cx, self.fast_embedder, self.text, self.budget, None),
+            self.search_tier(self.fast, self.fast_embedder),
             checked_lexical(self.cx, self.lexical, self.text, self.budget),
         )
         .await?;
@@ -346,9 +394,7 @@ impl<'a> NativeProgressiveSearch<'a> {
                 "refinement requires its admitted arm",
             )
         })?;
-        let quality_hits = quality
-            .search_text(self.cx, embedder, self.text, self.budget, None)
-            .await?;
+        let quality_hits = self.search_tier(quality, embedder).await?;
         let candidates = NativePhaseCandidates {
             fast: pending.fast.len(),
             quality: quality_hits.len(),
