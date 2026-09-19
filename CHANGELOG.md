@@ -20,7 +20,7 @@ regressions now pass; combined-source and rebuilt-artifact qualification remain 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | Unreleased fsfs | Release preparation | 2026-09-09–17 | Progressive warm-daemon streaming, indexing cancellation and pressure checks, model reuse, native MiniLM numerical fixes, doctor producer admission, installer profile/offline fixes, and lexical-flush retry retention |
-| frankensearch 0.6.1 | Library family, version bump in-tree (unpublished at time of writing) | 2026-09-18 | Native ANN over sealed source cohorts, progressive lazy reranking, optional Tantivy lexical arm, cancellation-safe embedding leases, NEON/x86 reranker bit parity, Windows publication leases |
+| frankensearch 0.6.1 | crates.io publication + `frankensearch-v0.6.1` git tag | 2026-09-19 | Native ANN over sealed source cohorts, progressive lazy reranking, optional Tantivy lexical arm, cancellation-safe embedding leases, NEON/x86 reranker bit parity, Windows publication leases |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
 | [crates-v0.5.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.5.0) | Library bundle | 2026-09-08 | All 13 publishable members and release evidence share v1.10.0 source; binary release retains latest routing |
@@ -43,14 +43,15 @@ regressions now pass; combined-source and rebuilt-artifact qualification remain 
 Changes on `main` after the 2026-09-08 publication. Library changes through
 [`dd093fb2`](https://github.com/Dicklesworthstone/frankensearch/commit/dd093fb230404ab08be2ed6f27776ed6c4796485)
 are included in the September 12 crate publication described below. fsfs CLI
-changes remain unreleased; the published fsfs is still 1.10.0. Gauntlet and release-checker
+changes are available in the fsfs 1.11.0 crate; downloadable binaries remain at
+1.10.0. Gauntlet and release-checker
 changes describe repository tooling, not published library capabilities.
-Library corrections after that publication, including the Potion dependency
-identity repair below, also remain unreleased.
+Library corrections through `7cc86150`, including the Potion dependency
+identity repair below, are included in the September 19 publication.
 
-The release candidate advances fsfs to **1.11.0**, the facade to **0.6.1**,
+The September 19 crate publication advances fsfs to **1.11.0**, the facade to **0.6.1**,
 rerank to **0.4.1**, TUI and ops to **0.3.0**, and the other eight public
-component crates to **0.3.1**. Publication is pending. The embedder 0.3.1
+component crates to **0.3.1**. The binary release is pending. The embedder 0.3.1
 adapter changes stored producer identity again; rebuild older semantic indexes.
 Historical adapter identities remain rejected by strict admission, and the
 0.3.0 Quill manifest wire fixture remains reproducible alongside 0.2.4 and 0.2.3.
@@ -228,17 +229,55 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ---
 
-## frankensearch 0.6.1 — 2026-09-18
+## frankensearch 0.6.1 — 2026-09-19
 
 Library-family version bump covering the native ANN work that landed after
 0.6.0: facade 0.6.1, rerank 0.4.1, fsfs 1.11.0, ops and TUI 0.3.0, and core,
 durability, embed, index, lexical, fusion, Quill and storage 0.3.1.
 `frankensearch-quill-gauntlet` remains `publish = false`.
 
-**Publication status at the time of writing: NOT YET PUBLISHED.** These versions
-exist in-tree only; crates.io still serves the 0.6.0 family. This entry records
-the source changes, not a verified publication. No cross-platform binary
-qualification is claimed, and the fsfs binary release remains pending.
+**Published to crates.io on 2026-09-19**, tagged `frankensearch-v0.6.1` at
+`7cc86150`. No cross-platform binary qualification is claimed, and the fsfs binary
+release remains pending.
+
+**Correction to the initial row-provenance diagnosis:** the four remaining
+failures reported in [#52](https://github.com/Dicklesworthstone/frankensearch/issues/52)
+and [#53](https://github.com/Dicklesworthstone/frankensearch/issues/53) came from
+test assertions that treated insertion positions as physical rows. FSVI sorts
+records by document-ID hash when saving. For example, the shard written as
+`b, d` is stored as `d, b`, so the hit for `b` correctly names physical row 1.
+The original progressive fixture stores `a-quality` at row 2 in both tiers,
+despite inserting it at different positions. The reported deltas therefore do
+not establish a production row-resolution defect.
+
+The follow-up tests check returned rows against their retained source documents
+and vectors. The progressive regression retains its original cohort and adds a
+cohort where the quality winner really has a different physical row from its
+fast-tier counterpart. No production ranking, provenance or persisted-format
+code changed. The full default facade test command passes 280 tests with zero
+failures and three existing ignored doctests; this does not qualify the separate
+full Quill, real-model or binary release gates.
+
+The optional Quill integration tests also needed fixture repairs: calls now use
+the public `LexicalWrite` upsert API, exact receipts bind the same ordered
+document cohort in both components, metadata values match the public string
+map, and Delta rejection is exercised with an actual live Delta publication.
+With those repairs, the all-features facade library suite passes 266 tests with
+zero failures and one existing ignored test. The same final source snapshot
+also passes all 46 cross-component tests, all 23 integration tests with real
+semantic models required, and strict all-targets/all-features Clippy. Production
+admission checks are unchanged. These results do not close the separate full
+Quill, R1 acceptance, or fsfs binary release gates.
+
+The optional hybrid snapshot capture buffer now uses a heap allocation instead
+of a 64 KiB stack array. Lexical and native hybrid build stages heap-pin their
+nested futures to keep caller futures below the large-future lint threshold.
+Callback naming, fixture clones and API documentation also received strict
+all-features Clippy fixes.
+
+All 13 published archives were downloaded and checked against crates.io
+checksums and their clean `7cc86150` VCS records. The fsfs binary release remains
+pending; these registry checks do not qualify a later source revision.
 
 ### Delivered capability: native ANN retrieval over sealed source cohorts
 

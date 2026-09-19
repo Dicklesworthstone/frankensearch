@@ -980,11 +980,15 @@ mod tests {
                 .iter()
                 .find(|hit| hit.result.doc_id == "z-fast")
                 .unwrap();
+            // Both owners persist z-fast at row 1 despite different insertion
+            // positions. a-late below supplies the distinct-coordinate case.
+            assert_eq!(a.shard(0).unwrap().owner.doc_id_at(1).unwrap(), "z-fast");
+            assert_eq!(b.shard(0).unwrap().owner.doc_id_at(1).unwrap(), "z-fast");
             assert_eq!(
                 shared.fast_row,
                 Some(NativeShardRow {
                     shard: 0,
-                    physical_row: 0
+                    physical_row: 1
                 })
             );
             assert_eq!(
@@ -999,6 +1003,26 @@ mod tests {
                 (Some(1.0), Some(0.75))
             );
             assert_eq!(shared.result.metadata.as_deref().unwrap()["generation"], 7);
+            let late = hits
+                .iter()
+                .find(|hit| hit.result.doc_id == "a-late")
+                .unwrap();
+            assert_eq!(late.fast_row.unwrap().physical_row, 1);
+            assert_eq!(late.quality_row.unwrap().physical_row, 0);
+            for hit in &hits {
+                for (set, location) in [(&a, hit.fast_row), (&b, hit.quality_row)] {
+                    if let Some(row) = location {
+                        assert_eq!(
+                            set.shard(row.shard)
+                                .unwrap()
+                                .owner
+                                .doc_id_at(row.physical_row as usize)
+                                .unwrap(),
+                            hit.result.doc_id
+                        );
+                    }
+                }
+            }
             assert!(hits.iter().all(|hit| hit.result.index.is_none()));
             assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 1);
         });
@@ -1530,7 +1554,7 @@ mod tests {
                             winner.fast_row,
                             Some(NativeShardRow {
                                 shard: 0,
-                                physical_row: 0
+                                physical_row: 1
                             })
                         );
                         assert_eq!(

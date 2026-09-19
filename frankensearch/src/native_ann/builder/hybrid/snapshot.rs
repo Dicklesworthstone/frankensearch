@@ -402,7 +402,7 @@ fn fingerprint_file(cx: &Cx, path: &Path, limit: u64) -> SearchResult<Artifact> 
         return Err(rejected("size", "lexical file exceeds its capture bound"));
     }
     let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut observed = 0_u64;
     loop {
         checkpoint(cx, "native_ann.hybrid_snapshot.capture_chunk")?;

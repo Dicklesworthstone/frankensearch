@@ -1503,7 +1503,7 @@ mod four_engine_generation_receipts {
             let documents = order
                 .iter()
                 .map(|id| IndexableDocument {
-                    id: (*id).to_owned(),
+                    id: (*id).clone(),
                     content: format!("{id} shares the generation document set"),
                     title: None,
                     metadata: std::collections::HashMap::new(),
@@ -1617,7 +1617,7 @@ mod four_engine_generation_receipts {
             let documents = order
                 .iter()
                 .map(|id| IndexableDocument {
-                    id: (*id).to_owned(),
+                    id: (*id).clone(),
                     content: format!("{id} shares the generation document set"),
                     title: None,
                     metadata: std::collections::HashMap::new(),
@@ -1754,7 +1754,7 @@ mod four_engine_generation_receipts {
             let documents = order
                 .iter()
                 .map(|id| IndexableDocument {
-                    id: (*id).to_owned(),
+                    id: (*id).clone(),
                     content: format!("{id} shares the generation document set"),
                     title: None,
                     metadata: std::collections::HashMap::new(),

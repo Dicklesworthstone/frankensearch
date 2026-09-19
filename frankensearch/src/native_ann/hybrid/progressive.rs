@@ -750,68 +750,97 @@ mod tests {
     #[test]
     fn lazy_refinement_retrieves_a_winner_outside_the_fast_candidate_pool() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let fast = Provider::new("fast", 2);
-            let quality = Provider::new("quality", 3);
-            let fast_index = fast_index(&cx, &fast);
-            let quality_index = quality_index(&cx, &quality);
-            let lexical = Lexical::new(&[]);
-            let mut stream = fast_index
-                .search_hybrid_progressive(
+            for (padding, quality_row) in [("middle", 2_u32), ("quality-padding", 1)] {
+                let fast = Provider::new("fast", 2);
+                let quality = Provider::new("quality", 3);
+                let fast_index = fast_index(&cx, &fast);
+                // FSVI persists hash-sorted rows, not insertion positions. Use a
+                // different quality cohort so the winning document really has
+                // distinct physical positions in the two retained owners.
+                let quality_index = native_index(
                     &cx,
-                    &fast,
-                    Some((&quality_index, &quality)),
-                    &lexical,
-                    "query",
-                    1,
-                )
-                .unwrap();
-            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
-            let NativeSearchPhase::Initial {
-                results,
-                candidates,
-            } = stream.next_phase().await.unwrap().unwrap()
-            else {
-                panic!("expected initial phase");
-            };
-            assert_eq!(results[0].doc_id, "z-fast");
-            assert_eq!(
-                candidates,
-                NativePhaseCandidates {
-                    fast: 3,
-                    quality: 0,
-                    lexical: 0
-                }
-            );
-            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
-            let State::Refine(pending) = &stream.state else {
-                panic!("missing retained pool")
-            };
-            assert!(pending.fast.iter().all(|hit| hit.doc_id != "a-quality"));
-            let NativeSearchPhase::Refined {
-                results,
-                candidates,
-            } = stream.next_phase().await.unwrap().unwrap()
-            else {
-                panic!("expected independent refinement");
-            };
-            assert_eq!(results[0].doc_id, "a-quality");
-            assert_eq!(results[0].quality_score, Some(1.0));
-            assert!(results[0].fast_score.is_none());
-            assert_eq!(results[0].source, ScoreSource::SemanticQuality);
-            assert_eq!(results[0].index, Some(0)); // quality owner's row, not the fast row 3
-            assert_eq!(
-                candidates,
-                NativePhaseCandidates {
-                    fast: 3,
-                    quality: 3,
-                    lexical: 0
-                }
-            );
-            assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
-            assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
-            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
-            assert!(stream.is_finished());
-            assert!(stream.next_phase().await.unwrap().is_none());
+                    &quality,
+                    generation(),
+                    &[
+                        ("a-quality", &[1.0, 0.0, 0.0]),
+                        ("near", &[0.0, 1.0, 0.0]),
+                        (padding, &[0.0, 0.0, 1.0]),
+                        ("z-fast", &[-1.0, 0.0, 0.0]),
+                    ],
+                );
+                assert_eq!(fast_index.owner.doc_id_at(2).unwrap(), "a-quality");
+                assert_eq!(
+                    quality_index.owner.doc_id_at(quality_row as usize).unwrap(),
+                    "a-quality"
+                );
+                let lexical = Lexical::new(&[]);
+                let mut stream = fast_index
+                    .search_hybrid_progressive(
+                        &cx,
+                        &fast,
+                        Some((&quality_index, &quality)),
+                        &lexical,
+                        "query",
+                        1,
+                    )
+                    .unwrap();
+                assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+                let NativeSearchPhase::Initial {
+                    results,
+                    candidates,
+                } = stream.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("expected initial phase");
+                };
+                assert_eq!(results[0].doc_id, "z-fast");
+                assert_eq!(
+                    candidates,
+                    NativePhaseCandidates {
+                        fast: 3,
+                        quality: 0,
+                        lexical: 0
+                    }
+                );
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+                let State::Refine(pending) = &stream.state else {
+                    panic!("missing retained pool")
+                };
+                assert!(pending.fast.iter().all(|hit| hit.doc_id != "a-quality"));
+                let NativeSearchPhase::Refined {
+                    results,
+                    candidates,
+                } = stream.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("expected independent refinement");
+                };
+                assert_eq!(results[0].doc_id, "a-quality");
+                assert_eq!(results[0].quality_score, Some(1.0));
+                assert!(results[0].fast_score.is_none());
+                assert_eq!(results[0].source, ScoreSource::SemanticQuality);
+                assert_eq!(results[0].index, Some(quality_row));
+                let row = results[0].index.unwrap() as usize;
+                assert_eq!(
+                    quality_index.owner.doc_id_at(row).unwrap(),
+                    results[0].doc_id
+                );
+                assert_eq!(
+                    quality_index.owner.vector_at_f32(row).unwrap(),
+                    vec![1.0, 0.0, 0.0]
+                );
+                assert_eq!(
+                    candidates,
+                    NativePhaseCandidates {
+                        fast: 3,
+                        quality: 3,
+                        lexical: 0
+                    }
+                );
+                assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+                assert!(stream.is_finished());
+                assert!(stream.next_phase().await.unwrap().is_none());
+            }
         });
     }
 

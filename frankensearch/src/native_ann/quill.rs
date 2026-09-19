@@ -368,7 +368,7 @@ fn join_docsets(
     Ok(())
 }
 
-/// The publisher on one QuillIndex advances monotonically and rejects epoch
+/// The publisher on one `QuillIndex` advances monotonically and rejects epoch
 /// reuse. Pointer equality on both sides of candidate scoring therefore proves
 /// the batch was scored on this exact Arc, without decoding backend-private
 /// hydration payloads (which differ in conformance-internals builds).
@@ -465,7 +465,7 @@ mod tests {
     use frankensearch_core::generation::{
         ArtifactGenerationIdentityV1, CommitRange, EmbeddingIdentityBundleV1, QuantizationFormat,
     };
-    use frankensearch_core::traits::{IdentityBoundEmbedding, ModelCategory};
+    use frankensearch_core::traits::{IdentityBoundEmbedding, LexicalWrite, ModelCategory};
     use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
     use frankensearch_quill::QuillConfig;
 
@@ -520,7 +520,7 @@ mod tests {
         fn dimension(&self) -> usize {
             2
         }
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "quill-native"
         }
         fn model_name(&self) -> &str {
@@ -555,16 +555,18 @@ mod tests {
         let writer = QuillIndex::create(cx, &lexical_path, config())
             .await
             .unwrap();
-        writer
-            .upsert_documents(
-                cx,
-                &[
-                    IndexableDocument::new("alpha", "common alpha").with_metadata("version", "old"),
-                    IndexableDocument::new("beta", "common beta").with_metadata("version", "old"),
-                ],
-            )
-            .await
-            .unwrap();
+        LexicalWrite::index_documents(
+            &writer,
+            cx,
+            &[
+                // Exact component receipts authenticate ordered membership.
+                // Match the FSVI writer's persisted document-hash order.
+                IndexableDocument::new("beta", "common beta").with_metadata("version", "old"),
+                IndexableDocument::new("alpha", "common alpha").with_metadata("version", "old"),
+            ],
+        )
+        .await
+        .unwrap();
         writer.commit(cx).await.unwrap();
         drop(writer);
         // A fresh writer starts with just its sealed Keeper publication.
@@ -698,14 +700,58 @@ mod tests {
 
     #[test]
     fn unsealed_delta_is_not_authenticated_by_a_keeper_only_receipt() {
+        use frankensearch_quill::contract::fieldnorm_to_id;
+        use frankensearch_quill::delta::{DeltaFieldNorm, DeltaSegment, DeltaTermPosting};
+
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let provider = Provider::new();
             let fixture = fixture(&cx, &provider, &["alpha", "beta"]).await;
-            fixture
-                .lexical
-                .upsert_documents(&cx, &[IndexableDocument::new("new", "common new")])
-                .await
+            let keeper = fixture.lexical.snapshot().unwrap();
+            let manifest = &keeper.loaded_manifest().manifest;
+            let mut delta = DeltaSegment::new(
+                frankensearch_quill::DEFAULT_SCHEMA,
+                manifest.docid_high_watermark,
+                usize::MAX,
+            )
+            .unwrap();
+            // The shipping schema's ID, content and title fields, respectively.
+            let norms = [(0, 1), (1, 2), (2, 0)].map(|(field_ord, raw_length)| DeltaFieldNorm {
+                field_ord,
+                raw_length,
+                fieldnorm_id: fieldnorm_to_id(raw_length),
+            });
+            delta
+                .apply_document(
+                    u32::try_from(manifest.docid_high_watermark).unwrap(),
+                    "new".into(),
+                    &norms,
+                    &[
+                        DeltaTermPosting {
+                            field_ord: 0,
+                            term: b"new",
+                            frequency: 1,
+                            positions: None,
+                        },
+                        DeltaTermPosting {
+                            field_ord: 1,
+                            term: b"common",
+                            frequency: 1,
+                            positions: Some(&[0]),
+                        },
+                        DeltaTermPosting {
+                            field_ord: 1,
+                            term: b"new",
+                            frequency: 1,
+                            positions: Some(&[1]),
+                        },
+                    ],
+                )
                 .unwrap();
+            let published = fixture
+                .lexical
+                .publish_delta_table(vec![Arc::new(delta.freeze(manifest.generation))])
+                .unwrap();
+            assert_eq!(published.live_doc_count(), keeper.doc_count() + 1);
             assert!(fixture.lexical.search_snapshot().unwrap().delta_count() > 0);
             assert!(
                 matches!(fixture.admit(&cx), Err(SearchError::InvalidConfig { value, .. }) if value == "unsealed-delta")
@@ -719,11 +765,13 @@ mod tests {
             let provider = Provider::new();
             let fixture = fixture(&cx, &provider, &["alpha", "beta"]).await;
             let view = fixture.admit(&cx).unwrap();
-            fixture
-                .lexical
-                .upsert_documents(&cx, &[IndexableDocument::new("alpha", "common changed")])
-                .await
-                .unwrap();
+            LexicalWrite::index_documents(
+                fixture.lexical.as_ref(),
+                &cx,
+                &[IndexableDocument::new("alpha", "common changed")],
+            )
+            .await
+            .unwrap();
             for k in [0, 2] {
                 assert!(
                     matches!(view.search_text(&cx, &provider, "common", k).await, Err(SearchError::InvalidConfig { field, .. }) if field == "native_ann.quill.publication")
@@ -752,19 +800,18 @@ mod tests {
                     .poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Pending
             ));
-            fixture
-                .lexical
-                .upsert_documents(
-                    &cx,
-                    &[
-                        IndexableDocument::new("alpha", "common changed alpha")
-                            .with_metadata("version", "new"),
-                        IndexableDocument::new("beta", "common changed beta")
-                            .with_metadata("version", "new"),
-                    ],
-                )
-                .await
-                .unwrap();
+            LexicalWrite::index_documents(
+                fixture.lexical.as_ref(),
+                &cx,
+                &[
+                    IndexableDocument::new("alpha", "common changed alpha")
+                        .with_metadata("version", "new"),
+                    IndexableDocument::new("beta", "common changed beta")
+                        .with_metadata("version", "new"),
+                ],
+            )
+            .await
+            .unwrap();
             assert!(!Arc::ptr_eq(
                 view.lexical_snapshot(),
                 &fixture.lexical.search_snapshot().unwrap()
@@ -885,11 +932,14 @@ mod tests {
             let writer = QuillIndex::create(&cx, &lexical_path, config())
                 .await
                 .unwrap();
-            let docs: Vec<_> = ["a", "b", "c", "z"]
+            // Match the vector owner's persisted document-hash order.
+            let docs: Vec<_> = ["a", "c", "b", "z"]
                 .into_iter()
                 .map(|id| IndexableDocument::new(id, "common"))
                 .collect();
-            writer.upsert_documents(&cx, &docs).await.unwrap();
+            LexicalWrite::index_documents(&writer, &cx, &docs)
+                .await
+                .unwrap();
             writer.commit(&cx).await.unwrap();
             drop(writer);
             let lexical = Arc::new(
@@ -996,19 +1046,18 @@ mod tests {
                 stream.next_phase().await.unwrap(),
                 Some(NativeSearchPhase::Initial { .. })
             ));
-            fixture
-                .lexical
-                .upsert_documents(
-                    &cx,
-                    &[
-                        IndexableDocument::new("alpha", "common changed")
-                            .with_metadata("version", "new"),
-                        IndexableDocument::new("beta", "common changed")
-                            .with_metadata("version", "new"),
-                    ],
-                )
-                .await
-                .unwrap();
+            LexicalWrite::index_documents(
+                fixture.lexical.as_ref(),
+                &cx,
+                &[
+                    IndexableDocument::new("alpha", "common changed")
+                        .with_metadata("version", "new"),
+                    IndexableDocument::new("beta", "common changed")
+                        .with_metadata("version", "new"),
+                ],
+            )
+            .await
+            .unwrap();
             let NativeSearchPhase::Refined { results, .. } =
                 stream.next_phase().await.unwrap().unwrap()
             else {

@@ -58,7 +58,7 @@ impl Reranker for RerankProbe {
             Ok(scores)
         })
     }
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "retained-source-test-reranker"
     }
     fn model_name(&self) -> &str {
@@ -481,7 +481,7 @@ mod selected_restart {
                 let position = documents.iter().position(|doc| doc.id == "b").unwrap();
                 let mut encoded = serde_json::to_value(&documents[position]).unwrap();
                 encoded["title"] = serde_json::json!("original title");
-                encoded["metadata"] = serde_json::json!({"revision": 9, "nested": ["kept"]});
+                encoded["metadata"] = serde_json::json!({"revision": "9", "nested": "[\"kept\"]"});
                 documents[position] = serde_json::from_value(encoded).unwrap();
                 let retrieval = if ann {
                     NativeBuildRetrieval::Hnsw {
@@ -702,7 +702,9 @@ mod selected_restart {
                         .unwrap()
                         .iter()
                         .find_map(|file| {
-                            file["name"].as_str().filter(|name| name.ends_with(".fslx"))
+                            file["name"].as_str().filter(|name| {
+                                Path::new(name).extension().is_some_and(|ext| ext == "fslx")
+                            })
                         })
                         .unwrap()
                 };
