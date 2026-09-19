@@ -119,8 +119,13 @@ fn reopened_sources_retain_titles_metadata_unicode_and_empty_text() {
             .with_title("title\n第二行");
         // Round-trip every real source field, including optional metadata.
         let mut encoded = serde_json::to_value(&doc).unwrap();
-        encoded["metadata"] =
-            serde_json::json!({"generation": 9, "nested": ["one", {"two": true}]});
+        // `IndexableDocument::metadata` is HashMap<String, String>, so every value
+        // must be a string. Non-string values here made the round-trip below fail
+        // to deserialize before it could exercise anything.
+        encoded["metadata"] = serde_json::json!({
+            "generation": "9",
+            "nested": "[\"one\", {\"two\": true}]",
+        });
         doc = serde_json::from_value(encoded).unwrap();
         let built = NativeIndexBuilder::new(&path, generation(), provider("fast", 2))
             .unwrap()

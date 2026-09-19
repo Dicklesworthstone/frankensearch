@@ -1780,7 +1780,17 @@ mod published_tests {
             let mut identity = artifact.1.frozen_identity().identity.clone();
             identity.producer.backend = "new-producer".to_owned();
             identity.validate().unwrap();
-            let new_query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity.clone()).unwrap();
+            // `identity` here is an INDEX-side bundle, so its storage.format is the
+            // persisted "fsvi-v2". A query-side bundle must bind in-memory f32 storage
+            // instead (see IdentityBundle::space_fingerprint: the two legitimately differ
+            // in storage while sharing a space), and BoundQueryEmbedding enforces that.
+            let mut query_identity = identity.clone();
+            "in-memory-f32-v1".clone_into(&mut query_identity.storage.format);
+            // An in-memory format also has to declare a native-value endianness
+            // contract; "little-endian" describes a byte layout that an in-process
+            // Vec<f32> does not have. This matches what the in-memory embedders bind.
+            "native-f32-values".clone_into(&mut query_identity.storage.endianness);
+            let new_query = BoundQueryEmbedding::new(vec![1.0, 0.0], query_identity).unwrap();
             let binding = FsviV2IdentityBinding::new(
                 ArtifactGenerationIdentityV1::new(2, [0x73; 16]).unwrap(),
                 identity.freeze().unwrap(),
