@@ -36,13 +36,17 @@ use crate::{Cx, Embedder, IndexableDocument, SearchResult, VectorHit};
 mod snapshot;
 pub use snapshot::NativeReopenLimits;
 
+mod update;
+pub use update::NativeIndexUpdate;
+use update::ReuseSource;
+
 #[cfg(feature = "quill")]
 mod hybrid;
 #[cfg(feature = "quill")]
 pub use hybrid::{NativeBuiltHybridIndex, NativeHybridReopenLimits};
 
 /// Persisted vector precision; neither option changes the producing model.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeBuildPrecision {
     /// Preserve the model's f32 outputs.
@@ -187,6 +191,7 @@ pub struct NativeIndexBuilder {
     quality: Option<TierPlan>,
     batch_size: usize,
     documents: Vec<IndexableDocument>,
+    reuse: Option<ReuseSource>,
 }
 
 impl NativeIndexBuilder {
@@ -214,6 +219,7 @@ impl NativeIndexBuilder {
             quality: None,
             batch_size: 64,
             documents: Vec::new(),
+            reuse: None,
         })
     }
 
@@ -352,9 +358,19 @@ impl NativeIndexBuilder {
             .map(|binding| VectorIndex::create_v2(&quality_path, binding.clone()))
             .transpose()?;
         for batch in self.documents.chunks(self.batch_size) {
-            self.fast.write_batch(cx, &mut fast_writer, batch).await?;
+            self.fast
+                .write_batch_reusing(
+                    cx,
+                    &mut fast_writer,
+                    batch,
+                    self.reuse.as_ref().map(|source| (source, &source.fast)),
+                )
+                .await?;
             if let (Some(tier), Some(writer)) = (&self.quality, &mut quality_writer) {
-                tier.write_batch(cx, writer, batch).await?;
+                let reuse = self.reuse.as_ref().and_then(|source| {
+                    source.quality.as_ref().map(|quality| (source, quality))
+                });
+                tier.write_batch_reusing(cx, writer, batch, reuse).await?;
             }
         }
         checkpoint(cx, "native_ann.builder.finish_vectors")?;
