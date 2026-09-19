@@ -131,7 +131,9 @@ fn build_two_tier_stub_index(name: &str, docs: &[(&str, &str)]) -> PathBuf {
             for (id, text) in docs {
                 builder = builder.add_document(id, text);
             }
-            let stats = builder.build(&cx).await.expect("build two-tier stub index");
+            let stats = Box::pin(builder.build(&cx))
+                .await
+                .expect("build two-tier stub index");
             assert!(
                 stats.has_quality_index,
                 "semantic stubs must write a quality generation"
@@ -526,7 +528,7 @@ fn index_builder_creates_searchable_index() {
         for (id, text) in TEST_CORPUS {
             builder = builder.add_document(*id, *text);
         }
-        let stats = builder.build(&cx).await.unwrap();
+        let stats = Box::pin(builder.build(&cx)).await.unwrap();
 
         assert_eq!(stats.doc_count, 20);
         assert_eq!(stats.error_count, 0);
@@ -563,7 +565,7 @@ fn index_builder_with_two_tier() {
         for (id, text) in TEST_CORPUS {
             builder = builder.add_document(*id, *text);
         }
-        let stats = builder.build(&cx).await.unwrap();
+        let stats = Box::pin(builder.build(&cx)).await.unwrap();
 
         assert_eq!(stats.doc_count, 20);
         assert_eq!(stats.embedder_availability, TwoTierAvailability::HashOnly);
@@ -804,11 +806,13 @@ fn index_builder_empty_documents_rejected() {
         let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
         let stack = EmbedderStack::from_parts(fast, None);
 
-        let err = IndexBuilder::new(&dir)
-            .with_embedder_stack(stack)
-            .build(&cx)
-            .await
-            .expect_err("should fail with no docs");
+        let err = Box::pin(
+            IndexBuilder::new(&dir)
+                .with_embedder_stack(stack)
+                .build(&cx),
+        )
+        .await
+        .expect_err("should fail with no docs");
 
         assert!(
             matches!(err, SearchError::InvalidConfig { .. }),
@@ -983,7 +987,7 @@ fn index_builder_reports_progress() {
         for (id, text) in TEST_CORPUS {
             builder = builder.add_document(*id, *text);
         }
-        let stats = builder.build(&cx).await.unwrap();
+        let stats = Box::pin(builder.build(&cx)).await.unwrap();
 
         assert_eq!(stats.doc_count, 20);
         let calls = progress_calls.lock().unwrap();
@@ -1074,8 +1078,7 @@ fn real_models_two_tier_search_yields_refined_through_the_public_api() {
         for (id, text) in TEST_CORPUS {
             builder = builder.add_document(*id, *text);
         }
-        let stats = builder
-            .build(&cx)
+        let stats = Box::pin(builder.build(&cx))
             .await
             .expect("build both tiers with the registered models");
         assert_eq!(stats.doc_count, TEST_CORPUS.len());

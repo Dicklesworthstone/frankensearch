@@ -33,11 +33,11 @@ impl NativeIndexBuilder {
     /// cancellation errors. Failures may leave an unselected directory but never
     /// produce a partial hybrid success or overwrite an older generation.
     pub async fn build_hybrid(self, cx: &Cx) -> SearchResult<NativeBuiltHybridIndex> {
-        let vectors = self.build(cx).await?;
+        let vectors = Box::pin(self.build(cx)).await?;
         checkpoint(cx, "native_ann.builder.lexical_start")?;
         let path = vectors.directory.join("lexical");
         std::fs::create_dir(&path)?;
-        let response = QuillIndex::create(
+        let response = Box::pin(QuillIndex::create(
             cx,
             &path,
             QuillConfig {
@@ -46,7 +46,7 @@ impl NativeIndexBuilder {
                 max_ingest_shards: 1,
                 ..QuillConfig::default()
             },
-        )
+        ))
         .await;
         checkpoint(cx, "native_ann.builder.lexical_created")?;
         let lexical = response?;
@@ -56,7 +56,7 @@ impl NativeIndexBuilder {
             checkpoint(cx, "native_ann.builder.lexical_document_complete")?;
             response?;
         }
-        let response = lexical.finish_bulk_load(cx).await;
+        let response = Box::pin(lexical.finish_bulk_load(cx)).await;
         checkpoint(cx, "native_ann.builder.lexical_finalized")?;
         response?;
         if LexicalRead::doc_count(&lexical)? != vectors.documents.len() {
@@ -71,7 +71,7 @@ impl NativeIndexBuilder {
         // Capture bytes here, NOT at a later seal: a newer publication on disk
         // must never be blessed as belonging to these retained source vectors.
         let seal = LexicalSeal::capture(cx, &path, lexical.search_snapshot()?.keeper_generation())?;
-        let response = QuillSearchIndex::open(cx, &path, QuillConfig::default()).await;
+        let response = Box::pin(QuillSearchIndex::open(cx, &path, QuillConfig::default())).await;
         checkpoint(cx, "native_ann.builder.lexical_reader")?;
         let reader = response?;
         let built = NativeBuiltHybridIndex::from_readers(cx, vectors, reader, seal)?;
@@ -79,6 +79,8 @@ impl NativeIndexBuilder {
         Ok(built)
     }
 }
+
+type SourceTextLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 
 /// Complete process-local native hybrid generation built from one source cohort.
 ///
@@ -96,7 +98,7 @@ pub struct NativeBuiltHybridIndex {
     vectors: NativeBuiltIndex,
     lexical: QuillSearchIndex,
     lexical_seal: LexicalSeal,
-    text: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    text: Box<SourceTextLookup>,
 }
 
 impl NativeBuiltHybridIndex {
