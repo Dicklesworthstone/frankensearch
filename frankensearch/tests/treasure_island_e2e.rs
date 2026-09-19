@@ -1357,7 +1357,7 @@ mod lexical {
 
     /// Bounded Long John Silver layout diagnostic from extra checkout
     /// frankensearch-ljs-diagnostic-a9fd79b6. Requires the facade's
-    /// `pruning-conformance` feature. Does not change ExactRepair acceptance.
+    /// `pruning-conformance` feature. Does not change `ExactRepair` acceptance.
     #[cfg(feature = "pruning-conformance")]
     #[test]
     #[ignore = "bounded source-bound LJS arithmetic diagnostic"]

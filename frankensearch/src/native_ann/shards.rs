@@ -766,11 +766,13 @@ mod tests {
                     );
                 }
                 let hits = set.search(&cx, &query(), 2, None).unwrap();
+                // Persisted rows are hash-sorted: shard 1 contains d, then b.
+                assert_eq!(set.shards[1].owner.doc_id_at(1).unwrap(), "b");
                 assert_eq!(
                     hits[0].row,
                     NativeShardRow {
                         shard: 1,
-                        physical_row: 0
+                        physical_row: 1
                     }
                 );
                 assert_eq!(
@@ -780,6 +782,13 @@ mod tests {
                         physical_row: 1
                     }
                 );
+                for hit in &hits {
+                    let owner = &set.shards[hit.row.shard].owner;
+                    assert_eq!(
+                        owner.doc_id_at(hit.row.physical_row as usize).unwrap(),
+                        hit.doc_id
+                    );
+                }
                 assert_eq!(
                     (set.shard_count(), set.live_count(), set.physical_count()),
                     (2, 4, 5)

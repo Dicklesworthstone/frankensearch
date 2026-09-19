@@ -881,16 +881,16 @@ impl IndexBuilder {
             let result = match backend {
                 #[cfg(feature = "quill")]
                 IndexLexicalBackend::Quill => {
-                    build_lexical_index(cx, &lexical_path, lexical_docs).await
+                    Box::pin(build_lexical_index(cx, &lexical_path, lexical_docs)).await
                 }
                 #[cfg(feature = "lexical-tantivy")]
                 IndexLexicalBackend::Tantivy => {
-                    build_tantivy_lexical_index(
+                    Box::pin(build_tantivy_lexical_index(
                         cx,
                         &lexical_path,
                         lexical_docs,
                         tantivy_lexical.expect("Tantivy writer admitted before vector publication"),
-                    )
+                    ))
                     .await
                 }
             };
