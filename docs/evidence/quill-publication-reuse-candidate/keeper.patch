@@ -1,0 +1,215 @@
+diff --git a/crates/frankensearch-quill/src/keeper.rs b/crates/frankensearch-quill/src/keeper.rs
+--- a/crates/frankensearch-quill/src/keeper.rs
++++ b/crates/frankensearch-quill/src/keeper.rs
+@@ -2250,4 +2250,9 @@
++mod publication_reuse;
++
+ enum RecoveredSegmentBacking {
+     Mapped(SegmentReader<ReadOnlyMappedFile>),
+     Owned(SegmentReader<EncodedSegment>),
++    // Arbitrary copied bytes must pass fresh full-prefix and schema admission;
++    // unlike EncodedSegment, they never carry a producer-minted witness.
++    ValidatedCopy(SegmentReader<Vec<u8>>),
+ }
+@@ -2257,5 +2262,6 @@
+         match self {
+             Self::Mapped(reader) => reader.header(),
+             Self::Owned(reader) => reader.header(),
++            Self::ValidatedCopy(reader) => reader.header(),
+         }
+     }
+@@ -2265,5 +2271,6 @@
+         match self {
+             Self::Mapped(reader) => reader.section(kind),
+             Self::Owned(reader) => reader.section(kind),
++            Self::ValidatedCopy(reader) => reader.section(kind),
+         }
+     }
+@@ -2273,5 +2280,6 @@
+         match self {
+             Self::Mapped(reader) => reader.section_entries(),
+             Self::Owned(reader) => reader.section_entries(),
++            Self::ValidatedCopy(reader) => reader.section_entries(),
+         }
+     }
+@@ -2281,5 +2289,6 @@
+         match self {
+             Self::Mapped(reader) => reader.verify(),
+             Self::Owned(reader) => reader.verify(),
++            Self::ValidatedCopy(reader) => reader.verify(),
+         }
+     }
+@@ -2289,5 +2298,6 @@
+         match self {
+             Self::Mapped(reader) => reader.source_bytes(),
+             Self::Owned(reader) => reader.source_bytes(),
++            Self::ValidatedCopy(reader) => reader.source_bytes(),
+         }
+     }
+@@ -2301,5 +2311,6 @@
+         match self {
+             Self::Mapped(reader) => reader.file_xxh3(),
+             Self::Owned(reader) => reader.file_xxh3(),
++            Self::ValidatedCopy(reader) => reader.file_xxh3(),
+         }
+     }
+@@ -3699,4 +3710,12 @@
+     fn open_once(directory: &Path, schema: SchemaDescriptor) -> Result<Self, KeeperError> {
++        Self::open_once_reusing_validation(directory, schema, None)
++    }
++
++    fn open_once_reusing_validation(
++        directory: &Path,
++        schema: SchemaDescriptor,
++        preflight: Option<&publication_reuse::PublicationValidationCache>,
++    ) -> Result<Self, KeeperError> {
+         let expected_schema_id = schema
+             .schema_id()
+             .map_err(|source| KeeperError::InvalidSchema { source })?;
+@@ -3734,11 +3753,26 @@
+             let authenticated_file_witness = authenticated_file_witness?;
+-            segments.push(RecoveredSegment::bind(
+-                path,
+-                manifest_segment.clone(),
+-                reader,
+-                schema,
+-                authenticated_file_witness,
+-            )?);
++            // Cache lookup happens only AFTER the fresh same-descriptor
++            // authentication above, never in place of opening selected bytes.
++            let reusable = match preflight {
++                Some(cache) => cache.rebind_if_identical(
++                    &path,
++                    manifest_segment,
++                    &reader,
++                    schema,
++                    &authenticated_file_witness,
++                )?,
++                None => None,
++            };
++            segments.push(match reusable {
++                Some(segment) => segment,
++                None => RecoveredSegment::bind(
++                    path,
++                    manifest_segment.clone(),
++                    reader,
++                    schema,
++                    authenticated_file_witness,
++                )?,
++            });
+         }
+ 
+         let snapshot = Self::from_parts(Some(directory.to_path_buf()), schema, loaded, segments)?;
+@@ -5246,6 +5280,36 @@
+         manifest: &Manifest,
+         intent: PublishIntent,
+     ) -> Result<&KeeperSnapshot, KeeperError> {
++        self.publish_with_intent_reusing_validation(cx, manifest, intent, 0)
++            .await
++    }
++
++    /// Publish with an explicit budget for retaining immutable preflight images.
++    ///
++    /// This uses the same claims, durability, deletion-intent, reconciliation
++    /// and cancellation protocol as [`Self::publish_with_intent`]. A nonzero
++    /// budget may avoid duplicate schema/TERMDICT validation after publication,
++    /// but never skips rereading MANIFEST, opening selected files or authenticating
++    /// their actual full prefixes. Reuse also requires exact byte equality.
++    ///
++    /// `byte_budget` bounds copied FSLX images per attempt, not metadata or RSS.
++    /// Installed readers retain accepted images; pinned generations can retain
++    /// multiple budgets. Copying adds allocation, memory traffic and a fresh
++    /// checksum pass. Qualify that tradeoff for the workload before opting in;
++    /// ordinary publication uses zero and retains the mapped binding path.
++    ///
++    /// # Errors
++    ///
++    /// Returns the ordinary publication errors, including copied-image
++    /// corruption. Cache capacity or raw-image allocation failure falls back to
++    /// full validation; neither can authorize partial publication or old bytes.
++    pub async fn publish_with_intent_reusing_validation(
++        &mut self,
++        cx: &Cx,
++        manifest: &Manifest,
++        intent: PublishIntent,
++        byte_budget: usize,
++    ) -> Result<&KeeperSnapshot, KeeperError> {
+         if cx.is_cancel_requested() {
+             return Err(KeeperError::PublishLock {
+                 source: LockError::Cancelled,
+@@ -5281,11 +5345,22 @@
+         let preflight_protection = self.protection.clone();
+         let schema = self.snapshot.schema();
+-        spawn_blocking(move || {
+-            validate_proposed_manifest_segments(
+-                &preflight_directory,
+-                &preflight_manifest,
+-                schema,
+-                &preflight_protection,
+-            )
++        let preflight = spawn_blocking(move || {
++            if byte_budget == 0 {
++                validate_proposed_manifest_segments(
++                    &preflight_directory,
++                    &preflight_manifest,
++                    schema,
++                    &preflight_protection,
++                )?;
++                Ok(publication_reuse::PublicationValidationCache::default())
++            } else {
++                validate_proposed_manifest_segments_with_cache(
++                    &preflight_directory,
++                    &preflight_manifest,
++                    schema,
++                    &preflight_protection,
++                    byte_budget,
++                )
++            }
+         })
+         .await?;
+@@ -5353,5 +5428,10 @@
+         self.admission.ensure_directory_identity()?;
+-        self.snapshot = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
++        let schema = self.snapshot.schema();
++        self.snapshot = if preflight.is_empty() {
++            open_snapshot_blocking(directory, schema).await?
++        } else {
++            publication_reuse::open_snapshot_after_preflight(directory, schema, preflight).await?
++        };
+         self.pending_publication = None;
+         Ok(self.retained_snapshot_for_bookkeeping())
+     }
+@@ -10990,6 +11070,18 @@
+     schema: SchemaDescriptor,
+     protection: &WriterProtection,
+ ) -> Result<(), KeeperError> {
++    validate_proposed_manifest_segments_with_cache(directory, manifest, schema, protection, 0)
++        .map(|_| ())
++}
++
++fn validate_proposed_manifest_segments_with_cache(
++    directory: &Path,
++    manifest: &Manifest,
++    schema: SchemaDescriptor,
++    protection: &WriterProtection,
++    byte_budget: usize,
++) -> Result<publication_reuse::PublicationValidationCache, KeeperError> {
++    let mut cache = publication_reuse::PublicationValidationCache::new(byte_budget);
+     for manifest_segment in &manifest.segments {
+         let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
+         let reader = SegmentReader::open_published(&path, schema).map_err(|source| {
+@@ -11036,4 +11128,4 @@
+-        let _validated_segment = RecoveredSegment::bind(
++        cache.admit(
+             path,
+             manifest_segment.clone(),
+             reader,
+@@ -11041,7 +11133,7 @@
+             authenticated_file_witness,
+         )?;
+     }
+-    Ok(())
++    Ok(cache)
+ }
+ 
+ /// Authenticate a MANIFEST segment binding against the backing FSLX bytes.
