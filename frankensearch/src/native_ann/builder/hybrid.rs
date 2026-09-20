@@ -9,6 +9,7 @@ use super::{NativeBuiltIndex, NativeIndexBuilder};
 use crate::native_ann::NativeProgressiveSearch;
 use crate::{Cx, LexicalRead, LexicalWrite, Reranker, ScoredResult, SearchResult};
 
+mod cohort;
 mod snapshot;
 use snapshot::LexicalSeal;
 pub use snapshot::NativeHybridReopenLimits;
@@ -94,6 +95,10 @@ type SourceTextLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 /// [`Self::open_selected`]. Keep its directory trusted and immutable throughout
 /// sealing, reopening and the lifetime of Quill's mapped readers. An independent
 /// writer's append-only publication does not refresh an already-retained view.
+/// Build and selected reopen also compare every live lexical document's stored
+/// ID, content, title and metadata with the retained source cohort. This census
+/// adds full-cohort read work at admission, not at each query; equal counts and
+/// generation numbers alone do not prove a common source cut.
 pub struct NativeBuiltHybridIndex {
     vectors: NativeBuiltIndex,
     lexical: QuillSearchIndex,
@@ -119,6 +124,7 @@ impl NativeBuiltHybridIndex {
                 "the sealed lexical reader must contain the complete source cohort",
             ));
         }
+        cohort::validate(cx, &lexical, &vectors.documents)?;
         let source = Arc::clone(&vectors.documents);
         let text = Box::new(move |id: &str| {
             source
