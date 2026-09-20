@@ -12725,6 +12725,69 @@ mod tests {
     }
 
     #[test]
+    fn gh49_numeric_range_shares_the_live_domain_after_a_tombstone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A sealed segment that has acquired a tombstone has two counts: the
+        // persisted NUMERIC column still holds one value per at-seal row,
+        // while term and `All` leaves are built on the live count. Supplying
+        // the at-seal count for both put the range leaf in a different segment
+        // domain from its Boolean siblings, and `shared_segment_num_docs`
+        // rejected the whole query with "Boolean children belong to different
+        // segment domains" — surfacing to CASS as BACKEND_UNAVAILABLE for an
+        // ordinary filtered search (#49).
+        let entries = [
+            NumericEntry::i64(0, 0),
+            NumericEntry::i64(1, 1),
+            NumericEntry::i64(2, 2),
+        ];
+        let fields = [NumericFieldInput::new(0, &entries)];
+        let encoded = EncodedNumericSection::encode(RANGE_TEST_SCHEMA, 0, 3, &fields)?;
+        let field = encoded
+            .section()?
+            .field(0)
+            .expect("created_at NUMERIC field");
+
+        // Three rows at seal, one since tombstoned.
+        let at_seal_num_docs = 3;
+        let live_num_docs = 2;
+
+        let range = ReferenceScorer::numeric_range(
+            field,
+            Bound::Included(NumericValue::I64(0)),
+            Bound::Included(NumericValue::I64(2)),
+            at_seal_num_docs,
+            live_num_docs,
+        )?;
+        let all = ReferenceScorer::all_with_boost(0, 3, live_num_docs, 1.0)?;
+
+        // The combination is what failed: each leaf is fine alone.
+        let mut combined = ReferenceScorer::boolean(vec![
+            ScorerClause::must(all),
+            ScorerClause::must(range),
+        ])?;
+        let hits = combined.top_k(3, &AllLiveDocs)?;
+        assert!(
+            !hits.is_empty(),
+            "a filtered query over a tombstoned segment must still return results"
+        );
+
+        // And the column is still validated against its own domain: the live
+        // count must not be able to make a legitimate column look corrupt.
+        assert!(
+            ReferenceScorer::numeric_range(
+                field,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                at_seal_num_docs,
+                live_num_docs,
+            )
+            .is_ok(),
+            "three values over three at-seal rows is valid however few are live"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn numeric_ranges_preserve_boolean_multiplicity_exclusion_and_live_filtering()
     -> Result<(), Box<dyn std::error::Error>> {
         let entries = [
@@ -12866,13 +12929,16 @@ mod tests {
         )?;
         assert_eq!(ordinary.cost(), 1);
         assert_eq!(ordinary.size_hint(), 0);
+        // Cardinality is validated against the column's own domain, so the
+        // live count deliberately differs here: a column holding more values
+        // than at-seal rows is corrupt whatever the snapshot currently shows.
         assert!(matches!(
             ReferenceScorer::numeric_range(
                 repeated_field,
                 Bound::Unbounded,
                 Bound::Unbounded,
                 1,
-                1
+                2
             ),
             Err(ArgusError::InvalidNumericCardinality {
                 field_ord: 0,
