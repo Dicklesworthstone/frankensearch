@@ -100,7 +100,20 @@ impl NativeAnnIndex {
             ),
         )
         .await?;
-        refined_winners(cx, lexical, &batch, &fast_hits, &quality_hits, k, is_hash).await
+        refined_winners(
+            cx,
+            lexical,
+            &batch,
+            &fast_hits,
+            &quality_hits,
+            k,
+            RefinementFusion {
+                quality_weight: 0.7,
+                rrf: &RrfConfig::default(),
+                is_hash,
+            },
+        )
+        .await
     }
 }
 
@@ -157,6 +170,14 @@ pub(super) async fn checked_lexical(
     Ok(batch)
 }
 
+/// Ranking policy and the independently admitted vector-lane classification.
+/// Only native callers construct this; user tuning never chooses `is_hash`.
+pub(super) struct RefinementFusion<'a> {
+    pub quality_weight: f32,
+    pub rrf: &'a RrfConfig,
+    pub is_hash: bool,
+}
+
 pub(super) async fn refined_winners(
     cx: &Cx,
     lexical: &dyn LexicalRead,
@@ -164,18 +185,16 @@ pub(super) async fn refined_winners(
     fast_hits: &[VectorHit],
     quality_hits: &[VectorHit],
     k: usize,
-    is_hash: bool,
+    fusion: RefinementFusion<'_>,
 ) -> SearchResult<Vec<ScoredResult>> {
     checkpoint(cx, "native_ann.tiered_blend")?;
-    let vectors = blend_two_tier(fast_hits, quality_hits, 0.7);
-    let hits = rrf_fuse_for_vector_lane(
-        batch.results(),
-        &vectors,
-        k,
-        0,
-        &RrfConfig::default(),
+    let RefinementFusion {
+        quality_weight,
+        rrf,
         is_hash,
-    );
+    } = fusion;
+    let vectors = blend_two_tier(fast_hits, quality_hits, quality_weight);
+    let hits = rrf_fuse_for_vector_lane(batch.results(), &vectors, k, 0, rrf, is_hash);
     let mut results = hydrate_winners(cx, lexical, hits, batch).await?;
     let fast: BTreeMap<_, _> = fast_hits
         .iter()

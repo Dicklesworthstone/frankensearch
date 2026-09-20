@@ -7,7 +7,7 @@ use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::traits::Reranker;
 use frankensearch_fusion::{RrfConfig, rrf_fuse_for_vector_lane};
 
-use super::refinement::{admit_pair, checked_lexical, refined_winners};
+use super::refinement::{RefinementFusion, admit_pair, checked_lexical, refined_winners};
 use super::{NativeAnnIndex, checkpoint, hydrate_winners, invalid, join_sources};
 use crate::{Cx, Embedder, LexicalRead, ScoredResult, SearchError, SearchResult, VectorHit};
 
@@ -54,6 +54,11 @@ impl NativeAnnIndex {
             k,
             reranker: None,
             allowed_documents: None,
+            candidate_multiplier: 3,
+            rrf: RrfConfig::default(),
+            quality_weight: 0.7,
+            fast_ef: None,
+            quality_ef: None,
             budget: k.checked_mul(3).ok_or_else(|| {
                 invalid(
                     "progressive.candidate_budget",
@@ -165,6 +170,11 @@ pub struct NativeProgressiveSearch<'a> {
     text: &'a str,
     k: usize,
     budget: usize,
+    candidate_multiplier: usize,
+    rrf: RrfConfig,
+    quality_weight: f32,
+    fast_ef: Option<usize>,
+    quality_ef: Option<usize>,
     reranker: Option<RerankRequest<'a>>,
     // Installed only by the built-cohort scope adapter, together with its
     // filtered lexical reader. None preserves the ordinary unscoped path.
@@ -173,6 +183,128 @@ pub struct NativeProgressiveSearch<'a> {
 }
 
 impl<'a> NativeProgressiveSearch<'a> {
+    /// Set the fusion policy for BOTH Initial and Refined before either starts.
+    ///
+    /// Defaults are the existing RRF policy and 0.7 quality blend. `rrf` is
+    /// owned by this query, so later caller configuration cannot change a phase.
+    /// Its semantic weight also weights a hash-control vector lane without
+    /// relabelling that lane. Every source weight must be strictly positive;
+    /// zero is not a way to disable a required provider or its admission checks.
+    ///
+    /// The quality weight applies to documents present in BOTH vector pools.
+    /// One-sided candidates keep their normalized score, including at 0 and 1,
+    /// as in the existing union-preserving blend. Raw scores, physical rows and
+    /// required-quality failure behavior do not change with weighting.
+    ///
+    /// # Errors
+    /// Refuses cancellation, started queries, non-finite/out-of-range policy,
+    /// or a maximum two-source RRF score outside public f32 result precision.
+    pub fn with_fusion(mut self, rrf: RrfConfig, quality_weight: f32) -> SearchResult<Self> {
+        self.configure()?;
+        if !quality_weight.is_finite() || !(0.0..=1.0).contains(&quality_weight) {
+            return Err(invalid(
+                "progressive.quality_weight",
+                "out-of-range",
+                "quality blend weight must be finite and between zero and one",
+            ));
+        }
+        if !rrf.k.is_finite()
+            || rrf.k < 0.0
+            || !rrf.lexical_weight.is_finite()
+            || rrf.lexical_weight <= 0.0
+            || !rrf.semantic_weight.is_finite()
+            || rrf.semantic_weight <= 0.0
+        {
+            return Err(invalid(
+                "progressive.rrf",
+                "invalid",
+                "RRF K must be finite and nonnegative, and source weights finite and positive",
+            ));
+        }
+        let first_rank = 1.0 / (rrf.k + 1.0);
+        let maximum_score = first_rank * rrf.lexical_weight + first_rank * rrf.semantic_weight;
+        if !maximum_score.is_finite() || maximum_score > f64::from(f32::MAX) {
+            return Err(invalid(
+                "progressive.rrf",
+                "score-overflow",
+                "the maximum fused score must fit the public f32 result",
+            ));
+        }
+        self.rrf = rrf;
+        self.quality_weight = quality_weight;
+        Ok(self)
+    }
+
+    /// Request `multiplier * max(k, rerank_window)` candidates from EACH source.
+    ///
+    /// The default is three. This is independent of the displayed page size and
+    /// may change both pool-local normalization and final ranking. Configuring
+    /// the reranker before or after this method produces the same budget.
+    /// Scoped retrieval retains its own eligible-candidate and widening rules.
+    /// This bounds requested hits, not graph visits or provider peak memory.
+    ///
+    /// # Errors
+    /// Refuses zero, checked-arithmetic overflow, cancellation or a started query.
+    pub fn with_candidate_multiplier(mut self, multiplier: usize) -> SearchResult<Self> {
+        self.configure()?;
+        if multiplier == 0 {
+            return Err(invalid(
+                "progressive.candidate_multiplier",
+                "zero",
+                "candidate multiplier must be positive",
+            ));
+        }
+        self.budget = self.result_window().checked_mul(multiplier).ok_or_else(|| {
+            invalid(
+                "progressive.candidate_budget",
+                "overflow",
+                "the configured candidate budget must fit usize",
+            )
+        })?;
+        self.candidate_multiplier = multiplier;
+        Ok(self)
+    }
+
+    /// Override the fast and quality native graph beams independently.
+    ///
+    /// None uses that owner's admitted default. The existing search policy
+    /// raises a beam to its requested-hit floor, caps it at physical row count,
+    /// and widens it on filtered underfill. Exact owners still ignore the beam.
+    /// These settings do not rebuild graphs, alter source counts or certify ANN
+    /// recall. Every configured provider is still independently admitted.
+    ///
+    /// # Errors
+    /// Refuses a zero beam, cancellation or configuration after a phase starts.
+    pub fn with_beam_widths(
+        mut self,
+        fast: Option<usize>,
+        quality: Option<usize>,
+    ) -> SearchResult<Self> {
+        self.configure()?;
+        if fast == Some(0) || quality == Some(0) {
+            return Err(invalid(
+                "progressive.beam",
+                "zero",
+                "an explicit graph beam must be positive",
+            ));
+        }
+        self.fast_ef = fast;
+        self.quality_ef = quality;
+        Ok(self)
+    }
+
+    fn configure(&self) -> SearchResult<()> {
+        checkpoint(self.cx, "native_ann.progressive_configuration")?;
+        if !matches!(self.state, State::Initial) {
+            return Err(invalid(
+                "progressive.configuration",
+                "started",
+                "query policy must be fixed before requesting its first phase",
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "quill")]
     pub(in crate::native_ann) fn with_allowed_documents(
         mut self,
@@ -194,6 +326,7 @@ impl<'a> NativeProgressiveSearch<'a> {
         &self,
         index: &NativeAnnIndex,
         embedder: &dyn Embedder,
+        ef: Option<usize>,
     ) -> SearchResult<Vec<VectorHit>> {
         match self.allowed_documents {
             Some(allowed) => {
@@ -203,14 +336,14 @@ impl<'a> NativeProgressiveSearch<'a> {
                         embedder,
                         self.text,
                         self.budget.min(allowed.len()),
-                        None,
+                        ef,
                         |id| allowed.contains(id),
                     )
                     .await
             }
             None => {
                 index
-                    .search_text(self.cx, embedder, self.text, self.budget, None)
+                    .search_text(self.cx, embedder, self.text, self.budget, ef)
                     .await
             }
         }
@@ -219,7 +352,8 @@ impl<'a> NativeProgressiveSearch<'a> {
     /// Add a lazy final cross-encoder stage before requesting the first phase.
     ///
     /// `top_k` bounds the rerank window, independently of the displayed page.
-    /// Retrieval budgets expand to three times `max(k, top_k)` so reranking can
+    /// Retrieval budgets expand to the configured multiplier times
+    /// `max(k, top_k)` (three by default) so reranking can
     /// promote candidates outside the initial page. Enabling this option may
     /// therefore change initial fusion relative to a smaller, unreranked query.
     /// Only requesting the final phase resolves text or calls the reranker;
@@ -254,13 +388,17 @@ impl<'a> NativeProgressiveSearch<'a> {
                 "attach a positive rerank window before requesting any phase",
             ));
         }
-        self.budget = self.k.max(top_k).checked_mul(3).ok_or_else(|| {
-            invalid(
-                "rerank.candidate_budget",
-                "overflow",
-                "rerank retrieval budget must fit usize",
-            )
-        })?;
+        self.budget = self
+            .k
+            .max(top_k)
+            .checked_mul(self.candidate_multiplier)
+            .ok_or_else(|| {
+                invalid(
+                    "rerank.candidate_budget",
+                    "overflow",
+                    "rerank retrieval budget must fit usize",
+                )
+            })?;
         self.reranker = Some(RerankRequest {
             reranker,
             text: text_fn,
@@ -273,6 +411,32 @@ impl<'a> NativeProgressiveSearch<'a> {
     #[must_use]
     pub const fn is_finished(&self) -> bool {
         matches!(self.state, State::Done)
+    }
+
+    /// Execute every configured phase and return only the final successful page.
+    ///
+    /// This consumes an unstarted query with all of its configured fusion,
+    /// candidate, beam and scope settings. Missing rerank text keeps the last
+    /// valid retrieval page. Use `next_phase` instead for early delivery and
+    /// explicit degradation pages.
+    ///
+    /// # Errors
+    /// Propagates any required phase failure or cancellation, including errors
+    /// carried by RefinementFailed/RerankFailed; it never silently returns an
+    /// earlier page as successful refinement. Refuses an already-started query.
+    pub async fn collect(mut self) -> SearchResult<Vec<ScoredResult>> {
+        self.configure()?;
+        let mut page = Vec::new();
+        while let Some(phase) = self.next_phase().await? {
+            page = match phase {
+                NativeSearchPhase::Initial { results, .. }
+                | NativeSearchPhase::Refined { results, .. }
+                | NativeSearchPhase::Reranked { results, .. } => results,
+                NativeSearchPhase::RefinementFailed { error, .. }
+                | NativeSearchPhase::RerankFailed { error, .. } => return Err(error),
+            };
+        }
+        Ok(page)
     }
 
     /// Compute one requested phase, then finish permanently after the last.
@@ -318,7 +482,7 @@ impl<'a> NativeProgressiveSearch<'a> {
         }
         let (fast, batch) = join_sources(
             self.cx,
-            self.search_tier(self.fast, self.fast_embedder),
+            self.search_tier(self.fast, self.fast_embedder, self.fast_ef),
             checked_lexical(self.cx, self.lexical, self.text, self.budget),
         )
         .await?;
@@ -332,7 +496,7 @@ impl<'a> NativeProgressiveSearch<'a> {
             &fast,
             self.result_window(),
             0,
-            &RrfConfig::default(),
+            &self.rrf,
             is_hash,
         );
         let mut results = hydrate_winners(self.cx, self.lexical, fused, &batch).await?;
@@ -394,7 +558,7 @@ impl<'a> NativeProgressiveSearch<'a> {
                 "refinement requires its admitted arm",
             )
         })?;
-        let quality_hits = self.search_tier(quality, embedder).await?;
+        let quality_hits = self.search_tier(quality, embedder, self.quality_ef).await?;
         let candidates = NativePhaseCandidates {
             fast: pending.fast.len(),
             quality: quality_hits.len(),
@@ -407,7 +571,11 @@ impl<'a> NativeProgressiveSearch<'a> {
             &pending.fast,
             &quality_hits,
             self.result_window(),
-            is_hash,
+            RefinementFusion {
+                quality_weight: self.quality_weight,
+                rrf: &self.rrf,
+                is_hash,
+            },
         )
         .await?;
         checkpoint(self.cx, "native_ann.progressive_refined_complete")?;
@@ -791,6 +959,294 @@ mod tests {
                 ("z-fast", &[-1.0, 0.0, 0.0]),
             ],
         )
+    }
+
+    #[test]
+    fn configured_defaults_collect_the_existing_refined_page() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let quality = Provider::new("quality", 3);
+            let index = fast_index(&cx, &fast);
+            let qindex = quality_index(&cx, &quality);
+            let lexical = Lexical::new(&["a-quality", "z-fast"]);
+            let expected = index
+                .search_hybrid_refined_text(
+                    &cx, &fast, (&qindex, &quality), &lexical, "query", 3,
+                )
+                .await
+                .unwrap();
+            let actual = index
+                .search_hybrid_progressive(
+                    &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 3,
+                )
+                .unwrap()
+                .with_fusion(RrfConfig::default(), 0.7)
+                .unwrap()
+                .with_candidate_multiplier(3)
+                .unwrap()
+                .with_beam_widths(None, None)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap());
+        });
+    }
+
+    #[test]
+    fn configured_quality_weight_changes_ranking_not_raw_evidence_or_row_space() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let quality = Provider::new("quality", 3);
+            let index = fast_index(&cx, &fast);
+            let qindex = quality_index(&cx, &quality);
+            let lexical = Lexical::new(&[]);
+            for (weight, winner) in [(0.0, "z-fast"), (1.0, "a-quality")] {
+                let results = index
+                    .search_hybrid_progressive(
+                        &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 4,
+                    )
+                    .unwrap()
+                    .with_fusion(RrfConfig::default(), weight)
+                    .unwrap()
+                    .with_candidate_multiplier(1)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert_eq!(results[0].doc_id, winner);
+                assert_eq!(results.len(), 4);
+                let a = results.iter().find(|hit| hit.doc_id == "a-quality").unwrap();
+                assert_eq!(a.fast_score, Some(0.0));
+                assert_eq!(a.quality_score, Some(1.0));
+                assert_eq!(a.source, ScoreSource::SemanticQuality);
+                // Zero is a real fast score, so even at quality weight 1 the
+                // index belongs to the contributing fast owner, not to a rank.
+                assert_eq!(a.index, Some(2));
+                assert_eq!(index.owner.doc_id_at(2).unwrap(), a.doc_id);
+                let z = results.iter().find(|hit| hit.doc_id == "z-fast").unwrap();
+                assert_eq!(z.fast_score, Some(1.0));
+                assert_eq!(z.quality_score, Some(-1.0));
+            }
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn configured_rrf_weights_and_k_are_applied_to_both_phases() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let quality = Provider::new("quality", 3);
+            let index = fast_index(&cx, &fast);
+            let qindex = quality_index(&cx, &quality);
+            let lexical = Lexical::new(&["lexical-only"]);
+            for (k, expected_score) in [(0.0, 2.0_f32), (60.0, 2.0_f32 / 61.0)] {
+                for prefer_lexical in [false, true] {
+                    let config = RrfConfig {
+                        k,
+                        lexical_weight: if prefer_lexical { 2.0 } else { 1.0 },
+                        semantic_weight: if prefer_lexical { 1.0 } else { 2.0 },
+                        ..RrfConfig::default()
+                    };
+                    let mut stream = index
+                        .search_hybrid_progressive(
+                            &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1,
+                        )
+                        .unwrap()
+                        .with_fusion(config, 0.7)
+                        .unwrap();
+                    let NativeSearchPhase::Initial { results, .. } =
+                        stream.next_phase().await.unwrap().unwrap()
+                    else { panic!("initial") };
+                    assert_eq!(results[0].doc_id, if prefer_lexical { "lexical-only" } else { "z-fast" });
+                    assert_eq!(results[0].score.to_bits(), expected_score.to_bits());
+                    let NativeSearchPhase::Refined { results, .. } =
+                        stream.next_phase().await.unwrap().unwrap()
+                    else { panic!("refined") };
+                    assert_eq!(results[0].doc_id, if prefer_lexical { "lexical-only" } else { "a-quality" });
+                    assert_eq!(results[0].score.to_bits(), expected_score.to_bits());
+                    if prefer_lexical {
+                        assert_eq!(results[0].source, ScoreSource::Lexical);
+                        assert!(results[0].index.is_none());
+                        assert_eq!(results[0].metadata.as_deref().unwrap()["generation"], 1);
+                    } else {
+                        assert_eq!(results[0].quality_score, Some(1.0));
+                        assert!(results[0].fast_score.is_none());
+                        assert_eq!(qindex.owner.doc_id_at(results[0].index.unwrap() as usize).unwrap(), results[0].doc_id);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn candidate_multiplier_is_effective_and_independent_of_reranker_configuration_order() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let quality = Provider::new("quality", 3);
+            let index = fast_index(&cx, &fast);
+            let qindex = quality_index(&cx, &quality);
+            let lexical = Lexical::new(&["z-fast", "middle", "near", "a-quality"]);
+            for multiplier in [1, 2, 4] {
+                let mut stream = index
+                    .search_hybrid_progressive(
+                        &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1,
+                    )
+                    .unwrap()
+                    .with_candidate_multiplier(multiplier)
+                    .unwrap();
+                let NativeSearchPhase::Initial { candidates, results } =
+                    stream.next_phase().await.unwrap().unwrap()
+                else { panic!("initial") };
+                assert_eq!(results.len(), 1);
+                assert_eq!(candidates, NativePhaseCandidates { fast: multiplier, quality: 0, lexical: multiplier });
+                let NativeSearchPhase::Refined { candidates, .. } =
+                    stream.next_phase().await.unwrap().unwrap()
+                else { panic!("refined") };
+                assert_eq!(candidates, NativePhaseCandidates { fast: multiplier, quality: multiplier, lexical: multiplier });
+            }
+            let model = CrossEncoder::new(RerankReply::Winner);
+            let mut pages = Vec::new();
+            for reranker_first in [false, true] {
+                let stream = index
+                    .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
+                    .unwrap();
+                let mut stream = if reranker_first {
+                    stream.with_reranker(&model, &source_text, 3).unwrap()
+                        .with_candidate_multiplier(1).unwrap()
+                } else {
+                    stream.with_candidate_multiplier(1).unwrap()
+                        .with_reranker(&model, &source_text, 3).unwrap()
+                };
+                let NativeSearchPhase::Initial { candidates, .. } =
+                    stream.next_phase().await.unwrap().unwrap()
+                else { panic!("initial") };
+                assert_eq!(candidates.fast, 3);
+                assert_eq!(candidates.lexical, 3);
+                let NativeSearchPhase::Reranked { results, evaluated, .. } =
+                    stream.next_phase().await.unwrap().unwrap()
+                else { panic!("reranked") };
+                assert_eq!(evaluated, 3);
+                assert_eq!(results[0].doc_id, "near");
+                pages.push(serde_json::to_value(results).unwrap());
+            }
+            assert_eq!(pages[0], pages[1]);
+        });
+    }
+
+    #[test]
+    fn invalid_or_overflowing_query_policy_is_not_sanitized_into_default_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let index = fast_index(&cx, &fast);
+            let lexical = Lexical::new(&[]);
+            let fresh = |k| index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", k).unwrap();
+            for k in [0, 2] {
+                for weight in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+                    assert!(fresh(k).with_fusion(RrfConfig::default(), weight).is_err());
+                }
+                for value in [f64::NAN, f64::INFINITY, -1.0] {
+                    assert!(fresh(k).with_fusion(RrfConfig { k: value, ..RrfConfig::default() }, 0.7).is_err());
+                }
+                for value in [f64::NAN, f64::INFINITY, -1.0, 0.0, f64::MAX] {
+                    assert!(fresh(k).with_fusion(RrfConfig { lexical_weight: value, ..RrfConfig::default() }, 0.7).is_err());
+                    assert!(fresh(k).with_fusion(RrfConfig { semantic_weight: value, ..RrfConfig::default() }, 0.7).is_err());
+                }
+                assert!(fresh(k).with_candidate_multiplier(0).is_err());
+                assert!(fresh(k).with_beam_widths(Some(0), None).is_err());
+                assert!(fresh(k).with_beam_widths(None, Some(0)).is_err());
+            }
+            assert!(fresh(2).with_candidate_multiplier(usize::MAX).is_err());
+            let model = CrossEncoder::new(RerankReply::Unavailable);
+            assert!(fresh(1).with_candidate_multiplier(2).unwrap()
+                .with_reranker(&model, &source_text, usize::MAX).is_err());
+            assert!(fresh(1).with_reranker(&model, &source_text, 2).unwrap()
+                .with_candidate_multiplier(usize::MAX).is_err());
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn tuning_cannot_change_a_started_query_or_disable_required_quality() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Provider::new("fast", 2);
+            let mut quality = Provider::new("quality", 3);
+            quality.reply = Reply::Failed;
+            let index = fast_index(&cx, &fast);
+            let qindex = quality_index(&cx, &quality);
+            let lexical = Lexical::new(&["z-fast"]);
+            for setting in 0..4 {
+                let mut stream = index.search_hybrid_progressive(
+                    &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1,
+                ).unwrap();
+                assert!(stream.next_phase().await.unwrap().is_some());
+                match setting {
+                    0 => assert!(stream.with_fusion(RrfConfig::default(), 0.0).is_err()),
+                    1 => assert!(stream.with_candidate_multiplier(1).is_err()),
+                    2 => assert!(stream.with_beam_widths(Some(1), None).is_err()),
+                    _ => assert!(stream.collect().await.is_err()),
+                }
+            }
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            let error = index.search_hybrid_progressive(
+                &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1,
+            ).unwrap().with_fusion(RrfConfig::default(), 0.0).unwrap()
+                .collect().await.unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "native_ann.test.provider"));
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+        });
+    }
+
+    #[test]
+    fn beam_overrides_reach_each_tier_before_retained_owner_rescoring() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let provider = Provider::new("fast", 2);
+            let lexical = Lexical::new(&[]);
+            let mut changed_fast = false;
+            let mut changed_quality = false;
+            for reverse in [false, true] {
+                // Both graph distances round to 1.0, but their retained f32
+                // dot products differ. A full beam must see the better row.
+                let low = [1.0e-8, 1.0];
+                let high = [2.0e-8, 1.0];
+                let rows: [(&str, &[f32]); 2] = if reverse {
+                    [("a", &high), ("b", &low)]
+                } else {
+                    [("a", &low), ("b", &high)]
+                };
+                let winner = if reverse { "a" } else { "b" };
+                let mut index = native_index(&cx, &provider, generation(), &rows);
+                index.default_ef_search = 1;
+                let narrow = index.search_hybrid_progressive(
+                    &cx, &provider, None, &lexical, "query", 1,
+                ).unwrap().with_candidate_multiplier(1).unwrap().collect().await.unwrap();
+                let wide = index.search_hybrid_progressive(
+                    &cx, &provider, None, &lexical, "query", 1,
+                ).unwrap().with_candidate_multiplier(1).unwrap()
+                    .with_beam_widths(Some(2), None).unwrap().collect().await.unwrap();
+                assert_eq!(wide[0].doc_id, winner);
+                assert_eq!(wide[0].fast_score, Some(high[0]));
+                changed_fast |= narrow[0].doc_id != wide[0].doc_id;
+                let empty = native_index(&cx, &provider, generation(), &[]);
+                let narrow = empty.search_hybrid_progressive(
+                    &cx, &provider, Some((&index, &provider)), &lexical, "query", 1,
+                ).unwrap().with_candidate_multiplier(1).unwrap().collect().await.unwrap();
+                let wide = empty.search_hybrid_progressive(
+                    &cx, &provider, Some((&index, &provider)), &lexical, "query", 1,
+                ).unwrap().with_candidate_multiplier(1).unwrap()
+                    .with_beam_widths(None, Some(2)).unwrap().collect().await.unwrap();
+                assert_eq!(wide[0].doc_id, winner);
+                assert_eq!(wide[0].quality_score, Some(high[0]));
+                assert!(wide[0].fast_score.is_none());
+                assert_eq!(index.owner.doc_id_at(wide[0].index.unwrap() as usize).unwrap(), winner);
+                changed_quality |= narrow[0].doc_id != wide[0].doc_id;
+            }
+            assert!(changed_fast && changed_quality, "the overrides must change actual retrieval, not only stored configuration");
+        });
     }
 
     #[test]
