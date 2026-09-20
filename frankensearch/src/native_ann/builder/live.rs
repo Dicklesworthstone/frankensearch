@@ -16,13 +16,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use asupersync::sync::{RwLock, RwLockError};
-use frankensearch_core::generation::{
-    ArtifactGenerationIdentityV1, GenerationComponentReceiptV1,
-};
+use frankensearch_core::generation::{ArtifactGenerationIdentityV1, GenerationComponentReceiptV1};
 
 use super::{
-    NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltHybridIndex,
-    NativeHybridReopenLimits, NativeIndexUpdate, checkpoint, invalid,
+    NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltHybridIndex, NativeHybridReopenLimits,
+    NativeIndexUpdate, checkpoint, invalid,
 };
 use crate::{Cx, IndexableDocument, ScoredResult, SearchError, SearchResult};
 
@@ -215,7 +213,12 @@ impl NativeHybridSnapshot {
     /// Complete artifact generation identity, including its nonce.
     #[must_use]
     pub fn generation(&self) -> ArtifactGenerationIdentityV1 {
-        self.index.vectors().fast().index().owner_witness().generation
+        self.index
+            .vectors()
+            .fast()
+            .index()
+            .owner_witness()
+            .generation
     }
 
     /// Stage incremental source edits against this exact predecessor.
@@ -268,7 +271,10 @@ impl NativeHybridSnapshot {
             directory,
             expected,
             Arc::clone(&vectors.fast.embedder),
-            vectors.quality.as_ref().map(|tier| Arc::clone(&tier.embedder)),
+            vectors
+                .quality
+                .as_ref()
+                .map(|tier| Arc::clone(&tier.embedder)),
             limits,
         )
         .await?;
@@ -504,7 +510,11 @@ mod tests {
                     std::future::pending::<()>().await;
                 }
                 if self.fail_batches.load(Ordering::SeqCst) {
-                    return Err(invalid("live.test_provider", "failed", "required tier failed"));
+                    return Err(invalid(
+                        "live.test_provider",
+                        "failed",
+                        "required tier failed",
+                    ));
                 }
                 Ok(texts
                     .iter()
@@ -575,12 +585,18 @@ mod tests {
         let fast = Provider::new("live-fast", 2);
         let quality = Provider::new("live-quality", 3);
         let initial = build(cx, &root.join("initial"), 1, &fast, Some(&quality)).await;
-        (NativeLiveHybridIndex::new(cx, initial).unwrap(), fast, quality)
+        (
+            NativeLiveHybridIndex::new(cx, initial).unwrap(),
+            fast,
+            quality,
+        )
     }
 
     fn assert_refusal(error: SearchError, field: &str) {
-        assert!(matches!(error, SearchError::InvalidConfig { field: actual, .. }
-            if actual == field));
+        assert!(
+            matches!(error, SearchError::InvalidConfig { field: actual, .. }
+            if actual == field)
+        );
     }
 
     fn assert_rows(page: &NativeHybridResults) {
@@ -798,8 +814,9 @@ mod tests {
             );
             assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
             let mut install = Box::pin(live.install(&cx, &candidate));
-            let Poll::Ready(Ok(installed)) =
-                install.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            let Poll::Ready(Ok(installed)) = install
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
             else {
                 panic!("inference must not retain the selection lock");
             };
@@ -856,7 +873,9 @@ mod tests {
             );
             cx.set_cancel_requested(true);
             assert!(matches!(
-                cancelled.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                cancelled
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Ready(Err(SearchError::Cancelled { .. }))
             ));
             drop(cancelled);
@@ -878,7 +897,10 @@ mod tests {
                 Err(SearchError::Cancelled { .. })
             ));
             cx.set_cancel_requested(false);
-            assert_eq!(live.snapshot(&cx).await.unwrap().generation(), generation(2));
+            assert_eq!(
+                live.snapshot(&cx).await.unwrap().generation(),
+                generation(2)
+            );
         });
     }
 
@@ -923,7 +945,11 @@ mod tests {
             ));
             assert!(base.index().vectors().document("new").is_none());
             assert_eq!(
-                live.search_quality(&cx, "vertical", 1).await.unwrap().results[0].doc_id,
+                live.search_quality(&cx, "vertical", 1)
+                    .await
+                    .unwrap()
+                    .results[0]
+                    .doc_id,
                 "b"
             );
         });
@@ -956,7 +982,11 @@ mod tests {
             };
             bad.sha256[0] ^= 1;
             let limits = NativeHybridReopenLimits::default();
-            assert!(base.prepare_selected(&cx, &next_path, &bad, limits).await.is_err());
+            assert!(
+                base.prepare_selected(&cx, &next_path, &bad, limits)
+                    .await
+                    .is_err()
+            );
             assert!(Arc::ptr_eq(
                 &live.snapshot(&cx).await.unwrap().index,
                 &base.index
@@ -1012,9 +1042,14 @@ mod tests {
                 let receipt = candidate.seal_for_reopen(&cx).unwrap();
                 drop(candidate);
                 assert!(
-                    base.prepare_selected(&cx, &path, &receipt, NativeHybridReopenLimits::default())
-                        .await
-                        .is_err()
+                    base.prepare_selected(
+                        &cx,
+                        &path,
+                        &receipt,
+                        NativeHybridReopenLimits::default()
+                    )
+                    .await
+                    .is_err()
                 );
                 assert!(Arc::ptr_eq(
                     &live.snapshot(&cx).await.unwrap().index,

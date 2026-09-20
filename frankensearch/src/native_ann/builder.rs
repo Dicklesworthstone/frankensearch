@@ -379,9 +379,10 @@ impl NativeIndexBuilder {
                 )
                 .await?;
             if let (Some(tier), Some(writer)) = (&self.quality, &mut quality_writer) {
-                let reuse = self.reuse.as_ref().and_then(|source| {
-                    source.quality.as_ref().map(|quality| (source, quality))
-                });
+                let reuse = self
+                    .reuse
+                    .as_ref()
+                    .and_then(|source| source.quality.as_ref().map(|quality| (source, quality)));
                 tier.write_batch_reusing(cx, writer, batch, reuse).await?;
             }
         }

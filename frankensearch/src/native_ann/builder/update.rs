@@ -267,7 +267,11 @@ impl ReuseTier {
             let source = documents
                 .binary_search_by(|document| document.id.as_str().cmp(row.doc_id()))
                 .map_err(|_| {
-                    invalid("update.source_join", "unknown-id", "row has no source document")
+                    invalid(
+                        "update.source_join",
+                        "unknown-id",
+                        "row has no source document",
+                    )
                 })?;
             if !row.flags().is_live()
                 || std::mem::replace(&mut physical_rows[source], physical) != usize::MAX
@@ -457,7 +461,11 @@ mod tests {
                     })
                     .collect();
                 if fault == FOREIGN {
-                    output.last_mut().unwrap().identity.clone_from(&self.foreign);
+                    output
+                        .last_mut()
+                        .unwrap()
+                        .identity
+                        .clone_from(&self.foreign);
                 }
                 if fault == CANCEL {
                     cx.set_cancel_requested(true);
@@ -542,10 +550,22 @@ mod tests {
                 expected.index.owner.doc_id_at(row).unwrap()
             );
             assert_eq!(
-                actual.index.owner.vector_at_f32(row).unwrap()
-                    .iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                expected.index.owner.vector_at_f32(row).unwrap()
-                    .iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+                actual
+                    .index
+                    .owner
+                    .vector_at_f32(row)
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .index
+                    .owner
+                    .vector_at_f32(row)
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -567,53 +587,82 @@ mod tests {
                         .with_fast_storage(precision, graph(ann))
                         .with_quality_storage(other_precision, graph(!ann))
                         .unwrap()
-                        .build(&cx).await.unwrap();
+                        .build(&cx)
+                        .await
+                        .unwrap();
                     let old_fast_bytes = std::fs::read(old.fast.vector_path()).unwrap();
-                    let old_quality_bytes = std::fs::read(old.quality().unwrap().vector_path()).unwrap();
+                    let old_quality_bytes =
+                        std::fs::read(old.quality().unwrap().vector_path()).unwrap();
                     assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
                     assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
                     let revised_a = IndexableDocument::new("a", "fractional")
                         .with_title("new title")
                         .with_metadata("revision", "2");
-                    let next = old.begin_update(&cx, dir.path().join("next"), generation(2))
+                    let next = old
+                        .begin_update(&cx, dir.path().join("next"), generation(2))
                         .unwrap()
                         .upsert_document(IndexableDocument::new("b", "horizontal"))
                         .delete_document("c")
                         .upsert_document(revised_a.clone())
                         .upsert_document(IndexableDocument::new("new", "vertical"))
-                        .with_batch_size(2).unwrap()
-                        .build(&cx).await.unwrap();
+                        .with_batch_size(2)
+                        .unwrap()
+                        .build(&cx)
+                        .await
+                        .unwrap();
                     assert_eq!(fast.submitted.load(Ordering::SeqCst), 7);
                     assert_eq!(quality.submitted.load(Ordering::SeqCst), 7);
                     assert_eq!(next.fast.graph_path.is_some(), ann);
                     assert_eq!(next.quality().unwrap().graph_path.is_some(), !ann);
                     assert!(next.document("c").is_none());
                     assert_eq!(next.document("a").unwrap().metadata["revision"], "2");
-                    assert_eq!(next.document("a").unwrap().title.as_deref(), Some("new title"));
+                    assert_eq!(
+                        next.document("a").unwrap().title.as_deref(),
+                        Some("new title")
+                    );
                     // The baseline re-embeds the explicitly specified final cohort.
                     // It does not derive expected vectors or rows from the update.
                     let rebuilt = NativeIndexBuilder::new(
-                        dir.path().join("rebuilt"), generation(2), fast.clone(),
-                    ).unwrap()
-                        .with_quality_embedder(quality.clone()).unwrap()
-                        .with_fast_storage(precision, graph(ann))
-                        .with_quality_storage(other_precision, graph(!ann)).unwrap()
-                        .add_documents([
-                            revised_a,
-                            IndexableDocument::new("b", "horizontal"),
-                            IndexableDocument::new("x", "diagonal"),
-                            IndexableDocument::new("z-fast", "horizontal"),
-                            IndexableDocument::new("new", "vertical"),
-                        ])
-                        .build(&cx).await.unwrap();
+                        dir.path().join("rebuilt"),
+                        generation(2),
+                        fast.clone(),
+                    )
+                    .unwrap()
+                    .with_quality_embedder(quality.clone())
+                    .unwrap()
+                    .with_fast_storage(precision, graph(ann))
+                    .with_quality_storage(other_precision, graph(!ann))
+                    .unwrap()
+                    .add_documents([
+                        revised_a,
+                        IndexableDocument::new("b", "horizontal"),
+                        IndexableDocument::new("x", "diagonal"),
+                        IndexableDocument::new("z-fast", "horizontal"),
+                        IndexableDocument::new("new", "vertical"),
+                    ])
+                    .build(&cx)
+                    .await
+                    .unwrap();
                     assert_same_tier(next.fast(), rebuilt.fast());
                     assert_same_tier(next.quality().unwrap(), rebuilt.quality().unwrap());
                     assert_eq!(old.document("b").unwrap().content, "vertical");
                     assert!(old.document("c").is_some() && old.document("new").is_none());
-                    assert_eq!(std::fs::read(old.fast.vector_path()).unwrap(), old_fast_bytes);
-                    assert_eq!(std::fs::read(old.quality().unwrap().vector_path()).unwrap(), old_quality_bytes);
-                    assert_eq!(old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
-                    assert_eq!(next.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "new");
+                    assert_eq!(
+                        std::fs::read(old.fast.vector_path()).unwrap(),
+                        old_fast_bytes
+                    );
+                    assert_eq!(
+                        std::fs::read(old.quality().unwrap().vector_path()).unwrap(),
+                        old_quality_bytes
+                    );
+                    assert_eq!(
+                        old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                        "b"
+                    );
+                    assert_eq!(
+                        next.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                        "new"
+                    );
                 }
             }
         });
@@ -625,19 +674,31 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let fast = Provider::new("fast", 2);
             let quality = Provider::new("quality", 3);
-            let old = builder(&dir.path().join("old"), &fast, &quality).build(&cx).await.unwrap();
+            let old = builder(&dir.path().join("old"), &fast, &quality)
+                .build(&cx)
+                .await
+                .unwrap();
             // Both providers would fail if any batch were submitted.
             fast.fault.store(FAIL, Ordering::SeqCst);
             quality.fault.store(FAIL, Ordering::SeqCst);
-            let metadata = old.begin_update(&cx, dir.path().join("metadata"), generation(2))
+            let metadata = old
+                .begin_update(&cx, dir.path().join("metadata"), generation(2))
                 .unwrap()
                 .upsert_document(IndexableDocument::new("b", "vertical").with_metadata("v", "new"))
                 .delete_document("absent")
-                .build(&cx).await.unwrap();
+                .build(&cx)
+                .await
+                .unwrap();
             assert_eq!(metadata.document("b").unwrap().metadata["v"], "new");
-            let noop = metadata.begin_update(&cx, dir.path().join("noop"), generation(3))
-                .unwrap().build(&cx).await.unwrap();
-            let mut update = noop.begin_update(&cx, dir.path().join("empty"), generation(4)).unwrap();
+            let noop = metadata
+                .begin_update(&cx, dir.path().join("noop"), generation(3))
+                .unwrap()
+                .build(&cx)
+                .await
+                .unwrap();
+            let mut update = noop
+                .begin_update(&cx, dir.path().join("empty"), generation(4))
+                .unwrap();
             for document in documents() {
                 update = update.delete_document(document.id);
             }
@@ -660,19 +721,28 @@ mod tests {
             let quality = Provider::new("quality", 3);
             let old = builder(&dir.path().join("old"), &fast, &quality)
                 .with_fast_storage(NativeBuildPrecision::F16, graph(false))
-                .build(&cx).await.unwrap();
-            let next = old.begin_update(&cx, dir.path().join("next"), generation(2))
+                .build(&cx)
+                .await
+                .unwrap();
+            let next = old
+                .begin_update(&cx, dir.path().join("next"), generation(2))
                 .unwrap()
                 .with_fast_storage(NativeBuildPrecision::F32, graph(true))
-                .build(&cx).await.unwrap();
+                .build(&cx)
+                .await
+                .unwrap();
             assert_eq!(fast.submitted.load(Ordering::SeqCst), 10);
             assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
             let owner = &next.fast.index.owner;
-            let row = (0..owner.record_count()).find(|&row| owner.doc_id_at(row).unwrap() == "a").unwrap();
+            let row = (0..owner.record_count())
+                .find(|&row| owner.doc_id_at(row).unwrap() == "a")
+                .unwrap();
             let actual = owner.vector_at_f32(row).unwrap();
             assert_eq!(actual, fast.values("fractional"));
             let old_owner = &old.fast.index.owner;
-            let old_row = (0..old_owner.record_count()).find(|&row| old_owner.doc_id_at(row).unwrap() == "a").unwrap();
+            let old_row = (0..old_owner.record_count())
+                .find(|&row| old_owner.doc_id_at(row).unwrap() == "a")
+                .unwrap();
             assert_ne!(actual, old_owner.vector_at_f32(old_row).unwrap());
         });
     }
@@ -683,16 +753,23 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let fast = Provider::new("fast", 2);
             let old = NativeIndexBuilder::new(dir.path().join("old"), generation(1), fast.clone())
-                .unwrap().add_document(IndexableDocument::new("old-id", "vertical"))
-                .build(&cx).await.unwrap();
-            let next = old.begin_update(&cx, dir.path().join("next"), generation(2)).unwrap()
+                .unwrap()
+                .add_document(IndexableDocument::new("old-id", "vertical"))
+                .build(&cx)
+                .await
+                .unwrap();
+            let next = old
+                .begin_update(&cx, dir.path().join("next"), generation(2))
+                .unwrap()
                 .delete_document("old-id")
                 .upsert_document(IndexableDocument::new("new-id", "horizontal"))
                 .delete_document("new-id")
                 .upsert_document(IndexableDocument::new("new-id", "vertical"))
                 .upsert_document(IndexableDocument::new("temporary", "horizontal"))
                 .delete_document("temporary")
-                .build(&cx).await.unwrap();
+                .build(&cx)
+                .await
+                .unwrap();
             assert_eq!(next.documents().len(), 1);
             assert_eq!(next.documents()[0].id, "new-id");
             assert_eq!(next.documents()[0].content, "vertical");
@@ -709,13 +786,19 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let fast = Provider::new("fast", 2);
                 let quality = Provider::new("quality", 3);
-                let old = builder(&dir.path().join("old"), &fast, &quality).build(&cx).await.unwrap();
+                let old = builder(&dir.path().join("old"), &fast, &quality)
+                    .build(&cx)
+                    .await
+                    .unwrap();
                 let old_bytes = std::fs::read(old.fast.vector_path()).unwrap();
                 quality.fault.store(fault, Ordering::SeqCst);
                 let path = dir.path().join("failed");
-                let result = old.begin_update(&cx, &path, generation(2)).unwrap()
+                let result = old
+                    .begin_update(&cx, &path, generation(2))
+                    .unwrap()
                     .upsert_document(IndexableDocument::new("new", "vertical"))
-                    .build(&cx).await;
+                    .build(&cx)
+                    .await;
                 assert!(result.is_err());
                 if fault == CANCEL {
                     assert!(matches!(result, Err(SearchError::Cancelled { .. })));
@@ -726,8 +809,19 @@ mod tests {
                 assert_eq!(old.fast().index().live_count(), 5);
                 assert_eq!(old.quality().unwrap().index().live_count(), 5);
                 assert_eq!(std::fs::read(old.fast.vector_path()).unwrap(), old_bytes);
-                assert_eq!(old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
-                assert_eq!(old.quality().unwrap().search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
+                assert_eq!(
+                    old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                    "b"
+                );
+                assert_eq!(
+                    old.quality()
+                        .unwrap()
+                        .search(&cx, "vertical", 1)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "b"
+                );
             }
         });
     }
@@ -738,22 +832,47 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let fast = Provider::new("fast", 2);
             let quality = Provider::new("quality", 3);
-            let old = builder(&dir.path().join("old"), &fast, &quality).build(&cx).await.unwrap();
+            let old = builder(&dir.path().join("old"), &fast, &quality)
+                .build(&cx)
+                .await
+                .unwrap();
             quality.fault.store(PENDING, Ordering::SeqCst);
             let path = dir.path().join("abandoned");
-            let update = old.begin_update(&cx, &path, generation(2)).unwrap()
+            let update = old
+                .begin_update(&cx, &path, generation(2))
+                .unwrap()
                 .upsert_document(IndexableDocument::new("new", "vertical"));
             let mut future = Box::pin(update.build(&cx));
-            assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-            assert_eq!(old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
-            assert_eq!(old.quality().unwrap().search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert_eq!(
+                old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                "b"
+            );
+            assert_eq!(
+                old.quality()
+                    .unwrap()
+                    .search(&cx, "vertical", 1)
+                    .await
+                    .unwrap()[0]
+                    .doc_id,
+                "b"
+            );
             drop(future);
             assert_eq!(quality.drops.load(Ordering::SeqCst), 2);
             assert!(!path.join("fast.fsvi").exists());
             quality.fault.store(OK, Ordering::SeqCst);
-            let retry = old.begin_update(&cx, dir.path().join("retry"), generation(2)).unwrap()
+            let retry = old
+                .begin_update(&cx, dir.path().join("retry"), generation(2))
+                .unwrap()
                 .upsert_document(IndexableDocument::new("new", "vertical"))
-                .build(&cx).await.unwrap();
+                .build(&cx)
+                .await
+                .unwrap();
             assert_eq!(retry.documents().len(), 6);
             assert!(old.document("new").is_none());
         });
@@ -765,12 +884,20 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let fast = Provider::new("fast", 2);
             let quality = Provider::new("quality", 3);
-            let old = builder(&dir.path().join("old"), &fast, &quality).build(&cx).await.unwrap();
+            let old = builder(&dir.path().join("old"), &fast, &quality)
+                .build(&cx)
+                .await
+                .unwrap();
             let path = dir.path().join("rejected");
             assert!(old.begin_update(&cx, &path, generation(1)).is_err());
-            assert!(old.begin_update(
-                &cx, &path, ArtifactGenerationIdentityV1::new(1, [0x56; 16]).unwrap(),
-            ).is_err());
+            assert!(
+                old.begin_update(
+                    &cx,
+                    &path,
+                    ArtifactGenerationIdentityV1::new(1, [0x56; 16]).unwrap(),
+                )
+                .is_err()
+            );
             quality.fault.store(IDENTITY_DRIFT, Ordering::SeqCst);
             assert!(old.begin_update(&cx, &path, generation(2)).is_err());
             quality.fault.store(OK, Ordering::SeqCst);
@@ -778,16 +905,30 @@ mod tests {
             quality.fault.store(IDENTITY_DRIFT, Ordering::SeqCst);
             assert!(update.build(&cx).await.is_err());
             quality.fault.store(OK, Ordering::SeqCst);
-            assert!(old.begin_update(&cx, &path, generation(2)).unwrap()
-                .delete_document("").build(&cx).await.is_err());
-            assert!(old.begin_update(&cx, &path, generation(2)).unwrap()
-                .upsert_document(IndexableDocument::new("", "horizontal"))
-                .build(&cx).await.is_err());
+            assert!(
+                old.begin_update(&cx, &path, generation(2))
+                    .unwrap()
+                    .delete_document("")
+                    .build(&cx)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                old.begin_update(&cx, &path, generation(2))
+                    .unwrap()
+                    .upsert_document(IndexableDocument::new("", "horizontal"))
+                    .build(&cx)
+                    .await
+                    .is_err()
+            );
             assert!(!path.exists());
             assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
             assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
-            let result = old.begin_update(&cx, old.directory(), generation(2)).unwrap()
-                .build(&cx).await;
+            let result = old
+                .begin_update(&cx, old.directory(), generation(2))
+                .unwrap()
+                .build(&cx)
+                .await;
             assert!(result.is_err());
             assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
         });
@@ -800,8 +941,13 @@ mod tests {
             let fast = Provider::new("fast", 2);
             let quality = Provider::new("quality", 3);
             let old_path = dir.path().join("old");
-            let old = builder(&old_path, &fast, &quality).build(&cx).await.unwrap();
-            let update = old.begin_update(&cx, dir.path().join("next"), generation(2)).unwrap();
+            let old = builder(&old_path, &fast, &quality)
+                .build(&cx)
+                .await
+                .unwrap();
+            let update = old
+                .begin_update(&cx, dir.path().join("next"), generation(2))
+                .unwrap();
             std::fs::rename(&old_path, dir.path().join("archived")).unwrap();
             assert!(!old_path.exists());
             drop(old);
@@ -809,7 +955,10 @@ mod tests {
             assert_eq!(next.documents().len(), 5);
             assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
             assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
-            assert_eq!(next.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
+            assert_eq!(
+                next.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                "b"
+            );
         });
     }
 
@@ -823,28 +972,50 @@ mod tests {
             let path = dir.path().join("old");
             let old = builder(&path, &fast, &quality)
                 .with_fast_storage(NativeBuildPrecision::F16, graph(true))
-                .build(&cx).await.unwrap();
+                .build(&cx)
+                .await
+                .unwrap();
             let receipt = old.seal_for_reopen(&cx).unwrap();
             drop(old);
             let reopened = NativeBuiltIndex::open_selected(
-                &cx, &path, &receipt, fast.clone(), Some(quality.clone()),
-            ).unwrap();
+                &cx,
+                &path,
+                &receipt,
+                fast.clone(),
+                Some(quality.clone()),
+            )
+            .unwrap();
             let next_path = dir.path().join("next");
-            let next = reopened.begin_update(&cx, &next_path, generation(2)).unwrap()
+            let next = reopened
+                .begin_update(&cx, &next_path, generation(2))
+                .unwrap()
                 .delete_document("b")
-                .build(&cx).await.unwrap();
+                .build(&cx)
+                .await
+                .unwrap();
             assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
             assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
             assert!(next.fast.graph_path().is_some());
             let next_receipt = next.seal_for_reopen(&cx).unwrap();
             drop(next);
             let selected = NativeBuiltIndex::open_selected(
-                &cx, &next_path, &next_receipt, fast.clone(), Some(quality.clone()),
-            ).unwrap();
+                &cx,
+                &next_path,
+                &next_receipt,
+                fast.clone(),
+                Some(quality.clone()),
+            )
+            .unwrap();
             assert!(selected.document("b").is_none());
             assert!(reopened.document("b").is_some());
-            assert_eq!(selected.fast.index.owner_witness().generation, generation(2));
-            assert_eq!(selected.quality().unwrap().index.owner_witness().generation, generation(2));
+            assert_eq!(
+                selected.fast.index.owner_witness().generation,
+                generation(2)
+            );
+            assert_eq!(
+                selected.quality().unwrap().index.owner_witness().generation,
+                generation(2)
+            );
         });
     }
 
@@ -859,14 +1030,17 @@ mod tests {
             let quality = Provider::new("quality", 3);
             let old = NativeIndexBuilder::new(dir.path().join("old"), generation(1), fast.clone())
                 .unwrap()
-                .with_quality_embedder(quality.clone()).unwrap()
+                .with_quality_embedder(quality.clone())
+                .unwrap()
                 .with_fast_storage(NativeBuildPrecision::F16, graph(true))
                 .add_documents([
                     IndexableDocument::new("a", "retained common"),
                     IndexableDocument::new("b", "obsolete common").with_metadata("revision", "old"),
                     IndexableDocument::new("c", "removed common"),
                 ])
-                .build_hybrid(&cx).await.unwrap();
+                .build_hybrid(&cx)
+                .await
+                .unwrap();
             let mut old_stream = old.progressive(&cx, "obsolete", 1).unwrap();
             let Some(NativeSearchPhase::Initial { results, .. }) =
                 old_stream.next_phase().await.unwrap()
@@ -877,22 +1051,48 @@ mod tests {
             assert!(results[0].lexical_score.is_some());
 
             let path = dir.path().join("next");
-            let next = old.begin_update(&cx, &path, generation(2)).unwrap()
+            let next = old
+                .begin_update(&cx, &path, generation(2))
+                .unwrap()
                 .delete_document("c")
                 .upsert_documents([
-                    IndexableDocument::new("b", "replacement common").with_metadata("revision", "new"),
+                    IndexableDocument::new("b", "replacement common")
+                        .with_metadata("revision", "new"),
                     IndexableDocument::new("d", "arrival common"),
                 ])
-                .build_hybrid(&cx).await.unwrap();
+                .build_hybrid(&cx)
+                .await
+                .unwrap();
             assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
             assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
             assert_eq!(old.lexical().doc_count().unwrap(), 3);
             assert_eq!(next.lexical().doc_count().unwrap(), 3);
-            assert!(next.lexical().search(&cx, "obsolete", 10).await.unwrap().is_empty());
-            assert!(next.lexical().search(&cx, "removed", 10).await.unwrap().is_empty());
-            assert_eq!(next.lexical().search(&cx, "replacement", 10).await.unwrap()[0].doc_id, "b");
-            assert_eq!(next.lexical().search(&cx, "arrival", 10).await.unwrap()[0].doc_id, "d");
-            assert_eq!(old.lexical().search(&cx, "removed", 10).await.unwrap()[0].doc_id, "c");
+            assert!(
+                next.lexical()
+                    .search(&cx, "obsolete", 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                next.lexical()
+                    .search(&cx, "removed", 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                next.lexical().search(&cx, "replacement", 10).await.unwrap()[0].doc_id,
+                "b"
+            );
+            assert_eq!(
+                next.lexical().search(&cx, "arrival", 10).await.unwrap()[0].doc_id,
+                "d"
+            );
+            assert_eq!(
+                old.lexical().search(&cx, "removed", 10).await.unwrap()[0].doc_id,
+                "c"
+            );
             let Some(NativeSearchPhase::Refined { results, .. }) =
                 old_stream.next_phase().await.unwrap()
             else {
@@ -900,17 +1100,35 @@ mod tests {
             };
             assert_eq!(results[0].doc_id, "b");
             assert!(results[0].lexical_score.is_some());
-            assert_eq!(old.vectors().document("b").unwrap().metadata["revision"], "old");
-            assert_eq!(next.vectors().document("b").unwrap().metadata["revision"], "new");
+            assert_eq!(
+                old.vectors().document("b").unwrap().metadata["revision"],
+                "old"
+            );
+            assert_eq!(
+                next.vectors().document("b").unwrap().metadata["revision"],
+                "new"
+            );
 
             let receipt = next.seal_for_reopen(&cx).unwrap();
             drop(next);
             let reopened = NativeBuiltHybridIndex::open_selected(
-                &cx, &path, &receipt, fast.clone(), Some(quality.clone()),
-            ).await.unwrap();
+                &cx,
+                &path,
+                &receipt,
+                fast.clone(),
+                Some(quality.clone()),
+            )
+            .await
+            .unwrap();
             assert!(reopened.vectors().document("c").is_none());
-            assert_eq!(reopened.lexical().search(&cx, "arrival", 10).await.unwrap()[0].doc_id, "d");
-            assert_eq!(reopened.vectors().document("b").unwrap().content, "replacement common");
+            assert_eq!(
+                reopened.lexical().search(&cx, "arrival", 10).await.unwrap()[0].doc_id,
+                "d"
+            );
+            assert_eq!(
+                reopened.vectors().document("b").unwrap().content,
+                "replacement common"
+            );
             assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
             assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
         });
@@ -924,15 +1142,27 @@ mod tests {
             let fast = Provider::new("fast", 2);
             let quality = Provider::new("quality", 3);
             let old = builder(&dir.path().join("old"), &fast, &quality)
-                .build_hybrid(&cx).await.unwrap();
+                .build_hybrid(&cx)
+                .await
+                .unwrap();
             quality.fault.store(PENDING, Ordering::SeqCst);
             let path = dir.path().join("pending");
-            let update = old.begin_update(&cx, &path, generation(2)).unwrap()
+            let update = old
+                .begin_update(&cx, &path, generation(2))
+                .unwrap()
                 .delete_document("b")
                 .upsert_document(IndexableDocument::new("new", "vertical"));
             let mut future = Box::pin(update.build_hybrid(&cx));
-            assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-            assert_eq!(old.lexical().search(&cx, "vertical", 10).await.unwrap()[0].doc_id, "b");
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert_eq!(
+                old.lexical().search(&cx, "vertical", 10).await.unwrap()[0].doc_id,
+                "b"
+            );
             assert_eq!(old.search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
             drop(future);
             assert_eq!(quality.drops.load(Ordering::SeqCst), 2);

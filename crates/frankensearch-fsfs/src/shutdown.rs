@@ -336,7 +336,10 @@ impl ShutdownCoordinator {
             ShutdownState::Running => {
                 *lock_or_recover(&self.first_stop_signal_at) = Some(now);
                 self.request_shutdown(ShutdownReason::Signal(signal));
-                info!(signal, "received first stop signal, initiating graceful shutdown");
+                info!(
+                    signal,
+                    "received first stop signal, initiating graceful shutdown"
+                );
             }
             ShutdownState::ShuttingDown => {
                 let first_stop_signal_at = *lock_or_recover(&self.first_stop_signal_at);

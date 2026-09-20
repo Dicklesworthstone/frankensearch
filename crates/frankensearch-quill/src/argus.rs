@@ -12761,10 +12761,8 @@ mod tests {
         let all = ReferenceScorer::all_with_boost(0, 3, live_num_docs, 1.0)?;
 
         // The combination is what failed: each leaf is fine alone.
-        let mut combined = ReferenceScorer::boolean(vec![
-            ScorerClause::must(all),
-            ScorerClause::must(range),
-        ])?;
+        let mut combined =
+            ReferenceScorer::boolean(vec![ScorerClause::must(all), ScorerClause::must(range)])?;
         let hits = combined.top_k(3, &AllLiveDocs)?;
         assert!(
             !hits.is_empty(),

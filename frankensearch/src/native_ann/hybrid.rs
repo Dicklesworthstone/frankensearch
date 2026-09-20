@@ -960,9 +960,9 @@ mod tests {
         });
     }
 
-    fn assert_hydration_refusal(error: SearchError) {
+    fn assert_hydration_refusal(error: &SearchError) {
         assert!(
-            matches!(error, SearchError::InvalidConfig { ref field, ref value, .. }
+            matches!(error, SearchError::InvalidConfig { field, value, .. }
             if field == "native_ann.hydration.provenance" && value == "mutated-result")
         );
     }
@@ -1004,7 +1004,7 @@ mod tests {
                 let error = hydrate_results(&cx, &lexical, &mut results, &batch)
                     .await
                     .expect_err(name);
-                assert_hydration_refusal(error);
+                assert_hydration_refusal(&error);
                 assert_eq!(serde_json::to_value(&results).unwrap(), before, "{name}");
                 assert!(Arc::ptr_eq(
                     results[0].metadata.as_ref().unwrap(),
@@ -1110,7 +1110,7 @@ mod tests {
                     )
                     .await,
             ] {
-                assert_hydration_refusal(response.unwrap_err());
+                assert_hydration_refusal(&response.unwrap_err());
             }
             for response in [
                 shards
@@ -1130,7 +1130,7 @@ mod tests {
                     )
                     .await,
             ] {
-                assert_hydration_refusal(response.unwrap_err());
+                assert_hydration_refusal(&response.unwrap_err());
             }
             assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 6);
         });
@@ -1169,7 +1169,7 @@ mod tests {
             else {
                 panic!("failed hydration must not become successful refinement");
             };
-            assert_hydration_refusal(error);
+            assert_hydration_refusal(&error);
             assert_eq!(serde_json::to_value(&initial_results).unwrap(), before);
             assert!(Arc::ptr_eq(
                 results[0].metadata.as_ref().unwrap(),
