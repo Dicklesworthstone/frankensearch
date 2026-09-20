@@ -15,6 +15,10 @@ A September 17 supplement records lexical-flush retry and resume-ordering fixes
 and FrankenSQLite 0.4.4 adoption. Both previously failing SQLite corruption
 regressions now pass; combined-source and rebuilt-artifact qualification remain pending.
 
+A September 20 supplement below separates changes landed after the 0.6.1
+publication from that immutable crate release. Cross-platform binaries and
+complete release qualification remain pending.
+
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
@@ -65,8 +69,6 @@ Historical adapter identities remain rejected by strict admission, and the
 ### Changed
 
 - **HTTP transport updates to ureq 3.4.2 and Rustls 0.23.45.** The Rustls update addresses [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html); ureq also updates redirect and connection handling. Verified HTTPS requests pass through the updated transport. Combined-source release checks remain pending; see the [upgrade log](docs/planning/UPGRADE_LOG.md).
-
-- **FrankenTUI 0.7.0, wide 1.7.1, crc32fast 1.5.2, and TOML 1.1.6.** The terminal framework and configuration updates pass their affected consumer suites. The latest SIMD and checksum patches pass the index SIMD and WAL suites. These checks establish compatibility, not a measured speedup. Full release qualification remains pending; see the [upgrade log](docs/planning/UPGRADE_LOG.md).
 
 - **FrankenTUI 0.7.0, wide 1.7.1, crc32fast 1.5.2, and TOML 1.1.6.** The terminal framework and configuration updates pass their affected consumer suites. The latest SIMD and checksum patches pass the index SIMD and WAL suites. These checks establish compatibility, not a measured speedup. Full release qualification remains pending; see the [upgrade log](docs/planning/UPGRADE_LOG.md).
 
@@ -228,6 +230,62 @@ Historical adapter identities remain rejected by strict admission, and the
 - **Populated CASS native-consumer acceptance remains pending ([#47](https://github.com/Dicklesworthstone/frankensearch/issues/47)).** The native F32 and Int8 certificate tests now pass on ARM64 macOS as well as Linux x86. Those producer checks do not establish the downstream CASS integration. Standard full binaries use ONNX quality embeddings by default, and the native loader continues to reject mismatched numerical output. [Qualification record](docs/planning/UPGRADE_LOG.md).
 
 ---
+
+## Unreleased changes after frankensearch 0.6.1
+
+This section covers landed source through
+[`aaf8bae1`](https://github.com/Dicklesworthstone/frankensearch/commit/aaf8bae1169f39acdaf12c0e58b65a0ab876ab7c).
+These changes are **not included in the published 0.6.1 crate family**.
+The combined-source quality gate and rebuilt platform artifacts are still being
+qualified; individual results below are narrower than release acceptance.
+
+- **Numeric filters compose with other Boolean clauses after a document is
+  deleted ([#49](https://github.com/Dicklesworthstone/frankensearch/issues/49)).**
+  Quill validates persisted numeric columns against their original row count,
+  while range and set scorers use the live document count shared by other
+  query leaves. Previously, a tombstone could make a valid filtered query fail
+  with a segment-domain disagreement. Seventeen selected numeric tests,
+  including the new tombstone/Boolean regression, pass with strict Quill
+  library/test Clippy and formatting.
+  [Fix](https://github.com/Dicklesworthstone/frankensearch/commit/86337594e7020836aa34983ba198c44f58123165);
+  [constructor migration and regression](https://github.com/Dicklesworthstone/frankensearch/commit/e2eb8d74f57d9c292cac2b139c5e090b97ae3c3d).
+
+- **A second SIGTERM can force shutdown.** SIGINT and SIGTERM now share the
+  existing three-second escalation window. The first stop signal requests
+  graceful shutdown; either stop signal repeated within that window forces
+  exit. This makes the escape hatch available to service supervisors as well
+  as interactive Ctrl-C users.
+  [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/6f2ad6096da6304c999c131c50770891e8f048ae).
+
+- **Native hybrid hydration preserves ranked-result provenance.** Hydration
+  stages result copies and rejects changes to ranking and source identity
+  before publishing enriched results. Physical FSVI row order is checked
+  independently of lexical and source ordinals. The focused hydration and
+  public provenance suites pass 21 tests with strict Clippy and formatting.
+  Nested build futures and snapshot scratch storage also move to the heap.
+  [Hydration boundary](https://github.com/Dicklesworthstone/frankensearch/commit/5672f08848bc158f9fdef550eef2d9999e8348a8);
+  [public provenance tests](https://github.com/Dicklesworthstone/frankensearch/commit/d7ef46e443e212ae67718fc063aeb57871abc35f);
+  [build allocation fix](https://github.com/Dicklesworthstone/frankensearch/commit/1e8d986da5d0d8585f6e271aaa6dd1484d2aec7e).
+
+- **Native hybrid indexes gain staged updates, scoped queries, and caller-clock
+  deadlines.** A live index can prepare and install a complete source/vector/
+  lexical snapshot while retained readers keep their original generation.
+  Admission checks the lexical records against the retained source cohort.
+  Immutable query scopes filter candidates before fusion and reranking;
+  validated tuning controls fusion weights, candidate counts, and per-tier ANN
+  beams. Configured final-page collection retains the original absolute
+  deadline rather than starting a fresh budget. Deadlines reject late results
+  cooperatively; they do not preempt synchronous model or graph work. These
+  opt-in library APIs do not switch the fsfs watcher to the new architecture,
+  and their combined-source validation remains pending.
+  [Live snapshots](https://github.com/Dicklesworthstone/frankensearch/commit/923e18c71df7dc14e0c14cdc91449cb3241b4c2e);
+  [cohort admission](https://github.com/Dicklesworthstone/frankensearch/commit/9f2e2d2bd0809418940ce6da2745abac191a11b6);
+  [scoped retrieval](https://github.com/Dicklesworthstone/frankensearch/commit/8b1c89edb78391b794656bd9cbc9b375a9ed3c14);
+  [configured deadline collection](https://github.com/Dicklesworthstone/frankensearch/commit/9835ba53318ad23a53ae5a9f18cf261c46240950).
+
+The archived Quill publication-reuse proposal is outside the compilation tree;
+its presence does not enable or qualify a production optimization.
+[Candidate status](https://github.com/Dicklesworthstone/frankensearch/commit/83c7ba743d61756369ed43245835712034c427b0).
 
 ## frankensearch 0.6.1 — 2026-09-19
 

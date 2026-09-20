@@ -782,3 +782,53 @@ certificates. Mach-O SHA-256 is
 `cd3b76353cad3415855e1be9a015088e5b2455a1a177633d55a4da707d6bb39c`;
 the receipt is `dependencies/darwin-fastembed701-native-results/receipt.json`.
 This does not yet qualify Windows or the combined release.
+
+### September 20 post-0.6.1 source supplement
+
+Reviewed the complete non-merge inventory from `7cc86150` through
+`aaf8bae1169f39acdaf12c0e58b65a0ab876ab7c`, including commit descriptions,
+changed surfaces, numeric constructor/test diffs, shutdown signal handling,
+native API declarations, and the retained qualification receipts. The new
+changelog section is explicitly unpublished. A live GitHub release-list read
+on September 20 still reports `crates-v0.5.0` and `v1.10.0` as the newest
+GitHub Releases; the existing 0.6.1 registry publication is a separate event.
+
+Coverage:
+
+- `0334d547`, `8b312bac`, `a8d2dce9`, `643127ee`, and `d7ef46e4` repair
+  output/fixture assumptions and independently pin physical row provenance.
+  The historical 0.6.1 diagnosis corrections remain in that release entry.
+- `1e8d986d`, `5672f088`, and `aa6bf6b0` cover heap allocation, staged
+  hydration/provenance validation, and the final lint/format correction.
+  The focused receipt `dependencies/native567-lintfix-evidence/receipt.json`
+  binds formatting, strict Clippy, 18 hydration tests, and three public
+  provenance tests; its SHA-256 is
+  `ea21381e6015935ce8affe3eeb8abb0a4683c877ea4b8e932a50b64429bea54b`.
+- `1ce6ad0f`, `923e18c7`, `17021d4c`, `c4fdf881`, `8b1c89ed`,
+  `9f2e2d2b`, `8268b88f`, and `9835ba53` add staged/live generations,
+  deadline-aware progressive queries, source-cohort admission, immutable
+  scopes, and tuning. Their original commits report no Rust execution;
+  current combined-source qualification remains in progress. No shipped
+  fsfs cutover, preemptive deadline, or performance certification is claimed.
+- `6f2ad609` shares the three-second force-exit window between SIGINT and
+  SIGTERM, including mixed sequences; read directly against shutdown.rs.
+- `86337594` separates persisted numeric-column cardinality from the live
+  scorer domain. `e2eb8d74` migrates all 20 existing constructor test calls
+  and adds the tombstone/Boolean regression. The verified receipt at
+  `dependencies/numeric863-r2-evidence/receipt.json` records 17 passes,
+  zero failures/ignores, formatting, and strict library/test Clippy. SHA-256:
+  `5ea2a79b17412634602c7979434ef0d774b4186390d85c9cc218e7dc1e895b7d`.
+- `6181cc4b` and `83c7ba74` preserve an unintegrated publication-reuse
+  proposal and archive its preparation workflow. No enabled optimization or
+  workflow execution is claimed. Beads-only bookkeeping commits add no
+  product capability.
+
+The receipt paths above are relative to
+`/data/release-work/frankensearch-release-20260912/`. Linux GNU and musl
+candidates and the Windows embedded candidate at source `643127ee` have
+separate successful runtime receipts, but do not contain later numeric,
+shutdown, or native API changes. Darwin builds and the unchanged default
+quality gate now target frozen `aaf8bae1`. The complete Quill inventory,
+exact public R1 comparison, and all current-source release gates remain open.
+An identical dependency-update bullet was removed from the changelog without
+changing its recorded qualification scope.
