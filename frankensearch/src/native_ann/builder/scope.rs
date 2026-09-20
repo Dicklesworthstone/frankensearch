@@ -448,7 +448,10 @@ mod tests {
             let score = if text.contains("private") {
                 2.0
             } else if text.contains("fast") {
-                if quality { 0.0 } else { 1.0 }
+                // Include the fast winner in the quality pool, below its winner.
+                // Otherwise both one-sided winners keep normalized score 1.0,
+                // and the documented ID tie-break correctly prefers a-fast.
+                if quality { 0.6 } else { 1.0 }
             } else if text.contains("middle") {
                 if quality { 0.5 } else { 0.75 }
             } else if text.contains("near") {

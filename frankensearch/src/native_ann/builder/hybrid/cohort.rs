@@ -201,9 +201,9 @@ mod tests {
         (reader, seal)
     }
 
-    fn assert_join_error(error: SearchError, value: &str) {
+    fn assert_join_error(error: &SearchError, value: &str) {
         assert!(
-            matches!(error, SearchError::InvalidConfig { ref field, value: ref actual, .. }
+            matches!(error, SearchError::InvalidConfig { field, value: actual, .. }
             if field == "native_ann.builder.lexical_source_join" && actual == value)
         );
     }
@@ -266,7 +266,7 @@ mod tests {
                 );
                 assert_eq!(reader.keeper_generation(), seal.generation());
                 let result = NativeBuiltHybridIndex::from_readers(&cx, vectors, reader, seal);
-                assert_join_error(result.err().expect("mixed source must be refused"), field);
+                assert_join_error(&result.err().expect("mixed source must be refused"), field);
             }
         });
     }
@@ -391,7 +391,7 @@ mod tests {
             )
             .await;
             assert_join_error(
-                result
+                &result
                     .err()
                     .expect("mixed source must fail after hash admission"),
                 "content",

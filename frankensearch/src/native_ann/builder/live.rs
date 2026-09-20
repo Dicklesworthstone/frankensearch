@@ -976,10 +976,7 @@ mod tests {
                 fast.documents.load(Ordering::SeqCst),
                 quality.documents.load(Ordering::SeqCst),
             );
-            let mut bad = GenerationComponentReceiptV1 {
-                byte_len: receipt.byte_len,
-                sha256: receipt.sha256,
-            };
+            let mut bad = receipt;
             bad.sha256[0] ^= 1;
             let limits = NativeHybridReopenLimits::default();
             assert!(

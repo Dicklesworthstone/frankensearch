@@ -303,7 +303,7 @@ mod tests {
         (clock, deadline)
     }
 
-    fn assert_timeout<T>(outcome: Poll<SearchResult<T>>) {
+    fn assert_timeout<T>(outcome: &Poll<SearchResult<T>>) {
         assert!(matches!(
             outcome,
             Poll::Ready(Err(SearchError::SearchTimeout { .. }))
@@ -320,7 +320,7 @@ mod tests {
             Ok(())
         }));
         assert_timeout(
-            expired
+            &expired
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop())),
         );
@@ -362,7 +362,7 @@ mod tests {
         let _ = deadline.timer.process_timers();
         assert_eq!(first.0.load(Ordering::SeqCst), 0);
         assert!(second.0.load(Ordering::SeqCst) > 0);
-        assert_timeout(query.as_mut().poll(&mut Context::from_waker(&second_waker)));
+        assert_timeout(&query.as_mut().poll(&mut Context::from_waker(&second_waker)));
         // Completed-but-still-allocated futures must not retain a timer.
         assert!(deadline.timer.is_empty());
     }
@@ -417,7 +417,7 @@ mod tests {
                     Poll::Ready(Err(SearchError::Cancelled { .. }))
                 ));
             } else {
-                assert_timeout(result);
+                assert_timeout(&result);
             }
             assert!(deadline.timer.is_empty());
         }
@@ -695,9 +695,9 @@ mod tests {
                 .unwrap()
                 .with_fusion(config, 0.4)
                 .unwrap();
-            let reranked = deadline.collect(&cx, query).await.unwrap();
-            assert_eq!(reranked[0].doc_id, "b");
-            assert_eq!(reranked[0].rerank_score, Some(1.0));
+            let ranked_results = deadline.collect(&cx, query).await.unwrap();
+            assert_eq!(ranked_results[0].doc_id, "b");
+            assert_eq!(ranked_results[0].rerank_score, Some(1.0));
             assert_eq!(*reranker.ids.lock().unwrap(), ["a", "b"]);
             assert!(deadline.timer.is_empty());
 
