@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::time::Instant;
 
 use asupersync::Cx;
 use rayon::prelude::*;
@@ -251,13 +252,32 @@ impl Model2VecEmbedder {
             }
         }
 
+        // Per-phase load timings (GH #46).
+        //
+        // A cold load of the 128M model is seconds long and the split between
+        // building the 500k-piece tokenizer and streaming the 512 MB matrix is
+        // what decides which one is worth attacking. Reporters were
+        // reconstructing that split through the Python binding because the Rust
+        // binary emitted one event at the end; these make the real binary say
+        // it. Each phase logs as it completes, so a load that never finishes
+        // still attributes the time it spent.
+        let load_started = Instant::now();
+        let elapsed_ms = |started: Instant| started.elapsed().as_secs_f64() * 1_000.0;
+
         // Load tokenizer
+        let tokenizer_started = Instant::now();
         let tokenizer_path = model_dir.join("tokenizer.json");
         let tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|e| SearchError::ModelLoadFailed {
                 path: tokenizer_path,
                 source: format!("failed to load tokenizer: {e}").into(),
             })?;
+        let tokenizer_build_ms = elapsed_ms(tokenizer_started);
+        tracing::debug!(
+            model = name,
+            tokenizer_build_ms,
+            "Model2Vec tokenizer built"
+        );
 
         // Locate the embedding tensor WITHOUT reading the matrix.
         //
@@ -268,6 +288,7 @@ impl Model2VecEmbedder {
         // 512 MB artifact (GH #46). Only the header is read here; the matrix
         // is streamed straight into its final `Vec<f32>` below, and only after
         // every admission check has passed.
+        let header_started = Instant::now();
         let safetensors_path = model_dir.join("model.safetensors");
         let located = SafetensorsF32Matrix::locate(&safetensors_path).map_err(|e| {
             SearchError::ModelLoadFailed {
@@ -275,7 +296,14 @@ impl Model2VecEmbedder {
                 source: e.into(),
             }
         })?;
+        let header_locate_ms = elapsed_ms(header_started);
+        tracing::debug!(
+            model = name,
+            header_locate_ms,
+            "Model2Vec tensor header located"
+        );
 
+        let admission_started = Instant::now();
         let vocab_size = located.vocab_size;
         let dimensions = located.dimensions;
         let parsed_dimension =
@@ -302,20 +330,42 @@ impl Model2VecEmbedder {
             });
         }
         identity.validate()?;
+        let admission_ms = elapsed_ms(admission_started);
+        tracing::debug!(model = name, admission_ms, "Model2Vec identity admitted");
 
         // Stream the matrix into its final buffer. Every check that could
         // reject this artifact — receipt, dtype, shape, attested dimension,
         // identity — has already run, so no borrowed or decoded bytes can
         // outlive a failed admission.
+        let stream_started = Instant::now();
         let embeddings = located
             .read_values()
             .map_err(|e| SearchError::ModelLoadFailed {
                 path: safetensors_path,
                 source: e.into(),
             })?;
+        let matrix_stream_ms = elapsed_ms(stream_started);
+        tracing::debug!(
+            model = name,
+            matrix_stream_ms,
+            values = embeddings.len(),
+            "Model2Vec matrix streamed"
+        );
 
         #[cfg(test)]
         record_model2vec_full_load(model_dir);
+
+        // One line carrying the whole split, so a field report does not have to
+        // stitch four events together (GH #46).
+        tracing::debug!(
+            model = name,
+            tokenizer_build_ms,
+            header_locate_ms,
+            admission_ms,
+            matrix_stream_ms,
+            total_ms = elapsed_ms(load_started),
+            "Model2Vec load phase timings"
+        );
 
         tracing::info!(
             model = DEFAULT_MODEL_NAME,
