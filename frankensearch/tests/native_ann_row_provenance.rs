@@ -208,7 +208,10 @@ fn write_owner(
 
 fn assert_owner(owner: &ValidatedFsviBytes, rows: &[Row], physical_order: &[usize]) {
     assert_eq!(owner.record_count(), rows.len());
-    assert_eq!(owner.live_count(), rows.iter().filter(|row| row.live).count());
+    assert_eq!(
+        owner.live_count(),
+        rows.iter().filter(|row| row.live).count()
+    );
     for (physical_row, &source_row) in physical_order.iter().enumerate() {
         let expected = rows[source_row];
         assert_eq!(owner.doc_id_at(physical_row).unwrap(), expected.id);
@@ -224,7 +227,10 @@ fn assert_result_row(
 ) {
     assert_eq!(result.index, Some(physical_row));
     let physical_row = usize::try_from(physical_row).unwrap();
-    assert_eq!(owner.doc_id_at(physical_row).unwrap(), result.doc_id.as_str());
+    assert_eq!(
+        owner.doc_id_at(physical_row).unwrap(),
+        result.doc_id.as_str()
+    );
     assert_eq!(owner.vector_at_f32(physical_row).unwrap(), vector);
 }
 
@@ -285,7 +291,10 @@ fn writer_permutations_preserve_rows_through_graph_reload_exact_search_and_filte
                         .unwrap();
                     assert_eq!(filtered.len(), 1);
                     assert_eq!(filtered[0].doc_id, "a-quality");
-                    assert_eq!(filtered[0].index, 3, "not the filtered candidate's rank zero");
+                    assert_eq!(
+                        filtered[0].index, 3,
+                        "not the filtered candidate's rank zero"
+                    );
                 }
             }
         }
@@ -417,10 +426,7 @@ fn quality_only_and_shared_winners_use_the_contributing_owners_physical_row_spac
                 )
                 .await
                 .unwrap();
-            let winner = shared
-                .iter()
-                .find(|hit| hit.doc_id == "a-quality")
-                .unwrap();
+            let winner = shared.iter().find(|hit| hit.doc_id == "a-quality").unwrap();
             // Even a zero-valued fast score is present evidence. Source alone
             // cannot select the owner: both cases are SemanticQuality.
             assert_eq!(winner.source, ScoreSource::SemanticQuality);

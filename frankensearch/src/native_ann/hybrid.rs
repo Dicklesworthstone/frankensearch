@@ -183,7 +183,10 @@ async fn hydrate_results(
         return Ok(());
     }
     let mut staged = Vec::new();
-    for result in results.iter().filter(|result| result.lexical_score.is_some()) {
+    for result in results
+        .iter()
+        .filter(|result| result.lexical_score.is_some())
+    {
         checkpoint(cx, "native_ann.hybrid_stage_hydration")?;
         staged.push(result.clone());
     }
@@ -235,7 +238,7 @@ fn validate_hydrated_result(expected: &ScoredResult, actual: &ScoredResult) -> S
         metadata: _,
     } = actual;
     debug_assert!(expected.explanation.is_none());
-    if doc_id != &expected.doc_id
+    if doc_id != expected.doc_id
         || score.to_bits() != expected.score.to_bits()
         || source != &expected.source
         || index != &expected.index
@@ -958,8 +961,10 @@ mod tests {
     }
 
     fn assert_hydration_refusal(error: SearchError) {
-        assert!(matches!(error, SearchError::InvalidConfig { ref field, ref value, .. }
-            if field == "native_ann.hydration.provenance" && value == "mutated-result"));
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, ref value, .. }
+            if field == "native_ann.hydration.provenance" && value == "mutated-result")
+        );
     }
 
     #[test]
@@ -1043,10 +1048,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let mut lexical = Lexical::new();
             let batch = lexical.search_candidates(&cx, "query", 2).await.unwrap();
-            let mut results = vec![
-                lexical_result("beta", 10.0),
-                lexical_result("alpha", 5.0),
-            ];
+            let mut results = vec![lexical_result("beta", 10.0), lexical_result("alpha", 5.0)];
             let before = serde_json::to_value(&results).unwrap();
             lexical.hydration_reply = HydrationReply::Cancelled;
             assert!(matches!(
@@ -1081,12 +1083,9 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = Arc::new(index(&cx, false));
             let expected = [index.owner_witness().clone()];
-            let shards = crate::native_ann::NativeShardSet::admit(
-                &cx,
-                &expected,
-                vec![Arc::clone(&index)],
-            )
-            .unwrap();
+            let shards =
+                crate::native_ann::NativeShardSet::admit(&cx, &expected, vec![Arc::clone(&index)])
+                    .unwrap();
             let provider = Provider::new(false);
             let mut lexical = Lexical::new();
             lexical.hydration_reply = HydrationReply::Rewrite {
