@@ -23233,8 +23233,12 @@ mod tests {
                 .expect("cached DF fuel snapshot is authoritative");
             assert_eq!(snapshot.keeper_snapshot().segments().len(), 2);
             let prepared = PreparedSnapshotDocFreqs::new();
+            // `upper_bound > budget` keeps metering live, so every assertion
+            // below is about admissions that are really being counted. The
+            // budget is exactly one snapshot scan: two sealed segments, one
+            // dictionary block each.
             let checkpoint: QueryCheckpointHandle<'_> =
-                QueryCheckpoint::new(&cx, "cached_df_fuel", 3, 4);
+                QueryCheckpoint::new(&cx, "cached_df_fuel", 2, 3);
 
             assert_eq!(
                 prepared
@@ -23242,18 +23246,120 @@ mod tests {
                     .expect("first snapshot DF scan is admitted"),
                 2
             );
-            let error = prepared
-                .get_or_compute(&checkpoint, &snapshot, CONTENT_FIELD, b"alpha")
-                .expect_err("the cached hit must replay both dictionary admissions");
+            // Repeats open no dictionary, so they must not spend the budget a
+            // second time. Charging them was what kept the per-query table
+            // from bounding anything in #41: the table saved the reads while
+            // the fuel still grew as `terms x segments^2`.
+            for repeat in 0..8 {
+                assert_eq!(
+                    prepared
+                        .get_or_compute(&checkpoint, &snapshot, CONTENT_FIELD, b"alpha")
+                        .unwrap_or_else(|error| panic!(
+                            "cached repeat {repeat} must not charge a second scan: {error}"
+                        )),
+                    2
+                );
+            }
+            // The budget is genuinely spent, not merely unmetered: one more
+            // real dictionary block is refused.
+            let error = checkpoint
+                .admit(QueryWorkKind::DictionaryBlock, 1)
+                .expect_err("the single scan must have consumed the whole budget");
             assert!(matches!(
                 error,
-                QuillIndexError::QueryFuelExhausted {
-                    budget: 3,
-                    consumed: 3,
-                    dictionary_blocks: 3,
+                ArgusError::QueryFuelExhausted {
+                    budget: 2,
+                    consumed: 2,
+                    dictionary_blocks: 2,
                     ..
                 }
             ));
+        });
+    }
+
+    /// Publish `commits` single-document segments and return the query-work
+    /// ceiling of one field-qualified term against them.
+    ///
+    /// Every term of that ceiling is linear in the segment count for this
+    /// query shape -- one segment charge, one posting traversal pair per
+    /// segment, one statistics scan plus one local probe per segment -- so the
+    /// ceiling itself must be.
+    async fn fragmented_term_query_ceiling(cx: &Cx, commits: usize) -> u64 {
+        let index = QuillIndex::in_memory(QuillConfig {
+            // Well clear of `commits`, so each publication keeps its own
+            // segment instead of being folded into a same-tier merge.
+            tier_fanout: 32,
+            ..deterministic_config()
+        })
+        .expect("create fragmented ceiling index");
+        for ordinal in 0..commits {
+            index
+                .index_documents(
+                    cx,
+                    &[IndexableDocument::new(
+                        format!("ceiling-{ordinal}"),
+                        "alpha",
+                    )],
+                )
+                .await
+                .expect("stage fragmented ceiling document");
+            index
+                .commit(cx)
+                .await
+                .expect("publish fragmented ceiling segment");
+        }
+        let snapshot = index
+            .search_snapshot()
+            .expect("fragmented ceiling snapshot is authoritative");
+        assert_eq!(
+            snapshot.keeper_snapshot().segments().len(),
+            commits,
+            "the fixture must keep one sealed segment per commit"
+        );
+        assert_eq!(snapshot.delta_count(), 0, "every commit must seal");
+        let mut parsed = index
+            .reader
+            .default_parser()
+            .expect("fragmented ceiling parser")
+            // Field-qualified on purpose: a bare term fans out across both
+            // default fields and doubles every count below without saying
+            // anything about segment scaling.
+            .parse_lenient("content:alpha");
+        let _ = canonicalize_query(&mut parsed.query);
+        query_work_upper_bound(
+            &parsed.query,
+            &snapshot,
+            index.reader.schema,
+            index.reader.config.glob_expansion_limit,
+        )
+        .expect("bound fragmented ceiling query")
+    }
+
+    #[test]
+    fn the_query_ceiling_stays_linear_in_segment_count_issue_41() {
+        run_with_cx(|cx| async move {
+            let two = fragmented_term_query_ceiling(&cx, 2).await;
+            let four = fragmented_term_query_ceiling(&cx, 4).await;
+            let eight = fragmented_term_query_ceiling(&cx, 8).await;
+
+            // `PreparedSnapshotDocFreqs` computes a term's snapshot statistics
+            // once, so the ceiling charges one scan per stream rather than one
+            // per lowered segment. Doubling the segment count must therefore
+            // double the ceiling exactly. The pre-#41 ceiling carried
+            // `streams x segments^2`, which quadrupled it: 2 -> 4 -> 8
+            // segments produced 10 -> 24 -> 64 statistics units instead of
+            // 4 -> 8 -> 16, and a CASS archive at 473 segments spent a 10M
+            // budget on statistics it had already computed.
+            assert_eq!(
+                four,
+                two * 2,
+                "doubling 2 -> 4 segments must double the ceiling ({two} -> {four})"
+            );
+            assert_eq!(
+                eight,
+                four * 2,
+                "doubling 4 -> 8 segments must double the ceiling ({four} -> {eight})"
+            );
         });
     }
 
