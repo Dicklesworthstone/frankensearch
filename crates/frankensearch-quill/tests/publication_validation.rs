@@ -860,3 +860,108 @@ fn upsert_preserves_unchanged_segments_and_fresh_reopen_query_results() {
         assert_eq!(replacement[0].doc_id, "one");
     });
 }
+
+#[test]
+fn retained_damage_never_returns_success_and_reconciliation_requires_fresh_bytes() {
+    for missing in [false, true] {
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("retained damage directory");
+            let index = QuillIndex::create(&cx, directory.path(), config())
+                .await
+                .expect("create index");
+            append_document(
+                &index,
+                &cx,
+                directory.path(),
+                "retained",
+                "shared retained document",
+            )
+            .await;
+            let expected = LexicalRead::search(&index, &cx, "shared", 10)
+                .await
+                .expect("intact control search");
+            assert_eq!(expected.len(), 1);
+            drop(index);
+            let mut writer = KeeperWriter::open(&cx, directory.path(), DEFAULT_SCHEMA)
+                .await
+                .expect("open writer");
+            let retained = retained_manifest(&writer);
+            let proposed = successor(&writer);
+            assert_eq!(proposed.segments, retained.segments);
+            let paths = stage_segments(directory.path(), directory.path(), &retained);
+            assert_eq!(paths.len(), 1);
+            let path = paths.values().next().expect("retained segment path");
+            let hidden = directory.path().join("hidden-retained-segment");
+            let original = if missing {
+                std::fs::rename(path, &hidden).expect("hide unchanged retained segment");
+                None
+            } else {
+                Some(corrupt_same_length(path))
+            };
+
+            let error = writer
+                .publish(&cx, &proposed)
+                .await
+                .err()
+                .expect("retained damage must never produce a successful publication");
+            assert!(
+                matches!(&error, KeeperError::SegmentOpen { path: failed, .. } if failed == path),
+                "unexpected failure: {error}"
+            );
+            let installed = load_manifest_pair(directory.path())
+                .expect("read authority after refused publication")
+                .manifest;
+            if installed.generation == retained.generation {
+                // Incumbent full preflight detects the fault before promotion.
+                assert_eq!(installed, retained);
+                assert_eq!(retained_manifest(&writer), retained);
+                assert!(!writer.publication_awaits_reconciliation());
+            } else {
+                // Delta preflight may promote unchanged bindings, but a failed
+                // mandatory fresh open must not expose the old snapshot as new.
+                assert_eq!(installed.generation, proposed.generation);
+                assert_eq!(installed.segments, proposed.segments);
+                assert!(writer.publication_awaits_reconciliation());
+                assert!(matches!(
+                    writer.snapshot(),
+                    Err(KeeperError::PublicationReconciliationRequired {
+                        retained_generation,
+                        proposed_generation,
+                    }) if retained_generation == retained.generation
+                        && proposed_generation == proposed.generation
+                ));
+                assert!(
+                    writer.reconcile_publication(&cx).await.is_err(),
+                    "reconciliation must not adopt still-damaged backing files"
+                );
+                assert!(writer.publication_awaits_reconciliation());
+                assert!(writer.snapshot().is_err());
+            }
+
+            let before_open = directory_bytes(directory.path());
+            assert!(matches!(
+                KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
+                Err(KeeperError::SegmentOpen { .. })
+            ));
+            assert!(
+                QuillSearchIndex::open(&cx, directory.path(), config())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(directory_bytes(directory.path()), before_open);
+            if let Some(original) = original {
+                restore_segment(path, &original);
+            } else {
+                std::fs::rename(&hidden, path).expect("restore unchanged retained segment");
+            }
+            let reconciled = writer
+                .reconcile_publication(&cx)
+                .await
+                .expect("reconcile exact restored authority");
+            assert_eq!(reconciled.loaded_manifest().manifest, installed);
+            assert!(!writer.publication_awaits_reconciliation());
+            drop(writer);
+            assert_fresh_search_matches(&cx, directory.path(), &expected).await;
+        });
+    }
+}
