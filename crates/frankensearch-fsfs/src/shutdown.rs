@@ -23,7 +23,8 @@ type SignalHandle = signal_hook::iterator::Handle;
 use tracing::debug;
 use tracing::{info, warn};
 
-/// Time window where a second `SIGINT` forces immediate exit.
+/// Time window where a second stop signal (`SIGINT` or `SIGTERM`) forces
+/// immediate exit.
 pub const FORCE_EXIT_WINDOW: Duration = Duration::from_secs(3);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -66,7 +67,7 @@ pub struct ShutdownCoordinator {
     shutdown_state: AtomicU8,
     shutdown_reason: Mutex<Option<ShutdownReason>>,
     #[cfg(any(test, not(windows)))]
-    first_sigint_at: Mutex<Option<Instant>>,
+    first_stop_signal_at: Mutex<Option<Instant>>,
     reload_requested: AtomicBool,
     diagnostics_dump_count: AtomicU64,
     signal_registration_active: AtomicBool,
@@ -90,7 +91,7 @@ impl ShutdownCoordinator {
             shutdown_state: AtomicU8::new(ShutdownState::Running.as_u8()),
             shutdown_reason: Mutex::new(None),
             #[cfg(any(test, not(windows)))]
-            first_sigint_at: Mutex::new(None),
+            first_stop_signal_at: Mutex::new(None),
             reload_requested: AtomicBool::new(false),
             diagnostics_dump_count: AtomicU64::new(0),
             signal_registration_active: AtomicBool::new(false),
@@ -293,11 +294,14 @@ impl ShutdownCoordinator {
     #[cfg(any(test, not(windows)))]
     fn handle_signal(&self, signal: i32) {
         match signal {
-            SIGINT => self.handle_sigint(),
-            SIGTERM => {
-                self.request_shutdown(ShutdownReason::Signal(SIGTERM));
-                info!("received SIGTERM, initiating graceful shutdown");
-            }
+            // Both stop signals escalate. SIGTERM used to request a graceful
+            // shutdown and nothing more, so repeating it did nothing and an
+            // operator whose graceful path was wedged had no recourse short of
+            // SIGKILL (#43). The escape hatch was reachable only by an
+            // interactive Ctrl-C, while `kill`, systemd and every process
+            // supervisor send SIGTERM — so it was missing from exactly the
+            // context that needs it.
+            SIGINT | SIGTERM => self.handle_stop_signal(signal),
             #[cfg(not(windows))]
             SIGHUP => {
                 self.request_config_reload();
@@ -318,37 +322,50 @@ impl ShutdownCoordinator {
         }
     }
 
+    /// Handle SIGINT or SIGTERM: the first requests a graceful shutdown, a
+    /// second within [`FORCE_EXIT_WINDOW`] forces exit.
+    ///
+    /// The window is shared between the two rather than tracked per signal, so
+    /// Ctrl-C followed by `kill` escalates as readily as either on its own —
+    /// an operator reaching for the second signal means the same thing
+    /// whichever they send.
     #[cfg(any(test, not(windows)))]
-    fn handle_sigint(&self) {
+    fn handle_stop_signal(&self, signal: i32) {
         let now = Instant::now();
         match self.state() {
             ShutdownState::Running => {
-                *lock_or_recover(&self.first_sigint_at) = Some(now);
-                self.request_shutdown(ShutdownReason::Signal(SIGINT));
-                info!("received first SIGINT, initiating graceful shutdown");
+                *lock_or_recover(&self.first_stop_signal_at) = Some(now);
+                self.request_shutdown(ShutdownReason::Signal(signal));
+                info!(signal, "received first stop signal, initiating graceful shutdown");
             }
             ShutdownState::ShuttingDown => {
-                let first_sigint_at = *lock_or_recover(&self.first_sigint_at);
-                if let Some(first) = first_sigint_at
+                let first_stop_signal_at = *lock_or_recover(&self.first_stop_signal_at);
+                if let Some(first) = first_stop_signal_at
                     && now.saturating_duration_since(first) <= FORCE_EXIT_WINDOW
                 {
-                    self.promote_force_exit();
+                    self.promote_force_exit(signal);
                     return;
                 }
 
-                *lock_or_recover(&self.first_sigint_at) = Some(now);
-                debug!("received SIGINT outside force-exit window; remaining in graceful shutdown");
+                *lock_or_recover(&self.first_stop_signal_at) = Some(now);
+                debug!(
+                    signal,
+                    "received stop signal outside force-exit window; remaining in graceful shutdown"
+                );
             }
             ShutdownState::ForceExit => {}
         }
     }
 
     #[cfg(any(test, not(windows)))]
-    fn promote_force_exit(&self) {
+    fn promote_force_exit(&self, signal: i32) {
         self.shutdown_state
             .store(ShutdownState::ForceExit.as_u8(), Ordering::Release);
-        self.set_reason(ShutdownReason::Signal(SIGINT));
-        warn!("received second SIGINT within window, forcing immediate exit");
+        self.set_reason(ShutdownReason::Signal(signal));
+        warn!(
+            signal,
+            "received second stop signal within window, forcing immediate exit"
+        );
     }
 
     fn set_reason(&self, reason: ShutdownReason) {
@@ -401,6 +418,51 @@ mod tests {
             coordinator.current_reason(),
             Some(ShutdownReason::Signal(SIGTERM))
         );
+    }
+
+    #[test]
+    fn second_sigterm_forces_exit_like_a_second_sigint() {
+        // SIGTERM used to request a graceful shutdown and nothing more, so a
+        // wedged shutdown left SIGKILL as the only recourse — and SIGTERM is
+        // what `kill`, systemd and every process supervisor send, so the
+        // escape hatch was missing from the context that needs it most (#43).
+        let coordinator = ShutdownCoordinator::new();
+
+        coordinator.process_signal_for_test(SIGTERM);
+        assert_eq!(coordinator.state(), ShutdownState::ShuttingDown);
+        assert!(!coordinator.is_force_exit_requested());
+
+        coordinator.process_signal_for_test(SIGTERM);
+        assert_eq!(coordinator.state(), ShutdownState::ForceExit);
+        assert!(coordinator.is_force_exit_requested());
+        assert_eq!(
+            coordinator.current_reason(),
+            Some(ShutdownReason::Signal(SIGTERM))
+        );
+    }
+
+    #[test]
+    fn a_stop_signal_escalates_whichever_one_arrives_second() {
+        // The force-exit window is shared rather than tracked per signal: an
+        // operator who presses Ctrl-C and then reaches for `kill` means the
+        // same thing as one who sends either twice.
+        for (first, second) in [(SIGINT, SIGTERM), (SIGTERM, SIGINT)] {
+            let coordinator = ShutdownCoordinator::new();
+            coordinator.process_signal_for_test(first);
+            assert_eq!(coordinator.state(), ShutdownState::ShuttingDown);
+
+            coordinator.process_signal_for_test(second);
+            assert_eq!(
+                coordinator.state(),
+                ShutdownState::ForceExit,
+                "{first} then {second} must force exit"
+            );
+            assert_eq!(
+                coordinator.current_reason(),
+                Some(ShutdownReason::Signal(second)),
+                "the reason names the signal that forced the exit"
+            );
+        }
     }
 
     #[test]
