@@ -69,11 +69,7 @@ async fn append_document(
 /// Stage real FSLX files without manufacturing headers, hashes, or docid ranges.
 /// The donor and recipient have separate writer admissions. Never overwrite a
 /// retained recipient file while constructing a successor proposal.
-fn stage_segments(
-    donor: &Path,
-    recipient: &Path,
-    manifest: &Manifest,
-) -> BTreeMap<u64, PathBuf> {
+fn stage_segments(donor: &Path, recipient: &Path, manifest: &Manifest) -> BTreeMap<u64, PathBuf> {
     let mut staged = BTreeMap::new();
     for entry in std::fs::read_dir(donor).expect("enumerate donor files") {
         let entry = entry.expect("read donor directory entry");
@@ -117,7 +113,11 @@ fn directory_bytes(directory: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         .expect("enumerate authority files")
         .filter_map(|entry| {
             let entry = entry.expect("read authority entry");
-            if !entry.file_type().expect("inspect authority entry").is_file() {
+            if !entry
+                .file_type()
+                .expect("inspect authority entry")
+                .is_file()
+            {
                 return None;
             }
             let path = entry.path();
@@ -165,7 +165,10 @@ async fn assert_fresh_search_matches(cx: &Cx, directory: &Path, expected: &[Scor
         .expect("search through fresh public reader");
     assert_eq!(actual.len(), expected.len());
     for (actual, expected) in actual.iter().zip(expected) {
-        assert_eq!(actual.doc_id, expected.doc_id, "fresh-open result order and ids");
+        assert_eq!(
+            actual.doc_id, expected.doc_id,
+            "fresh-open result order and ids"
+        );
         assert_eq!(
             actual.score.to_bits(),
             expected.score.to_bits(),
@@ -300,7 +303,10 @@ fn changed_witness_for_a_retained_id_cannot_be_published_as_unchanged() {
             } else {
                 proposed.segments[0].file_xxh3 ^= 1;
             }
-            assert_eq!(proposed.segments[0].segment_id, retained.segments[0].segment_id);
+            assert_eq!(
+                proposed.segments[0].segment_id,
+                retained.segments[0].segment_id
+            );
             let before = directory_bytes(directory.path());
             let error = writer
                 .publish(&cx, &proposed)
@@ -376,7 +382,10 @@ fn cancelled_retained_only_publication_keeps_authority_and_retries_once() {
             .publish(&cx, &proposed)
             .await
             .expect("uncancelled retry publishes exactly once");
-        assert_eq!(retained_manifest(&writer).generation, retained.generation + 1);
+        assert_eq!(
+            retained_manifest(&writer).generation,
+            retained.generation + 1
+        );
         assert!(!writer.publication_awaits_reconciliation());
         drop(writer);
         assert_fresh_search_matches(&cx, directory.path(), &expected).await;
@@ -497,7 +506,9 @@ fn durable_commit_cancellation_retains_exact_delta_until_one_successful_retry() 
             assert!(index.has_uncommitted_changes());
             assert!(Arc::ptr_eq(
                 &snapshot_before,
-                &index.search_snapshot().expect("retained snapshot stays readable"),
+                &index
+                    .search_snapshot()
+                    .expect("retained snapshot stays readable"),
             ));
             assert_eq!(
                 std::fs::read(directory.path().join("MANIFEST"))
@@ -516,10 +527,16 @@ fn durable_commit_cancellation_retains_exact_delta_until_one_successful_retry() 
             assert!(pending.pending_manifest_present());
             let staged = directory_bytes(directory.path());
             if let Some(before) = &pending_before {
-                assert_eq!(&pending, before, "retry retains the exact prepared transaction");
+                assert_eq!(
+                    &pending, before,
+                    "retry retains the exact prepared transaction"
+                );
             }
             if let Some(before) = &staged_before {
-                assert_eq!(&staged, before, "retry changes no staged or authoritative bytes");
+                assert_eq!(
+                    &staged, before,
+                    "retry changes no staged or authoritative bytes"
+                );
             }
             pending_before = Some(pending);
             staged_before = Some(staged);
@@ -541,8 +558,14 @@ fn durable_commit_cancellation_retains_exact_delta_until_one_successful_retry() 
             assert!(installed.segments.contains(segment));
         }
         let snapshot_after = index.search_snapshot().expect("successor public snapshot");
-        assert_eq!(snapshot_after.snapshot_epoch(), snapshot_before.snapshot_epoch() + 1);
-        assert_eq!(snapshot_after.keeper_generation(), snapshot_before.keeper_generation() + 1);
+        assert_eq!(
+            snapshot_after.snapshot_epoch(),
+            snapshot_before.snapshot_epoch() + 1
+        );
+        assert_eq!(
+            snapshot_after.keeper_generation(),
+            snapshot_before.keeper_generation() + 1
+        );
         let expected_after = LexicalRead::search(&index, &cx, "shared", 10)
             .await
             .expect("successful-retry control search");

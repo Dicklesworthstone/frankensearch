@@ -640,7 +640,10 @@ mod tests {
 
         // No stop call: error paths and library callers rely on owner lifetime.
         drop(coordinator);
-        assert!(weak.upgrade().is_none(), "listener must not retain its owner");
+        assert!(
+            weak.upgrade().is_none(),
+            "listener must not retain its owner"
+        );
     }
 
     #[test]
