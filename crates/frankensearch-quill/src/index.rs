@@ -15534,6 +15534,12 @@ fn lower_leaf_numeric_range<'a>(
             let field = section.field(field_ord).ok_or_else(|| {
                 invalid_state(format!("NUMERIC has no indexed-or-fast field {field_ord}"))
             })?;
+            // Two counts, deliberately: the persisted column holds one value
+            // per at-seal row and can only be validated against that, while
+            // the scorer must share the live domain its Boolean siblings use
+            // (`QueryNode::All` and term leaves both take
+            // `leaf.live_document_count()`). Passing the at-seal count for
+            // both made a tombstoned segment fail a valid query (#49).
             materialize_live_numeric_range(
                 cx,
                 leaf,
@@ -15541,6 +15547,7 @@ fn lower_leaf_numeric_range<'a>(
                 lower,
                 upper,
                 segment.at_seal_doc_count(),
+                leaf.live_document_count()?,
                 score,
             )
         }
@@ -15560,6 +15567,9 @@ fn lower_leaf_numeric_range<'a>(
                 field,
                 lower,
                 upper,
+                // A Delta's encoded column is built from its live rows, so
+                // both domains are the same count here.
+                leaf.live_document_count()?,
                 leaf.live_document_count()?,
                 score,
             )
@@ -15573,7 +15583,8 @@ fn materialize_live_numeric_range<'a>(
     field: NumericField<'_>,
     lower: Bound<NumericValue>,
     upper: Bound<NumericValue>,
-    segment_num_docs: u32,
+    column_num_docs: u32,
+    live_num_docs: u32,
     score: f32,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     const CANCEL_CHECK_MASK: usize = 1_023;
@@ -15583,8 +15594,13 @@ fn materialize_live_numeric_range<'a>(
         .range_entries(lower, upper)
         .map_err(ArgusError::from)?;
     let value_count = field.len();
+    // Coverage is a property of the persisted column, so it is judged against
+    // the column's own domain: a value for every at-seal row, all of them in
+    // range. That implies coverage of the live rows too, since those are a
+    // subset — judging it against the live count instead would silently drop
+    // the optimisation on any segment holding a tombstone.
     let covers_every_document = value_count
-        == usize::try_from(segment_num_docs).unwrap_or(usize::MAX)
+        == usize::try_from(column_num_docs).unwrap_or(usize::MAX)
         && entries.len() == value_count;
     let mut docids = Vec::new();
     docids
@@ -15605,7 +15621,8 @@ fn materialize_live_numeric_range<'a>(
         field.field_ord(),
         docids,
         value_count,
-        segment_num_docs,
+        column_num_docs,
+        live_num_docs,
         covers_every_document,
         score,
     )
@@ -16022,7 +16039,16 @@ fn lower_leaf_numeric_set<'a>(
             let field = section.field(field_ord).ok_or_else(|| {
                 invalid_state(format!("NUMERIC has no indexed field {field_ord}"))
             })?;
-            lower_numeric_field_set(field, values, segment.at_seal_doc_count(), boost, mode)
+            // Same split as the range path: validate the persisted column
+            // against its at-seal domain, score in the live one (#49).
+            lower_numeric_field_set(
+                field,
+                values,
+                segment.at_seal_doc_count(),
+                leaf.live_document_count()?,
+                boost,
+                mode,
+            )
         }
         QueryLeaf::Delta(delta) => {
             let encoded = encode_live_delta_numeric(delta, schema)?;
@@ -16032,7 +16058,10 @@ fn lower_leaf_numeric_set<'a>(
             let field = section.field(field_ord).ok_or_else(|| {
                 invalid_state(format!("Delta NUMERIC has no indexed field {field_ord}"))
             })?;
-            lower_numeric_field_set(field, values, leaf.live_document_count()?, boost, mode)
+            // A Delta's encoded column is built from its live rows, so both
+            // domains are the same count here.
+            let live_num_docs = leaf.live_document_count()?;
+            lower_numeric_field_set(field, values, live_num_docs, live_num_docs, boost, mode)
         }
     }
 }
@@ -16040,7 +16069,8 @@ fn lower_leaf_numeric_set<'a>(
 fn lower_numeric_field_set<'a>(
     field: NumericField<'_>,
     values: &[NumericValue],
-    document_count: u32,
+    column_num_docs: u32,
+    live_num_docs: u32,
     boost: f32,
     mode: QueryLoweringMode,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
@@ -16053,7 +16083,8 @@ fn lower_numeric_field_set<'a>(
             field,
             Bound::Included(value),
             Bound::Included(value),
-            document_count,
+            column_num_docs,
+            live_num_docs,
         )?));
     }
     let matching = lower_boolean(
