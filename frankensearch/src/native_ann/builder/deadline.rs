@@ -15,7 +15,9 @@ use asupersync::time::{TimerDriverHandle, TimerHandle};
 use asupersync::types::Time;
 
 use super::live::{NativeHybridResults, NativeLiveHybridIndex};
+use super::scope::NativeScopedHybridIndex;
 use super::{NativeBuiltHybridIndex, checkpoint, invalid};
+use crate::native_ann::NativeProgressiveSearch;
 use crate::{Cx, ScoredResult, SearchError, SearchResult};
 
 mod progressive;
@@ -83,6 +85,33 @@ impl NativeSearchDeadline {
     #[must_use]
     pub const fn expires_at(&self) -> Time {
         self.expires
+    }
+
+    /// Collect a configured native query under this original absolute deadline.
+    ///
+    /// Accepts the actual unstarted progressive query, including its fusion,
+    /// candidate, beam, scope and retained-source reranker settings. No default
+    /// query is reconstructed and no source/reader is replaced. Pass the same
+    /// context used to prepare the query. A query from a live snapshot keeps
+    /// that snapshot; hold the pin while interpreting returned physical rows.
+    ///
+    /// This returns a final page rather than streaming intermediate phases.
+    /// The budget includes every requested phase, including scoped lexical
+    /// widening and reranking. Configuration time after deadline creation also
+    /// consumes the budget. Expiry never grants quality or reranking a new one.
+    /// A dropped pending call releases the owned query and timer registration.
+    /// Synchronous work is not preempted; late completion is refused on return.
+    ///
+    /// # Errors
+    /// Returns timeout or any required phase failure, never an Initial-only
+    /// success after failed refinement. Cancellation remains cancellation.
+    /// Before expiry, the underlying collector also refuses a started query.
+    pub async fn collect(
+        &self,
+        cx: &Cx,
+        query: NativeProgressiveSearch<'_>,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.run(cx, query.collect()).await
     }
 
     fn expired(&self) -> bool {
@@ -205,6 +234,28 @@ impl NativeLiveHybridIndex {
     }
 }
 
+impl NativeScopedHybridIndex<'_> {
+    /// Collect scoped refinement with one deadline for all eligible retrieval.
+    ///
+    /// The original scope is retained through candidate widening, both vector
+    /// tiers and hydration. No out-of-scope or newer-generation fallback occurs
+    /// when time expires. For tuned or reranked queries, prepare this scope's
+    /// progressive query and pass it to [`NativeSearchDeadline::collect`].
+    ///
+    /// # Errors
+    /// Propagates scope/query admission, required-phase errors, timeout and
+    /// cancellation. An expired deadline does not bypass constructor admission.
+    pub async fn search_refined_before(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        deadline: &NativeSearchDeadline,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        deadline.collect(cx, self.progressive(cx, text, k)?).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +264,11 @@ mod tests {
     use std::task::{Context, Wake, Waker};
 
     use asupersync::time::VirtualClock;
+    use frankensearch_core::generation::EmbeddingIdentityBundleV1;
+    use frankensearch_core::traits::{IdentityBoundEmbedding, RerankDocument, RerankScore};
+    use frankensearch_fusion::RrfConfig;
+
+    use crate::{Embedder, ModelCategory, Reranker, SearchFuture};
 
     #[derive(Default)]
     struct Wakes(AtomicUsize);
@@ -375,6 +431,312 @@ mod tests {
             assert_eq!(page.snapshot.index().vectors().document("b").unwrap().content, "vertical");
             assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
             assert_eq!(quality.queries.load(Ordering::SeqCst), 1);
+            assert!(!cx.is_cancel_requested());
+        });
+    }
+
+    // Real native/Quill construction with a controlled query-only suspension.
+    // The inherited provider is explicitly a hash-control test model.
+    struct QueryGate {
+        inner: super::super::tests::Provider,
+        mode: AtomicUsize,
+        calls: AtomicUsize,
+        drops: AtomicUsize,
+    }
+
+    impl QueryGate {
+        fn new(name: &str, dimension: u32) -> Self {
+            Self {
+                inner: super::super::tests::Provider::new(
+                    name,
+                    dimension,
+                    super::super::tests::Reply::Correct,
+                ),
+                mode: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                drops: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    struct GateDrop<'a>(&'a AtomicUsize);
+
+    impl Drop for GateDrop<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Embedder for QueryGate {
+        fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _drop = GateDrop(&self.drops);
+                match self.mode.load(Ordering::SeqCst) {
+                    1 => std::future::pending().await,
+                    2 => Err(invalid("deadline.test", "failed", "required provider failed")),
+                    3 => Err(SearchError::Cancelled {
+                        phase: "deadline.test".to_owned(),
+                        reason: "provider cancelled".to_owned(),
+                    }),
+                    _ => self.inner.embed(cx, text).await,
+                }
+            })
+        }
+
+        fn embed_batch_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+            self.inner.embed_batch_bound(cx, texts)
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            self.inner.identity()
+        }
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+        fn is_semantic(&self) -> bool {
+            false
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
+    async fn scoped_fixture(
+        cx: &Cx,
+    ) -> (
+        tempfile::TempDir,
+        Arc<QueryGate>,
+        Arc<QueryGate>,
+        NativeBuiltHybridIndex,
+    ) {
+        use super::super::NativeIndexBuilder;
+        use super::super::tests::{documents, generation};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fast = Arc::new(QueryGate::new("fast", 2));
+        let quality = Arc::new(QueryGate::new("quality", 3));
+        let index = NativeIndexBuilder::new(
+            directory.path().join("index"),
+            generation(),
+            fast.clone(),
+        )
+        .unwrap()
+        .with_quality_embedder(quality.clone())
+        .unwrap()
+        .add_documents(documents())
+        .build_hybrid(cx)
+        .await
+        .unwrap();
+        (directory, fast, quality, index)
+    }
+
+    #[derive(Default)]
+    struct ScopedReranker {
+        ids: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Reranker for ScopedReranker {
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            documents: &'a [RerankDocument],
+        ) -> SearchFuture<'a, Vec<RerankScore>> {
+            Box::pin(async move {
+                *self.ids.lock().unwrap() =
+                    documents.iter().map(|doc| doc.doc_id.clone()).collect();
+                Ok(documents
+                    .iter()
+                    .enumerate()
+                    .map(|(original_rank, document)| RerankScore {
+                        doc_id: document.doc_id.clone(),
+                        original_rank,
+                        score: if document.doc_id == "b" { 1.0 } else { 0.0 },
+                        raw_logit: None,
+                    })
+                    .collect())
+            })
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn id(&self) -> &str {
+            "deadline-scoped-reranker"
+        }
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+    }
+
+    #[test]
+    fn bounded_scoped_collection_preserves_tuning_and_excludes_reranker_documents() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_directory, fast, quality, index) = scoped_fixture(&cx).await;
+            let scope = index
+                .scope(&cx, |doc| Ok(doc.id == "a" || doc.id == "b"))
+                .unwrap();
+            let config = RrfConfig {
+                k: 0.0,
+                lexical_weight: 3.0,
+                ..RrfConfig::default()
+            };
+            let query = || {
+                scope
+                    .progressive(&cx, "horizontal", 2)
+                    .unwrap()
+                    .with_fusion(config.clone(), 0.4)
+                    .unwrap()
+                    .with_candidate_multiplier(1)
+                    .unwrap()
+                    .with_beam_widths(Some(2), Some(2))
+                    .unwrap()
+            };
+            let expected = query().collect().await.unwrap();
+            let (_, deadline) = clock(&cx, Duration::from_secs(1));
+            let actual = deadline.collect(&cx, query()).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(actual[0].doc_id, "a");
+            assert_eq!(actual[0].score.to_bits(), 4.0_f32.to_bits());
+            assert_eq!(actual[1].doc_id, "b");
+            assert_eq!(actual[1].score.to_bits(), 0.5_f32.to_bits());
+            assert!(actual.iter().all(|hit| {
+                hit.fast_score.is_none() && hit.quality_score.is_none() && hit.index.is_none()
+            }));
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 2);
+
+            let reranker = ScopedReranker::default();
+            let query = scope
+                .progressive_with_reranker(&cx, "horizontal", 1, &reranker, 2)
+                .unwrap()
+                .with_candidate_multiplier(1)
+                .unwrap()
+                .with_fusion(config, 0.4)
+                .unwrap();
+            let reranked = deadline.collect(&cx, query).await.unwrap();
+            assert_eq!(reranked[0].doc_id, "b");
+            assert_eq!(reranked[0].rerank_score, Some(1.0));
+            assert_eq!(*reranker.ids.lock().unwrap(), ["a", "b"]);
+            assert!(deadline.timer.is_empty());
+
+            let expected = scope.search_refined(&cx, "horizontal", 2).await.unwrap();
+            let actual = scope
+                .search_refined_before(&cx, "horizontal", 2, &deadline)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn configuring_a_scoped_query_does_not_grant_a_fresh_deadline() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_directory, fast, quality, index) = scoped_fixture(&cx).await;
+            let (time, deadline) = clock(&cx, Duration::from_millis(10));
+            time.advance(10_000_000);
+            let scope = index.scope(&cx, |doc| Ok(doc.id == "b")).unwrap();
+            let query = scope
+                .progressive(&cx, "vertical", 1)
+                .unwrap()
+                .with_candidate_multiplier(1)
+                .unwrap()
+                .with_fusion(RrfConfig::default(), 0.0)
+                .unwrap();
+            assert!(matches!(
+                deadline.collect(&cx, query).await,
+                Err(SearchError::SearchTimeout { elapsed_ms: 10, budget_ms: 10 })
+            ));
+            assert!(matches!(
+                scope.search_refined_before(&cx, "vertical", 1, &deadline).await,
+                Err(SearchError::SearchTimeout { .. })
+            ));
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            assert!(deadline.timer.is_empty());
+            assert!(!cx.is_cancel_requested());
+        });
+    }
+
+    #[test]
+    fn bounded_collection_does_not_hide_required_quality_failure_at_zero_weight() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_directory, fast, quality, index) = scoped_fixture(&cx).await;
+            let scope = index.scope(&cx, |doc| Ok(doc.id == "b")).unwrap();
+            let (_, deadline) = clock(&cx, Duration::from_secs(1));
+            for mode in [2, 3] {
+                quality.mode.store(mode, Ordering::SeqCst);
+                let query = scope
+                    .progressive(&cx, "vertical", 1)
+                    .unwrap()
+                    .with_fusion(RrfConfig::default(), 0.0)
+                    .unwrap();
+                let error = deadline.collect(&cx, query).await.unwrap_err();
+                if mode == 2 {
+                    assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
+                        if field == "native_ann.deadline.test"));
+                } else {
+                    assert!(matches!(error, SearchError::Cancelled { ref phase, .. }
+                        if phase == "deadline.test"));
+                }
+            }
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 2);
+            assert!(deadline.timer.is_empty());
+        });
+    }
+
+    #[test]
+    fn scoped_collection_timeout_drop_and_cancellation_release_required_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_directory, fast, quality, index) = scoped_fixture(&cx).await;
+            let scope = index.scope(&cx, |doc| Ok(doc.id == "b")).unwrap();
+            for ending in 0..3 {
+                quality.mode.store(1, Ordering::SeqCst);
+                let (time, deadline) = clock(&cx, Duration::from_millis(10));
+                let query = scope.progressive(&cx, "vertical", 1).unwrap();
+                let mut pending = Box::pin(deadline.collect(&cx, query));
+                assert!(pending
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
+                assert_eq!(deadline.timer.pending_count(), 1);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), ending + 1);
+                match ending {
+                    0 => {
+                        time.advance(10_000_000);
+                        let _ = deadline.timer.process_timers();
+                        assert!(matches!(pending.await, Err(SearchError::SearchTimeout { .. })));
+                    }
+                    1 => drop(pending),
+                    _ => {
+                        cx.set_cancel_requested(true);
+                        time.advance(10_000_000);
+                        assert!(matches!(pending.await, Err(SearchError::Cancelled { .. })));
+                        cx.set_cancel_requested(false);
+                    }
+                }
+                assert_eq!(quality.drops.load(Ordering::SeqCst), ending + 1);
+                assert!(deadline.timer.is_empty());
+            }
+            quality.mode.store(0, Ordering::SeqCst);
+            assert_eq!(scope.search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 4);
             assert!(!cx.is_cancel_requested());
         });
     }
