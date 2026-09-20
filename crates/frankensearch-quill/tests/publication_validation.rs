@@ -553,3 +553,310 @@ fn durable_commit_cancellation_retains_exact_delta_until_one_successful_retry() 
         assert_fresh_search_matches(&cx, directory.path(), &expected_after).await;
     });
 }
+
+/// Produce one real segment with two live rows, so a tombstone-only proposal
+/// keeps the immutable id, range, length, and file witness exactly unchanged.
+async fn two_row_manifest(cx: &Cx, directory: &Path) -> Manifest {
+    let index = QuillIndex::create(
+        cx,
+        directory,
+        QuillConfig {
+            max_ingest_shards: 1,
+            max_visibility_lag_ms: u64::MAX,
+            ..config()
+        },
+    )
+    .await
+    .expect("create two-row fixture");
+    LexicalWrite::index_documents(
+        &index,
+        cx,
+        &[
+            IndexableDocument::new("first", "shared first document"),
+            IndexableDocument::new("second", "shared second document"),
+        ],
+    )
+    .await
+    .expect("stage two rows in one shard");
+    LexicalWrite::commit(&index, cx)
+        .await
+        .expect("publish one two-row segment");
+    let manifest = load_manifest_pair(directory)
+        .expect("read two-row fixture manifest")
+        .manifest;
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].docid_lo, 0);
+    assert_eq!(manifest.segments[0].doc_count, 2);
+    manifest
+}
+
+#[test]
+fn tombstone_only_change_revalidates_retained_bytes_before_publication() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("tombstone fixture directory");
+        let initial = two_row_manifest(&cx, directory.path()).await;
+        let paths = stage_segments(directory.path(), directory.path(), &initial);
+        let path = paths.values().next().expect("retained segment path");
+        let mut writer = KeeperWriter::open(&cx, directory.path(), DEFAULT_SCHEMA)
+            .await
+            .expect("admit intact retained segment");
+        let retained = retained_manifest(&writer);
+        let mut proposed = successor(&writer);
+        proposed.segments[0]
+            .tombstones
+            .insert(0)
+            .expect("tombstone a real row");
+        let mut expected_entry = retained.segments[0].clone();
+        expected_entry.tombstones = proposed.segments[0].tombstones.clone();
+        assert_eq!(proposed.segments[0], expected_entry);
+        assert_ne!(proposed.segments[0], retained.segments[0]);
+
+        let original = corrupt_same_length(path);
+        let before = directory_bytes(directory.path());
+        let error = writer
+            .publish(&cx, &proposed)
+            .await
+            .err()
+            .expect("changed tombstones must not inherit preflight admission");
+        assert!(
+            matches!(error, KeeperError::SegmentOpen { .. }),
+            "unexpected failure: {error}"
+        );
+        assert_eq!(directory_bytes(directory.path()), before);
+        assert!(!writer.publication_awaits_reconciliation());
+        assert_eq!(retained_manifest(&writer), retained);
+
+        restore_segment(path, &original);
+        writer
+            .publish(&cx, &proposed)
+            .await
+            .expect("the same tombstone proposal succeeds after restoring its file");
+        let installed = retained_manifest(&writer);
+        assert_eq!(installed.generation, retained.generation + 1);
+        assert_eq!(installed.segments, proposed.segments);
+        assert_eq!(writer.snapshot().expect("installed authority").doc_count(), 1);
+        assert_eq!(std::fs::read(path).expect("retained bytes"), original);
+        drop(writer);
+        let reopened = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+            .expect("fresh open authenticates the file and binds its new tombstones");
+        assert_eq!(reopened.loaded_manifest().manifest, installed);
+        assert_eq!(reopened.doc_count(), 1);
+        let reader = QuillSearchIndex::open(&cx, directory.path(), config())
+            .await
+            .expect("open fresh search reader");
+        let hits = LexicalRead::search(&reader, &cx, "shared", 10)
+            .await
+            .expect("search after tombstone-only publication");
+        assert_eq!(hits.len(), 1, "the deleted physical row must stay invisible");
+    });
+}
+
+#[cfg(feature = "durability")]
+#[test]
+fn tombstone_only_change_requires_retained_segment_sidecar_and_retries_cleanly() {
+    use std::sync::Arc;
+
+    use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileProtector};
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let donor_dir = tempfile::tempdir().expect("durable donor directory");
+        let recipient_dir = tempfile::tempdir().expect("durable recipient directory");
+        let mut first = two_row_manifest(&cx, donor_dir.path()).await;
+        let protector = FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
+            .expect("real durability protector");
+        let mut writer = KeeperWriter::create_durable(
+            &cx,
+            recipient_dir.path(),
+            DEFAULT_SCHEMA,
+            protector.clone(),
+        )
+        .await
+        .expect("create protected recipient");
+        let staged = stage_segments(donor_dir.path(), recipient_dir.path(), &first);
+        let path = staged.values().next().expect("staged two-row segment");
+        protector.protect_file(path).expect("protect the real FSLX file");
+        first.generation = successor(&writer).generation;
+        writer
+            .publish(&cx, &first)
+            .await
+            .expect("admit the healthy segment and its sidecar");
+        let retained = retained_manifest(&writer);
+        let mut proposed = successor(&writer);
+        proposed.segments[0]
+            .tombstones
+            .insert(0)
+            .expect("change only retained tombstones");
+        let mut expected_entry = retained.segments[0].clone();
+        expected_entry.tombstones = proposed.segments[0].tombstones.clone();
+        assert_eq!(proposed.segments[0], expected_entry);
+        assert_ne!(proposed.segments[0], retained.segments[0]);
+        let original = std::fs::read(path).expect("intact retained FSLX bytes");
+        let sidecar = FileProtector::sidecar_path(path);
+        assert!(
+            protector
+                .verify_file(path, &sidecar)
+                .expect("verify healthy control sidecar")
+                .healthy
+        );
+        let saved_sidecar = recipient_dir.path().join("saved-sidecar.fixture");
+        std::fs::rename(&sidecar, &saved_sidecar).expect("hide, do not delete, the sidecar");
+        let before = directory_bytes(recipient_dir.path());
+        let error = writer
+            .publish(&cx, &proposed)
+            .await
+            .err()
+            .expect("a tombstone change still requires sidecar preflight");
+        assert!(
+            matches!(
+                error,
+                KeeperError::Durability {
+                    operation: "preflight durable segment sidecar",
+                    ..
+                }
+            ),
+            "unexpected failure: {error}"
+        );
+        assert_eq!(directory_bytes(recipient_dir.path()), before);
+        assert!(!writer.publication_awaits_reconciliation());
+        assert_eq!(retained_manifest(&writer), retained);
+        assert_eq!(writer.snapshot().expect("retained authority").doc_count(), 2);
+
+        std::fs::rename(&saved_sidecar, &sidecar).expect("restore the exact healthy sidecar");
+        writer
+            .publish(&cx, &proposed)
+            .await
+            .expect("retry the same proposal with its restored durability evidence");
+        let installed = retained_manifest(&writer);
+        assert_eq!(installed.generation, retained.generation + 1);
+        assert_eq!(installed.segments, proposed.segments);
+        assert_eq!(std::fs::read(path).expect("unchanged FSLX bytes"), original);
+        assert!(
+            protector
+                .verify_file(path, &sidecar)
+                .expect("sidecar remains healthy after publication")
+                .healthy
+        );
+        drop(writer);
+        let reopened = KeeperSnapshot::open(recipient_dir.path(), DEFAULT_SCHEMA)
+            .expect("fresh reopen after durable tombstone retry");
+        assert_eq!(reopened.loaded_manifest().manifest, installed);
+        assert_eq!(reopened.doc_count(), 1);
+    });
+}
+
+#[test]
+fn upsert_preserves_unchanged_segments_and_fresh_reopen_query_results() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("incremental upsert directory");
+        let index = QuillIndex::create(
+            &cx,
+            directory.path(),
+            QuillConfig {
+                max_ingest_shards: 1,
+                tier_fanout: 32,
+                compaction_tombstone_density: 1.0,
+                max_visibility_lag_ms: u64::MAX,
+                ..config()
+            },
+        )
+        .await
+        .expect("create deterministic retained-segment fixture");
+        // Keep a live anchor in the replaced segment, so this tests a changed
+        // entry rather than depending on fully deleted segment retention.
+        LexicalWrite::index_documents(
+            &index,
+            &cx,
+            &[
+                IndexableDocument::new("one", "shared antique"),
+                IndexableDocument::new("anchor", "shared stable anchor"),
+            ],
+        )
+        .await
+        .expect("stage original and anchor in one segment");
+        LexicalWrite::commit(&index, &cx)
+            .await
+            .expect("publish original and anchor");
+        for (id, text) in [
+            ("two", "shared blue"),
+            ("three", "shared green"),
+        ] {
+            append_document(&index, &cx, directory.path(), id, text).await;
+        }
+        let before = load_manifest_pair(directory.path())
+            .expect("read retained generation")
+            .manifest;
+        assert_eq!(before.segments.len(), 3);
+        let after = append_document(
+            &index,
+            &cx,
+            directory.path(),
+            "one",
+            "shared replacement",
+        )
+        .await;
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.segments.len(), 4);
+        let mut unchanged = 0;
+        let mut tombstone_changed = 0;
+        for old in &before.segments {
+            let carried = after
+                .segments
+                .iter()
+                .find(|entry| entry.segment_id == old.segment_id)
+                .expect("every old segment remains in the successor");
+            if carried == old {
+                unchanged += 1;
+            } else {
+                let mut expected_entry = old.clone();
+                expected_entry.tombstones = carried.tombstones.clone();
+                assert_eq!(carried, &expected_entry, "only tombstones may change");
+                assert_ne!(carried.tombstones, old.tombstones);
+                tombstone_changed += 1;
+            }
+        }
+        assert_eq!(unchanged, 2);
+        assert_eq!(tombstone_changed, 1);
+        assert_eq!(
+            after
+                .segments
+                .iter()
+                .filter(|entry| {
+                    !before
+                        .segments
+                        .iter()
+                        .any(|old| old.segment_id == entry.segment_id)
+                })
+                .count(),
+            1,
+            "the upsert adds one segment beside the changed tombstone entry"
+        );
+        let expected = LexicalRead::search(&index, &cx, "shared", 10)
+            .await
+            .expect("search live upserted index");
+        let mut ids: Vec<_> = expected.iter().map(|hit| hit.doc_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["anchor", "one", "three", "two"]);
+        assert!(
+            LexicalRead::search(&index, &cx, "antique", 10)
+                .await
+                .expect("query replaced text before reopen")
+                .is_empty()
+        );
+        drop(index);
+        assert_fresh_search_matches(&cx, directory.path(), &expected).await;
+        let reopened = QuillSearchIndex::open(&cx, directory.path(), config())
+            .await
+            .expect("open fresh upsert reader");
+        assert!(
+            LexicalRead::search(&reopened, &cx, "antique", 10)
+                .await
+                .expect("query replaced text after reopen")
+                .is_empty()
+        );
+        let replacement = LexicalRead::search(&reopened, &cx, "replacement", 10)
+            .await
+            .expect("query replacement text after reopen");
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].doc_id, "one");
+    });
+}
