@@ -23342,6 +23342,15 @@ mod tests {
             let four = fragmented_term_query_ceiling(&cx, 4).await;
             let eight = fragmented_term_query_ceiling(&cx, 8).await;
 
+            // Pinned so the ratio below cannot be satisfied by two wrong
+            // numbers. For `k` single-document segments and one stream the
+            // ceiling is `k` segment charges, `2k` posting blocks (one
+            // traversal pair per segment) and `2k` dictionary blocks (one
+            // snapshot scan plus one local probe per segment): `5k`. The
+            // pre-#41 ceiling was `k^2 + 4k`, so these three would read
+            // 12, 32 and 96.
+            assert_eq!((two, four, eight), (10, 20, 40));
+
             // `PreparedSnapshotDocFreqs` computes a term's snapshot statistics
             // once, so the ceiling charges one scan per stream rather than one
             // per lowered segment. Doubling the segment count must therefore
