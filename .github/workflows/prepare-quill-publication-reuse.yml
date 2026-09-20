@@ -1,0 +1,70 @@
+name: Prepare reviewed Quill publication reuse
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/prepare-quill-publication-reuse.yml]
+
+# One-shot source transport for the owner-requested direct-main commit.
+# Creates a Git blob only, never a branch update, release, or test verdict.
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.repository == 'Dicklesworthstone/frankensearch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Apply the reviewed integration to the complete original file
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, tempfile, urllib.request
+          repository = 'Dicklesworthstone/frankensearch'
+          path = 'crates/frankensearch-quill/src/keeper.rs'
+          expected_base = '19b4b3b6ae02001eabfa40e3221ffc76d3ad270f'
+          patch_blob = 'ce6c2906bfc9b70054b9224297bbe0523bcab6a2'
+          def blob_sha(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def api(suffix, data=None):
+              body = None if data is None else json.dumps(data).encode()
+              request = urllib.request.Request(
+                  f'https://api.github.com/repos/{repository}/{suffix}', data=body,
+                  method='GET' if data is None else 'POST',
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json',
+                           'User-Agent': 'quill-reviewed-patch-preparation'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          encoded = api('git/blobs/' + patch_blob)
+          assert encoded['encoding'] == 'base64'
+          patch = base64.b64decode(encoded['content'])
+          assert blob_sha(patch) == patch_blob
+          assert hashlib.sha256(patch).hexdigest() == '0b2d1b37bfd3c713441c4b299e7fe1b8cd4d378779a018d849a5fb510223bd25'
+          url = f'https://raw.githubusercontent.com/{repository}/{os.environ["GITHUB_SHA"]}/{path}'
+          with urllib.request.urlopen(url, timeout=60) as response:
+              original = response.read()
+          assert blob_sha(original) == expected_base, 'Keeper changed; reconcile before applying'
+          with tempfile.TemporaryDirectory() as directory:
+              root = pathlib.Path(directory)
+              target = root / path
+              target.parent.mkdir(parents=True)
+              target.write_bytes(original)
+              subprocess.run(['git', 'init', '--quiet', directory], check=True)
+              subprocess.run(['git', 'apply', '--check', '--whitespace=error', '-'], cwd=root, input=patch, check=True)
+              subprocess.run(['git', 'apply', '--whitespace=error', '-'], cwd=root, input=patch, check=True)
+              modified = target.read_bytes()
+          result = api('git/blobs', {'encoding': 'utf-8', 'content': modified.decode('utf-8')})
+          assert result['sha'] == blob_sha(modified), 'Uploaded bytes differ'
+          receipt = {'base_blob': expected_base, 'keeper_blob': result['sha'],
+                     'prepared_at_commit': os.environ['GITHUB_SHA'],
+                     'patch_application': 'passed on complete original keeper.rs',
+                     'rust_tests': 'not run', 'branch_updated_by_job': False}
+          print('PUBLICATION_REUSE_RECEIPT=' + json.dumps(receipt, sort_keys=True))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('```json\n' + json.dumps(receipt, indent=2) + '\n```\n')
+          PY
