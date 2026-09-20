@@ -5,7 +5,8 @@
 //! - Collect CPU/memory/IO/load signals from `/proc` on Linux.
 //! - Smooth noisy readings via EWMA.
 //! - Derive `normal`/`constrained`/`degraded`/`emergency` states.
-//! - Apply hysteresis + anti-flap consecutive-reading guards.
+//! - Escalate memory emergencies immediately, without smoothing away a breach.
+//! - Apply hysteresis + anti-flap consecutive-reading guards to recovery.
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -924,6 +925,7 @@ pub struct PressureSnapshot {
     pub timestamp_ms: u64,
     pub raw: PressureSignal,
     pub smoothed: PressureSignal,
+    /// Admission score: the maximum of smoothed pressure and current memory pressure.
     pub score: f64,
     pub state: PressureState,
 }
@@ -1529,6 +1531,10 @@ impl PressureController {
     }
 
     /// Observe one signal and derive a stable pressure transition.
+    ///
+    /// Current memory pressure is a safety floor, not a noisy utilization hint.
+    /// A memory emergency bypasses the consecutive-reading delay; recovery and
+    /// non-memory transitions retain the configured smoothing and anti-flap gates.
     #[must_use]
     pub fn observe(&mut self, raw: PressureSignal, timestamp_ms: u64) -> PressureTransition {
         let smoothed = self
@@ -1537,9 +1543,16 @@ impl PressureController {
         self.smoothed_signal = Some(smoothed);
 
         let thresholds = PressureThresholds::for_profile(self.config.profile);
-        let score = smoothed.score();
+        // Do not admit more work against a stale low memory EWMA, including
+        // during recovery or when ewma_alpha is configured to zero (#43).
+        let score = smoothed.score().max(raw.memory_pct);
         let target = self.target_state(score, thresholds);
         let from_state = self.current_state;
+        let consecutive_required = if raw.memory_pct >= thresholds.emergency {
+            1
+        } else {
+            self.config.consecutive_required
+        };
 
         let (changed, reason_code) = if target == self.current_state {
             self.pending_state = None;
@@ -1553,7 +1566,7 @@ impl PressureController {
                 self.pending_consecutive = 1;
             }
 
-            if self.pending_consecutive >= self.config.consecutive_required {
+            if self.pending_consecutive >= consecutive_required {
                 self.current_state = target;
                 self.pending_state = None;
                 self.pending_consecutive = 0;
@@ -1568,7 +1581,7 @@ impl PressureController {
             to: self.current_state,
             changed,
             reason_code,
-            consecutive_required: self.config.consecutive_required,
+            consecutive_required,
             consecutive_observed: self.pending_consecutive,
             snapshot: PressureSnapshot {
                 timestamp_ms,
@@ -1901,6 +1914,176 @@ fn parse_u64_field(field: &str, value: &str) -> SearchResult<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_emergency_bypasses_smoothing_and_pending_transition() {
+        for (profile, emergency_pct) in [
+            (PressureProfile::Strict, 90.0),
+            (PressureProfile::Performance, 95.0),
+            (PressureProfile::Degraded, 98.0),
+        ] {
+            for alpha in [0.0, 0.3, 1.0] {
+                let mut controller = PressureController::new(PressureControllerConfig {
+                    profile,
+                    ewma_alpha: alpha,
+                    consecutive_required: u8::MAX,
+                    ..PressureControllerConfig::default()
+                })
+                .expect("valid config");
+                let pending = controller.observe(PressureSignal::new(85.0, 10.0, 10.0, 10.0), 0);
+                assert_eq!(pending.to, PressureState::Normal);
+                assert_eq!(pending.consecutive_observed, 1);
+
+                let breach = controller.observe(
+                    PressureSignal::new(10.0, emergency_pct, 10.0, 10.0),
+                    1,
+                );
+                assert_eq!(breach.from, PressureState::Normal);
+                assert_eq!(breach.to, PressureState::Emergency);
+                assert!(breach.changed);
+                assert_eq!(breach.reason_code, "pressure.transition.applied");
+                assert_eq!(breach.consecutive_required, 1);
+                assert_eq!(breach.consecutive_observed, 0);
+                assert!(breach.snapshot.score >= emergency_pct);
+                assert_eq!(controller.config().consecutive_required, u8::MAX);
+                if alpha < 1.0 {
+                    assert!(breach.snapshot.smoothed.memory_pct < emergency_pct);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn memory_recovery_requires_hysteresis_and_a_fresh_healthy_streak() {
+        let mut controller = PressureController::new(PressureControllerConfig {
+            ewma_alpha: 0.0,
+            ..PressureControllerConfig::default()
+        })
+        .expect("valid config");
+        let low = PressureSignal::new(10.0, 10.0, 10.0, 10.0);
+        let _ = controller.observe(low, 0);
+        let breach = controller.observe(PressureSignal::new(10.0, 95.0, 10.0, 10.0), 1);
+        assert_eq!(breach.to, PressureState::Emergency);
+
+        // Even a frozen, healthy EWMA must not permit recovery above the
+        // emergency exit threshold (95 - 5), including its exact boundary.
+        for memory_pct in [94.0, 90.0, 94.0, 95.0] {
+            let held = controller.observe(PressureSignal::new(10.0, memory_pct, 10.0, 10.0), 2);
+            assert_eq!(held.to, PressureState::Emergency);
+            assert!(!held.changed);
+            assert_eq!(held.consecutive_observed, 0);
+        }
+        for count in 1..=2 {
+            let pending = controller.observe(low, 3);
+            assert_eq!(pending.to, PressureState::Emergency);
+            assert_eq!(pending.consecutive_required, 3);
+            assert_eq!(pending.consecutive_observed, count);
+        }
+        let interrupted = controller.observe(PressureSignal::new(10.0, 92.0, 10.0, 10.0), 4);
+        assert_eq!(interrupted.to, PressureState::Emergency);
+        assert_eq!(interrupted.consecutive_observed, 0);
+        for count in 1..=2 {
+            let pending = controller.observe(low, 5);
+            assert_eq!(pending.to, PressureState::Emergency);
+            assert_eq!(pending.consecutive_observed, count);
+        }
+        let recovered = controller.observe(low, 6);
+        assert_eq!(recovered.to, PressureState::Normal);
+        assert!(recovered.changed);
+        assert_eq!(recovered.consecutive_required, 3);
+    }
+
+    #[test]
+    fn non_memory_emergencies_retain_smoothing_and_consecutive_guards() {
+        let low = PressureSignal::new(10.0, 10.0, 10.0, 10.0);
+        for hot in [
+            PressureSignal::new(100.0, 10.0, 10.0, 10.0),
+            PressureSignal::new(10.0, 10.0, 100.0, 10.0),
+            PressureSignal::new(10.0, 10.0, 10.0, 100.0),
+        ] {
+            let mut smoothed = PressureController::from_profile(PressureProfile::Performance);
+            let _ = smoothed.observe(low, 0);
+            assert_eq!(smoothed.observe(hot, 1).to, PressureState::Normal);
+
+            let mut controller = PressureController::new(PressureControllerConfig {
+                ewma_alpha: 1.0,
+                ..PressureControllerConfig::default()
+            })
+            .expect("valid config");
+            let _ = controller.observe(low, 0);
+            for count in 1..=2 {
+                let pending = controller.observe(hot, 1);
+                assert_eq!(pending.to, PressureState::Normal);
+                assert_eq!(pending.consecutive_required, 3);
+                assert_eq!(pending.consecutive_observed, count);
+            }
+            assert_eq!(controller.observe(hot, 2).to, PressureState::Emergency);
+        }
+    }
+
+    #[test]
+    fn memory_emergency_escalates_from_every_lower_state() {
+        for (cpu_pct, expected) in [
+            (10.0, PressureState::Normal),
+            (75.0, PressureState::Constrained),
+            (88.0, PressureState::Degraded),
+        ] {
+            let mut controller = PressureController::new(PressureControllerConfig {
+                ewma_alpha: 1.0,
+                ..PressureControllerConfig::default()
+            })
+            .expect("valid config");
+            for timestamp in 0..3 {
+                let _ = controller.observe(
+                    PressureSignal::new(cpu_pct, 10.0, 10.0, 10.0),
+                    timestamp,
+                );
+            }
+            assert_eq!(controller.state(), expected);
+            let breach = controller.observe(PressureSignal::new(10.0, 95.0, 10.0, 10.0), 3);
+            assert_eq!(breach.from, expected);
+            assert_eq!(breach.to, PressureState::Emergency);
+            assert!(breach.changed);
+        }
+    }
+
+    #[test]
+    fn memory_emergency_state_defers_heavy_lanes_even_with_smoothed_input() {
+        let governor = ResourcePressureGovernor::default();
+        for (profile, emergency_pct) in [
+            (PressureProfile::Strict, 90.0),
+            (PressureProfile::Performance, 95.0),
+            (PressureProfile::Degraded, 98.0),
+        ] {
+            let mut controller = PressureController::new(PressureControllerConfig {
+                profile,
+                ewma_alpha: 0.0,
+                ..PressureControllerConfig::default()
+            })
+            .expect("valid config");
+            let _ = controller.observe(PressureSignal::new(10.0, 10.0, 10.0, 10.0), 0);
+            let breach = controller.observe(
+                PressureSignal::new(10.0, emergency_pct, 10.0, 10.0),
+                1,
+            );
+            let input = resource_input(breach.snapshot.state, breach.snapshot.smoothed);
+            for lane in [
+                ResourceLane::Indexing,
+                ResourceLane::WatchRefresh,
+                ResourceLane::ModelLoad,
+                ResourceLane::QualityRefinement,
+            ] {
+                let decision = governor.decide(input, lane);
+                assert_eq!(decision.mode, ResourceAdmissionMode::Defer);
+                assert!(!decision.admitted);
+                assert!(decision.backpressure.cancel_on_pressure_escalation);
+                assert_eq!(decision.backpressure.queue_budget, 1);
+            }
+            let initial = governor.decide(input, ResourceLane::InitialSearch);
+            assert_eq!(initial.mode, ResourceAdmissionMode::Admit);
+            assert!(initial.admitted);
+        }
+    }
 
     #[test]
     fn controller_requires_consecutive_readings_before_transition() {
