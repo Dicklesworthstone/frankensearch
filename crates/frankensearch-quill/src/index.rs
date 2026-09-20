@@ -4681,7 +4681,14 @@ impl PreparedSnapshotDocFreqs {
             .copied()
         {
             drop(entries);
-            replay_ranking_snapshot_doc_freq_admissions(checkpoint, snapshot)?;
+            // A hit opens no dictionary, so it admits no dictionary block.
+            // The per-segment replay that used to stand here left the charge
+            // at `streams x segments^2` even though the scan happened once,
+            // which made the table a latency optimisation that could not stop
+            // a few hundred segments from exhausting the budget on statistics
+            // nothing recomputed (#41). The zero-unit admission preserves the
+            // cancellation poll those replayed admissions used to provide.
+            checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
             return Ok(cached);
         }
 
@@ -4747,21 +4754,17 @@ impl PreparedSnapshotDocFreqs {
     }
 }
 
+/// A snapshot with fewer sealed segments than this has nothing to reuse: a
+/// single lowering already performs the one and only snapshot scan. The
+/// query-work ceiling has to charge whichever regime actually runs, so it
+/// reads the threshold from here rather than restating it.
+const SNAPSHOT_DOC_FREQ_TABLE_MIN_SEGMENTS: usize = 2;
+
 fn prepare_snapshot_doc_freqs(snapshot: &QuillSearchSnapshot) -> Option<PreparedSnapshotDocFreqs> {
-    if snapshot.keeper_snapshot().segments().len() < 2 {
+    if snapshot.keeper_snapshot().segments().len() < SNAPSHOT_DOC_FREQ_TABLE_MIN_SEGMENTS {
         return None;
     }
     Some(PreparedSnapshotDocFreqs::new())
-}
-
-fn replay_ranking_snapshot_doc_freq_admissions(
-    checkpoint: &QueryCheckpointHandle<'_>,
-    snapshot: &QuillSearchSnapshot,
-) -> Result<(), QuillIndexError> {
-    for _ in snapshot.keeper_snapshot().segments() {
-        checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13418,18 +13421,27 @@ fn query_work_upper_bound(
         .dictionary_scans
         .saturating_mul(dictionary_blocks)
         .saturating_mul(segment_count);
-    // Exact term statistics probe every sealed dictionary for each lowered
-    // segment, then the segment-local cursor performs one more indexed probe.
     // Every posting stream is opened through `lower_leaf_term`, including
-    // terms materialized by range and glob expansion. Each opening probes all
-    // sealed dictionaries for snapshot statistics and then the leaf-local
-    // dictionary, so use the complete stream ceiling rather than only the
-    // syntactic exact-term count.
-    let indexed_dictionary_blocks = posting_streams.saturating_mul(
-        segment_count
-            .saturating_mul(keeper_count)
-            .saturating_add(keeper_count),
-    );
+    // terms materialized by range and glob expansion, so use the complete
+    // stream ceiling rather than only the syntactic exact-term count. Each
+    // opening costs snapshot statistics plus one probe of the leaf-local
+    // dictionary, and only a sealed leaf performs that local probe.
+    //
+    // The statistics are the part that used to dominate. A snapshot scan
+    // reads every sealed dictionary, and without the query-local table each
+    // of the `segment_count` lowerings repeated it, so the charge grew as
+    // `streams x segments^2` and a few hundred segments exhausted any budget
+    // (#41). `PreparedSnapshotDocFreqs` computes it once per term, so above
+    // the table threshold the ceiling is one scan per stream; below it the
+    // repeat is real and still has to be charged.
+    let snapshot_statistic_probes =
+        if keeper.segments().len() >= SNAPSHOT_DOC_FREQ_TABLE_MIN_SEGMENTS {
+            keeper_count
+        } else {
+            segment_count.saturating_mul(keeper_count)
+        };
+    let indexed_dictionary_blocks =
+        posting_streams.saturating_mul(snapshot_statistic_probes.saturating_add(keeper_count));
     // Existing phrase lowering materializes positioned rows before candidate
     // verification. Bound both the decode and verification passes.
     let position_docs = shape
@@ -15418,6 +15430,7 @@ fn lower_query_with_mode<'a>(
                 checkpoint,
                 leaf,
                 snapshot,
+                prepared_doc_freqs,
                 schema,
                 *field_id,
                 lower,
@@ -15429,6 +15442,7 @@ fn lower_query_with_mode<'a>(
                 checkpoint,
                 leaf,
                 snapshot,
+                prepared_doc_freqs,
                 schema,
                 field_ids,
                 pattern.as_bytes(),
@@ -15440,6 +15454,7 @@ fn lower_query_with_mode<'a>(
                 checkpoint,
                 leaf,
                 snapshot,
+                prepared_doc_freqs,
                 schema,
                 *field_id,
                 values,
@@ -15459,11 +15474,13 @@ fn lower_query_with_mode<'a>(
         .ok_or_else(|| invalid_state("query lowering produced no root scorer"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_leaf_range<'a>(
     cx: &Cx,
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
     schema: SchemaDescriptor,
     field_ord: u16,
     lower: &Bound<QueryValue>,
@@ -15487,7 +15504,15 @@ fn lower_leaf_range<'a>(
             let terms =
                 snapshot_string_range_terms(checkpoint, snapshot, schema, field_ord, lower, upper)?;
             lower_leaf_string_predicate(
-                checkpoint, leaf, snapshot, schema, field_ord, terms, boost, mode,
+                checkpoint,
+                leaf,
+                snapshot,
+                prepared_doc_freqs,
+                schema,
+                field_ord,
+                terms,
+                boost,
+                mode,
             )
         }
         FieldKind::I64 {
@@ -15903,10 +15928,12 @@ fn encode_live_delta_numeric(
         .map_err(QuillIndexError::from)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_leaf_set<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
     schema: SchemaDescriptor,
     field_ord: u16,
     values: &[QueryValue],
@@ -15928,6 +15955,7 @@ fn lower_leaf_set<'a>(
                 checkpoint,
                 leaf,
                 snapshot,
+                prepared_doc_freqs,
                 schema,
                 field_ord,
                 terms.into_iter().collect(),
@@ -16102,10 +16130,12 @@ fn lower_numeric_field_set<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_leaf_string_predicate<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
     schema: SchemaDescriptor,
     field_ord: u16,
     terms: Vec<Vec<u8>>,
@@ -16117,8 +16147,22 @@ fn lower_leaf_string_predicate<'a>(
         .try_reserve_exact(terms.len())
         .map_err(|_| invalid_state("could not allocate string predicate clauses"))?;
     for term in terms {
+        // A materialized range, set or glob term is lowered exactly like a
+        // syntactic one, so it reads the same query-local statistics table.
+        // Passing `None` here made every expanded term rescan every sealed
+        // dictionary in every lowered segment, which is the quadratic charge
+        // the table exists to retire (#41) -- and the resulting BM25 figure is
+        // then discarded by the constant score below.
         clauses.push(ScorerClause::should(lower_leaf_term(
-            leaf, snapshot, schema, field_ord, &term, None, 1.0, false, checkpoint,
+            leaf,
+            snapshot,
+            schema,
+            field_ord,
+            &term,
+            prepared_doc_freqs,
+            1.0,
+            false,
+            checkpoint,
         )?));
     }
     let matching = lower_boolean(
@@ -16136,10 +16180,12 @@ fn lower_leaf_string_predicate<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_leaf_glob<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
     schema: SchemaDescriptor,
     field_ids: &[u16],
     pattern: &[u8],
@@ -16161,7 +16207,15 @@ fn lower_leaf_glob<'a>(
             expansion_limit,
         )?;
         let field_scorer = lower_leaf_string_predicate(
-            checkpoint, leaf, snapshot, schema, field_ord, terms, boost, mode,
+            checkpoint,
+            leaf,
+            snapshot,
+            prepared_doc_freqs,
+            schema,
+            field_ord,
+            terms,
+            boost,
+            mode,
         )?;
         fields.push(ScorerClause::should(field_scorer));
     }
@@ -23152,7 +23206,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_snapshot_term_statistics_preserve_fuel_admission_boundaries() {
+    fn cached_snapshot_term_statistics_charge_no_repeat_dictionary_scan() {
         run_with_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("cached DF fuel directory");
             let config = QuillConfig {
