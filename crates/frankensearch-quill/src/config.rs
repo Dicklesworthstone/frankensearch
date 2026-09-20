@@ -72,6 +72,28 @@ pub struct QuillConfig {
     /// Per-segment tombstone density that triggers compaction.
     pub compaction_tombstone_density: f64,
     /// Maximum fraction of holes tolerated by concat-merge policy.
+    ///
+    /// [`crate::plan_tier_merge`] merges a window of same-tier segments only
+    /// when its hull is at most this fraction holes, which keeps an ordinary
+    /// index from paying for a merge that mostly copies empty address space.
+    ///
+    /// An index built by many short writer sessions is almost all holes by
+    /// construction, and at the default no window of it is ever eligible.
+    /// Opening a writer resumes at the next lease boundary above the
+    /// manifest's document-id high watermark, so a session that publishes
+    /// three documents still moves its successor past a whole 65,536-wide
+    /// lease. An incremental indexer that runs briefly every few minutes
+    /// therefore accumulates tiny segments inside ~99%-hole leases; the tier
+    /// policy refuses all of them, compaction is driven by tombstone density
+    /// alone and an append-only corpus produces no tombstones, so the segment
+    /// count only grows between full rebuilds (#41).
+    ///
+    /// Such a deployment should raise this toward `1.0`. Concat merge
+    /// preserves document ids across gaps and the planner keeps merged
+    /// intervals pairwise disjoint at any ratio; what a hole-tolerant merge
+    /// spends is address space rather than correctness, because it retires
+    /// every live shard session so a later append cannot land inside the new
+    /// hull.
     pub merge_max_hole_ratio: f64,
     /// Maximum terms a glob may expand into before returning a typed error.
     pub glob_expansion_limit: usize,
