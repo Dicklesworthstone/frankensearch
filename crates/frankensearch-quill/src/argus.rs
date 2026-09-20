@@ -12506,6 +12506,7 @@ mod tests {
             Bound::Included(NumericValue::I64(5)),
             Bound::Excluded(NumericValue::I64(10)),
             8,
+            8,
         )?;
         assert_eq!(range.doc(), Some(102));
         assert_eq!(range.cost(), 6, "Tantivy RangeDocSet uses floor(0.8N)");
@@ -12527,6 +12528,7 @@ mod tests {
             Bound::Included(NumericValue::I64(5)),
             Bound::Excluded(NumericValue::I64(10)),
             8,
+            8,
             2.5,
         )?;
         assert_eq!(boosted.score()?.to_bits(), 2.5_f32.to_bits());
@@ -12535,6 +12537,7 @@ mod tests {
             field,
             Bound::Included(NumericValue::I64(5)),
             Bound::Excluded(NumericValue::I64(10)),
+            8,
             8,
         )?;
         let mut replaced = ReferenceScorer::constant_score(inner, 3.25)?;
@@ -12551,11 +12554,13 @@ mod tests {
                 Bound::Unbounded,
                 Bound::Included(NumericValue::I64(5)),
                 8,
+                8,
             )?),
             ScorerClause::should(ReferenceScorer::numeric_range(
                 field,
                 Bound::Included(NumericValue::I64(5)),
                 Bound::Included(NumericValue::I64(10)),
+                8,
                 8,
             )?),
         ])?;
@@ -12574,6 +12579,7 @@ mod tests {
                 Bound::Included(NumericValue::I64(0)),
                 Bound::Included(NumericValue::I64(0)),
                 8,
+                8,
             )?,
             1.0e8,
         )?;
@@ -12583,6 +12589,7 @@ mod tests {
                 Bound::Unbounded,
                 Bound::Included(NumericValue::I64(5)),
                 8,
+                8,
             )?,
             -1.0e8,
         )?;
@@ -12591,6 +12598,7 @@ mod tests {
                 field,
                 Bound::Unbounded,
                 Bound::Included(NumericValue::I64(10)),
+                8,
                 8,
             )?,
             1.0,
@@ -12612,6 +12620,7 @@ mod tests {
             Bound::Unbounded,
             Bound::Included(NumericValue::I64(5)),
             8,
+            8,
         )?;
         assert_eq!(
             unscored.collect_doc_set(&AllLiveDocs)?,
@@ -12623,6 +12632,7 @@ mod tests {
             Bound::Included(NumericValue::I64(30)),
             Bound::Included(NumericValue::I64(40)),
             8,
+            8,
         )?;
         assert_eq!(empty.doc(), None);
         assert!(matches!(
@@ -12630,6 +12640,7 @@ mod tests {
                 field,
                 Bound::Included(NumericValue::U64(0)),
                 Bound::Unbounded,
+                8,
                 8
             ),
             Err(ArgusError::Numeric(NumericCodecError::BoundTypeMismatch {
@@ -12654,6 +12665,7 @@ mod tests {
             numeric_field,
             Bound::Included(NumericValue::I64(7)),
             Bound::Included(NumericValue::I64(7)),
+            10,
             10,
         )?;
         assert_eq!(
@@ -12699,7 +12711,7 @@ mod tests {
             .field(0)
             .expect("high created_at NUMERIC field");
         let mut high =
-            ReferenceScorer::numeric_range(high_field, Bound::Unbounded, Bound::Unbounded, 2)?;
+            ReferenceScorer::numeric_range(high_field, Bound::Unbounded, Bound::Unbounded, 2, 2)?;
         assert_eq!(
             high.cost(),
             2,
@@ -12732,6 +12744,7 @@ mod tests {
                 Bound::Included(NumericValue::I64(0)),
                 Bound::Included(NumericValue::I64(1)),
                 3,
+                3,
             )
         };
         let right = || {
@@ -12740,9 +12753,11 @@ mod tests {
                 Bound::Included(NumericValue::I64(1)),
                 Bound::Included(NumericValue::I64(2)),
                 3,
+                3,
             )
         };
-        let all = || ReferenceScorer::numeric_range(field, Bound::Unbounded, Bound::Unbounded, 3);
+        let all =
+            || ReferenceScorer::numeric_range(field, Bound::Unbounded, Bound::Unbounded, 3, 3);
 
         let mut required_full_range = ReferenceScorer::boolean(vec![
             ScorerClause::must(all()?),
@@ -12764,6 +12779,7 @@ mod tests {
                 field,
                 Bound::Unbounded,
                 Bound::Unbounded,
+                3,
                 3,
                 2.5,
             )?),
@@ -12805,6 +12821,7 @@ mod tests {
                 Bound::Included(NumericValue::I64(1)),
                 Bound::Included(NumericValue::I64(1)),
                 3,
+                3,
             )?),
         ])?;
         let excluded_hits = excluded.top_k(3, &AllLiveDocs)?;
@@ -12840,18 +12857,74 @@ mod tests {
             .section()?
             .field(0)
             .expect("multi-valued NUMERIC fixture");
-        let ordinary =
-            ReferenceScorer::numeric_range(repeated_field, Bound::Unbounded, Bound::Unbounded, 2)?;
+        let ordinary = ReferenceScorer::numeric_range(
+            repeated_field,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            2,
+            2,
+        )?;
         assert_eq!(ordinary.cost(), 1);
         assert_eq!(ordinary.size_hint(), 0);
         assert!(matches!(
-            ReferenceScorer::numeric_range(repeated_field, Bound::Unbounded, Bound::Unbounded, 1),
+            ReferenceScorer::numeric_range(
+                repeated_field,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                1,
+                1
+            ),
             Err(ArgusError::InvalidNumericCardinality {
                 field_ord: 0,
                 value_count: 2,
                 segment_num_docs: 1,
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_ranges_compose_with_live_domain_after_tombstones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let entries = [
+            NumericEntry::i64(0, 0),
+            NumericEntry::i64(1, 1),
+            NumericEntry::i64(2, 2),
+        ];
+        let fields = [NumericFieldInput::new(0, &entries)];
+        let encoded = EncodedNumericSection::encode(RANGE_TEST_SCHEMA, 0, 3, &fields)?;
+        let field = encoded
+            .section()?
+            .field(0)
+            .expect("created_at NUMERIC field");
+        let range = ReferenceScorer::numeric_range(
+            field,
+            Bound::Included(NumericValue::I64(2)),
+            Bound::Included(NumericValue::I64(2)),
+            3,
+            2,
+        )?;
+        let boosted_range = ReferenceScorer::numeric_range_with_boost(
+            field,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            3,
+            2,
+            2.5,
+        )?;
+        let mut query = ReferenceScorer::boolean(vec![
+            ScorerClause::must(ReferenceScorer::all_with_boost(0, 3, 2, 3.0)?),
+            ScorerClause::must(boosted_range),
+            ScorerClause::should(range),
+        ])?;
+        let hits = query.top_k(3, &|docid| docid != 1)?;
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            vec![(2, 6.5_f32.to_bits()), (0, 5.5_f32.to_bits())],
+            "physical numeric rows survive validation while Boolean domains use the live count"
+        );
         Ok(())
     }
 
