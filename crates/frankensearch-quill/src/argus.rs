@@ -4116,23 +4116,37 @@ impl<'a> ReferenceScorer<'a> {
 
     /// Compile one NUMERIC field range into an owned constant-score doc set.
     ///
-    /// `segment_num_docs` is the physical at-seal document count, including
-    /// tombstoned rows. Live-document filtering remains a collector concern so
-    /// range leaves compose with the same snapshot statistics as term leaves.
+    /// A sealed segment has two legitimate document counts, and this leaf needs
+    /// both:
+    ///
+    /// - `column_num_docs` is the **physical at-seal** count, including
+    ///   tombstoned rows. The persisted column stores one value per row that
+    ///   existed at seal time, so this is the only count against which its
+    ///   cardinality can be validated.
+    /// - `live_num_docs` is the **current snapshot** count, and becomes the
+    ///   scorer's segment domain. Term and `All` leaves are built on the live
+    ///   count, and `shared_segment_num_docs` requires every Boolean child to
+    ///   agree, so a range leaf carrying the at-seal count made an ordinary
+    ///   filtered query fail with `Boolean children belong to different segment
+    ///   domains` as soon as the segment acquired a tombstone (#49).
+    ///
+    /// The two are equal until a manifest tombstones a document without
+    /// compacting the segment, which is why passing one value for both went
+    /// unnoticed on freshly built indexes.
     ///
     /// # Errors
     ///
     /// Returns a typed numeric-codec error for a bound whose signedness does
     /// not match the field or if the bounded docid set cannot be allocated.
-    /// It also rejects a field value count larger than the caller-supplied
-    /// physical segment document count.
+    /// It also rejects a field value count larger than `column_num_docs`.
     pub fn numeric_range(
         field: NumericField<'_>,
         lower: Bound<NumericValue>,
         upper: Bound<NumericValue>,
-        segment_num_docs: u32,
+        column_num_docs: u32,
+        live_num_docs: u32,
     ) -> Result<Self, ArgusError> {
-        Self::numeric_range_with_boost(field, lower, upper, segment_num_docs, 1.0)
+        Self::numeric_range_with_boost(field, lower, upper, column_num_docs, live_num_docs, 1.0)
     }
 
     /// Compile one boosted NUMERIC field range into an owned constant-score doc set.
@@ -4149,7 +4163,8 @@ impl<'a> ReferenceScorer<'a> {
         field: NumericField<'_>,
         lower: Bound<NumericValue>,
         upper: Bound<NumericValue>,
-        segment_num_docs: u32,
+        column_num_docs: u32,
+        live_num_docs: u32,
         boost: f32,
     ) -> Result<Self, ArgusError> {
         if !boost.is_finite() {
@@ -4158,11 +4173,11 @@ impl<'a> ReferenceScorer<'a> {
             });
         }
         let value_count = field.len();
-        if value_count > usize::try_from(segment_num_docs).unwrap_or(usize::MAX) {
+        if value_count > usize::try_from(column_num_docs).unwrap_or(usize::MAX) {
             return Err(ArgusError::InvalidNumericCardinality {
                 field_ord: field.field_ord(),
                 value_count,
-                segment_num_docs,
+                segment_num_docs: column_num_docs,
             });
         }
         let docids = field.range_docids(lower, upper)?;
@@ -4173,7 +4188,7 @@ impl<'a> ReferenceScorer<'a> {
             node: ScorerNode::NumericRange(NumericRangeScorer::new(
                 docids,
                 value_count,
-                segment_num_docs,
+                live_num_docs,
                 boost,
             )),
             subtree_nodes: 1,
@@ -4192,7 +4207,8 @@ impl<'a> ReferenceScorer<'a> {
         field_ord: u16,
         docids: Vec<u32>,
         value_count: usize,
-        segment_num_docs: u32,
+        column_num_docs: u32,
+        live_num_docs: u32,
         covers_every_document: bool,
         boost: f32,
     ) -> Result<Self, ArgusError> {
@@ -4201,11 +4217,11 @@ impl<'a> ReferenceScorer<'a> {
                 boost_bits: boost.to_bits(),
             });
         }
-        if value_count > usize::try_from(segment_num_docs).unwrap_or(usize::MAX) {
+        if value_count > usize::try_from(column_num_docs).unwrap_or(usize::MAX) {
             return Err(ArgusError::InvalidNumericCardinality {
                 field_ord,
                 value_count,
-                segment_num_docs,
+                segment_num_docs: column_num_docs,
             });
         }
         if docids.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -4219,7 +4235,7 @@ impl<'a> ReferenceScorer<'a> {
         Ok(Self {
             node: ScorerNode::NumericRange(NumericRangeScorer::new_materialized(
                 docids,
-                segment_num_docs,
+                live_num_docs,
                 covers_every_document,
                 boost,
             )),
