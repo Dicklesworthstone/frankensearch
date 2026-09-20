@@ -71,6 +71,9 @@ pub struct ShutdownCoordinator {
     reload_requested: AtomicBool,
     diagnostics_dump_count: AtomicU64,
     signal_registration_active: AtomicBool,
+    // Registration publishes two handles. Stop must not observe a partial
+    // registration, nor may a restart overtake a listener that is still joining.
+    signal_lifecycle: Mutex<()>,
     #[cfg(not(windows))]
     signal_handle: Mutex<Option<SignalHandle>>,
     #[cfg(not(windows))]
@@ -95,6 +98,7 @@ impl ShutdownCoordinator {
             reload_requested: AtomicBool::new(false),
             diagnostics_dump_count: AtomicU64::new(0),
             signal_registration_active: AtomicBool::new(false),
+            signal_lifecycle: Mutex::new(()),
             #[cfg(not(windows))]
             signal_handle: Mutex::new(None),
             #[cfg(not(windows))]
@@ -109,6 +113,7 @@ impl ShutdownCoordinator {
     ///
     /// Returns an error when signal handler registration fails.
     pub fn register_signals(self: &Arc<Self>) -> SearchResult<()> {
+        let _lifecycle = lock_or_recover(&self.signal_lifecycle);
         if self
             .signal_registration_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -141,11 +146,16 @@ impl ShutdownCoordinator {
                 )?;
             let handle = signals.handle();
 
-            let coordinator = Arc::clone(self);
+            // A strong reference here would keep the coordinator and its
+            // process-wide signal handlers alive forever after the owner exits.
+            let coordinator = Arc::downgrade(self);
             let listener = thread::Builder::new()
                 .name("fsfs-signal-listener".to_owned())
                 .spawn(move || {
                     for signal in signals.forever() {
+                        let Some(coordinator) = coordinator.upgrade() else {
+                            break;
+                        };
                         coordinator.handle_signal(signal);
                         if coordinator.is_force_exit_requested() {
                             std::process::exit(crate::exit_code::INTERRUPTED);
@@ -172,6 +182,7 @@ impl ShutdownCoordinator {
 
     /// Stop the signal listener thread and clear registration state.
     pub fn stop_signal_listener(&self) {
+        let _lifecycle = lock_or_recover(&self.signal_lifecycle);
         #[cfg(not(windows))]
         {
             let signal_handle = lock_or_recover(&self.signal_handle).take();
@@ -180,7 +191,11 @@ impl ShutdownCoordinator {
             }
 
             let listener_thread = lock_or_recover(&self.signal_listener_thread).take();
+            // The listener can release the last temporary upgraded Arc after
+            // handling a signal. Its Drop closes the iterator, but must not
+            // attempt to join the thread currently running that destructor.
             if let Some(listener_thread) = listener_thread
+                && listener_thread.thread().id() != thread::current().id()
                 && let Err(error) = listener_thread.join()
             {
                 warn!(
@@ -385,6 +400,12 @@ impl ShutdownCoordinator {
     #[cfg(test)]
     pub(crate) fn process_signal_for_test(&self, signal: i32) {
         self.handle_signal(signal);
+    }
+}
+
+impl Drop for ShutdownCoordinator {
+    fn drop(&mut self) {
+        self.stop_signal_listener();
     }
 }
 
@@ -608,5 +629,96 @@ mod tests {
             .register_signals()
             .expect("register signal handlers again");
         coordinator.stop_signal_listener();
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn dropping_coordinator_releases_registered_listener() {
+        let coordinator = Arc::new(ShutdownCoordinator::new());
+        coordinator.register_signals().expect("register signals");
+        let weak = Arc::downgrade(&coordinator);
+
+        // No stop call: error paths and library callers rely on owner lifetime.
+        drop(coordinator);
+        assert!(weak.upgrade().is_none(), "listener must not retain its owner");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn repeated_registration_keeps_one_listener_without_retaining_owner() {
+        let coordinator = Arc::new(ShutdownCoordinator::new());
+        coordinator.register_signals().expect("register signals");
+        let listener_id = super::lock_or_recover(&coordinator.signal_listener_thread)
+            .as_ref()
+            .expect("listener installed")
+            .thread()
+            .id();
+
+        coordinator.register_signals().expect("register again");
+        assert_eq!(Arc::strong_count(&coordinator), 1);
+        assert_eq!(
+            super::lock_or_recover(&coordinator.signal_listener_thread)
+                .as_ref()
+                .expect("listener remains installed")
+                .thread()
+                .id(),
+            listener_id
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn concurrent_registration_and_stop_leave_no_listener_installed() {
+        let coordinator = Arc::new(ShutdownCoordinator::new());
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let coordinator = Arc::clone(&coordinator);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..8 {
+                        coordinator.register_signals().expect("register signals");
+                        coordinator.stop_signal_listener();
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        for worker in workers {
+            worker.join().expect("lifecycle worker");
+        }
+        coordinator.stop_signal_listener();
+        assert!(super::lock_or_recover(&coordinator.signal_handle).is_none());
+        assert!(super::lock_or_recover(&coordinator.signal_listener_thread).is_none());
+        assert!(
+            !coordinator
+                .signal_registration_active
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let weak = Arc::downgrade(&coordinator);
+        drop(coordinator);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn listener_thread_can_drop_its_own_coordinator_without_self_join() {
+        let coordinator = Arc::new(ShutdownCoordinator::new());
+        let weak = Arc::downgrade(&coordinator);
+        let (owner_tx, owner_rx) = std::sync::mpsc::channel::<Arc<ShutdownCoordinator>>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let listener = thread::spawn(move || {
+            let owner = owner_rx.recv().expect("coordinator ownership");
+            drop(owner);
+            done_tx.send(()).expect("report completed destruction");
+        });
+        *super::lock_or_recover(&coordinator.signal_listener_thread) = Some(listener);
+        owner_tx.send(coordinator).expect("transfer final owner");
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("destructor must not join its own thread");
+        assert!(weak.upgrade().is_none());
     }
 }
