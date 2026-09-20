@@ -202,8 +202,10 @@ mod tests {
     }
 
     fn assert_join_error(error: SearchError, value: &str) {
-        assert!(matches!(error, SearchError::InvalidConfig { ref field, value: ref actual, .. }
-            if field == "native_ann.builder.lexical_source_join" && actual == value));
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, value: ref actual, .. }
+            if field == "native_ann.builder.lexical_source_join" && actual == value)
+        );
     }
 
     #[test]
@@ -244,7 +246,8 @@ mod tests {
                 ("content", |doc| doc.content = "VERTICAL!".to_owned()),
                 ("title", |doc| doc.title = Some("other title".to_owned())),
                 ("metadata", |doc| {
-                    doc.metadata.insert("alpha".to_owned(), "replacement".to_owned());
+                    doc.metadata
+                        .insert("alpha".to_owned(), "replacement".to_owned());
                 }),
             ];
             for &(field, change) in changes {
@@ -253,7 +256,8 @@ mod tests {
                 let vectors = vectors(&cx, &directory.path().join("vectors"), source.clone()).await;
                 let mut wrong = source;
                 change(wrong.iter_mut().find(|doc| doc.id == "b").unwrap());
-                let (reader, seal) = lexical(&cx, &vectors.directory().join("lexical"), &wrong).await;
+                let (reader, seal) =
+                    lexical(&cx, &vectors.directory().join("lexical"), &wrong).await;
                 // The old admission conditions are all satisfied. Both vector
                 // and lexical artifacts were produced by their real writers.
                 assert_eq!(
@@ -367,14 +371,9 @@ mod tests {
             std::fs::write(hybrid_descriptor, &hybrid).unwrap();
             // Prove that source hashes, vector ownership, producer identity and
             // source membership all pass their original independent admission.
-            let vector_only = NativeBuiltIndex::open_selected(
-                &cx,
-                &path,
-                &receipt(&vectors),
-                fast.clone(),
-                None,
-            )
-            .unwrap();
+            let vector_only =
+                NativeBuiltIndex::open_selected(&cx, &path, &receipt(&vectors), fast.clone(), None)
+                    .unwrap();
             assert_eq!(
                 vector_only.document("b").unwrap().content,
                 "source text never indexed lexically"
@@ -392,12 +391,17 @@ mod tests {
             )
             .await;
             assert_join_error(
-                result.err().expect("mixed source must fail after hash admission"),
+                result
+                    .err()
+                    .expect("mixed source must fail after hash admission"),
                 "content",
             );
             assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
             assert_eq!(built.vectors().document("b").unwrap().content, "vertical");
-            assert_eq!(built.search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
+            assert_eq!(
+                built.search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                "b"
+            );
         });
     }
 

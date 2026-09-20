@@ -254,13 +254,16 @@ impl<'a> NativeProgressiveSearch<'a> {
                 "candidate multiplier must be positive",
             ));
         }
-        self.budget = self.result_window().checked_mul(multiplier).ok_or_else(|| {
-            invalid(
-                "progressive.candidate_budget",
-                "overflow",
-                "the configured candidate budget must fit usize",
-            )
-        })?;
+        self.budget = self
+            .result_window()
+            .checked_mul(multiplier)
+            .ok_or_else(|| {
+                invalid(
+                    "progressive.candidate_budget",
+                    "overflow",
+                    "the configured candidate budget must fit usize",
+                )
+            })?;
         self.candidate_multiplier = multiplier;
         Ok(self)
     }
@@ -970,14 +973,17 @@ mod tests {
             let qindex = quality_index(&cx, &quality);
             let lexical = Lexical::new(&["a-quality", "z-fast"]);
             let expected = index
-                .search_hybrid_refined_text(
-                    &cx, &fast, (&qindex, &quality), &lexical, "query", 3,
-                )
+                .search_hybrid_refined_text(&cx, &fast, (&qindex, &quality), &lexical, "query", 3)
                 .await
                 .unwrap();
             let actual = index
                 .search_hybrid_progressive(
-                    &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 3,
+                    &cx,
+                    &fast,
+                    Some((&qindex, &quality)),
+                    &lexical,
+                    "query",
+                    3,
                 )
                 .unwrap()
                 .with_fusion(RrfConfig::default(), 0.7)
@@ -989,7 +995,10 @@ mod tests {
                 .collect()
                 .await
                 .unwrap();
-            assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap());
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
         });
     }
 
@@ -1004,7 +1013,12 @@ mod tests {
             for (weight, winner) in [(0.0, "z-fast"), (1.0, "a-quality")] {
                 let results = index
                     .search_hybrid_progressive(
-                        &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 4,
+                        &cx,
+                        &fast,
+                        Some((&qindex, &quality)),
+                        &lexical,
+                        "query",
+                        4,
                     )
                     .unwrap()
                     .with_fusion(RrfConfig::default(), weight)
@@ -1016,7 +1030,10 @@ mod tests {
                     .unwrap();
                 assert_eq!(results[0].doc_id, winner);
                 assert_eq!(results.len(), 4);
-                let a = results.iter().find(|hit| hit.doc_id == "a-quality").unwrap();
+                let a = results
+                    .iter()
+                    .find(|hit| hit.doc_id == "a-quality")
+                    .unwrap();
                 assert_eq!(a.fast_score, Some(0.0));
                 assert_eq!(a.quality_score, Some(1.0));
                 assert_eq!(a.source, ScoreSource::SemanticQuality);
@@ -1051,20 +1068,43 @@ mod tests {
                     };
                     let mut stream = index
                         .search_hybrid_progressive(
-                            &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1,
+                            &cx,
+                            &fast,
+                            Some((&qindex, &quality)),
+                            &lexical,
+                            "query",
+                            1,
                         )
                         .unwrap()
                         .with_fusion(config, 0.7)
                         .unwrap();
                     let NativeSearchPhase::Initial { results, .. } =
                         stream.next_phase().await.unwrap().unwrap()
-                    else { panic!("initial") };
-                    assert_eq!(results[0].doc_id, if prefer_lexical { "lexical-only" } else { "z-fast" });
+                    else {
+                        panic!("initial")
+                    };
+                    assert_eq!(
+                        results[0].doc_id,
+                        if prefer_lexical {
+                            "lexical-only"
+                        } else {
+                            "z-fast"
+                        }
+                    );
                     assert_eq!(results[0].score.to_bits(), expected_score.to_bits());
                     let NativeSearchPhase::Refined { results, .. } =
                         stream.next_phase().await.unwrap().unwrap()
-                    else { panic!("refined") };
-                    assert_eq!(results[0].doc_id, if prefer_lexical { "lexical-only" } else { "a-quality" });
+                    else {
+                        panic!("refined")
+                    };
+                    assert_eq!(
+                        results[0].doc_id,
+                        if prefer_lexical {
+                            "lexical-only"
+                        } else {
+                            "a-quality"
+                        }
+                    );
                     assert_eq!(results[0].score.to_bits(), expected_score.to_bits());
                     if prefer_lexical {
                         assert_eq!(results[0].source, ScoreSource::Lexical);
@@ -1073,7 +1113,13 @@ mod tests {
                     } else {
                         assert_eq!(results[0].quality_score, Some(1.0));
                         assert!(results[0].fast_score.is_none());
-                        assert_eq!(qindex.owner.doc_id_at(results[0].index.unwrap() as usize).unwrap(), results[0].doc_id);
+                        assert_eq!(
+                            qindex
+                                .owner
+                                .doc_id_at(results[0].index.unwrap() as usize)
+                                .unwrap(),
+                            results[0].doc_id
+                        );
                     }
                 }
             }
@@ -1091,20 +1137,45 @@ mod tests {
             for multiplier in [1, 2, 4] {
                 let mut stream = index
                     .search_hybrid_progressive(
-                        &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1,
+                        &cx,
+                        &fast,
+                        Some((&qindex, &quality)),
+                        &lexical,
+                        "query",
+                        1,
                     )
                     .unwrap()
                     .with_candidate_multiplier(multiplier)
                     .unwrap();
-                let NativeSearchPhase::Initial { candidates, results } =
-                    stream.next_phase().await.unwrap().unwrap()
-                else { panic!("initial") };
+                let NativeSearchPhase::Initial {
+                    candidates,
+                    results,
+                } = stream.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("initial")
+                };
                 assert_eq!(results.len(), 1);
-                assert_eq!(candidates, NativePhaseCandidates { fast: multiplier, quality: 0, lexical: multiplier });
+                assert_eq!(
+                    candidates,
+                    NativePhaseCandidates {
+                        fast: multiplier,
+                        quality: 0,
+                        lexical: multiplier
+                    }
+                );
                 let NativeSearchPhase::Refined { candidates, .. } =
                     stream.next_phase().await.unwrap().unwrap()
-                else { panic!("refined") };
-                assert_eq!(candidates, NativePhaseCandidates { fast: multiplier, quality: multiplier, lexical: multiplier });
+                else {
+                    panic!("refined")
+                };
+                assert_eq!(
+                    candidates,
+                    NativePhaseCandidates {
+                        fast: multiplier,
+                        quality: multiplier,
+                        lexical: multiplier
+                    }
+                );
             }
             let model = CrossEncoder::new(RerankReply::Winner);
             let mut pages = Vec::new();
@@ -1113,20 +1184,31 @@ mod tests {
                     .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", 1)
                     .unwrap();
                 let mut stream = if reranker_first {
-                    stream.with_reranker(&model, &source_text, 3).unwrap()
-                        .with_candidate_multiplier(1).unwrap()
+                    stream
+                        .with_reranker(&model, &source_text, 3)
+                        .unwrap()
+                        .with_candidate_multiplier(1)
+                        .unwrap()
                 } else {
-                    stream.with_candidate_multiplier(1).unwrap()
-                        .with_reranker(&model, &source_text, 3).unwrap()
+                    stream
+                        .with_candidate_multiplier(1)
+                        .unwrap()
+                        .with_reranker(&model, &source_text, 3)
+                        .unwrap()
                 };
                 let NativeSearchPhase::Initial { candidates, .. } =
                     stream.next_phase().await.unwrap().unwrap()
-                else { panic!("initial") };
+                else {
+                    panic!("initial")
+                };
                 assert_eq!(candidates.fast, 3);
                 assert_eq!(candidates.lexical, 3);
-                let NativeSearchPhase::Reranked { results, evaluated, .. } =
-                    stream.next_phase().await.unwrap().unwrap()
-                else { panic!("reranked") };
+                let NativeSearchPhase::Reranked {
+                    results, evaluated, ..
+                } = stream.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("reranked")
+                };
                 assert_eq!(evaluated, 3);
                 assert_eq!(results[0].doc_id, "near");
                 pages.push(serde_json::to_value(results).unwrap());
@@ -1141,17 +1223,51 @@ mod tests {
             let fast = Provider::new("fast", 2);
             let index = fast_index(&cx, &fast);
             let lexical = Lexical::new(&[]);
-            let fresh = |k| index.search_hybrid_progressive(&cx, &fast, None, &lexical, "query", k).unwrap();
+            let fresh = |k| {
+                index
+                    .search_hybrid_progressive(&cx, &fast, None, &lexical, "query", k)
+                    .unwrap()
+            };
             for k in [0, 2] {
                 for weight in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
                     assert!(fresh(k).with_fusion(RrfConfig::default(), weight).is_err());
                 }
                 for value in [f64::NAN, f64::INFINITY, -1.0] {
-                    assert!(fresh(k).with_fusion(RrfConfig { k: value, ..RrfConfig::default() }, 0.7).is_err());
+                    assert!(
+                        fresh(k)
+                            .with_fusion(
+                                RrfConfig {
+                                    k: value,
+                                    ..RrfConfig::default()
+                                },
+                                0.7
+                            )
+                            .is_err()
+                    );
                 }
                 for value in [f64::NAN, f64::INFINITY, -1.0, 0.0, f64::MAX] {
-                    assert!(fresh(k).with_fusion(RrfConfig { lexical_weight: value, ..RrfConfig::default() }, 0.7).is_err());
-                    assert!(fresh(k).with_fusion(RrfConfig { semantic_weight: value, ..RrfConfig::default() }, 0.7).is_err());
+                    assert!(
+                        fresh(k)
+                            .with_fusion(
+                                RrfConfig {
+                                    lexical_weight: value,
+                                    ..RrfConfig::default()
+                                },
+                                0.7
+                            )
+                            .is_err()
+                    );
+                    assert!(
+                        fresh(k)
+                            .with_fusion(
+                                RrfConfig {
+                                    semantic_weight: value,
+                                    ..RrfConfig::default()
+                                },
+                                0.7
+                            )
+                            .is_err()
+                    );
                 }
                 assert!(fresh(k).with_candidate_multiplier(0).is_err());
                 assert!(fresh(k).with_beam_widths(Some(0), None).is_err());
@@ -1159,10 +1275,20 @@ mod tests {
             }
             assert!(fresh(2).with_candidate_multiplier(usize::MAX).is_err());
             let model = CrossEncoder::new(RerankReply::Unavailable);
-            assert!(fresh(1).with_candidate_multiplier(2).unwrap()
-                .with_reranker(&model, &source_text, usize::MAX).is_err());
-            assert!(fresh(1).with_reranker(&model, &source_text, 2).unwrap()
-                .with_candidate_multiplier(usize::MAX).is_err());
+            assert!(
+                fresh(1)
+                    .with_candidate_multiplier(2)
+                    .unwrap()
+                    .with_reranker(&model, &source_text, usize::MAX)
+                    .is_err()
+            );
+            assert!(
+                fresh(1)
+                    .with_reranker(&model, &source_text, 2)
+                    .unwrap()
+                    .with_candidate_multiplier(usize::MAX)
+                    .is_err()
+            );
             assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
             assert_eq!(lexical.calls.load(Ordering::SeqCst), 0);
             assert_eq!(model.calls.load(Ordering::SeqCst), 0);
@@ -1179,9 +1305,16 @@ mod tests {
             let qindex = quality_index(&cx, &quality);
             let lexical = Lexical::new(&["z-fast"]);
             for setting in 0..4 {
-                let mut stream = index.search_hybrid_progressive(
-                    &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1,
-                ).unwrap();
+                let mut stream = index
+                    .search_hybrid_progressive(
+                        &cx,
+                        &fast,
+                        Some((&qindex, &quality)),
+                        &lexical,
+                        "query",
+                        1,
+                    )
+                    .unwrap();
                 assert!(stream.next_phase().await.unwrap().is_some());
                 match setting {
                     0 => assert!(stream.with_fusion(RrfConfig::default(), 0.0).is_err()),
@@ -1191,11 +1324,24 @@ mod tests {
                 }
             }
             assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
-            let error = index.search_hybrid_progressive(
-                &cx, &fast, Some((&qindex, &quality)), &lexical, "query", 1,
-            ).unwrap().with_fusion(RrfConfig::default(), 0.0).unwrap()
-                .collect().await.unwrap_err();
-            assert!(matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "native_ann.test.provider"));
+            let error = index
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&qindex, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
+                .unwrap()
+                .with_fusion(RrfConfig::default(), 0.0)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "native_ann.test.provider")
+            );
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
             assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
         });
@@ -1221,31 +1367,76 @@ mod tests {
                 let winner = if reverse { "a" } else { "b" };
                 let mut index = native_index(&cx, &provider, generation(), &rows);
                 index.default_ef_search = 1;
-                let narrow = index.search_hybrid_progressive(
-                    &cx, &provider, None, &lexical, "query", 1,
-                ).unwrap().with_candidate_multiplier(1).unwrap().collect().await.unwrap();
-                let wide = index.search_hybrid_progressive(
-                    &cx, &provider, None, &lexical, "query", 1,
-                ).unwrap().with_candidate_multiplier(1).unwrap()
-                    .with_beam_widths(Some(2), None).unwrap().collect().await.unwrap();
+                let narrow = index
+                    .search_hybrid_progressive(&cx, &provider, None, &lexical, "query", 1)
+                    .unwrap()
+                    .with_candidate_multiplier(1)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let wide = index
+                    .search_hybrid_progressive(&cx, &provider, None, &lexical, "query", 1)
+                    .unwrap()
+                    .with_candidate_multiplier(1)
+                    .unwrap()
+                    .with_beam_widths(Some(2), None)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
                 assert_eq!(wide[0].doc_id, winner);
                 assert_eq!(wide[0].fast_score, Some(high[0]));
                 changed_fast |= narrow[0].doc_id != wide[0].doc_id;
                 let empty = native_index(&cx, &provider, generation(), &[]);
-                let narrow = empty.search_hybrid_progressive(
-                    &cx, &provider, Some((&index, &provider)), &lexical, "query", 1,
-                ).unwrap().with_candidate_multiplier(1).unwrap().collect().await.unwrap();
-                let wide = empty.search_hybrid_progressive(
-                    &cx, &provider, Some((&index, &provider)), &lexical, "query", 1,
-                ).unwrap().with_candidate_multiplier(1).unwrap()
-                    .with_beam_widths(None, Some(2)).unwrap().collect().await.unwrap();
+                let narrow = empty
+                    .search_hybrid_progressive(
+                        &cx,
+                        &provider,
+                        Some((&index, &provider)),
+                        &lexical,
+                        "query",
+                        1,
+                    )
+                    .unwrap()
+                    .with_candidate_multiplier(1)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let wide = empty
+                    .search_hybrid_progressive(
+                        &cx,
+                        &provider,
+                        Some((&index, &provider)),
+                        &lexical,
+                        "query",
+                        1,
+                    )
+                    .unwrap()
+                    .with_candidate_multiplier(1)
+                    .unwrap()
+                    .with_beam_widths(None, Some(2))
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
                 assert_eq!(wide[0].doc_id, winner);
                 assert_eq!(wide[0].quality_score, Some(high[0]));
                 assert!(wide[0].fast_score.is_none());
-                assert_eq!(index.owner.doc_id_at(wide[0].index.unwrap() as usize).unwrap(), winner);
+                assert_eq!(
+                    index
+                        .owner
+                        .doc_id_at(wide[0].index.unwrap() as usize)
+                        .unwrap(),
+                    winner
+                );
                 changed_quality |= narrow[0].doc_id != wide[0].doc_id;
             }
-            assert!(changed_fast && changed_quality, "the overrides must change actual retrieval, not only stored configuration");
+            assert!(
+                changed_fast && changed_quality,
+                "the overrides must change actual retrieval, not only stored configuration"
+            );
         });
     }
 

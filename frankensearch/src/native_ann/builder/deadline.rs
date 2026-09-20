@@ -67,12 +67,23 @@ impl NativeSearchDeadline {
     pub fn with_timer(cx: &Cx, timer: TimerDriverHandle, budget: Duration) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.deadline.configure")?;
         let budget_nanos = u64::try_from(budget.as_nanos()).map_err(|_| {
-            invalid("deadline.budget", "overflow", "budget must fit u64 nanoseconds")
+            invalid(
+                "deadline.budget",
+                "overflow",
+                "budget must fit u64 nanoseconds",
+            )
         })?;
         let started = timer.now();
-        let expires = started.as_nanos().checked_add(budget_nanos).ok_or_else(|| {
-            invalid("deadline.expiry", "overflow", "absolute deadline must fit Time")
-        })?;
+        let expires = started
+            .as_nanos()
+            .checked_add(budget_nanos)
+            .ok_or_else(|| {
+                invalid(
+                    "deadline.expiry",
+                    "overflow",
+                    "absolute deadline must fit Time",
+                )
+            })?;
         Ok(Self {
             timer,
             started,
@@ -120,7 +131,11 @@ impl NativeSearchDeadline {
 
     fn timeout(&self) -> SearchError {
         SearchError::SearchTimeout {
-            elapsed_ms: self.timer.now().as_nanos().saturating_sub(self.started.as_nanos())
+            elapsed_ms: self
+                .timer
+                .now()
+                .as_nanos()
+                .saturating_sub(self.started.as_nanos())
                 / 1_000_000,
             budget_ms: self.budget_nanos / 1_000_000,
         }
@@ -289,7 +304,10 @@ mod tests {
     }
 
     fn assert_timeout<T>(outcome: Poll<SearchResult<T>>) {
-        assert!(matches!(outcome, Poll::Ready(Err(SearchError::SearchTimeout { .. }))));
+        assert!(matches!(
+            outcome,
+            Poll::Ready(Err(SearchError::SearchTimeout { .. }))
+        ));
     }
 
     #[test]
@@ -301,14 +319,20 @@ mod tests {
             polls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }));
-        assert_timeout(expired.as_mut().poll(&mut Context::from_waker(Waker::noop())));
+        assert_timeout(
+            expired
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+        );
         assert_eq!(polls.load(Ordering::SeqCst), 0);
         assert!(deadline.timer.is_empty());
         assert!(!cx.is_cancel_requested());
         let (_, deadline) = clock(&cx, Duration::from_millis(10));
         let mut ready = Box::pin(deadline.run(&cx, std::future::ready(Ok(7_u8))));
-        assert!(matches!(ready.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Ok(7))));
+        assert!(matches!(
+            ready.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(7))
+        ));
         assert!(deadline.timer.is_empty());
     }
 
@@ -321,8 +345,18 @@ mod tests {
         let first_waker = Waker::from(Arc::clone(&first));
         let second_waker = Waker::from(Arc::clone(&second));
         let mut query = Box::pin(deadline.run(&cx, std::future::pending::<SearchResult<()>>()));
-        assert!(query.as_mut().poll(&mut Context::from_waker(&first_waker)).is_pending());
-        assert!(query.as_mut().poll(&mut Context::from_waker(&second_waker)).is_pending());
+        assert!(
+            query
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        assert!(
+            query
+                .as_mut()
+                .poll(&mut Context::from_waker(&second_waker))
+                .is_pending()
+        );
         assert_eq!(deadline.timer.pending_count(), 1);
         clock.advance(10_000_000);
         let _ = deadline.timer.process_timers();
@@ -348,7 +382,12 @@ mod tests {
             let _guard = Dropped(&drops);
             std::future::pending::<SearchResult<()>>().await
         }));
-        assert!(query.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            query
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         assert_eq!(deadline.timer.pending_count(), 1);
         drop(query);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -373,7 +412,10 @@ mod tests {
             }));
             let result = query.as_mut().poll(&mut Context::from_waker(Waker::noop()));
             if cancelled {
-                assert!(matches!(result, Poll::Ready(Err(SearchError::Cancelled { .. }))));
+                assert!(matches!(
+                    result,
+                    Poll::Ready(Err(SearchError::Cancelled { .. }))
+                ));
             } else {
                 assert_timeout(result);
             }
@@ -387,11 +429,15 @@ mod tests {
         let (_, deadline) = clock(&cx, Duration::ZERO);
         cx.set_cancel_requested(true);
         let mut query = Box::pin(deadline.run(&cx, std::future::ready(Ok(()))));
-        assert!(matches!(query.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(SearchError::Cancelled { .. }))));
+        assert!(matches!(
+            query.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(SearchError::Cancelled { .. }))
+        ));
         drop(query);
         cx.set_cancel_requested(false);
-        assert!(NativeSearchDeadline::with_timer(&cx, deadline.timer.clone(), Duration::MAX).is_err());
+        assert!(
+            NativeSearchDeadline::with_timer(&cx, deadline.timer.clone(), Duration::MAX).is_err()
+        );
         let clock = Arc::new(VirtualClock::starting_at(Time::from_nanos(u64::MAX - 1)));
         let timer = TimerDriverHandle::with_virtual_clock(clock);
         assert!(NativeSearchDeadline::with_timer(&cx, timer, Duration::from_nanos(2)).is_err());
@@ -399,36 +445,58 @@ mod tests {
 
     #[test]
     fn a_context_without_time_cannot_start_an_ambient_timer() {
-        let cx = Cx::detached_cancel_context();
-        assert!(matches!(NativeSearchDeadline::after(&cx, Duration::from_secs(1)),
-            Err(SearchError::InvalidConfig { field, .. }) if field == "native_ann.deadline.timer"));
+        // Keep the API's capability type, but supply no runtime timer driver.
+        let cx = Cx::for_testing();
+        assert!(cx.timer_driver().is_none());
+        assert!(
+            matches!(NativeSearchDeadline::after(&cx, Duration::from_secs(1)),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "native_ann.deadline.timer")
+        );
     }
 
     #[test]
     fn bounded_live_refinement_keeps_snapshot_provenance_and_expired_queries_do_no_work() {
-        use super::super::tests::{Provider, Reply, documents, generation};
         use super::super::NativeIndexBuilder;
+        use super::super::tests::{Provider, Reply, documents, generation};
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
             let quality = Arc::new(Provider::new("quality", 3, Reply::Correct));
-            let index = NativeIndexBuilder::new(directory.path().join("index"), generation(), fast.clone())
-                .unwrap()
-                .with_quality_embedder(quality.clone()).unwrap()
-                .add_documents(documents())
-                .build_hybrid(&cx).await.unwrap();
+            let index =
+                NativeIndexBuilder::new(directory.path().join("index"), generation(), fast.clone())
+                    .unwrap()
+                    .with_quality_embedder(quality.clone())
+                    .unwrap()
+                    .add_documents(documents())
+                    .build_hybrid(&cx)
+                    .await
+                    .unwrap();
             let live = NativeLiveHybridIndex::new(&cx, index).unwrap();
             let (_, expired) = clock(&cx, Duration::ZERO);
-            assert!(matches!(live.search_refined_before(&cx, "vertical", 1, &expired).await,
-                Err(SearchError::SearchTimeout { .. })));
+            assert!(matches!(
+                live.search_refined_before(&cx, "vertical", 1, &expired)
+                    .await,
+                Err(SearchError::SearchTimeout { .. })
+            ));
             assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
             assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
             let (_, deadline) = clock(&cx, Duration::from_secs(1));
-            let page = live.search_refined_before(&cx, "vertical", 1, &deadline).await.unwrap();
+            let page = live
+                .search_refined_before(&cx, "vertical", 1, &deadline)
+                .await
+                .unwrap();
             assert_eq!(page.results[0].doc_id, "b");
             assert_eq!(page.snapshot.generation(), generation());
-            assert_eq!(page.snapshot.index().vectors().document("b").unwrap().content, "vertical");
+            assert_eq!(
+                page.snapshot
+                    .index()
+                    .vectors()
+                    .document("b")
+                    .unwrap()
+                    .content,
+                "vertical"
+            );
             assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
             assert_eq!(quality.queries.load(Ordering::SeqCst), 1);
             assert!(!cx.is_cancel_requested());
@@ -474,7 +542,11 @@ mod tests {
                 let _drop = GateDrop(&self.drops);
                 match self.mode.load(Ordering::SeqCst) {
                     1 => std::future::pending().await,
-                    2 => Err(invalid("deadline.test", "failed", "required provider failed")),
+                    2 => Err(invalid(
+                        "deadline.test",
+                        "failed",
+                        "required provider failed",
+                    )),
                     3 => Err(SearchError::Cancelled {
                         phase: "deadline.test".to_owned(),
                         reason: "provider cancelled".to_owned(),
@@ -526,18 +598,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let fast = Arc::new(QueryGate::new("fast", 2));
         let quality = Arc::new(QueryGate::new("quality", 3));
-        let index = NativeIndexBuilder::new(
-            directory.path().join("index"),
-            generation(),
-            fast.clone(),
-        )
-        .unwrap()
-        .with_quality_embedder(quality.clone())
-        .unwrap()
-        .add_documents(documents())
-        .build_hybrid(cx)
-        .await
-        .unwrap();
+        let index =
+            NativeIndexBuilder::new(directory.path().join("index"), generation(), fast.clone())
+                .unwrap()
+                .with_quality_embedder(quality.clone())
+                .unwrap()
+                .add_documents(documents())
+                .build_hybrid(cx)
+                .await
+                .unwrap();
         (directory, fast, quality, index)
     }
 
@@ -660,10 +729,15 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 deadline.collect(&cx, query).await,
-                Err(SearchError::SearchTimeout { elapsed_ms: 10, budget_ms: 10 })
+                Err(SearchError::SearchTimeout {
+                    elapsed_ms: 10,
+                    budget_ms: 10
+                })
             ));
             assert!(matches!(
-                scope.search_refined_before(&cx, "vertical", 1, &deadline).await,
+                scope
+                    .search_refined_before(&cx, "vertical", 1, &deadline)
+                    .await,
                 Err(SearchError::SearchTimeout { .. })
             ));
             assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
@@ -711,17 +785,22 @@ mod tests {
                 let (time, deadline) = clock(&cx, Duration::from_millis(10));
                 let query = scope.progressive(&cx, "vertical", 1).unwrap();
                 let mut pending = Box::pin(deadline.collect(&cx, query));
-                assert!(pending
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                    .is_pending());
+                assert!(
+                    pending
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
                 assert_eq!(deadline.timer.pending_count(), 1);
                 assert_eq!(quality.calls.load(Ordering::SeqCst), ending + 1);
                 match ending {
                     0 => {
                         time.advance(10_000_000);
                         let _ = deadline.timer.process_timers();
-                        assert!(matches!(pending.await, Err(SearchError::SearchTimeout { .. })));
+                        assert!(matches!(
+                            pending.await,
+                            Err(SearchError::SearchTimeout { .. })
+                        ));
                     }
                     1 => drop(pending),
                     _ => {
@@ -735,7 +814,10 @@ mod tests {
                 assert!(deadline.timer.is_empty());
             }
             quality.mode.store(0, Ordering::SeqCst);
-            assert_eq!(scope.search(&cx, "vertical", 1).await.unwrap()[0].doc_id, "b");
+            assert_eq!(
+                scope.search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                "b"
+            );
             assert_eq!(fast.calls.load(Ordering::SeqCst), 4);
             assert!(!cx.is_cancel_requested());
         });

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use super::NativeBuiltHybridIndex;
 use crate::native_ann::{NativeProgressiveSearch, NativeSearchPhase, checkpoint, invalid};
 use crate::{
-    Cx, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
-    Reranker, ScoreSource, ScoredResult, SearchFuture, SearchResult,
+    Cx, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead, Reranker,
+    ScoreSource, ScoredResult, SearchFuture, SearchResult,
 };
 
 type ScopedText<'a> = dyn Fn(&str) -> Option<String> + Send + Sync + 'a;
@@ -390,8 +390,8 @@ impl LexicalRead for ScopedLexical<'_> {
 mod tests {
     use super::*;
     use std::future::Future;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
     use frankensearch_core::generation::{
@@ -402,7 +402,9 @@ mod tests {
     use frankensearch_index::native_hnsw::HnswParams;
 
     use crate::native_ann::builder::live::NativeLiveHybridIndex;
-    use crate::native_ann::builder::{NativeBuildPrecision, NativeBuildRetrieval, NativeIndexBuilder};
+    use crate::native_ann::builder::{
+        NativeBuildPrecision, NativeBuildRetrieval, NativeIndexBuilder,
+    };
     use crate::{Embedder, ModelCategory, SearchError};
 
     struct Provider {
@@ -422,28 +424,40 @@ mod tests {
             identity.space.hash_control = None;
             identity.space.artifact_manifest_fingerprint = "a".repeat(64);
             identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
-                role: "weights".to_owned(), sha256: "b".repeat(64), size: 1,
+                role: "weights".to_owned(),
+                sha256: "b".repeat(64),
+                size: 1,
             }];
             identity.producer.space_fingerprint = identity.space.fingerprint();
             identity.validate().unwrap();
             let mut foreign = identity.clone();
             foreign.producer.backend = "foreign".to_owned();
             Self {
-                identity, foreign,
+                identity,
+                foreign,
                 advertise_foreign: AtomicBool::new(false),
-                queries: AtomicUsize::new(0), drops: AtomicUsize::new(0),
-                hold: AtomicBool::new(false), fail: AtomicBool::new(false),
+                queries: AtomicUsize::new(0),
+                drops: AtomicUsize::new(0),
+                hold: AtomicBool::new(false),
+                fail: AtomicBool::new(false),
             }
         }
 
         fn values(&self, text: &str) -> Vec<f32> {
             let quality = self.dimension() == 3;
-            let score = if text.contains("private") { 2.0 }
-                else if text.contains("fast") { if quality { 0.0 } else { 1.0 } }
-                else if text.contains("middle") { if quality { 0.5 } else { 0.75 } }
-                else if text.contains("near") { if quality { 0.75 } else { 0.5 } }
-                else if text.contains("quality") { if quality { 1.0 } else { 0.0 } }
-                else { 1.0 };
+            let score = if text.contains("private") {
+                2.0
+            } else if text.contains("fast") {
+                if quality { 0.0 } else { 1.0 }
+            } else if text.contains("middle") {
+                if quality { 0.5 } else { 0.75 }
+            } else if text.contains("near") {
+                if quality { 0.75 } else { 0.5 }
+            } else if text.contains("quality") {
+                if quality { 1.0 } else { 0.0 }
+            } else {
+                1.0
+            };
             let mut values = vec![0.0; self.dimension()];
             values[0] = score;
             // Stored rows may have zero query score but never zero vector norm.
@@ -454,7 +468,9 @@ mod tests {
 
     struct DropCount<'a>(&'a AtomicUsize);
     impl Drop for DropCount<'_> {
-        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     impl Embedder for Provider {
@@ -462,38 +478,67 @@ mod tests {
             Box::pin(async move { Ok(self.values(text)) })
         }
         fn embed_batch_bound<'a>(
-            &'a self, _cx: &'a Cx, texts: &'a [&'a str],
+            &'a self,
+            _cx: &'a Cx,
+            texts: &'a [&'a str],
         ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
             Box::pin(async move {
-                Ok(texts.iter().map(|text| IdentityBoundEmbedding {
-                    values: self.values(text), identity: self.identity.clone(),
-                }).collect())
+                Ok(texts
+                    .iter()
+                    .map(|text| IdentityBoundEmbedding {
+                        values: self.values(text),
+                        identity: self.identity.clone(),
+                    })
+                    .collect())
             })
         }
         fn embed_bound<'a>(
-            &'a self, _cx: &'a Cx, _text: &'a str,
+            &'a self,
+            _cx: &'a Cx,
+            _text: &'a str,
         ) -> SearchFuture<'a, IdentityBoundEmbedding> {
             Box::pin(async move {
                 self.queries.fetch_add(1, Ordering::SeqCst);
                 let _drop = DropCount(&self.drops);
-                if self.hold.load(Ordering::SeqCst) { return std::future::pending().await; }
+                if self.hold.load(Ordering::SeqCst) {
+                    return std::future::pending().await;
+                }
                 if self.fail.load(Ordering::SeqCst) {
                     return Err(invalid("scope.test_provider", "failed", "quality failed"));
                 }
                 let mut values = vec![0.0; self.dimension()];
                 values[0] = 1.0;
-                Ok(IdentityBoundEmbedding { values, identity: self.identity.clone() })
+                Ok(IdentityBoundEmbedding {
+                    values,
+                    identity: self.identity.clone(),
+                })
             })
         }
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
-            Ok(if self.advertise_foreign.load(Ordering::SeqCst) { &self.foreign } else { &self.identity })
+            Ok(if self.advertise_foreign.load(Ordering::SeqCst) {
+                &self.foreign
+            } else {
+                &self.identity
+            })
         }
-        fn id(&self) -> &str { &self.identity.space.logical_model_id }
-        fn model_name(&self) -> &str { self.id() }
-        fn dimension(&self) -> usize { usize::try_from(self.identity.space.dimension).unwrap() }
-        fn is_ready(&self) -> bool { true }
-        fn is_semantic(&self) -> bool { true }
-        fn category(&self) -> ModelCategory { ModelCategory::TransformerEmbedder }
+        fn id(&self) -> &str {
+            &self.identity.space.logical_model_id
+        }
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+        fn dimension(&self) -> usize {
+            usize::try_from(self.identity.space.dimension).unwrap()
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::TransformerEmbedder
+        }
     }
 
     fn generation(sequence: u64) -> ArtifactGenerationIdentityV1 {
@@ -501,33 +546,64 @@ mod tests {
     }
 
     fn documents() -> Vec<IndexableDocument> {
-        let mut documents: Vec<_> = (0..24).map(|i| {
-            IndexableDocument::new(format!("private-{i:02}"), "needle private")
-                .with_metadata("scope", "private")
-        }).collect();
-        for (id, kind) in [("a-fast", "fast"), ("b-middle", "middle"), ("c-near", "near"), ("d-quality", "quality")] {
-            documents.push(IndexableDocument::new(id, format!("needle {kind} {}", "padding ".repeat(24)))
-                .with_title(format!("retained {id}"))
-                .with_metadata("scope", "public"));
+        let mut documents: Vec<_> = (0..24)
+            .map(|i| {
+                IndexableDocument::new(format!("private-{i:02}"), "needle private")
+                    .with_metadata("scope", "private")
+            })
+            .collect();
+        for (id, kind) in [
+            ("a-fast", "fast"),
+            ("b-middle", "middle"),
+            ("c-near", "near"),
+            ("d-quality", "quality"),
+        ] {
+            documents.push(
+                IndexableDocument::new(id, format!("needle {kind} {}", "padding ".repeat(24)))
+                    .with_title(format!("retained {id}"))
+                    .with_metadata("scope", "public"),
+            );
         }
         documents
     }
 
     fn public(document: &IndexableDocument) -> bool {
-        document.metadata.get("scope").is_some_and(|scope| scope == "public")
+        document
+            .metadata
+            .get("scope")
+            .is_some_and(|scope| scope == "public")
     }
 
     async fn build(
-        cx: &Cx, path: &std::path::Path, ann: bool, fast: &Arc<Provider>, quality: Option<&Arc<Provider>>,
+        cx: &Cx,
+        path: &std::path::Path,
+        ann: bool,
+        fast: &Arc<Provider>,
+        quality: Option<&Arc<Provider>>,
     ) -> NativeBuiltHybridIndex {
-        let mut builder = NativeIndexBuilder::new(path, generation(1), fast.clone()).unwrap()
+        let mut builder = NativeIndexBuilder::new(path, generation(1), fast.clone())
+            .unwrap()
             .add_documents(documents())
-            .with_fast_storage(NativeBuildPrecision::F16, if ann {
-                NativeBuildRetrieval::Hnsw { params: HnswParams { ef_search: 1, ..HnswParams::default() }, seed: 7 }
-            } else { NativeBuildRetrieval::Exact });
+            .with_fast_storage(
+                NativeBuildPrecision::F16,
+                if ann {
+                    NativeBuildRetrieval::Hnsw {
+                        params: HnswParams {
+                            ef_search: 1,
+                            ..HnswParams::default()
+                        },
+                        seed: 7,
+                    }
+                } else {
+                    NativeBuildRetrieval::Exact
+                },
+            );
         if let Some(quality) = quality {
-            builder = builder.with_quality_embedder(quality.clone()).unwrap()
-                .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact).unwrap();
+            builder = builder
+                .with_quality_embedder(quality.clone())
+                .unwrap()
+                .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+                .unwrap();
         }
         builder.build_hybrid(cx).await.unwrap()
     }
@@ -536,7 +612,9 @@ mod tests {
         if let Some(row) = result.index {
             let tier = if quality_primary || result.fast_score.is_none() {
                 index.vectors().quality().unwrap()
-            } else { index.vectors().fast() };
+            } else {
+                index.vectors().fast()
+            };
             assert_eq!(
                 tier.index()
                     .owner
@@ -554,31 +632,83 @@ mod tests {
                 let directory = tempfile::tempdir().unwrap();
                 let fast = Arc::new(Provider::new("fast", 2));
                 let quality = Arc::new(Provider::new("quality", 3));
-                let index = build(&cx, &directory.path().join("index"), ann, &fast, Some(&quality)).await;
+                let index = build(
+                    &cx,
+                    &directory.path().join("index"),
+                    ann,
+                    &fast,
+                    Some(&quality),
+                )
+                .await;
                 let scope = index.scope(&cx, |document| Ok(public(document))).unwrap();
                 assert_eq!(scope.len(), 4);
                 assert!(!scope.is_empty());
                 assert!(scope.document("private-00").is_none());
-                let full = index.lexical().search_candidates(&cx, "needle", 28).await.unwrap();
+                let full = index
+                    .lexical()
+                    .search_candidates(&cx, "needle", 28)
+                    .await
+                    .unwrap();
                 assert_eq!(full.results().len(), 28);
-                assert!(full.results()[..3].iter().all(|r| r.doc_id.starts_with("private-")));
-                let expected: Vec<_> = full.results().iter().filter(|r| scope.document(r.doc_id.as_str()).is_some())
-                    .take(3).map(|r| (r.doc_id.clone(), r.score.to_bits())).collect();
-                let filtered = scope.lexical.search_candidates(&cx, "needle", 3).await.unwrap();
-                assert_eq!(filtered.results().iter().map(|r| (r.doc_id.clone(), r.score.to_bits())).collect::<Vec<_>>(), expected);
+                assert!(
+                    full.results()[..3]
+                        .iter()
+                        .all(|r| r.doc_id.starts_with("private-"))
+                );
+                let expected: Vec<_> = full
+                    .results()
+                    .iter()
+                    .filter(|r| scope.document(r.doc_id.as_str()).is_some())
+                    .take(3)
+                    .map(|r| (r.doc_id.clone(), r.score.to_bits()))
+                    .collect();
+                let filtered = scope
+                    .lexical
+                    .search_candidates(&cx, "needle", 3)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    filtered
+                        .results()
+                        .iter()
+                        .map(|r| (r.doc_id.clone(), r.score.to_bits()))
+                        .collect::<Vec<_>>(),
+                    expected
+                );
                 assert!(filtered.is_deferred());
-                let unfiltered = index.vectors().fast().search(&cx, "needle", 3).await.unwrap();
+                let unfiltered = index
+                    .vectors()
+                    .fast()
+                    .search(&cx, "needle", 3)
+                    .await
+                    .unwrap();
                 assert!(unfiltered.iter().all(|r| r.doc_id.starts_with("private-")));
                 let hits = scope.search(&cx, "needle", 3).await.unwrap();
-                assert_eq!(hits.len(), 3, "post-filtering the global window would return nothing");
+                assert_eq!(
+                    hits.len(),
+                    3,
+                    "post-filtering the global window would return nothing"
+                );
                 for hit in &hits {
                     assert!(scope.document(hit.doc_id.as_str()).is_some());
                     assert!(hit.lexical_score.is_some() && hit.metadata.is_some());
                     assert_row(&index, hit, false);
                 }
-                let all = scope.lexical.search_candidates(&cx, "needle", 100).await.unwrap();
+                let all = scope
+                    .lexical
+                    .search_candidates(&cx, "needle", 100)
+                    .await
+                    .unwrap();
                 assert_eq!(all.results().len(), 4);
-                assert!(scope.lexical.search_candidates(&cx, "absentterm", 3).await.unwrap().results().is_empty());
+                assert!(
+                    scope
+                        .lexical
+                        .search_candidates(&cx, "absentterm", 3)
+                        .await
+                        .unwrap()
+                        .results()
+                        .is_empty()
+                );
             }
         });
     }
@@ -589,14 +719,33 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2));
             let quality = Arc::new(Provider::new("quality", 3));
-            let index = build(&cx, &directory.path().join("index"), true, &fast, Some(&quality)).await;
+            let index = build(
+                &cx,
+                &directory.path().join("index"),
+                true,
+                &fast,
+                Some(&quality),
+            )
+            .await;
             let scope = index.scope(&cx, |document| Ok(public(document))).unwrap();
             let mut stream = scope.progressive(&cx, "absentterm", 1).unwrap();
-            let NativeSearchPhase::Initial { results, candidates } = stream.next_phase().await.unwrap().unwrap() else { panic!("initial"); };
+            let NativeSearchPhase::Initial {
+                results,
+                candidates,
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("initial");
+            };
             assert_eq!(results[0].doc_id, "a-fast");
             assert_eq!(candidates.fast, 3);
             assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
-            let NativeSearchPhase::Refined { results, candidates } = stream.next_phase().await.unwrap().unwrap() else { panic!("refined"); };
+            let NativeSearchPhase::Refined {
+                results,
+                candidates,
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("refined");
+            };
             assert_eq!(results[0].doc_id, "d-quality");
             assert_eq!(results[0].quality_score, Some(1.0));
             assert!(results[0].fast_score.is_none());
@@ -620,34 +769,70 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2));
             let quality = Arc::new(Provider::new("quality", 3));
-            let index = build(&cx, &directory.path().join("index"), false, &fast, Some(&quality)).await;
+            let index = build(
+                &cx,
+                &directory.path().join("index"),
+                false,
+                &fast,
+                Some(&quality),
+            )
+            .await;
             let scope = index.scope(&cx, |_| Ok(true)).unwrap();
             for k in [0, 1, 5, 40] {
                 for (scoped, original) in [
-                    (scope.search(&cx, "needle", k).await, index.search(&cx, "needle", k).await),
-                    (scope.search_refined(&cx, "needle", k).await, index.search_refined(&cx, "needle", k).await),
-                    (scope.search_quality(&cx, "needle", k).await, index.search_quality(&cx, "needle", k).await),
+                    (
+                        scope.search(&cx, "needle", k).await,
+                        index.search(&cx, "needle", k).await,
+                    ),
+                    (
+                        scope.search_refined(&cx, "needle", k).await,
+                        index.search_refined(&cx, "needle", k).await,
+                    ),
+                    (
+                        scope.search_quality(&cx, "needle", k).await,
+                        index.search_quality(&cx, "needle", k).await,
+                    ),
                 ] {
-                    assert_eq!(serde_json::to_value(scoped.unwrap()).unwrap(), serde_json::to_value(original.unwrap()).unwrap());
+                    assert_eq!(
+                        serde_json::to_value(scoped.unwrap()).unwrap(),
+                        serde_json::to_value(original.unwrap()).unwrap()
+                    );
                 }
             }
         });
     }
 
-    struct RerankProbe { inputs: Mutex<Vec<RerankDocument>> }
+    struct RerankProbe {
+        inputs: Mutex<Vec<RerankDocument>>,
+    }
     impl Reranker for RerankProbe {
-        fn rerank<'a>(&'a self, _cx: &'a Cx, _query: &'a str, docs: &'a [RerankDocument]) -> SearchFuture<'a, Vec<RerankScore>> {
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            docs: &'a [RerankDocument],
+        ) -> SearchFuture<'a, Vec<RerankScore>> {
             Box::pin(async move {
                 *self.inputs.lock().unwrap() = docs.to_vec();
-                Ok(docs.iter().enumerate().map(|(original_rank, doc)| RerankScore {
-                    doc_id: doc.doc_id.clone(), original_rank, raw_logit: None,
-                    score: if doc.doc_id == "d-quality" { 1.0 } else { 0.0 },
-                }).collect())
+                Ok(docs
+                    .iter()
+                    .enumerate()
+                    .map(|(original_rank, doc)| RerankScore {
+                        doc_id: doc.doc_id.clone(),
+                        original_rank,
+                        raw_logit: None,
+                        score: if doc.doc_id == "d-quality" { 1.0 } else { 0.0 },
+                    })
+                    .collect())
             })
         }
         #[allow(clippy::unnecessary_literal_bound)]
-        fn id(&self) -> &str { "scoped-reranker" }
-        fn model_name(&self) -> &str { self.id() }
+        fn id(&self) -> &str {
+            "scoped-reranker"
+        }
+        fn model_name(&self) -> &str {
+            self.id()
+        }
     }
 
     #[test]
@@ -657,11 +842,20 @@ mod tests {
             let fast = Arc::new(Provider::new("fast", 2));
             let index = build(&cx, &directory.path().join("index"), false, &fast, None).await;
             let scope = index.scope(&cx, |document| Ok(public(document))).unwrap();
-            let probe = RerankProbe { inputs: Mutex::new(Vec::new()) };
-            let mut stream = scope.progressive_with_reranker(&cx, "needle", 1, &probe, 4).unwrap();
+            let probe = RerankProbe {
+                inputs: Mutex::new(Vec::new()),
+            };
+            let mut stream = scope
+                .progressive_with_reranker(&cx, "needle", 1, &probe, 4)
+                .unwrap();
             assert!(stream.next_phase().await.unwrap().is_some());
             assert!(probe.inputs.lock().unwrap().is_empty());
-            let NativeSearchPhase::Reranked { results, evaluated, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("reranked"); };
+            let NativeSearchPhase::Reranked {
+                results, evaluated, ..
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("reranked");
+            };
             assert_eq!(evaluated, 4);
             assert_eq!(results[0].doc_id, "d-quality");
             assert_eq!(results[0].fast_score, Some(0.0));
@@ -681,18 +875,45 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2));
             let quality = Arc::new(Provider::new("quality", 3));
-            let index = build(&cx, &directory.path().join("index"), false, &fast, Some(&quality)).await;
+            let index = build(
+                &cx,
+                &directory.path().join("index"),
+                false,
+                &fast,
+                Some(&quality),
+            )
+            .await;
             let empty = index.scope(&cx, |_| Ok(false)).unwrap();
             assert!(empty.is_empty());
-            assert!(empty.search_refined(&cx, "needle", 5).await.unwrap().is_empty());
-            assert!(empty.search_quality(&cx, "needle", 5).await.unwrap().is_empty());
+            assert!(
+                empty
+                    .search_refined(&cx, "needle", 5)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                empty
+                    .search_quality(&cx, "needle", 5)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
             assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
             quality.advertise_foreign.store(true, Ordering::SeqCst);
             assert!(empty.progressive(&cx, "needle", 0).is_err());
             assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
-            let fast_only = build(&cx, &directory.path().join("fast-only"), false, &fast, None).await;
-            assert!(fast_only.scope(&cx, |_| Ok(false)).unwrap().search_quality(&cx, "needle", 0).await.is_err());
+            let fast_only =
+                build(&cx, &directory.path().join("fast-only"), false, &fast, None).await;
+            assert!(
+                fast_only
+                    .scope(&cx, |_| Ok(false))
+                    .unwrap()
+                    .search_quality(&cx, "needle", 0)
+                    .await
+                    .is_err()
+            );
         });
     }
 
@@ -705,11 +926,18 @@ mod tests {
             let mut calls = 0;
             let result = index.scope(&cx, |_| {
                 calls += 1;
-                if calls == 3 { Err(invalid("scope.test_policy", "failed", "lookup failed")) } else { Ok(true) }
+                if calls == 3 {
+                    Err(invalid("scope.test_policy", "failed", "lookup failed"))
+                } else {
+                    Ok(true)
+                }
             });
             assert!(result.is_err());
             assert_eq!(calls, 3);
-            let result = index.scope(&cx, |_| { cx.set_cancel_requested(true); Ok(true) });
+            let result = index.scope(&cx, |_| {
+                cx.set_cancel_requested(true);
+                Ok(true)
+            });
             assert!(matches!(result, Err(SearchError::Cancelled { .. })));
             assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
             cx.set_cancel_requested(false);
@@ -722,14 +950,30 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2));
             let quality = Arc::new(Provider::new("quality", 3));
-            let index = build(&cx, &directory.path().join("index"), false, &fast, Some(&quality)).await;
+            let index = build(
+                &cx,
+                &directory.path().join("index"),
+                false,
+                &fast,
+                Some(&quality),
+            )
+            .await;
             let scope = index.scope(&cx, |document| Ok(public(document))).unwrap();
             quality.fail.store(true, Ordering::SeqCst);
             assert!(scope.search_refined(&cx, "needle", 1).await.is_err());
             let mut stream = scope.progressive(&cx, "needle", 1).unwrap();
-            let NativeSearchPhase::Initial { results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("initial"); };
+            let NativeSearchPhase::Initial { results, .. } =
+                stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("initial");
+            };
             let before = serde_json::to_value(&results).unwrap();
-            let NativeSearchPhase::RefinementFailed { initial_results, .. } = stream.next_phase().await.unwrap().unwrap() else { panic!("failure"); };
+            let NativeSearchPhase::RefinementFailed {
+                initial_results, ..
+            } = stream.next_phase().await.unwrap().unwrap()
+            else {
+                panic!("failure");
+            };
             assert_eq!(serde_json::to_value(initial_results).unwrap(), before);
             quality.fail.store(false, Ordering::SeqCst);
             quality.hold.store(true, Ordering::SeqCst);
@@ -737,7 +981,12 @@ mod tests {
             assert!(stream.next_phase().await.unwrap().is_some());
             let drops = quality.drops.load(Ordering::SeqCst);
             let mut future = Box::pin(stream.next_phase());
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
             drop(future);
             assert_eq!(quality.drops.load(Ordering::SeqCst), drops + 1);
             assert!(stream.is_finished());
@@ -751,32 +1000,64 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2));
             let quality = Arc::new(Provider::new("quality", 3));
-            let index = build(&cx, &directory.path().join("old"), false, &fast, Some(&quality)).await;
+            let index = build(
+                &cx,
+                &directory.path().join("old"),
+                false,
+                &fast,
+                Some(&quality),
+            )
+            .await;
             let live = NativeLiveHybridIndex::new(&cx, index).unwrap();
             let pin = live.snapshot(&cx).await.unwrap();
             let calls = AtomicUsize::new(0);
-            let scope = pin.index().scope(&cx, |document| {
-                calls.fetch_add(1, Ordering::SeqCst); Ok(public(document))
-            }).unwrap();
+            let scope = pin
+                .index()
+                .scope(&cx, |document| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(public(document))
+                })
+                .unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 28);
             let before = scope.search_refined(&cx, "needle", 4).await.unwrap();
-            let candidate = pin.begin_update(&cx, directory.path().join("next"), generation(2)).unwrap()
-                .upsert_document(IndexableDocument::new("d-quality", "needle private").with_metadata("scope", "private"))
-                .upsert_document(IndexableDocument::new("fresh", "needle fast").with_metadata("scope", "public"))
-                .build(&cx).await.unwrap();
+            let candidate = pin
+                .begin_update(&cx, directory.path().join("next"), generation(2))
+                .unwrap()
+                .upsert_document(
+                    IndexableDocument::new("d-quality", "needle private")
+                        .with_metadata("scope", "private"),
+                )
+                .upsert_document(
+                    IndexableDocument::new("fresh", "needle fast").with_metadata("scope", "public"),
+                )
+                .build(&cx)
+                .await
+                .unwrap();
             let next = live.install(&cx, &candidate).await.unwrap();
-            let next_scope = next.index().scope(&cx, |document| Ok(public(document))).unwrap();
+            let next_scope = next
+                .index()
+                .scope(&cx, |document| Ok(public(document)))
+                .unwrap();
             assert!(scope.document("d-quality").is_some());
             assert!(scope.document("fresh").is_none());
             assert!(next_scope.document("d-quality").is_none());
             assert!(next_scope.document("fresh").is_some());
             let after = scope.search_refined(&cx, "needle", 4).await.unwrap();
-            assert_eq!(serde_json::to_value(before).unwrap(), serde_json::to_value(&after).unwrap());
+            assert_eq!(
+                serde_json::to_value(before).unwrap(),
+                serde_json::to_value(&after).unwrap()
+            );
             assert_eq!(calls.load(Ordering::SeqCst), 28);
-            for hit in &after { assert_row(pin.index(), hit, false); }
+            for hit in &after {
+                assert_row(pin.index(), hit, false);
+            }
             let current = next_scope.search_refined(&cx, "needle", 4).await.unwrap();
             assert_eq!(current.len(), 4);
-            assert!(current.iter().all(|hit| next_scope.document(hit.doc_id.as_str()).is_some()));
+            assert!(
+                current
+                    .iter()
+                    .all(|hit| next_scope.document(hit.doc_id.as_str()).is_some())
+            );
         });
     }
 }
