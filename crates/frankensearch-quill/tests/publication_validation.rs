@@ -1,6 +1,6 @@
 //! Publication validation contracts for the delta-preflight change in gh#51.
 //!
-//! These public-API regressions also pass with the incumbent full preflight.
+//! These public-API regressions protect both the incumbent and delta preflight.
 //! They deliberately do not claim to measure skipped validation work: the
 //! private delta-selection tests belong beside Keeper's preflight validator.
 
@@ -8,10 +8,16 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "conformance-internals")]
+use std::sync::Arc;
 
 use asupersync::Cx;
 use asupersync::sync::LockError;
+#[cfg(feature = "conformance-internals")]
+use frankensearch_core::SearchError;
 use frankensearch_core::{IndexableDocument, LexicalRead, LexicalWrite, ScoredResult};
+#[cfg(feature = "conformance-internals")]
+use frankensearch_quill::index::ConformanceCancellationStage;
 use frankensearch_quill::{
     DEFAULT_SCHEMA, KeeperError, KeeperSnapshot, KeeperWriter, Manifest, QuillConfig, QuillIndex,
     QuillSearchIndex, SegmentReader, load_manifest_pair,
@@ -434,5 +440,116 @@ fn fresh_open_rechecks_retained_bytes_after_repeated_successful_publications() {
         restore_segment(path, &original);
         drop(writer);
         assert_fresh_search_matches(&cx, directory.path(), &expected).await;
+    });
+}
+
+#[cfg(feature = "conformance-internals")]
+#[test]
+fn durable_commit_cancellation_retains_exact_delta_until_one_successful_retry() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("durable cancellation directory");
+        let index = QuillIndex::create(&cx, directory.path(), config())
+            .await
+            .expect("create durable index");
+        let retained = append_document(
+            &index,
+            &cx,
+            directory.path(),
+            "retained",
+            "shared retained document",
+        )
+        .await;
+        let expected_before = LexicalRead::search(&index, &cx, "shared", 10)
+            .await
+            .expect("retained-generation control search");
+        assert_eq!(expected_before.len(), 1);
+        let manifest_before = std::fs::read(directory.path().join("MANIFEST"))
+            .expect("read retained authority bytes");
+        let snapshot_before = index.search_snapshot().expect("retained public snapshot");
+
+        LexicalWrite::index_document(
+            &index,
+            &cx,
+            &IndexableDocument::new("added", "shared added document"),
+        )
+        .await
+        .expect("stage one new document beside the retained segment");
+        let controller = index.conformance_cancellation_controller();
+        let mut pending_before = None;
+        let mut staged_before = None;
+        for _ in 0..2 {
+            controller
+                .arm(ConformanceCancellationStage::CommitPublication, 1)
+                .expect("arm real pre-publication checkpoint");
+            let error = LexicalWrite::commit(&index, &cx)
+                .await
+                .err()
+                .expect("checkpoint must cancel the actual durable commit");
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "commit publish"
+                        && reason == "Quill observed request cancellation"
+            ));
+            assert!(controller.fired());
+            assert_eq!(controller.observed_checkpoints(), 1);
+            assert!(cx.is_cancel_requested());
+            assert!(index.has_uncommitted_changes());
+            assert!(Arc::ptr_eq(
+                &snapshot_before,
+                &index.search_snapshot().expect("retained snapshot stays readable"),
+            ));
+            assert_eq!(
+                std::fs::read(directory.path().join("MANIFEST"))
+                    .expect("read authority after cancellation"),
+                manifest_before
+            );
+
+            let pending = index
+                .conformance_pending_writer_state()
+                .expect("capture exact pending transaction");
+            assert_eq!(pending.dirty_shard_count(), 0);
+            assert_eq!(pending.pending_identity_count(), 0);
+            assert_eq!(pending.uncommitted_id_count(), 1);
+            assert_eq!(pending.pending_segment_count(), 1);
+            assert_eq!(pending.pending_owned_segment_count(), 1);
+            assert!(pending.pending_manifest_present());
+            let staged = directory_bytes(directory.path());
+            if let Some(before) = &pending_before {
+                assert_eq!(&pending, before, "retry retains the exact prepared transaction");
+            }
+            if let Some(before) = &staged_before {
+                assert_eq!(&staged, before, "retry changes no staged or authoritative bytes");
+            }
+            pending_before = Some(pending);
+            staged_before = Some(staged);
+
+            controller.disarm();
+            cx.set_cancel_requested(false);
+            assert_fresh_search_matches(&cx, directory.path(), &expected_before).await;
+        }
+
+        LexicalWrite::commit(&index, &cx)
+            .await
+            .expect("uncancelled retry publishes the staged delta");
+        assert!(!index.has_uncommitted_changes());
+        let installed = load_manifest_pair(directory.path())
+            .expect("read successor authority")
+            .manifest;
+        assert_eq!(installed.generation, retained.generation + 1);
+        for segment in &retained.segments {
+            assert!(installed.segments.contains(segment));
+        }
+        let snapshot_after = index.search_snapshot().expect("successor public snapshot");
+        assert_eq!(snapshot_after.snapshot_epoch(), snapshot_before.snapshot_epoch() + 1);
+        assert_eq!(snapshot_after.keeper_generation(), snapshot_before.keeper_generation() + 1);
+        let expected_after = LexicalRead::search(&index, &cx, "shared", 10)
+            .await
+            .expect("successful-retry control search");
+        assert_eq!(expected_after.len(), 2);
+        assert!(expected_after.iter().any(|hit| hit.doc_id == "retained"));
+        assert!(expected_after.iter().any(|hit| hit.doc_id == "added"));
+        drop(index);
+        assert_fresh_search_matches(&cx, directory.path(), &expected_after).await;
     });
 }
