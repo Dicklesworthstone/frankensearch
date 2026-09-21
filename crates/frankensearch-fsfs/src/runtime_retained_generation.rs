@@ -215,8 +215,9 @@ fn validate_retained_catalog_path(value: &str) -> SearchResult<()> {
     Err(SearchError::InvalidConfig {
         field: "storage.db_path".to_owned(),
         value: value.to_owned(),
-        reason: "retained generations require a catalog beneath {index_dir}, without parent traversal"
-            .to_owned(),
+        reason:
+            "retained generations require a catalog beneath {index_dir}, without parent traversal"
+                .to_owned(),
     })
 }
 
@@ -654,7 +655,10 @@ mod retained_search_tests {
             assert!(
                 matches!(error, SearchError::InvalidConfig { field, .. } if field == "storage.db_path")
             );
-            assert_eq!(store.active(&cx).expect("inventory remains valid"), selected);
+            assert_eq!(
+                store.active(&cx).expect("inventory remains valid"),
+                selected
+            );
             assert_eq!(
                 fs::read(external).expect("external data"),
                 b"foreign catalog sentinel"

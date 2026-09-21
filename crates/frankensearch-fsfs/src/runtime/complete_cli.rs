@@ -9,12 +9,12 @@ use std::time::Instant;
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 
+#[cfg(unix)]
+use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
 use super::{
     FsfsRuntime, InterfaceMode, SearchExecutionFlags, iso_timestamp_now, pressure_timestamp_ms,
     retained_search_checkpoint, validate_retained_catalog_path,
 };
-#[cfg(unix)]
-use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
 use crate::adapters::format_emitter::{emit_envelope, meta_for_format};
 use crate::generation_store::{
     COMPLETE_GENERATION_MANIFEST, COMPLETE_GENERATION_POINTER, CompleteGenerationStore,
@@ -115,7 +115,10 @@ impl FsfsRuntime {
         ) {
             return Ok(None);
         }
-        let root = if matches!(self.cli_input.command, CliCommand::Index | CliCommand::Watch) {
+        let root = if matches!(
+            self.cli_input.command,
+            CliCommand::Index | CliCommand::Watch
+        ) {
             self.resolve_index_root(&self.resolve_target_root()?)?
         } else {
             self.resolve_status_index_root()?
@@ -179,7 +182,10 @@ impl FsfsRuntime {
                 iso_timestamp_now(),
             );
             emit_envelope(&envelope, self.cli_input.format, writer)?;
-            if !matches!(self.cli_input.format, OutputFormat::Jsonl | OutputFormat::Csv) {
+            if !matches!(
+                self.cli_input.format,
+                OutputFormat::Jsonl | OutputFormat::Csv
+            ) {
                 writer.write_all(b"\n")?;
             }
         }
@@ -192,9 +198,7 @@ impl FsfsRuntime {
         root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
-        if self.cli_input.daemon
-            || self.cli_input.daemon_socket.is_some()
-            || self.cli_input.expand
+        if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() || self.cli_input.expand
         {
             return Err(complete_cli_error(
                 "search_options",
@@ -212,7 +216,10 @@ impl FsfsRuntime {
             .limit
             .unwrap_or(self.config.search.default_limit);
         if self.cli_input.stream
-            && !matches!(self.cli_input.format, OutputFormat::Jsonl | OutputFormat::Toon)
+            && !matches!(
+                self.cli_input.format,
+                OutputFormat::Jsonl | OutputFormat::Toon
+            )
         {
             return Err(complete_cli_error(
                 "format",
@@ -262,7 +269,10 @@ impl FsfsRuntime {
             )
             .with_warnings(warnings);
             emit_envelope(&envelope, self.cli_input.format, writer)?;
-            if !matches!(self.cli_input.format, OutputFormat::Jsonl | OutputFormat::Csv) {
+            if !matches!(
+                self.cli_input.format,
+                OutputFormat::Jsonl | OutputFormat::Csv
+            ) {
                 writer.write_all(b"\n")?;
             }
         }
@@ -280,8 +290,9 @@ impl FsfsRuntime {
                 "complete-generation serve currently supports stdin/stdout only; no socket daemon fallback was attempted",
             ));
         }
-        let stdin = std::io::stdin();
-        let mut input = stdin.lock();
+        // Keep the command future Send: StdinLock contains a non-Send guard
+        // that cannot be retained while a query awaits model/search work.
+        let mut input = std::io::BufReader::new(std::io::stdin());
         let mut output = std::io::stdout();
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         self.run_complete_generation_serve_with_io(cx, root, &mut input, &mut output, cache_enabled)
@@ -303,11 +314,11 @@ impl FsfsRuntime {
         use std::collections::HashMap;
         use std::io::{BufRead, Read};
 
-        let mut live = self.open_live_retained_search(cx, root).await?;
+        let mut session = self.open_live_retained_search(cx, root).await?;
         let mut cache = HashMap::new();
         let ready = Self::search_serve_ready_event(
             self.cli_input.format.to_string(),
-            &live.reader.resources,
+            &session.reader.resources,
         );
         emit_complete_serve_line(&ready, output)?;
         let mut line = Vec::new();
@@ -323,7 +334,10 @@ impl FsfsRuntime {
                 return Ok(());
             }
             if line.len() > FSFS_DAEMON_REQUEST_MAX_BYTES {
-                return Err(complete_cli_error("serve_request", "request exceeds 1 MiB limit"));
+                return Err(complete_cli_error(
+                    "serve_request",
+                    "request exceeds 1 MiB limit",
+                ));
             }
             let raw = match std::str::from_utf8(&line) {
                 Ok(raw) => raw.trim(),
@@ -354,18 +368,19 @@ impl FsfsRuntime {
             let query = request.query.clone();
             let mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
             let result = async {
-                if live.refresh(cx).await? {
+                if session.refresh(cx).await? {
                     cache.clear();
                 }
                 // Both the runtime's hydration paths and the resources belong
                 // to the same admitted generation. Never invoke this handler
                 // with the outer store-root runtime or after a failed refresh.
-                live.reader
+                session
+                    .reader
                     .runtime
                     .execute_search_serve_request(
                         cx,
                         request,
-                        &mut live.reader.resources,
+                        &mut session.reader.resources,
                         &mut cache,
                         cache_enabled,
                     )
@@ -390,7 +405,10 @@ fn emit_complete_serve_line<T: serde::Serialize, W: Write>(
     // bytes, so an oversized response cannot leave a partial JSON record.
     let mut bytes = SearchServeFrameBuffer::default();
     serde_json::to_writer(&mut bytes, value).map_err(|error| {
-        complete_cli_error("serve_response", &format!("cannot encode response: {error}"))
+        complete_cli_error(
+            "serve_response",
+            &format!("cannot encode response: {error}"),
+        )
     })?;
     bytes.write_all(b"\n")?;
     output.write_all(&bytes.0)?;
@@ -415,12 +433,12 @@ fn complete_cli_error(field: &str, reason: &str) -> SearchError {
 
 #[cfg(all(test, unix, not(feature = "embedded-models")))]
 mod tests {
-    use super::*;
     use super::super::FSFS_EXPLAIN_SESSION_FILE;
-    use asupersync::test_utils::run_test_with_cx;
+    use super::*;
     use crate::output_schema::SearchHitPayload;
     use crate::stream_protocol::StreamFrame;
     use crate::{CliInput, FsfsConfig};
+    use asupersync::test_utils::run_test_with_cx;
 
     fn fixture(parent: &Path) -> (FsfsRuntime, PathBuf, PathBuf) {
         let source = parent.join("source");
@@ -428,7 +446,7 @@ mod tests {
         fs::create_dir(&source).unwrap();
         fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
         let mut config = FsfsConfig::default();
-        config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+        "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
         config.indexing.offline = true;
         config.indexing.quality_model.clear();
         config.search.fast_only = true;
@@ -479,7 +497,11 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             self.flushes += 1;
-            if self.switches.front().is_some_and(|(after, _)| *after == self.flushes) {
+            if self
+                .switches
+                .front()
+                .is_some_and(|(after, _)| *after == self.flushes)
+            {
                 let (_, pointer) = self.switches.pop_front().expect("scheduled switch");
                 let temporary = self.root.join("test-selection-switch");
                 fs::write(&temporary, pointer)?;
@@ -517,9 +539,8 @@ mod tests {
                 flushes: 0,
                 switches: [(3, successor)].into(),
             };
-            let mut input = std::io::Cursor::new(
-                b"sharedtoken\nsharedtoken\nsharedtoken\nsharedtoken\nquit\n",
-            );
+            let mut input =
+                std::io::Cursor::new(b"sharedtoken\nsharedtoken\nsharedtoken\nsharedtoken\nquit\n");
             runtime
                 .run_complete_generation_serve_with_io(&cx, &root, &mut input, &mut output, true)
                 .await
@@ -531,7 +552,10 @@ mod tests {
                 assert_eq!(lines[row]["ok"], true);
                 assert_eq!(lines[row]["cached"], cached);
                 let phases = lines[row]["payloads"].as_array().unwrap();
-                assert_eq!(phases.last().unwrap()["hits"].as_array().unwrap().len(), count);
+                assert_eq!(
+                    phases.last().unwrap()["hits"].as_array().unwrap().len(),
+                    count
+                );
             }
             assert!(
                 CompleteGenerationStore::open(&cx, &root)
@@ -604,7 +628,11 @@ mod tests {
                 error,
                 SearchError::InvalidConfig { field, .. } if field == "complete_generation.serve_request"
             ));
-            assert_eq!(serve_lines(&output).len(), 1, "only the ready event is visible");
+            assert_eq!(
+                serve_lines(&output).len(),
+                1,
+                "only the ready event is visible"
+            );
             assert_eq!(store.active(&cx).unwrap(), before);
         });
     }

@@ -1020,6 +1020,24 @@ pub struct FsfsConfig {
     pub privacy: PrivacyConfig,
 }
 
+impl FsfsConfig {
+    /// Serialize a config file using `0` for the unlimited search-result limit.
+    ///
+    /// The in-memory `usize::MAX` sentinel exceeds TOML's signed integer range
+    /// on 64-bit hosts. The config loader already interprets zero as unlimited.
+    /// JSON snapshots retain their existing in-memory representation.
+    ///
+    /// # Errors
+    /// Returns a TOML serialization error if a field cannot be encoded.
+    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        let mut file_config = self.clone();
+        if file_config.search.default_limit == usize::MAX {
+            file_config.search.default_limit = 0;
+        }
+        toml::to_string_pretty(&file_config)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 struct DiscoveryConfigPatch {
     roots: Option<Vec<String>>,
@@ -3458,6 +3476,35 @@ mod tests {
         .expect("load defaults");
         assert!(result.config.privacy.redact_file_contents_in_logs);
         assert!(result.config.privacy.redact_paths_in_telemetry);
+    }
+
+    #[test]
+    fn config_toml_roundtrip_preserves_unlimited_and_bounded_search() {
+        for limit in [usize::MAX, 1, 20, 1_000_000] {
+            let mut config = super::FsfsConfig::default();
+            config.search.default_limit = limit;
+            let encoded = config.to_toml().expect("encode config file");
+            let parsed: toml::Value = toml::from_str(&encoded).expect("valid TOML");
+            let expected = if limit == usize::MAX { 0 } else { limit };
+            assert_eq!(
+                parsed["search"]["default_limit"].as_integer(),
+                Some(i64::try_from(expected).unwrap())
+            );
+            let loaded = load_from_str(
+                Some(&encoded),
+                None,
+                &HashMap::new(),
+                &CliOverrides::default(),
+                home(),
+            )
+            .expect("reload emitted config");
+            assert_eq!(loaded.config.search, config.search);
+            assert_eq!(config.search.default_limit, limit);
+            assert_eq!(
+                serde_json::to_value(&config).unwrap()["search"]["default_limit"],
+                limit
+            );
+        }
     }
 
     #[test]

@@ -556,14 +556,15 @@ fn run_config_init_command(
         })?;
     let path = target.to_path_buf();
     reject_directory_path(&path, "config.init.path")?;
-    let template = toml::to_string_pretty(&FsfsConfig::default()).map_err(|source| {
-        SearchError::SubsystemError {
-            subsystem: CONFIG_SUBSYSTEM,
-            source: Box::new(io::Error::other(format!(
-                "failed to encode default config template: {source}"
-            ))),
-        }
-    })?;
+    let template =
+        FsfsConfig::default()
+            .to_toml()
+            .map_err(|source| SearchError::SubsystemError {
+                subsystem: CONFIG_SUBSYSTEM,
+                source: Box::new(io::Error::other(format!(
+                    "failed to encode default config template: {source}"
+                ))),
+            })?;
     let created = if path.exists() {
         false
     } else {
@@ -757,14 +758,15 @@ fn run_config_reset_command(
 ) -> SearchResult<()> {
     let path =
         resolve_writable_config_path(explicit_config_path, project_config_path, user_config_path)?;
-    let template = toml::to_string_pretty(&FsfsConfig::default()).map_err(|source| {
-        SearchError::SubsystemError {
-            subsystem: CONFIG_SUBSYSTEM,
-            source: Box::new(io::Error::other(format!(
-                "failed to encode default config: {source}"
-            ))),
-        }
-    })?;
+    let template =
+        FsfsConfig::default()
+            .to_toml()
+            .map_err(|source| SearchError::SubsystemError {
+                subsystem: CONFIG_SUBSYSTEM,
+                source: Box::new(io::Error::other(format!(
+                    "failed to encode default config: {source}"
+                ))),
+            })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1596,6 +1598,32 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn config_init_and_reset_emit_reloadable_unlimited_defaults() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fsfs.toml");
+        let cli = CliInput {
+            format: OutputFormat::Json,
+            ..CliInput::default()
+        };
+        for reset in [false, true] {
+            if reset {
+                std::fs::write(&path, "[search]\ndefault_limit = 20\n").expect("existing config");
+                run_config_reset_command(&cli, Some(&path), None, None).expect("reset config");
+            } else {
+                run_config_init_command(&cli, Some(&path), None, None).expect("init config");
+            }
+            let loaded = load_from_sources(
+                Some(&path),
+                &HashMap::new(),
+                &CliOverrides::default(),
+                dir.path(),
+            )
+            .expect("reload generated config");
+            assert_eq!(loaded.config.search.default_limit, usize::MAX);
+        }
     }
 
     #[test]

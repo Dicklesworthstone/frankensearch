@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use frankensearch_fsfs::FsfsConfig;
@@ -46,12 +46,11 @@ impl Fixture {
         config.indexing.quality_model.clear();
         config.search.fast_only = true;
         config.search.rerank = false;
-        config.storage.db_path = catalog.to_owned();
+        catalog.clone_into(&mut config.storage.db_path);
         if let Some(path) = model_dir {
             config.indexing.model_dir = path.display().to_string();
         }
-        fs::write(&self.config, toml::to_string_pretty(&config).expect("TOML"))
-            .expect("fixture config");
+        fs::write(&self.config, config.to_toml().expect("TOML")).expect("fixture config");
     }
 
     fn command(&self, command: &str, format: &str) -> Command {
@@ -67,7 +66,18 @@ impl Fixture {
         child
             .current_dir(self.directory.path())
             .env("FRANKENSEARCH_CHECK_UPDATES", "0")
-            .arg(command)
+            .arg(command);
+        // The CLI takes its command's positional argument before options.
+        match command {
+            "index" => {
+                child.arg(&self.source);
+            }
+            "search" => {
+                child.arg("sharedtoken");
+            }
+            _ => {}
+        }
+        child
             .arg("--config")
             .arg(&self.config)
             .arg("--index-dir")
@@ -78,11 +88,17 @@ impl Fixture {
 }
 
 fn execute(command: &mut Command) -> Output {
+    execute_with_input(command, b"")
+}
+
+fn execute_with_input(command: &mut Command, input: &[u8]) -> Output {
     let capture = tempfile::tempdir().expect("capture");
+    let stdin_path = capture.path().join("stdin");
+    fs::write(&stdin_path, input).expect("request input");
     let stdout_path = capture.path().join("stdout");
     let stderr_path = capture.path().join("stderr");
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(fs::File::open(stdin_path).expect("stdin"))
         .stdout(fs::File::create(&stdout_path).expect("stdout"))
         .stderr(fs::File::create(&stderr_path).expect("stderr"))
         .spawn()
@@ -96,6 +112,7 @@ fn execute(command: &mut Command) -> Output {
             let _ = child.kill();
             let _ = child.wait();
             panic!(
+                // ubs:ignore — integration-test assertion: a timed-out child must fail the test.
                 "fsfs timed out\nstdout: {}\nstderr: {}",
                 fs::read_to_string(&stdout_path).unwrap_or_default(),
                 fs::read_to_string(&stderr_path).unwrap_or_default(),
@@ -131,14 +148,17 @@ fn complete_cli_binary_rejects_corrupt_selection_without_legacy_fallback() {
     let pointer = fixture.store.join(COMPLETE_GENERATION_POINTER);
     fs::write(&pointer, "corrupt complete selection").unwrap();
     // No opt-in variable: the executable must still dispatch to the store.
-    let output = execute(
-        fixture
-            .command("search", "json")
-            .args(["sharedtoken", "--no-daemon"]),
-    );
+    let output = execute(fixture.command("search", "json").arg("--no-daemon"));
     let value = json_output(&output, false);
-    assert!(value["error"].to_string().contains("complete-generation pointer"));
-    assert_eq!(fs::read_to_string(pointer).unwrap(), "corrupt complete selection");
+    assert!(
+        value["error"]
+            .to_string()
+            .contains("complete-generation pointer")
+    );
+    assert_eq!(
+        fs::read_to_string(pointer).unwrap(),
+        "corrupt complete selection"
+    );
     assert!(!fixture.store.join("vector").exists());
 }
 
@@ -152,11 +172,18 @@ fn complete_cli_binary_retains_interrupted_store_without_selection() {
         fixture
             .command("search", "json")
             .env("FSFS_COMPLETE_GENERATIONS", "false")
-            .args(["sharedtoken", "--no-daemon"]),
+            .arg("--no-daemon"),
     );
     let value = json_output(&output, false);
-    assert!(value["error"].to_string().contains("no complete generation"));
-    assert_eq!(fs::read_to_string(artifact).unwrap(), "abandoned build evidence");
+    assert!(
+        value["error"]
+            .to_string()
+            .contains("no complete generation")
+    );
+    assert_eq!(
+        fs::read_to_string(artifact).unwrap(),
+        "abandoned build evidence"
+    );
     assert!(!fixture.store.join(COMPLETE_GENERATION_POINTER).exists());
 }
 
@@ -169,11 +196,14 @@ fn complete_cli_binary_opt_in_refuses_catalog_escape_before_creating_store() {
     let output = execute(
         fixture
             .command("index", "json")
-            .env("FRANKENSEARCH_COMPLETE_GENERATIONS", "true")
-            .arg(&fixture.source),
+            .env("FRANKENSEARCH_COMPLETE_GENERATIONS", "true"),
     );
     let value = json_output(&output, false);
-    assert!(value["error"].to_string().contains("without parent traversal"));
+    assert!(
+        value["error"]
+            .to_string()
+            .contains("without parent traversal")
+    );
     assert!(!fixture.store.exists());
     assert_eq!(fs::read_to_string(outside).unwrap(), "unrelated database");
 }
@@ -184,11 +214,14 @@ fn complete_cli_binary_rejects_malformed_opt_in_before_writing() {
     let output = execute(
         fixture
             .command("index", "json")
-            .env("FSFS_COMPLETE_GENERATIONS", "not-a-boolean")
-            .arg(&fixture.source),
+            .env("FSFS_COMPLETE_GENERATIONS", "not-a-boolean"),
     );
     let value = json_output(&output, false);
-    assert!(value["error"].to_string().contains("FSFS_COMPLETE_GENERATIONS"));
+    assert!(
+        value["error"]
+            .to_string()
+            .contains("FSFS_COMPLETE_GENERATIONS")
+    );
     assert!(!fixture.store.exists());
 }
 
@@ -207,8 +240,7 @@ fn complete_cli_binary_semantic_rebuild_search_and_stream() {
         &execute(
             fixture
                 .command("index", "json")
-                .env("FSFS_COMPLETE_GENERATIONS", "1")
-                .arg(&fixture.source),
+                .env("FSFS_COMPLETE_GENERATIONS", "1"),
         ),
         true,
     );
@@ -218,37 +250,76 @@ fn complete_cli_binary_semantic_rebuild_search_and_stream() {
     let first_manifest = fs::read(&manifest).unwrap();
     fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
     // A successor needs no opt-in: the existing layout chooses the route.
-    let second = json_output(
-        &execute(fixture.command("index", "json").arg(&fixture.source)),
-        true,
+    let second = json_output(&execute(&mut fixture.command("index", "json")), true);
+    assert_ne!(
+        first["data"]["generation_id"],
+        second["data"]["generation_id"]
     );
-    assert_ne!(first["data"]["generation_id"], second["data"]["generation_id"]);
     assert!(first_path.is_dir());
     assert_eq!(fs::read(manifest).unwrap(), first_manifest);
     let result = json_output(
-        &execute(
-            fixture
-                .command("search", "json")
-                .args(["sharedtoken", "--no-daemon"]),
-        ),
+        &execute(fixture.command("search", "json").arg("--no-daemon")),
         true,
     );
     let hits = result["data"]["hits"].as_array().expect("search hits");
     assert_eq!(hits.len(), 2);
     for filename in ["alpha.md", "beta.md"] {
-        assert!(hits.iter().any(|hit| hit["path"].as_str().unwrap().ends_with(filename)));
+        assert!(
+            hits.iter()
+                .any(|hit| hit["path"].as_str().unwrap().ends_with(filename))
+        );
     }
     let stream = execute(
         fixture
             .command("search", "jsonl")
-            .args(["sharedtoken", "--no-daemon", "--stream"]),
+            .args(["--no-daemon", "--stream"]),
     );
-    assert!(stream.status.success(), "{}", String::from_utf8_lossy(&stream.stderr));
+    assert!(
+        stream.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stream.stderr)
+    );
     let frames = String::from_utf8(stream.stdout).unwrap();
     let frames = frames
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("stream frame"))
         .collect::<Vec<_>>();
-    assert!(frames.len() > 2, "started, results and terminal are required");
+    assert!(
+        frames.len() > 2,
+        "started, results and terminal are required"
+    );
     assert!(frames.iter().all(|frame| frame.get("data").is_none()));
+
+    // Exercise the actual scheduler and stdin adapter, not only the in-memory
+    // serve helper: malformed input must not prevent the next cached query.
+    let served = execute_with_input(
+        &mut fixture.command("serve", "jsonl"),
+        b"sharedtoken\n{broken\nsharedtoken\nquit\n",
+    );
+    assert!(
+        served.status.success(),
+        "{}",
+        String::from_utf8_lossy(&served.stderr)
+    );
+    let served = String::from_utf8(served.stdout).unwrap();
+    let lines = served
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("serve frame"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[0]["event"], "ready");
+    assert_eq!(lines[2]["ok"], false);
+    for (row, cached) in [(1, false), (3, true)] {
+        assert_eq!(lines[row]["ok"], true);
+        assert_eq!(lines[row]["cached"], cached);
+        let phases = lines[row]["payloads"].as_array().expect("query phases");
+        let hits = phases.last().unwrap()["hits"].as_array().expect("hits");
+        assert_eq!(hits.len(), 2);
+        for filename in ["alpha.md", "beta.md"] {
+            assert!(
+                hits.iter()
+                    .any(|hit| hit["path"].as_str().unwrap().ends_with(filename))
+            );
+        }
+    }
 }
