@@ -9,10 +9,7 @@
     "storage_lock_pressure",
     "watcher_backlog"
   ],
-  "supported_modes": [
-    "smoke",
-    "full"
-  ],
+  "supported_modes": ["smoke", "full"],
   "required_suite_fields": [
     "kind",
     "v",
@@ -37,12 +34,7 @@
     "expected",
     "replay_command"
   ],
-  "required_log_fields": [
-    "seed",
-    "config_hash",
-    "scenario_id",
-    "reason_code"
-  ],
+  "required_log_fields": ["seed", "config_hash", "scenario_id", "reason_code"],
   "validation_modes": [
     "json_schema_contract",
     "json_schema_smoke",

@@ -7,12 +7,7 @@
   "created_at": "2026-05-08T11:00:00Z",
   "command": {
     "client_surface": "cli",
-    "argv": [
-      "fsfs",
-      "search",
-      "--query",
-      "hybrid search"
-    ],
+    "argv": ["fsfs", "search", "--query", "hybrid search"],
     "working_dir": "/data/projects/frankensearch"
   },
   "environment": {
@@ -40,9 +35,7 @@
     {
       "phase": "initial",
       "status": "succeeded",
-      "artifact_refs": [
-        "initial-results"
-      ]
+      "artifact_refs": ["initial-results"]
     }
   ]
 }

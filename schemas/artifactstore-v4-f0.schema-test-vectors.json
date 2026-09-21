@@ -208,7 +208,11 @@
         "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
         "issued_at_unix_ns": 3,
         "terminal_outcome": "succeeded",
-        "signature": {"algorithm": "ed25519", "key_id": "reviewer-1", "signature": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+        "signature": {
+          "algorithm": "ed25519",
+          "key_id": "reviewer-1",
+          "signature": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
         "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
         "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
       }
@@ -232,7 +236,11 @@
         "redaction_witness": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         "issued_at_unix_ns": 31,
         "terminal_outcome": "succeeded",
-        "signature": {"algorithm": "ed25519", "key_id": "completion-issuer-1", "signature": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        "signature": {
+          "algorithm": "ed25519",
+          "key_id": "completion-issuer-1",
+          "signature": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
         "artifact_index_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         "failure_artifact_index_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
       }
@@ -256,7 +264,11 @@
         "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
         "issued_at_unix_ns": 4,
         "terminal_outcome": "succeeded",
-        "signature": {"algorithm": "ed25519", "key_id": "reviewer-1", "signature": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+        "signature": {
+          "algorithm": "ed25519",
+          "key_id": "reviewer-1",
+          "signature": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
         "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
         "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
       }
@@ -280,7 +292,11 @@
         "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
         "issued_at_unix_ns": 5,
         "terminal_outcome": "succeeded",
-        "signature": {"algorithm": "sha256", "key_id": "hash-only", "signature": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+        "signature": {
+          "algorithm": "sha256",
+          "key_id": "hash-only",
+          "signature": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
         "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
         "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
       }
@@ -373,7 +389,11 @@
         "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
         "issued_at_unix_ns": 9,
         "terminal_outcome": "succeeded",
-        "signature": {"algorithm": "rsa", "key_id": "unknown", "signature": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+        "signature": {
+          "algorithm": "rsa",
+          "key_id": "unknown",
+          "signature": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
         "execution_nonce": "00000000000000000000000000000000",
         "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
         "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"

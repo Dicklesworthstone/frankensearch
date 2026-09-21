@@ -12,31 +12,17 @@
       "timeout_orchestration",
       "cancellation_control"
     ],
-    "rayon_domain": [
-      "cpu_parallel"
-    ],
-    "sync_domain": [
-      "pure_transform",
-      "deterministic_math"
-    ]
+    "rayon_domain": ["cpu_parallel"],
+    "sync_domain": ["pure_transform", "deterministic_math"]
   },
-  "patterns": [
-    "timeout_bounded",
-    "structured_worker_pool",
-    "two_phase_channel"
-  ],
+  "patterns": ["timeout_bounded", "structured_worker_pool", "two_phase_channel"],
   "test_matrix": {
-    "unit": [
-      "async_signatures_have_cx_first",
-      "sync_signatures_forbid_cx"
-    ],
+    "unit": ["async_signatures_have_cx_first", "sync_signatures_forbid_cx"],
     "integration": [
       "labruntime_determinism",
       "timeout_cancellation_path",
       "region_cleanup_no_leaks"
     ],
-    "e2e": [
-      "two_tier_progressive_search_diagnostics_bundle"
-    ]
+    "e2e": ["two_tier_progressive_search_diagnostics_bundle"]
   }
 }

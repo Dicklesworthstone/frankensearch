@@ -4,10 +4,7 @@
   "path": "/home/ubuntu/.ssh/id_rsa",
   "decision": "exclude",
   "reason_code": "deny_sensitive_path",
-  "sensitive_classes": [
-    "private_keys",
-    "ssh_material"
-  ],
+  "sensitive_classes": ["private_keys", "ssh_material"],
   "persist_allowed": false,
   "emit_allowed": false,
   "display_allowed": false,

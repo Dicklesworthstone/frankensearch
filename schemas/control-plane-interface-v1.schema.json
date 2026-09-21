@@ -20,26 +20,12 @@
     },
     "topic": {
       "type": "string",
-      "enum": [
-        "search",
-        "embedding",
-        "index",
-        "resource",
-        "anomaly",
-        "lifecycle"
-      ]
+      "enum": ["search", "embedding", "index", "resource", "anomaly", "lifecycle"]
     },
     "snapshotResponse": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "snapshot_id",
-        "generated_ts",
-        "fleet_summary",
-        "instances"
-      ],
+      "required": ["kind", "v", "snapshot_id", "generated_ts", "fleet_summary", "instances"],
       "properties": {
         "kind": {
           "type": "string",
@@ -120,30 +106,15 @@
               "health": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": [
-                  "lifecycle_state",
-                  "slo_status",
-                  "error_budget_consumed_pct"
-                ],
+                "required": ["lifecycle_state", "slo_status", "error_budget_consumed_pct"],
                 "properties": {
                   "lifecycle_state": {
                     "type": "string",
-                    "enum": [
-                      "started",
-                      "healthy",
-                      "degraded",
-                      "stale",
-                      "stopped",
-                      "recovering"
-                    ]
+                    "enum": ["started", "healthy", "degraded", "stale", "stopped", "recovering"]
                   },
                   "slo_status": {
                     "type": "string",
-                    "enum": [
-                      "green",
-                      "yellow",
-                      "red"
-                    ]
+                    "enum": ["green", "yellow", "red"]
                   },
                   "error_budget_consumed_pct": {
                     "type": "number",
@@ -155,21 +126,12 @@
               "latest_metrics": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": [
-                  "search",
-                  "embedding",
-                  "index",
-                  "resource"
-                ],
+                "required": ["search", "embedding", "index", "resource"],
                 "properties": {
                   "search": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": [
-                      "p50_ms",
-                      "p95_ms",
-                      "qps"
-                    ],
+                    "required": ["p50_ms", "p95_ms", "qps"],
                     "properties": {
                       "p50_ms": {
                         "type": "number",
@@ -188,11 +150,7 @@
                   "embedding": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": [
-                      "queue_depth",
-                      "throughput_eps",
-                      "fail_rate_pct"
-                    ],
+                    "required": ["queue_depth", "throughput_eps", "fail_rate_pct"],
                     "properties": {
                       "queue_depth": {
                         "type": "integer",
@@ -212,11 +170,7 @@
                   "index": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": [
-                      "docs",
-                      "index_bytes",
-                      "stale_ratio_pct"
-                    ],
+                    "required": ["docs", "index_bytes", "stale_ratio_pct"],
                     "properties": {
                       "docs": {
                         "type": "integer",
@@ -236,12 +190,7 @@
                   "resource": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": [
-                      "cpu_pct",
-                      "rss_bytes",
-                      "io_read_bps",
-                      "io_write_bps"
-                    ],
+                    "required": ["cpu_pct", "rss_bytes", "io_read_bps", "io_write_bps"],
                     "properties": {
                       "cpu_pct": {
                         "type": "number",
@@ -267,11 +216,7 @@
               "anomaly_summary": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": [
-                  "active_count",
-                  "max_severity",
-                  "last_anomaly_ts"
-                ],
+                "required": ["active_count", "max_severity", "last_anomaly_ts"],
                 "properties": {
                   "active_count": {
                     "type": "integer",
@@ -279,18 +224,10 @@
                   },
                   "max_severity": {
                     "type": "string",
-                    "enum": [
-                      "none",
-                      "info",
-                      "warn",
-                      "error"
-                    ]
+                    "enum": ["none", "info", "warn", "error"]
                   },
                   "last_anomaly_ts": {
-                    "type": [
-                      "string",
-                      "null"
-                    ],
+                    "type": ["string", "null"],
                     "format": "date-time"
                   }
                 }
@@ -298,11 +235,7 @@
               "lag": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": [
-                  "ingest_lag_ms_p50",
-                  "ingest_lag_ms_p95",
-                  "stream_queue_depth"
-                ],
+                "required": ["ingest_lag_ms_p50", "ingest_lag_ms_p95", "stream_queue_depth"],
                 "properties": {
                   "ingest_lag_ms_p50": {
                     "type": "number",
@@ -326,14 +259,7 @@
     "streamSubscribe": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "client_id",
-        "topics",
-        "max_inflight",
-        "heartbeat_ms"
-      ],
+      "required": ["kind", "v", "client_id", "topics", "max_inflight", "heartbeat_ms"],
       "properties": {
         "kind": {
           "type": "string",
@@ -362,10 +288,7 @@
           }
         },
         "resume_cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "max_inflight": {
           "type": "integer",
@@ -380,14 +303,7 @@
     "streamFrame": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "frame_type",
-        "dispatch_ts",
-        "lag_ms",
-        "payload"
-      ],
+      "required": ["kind", "v", "frame_type", "dispatch_ts", "lag_ms", "payload"],
       "properties": {
         "kind": {
           "type": "string",
@@ -399,24 +315,13 @@
         },
         "frame_type": {
           "type": "string",
-          "enum": [
-            "event",
-            "control",
-            "heartbeat",
-            "error"
-          ]
+          "enum": ["event", "control", "heartbeat", "error"]
         },
         "cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "producer_ts": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "dispatch_ts": {
@@ -448,13 +353,7 @@
     "eventPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "event_id",
-        "topic",
-        "instance_id",
-        "project_key",
-        "root_request_id"
-      ],
+      "required": ["event_id", "topic", "instance_id", "project_key", "root_request_id"],
       "properties": {
         "event_id": {
           "$ref": "#/$defs/ulid"
@@ -480,75 +379,41 @@
     "controlPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "control_type"
-      ],
+      "required": ["control_type"],
       "properties": {
         "control_type": {
           "type": "string",
-          "enum": [
-            "backpressure",
-            "reconnect_advisory",
-            "sampling",
-            "topology_change"
-          ]
+          "enum": ["backpressure", "reconnect_advisory", "sampling", "topology_change"]
         },
         "backpressure_state": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "enum": [
-            "normal",
-            "constrained",
-            "dropping",
-            null
-          ]
+          "type": ["string", "null"],
+          "enum": ["normal", "constrained", "dropping", null]
         },
         "dropped_count_window": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "sampling_ratio": {
-          "type": [
-            "number",
-            "null"
-          ],
+          "type": ["number", "null"],
           "minimum": 0,
           "maximum": 1
         },
         "retry_after_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "resume_cursor_hint": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "reason_code": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       }
     },
     "heartbeatPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "queue_depth",
-        "max_inflight",
-        "unacked"
-      ],
+      "required": ["queue_depth", "max_inflight", "unacked"],
       "properties": {
         "queue_depth": {
           "type": "integer",
@@ -567,12 +432,7 @@
     "errorPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "code",
-        "message",
-        "recoverable",
-        "retry_after_ms"
-      ],
+      "required": ["code", "message", "recoverable", "retry_after_ms"],
       "properties": {
         "code": {
           "type": "string",
@@ -586,10 +446,7 @@
           "type": "boolean"
         },
         "retry_after_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         }
       }

@@ -10,14 +10,8 @@
     {
       "segment_id": "seg_0001",
       "text": "classifier routes low signal query to uncertain fallback profile",
-      "line_range": [
-        140,
-        143
-      ],
-      "byte_range": [
-        3821,
-        3897
-      ],
+      "line_range": [140, 143],
+      "byte_range": [3821, 3897],
       "truncated": false,
       "highlights": [
         {

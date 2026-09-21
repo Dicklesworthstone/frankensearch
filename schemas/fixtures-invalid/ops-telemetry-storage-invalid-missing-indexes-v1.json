@@ -1,15 +1,7 @@
 {
   "version": "v1",
   "database": "frankensearch-ops.db",
-  "supported_windows": [
-    "1m",
-    "15m",
-    "1h",
-    "6h",
-    "24h",
-    "3d",
-    "1w"
-  ],
+  "supported_windows": ["1m", "15m", "1h", "6h", "24h", "3d", "1w"],
   "tables": [
     {
       "name": "projects",
@@ -85,9 +77,7 @@
           "check": "state IN ('started','healthy','degraded','stale','stopped')"
         }
       ],
-      "foreign_keys": [
-        "project_key -> projects(project_key)"
-      ]
+      "foreign_keys": ["project_key -> projects(project_key)"]
     },
     {
       "name": "search_events",
@@ -278,9 +268,7 @@
         "project_key -> projects(project_key)",
         "instance_id -> instances(instance_id)"
       ],
-      "constraints": [
-        "UNIQUE (project_key, instance_id, embedder_id, ts_ms)"
-      ]
+      "constraints": ["UNIQUE (project_key, instance_id, embedder_id, ts_ms)"]
     },
     {
       "name": "index_inventory_snapshots",
@@ -343,9 +331,7 @@
         "project_key -> projects(project_key)",
         "instance_id -> instances(instance_id)"
       ],
-      "constraints": [
-        "UNIQUE (project_key, instance_id, index_name, ts_ms)"
-      ]
+      "constraints": ["UNIQUE (project_key, instance_id, index_name, ts_ms)"]
     },
     {
       "name": "resource_samples",
@@ -402,9 +388,7 @@
         "project_key -> projects(project_key)",
         "instance_id -> instances(instance_id)"
       ],
-      "constraints": [
-        "UNIQUE (project_key, instance_id, ts_ms)"
-      ]
+      "constraints": ["UNIQUE (project_key, instance_id, ts_ms)"]
     },
     {
       "name": "alerts_timeline",
@@ -469,9 +453,7 @@
           "nullable": true
         }
       ],
-      "foreign_keys": [
-        "project_key -> projects(project_key)"
-      ]
+      "foreign_keys": ["project_key -> projects(project_key)"]
     },
     {
       "name": "evidence_links",
@@ -518,9 +500,7 @@
         "project_key -> projects(project_key)",
         "alert_id -> alerts_timeline(alert_id)"
       ],
-      "constraints": [
-        "UNIQUE (alert_id, evidence_uri)"
-      ]
+      "constraints": ["UNIQUE (alert_id, evidence_uri)"]
     },
     {
       "name": "ops_schema_migrations",
@@ -593,13 +573,7 @@
     "forward_only_in_production": true,
     "reversible_in_dev_test": true,
     "checksum_validation": true,
-    "migration_columns": [
-      "version",
-      "name",
-      "applied_at_ms",
-      "checksum",
-      "reversible"
-    ]
+    "migration_columns": ["version", "name", "applied_at_ms", "checksum", "reversible"]
   },
   "retention_policy": {
     "raw_events_days": 7,
@@ -610,65 +584,30 @@
   "query_patterns": [
     {
       "name": "project_search_latency_window",
-      "filters": [
-        "project_key",
-        "instance_id",
-        "window",
-        "window_start_ms BETWEEN start AND end"
-      ],
+      "filters": ["project_key", "instance_id", "window", "window_start_ms BETWEEN start AND end"],
       "sort": "window_start_ms ASC",
-      "outputs": [
-        "search_count",
-        "p50_latency_us",
-        "p95_latency_us",
-        "p99_latency_us"
-      ],
+      "outputs": ["search_count", "p50_latency_us", "p95_latency_us", "p99_latency_us"],
       "window": "1h"
     },
     {
       "name": "live_open_alerts",
-      "filters": [
-        "project_key",
-        "state != resolved"
-      ],
+      "filters": ["project_key", "state != resolved"],
       "sort": "updated_at_ms DESC",
       "limit": 50,
-      "outputs": [
-        "alert_id",
-        "severity",
-        "category",
-        "reason_code",
-        "summary"
-      ]
+      "outputs": ["alert_id", "severity", "category", "reason_code", "summary"]
     },
     {
       "name": "project_resource_timeline",
-      "filters": [
-        "project_key",
-        "instance_id",
-        "ts_ms BETWEEN start AND end"
-      ],
+      "filters": ["project_key", "instance_id", "ts_ms BETWEEN start AND end"],
       "sort": "ts_ms ASC",
-      "outputs": [
-        "cpu_pct",
-        "rss_bytes",
-        "io_read_bytes",
-        "io_write_bytes",
-        "queue_depth"
-      ],
+      "outputs": ["cpu_pct", "rss_bytes", "io_read_bytes", "io_write_bytes", "queue_depth"],
       "window": "24h"
     },
     {
       "name": "instance_heartbeat_health",
-      "filters": [
-        "project_key"
-      ],
+      "filters": ["project_key"],
       "sort": "last_heartbeat_ms DESC",
-      "outputs": [
-        "instance_id",
-        "state",
-        "last_heartbeat_ms"
-      ],
+      "outputs": ["instance_id", "state", "last_heartbeat_ms"],
       "window": "15m"
     }
   ],

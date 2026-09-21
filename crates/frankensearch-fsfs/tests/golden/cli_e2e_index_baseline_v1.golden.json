@@ -3,13 +3,7 @@
   "scenario": {
     "id": "cli-index-baseline",
     "kind": "index",
-    "args": [
-      "index",
-      "--roots",
-      "/tmp/fsfs-e2e-corpus",
-      "--format",
-      "json"
-    ],
+    "args": ["index", "--roots", "/tmp/fsfs-e2e-corpus", "--format", "json"],
     "expected_exit_code": 0,
     "expected_reason_code": "e2e.cli.scenario_pass",
     "summary": "Index fixture corpus and emit structured diagnostics"
@@ -181,13 +175,7 @@
         "payload": {
           "scenario_id": "cli-index-baseline",
           "scenario_kind": "index",
-          "args": [
-            "index",
-            "--roots",
-            "/tmp/fsfs-e2e-corpus",
-            "--format",
-            "json"
-          ],
+          "args": ["index", "--roots", "/tmp/fsfs-e2e-corpus", "--format", "json"],
           "expected_reason_code": "e2e.cli.scenario_pass"
         }
       }

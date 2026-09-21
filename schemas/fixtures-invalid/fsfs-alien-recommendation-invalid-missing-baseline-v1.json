@@ -17,30 +17,17 @@
     "reason_code": "FSFS_RANKING_QUALITY_GUARD"
   },
   "isomorphism_proof_plan": {
-    "invariants": [
-      "Tie-break stability for equal scores."
-    ],
+    "invariants": ["Tie-break stability for equal scores."],
     "baseline_harness": "tests/e2e_ranking_replay.sh",
-    "replay_checks": [
-      "rank_trace_equivalence"
-    ]
+    "replay_checks": ["rank_trace_equivalence"]
   },
   "repro_artifacts": {
-    "manifest_fields": [
-      "seed",
-      "config_hash",
-      "subsystem"
-    ],
-    "artifact_outputs": [
-      "ranking_trace.jsonl",
-      "ranking_summary.json"
-    ],
+    "manifest_fields": ["seed", "config_hash", "subsystem"],
+    "artifact_outputs": ["ranking_trace.jsonl", "ranking_summary.json"],
     "replay_command": "cargo test -p frankensearch --test ranking_replay"
   },
   "rollback_plan": {
     "rollback_command": "fsfsctl policy set ranking.fixed=true",
-    "abort_conditions": [
-      "ndcg_drop_gt_0.05"
-    ]
+    "abort_conditions": ["ndcg_drop_gt_0.05"]
   }
 }

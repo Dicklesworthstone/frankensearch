@@ -3,83 +3,303 @@
   "queries": [
     {
       "query": "rust ownership borrowing",
-      "expected_top_10": ["test-rust-001", "test-rust-002", "test-rust-003", "test-rust-005", "test-rust-011", "test-rust-017", "test-mixed-001", "test-mixed-007", "test-mixed-012", "test-rust-010"]
+      "expected_top_10": [
+        "test-rust-001",
+        "test-rust-002",
+        "test-rust-003",
+        "test-rust-005",
+        "test-rust-011",
+        "test-rust-017",
+        "test-mixed-001",
+        "test-mixed-007",
+        "test-mixed-012",
+        "test-rust-010"
+      ]
     },
     {
       "query": "borrow checker lifetimes",
-      "expected_top_10": ["test-rust-002", "test-rust-003", "test-rust-011", "test-rust-012", "test-rust-018", "test-mixed-006", "test-mixed-013", "test-rust-004", "test-rust-009", "test-rust-016"]
+      "expected_top_10": [
+        "test-rust-002",
+        "test-rust-003",
+        "test-rust-011",
+        "test-rust-012",
+        "test-rust-018",
+        "test-mixed-006",
+        "test-mixed-013",
+        "test-rust-004",
+        "test-rust-009",
+        "test-rust-016"
+      ]
     },
     {
       "query": "traits generics serde",
-      "expected_top_10": ["test-rust-004", "test-rust-013", "test-rust-012", "test-rust-010", "test-rust-014", "test-mixed-011", "test-mixed-016", "test-rust-005", "test-rust-006", "test-ml-003"]
+      "expected_top_10": [
+        "test-rust-004",
+        "test-rust-013",
+        "test-rust-012",
+        "test-rust-010",
+        "test-rust-014",
+        "test-mixed-011",
+        "test-mixed-016",
+        "test-rust-005",
+        "test-rust-006",
+        "test-ml-003"
+      ]
     },
     {
       "query": "asupersync channel cancellation",
-      "expected_top_10": ["test-rust-007", "test-rust-008", "test-rust-017", "test-rust-009", "test-rust-019", "test-mixed-002", "test-mixed-008", "test-sysadmin-016", "test-ml-009", "test-rust-020"]
+      "expected_top_10": [
+        "test-rust-007",
+        "test-rust-008",
+        "test-rust-017",
+        "test-rust-009",
+        "test-rust-019",
+        "test-mixed-002",
+        "test-mixed-008",
+        "test-sysadmin-016",
+        "test-ml-009",
+        "test-rust-020"
+      ]
     },
     {
       "query": "cargo workspace release profile",
-      "expected_top_10": ["test-rust-010", "test-rust-020", "test-rust-014", "test-rust-019", "test-rust-016", "test-mixed-004", "test-mixed-014", "test-sysadmin-020", "test-ml-020", "test-rust-006"]
+      "expected_top_10": [
+        "test-rust-010",
+        "test-rust-020",
+        "test-rust-014",
+        "test-rust-019",
+        "test-rust-016",
+        "test-mixed-004",
+        "test-mixed-014",
+        "test-sysadmin-020",
+        "test-ml-020",
+        "test-rust-006"
+      ]
     },
     {
       "query": "text embeddings tokenization pooling",
-      "expected_top_10": ["test-ml-001", "test-ml-002", "test-ml-003", "test-ml-004", "test-ml-008", "test-ml-013", "test-mixed-001", "test-mixed-003", "test-rust-012", "test-ml-011"]
+      "expected_top_10": [
+        "test-ml-001",
+        "test-ml-002",
+        "test-ml-003",
+        "test-ml-004",
+        "test-ml-008",
+        "test-ml-013",
+        "test-mixed-001",
+        "test-mixed-003",
+        "test-rust-012",
+        "test-ml-011"
+      ]
     },
     {
       "query": "onnx quantization inference latency",
-      "expected_top_10": ["test-ml-005", "test-ml-006", "test-ml-007", "test-ml-014", "test-ml-019", "test-mixed-003", "test-mixed-009", "test-rust-016", "test-sysadmin-010", "test-ml-020"]
+      "expected_top_10": [
+        "test-ml-005",
+        "test-ml-006",
+        "test-ml-007",
+        "test-ml-014",
+        "test-ml-019",
+        "test-mixed-003",
+        "test-mixed-009",
+        "test-rust-016",
+        "test-sysadmin-010",
+        "test-ml-020"
+      ]
     },
     {
       "query": "hybrid retrieval reranking",
-      "expected_top_10": ["test-ml-008", "test-ml-009", "test-ml-010", "test-ml-013", "test-rust-017", "test-mixed-005", "test-mixed-010", "test-rust-005", "test-sysadmin-008", "test-ml-018"]
+      "expected_top_10": [
+        "test-ml-008",
+        "test-ml-009",
+        "test-ml-010",
+        "test-ml-013",
+        "test-rust-017",
+        "test-mixed-005",
+        "test-mixed-010",
+        "test-rust-005",
+        "test-sysadmin-008",
+        "test-ml-018"
+      ]
     },
     {
       "query": "fine tuning overfitting regularization",
-      "expected_top_10": ["test-ml-011", "test-ml-012", "test-ml-018", "test-ml-017", "test-ml-020", "test-mixed-017", "test-mixed-019", "test-ml-004", "test-rust-014", "test-ml-006"]
+      "expected_top_10": [
+        "test-ml-011",
+        "test-ml-012",
+        "test-ml-018",
+        "test-ml-017",
+        "test-ml-020",
+        "test-mixed-017",
+        "test-mixed-019",
+        "test-ml-004",
+        "test-rust-014",
+        "test-ml-006"
+      ]
     },
     {
       "query": "cosine similarity vector index",
-      "expected_top_10": ["test-ml-013", "test-ml-014", "test-ml-015", "test-ml-016", "test-rust-016", "test-rust-017", "test-mixed-012", "test-mixed-018", "test-sysadmin-012", "test-ml-010"]
+      "expected_top_10": [
+        "test-ml-013",
+        "test-ml-014",
+        "test-ml-015",
+        "test-ml-016",
+        "test-rust-016",
+        "test-rust-017",
+        "test-mixed-012",
+        "test-mixed-018",
+        "test-sysadmin-012",
+        "test-ml-010"
+      ]
     },
     {
       "query": "docker compose service logs",
-      "expected_top_10": ["test-sysadmin-001", "test-sysadmin-009", "test-sysadmin-014", "test-sysadmin-019", "test-sysadmin-020", "test-mixed-002", "test-mixed-011", "test-rust-019", "test-ml-019", "test-sysadmin-007"]
+      "expected_top_10": [
+        "test-sysadmin-001",
+        "test-sysadmin-009",
+        "test-sysadmin-014",
+        "test-sysadmin-019",
+        "test-sysadmin-020",
+        "test-mixed-002",
+        "test-mixed-011",
+        "test-rust-019",
+        "test-ml-019",
+        "test-sysadmin-007"
+      ]
     },
     {
       "query": "kubernetes rollout crashloop",
-      "expected_top_10": ["test-sysadmin-002", "test-sysadmin-006", "test-sysadmin-013", "test-sysadmin-017", "test-sysadmin-018", "test-mixed-004", "test-mixed-013", "test-sysadmin-010", "test-sysadmin-015", "test-rust-007"]
+      "expected_top_10": [
+        "test-sysadmin-002",
+        "test-sysadmin-006",
+        "test-sysadmin-013",
+        "test-sysadmin-017",
+        "test-sysadmin-018",
+        "test-mixed-004",
+        "test-mixed-013",
+        "test-sysadmin-010",
+        "test-sysadmin-015",
+        "test-rust-007"
+      ]
     },
     {
       "query": "nginx tls reverse proxy",
-      "expected_top_10": ["test-sysadmin-003", "test-sysadmin-018", "test-sysadmin-016", "test-sysadmin-011", "test-sysadmin-012", "test-mixed-006", "test-mixed-014", "test-sysadmin-004", "test-rust-018", "test-sysadmin-008"]
+      "expected_top_10": [
+        "test-sysadmin-003",
+        "test-sysadmin-018",
+        "test-sysadmin-016",
+        "test-sysadmin-011",
+        "test-sysadmin-012",
+        "test-mixed-006",
+        "test-mixed-014",
+        "test-sysadmin-004",
+        "test-rust-018",
+        "test-sysadmin-008"
+      ]
     },
     {
       "query": "postgres backup restore runbook",
-      "expected_top_10": ["test-sysadmin-004", "test-sysadmin-015", "test-sysadmin-010", "test-sysadmin-012", "test-sysadmin-020", "test-mixed-009", "test-mixed-016", "test-sysadmin-007", "test-ml-020", "test-sysadmin-005"]
+      "expected_top_10": [
+        "test-sysadmin-004",
+        "test-sysadmin-015",
+        "test-sysadmin-010",
+        "test-sysadmin-012",
+        "test-sysadmin-020",
+        "test-mixed-009",
+        "test-mixed-016",
+        "test-sysadmin-007",
+        "test-ml-020",
+        "test-sysadmin-005"
+      ]
     },
     {
       "query": "latency dashboard alerts slo",
-      "expected_top_10": ["test-sysadmin-007", "test-sysadmin-008", "test-sysadmin-016", "test-sysadmin-019", "test-sysadmin-020", "test-mixed-008", "test-mixed-015", "test-rust-019", "test-ml-019", "test-sysadmin-001"]
+      "expected_top_10": [
+        "test-sysadmin-007",
+        "test-sysadmin-008",
+        "test-sysadmin-016",
+        "test-sysadmin-019",
+        "test-sysadmin-020",
+        "test-mixed-008",
+        "test-mixed-015",
+        "test-rust-019",
+        "test-ml-019",
+        "test-sysadmin-001"
+      ]
     },
     {
       "query": "chocolate chip cookies",
-      "expected_top_10": ["test-cooking-001", "test-cooking-002", "test-cooking-005", "test-cooking-011", "test-cooking-016", "test-cooking-019", "test-cooking-013", "test-cooking-010", "test-cooking-020", "test-cooking-007"]
+      "expected_top_10": [
+        "test-cooking-001",
+        "test-cooking-002",
+        "test-cooking-005",
+        "test-cooking-011",
+        "test-cooking-016",
+        "test-cooking-019",
+        "test-cooking-013",
+        "test-cooking-010",
+        "test-cooking-020",
+        "test-cooking-007"
+      ]
     },
     {
       "query": "roast chicken marinade",
-      "expected_top_10": ["test-cooking-003", "test-cooking-004", "test-cooking-018", "test-cooking-015", "test-cooking-014", "test-cooking-009", "test-cooking-020", "test-cooking-012", "test-cooking-008", "test-cooking-006"]
+      "expected_top_10": [
+        "test-cooking-003",
+        "test-cooking-004",
+        "test-cooking-018",
+        "test-cooking-015",
+        "test-cooking-014",
+        "test-cooking-009",
+        "test-cooking-020",
+        "test-cooking-012",
+        "test-cooking-008",
+        "test-cooking-006"
+      ]
     },
     {
       "query": "sourdough starter hydration",
-      "expected_top_10": ["test-cooking-006", "test-cooking-009", "test-cooking-017", "test-cooking-012", "test-cooking-018", "test-cooking-004", "test-cooking-005", "test-cooking-014", "test-cooking-001", "test-cooking-020"]
+      "expected_top_10": [
+        "test-cooking-006",
+        "test-cooking-009",
+        "test-cooking-017",
+        "test-cooking-012",
+        "test-cooking-018",
+        "test-cooking-004",
+        "test-cooking-005",
+        "test-cooking-014",
+        "test-cooking-001",
+        "test-cooking-020"
+      ]
     },
     {
       "query": "meal prep pressure cooker",
-      "expected_top_10": ["test-cooking-010", "test-cooking-014", "test-cooking-017", "test-cooking-020", "test-cooking-015", "test-cooking-008", "test-cooking-013", "test-cooking-003", "test-cooking-019", "test-cooking-002"]
+      "expected_top_10": [
+        "test-cooking-010",
+        "test-cooking-014",
+        "test-cooking-017",
+        "test-cooking-020",
+        "test-cooking-015",
+        "test-cooking-008",
+        "test-cooking-013",
+        "test-cooking-003",
+        "test-cooking-019",
+        "test-cooking-002"
+      ]
     },
     {
       "query": "deploy rust embedding service",
-      "expected_top_10": ["test-mixed-001", "test-mixed-002", "test-mixed-003", "test-mixed-004", "test-mixed-005", "test-sysadmin-001", "test-sysadmin-002", "test-rust-007", "test-ml-005", "test-ml-008"]
+      "expected_top_10": [
+        "test-mixed-001",
+        "test-mixed-002",
+        "test-mixed-003",
+        "test-mixed-004",
+        "test-mixed-005",
+        "test-sysadmin-001",
+        "test-sysadmin-002",
+        "test-rust-007",
+        "test-ml-005",
+        "test-ml-008"
+      ]
     }
   ]
 }

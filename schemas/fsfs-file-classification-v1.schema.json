@@ -75,11 +75,7 @@
         "encoding_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "primary_detectors",
-            "normalization",
-            "unknown_encoding_action"
-          ],
+          "required": ["primary_detectors", "normalization", "unknown_encoding_action"],
           "properties": {
             "primary_detectors": {
               "type": "array",
@@ -93,55 +89,32 @@
               ],
               "items": {
                 "type": "string",
-                "enum": [
-                  "bom",
-                  "utf8_validation",
-                  "icu_heuristic"
-                ]
+                "enum": ["bom", "utf8_validation", "icu_heuristic"]
               },
               "minItems": 2
             },
             "normalization": {
               "type": "string",
-              "enum": [
-                "utf8_nfc",
-                "utf8_nfc_lossy",
-                "reject_non_text"
-              ]
+              "enum": ["utf8_nfc", "utf8_nfc_lossy", "reject_non_text"]
             },
             "unknown_encoding_action": {
               "type": "string",
-              "enum": [
-                "skip",
-                "lossy_decode",
-                "quarantine"
-              ]
+              "enum": ["skip", "lossy_decode", "quarantine"]
             }
           }
         },
         "corrupt_partial_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "truncated_action",
-            "checksum_mismatch_action",
-            "max_recovery_prefix_bytes"
-          ],
+          "required": ["truncated_action", "checksum_mismatch_action", "max_recovery_prefix_bytes"],
           "properties": {
             "truncated_action": {
               "type": "string",
-              "enum": [
-                "quarantine",
-                "skip",
-                "index_partial_with_flag"
-              ]
+              "enum": ["quarantine", "skip", "index_partial_with_flag"]
             },
             "checksum_mismatch_action": {
               "type": "string",
-              "enum": [
-                "quarantine",
-                "skip"
-              ]
+              "enum": ["quarantine", "skip"]
             },
             "max_recovery_prefix_bytes": {
               "type": "integer",
@@ -231,12 +204,7 @@
         "sniff_features": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "null_bytes",
-            "non_printable_ratio",
-            "high_bit_ratio",
-            "bom"
-          ],
+          "required": ["null_bytes", "non_printable_ratio", "high_bit_ratio", "bom"],
           "properties": {
             "null_bytes": {
               "type": "integer",
@@ -254,24 +222,13 @@
             },
             "bom": {
               "type": "string",
-              "enum": [
-                "none",
-                "utf8",
-                "utf16le",
-                "utf16be"
-              ]
+              "enum": ["none", "utf8", "utf16le", "utf16be"]
             }
           }
         },
         "detected_type": {
           "type": "string",
-          "enum": [
-            "text",
-            "binary",
-            "archive",
-            "partial",
-            "corrupt"
-          ]
+          "enum": ["text", "binary", "archive", "partial", "corrupt"]
         },
         "detected_encoding": {
           "oneOf": [
@@ -285,20 +242,11 @@
         },
         "normalization_applied": {
           "type": "string",
-          "enum": [
-            "utf8_nfc",
-            "utf8_nfc_lossy",
-            "none"
-          ]
+          "enum": ["utf8_nfc", "utf8_nfc_lossy", "none"]
         },
         "ingest_action": {
           "type": "string",
-          "enum": [
-            "index",
-            "skip",
-            "quarantine",
-            "index_partial_with_flag"
-          ]
+          "enum": ["index", "skip", "quarantine", "index_partial_with_flag"]
         },
         "classification_confidence": {
           "type": "number",
@@ -316,11 +264,7 @@
         "downstream_signals": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "utility_penalty",
-            "skip_candidate",
-            "requires_manual_review"
-          ],
+          "required": ["utility_penalty", "skip_candidate", "requires_manual_review"],
           "properties": {
             "utility_penalty": {
               "type": "number",
@@ -341,11 +285,7 @@
           "if": {
             "properties": {
               "detected_type": {
-                "enum": [
-                  "binary",
-                  "archive",
-                  "corrupt"
-                ]
+                "enum": ["binary", "archive", "corrupt"]
               }
             }
           },
@@ -371,11 +311,7 @@
           "then": {
             "properties": {
               "ingest_action": {
-                "enum": [
-                  "index_partial_with_flag",
-                  "skip",
-                  "quarantine"
-                ]
+                "enum": ["index_partial_with_flag", "skip", "quarantine"]
               }
             }
           }
@@ -391,10 +327,7 @@
           "then": {
             "properties": {
               "ingest_action": {
-                "enum": [
-                  "skip",
-                  "quarantine"
-                ]
+                "enum": ["skip", "quarantine"]
               }
             }
           }
@@ -410,10 +343,7 @@
           "then": {
             "properties": {
               "ingest_action": {
-                "enum": [
-                  "skip",
-                  "quarantine"
-                ]
+                "enum": ["skip", "quarantine"]
               }
             }
           }
@@ -447,12 +377,7 @@
         },
         "error_class": {
           "type": "string",
-          "enum": [
-            "truncated",
-            "checksum_mismatch",
-            "decode_error",
-            "io_short_read"
-          ]
+          "enum": ["truncated", "checksum_mismatch", "decode_error", "io_short_read"]
         },
         "bytes_recovered": {
           "type": "integer",
@@ -460,11 +385,7 @@
         },
         "ingest_action": {
           "type": "string",
-          "enum": [
-            "skip",
-            "quarantine",
-            "index_partial_with_flag"
-          ]
+          "enum": ["skip", "quarantine", "index_partial_with_flag"]
         },
         "reason_code": {
           "$ref": "#/$defs/reasonCode"

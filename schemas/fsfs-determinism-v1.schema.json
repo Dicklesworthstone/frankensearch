@@ -16,11 +16,7 @@
   "$defs": {
     "tier": {
       "type": "string",
-      "enum": [
-        "tier1",
-        "tier2",
-        "tier3"
-      ]
+      "enum": ["tier1", "tier2", "tier3"]
     },
     "nondeterminismSource": {
       "type": "string",
@@ -60,23 +56,14 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "tier",
-              "comparison_mode",
-              "required_surfaces",
-              "guarantee"
-            ],
+            "required": ["tier", "comparison_mode", "required_surfaces", "guarantee"],
             "properties": {
               "tier": {
                 "$ref": "#/$defs/tier"
               },
               "comparison_mode": {
                 "type": "string",
-                "enum": [
-                  "bit_exact",
-                  "semantic_equivalence",
-                  "statistical_tolerance"
-                ]
+                "enum": ["bit_exact", "semantic_equivalence", "statistical_tolerance"]
               },
               "required_surfaces": {
                 "type": "array",
@@ -104,10 +91,7 @@
                     "const": "bit_exact"
                   }
                 },
-                "required": [
-                  "tier",
-                  "comparison_mode"
-                ]
+                "required": ["tier", "comparison_mode"]
               }
             },
             {
@@ -121,10 +105,7 @@
                     "const": "semantic_equivalence"
                   }
                 },
-                "required": [
-                  "tier",
-                  "comparison_mode"
-                ]
+                "required": ["tier", "comparison_mode"]
               }
             },
             {
@@ -138,10 +119,7 @@
                     "const": "statistical_tolerance"
                   }
                 },
-                "required": [
-                  "tier",
-                  "comparison_mode"
-                ]
+                "required": ["tier", "comparison_mode"]
               }
             }
           ]
@@ -152,11 +130,7 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "source",
-              "mitigation",
-              "requirement_id"
-            ],
+            "required": ["source", "mitigation", "requirement_id"],
             "properties": {
               "source": {
                 "$ref": "#/$defs/nondeterminismSource"
@@ -180,9 +154,7 @@
                     "const": "float_arithmetic"
                   }
                 },
-                "required": [
-                  "source"
-                ]
+                "required": ["source"]
               }
             },
             {
@@ -193,9 +165,7 @@
                     "const": "thread_scheduling"
                   }
                 },
-                "required": [
-                  "source"
-                ]
+                "required": ["source"]
               }
             },
             {
@@ -206,9 +176,7 @@
                     "const": "filesystem_ordering"
                   }
                 },
-                "required": [
-                  "source"
-                ]
+                "required": ["source"]
               }
             },
             {
@@ -219,9 +187,7 @@
                     "const": "clock_source"
                   }
                 },
-                "required": [
-                  "source"
-                ]
+                "required": ["source"]
               }
             },
             {
@@ -232,9 +198,7 @@
                     "const": "random_sampling"
                   }
                 },
-                "required": [
-                  "source"
-                ]
+                "required": ["source"]
               }
             }
           ]
@@ -445,11 +409,7 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "name",
-              "version",
-              "digest"
-            ],
+            "required": ["name", "version", "digest"],
             "properties": {
               "name": {
                 "type": "string",
@@ -469,11 +429,7 @@
         "platform": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "os",
-            "arch",
-            "rustc"
-          ],
+          "required": ["os", "arch", "rustc"],
           "properties": {
             "os": {
               "type": "string",
@@ -491,34 +447,20 @@
         },
         "clock_mode": {
           "type": "string",
-          "enum": [
-            "frozen",
-            "simulated",
-            "realtime"
-          ]
+          "enum": ["frozen", "simulated", "realtime"]
         },
         "tie_break_policy": {
           "type": "string",
-          "enum": [
-            "doc_id_lexicographic",
-            "stable_input_order"
-          ]
+          "enum": ["doc_id_lexicographic", "stable_input_order"]
         },
         "float_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "mode",
-            "max_delta"
-          ],
+          "required": ["mode", "max_delta"],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "canonical_rounding",
-                "epsilon_window",
-                "ulp_budget"
-              ]
+              "enum": ["canonical_rounding", "epsilon_window", "ulp_budget"]
             },
             "max_delta": {
               "type": "number",
@@ -529,11 +471,7 @@
         "query_fingerprint": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "query_hash",
-            "canonicalizer_version",
-            "corpus_snapshot_id"
-          ],
+          "required": ["query_hash", "canonicalizer_version", "corpus_snapshot_id"],
           "properties": {
             "query_hash": {
               "type": "string",
@@ -552,11 +490,7 @@
         "evidence_bundle": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "manifest_hash",
-            "artifact_paths",
-            "config_signature"
-          ],
+          "required": ["manifest_hash", "artifact_paths", "config_signature"],
           "properties": {
             "manifest_hash": {
               "type": "string",
@@ -573,10 +507,7 @@
             "config_signature": {
               "type": "object",
               "additionalProperties": false,
-              "required": [
-                "schema_version",
-                "config_hash"
-              ],
+              "required": ["schema_version", "config_hash"],
               "properties": {
                 "schema_version": {
                   "type": "string",
@@ -599,26 +530,18 @@
                 "const": "tier1"
               }
             },
-            "required": [
-              "determinism_tier"
-            ]
+            "required": ["determinism_tier"]
           },
           "then": {
             "properties": {
               "clock_mode": {
-                "enum": [
-                  "frozen",
-                  "simulated"
-                ]
+                "enum": ["frozen", "simulated"]
               },
               "tie_break_policy": {
                 "const": "doc_id_lexicographic"
               }
             },
-            "required": [
-              "clock_mode",
-              "tie_break_policy"
-            ]
+            "required": ["clock_mode", "tie_break_policy"]
           }
         }
       ]
@@ -655,11 +578,7 @@
         },
         "comparison_mode": {
           "type": "string",
-          "enum": [
-            "bit_exact",
-            "semantic_equivalence",
-            "statistical_tolerance"
-          ]
+          "enum": ["bit_exact", "semantic_equivalence", "statistical_tolerance"]
         },
         "run_count": {
           "type": "integer",
@@ -675,10 +594,7 @@
         "tolerance_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "metric",
-            "max_delta"
-          ],
+          "required": ["metric", "max_delta"],
           "properties": {
             "metric": {
               "type": "string",
@@ -695,12 +611,7 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "reason_code",
-              "field_path",
-              "lhs",
-              "rhs"
-            ],
+            "required": ["reason_code", "field_path", "lhs", "rhs"],
             "properties": {
               "reason_code": {
                 "type": "string",
@@ -730,9 +641,7 @@
                 "const": false
               }
             },
-            "required": [
-              "pass"
-            ]
+            "required": ["pass"]
           },
           "then": {
             "properties": {
@@ -749,9 +658,7 @@
                 "const": "tier1"
               }
             },
-            "required": [
-              "determinism_tier"
-            ]
+            "required": ["determinism_tier"]
           },
           "then": {
             "properties": {
@@ -768,9 +675,7 @@
                 "const": "tier2"
               }
             },
-            "required": [
-              "determinism_tier"
-            ]
+            "required": ["determinism_tier"]
           },
           "then": {
             "properties": {
@@ -787,9 +692,7 @@
                 "const": "tier3"
               }
             },
-            "required": [
-              "determinism_tier"
-            ]
+            "required": ["determinism_tier"]
           },
           "then": {
             "properties": {
@@ -797,9 +700,7 @@
                 "const": "statistical_tolerance"
               }
             },
-            "required": [
-              "tolerance_policy"
-            ]
+            "required": ["tolerance_policy"]
           }
         }
       ]

@@ -14,9 +14,7 @@
       "path": "/home/ubuntu/project/target/debug/app",
       "decision": "defer",
       "reason_code": "privacy.artifact.generated",
-      "signals": [
-        "generated_artifact"
-      ],
+      "signals": ["generated_artifact"],
       "sensitive_classes": [],
       "redaction_action": "metadata_only",
       "evidence": {

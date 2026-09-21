@@ -4,11 +4,7 @@
   "title": "frankensearch Evidence JSONL Envelope v1",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "v",
-    "ts",
-    "event"
-  ],
+  "required": ["v", "ts", "event"],
   "properties": {
     "v": {
       "type": "integer",
@@ -51,13 +47,7 @@
         },
         "type": {
           "type": "string",
-          "enum": [
-            "decision",
-            "alert",
-            "degradation",
-            "transition",
-            "replay_marker"
-          ]
+          "enum": ["decision", "alert", "degradation", "transition", "replay_marker"]
         },
         "project_key": {
           "type": "string",
@@ -69,19 +59,13 @@
         "trace": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "root_request_id",
-            "parent_event_id"
-          ],
+          "required": ["root_request_id", "parent_event_id"],
           "properties": {
             "root_request_id": {
               "$ref": "#/$defs/ulid"
             },
             "parent_event_id": {
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": ["string", "null"],
               "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
             }
           }
@@ -89,11 +73,7 @@
         "reason": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "code",
-            "human",
-            "severity"
-          ],
+          "required": ["code", "human", "severity"],
           "properties": {
             "code": {
               "$ref": "#/$defs/reasonCode"
@@ -104,27 +84,18 @@
             },
             "severity": {
               "type": "string",
-              "enum": [
-                "info",
-                "warn",
-                "error"
-              ]
+              "enum": ["info", "warn", "error"]
             }
           }
         },
         "replay": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "mode"
-          ],
+          "required": ["mode"],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "live",
-                "deterministic"
-              ]
+              "enum": ["live", "deterministic"]
             },
             "seed": {
               "type": "integer",
@@ -149,11 +120,7 @@
                 }
               },
               "then": {
-                "required": [
-                  "seed",
-                  "tick_ms",
-                  "frame_seq"
-                ]
+                "required": ["seed", "tick_ms", "frame_seq"]
               }
             }
           ]
@@ -161,11 +128,7 @@
         "redaction": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "policy_version",
-            "contains_sensitive_source",
-            "transforms_applied"
-          ],
+          "required": ["policy_version", "contains_sensitive_source", "transforms_applied"],
           "properties": {
             "policy_version": {
               "type": "string",
@@ -179,13 +142,7 @@
               "minItems": 1,
               "items": {
                 "type": "string",
-                "enum": [
-                  "hash_sha256",
-                  "truncate_preview",
-                  "drop",
-                  "path_tokenize",
-                  "mask_partial"
-                ]
+                "enum": ["hash_sha256", "truncate_preview", "drop", "path_tokenize", "mask_partial"]
               }
             }
           }
@@ -204,11 +161,7 @@
             },
             "resource_profile": {
               "type": "string",
-              "enum": [
-                "strict",
-                "performance",
-                "degraded"
-              ]
+              "enum": ["strict", "performance", "degraded"]
             },
             "lag_ms": {
               "type": "integer",

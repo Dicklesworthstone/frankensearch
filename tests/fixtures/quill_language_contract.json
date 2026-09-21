@@ -9,12 +9,7 @@
     "score_epsilon": 0.0001
   },
   "fixture_execution": {
-    "lexical_loader_executes": [
-      "schema",
-      "analyzers",
-      "helpers",
-      "bm25_operation_order"
-    ],
+    "lexical_loader_executes": ["schema", "analyzers", "helpers", "bm25_operation_order"],
     "quill_differential_executes": [
       "canonical_query_trees",
       "ranking",
@@ -283,9 +278,7 @@
         "count_bytes": 65530
       },
       "token_admission": "kept",
-      "applies_to": [
-        "document_indexing"
-      ]
+      "applies_to": ["document_indexing"]
     },
     {
       "id": "analyzer-tantivy-index-limit-65531-dropped",
@@ -296,9 +289,7 @@
       },
       "token_admission": "dropped",
       "diagnostic": "warning",
-      "applies_to": [
-        "document_indexing"
-      ]
+      "applies_to": ["document_indexing"]
     },
     {
       "id": "analyzer-quill-query-limit-65531-dropped",
@@ -308,9 +299,7 @@
         "count_bytes": 65531
       },
       "token_admission": "dropped",
-      "applies_to": [
-        "quill_query_analysis"
-      ],
+      "applies_to": ["quill_query_analysis"],
       "classification": "explicit Quill hardening amendment; Tantivy QueryParser does not enforce MAX_TOKEN_LEN",
       "ordinary_string_query_reachable": false
     }
@@ -357,10 +346,7 @@
         "count_chars": 10001
       },
       "expected_chars": 10000,
-      "backends": [
-        "tantivy",
-        "fts5"
-      ]
+      "backends": ["tantivy", "fts5"]
     },
     {
       "id": "helper-query-truncate-unicode",
@@ -371,10 +357,7 @@
       },
       "expected_chars": 10000,
       "expected_bytes": 20000,
-      "backends": [
-        "tantivy",
-        "fts5"
-      ]
+      "backends": ["tantivy", "fts5"]
     }
   ],
   "parse_tree_cases": [
@@ -386,11 +369,7 @@
       "source": "contract extension for the path-shaped identifier class",
       "expected_ast": {
         "type": "Phrase",
-        "terms": [
-          "src",
-          "main",
-          "rs"
-        ],
+        "terms": ["src", "main", "rs"],
         "slop": 0,
         "fields": [
           {
@@ -784,10 +763,7 @@
       "input": "\"error handling\"",
       "expected_ast": {
         "type": "Phrase",
-        "terms": [
-          "error",
-          "handling"
-        ],
+        "terms": ["error", "handling"],
         "slop": 0,
         "fields": [
           {
@@ -1173,10 +1149,7 @@
       "expected_ast": {
         "type": "SetStr",
         "field": "id",
-        "values": [
-          "alpha",
-          "beta"
-        ]
+        "values": ["alpha", "beta"]
       }
     },
     {
@@ -1289,10 +1262,7 @@
             "occur": "Should",
             "query": {
               "type": "Phrase",
-              "terms": [
-                "error",
-                "handling"
-              ],
+              "terms": ["error", "handling"],
               "slop": 0,
               "fields": [
                 {
@@ -1372,9 +1342,7 @@
             "query": {
               "type": "SetStr",
               "field": "id",
-              "values": [
-                "z"
-              ]
+              "values": ["z"]
             }
           }
         ]
@@ -1734,12 +1702,7 @@
         "pattern": "exact",
         "class": "Exact",
         "strategy": "TermQuery",
-        "fields": [
-          "title",
-          "content",
-          "title_prefix",
-          "content_prefix"
-        ]
+        "fields": ["title", "content", "title_prefix", "content_prefix"]
       }
     },
     {
@@ -1753,12 +1716,7 @@
         "normalized_term": "prefix",
         "class": "Prefix",
         "strategy": "TermQuery",
-        "fields": [
-          "title",
-          "content",
-          "title_prefix",
-          "content_prefix"
-        ]
+        "fields": ["title", "content", "title_prefix", "content_prefix"]
       }
     },
     {
@@ -1772,10 +1730,7 @@
         "class": "Suffix",
         "strategy": "RegexQuery",
         "regex": ".*suffix",
-        "fields": [
-          "content",
-          "title"
-        ]
+        "fields": ["content", "title"]
       }
     },
     {
@@ -1789,10 +1744,7 @@
         "class": "Substring",
         "strategy": "RegexQuery",
         "regex": ".*middle.*",
-        "fields": [
-          "content",
-          "title"
-        ]
+        "fields": ["content", "title"]
       }
     },
     {
@@ -1806,10 +1758,7 @@
         "class": "Complex",
         "strategy": "RegexQuery",
         "regex": "a.*b.*c",
-        "fields": [
-          "content",
-          "title"
-        ],
+        "fields": ["content", "title"],
         "question_mark_operator": false
       }
     },
@@ -1875,14 +1824,8 @@
       "parser": "cass",
       "input": "cache",
       "filters": {
-        "agents": [
-          "claude",
-          "codex"
-        ],
-        "workspaces": [
-          "/alpha",
-          "/beta"
-        ]
+        "agents": ["claude", "codex"],
+        "workspaces": ["/alpha", "/beta"]
       },
       "expected_ast": {
         "type": "Boolean",
@@ -2244,10 +2187,7 @@
       "input": "\"error handling\"",
       "expected_ast": {
         "type": "Phrase",
-        "terms": [
-          "error",
-          "handling"
-        ],
+        "terms": ["error", "handling"],
         "slop": 0,
         "fields": [
           {
@@ -2302,10 +2242,7 @@
             "occur": "Must",
             "query": {
               "type": "Phrase",
-              "terms": [
-                "error",
-                "handling"
-              ],
+              "terms": ["error", "handling"],
               "slop": 0,
               "fields": [
                 {
@@ -2804,9 +2741,7 @@
       "parser": "cass",
       "input": "cache",
       "filters": {
-        "agents": [
-          "codex"
-        ]
+        "agents": ["codex"]
       },
       "expected_ast": {
         "type": "Boolean",
@@ -2866,12 +2801,8 @@
       "parser": "cass",
       "input": "cache",
       "filters": {
-        "agents": [
-          "codex"
-        ],
-        "workspaces": [
-          "/alpha"
-        ],
+        "agents": ["codex"],
+        "workspaces": ["/alpha"],
         "created_from": 1700000000000,
         "created_to": 1700000000999,
         "source_filter": "source_id",
@@ -3258,14 +3189,8 @@
     {
       "id": "score-avgdl-uses-raw-statistics",
       "conformance": "RankExact",
-      "segment_max_docs": [
-        2,
-        1
-      ],
-      "segment_total_tokens": [
-        13,
-        8
-      ],
+      "segment_max_docs": [2, 1],
+      "segment_total_tokens": [13, 8],
       "deleted_docs": 1,
       "expected_total_num_docs": 3,
       "expected_total_num_tokens": 21,
@@ -3336,11 +3261,7 @@
     {
       "id": "score-phrase-bm25",
       "conformance": "RankExact",
-      "term_doc_freqs_in_phrase_order": [
-        2,
-        3,
-        2
-      ],
+      "term_doc_freqs_in_phrase_order": [2, 3, 2],
       "doc_count": 8,
       "phrase_occurrences": 2,
       "fieldnorm_id": 8,
@@ -3351,34 +3272,16 @@
     {
       "id": "score-required-scorers-cost-order",
       "conformance": "RankExact",
-      "construction_order": [
-        "common",
-        "rare",
-        "medium",
-        "equal_cost_later"
-      ],
-      "runtime_costs": [
-        900,
-        3,
-        200,
-        200
-      ],
-      "expected_evaluation_order": [
-        "rare",
-        "medium",
-        "equal_cost_later",
-        "common"
-      ],
+      "construction_order": ["common", "rare", "medium", "equal_cost_later"],
+      "runtime_costs": [900, 3, 200, 200],
+      "expected_evaluation_order": ["rare", "medium", "equal_cost_later", "common"],
       "equal_cost_rule": "stable construction order"
     },
     {
       "id": "score-cass-regex-fields-constant",
       "conformance": "RankExact",
       "scope": "cass suffix, substring, and complex glob",
-      "fields": [
-        "content",
-        "title"
-      ],
+      "fields": ["content", "title"],
       "matched_score_per_field": 1.0,
       "term_dictionary_expansion_bound": null
     },
@@ -3421,16 +3324,7 @@
           "score": 0.9997
         }
       ],
-      "expected_components": [
-        [
-          "a",
-          "b",
-          "c"
-        ],
-        [
-          "d"
-        ]
-      ],
+      "expected_components": [["a", "b", "c"], ["d"]],
       "rule": "connect adjacent oracle-order scores when relative delta <= 0.0001, then take maximal connected components"
     }
   ],
@@ -3620,10 +3514,7 @@
         "65531-byte dropped token at position 1",
         "tail at position 2"
       ],
-      "expected_retained_positions": [
-        0,
-        2
-      ],
+      "expected_retained_positions": [0, 2],
       "contract": "dropping an oversized token preserves the following token's position gap"
     },
     {
@@ -3726,9 +3617,7 @@
   "surface_coverage": [
     {
       "surface": "schema",
-      "fixture_ids": [
-        "behavior-schema-default-fields"
-      ]
+      "fixture_ids": ["behavior-schema-default-fields"]
     },
     {
       "surface": "analyzers",
@@ -3822,10 +3711,7 @@
     },
     {
       "surface": "collectors",
-      "fixture_ids": [
-        "behavior-collectors",
-        "behavior-pagination-and-limit-zero"
-      ]
+      "fixture_ids": ["behavior-collectors", "behavior-pagination-and-limit-zero"]
     },
     {
       "surface": "scoring",
@@ -3849,39 +3735,27 @@
     },
     {
       "surface": "writer",
-      "fixture_ids": [
-        "behavior-writer-mutations"
-      ]
+      "fixture_ids": ["behavior-writer-mutations"]
     },
     {
       "surface": "reader",
-      "fixture_ids": [
-        "behavior-reader-snapshot"
-      ]
+      "fixture_ids": ["behavior-reader-snapshot"]
     },
     {
       "surface": "snippets",
-      "fixture_ids": [
-        "behavior-snippet-output"
-      ]
+      "fixture_ids": ["behavior-snippet-output"]
     },
     {
       "surface": "segments_durability",
-      "fixture_ids": [
-        "behavior-segments-durability"
-      ]
+      "fixture_ids": ["behavior-segments-durability"]
     },
     {
       "surface": "errors",
-      "fixture_ids": [
-        "behavior-errors-no-panic"
-      ]
+      "fixture_ids": ["behavior-errors-no-panic"]
     },
     {
       "surface": "concurrency",
-      "fixture_ids": [
-        "behavior-concurrency"
-      ]
+      "fixture_ids": ["behavior-concurrency"]
     }
   ]
 }

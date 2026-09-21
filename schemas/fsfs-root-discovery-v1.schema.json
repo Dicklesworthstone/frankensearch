@@ -49,19 +49,12 @@
         "override_modes": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "strict",
-            "permissive"
-          ],
+          "required": ["strict", "permissive"],
           "properties": {
             "strict": {
               "type": "object",
               "additionalProperties": false,
-              "required": [
-                "deny_on_ambiguity",
-                "cross_mount_default",
-                "follow_symlink_default"
-              ],
+              "required": ["deny_on_ambiguity", "cross_mount_default", "follow_symlink_default"],
               "properties": {
                 "deny_on_ambiguity": {
                   "type": "boolean",
@@ -80,10 +73,7 @@
             "permissive": {
               "type": "object",
               "additionalProperties": false,
-              "required": [
-                "allow_explicit_include_override",
-                "audit_reason_codes_required"
-              ],
+              "required": ["allow_explicit_include_override", "audit_reason_codes_required"],
               "properties": {
                 "allow_explicit_include_override": {
                   "type": "boolean",
@@ -143,10 +133,7 @@
           "properties": {
             "symlink_policy": {
               "type": "string",
-              "enum": [
-                "no_follow",
-                "follow_bounded"
-              ]
+              "enum": ["no_follow", "follow_bounded"]
             },
             "max_symlink_depth": {
               "type": "integer",
@@ -158,10 +145,7 @@
             },
             "mount_boundary_policy": {
               "type": "string",
-              "enum": [
-                "stay_on_device",
-                "allow_cross_mount_bounded"
-              ]
+              "enum": ["stay_on_device", "allow_cross_mount_bounded"]
             },
             "max_mount_hops": {
               "type": "integer",
@@ -201,10 +185,7 @@
         },
         "override_mode": {
           "type": "string",
-          "enum": [
-            "strict",
-            "permissive"
-          ]
+          "enum": ["strict", "permissive"]
         },
         "rules_evaluated": {
           "type": "array",
@@ -212,11 +193,7 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "source",
-              "matched",
-              "effect"
-            ],
+            "required": ["source", "matched", "effect"],
             "properties": {
               "source": {
                 "type": "string",
@@ -237,22 +214,14 @@
               },
               "effect": {
                 "type": "string",
-                "enum": [
-                  "include",
-                  "exclude",
-                  "noop"
-                ]
+                "enum": ["include", "exclude", "noop"]
               }
             }
           }
         },
         "final_decision": {
           "type": "string",
-          "enum": [
-            "include",
-            "exclude",
-            "require_opt_in"
-          ]
+          "enum": ["include", "exclude", "require_opt_in"]
         },
         "reason_code": {
           "$ref": "#/$defs/reasonCode"
@@ -275,9 +244,7 @@
                 "const": true
               }
             },
-            "required": [
-              "loop_detected"
-            ]
+            "required": ["loop_detected"]
           },
           "then": {
             "properties": {
@@ -292,14 +259,7 @@
     "guardEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "path",
-        "guard_type",
-        "action_taken",
-        "reason_code"
-      ],
+      "required": ["kind", "v", "path", "guard_type", "action_taken", "reason_code"],
       "properties": {
         "kind": {
           "type": "string",
@@ -315,19 +275,11 @@
         },
         "guard_type": {
           "type": "string",
-          "enum": [
-            "symlink_loop",
-            "mount_boundary",
-            "system_root_block"
-          ]
+          "enum": ["symlink_loop", "mount_boundary", "system_root_block"]
         },
         "action_taken": {
           "type": "string",
-          "enum": [
-            "excluded",
-            "require_opt_in",
-            "stopped_traversal"
-          ]
+          "enum": ["excluded", "require_opt_in", "stopped_traversal"]
         },
         "reason_code": {
           "$ref": "#/$defs/reasonCode"

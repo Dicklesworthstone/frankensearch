@@ -5,28 +5,19 @@
     {
       "tier": "tier1",
       "comparison_mode": "bit_exact",
-      "required_surfaces": [
-        "ranked_output",
-        "degradation_state_transition"
-      ],
+      "required_surfaces": ["ranked_output", "degradation_state_transition"],
       "guarantee": "Identical inputs and state produce bit-identical outputs."
     },
     {
       "tier": "tier2",
       "comparison_mode": "semantic_equivalence",
-      "required_surfaces": [
-        "explain_payload",
-        "evidence_ledger"
-      ],
+      "required_surfaces": ["explain_payload", "evidence_ledger"],
       "guarantee": "Semantically equivalent output with stable meaning."
     },
     {
       "tier": "tier3",
       "comparison_mode": "statistical_tolerance",
-      "required_surfaces": [
-        "embedding_similarity",
-        "performance_measurement"
-      ],
+      "required_surfaces": ["embedding_similarity", "performance_measurement"],
       "guarantee": "Reproducibility within declared statistical tolerance."
     }
   ],

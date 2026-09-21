@@ -1,13 +1,7 @@
 {
   "kind": "fsfs_replay_bundle_contract_definition",
   "v": 1,
-  "supported_scenarios": [
-    "search",
-    "index",
-    "doctor",
-    "audit",
-    "degraded_mode"
-  ],
+  "supported_scenarios": ["search", "index", "doctor", "audit", "degraded_mode"],
   "required_top_level_fields": [
     "kind",
     "v",
@@ -21,21 +15,9 @@
     "expected_phase_outcomes",
     "artifact_manifest"
   ],
-  "required_command_fields": [
-    "client_surface",
-    "argv",
-    "working_dir"
-  ],
-  "required_environment_fields": [
-    "seed",
-    "config_hash",
-    "snapshot"
-  ],
-  "required_expected_outcome_fields": [
-    "phase",
-    "status",
-    "artifact_refs"
-  ],
+  "required_command_fields": ["client_surface", "argv", "working_dir"],
+  "required_environment_fields": ["seed", "config_hash", "snapshot"],
+  "required_expected_outcome_fields": ["phase", "status", "artifact_refs"],
   "required_artifact_fields": [
     "artifact_id",
     "path",

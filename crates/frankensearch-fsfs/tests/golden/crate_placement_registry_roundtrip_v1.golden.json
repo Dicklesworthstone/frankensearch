@@ -190,11 +190,7 @@
       "resolution_deadline": "2026-02-21",
       "resolution_owner": "DustyElk",
       "rule_id": "R-1GFX",
-      "target_paths": [
-        "crates/**",
-        "tests/**",
-        "benches/**"
-      ]
+      "target_paths": ["crates/**", "tests/**", "benches/**"]
     },
     {
       "id_pattern": "^bd-3vw3$",

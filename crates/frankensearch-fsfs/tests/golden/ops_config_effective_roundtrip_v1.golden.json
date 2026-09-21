@@ -2,11 +2,7 @@
   "kind": "ops_config_effective",
   "v": 1,
   "resolved_at_ts": "2026-02-14T01:10:00Z",
-  "source_precedence_applied": [
-    "env",
-    "file",
-    "defaults"
-  ],
+  "source_precedence_applied": ["env", "file", "defaults"],
   "sources": {
     "env_keys_used": [
       "FRANKENSEARCH_OPS_UI_REFRESH_INTERVAL_MS",

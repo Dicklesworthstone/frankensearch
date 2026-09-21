@@ -8,16 +8,7 @@
   "generated_at": "2026-05-08T12:00:00Z",
   "command": {
     "client_surface": "cli",
-    "argv": [
-      "fsfs",
-      "incident-suite",
-      "--mode",
-      "smoke",
-      "--seed",
-      "424242",
-      "--format",
-      "jsonl"
-    ],
+    "argv": ["fsfs", "incident-suite", "--mode", "smoke", "--seed", "424242", "--format", "jsonl"],
     "working_dir": "/data/projects/frankensearch"
   },
   "environment": {
@@ -32,12 +23,7 @@
   "destructive_actions_allowed": false,
   "structured_log": {
     "event_schema": "fsfs.degraded_incident.event.v1",
-    "required_fields": [
-      "seed",
-      "config_hash",
-      "scenario_id",
-      "reason_code"
-    ],
+    "required_fields": ["seed", "config_hash", "scenario_id", "reason_code"],
     "redaction_note": "No raw corpus text or host secrets are emitted"
   },
   "artifact_manifest": {
@@ -65,9 +51,7 @@
         "status": "degraded",
         "preserves_initial_results": true,
         "degradation_stage": "embed_deferred",
-        "artifact_refs": [
-          "incident-quality-embedder-timeout-events"
-        ]
+        "artifact_refs": ["incident-quality-embedder-timeout-events"]
       },
       "replay_command": "fsfs incident-suite replay --scenario incident-quality-embedder-timeout --format jsonl"
     }

@@ -52,17 +52,13 @@
     {
       "phase": "initial",
       "status": "succeeded",
-      "artifact_refs": [
-        "initial-results"
-      ]
+      "artifact_refs": ["initial-results"]
     },
     {
       "phase": "refined",
       "status": "degraded",
       "reason_code": "fsfs.replay.quality_model_unavailable",
-      "artifact_refs": [
-        "refined-results"
-      ]
+      "artifact_refs": ["refined-results"]
     }
   ],
   "artifact_manifest": {

@@ -8,11 +8,7 @@
     "null_byte_hard_binary": true
   },
   "encoding_policy": {
-    "primary_detectors": [
-      "bom",
-      "utf8_validation",
-      "icu_heuristic"
-    ],
+    "primary_detectors": ["bom", "utf8_validation", "icu_heuristic"],
     "normalization": "utf8_nfc",
     "unknown_encoding_action": "quarantine"
   },

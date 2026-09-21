@@ -5,10 +5,7 @@
     "type": "unix_domain_socket",
     "socket_path_template": "${XDG_RUNTIME_DIR}/frankensearch/{instance_id}.sock",
     "framing": "length_prefixed",
-    "supported_codecs": [
-      "msgpack",
-      "cbor"
-    ],
+    "supported_codecs": ["msgpack", "cbor"],
     "auth_mode": "uid_match"
   },
   "fallback_transport": {

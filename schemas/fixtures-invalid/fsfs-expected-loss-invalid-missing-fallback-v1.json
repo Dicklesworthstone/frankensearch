@@ -2,14 +2,8 @@
   "kind": "fsfs_expected_loss_matrix",
   "v": 1,
   "family": "embed",
-  "state_space": [
-    "memory_pressure"
-  ],
-  "action_space": [
-    "embed_now",
-    "embed_defer",
-    "embed_disable"
-  ],
+  "state_space": ["memory_pressure"],
+  "action_space": ["embed_now", "embed_defer", "embed_disable"],
   "loss_rows": [
     {
       "state_id": "memory_pressure",

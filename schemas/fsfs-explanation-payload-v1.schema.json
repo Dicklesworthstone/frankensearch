@@ -22,37 +22,20 @@
     },
     "scoreComponentSource": {
       "type": "string",
-      "enum": [
-        "lexical_bm25",
-        "semantic_fast",
-        "semantic_quality",
-        "rerank"
-      ]
+      "enum": ["lexical_bm25", "semantic_fast", "semantic_quality", "rerank"]
     },
     "policyDomain": {
       "type": "string",
-      "enum": [
-        "query_intent",
-        "retrieval_budget",
-        "query_execution",
-        "degradation",
-        "discovery"
-      ]
+      "enum": ["query_intent", "retrieval_budget", "query_execution", "degradation", "discovery"]
     },
     "rankingPhase": {
       "type": "string",
-      "enum": [
-        "Initial",
-        "Refined"
-      ]
+      "enum": ["Initial", "Refined"]
     },
     "traceLink": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "trace_id",
-        "event_id"
-      ],
+      "required": ["trace_id", "event_id"],
       "properties": {
         "trace_id": {
           "type": "string",
@@ -79,12 +62,7 @@
     "rankMovementSnapshot": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "initial_rank",
-        "refined_rank",
-        "delta",
-        "reason"
-      ],
+      "required": ["initial_rank", "refined_rank", "delta", "reason"],
       "properties": {
         "initial_rank": {
           "type": "integer",
@@ -106,10 +84,7 @@
     "fusionContext": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "fused_score",
-        "in_both_sources"
-      ],
+      "required": ["fused_score", "in_both_sources"],
       "properties": {
         "fused_score": {
           "type": "number"
@@ -274,11 +249,7 @@
         "ranking_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "required_fields",
-            "require_component_breakdown",
-            "phase_enum"
-          ],
+          "required": ["required_fields", "require_component_breakdown", "phase_enum"],
           "properties": {
             "required_fields": {
               "type": "array",
@@ -296,10 +267,7 @@
               "maxItems": 2,
               "items": {
                 "type": "string",
-                "enum": [
-                  "Initial",
-                  "Refined"
-                ]
+                "enum": ["Initial", "Refined"]
               }
             }
           }
@@ -307,10 +275,7 @@
         "policy_decision_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "required_fields",
-            "domain_enum"
-          ],
+          "required": ["required_fields", "domain_enum"],
           "properties": {
             "required_fields": {
               "type": "array",
@@ -352,10 +317,7 @@
         "diagnostics_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "reason_code_prefixes",
-            "confidence_bounds"
-          ],
+          "required": ["reason_code_prefixes", "confidence_bounds"],
           "properties": {
             "reason_code_prefixes": {
               "type": "array",
@@ -386,14 +348,7 @@
     "explanationDecision": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "schema_version",
-        "query",
-        "ranking",
-        "policy_decisions"
-      ],
+      "required": ["kind", "v", "schema_version", "query", "ranking", "policy_decisions"],
       "properties": {
         "kind": {
           "type": "string",

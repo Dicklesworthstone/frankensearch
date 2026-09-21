@@ -4,9 +4,7 @@
   "path": "/home/ubuntu/.aws/credentials",
   "decision": "include",
   "reason_code": "unsafe_sensitive_persist",
-  "sensitive_classes": [
-    "credentials"
-  ],
+  "sensitive_classes": ["credentials"],
   "persist_allowed": true,
   "emit_allowed": true,
   "display_allowed": false,

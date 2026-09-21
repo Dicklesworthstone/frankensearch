@@ -2,10 +2,7 @@
   "kind": "fsfs_high_cost_artifact_decision",
   "v": 1,
   "path": "/workspace/node_modules/pkg/bundle.js",
-  "detectors_fired": [
-    "vendor_tree",
-    "transient_build_artifact"
-  ],
+  "detectors_fired": ["vendor_tree", "transient_build_artifact"],
   "evidence": {
     "size_mb": 12,
     "churn_rate_per_hour": 1,

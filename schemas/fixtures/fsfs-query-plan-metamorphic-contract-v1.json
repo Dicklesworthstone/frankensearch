@@ -6,65 +6,47 @@
   "generator_families": [
     {
       "family": "empty",
-      "seeds": [
-        1
-      ],
+      "seeds": [1],
       "description": "whitespace-only queries exercise the empty no-op path"
     },
     {
       "family": "identifier",
-      "seeds": [
-        2
-      ],
+      "seeds": [2],
       "description": "path and symbol-like queries must keep lexical-biased budgets"
     },
     {
       "family": "short_keyword",
-      "seeds": [
-        3
-      ],
+      "seeds": [3],
       "description": "short keyword queries must keep balanced candidate fanout"
     },
     {
       "family": "natural_language",
-      "seeds": [
-        4
-      ],
+      "seeds": [4],
       "description": "question-shaped queries must keep semantic-biased budgets"
     },
     {
       "family": "negation",
-      "seeds": [
-        5
-      ],
+      "seeds": [5],
       "description": "dash and NOT negation variants must parse to the same exclusions"
     },
     {
       "family": "low_signal_fallback",
-      "seeds": [
-        6
-      ],
+      "seeds": [6],
       "description": "punctuation-only queries must use a lexical-biased safe fallback"
     },
     {
       "family": "malformed_fallback",
-      "seeds": [
-        7
-      ],
+      "seeds": [7],
       "description": "control-character queries must force malformed lexical-only planning"
     },
     {
       "family": "capability_fallback",
-      "seeds": [
-        8
-      ],
+      "seeds": [8],
       "description": "missing semantic capability must degrade to lexical-only execution"
     },
     {
       "family": "tie_break",
-      "seeds": [
-        9
-      ],
+      "seeds": [9],
       "description": "hybrid plans must expose stable RRF tie-break precedence"
     }
   ],

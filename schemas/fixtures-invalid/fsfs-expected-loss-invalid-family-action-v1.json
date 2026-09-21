@@ -2,13 +2,8 @@
   "kind": "fsfs_expected_loss_matrix",
   "v": 1,
   "family": "degrade",
-  "state_space": [
-    "cpu_pressure"
-  ],
-  "action_space": [
-    "degrade_enter",
-    "index_now"
-  ],
+  "state_space": ["cpu_pressure"],
+  "action_space": ["degrade_enter", "index_now"],
   "loss_rows": [
     {
       "state_id": "cpu_pressure",
@@ -33,9 +28,7 @@
       "fallback_action": "degrade_hold",
       "reason_code": "FSFS_FALLBACK_CPU_TRIP",
       "trip_threshold": "2_windows",
-      "applies_to_actions": [
-        "degrade_enter"
-      ]
+      "applies_to_actions": ["degrade_enter"]
     }
   ]
 }

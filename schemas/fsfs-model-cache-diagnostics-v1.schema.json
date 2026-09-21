@@ -21,39 +21,19 @@
     },
     "cacheState": {
       "type": "string",
-      "enum": [
-        "warm",
-        "cold",
-        "missing",
-        "unknown"
-      ]
+      "enum": ["warm", "cold", "missing", "unknown"]
     },
     "downloadStatus": {
       "type": "string",
-      "enum": [
-        "ready",
-        "offline",
-        "disabled",
-        "missing",
-        "failed"
-      ]
+      "enum": ["ready", "offline", "disabled", "missing", "failed"]
     },
     "fallbackPath": {
       "type": "string",
-      "enum": [
-        "quality_model",
-        "fast_embed",
-        "hash_embedder",
-        "lexical_only"
-      ]
+      "enum": ["quality_model", "fast_embed", "hash_embedder", "lexical_only"]
     },
     "severity": {
       "type": "string",
-      "enum": [
-        "info",
-        "warning",
-        "error"
-      ]
+      "enum": ["info", "warning", "error"]
     },
     "redactedModelDir": {
       "type": "string",
@@ -128,12 +108,7 @@
     "stateRule": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "rule_id",
-        "state",
-        "reason_code",
-        "severity"
-      ],
+      "required": ["rule_id", "state", "reason_code", "severity"],
       "properties": {
         "rule_id": {
           "type": "string",
@@ -246,12 +221,7 @@
     "artifactIdentity": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "model_id",
-        "revision",
-        "digest_sha256",
-        "redacted_model_dir"
-      ],
+      "required": ["model_id", "revision", "digest_sha256", "redacted_model_dir"],
       "properties": {
         "model_id": {
           "type": "string",
@@ -272,14 +242,7 @@
     "operatorAdvice": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "reason_code",
-        "severity",
-        "summary",
-        "env_var",
-        "config_knob",
-        "command"
-      ],
+      "required": ["reason_code", "severity", "summary", "env_var", "config_knob", "command"],
       "properties": {
         "reason_code": {
           "$ref": "#/$defs/reasonCode"

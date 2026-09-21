@@ -30,9 +30,7 @@
     {
       "phase": "initial",
       "status": "succeeded",
-      "artifact_refs": [
-        "initial-results"
-      ]
+      "artifact_refs": ["initial-results"]
     }
   ],
   "artifact_manifest": {

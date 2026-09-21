@@ -13,11 +13,7 @@
     "full_hash_threshold_bytes": 65536
   },
   "rename_move_policy": {
-    "identity_keys": [
-      "device",
-      "inode",
-      "content_hash"
-    ],
+    "identity_keys": ["device", "inode", "content_hash"],
     "same_device_rename_preserves_identity": true,
     "cross_device_move": "hash_confirm"
   },

@@ -10,14 +10,8 @@
     {
       "segment_id": "seg_0021",
       "text": "fn main() { println!(\"hello\"); }",
-      "line_range": [
-        1,
-        1
-      ],
-      "byte_range": [
-        0,
-        32
-      ],
+      "line_range": [1, 1],
+      "byte_range": [0, 32],
       "truncated": false,
       "highlights": [
         {
@@ -47,10 +41,7 @@
     "reason_code": "config.invalid_prefix",
     "unicode_safe": true,
     "offsets_verified": true,
-    "emitted_fields": [
-      "event",
-      "reason_code"
-    ]
+    "emitted_fields": ["event", "reason_code"]
   },
   "degraded": {
     "applied": false,

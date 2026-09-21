@@ -32,10 +32,7 @@
     }
   ],
   "rollback": {
-    "trigger_reason_codes": [
-      "release.package.checksum_failed",
-      "upgrade.apply.rollback_triggered"
-    ],
+    "trigger_reason_codes": ["release.package.checksum_failed", "upgrade.apply.rollback_triggered"],
     "procedure": "Restore previous fsfs binary, keep downloaded artifacts for triage, emit deterministic reason code.",
     "user_message": "Upgrade aborted; previous fsfs binary restored."
   },

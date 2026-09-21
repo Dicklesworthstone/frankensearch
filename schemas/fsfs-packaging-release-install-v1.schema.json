@@ -21,10 +21,7 @@
     },
     "buildTool": {
       "type": "string",
-      "enum": [
-        "cargo",
-        "zigbuild"
-      ]
+      "enum": ["cargo", "zigbuild"]
     },
     "archiveFormat": {
       "type": "string",
@@ -82,11 +79,7 @@
     },
     "channel": {
       "type": "string",
-      "enum": [
-        "github_release",
-        "curl_installer",
-        "cargo_crates_io"
-      ]
+      "enum": ["github_release", "curl_installer", "cargo_crates_io"]
     },
     "semverTag": {
       "type": "string",
@@ -196,10 +189,7 @@
         "signature": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "signature_path",
-            "certificate_path"
-          ],
+          "required": ["signature_path", "certificate_path"],
           "properties": {
             "signature_path": {
               "type": "string",
@@ -323,10 +313,7 @@
             "checksum_required": { "type": "boolean", "const": true },
             "signature_strategy": {
               "type": "string",
-              "enum": [
-                "optional_cosign_blob",
-                "required_cosign_blob"
-              ]
+              "enum": ["optional_cosign_blob", "required_cosign_blob"]
             },
             "installer_verify_modes": {
               "type": "array",
@@ -334,10 +321,7 @@
               "uniqueItems": true,
               "items": {
                 "type": "string",
-                "enum": [
-                  "always_checksum",
-                  "explicit_signature_with_verify_flag"
-                ]
+                "enum": ["always_checksum", "explicit_signature_with_verify_flag"]
               }
             },
             "transparency_log_required": { "type": "boolean" }
@@ -392,18 +376,11 @@
         "upgrade_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "version_resolution_order",
-            "supported_upgrade_paths",
-            "rollback_behavior"
-          ],
+          "required": ["version_resolution_order", "supported_upgrade_paths", "rollback_behavior"],
           "properties": {
             "version_resolution_order": {
               "type": "array",
-              "prefixItems": [
-                { "const": "pinned" },
-                { "const": "latest" }
-              ],
+              "prefixItems": [{ "const": "pinned" }, { "const": "latest" }],
               "items": { "type": "string" },
               "minItems": 2
             },
@@ -413,11 +390,7 @@
               "uniqueItems": true,
               "items": {
                 "type": "string",
-                "enum": [
-                  "fresh_install",
-                  "n-1_to_n",
-                  "n-2_to_n"
-                ]
+                "enum": ["fresh_install", "n-1_to_n", "n-2_to_n"]
               }
             },
             "rollback_behavior": {
@@ -431,10 +404,7 @@
               "properties": {
                 "on_verification_failure": {
                   "type": "string",
-                  "enum": [
-                    "abort_without_replacing_binary",
-                    "abort_and_restore_previous_binary"
-                  ]
+                  "enum": ["abort_without_replacing_binary", "abort_and_restore_previous_binary"]
                 },
                 "on_post_install_failure": {
                   "type": "string",
@@ -445,10 +415,7 @@
                 },
                 "downgrade_support": {
                   "type": "string",
-                  "enum": [
-                    "best_effort_with_clear_error",
-                    "unsupported"
-                  ]
+                  "enum": ["best_effort_with_clear_error", "unsupported"]
                 }
               }
             }
@@ -457,11 +424,7 @@
         "ci_jobs": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "release_build_job",
-            "release_publish_job",
-            "crates_publish_job"
-          ],
+          "required": ["release_build_job", "release_publish_job", "crates_publish_job"],
           "properties": {
             "release_build_job": { "type": "string", "const": "release-build" },
             "release_publish_job": { "type": "string", "const": "release-publish" },
@@ -570,11 +533,7 @@
         "verification_summary": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "checksum_verified",
-            "signatures_present",
-            "transparency_log_checked"
-          ],
+          "required": ["checksum_verified", "signatures_present", "transparency_log_checked"],
           "properties": {
             "checksum_verified": { "type": "boolean", "const": true },
             "signatures_present": { "type": "boolean" },
@@ -646,21 +605,11 @@
     "upgradeStep": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "stage",
-        "action",
-        "on_failure_reason_code"
-      ],
+      "required": ["stage", "action", "on_failure_reason_code"],
       "properties": {
         "stage": {
           "type": "string",
-          "enum": [
-            "preflight",
-            "fetch",
-            "verify",
-            "install",
-            "post_install"
-          ]
+          "enum": ["preflight", "fetch", "verify", "install", "post_install"]
         },
         "action": { "type": "string", "minLength": 1 },
         "on_failure_reason_code": { "$ref": "#/$defs/reasonCode" }
@@ -696,11 +645,7 @@
         "rollback": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "trigger_reason_codes",
-            "procedure",
-            "user_message"
-          ],
+          "required": ["trigger_reason_codes", "procedure", "user_message"],
           "properties": {
             "trigger_reason_codes": {
               "type": "array",

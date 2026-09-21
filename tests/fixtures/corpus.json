@@ -7,7 +7,7 @@
       "content": "A checkout pipeline can fail when a moved value is reused after validation. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-15T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 64, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 64, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-002",
@@ -15,7 +15,7 @@
       "content": "Nested structs often need split borrows when mutation and reads happen in one function. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-16T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 63, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 63, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-003",
@@ -23,7 +23,7 @@
       "content": "Parser helpers that return borrowed slices require explicit lifetime relationships to compile cleanly. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-17T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 63, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 63, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-004",
@@ -31,7 +31,7 @@
       "content": "Search traits stay maintainable when generic bounds are minimal and capability-driven. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-18T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-005",
@@ -39,7 +39,7 @@
       "content": "Clear error enums prevent stringly-typed failures from leaking through public search APIs. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-19T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 62, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 62, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-006",
@@ -47,7 +47,7 @@
       "content": "Iterator-heavy code is concise, but explicit loops can simplify debugging and profiling. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-20T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 62, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 62, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-007",
@@ -55,7 +55,7 @@
       "content": "Structured async search needs a propagated Cx so cancellation and budgets stay coherent. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-21T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 63, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 63, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-008",
@@ -63,7 +63,7 @@
       "content": "Two-phase channel sends avoid message loss when tasks are cancelled mid-flight. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-22T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 62, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 62, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-009",
@@ -71,7 +71,7 @@
       "content": "Virtual time and schedule exploration make async regressions reproducible during CI triage. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-23T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-010",
@@ -79,7 +79,7 @@
       "content": "Feature flags should compose cleanly so optional search modules never pull forbidden deps. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-24T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 63, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 63, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-011",
@@ -87,7 +87,7 @@
       "content": "Borrowed strings reduce allocations when parsing repeated identifiers from large corpora. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-25T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-012",
@@ -95,7 +95,7 @@
       "content": "Declarative macros can remove boilerplate while preserving compile-time validation of queries. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-26T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 62, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 62, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-013",
@@ -103,7 +103,7 @@
       "content": "Versioned wire structs protect machine consumers when response schemas evolve quickly. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-27T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-014",
@@ -111,7 +111,7 @@
       "content": "Pedantic lint findings often reveal API friction before users discover the same issues. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-28T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 62, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 62, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-015",
@@ -119,7 +119,7 @@
       "content": "You can achieve strong search throughput while keeping an explicit forbid-unsafe policy. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-29T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-016",
@@ -127,7 +127,7 @@
       "content": "SIMD paths need baseline comparisons to guarantee score parity across CPU families. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-30T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-017",
@@ -135,7 +135,7 @@
       "content": "CPU-parallel scoring and async orchestration should compose without hidden runtime coupling. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-01-31T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 62, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 62, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-018",
@@ -143,7 +143,7 @@
       "content": "NFC normalization avoids false misses when equivalent Unicode strings use different forms. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-02-01T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 62, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 62, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-019",
@@ -151,7 +151,7 @@
       "content": "Flamegraphs clarify whether latency is dominated by embedding, I/O, or ranking loops. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-02-02T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-rust-020",
@@ -159,7 +159,7 @@
       "content": "Release profile choices materially affect vector-search throughput on commodity developer hardware. In this fixture note, a small Rust search service indexes documents and returns ranked results. The writeup explains ownership boundaries, explicit borrowing, and predictable error handling so refactors stay safe. It also mentions tests, tracing spans, and release tuning to keep throughput stable on laptops.",
       "created_at": "2026-02-03T12:00:00Z",
       "doc_type": "rust",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
 
     {
@@ -168,7 +168,7 @@
       "content": "Sentence embeddings map related phrases near each other even when wording differs. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-15T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-002",
@@ -176,7 +176,7 @@
       "content": "Tokenizer choice changes recall because subword boundaries shape available lexical signals. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-16T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-003",
@@ -184,7 +184,7 @@
       "content": "Mean pooling is simple, stable, and often strong for short support documents. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-17T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-004",
@@ -192,7 +192,7 @@
       "content": "L2 normalization makes cosine scoring comparable across documents with different magnitudes. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-18T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-005",
@@ -200,7 +200,7 @@
       "content": "Portable ONNX inference is practical when model files and tokenizer assets are pinned. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-19T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-006",
@@ -208,7 +208,7 @@
       "content": "Quantization can halve memory while preserving ranking quality on many retrieval tasks. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-20T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-007",
@@ -216,7 +216,7 @@
       "content": "Fast-tier and quality-tier models need explicit budgets to meet progressive UX targets. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-21T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-008",
@@ -224,7 +224,7 @@
       "content": "Candidate recall improves when lexical and semantic engines feed a shared fusion stage. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-22T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-009",
@@ -232,7 +232,7 @@
       "content": "Second-pass rerankers recover nuance when first-pass scores are too coarse. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-23T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-010",
@@ -240,7 +240,7 @@
       "content": "Rank-based fusion resists score-scale drift better than naive weighted summation. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-24T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-011",
@@ -248,7 +248,7 @@
       "content": "Model adaptation works best when noisy labels are filtered before expensive runs. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-25T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-012",
@@ -256,7 +256,7 @@
       "content": "Validation drift appears when benchmark queries are too similar to training examples. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-26T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-013",
@@ -264,7 +264,7 @@
       "content": "Recall audits compare top-k neighbors against exact baselines on frozen fixtures. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-27T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-014",
@@ -272,7 +272,7 @@
       "content": "Approximate nearest neighbor settings shift the speed and recall frontier measurably. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-28T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-015",
@@ -280,7 +280,7 @@
       "content": "Batch size tuning must balance throughput gains against tail latency inflation. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-29T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-016",
@@ -288,7 +288,7 @@
       "content": "Query drift can silently reduce relevance unless evaluation slices track new intent. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-30T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-017",
@@ -296,7 +296,7 @@
       "content": "Score calibration helps downstream consumers compare confidence across query families. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-01-31T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-018",
@@ -304,7 +304,7 @@
       "content": "Regularization choices influence generalization more than single benchmark improvements suggest. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-02-01T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-019",
@@ -312,7 +312,7 @@
       "content": "Per-request model metrics speed incident response when latency suddenly doubles. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-02-02T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-ml-020",
@@ -320,7 +320,7 @@
       "content": "Evaluation packs should pin models, fixtures, seeds, and hardware notes for repeatability. This fixture note follows a local retrieval stack that tokenizes text, computes embeddings, and fuses lexical and semantic signals. It highlights evaluation habits, including clear baselines, latency tracking, and regression tests. The examples keep model assumptions explicit so quality changes are measurable rather than anecdotal.",
       "created_at": "2026-02-03T13:00:00Z",
       "doc_type": "ml",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
 
     {
@@ -329,7 +329,7 @@
       "content": "A minimal compose stack is easiest to debug when indexing and API logs diverge. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-15T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 62, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 62, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-002",
@@ -337,7 +337,7 @@
       "content": "Rollout windows should include clear abort criteria and one-command rollback paths. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-16T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-003",
@@ -345,7 +345,7 @@
       "content": "TLS termination belongs in a repeatable config with strict cipher and timeout defaults. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-17T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-004",
@@ -353,7 +353,7 @@
       "content": "Backups are only real after restore drills prove recovery point and recovery time. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-18T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-005",
@@ -361,7 +361,7 @@
       "content": "Retention budgets prevent log growth from starving indexing and query caches. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-19T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-006",
@@ -369,7 +369,7 @@
       "content": "Crash loops are faster to isolate when startup probes and config checks are explicit. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-20T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-007",
@@ -377,7 +377,7 @@
       "content": "Dashboards should separate p50 and p99 so bursty regressions are visible quickly. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-21T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-008",
@@ -385,7 +385,7 @@
       "content": "Paged alerts need ownership metadata so incidents never stall on handoff confusion. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-22T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-009",
@@ -393,7 +393,7 @@
       "content": "Log rotation frequency should match disk pressure and troubleshooting retention needs. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-23T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-010",
@@ -401,7 +401,7 @@
       "content": "Backpressure policies should degrade gracefully before memory pressure cascades into outages. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-24T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-011",
@@ -409,7 +409,7 @@
       "content": "Service boundaries are safer when ingress, egress, and admin paths are separated. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-25T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-012",
@@ -417,7 +417,7 @@
       "content": "Pool limits should reflect workload concurrency and database recovery characteristics. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-26T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-013",
@@ -425,7 +425,7 @@
       "content": "Right-sized requests prevent noisy neighbors while preserving cluster utilization efficiency. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-27T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-014",
@@ -433,7 +433,7 @@
       "content": "Healthchecks should fail fast for broken dependencies but tolerate short warmups. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-28T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-015",
@@ -441,7 +441,7 @@
       "content": "Restore workflows should include checksum verification and post-restore query smoke tests. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-29T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-016",
@@ -449,7 +449,7 @@
       "content": "Certificate rotation should be rehearsed before expiry week to avoid emergency change risk. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-30T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 61, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 61, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-017",
@@ -457,7 +457,7 @@
       "content": "Policy checks catch unsafe deploy specs before they reach production clusters. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-01-31T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-018",
@@ -465,7 +465,7 @@
       "content": "Ingress routing rules need explicit host and path ownership to avoid collisions. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-02-01T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-019",
@@ -473,7 +473,7 @@
       "content": "Reliable timelines combine logs, traces, and alerts into one operator-readable narrative. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-02-02T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-sysadmin-020",
@@ -481,7 +481,7 @@
       "content": "Capacity plans should include index growth curves and worst-case reindex windows. This fixture note describes practical operations steps for a small production service. It covers reproducible configuration, rollout safety, observability, and incident response with concrete commands. The goal is predictable behavior under load, clear ownership during outages, fast recovery using documented runbooks, and small reversible changes.",
       "created_at": "2026-02-03T14:00:00Z",
       "doc_type": "sysadmin",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
 
     {
@@ -490,7 +490,7 @@
       "content": "Consistent cookies start with butter temperature control and measured mixing time. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-15T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-002",
@@ -498,7 +498,7 @@
       "content": "A short rest in the fridge deepens flavor and improves cookie spread control. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-16T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-003",
@@ -506,7 +506,7 @@
       "content": "Dry skin and even salting are the key steps for crisp roast chicken. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-17T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-004",
@@ -514,7 +514,7 @@
       "content": "A balanced marinade uses acid, fat, salt, and aromatics in repeatable ratios. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-18T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-005",
@@ -522,7 +522,7 @@
       "content": "Pan material and oven position can change browning more than sugar adjustments. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-19T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-006",
@@ -530,7 +530,7 @@
       "content": "Starter strength improves with consistent feed intervals and clear hydration tracking. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-20T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-007",
@@ -538,7 +538,7 @@
       "content": "Keeping legumes, grains, and stock on hand makes weeknight cooking predictable. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-21T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-008",
@@ -546,7 +546,7 @@
       "content": "Pressure cookers reduce prep time when soak plans and seasoning stages are clear. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-22T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-009",
@@ -554,7 +554,7 @@
       "content": "Hydration percentage affects shaping ease, crust color, and final crumb openness. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-23T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-010",
@@ -562,7 +562,7 @@
       "content": "Meal prep is easier when portions, cooling, and storage labels are standardized. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-24T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-011",
@@ -570,7 +570,7 @@
       "content": "Dark and light brown sugar produce noticeably different cookie moisture and chew. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-25T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-012",
@@ -578,7 +578,7 @@
       "content": "Egg dishes improve when heat is lowered early and carryover cooking is respected. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-26T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-013",
@@ -586,7 +586,7 @@
       "content": "Altitude changes require flour and liquid tweaks to preserve texture consistency. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-27T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-014",
@@ -594,7 +594,7 @@
       "content": "Batching sauces and proteins reduces weekday stress and cuts food waste. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-28T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-015",
@@ -602,7 +602,7 @@
       "content": "Uniform cuts and pan spacing are the fastest route to even roasted vegetables. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-29T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-016",
@@ -610,7 +610,7 @@
       "content": "Texture defects often trace to mixing order, flour measurement, or oven overshoot. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-30T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-017",
@@ -618,7 +618,7 @@
       "content": "Tracking dough hydration in percentages improves repeatability across flour brands and seasons. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-01-31T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-018",
@@ -626,7 +626,7 @@
       "content": "Protein cut and acid level determine safe and effective marinade hold times. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-02-01T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-019",
@@ -634,7 +634,7 @@
       "content": "Cooling racks and airtight storage preserve texture longer than countertop trays alone. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-02-02T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-cooking-020",
@@ -642,7 +642,7 @@
       "content": "One-pot workflows are reliable when aromatics, starch, and liquid additions are staged. This fixture note describes a home-kitchen workflow with ingredient prep, timing control, and flavor balancing. It explains why each step matters, how to recover if texture drifts, and how to serve consistently for weekday meals. Instructions stay specific enough for repeatable outcomes without requiring specialty equipment.",
       "created_at": "2026-02-03T15:00:00Z",
       "doc_type": "cooking",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
 
     {
@@ -651,7 +651,7 @@
       "content": "A local embedding API needs both model hygiene and container rollout discipline. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-15T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-002",
@@ -659,7 +659,7 @@
       "content": "Batching dinner prep and message queues both fail when backpressure signals are ignored. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-16T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-003",
@@ -667,7 +667,7 @@
       "content": "Pinned model assets and pantry staples both benefit from explicit version labels. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-17T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-004",
@@ -675,7 +675,7 @@
       "content": "Progressive rollout checkpoints resemble meal prep stages that prevent last-minute failure. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-18T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-005",
@@ -683,7 +683,7 @@
       "content": "A reranker pass mirrors taste testing after an initial recipe shortlist. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-19T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-006",
@@ -691,7 +691,7 @@
       "content": "Unicode handling matters for both source code identifiers and multilingual recipe titles. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-20T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 59, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 59, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-007",
@@ -699,7 +699,7 @@
       "content": "Mise en place maps cleanly to ownership boundaries that reduce accidental mutation. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-21T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-008",
@@ -707,7 +707,7 @@
       "content": "Alert budgets and oven timers both prevent quality regressions before they compound. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-22T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-009",
@@ -715,7 +715,7 @@
       "content": "Recovery drills in ops resemble batch-cooked freezer plans for bad weeks. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-23T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-010",
@@ -723,7 +723,7 @@
       "content": "Ingredient substitutions behave like semantic matches when exact terms are unavailable. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-24T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-011",
@@ -731,7 +731,7 @@
       "content": "Fast command palettes and prep checklists both reduce context-switching mistakes. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-25T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 56, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 56, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-012",
@@ -739,7 +739,7 @@
       "content": "Vector similarity can cluster recipe notes the way it clusters search documents. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-26T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-013",
@@ -747,7 +747,7 @@
       "content": "Long simmers and long borrows both require clear boundaries to avoid collapse. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-27T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-014",
@@ -755,7 +755,7 @@
       "content": "Release checklists resemble dinner service prep where timing and sequence matter. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-28T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-015",
@@ -763,7 +763,7 @@
       "content": "Taste calibration sessions mirror observability reviews that catch drift before incidents. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-29T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-016",
@@ -771,7 +771,7 @@
       "content": "Schema versioning and pantry rotation both prevent stale inventory from causing surprises. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-30T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-017",
@@ -779,7 +779,7 @@
       "content": "Regularization in models resembles simplifying a recipe to avoid overfitting taste. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-01-31T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-018",
@@ -787,7 +787,7 @@
       "content": "Tight SIMD loops and consistent knife skills both depend on disciplined repetition. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-02-01T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 58, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 58, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-019",
@@ -795,7 +795,7 @@
       "content": "Experiment logs and menu notes both improve decisions when context is preserved. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-02-02T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-mixed-020",
@@ -803,7 +803,7 @@
       "content": "Fast-only degrade mode mirrors weeknight cooking plans that prioritize reliability over novelty. This fixture note intentionally blends software and non-software contexts to test cross-topic ranking behavior. It combines concrete technical terms with everyday language, then explains how to separate intent from noise. The examples are designed for hybrid retrieval systems that must balance keyword precision with semantic similarity.",
       "created_at": "2026-02-03T16:00:00Z",
       "doc_type": "mixed",
-      "metadata": {"word_count": 60, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 60, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-code-001",
@@ -811,7 +811,7 @@
       "content": "This code-style fixture represents a small Rust module that writes quantized vectors to disk and verifies offsets after each append. It includes a constructor, a write_record method, and an integrity check helper. The surrounding notes describe why deterministic ordering and clear error variants matter when tests compare binary output across runs.",
       "created_at": "2026-02-04T16:00:00Z",
       "doc_type": "code",
-      "metadata": {"word_count": 56, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 56, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-code-002",
@@ -819,7 +819,7 @@
       "content": "This code-style fixture models a Python script that loads tokenizer assets, runs ONNX inference, and prints latency percentiles for a batch of queries. It intentionally references ONNX Runtime APIs and argument parsing patterns seen in tooling scripts. The description emphasizes reproducibility, pinned model revisions, and explicit fallback behavior when files are missing.",
       "created_at": "2026-02-05T16:00:00Z",
       "doc_type": "code",
-      "metadata": {"word_count": 57, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 57, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-config-002",
@@ -827,7 +827,7 @@
       "content": "This config-style fixture mirrors a production TOML file with sections for index paths, cache limits, telemetry sampling, and retention windows. It includes health check thresholds and degrade-mode toggles used by operators. The prose around the snippet explains precedence rules between environment variables, command flags, and committed defaults for reproducible behavior.",
       "created_at": "2026-02-06T16:00:00Z",
       "doc_type": "config",
-      "metadata": {"word_count": 55, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 55, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-adversarial-001",
@@ -835,7 +835,12 @@
       "content": "",
       "created_at": "2026-02-04T17:00:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 0, "reading_level": "none", "language": "en", "adversarial_type": "empty"}
+      "metadata": {
+        "word_count": 0,
+        "reading_level": "none",
+        "language": "en",
+        "adversarial_type": "empty"
+      }
     },
     {
       "doc_id": "test-adversarial-002",
@@ -843,7 +848,12 @@
       "content": "x",
       "created_at": "2026-02-04T17:01:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 1, "reading_level": "none", "language": "en", "adversarial_type": "single_char"}
+      "metadata": {
+        "word_count": 1,
+        "reading_level": "none",
+        "language": "en",
+        "adversarial_type": "single_char"
+      }
     },
     {
       "doc_id": "test-adversarial-003",
@@ -851,7 +861,12 @@
       "content": "the a an is are was were be been being have has had do does did will would shall should can could may might must the of in to for with on at by from",
       "created_at": "2026-02-04T17:02:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 35, "reading_level": "none", "language": "en", "adversarial_type": "stopwords_only"}
+      "metadata": {
+        "word_count": 35,
+        "reading_level": "none",
+        "language": "en",
+        "adversarial_type": "stopwords_only"
+      }
     },
     {
       "doc_id": "test-adversarial-004",
@@ -859,7 +874,12 @@
       "content": "\u4f60\u597d\u4e16\u754c \u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645 \ud83d\ude80\ud83c\udf1f\ud83d\udd25 caf\u00e9 na\u00efve r\u00e9sum\u00e9 \u00fc\u00f6\u00e4\u00df Za\u0142\u00f3\u017c g\u0119\u015bl\u0105 ja\u017a\u0144 \u0c28\u0c2e\u0c38\u0c4d\u0c15\u0c3e\u0c30",
       "created_at": "2026-02-04T17:03:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 10, "reading_level": "none", "language": "multi", "adversarial_type": "unicode_stress"}
+      "metadata": {
+        "word_count": 10,
+        "reading_level": "none",
+        "language": "multi",
+        "adversarial_type": "unicode_stress"
+      }
     },
     {
       "doc_id": "test-adversarial-005",
@@ -867,7 +887,12 @@
       "content": "<script>alert('xss')</script><img src=x onerror=alert(1)><b>bold</b>&amp;&lt;&gt;&quot;",
       "created_at": "2026-02-04T17:04:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 5, "reading_level": "none", "language": "en", "adversarial_type": "html_injection"}
+      "metadata": {
+        "word_count": 5,
+        "reading_level": "none",
+        "language": "en",
+        "adversarial_type": "html_injection"
+      }
     },
     {
       "doc_id": "test-adversarial-006",
@@ -875,7 +900,12 @@
       "content": "DROP TABLE documents; SELECT * FROM users WHERE 1=1; INSERT INTO logs VALUES ('pwned'); DELETE FROM embeddings; UNION SELECT password FROM credentials--",
       "created_at": "2026-02-04T17:05:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 20, "reading_level": "none", "language": "en", "adversarial_type": "sql_like"}
+      "metadata": {
+        "word_count": 20,
+        "reading_level": "none",
+        "language": "en",
+        "adversarial_type": "sql_like"
+      }
     },
     {
       "doc_id": "test-adversarial-007",
@@ -883,7 +913,12 @@
       "content": "This document has identical content to test deduplication handling. The search system should handle documents with the same body text but different identifiers gracefully without crashing or producing incorrect results.",
       "created_at": "2026-02-04T17:06:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 31, "reading_level": "beginner", "language": "en", "adversarial_type": "duplicate_a"}
+      "metadata": {
+        "word_count": 31,
+        "reading_level": "beginner",
+        "language": "en",
+        "adversarial_type": "duplicate_a"
+      }
     },
     {
       "doc_id": "test-adversarial-008",
@@ -891,7 +926,12 @@
       "content": "This document has identical content to test deduplication handling. The search system should handle documents with the same body text but different identifiers gracefully without crashing or producing incorrect results.",
       "created_at": "2026-02-04T17:07:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 31, "reading_level": "beginner", "language": "en", "adversarial_type": "duplicate_b"}
+      "metadata": {
+        "word_count": 31,
+        "reading_level": "beginner",
+        "language": "en",
+        "adversarial_type": "duplicate_b"
+      }
     },
     {
       "doc_id": "test-adversarial-009",
@@ -899,7 +939,12 @@
       "content": "  word1    \t\t   word2  \n\n\n\n\n   word3     word4          word5  \r\n\r\n  word6  ",
       "created_at": "2026-02-04T17:08:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 6, "reading_level": "none", "language": "en", "adversarial_type": "whitespace"}
+      "metadata": {
+        "word_count": 6,
+        "reading_level": "none",
+        "language": "en",
+        "adversarial_type": "whitespace"
+      }
     },
     {
       "doc_id": "test-adversarial-010",
@@ -907,7 +952,7 @@
       "content": "This adversarial fixture combines multilingual text, confusable characters, and escaped control bytes in one payload to validate canonicalization safety. It is designed to ensure tokenization remains deterministic, indexing does not panic, and query matching still produces stable behavior. The content intentionally mixes normal prose with edge symbols that frequently break naive parsers.",
       "created_at": "2026-02-07T16:00:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 54, "reading_level": "advanced", "language": "en"}
+      "metadata": { "word_count": 54, "reading_level": "advanced", "language": "en" }
     },
     {
       "doc_id": "test-adversarial-011",
@@ -915,7 +960,12 @@
       "content": "Die Vektorsuche verwendet Einbettungen, um semantisch \u00e4hnliche Dokumente zu finden. Jedes Dokument wird in einen hochdimensionalen Vektor umgewandelt. Die Kosinusn\u00e4he zwischen Vektoren misst die semantische \u00c4hnlichkeit. Hybride Suche kombiniert lexikalische BM25-Ergebnisse mit semantischen Vektortreffen durch Reciprocal Rank Fusion.",
       "created_at": "2026-02-04T17:10:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 38, "reading_level": "intermediate", "language": "de", "adversarial_type": "multilingual_de"}
+      "metadata": {
+        "word_count": 38,
+        "reading_level": "intermediate",
+        "language": "de",
+        "adversarial_type": "multilingual_de"
+      }
     },
     {
       "doc_id": "test-adversarial-012",
@@ -923,7 +973,7 @@
       "content": "This adversarial fixture simulates a noisy burst of repeated timestamped log lines with interleaved errors and partial stack traces. The text is intentionally repetitive to test scoring stability under high term frequency and low semantic value. It should remain indexable while avoiding pathological ranking behavior for normal user queries during sustained production incident replay sessions.",
       "created_at": "2026-02-08T16:00:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 53, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 53, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-adversarial-013",
@@ -931,7 +981,7 @@
       "content": "This adversarial fixture contains markdown-like narration wrapped around dense code blocks, table syntax, and frontmatter-style headers. It exists to test canonicalizer behavior when prose is minimal and markup dominates the payload. Correct handling means preserving useful identifiers while avoiding malformed token streams and maintaining deterministic normalization output across repeated index and query runs.",
       "created_at": "2026-02-09T16:00:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 51, "reading_level": "intermediate", "language": "en"}
+      "metadata": { "word_count": 51, "reading_level": "intermediate", "language": "en" }
     },
     {
       "doc_id": "test-adversarial-014",
@@ -939,7 +989,12 @@
       "content": "La recherche s\u00e9mantique utilise des mod\u00e8les d'incorporation pour repr\u00e9senter le texte sous forme de vecteurs denses. La similarit\u00e9 cosinus entre vecteurs mesure la proximit\u00e9 s\u00e9mantique. Les transformeurs comme BERT produisent des repr\u00e9sentations contextuelles. La fusion par rang r\u00e9ciproque combine les r\u00e9sultats lexicaux et s\u00e9mantiques.",
       "created_at": "2026-02-04T17:13:00Z",
       "doc_type": "adversarial",
-      "metadata": {"word_count": 39, "reading_level": "intermediate", "language": "fr", "adversarial_type": "multilingual_fr"}
+      "metadata": {
+        "word_count": 39,
+        "reading_level": "intermediate",
+        "language": "fr",
+        "adversarial_type": "multilingual_fr"
+      }
     },
     {
       "doc_id": "test-code-003",
@@ -947,7 +1002,7 @@
       "content": "#!/bin/bash\nset -euo pipefail\n\necho \"Building frankensearch...\"\ncargo fmt --all -- --check\ncargo clippy --workspace --all-targets -- -D warnings\ncargo test --workspace\ncargo build --release --workspace\n\necho \"Running benchmarks...\"\ncargo bench --workspace -- --output-format bencher\n\necho \"Build complete. Artifacts in target/release/\"",
       "created_at": "2026-02-04T17:14:00Z",
       "doc_type": "code",
-      "metadata": {"word_count": 25, "language": "bash", "adversarial_type": "code_file"}
+      "metadata": { "word_count": 25, "language": "bash", "adversarial_type": "code_file" }
     },
     {
       "doc_id": "test-config-001",
@@ -955,7 +1010,7 @@
       "content": "[search]\nquality_weight = 0.7\nrrf_k = 60.0\ncandidate_multiplier = 3\nquality_timeout_ms = 500\nfast_only = false\n\n[embedder.fast]\nmodel = \"potion-multilingual-128M\"\ndimension = 256\n\n[embedder.quality]\nmodel = \"all-MiniLM-L6-v2\"\ndimension = 384\n\n[index]\nquantization = \"f16\"\nalignment = 64\nmrl_search_dims = 0\n\n[lexical]\nengine = \"tantivy\"\nk1 = 1.2\nb = 0.75",
       "created_at": "2026-02-04T17:15:00Z",
       "doc_type": "config",
-      "metadata": {"word_count": 30, "language": "toml", "adversarial_type": "config_file"}
+      "metadata": { "word_count": 30, "language": "toml", "adversarial_type": "config_file" }
     },
     {
       "doc_id": "test-log-001",
@@ -963,7 +1018,7 @@
       "content": "2026-01-15T10:23:45.123Z INFO search::server: Starting search server on 0.0.0.0:8080\n2026-01-15T10:23:45.456Z INFO search::index: Loading vector index path=\"/data/index.fsvi\" records=50000\n2026-01-15T10:23:46.789Z INFO search::embed: Model loaded model=\"potion-128M\" dim=256 latency_ms=1333\n2026-01-15T10:23:47.012Z WARN search::embed: Quality model not available, falling back to fast-only mode\n2026-01-15T10:24:01.234Z INFO search::query: Search completed query=\"rust ownership\" phase=Initial results=10 latency_ms=12.3\n2026-01-15T10:24:05.567Z ERROR search::query: Search timeout query=\"very complex natural language query about machine learning\" budget_ms=500 elapsed_ms=501\n2026-01-15T10:24:10.890Z INFO search::query: Search completed query=\"docker compose\" phase=Refined results=10 latency_ms=145.6",
       "created_at": "2026-02-04T17:16:00Z",
       "doc_type": "log",
-      "metadata": {"word_count": 80, "language": "log", "adversarial_type": "log_file"}
+      "metadata": { "word_count": 80, "language": "log", "adversarial_type": "log_file" }
     }
   ]
 }

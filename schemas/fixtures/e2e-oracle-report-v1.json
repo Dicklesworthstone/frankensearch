@@ -13,7 +13,11 @@
           { "oracle_id": "ORACLE_NO_DUPLICATES", "outcome": "pass", "context": "" },
           { "oracle_id": "ORACLE_MONOTONIC_SCORES", "outcome": "pass", "context": "" },
           { "oracle_id": "ORACLE_PHASE1_ALWAYS_YIELDS", "outcome": "pass", "context": "" },
-          { "oracle_id": "ORACLE_EXPLAIN_PRESENT", "outcome": "skip", "context": "explain disabled for baseline lane" }
+          {
+            "oracle_id": "ORACLE_EXPLAIN_PRESENT",
+            "outcome": "skip",
+            "context": "explain disabled for baseline lane"
+          }
         ],
         "pass_count": 3,
         "fail_count": 0,

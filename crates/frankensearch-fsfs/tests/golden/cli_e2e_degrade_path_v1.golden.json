@@ -3,14 +3,7 @@
   "scenario": {
     "id": "cli-degrade-path",
     "kind": "degrade",
-    "args": [
-      "search",
-      "latency fallback lane",
-      "--profile",
-      "degraded",
-      "--format",
-      "json"
-    ],
+    "args": ["search", "latency fallback lane", "--profile", "degraded", "--format", "json"],
     "expected_exit_code": 0,
     "expected_reason_code": "e2e.cli.degrade_path",
     "summary": "Exercise degraded query path and reason-coded status"
@@ -182,14 +175,7 @@
         "payload": {
           "scenario_id": "cli-degrade-path",
           "scenario_kind": "degrade",
-          "args": [
-            "search",
-            "latency fallback lane",
-            "--profile",
-            "degraded",
-            "--format",
-            "json"
-          ],
+          "args": ["search", "latency fallback lane", "--profile", "degraded", "--format", "json"],
           "expected_reason_code": "e2e.cli.degrade_path"
         }
       }

@@ -32,20 +32,11 @@
     },
     "decision": {
       "type": "string",
-      "enum": [
-        "include",
-        "skip",
-        "defer"
-      ]
+      "enum": ["include", "skip", "defer"]
     },
     "redactionAction": {
       "type": "string",
-      "enum": [
-        "drop_content",
-        "hash_path",
-        "mask_excerpt",
-        "metadata_only"
-      ]
+      "enum": ["drop_content", "hash_path", "mask_excerpt", "metadata_only"]
     },
     "contractDefinition": {
       "type": "object",
@@ -280,15 +271,10 @@
           "if": {
             "properties": {
               "decision": {
-                "enum": [
-                  "skip",
-                  "defer"
-                ]
+                "enum": ["skip", "defer"]
               }
             },
-            "required": [
-              "decision"
-            ]
+            "required": ["decision"]
           },
           "then": {
             "properties": {
@@ -308,14 +294,10 @@
                 "const": "privacy.false_positive.suppressed"
               }
             },
-            "required": [
-              "reason_code"
-            ]
+            "required": ["reason_code"]
           },
           "then": {
-            "required": [
-              "false_positive_suppression_id"
-            ]
+            "required": ["false_positive_suppression_id"]
           }
         }
       ]
@@ -355,13 +337,7 @@
     "overrideEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "requested_decision",
-        "approved",
-        "reason",
-        "reason_code",
-        "expires_at"
-      ],
+      "required": ["requested_decision", "approved", "reason", "reason_code", "expires_at"],
       "properties": {
         "requested_decision": {
           "$ref": "#/$defs/decision"

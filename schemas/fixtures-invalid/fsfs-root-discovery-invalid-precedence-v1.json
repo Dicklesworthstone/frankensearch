@@ -1,9 +1,7 @@
 {
   "kind": "fsfs_root_discovery_contract_definition",
   "v": 1,
-  "default_roots": [
-    "/home/ubuntu"
-  ],
+  "default_roots": ["/home/ubuntu"],
   "override_modes": {
     "strict": {
       "deny_on_ambiguity": true,

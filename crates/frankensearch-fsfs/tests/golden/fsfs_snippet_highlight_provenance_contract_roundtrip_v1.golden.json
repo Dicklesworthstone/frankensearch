@@ -37,11 +37,7 @@
       "unicode_safe",
       "offsets_verified"
     ],
-    "reason_code_prefixes": [
-      "snippet.",
-      "highlight.",
-      "provenance."
-    ]
+    "reason_code_prefixes": ["snippet.", "highlight.", "provenance."]
   },
   "performance_targets": {
     "max_extraction_ms_per_result": 1.0

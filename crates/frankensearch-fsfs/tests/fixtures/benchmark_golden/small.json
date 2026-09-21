@@ -27,8 +27,5 @@
     "searching_peak_memory_mb": 250,
     "index_size_bytes_per_document": 2080
   },
-  "notes": [
-    "Mid-size mono-repo profile",
-    "Primary CI comparator for perf drift"
-  ]
+  "notes": ["Mid-size mono-repo profile", "Primary CI comparator for perf drift"]
 }

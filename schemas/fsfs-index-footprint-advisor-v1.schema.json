@@ -13,38 +13,19 @@
   "$defs": {
     "domain": {
       "type": "string",
-      "enum": [
-        "vector_index",
-        "lexical_index",
-        "metadata",
-        "model_cache",
-        "artifact"
-      ]
+      "enum": ["vector_index", "lexical_index", "metadata", "model_cache", "artifact"]
     },
     "scenario": {
       "type": "string",
-      "enum": [
-        "small",
-        "fragmented",
-        "oversized"
-      ]
+      "enum": ["small", "fragmented", "oversized"]
     },
     "action": {
       "type": "string",
-      "enum": [
-        "compaction",
-        "rebuild",
-        "retention",
-        "feature_adjustment"
-      ]
+      "enum": ["compaction", "rebuild", "retention", "feature_adjustment"]
     },
     "risk": {
       "type": "string",
-      "enum": [
-        "low",
-        "medium",
-        "high"
-      ]
+      "enum": ["low", "medium", "high"]
     },
     "reasonCode": {
       "type": "string",
@@ -90,10 +71,7 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "enum": [
-              "review_diagnostic_output",
-              "select_supported_mutation_workflow"
-            ]
+            "enum": ["review_diagnostic_output", "select_supported_mutation_workflow"]
           }
         },
         "mutation_class": {
@@ -261,10 +239,7 @@
           "const": false
         },
         "budget_bytes": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 1
         },
         "total_bytes": {
@@ -293,13 +268,7 @@
     "domainFootprint": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "domain",
-        "bytes",
-        "reclaimable_bytes",
-        "fragmentation_per_mille",
-        "source"
-      ],
+      "required": ["domain", "bytes", "reclaimable_bytes", "fragmentation_per_mille", "source"],
       "properties": {
         "domain": {
           "$ref": "#/$defs/domain"
@@ -373,11 +342,7 @@
     "summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "recommendation_count",
-        "projected_savings_bytes",
-        "highest_risk"
-      ],
+      "required": ["recommendation_count", "projected_savings_bytes", "highest_risk"],
       "properties": {
         "recommendation_count": {
           "type": "integer",

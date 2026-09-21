@@ -2,34 +2,16 @@
   "kind": "fsfs_config_effective",
   "v": 1,
   "resolved_at_ts": "2026-02-14T03:30:00Z",
-  "source_precedence_applied": [
-    "cli",
-    "env",
-    "file",
-    "defaults"
-  ],
+  "source_precedence_applied": ["cli", "env", "file", "defaults"],
   "sources": {
-    "cli_flags_used": [
-      "--roots",
-      "--limit"
-    ],
-    "env_keys_used": [
-      "FSFS_SEARCH_DEFAULT_LIMIT",
-      "FSFS_TUI_THEME"
-    ],
+    "cli_flags_used": ["--roots", "--limit"],
+    "env_keys_used": ["FSFS_SEARCH_DEFAULT_LIMIT", "FSFS_TUI_THEME"],
     "config_file_used": "/home/test/.config/fsfs/config.toml"
   },
   "values": {
     "discovery": {
-      "roots": [
-        "/home/test",
-        "/opt/projects"
-      ],
-      "exclude_patterns": [
-        ".git",
-        "node_modules",
-        "target"
-      ],
+      "roots": ["/home/test", "/opt/projects"],
+      "exclude_patterns": [".git", "node_modules", "target"],
       "text_selection_mode": "blocklist",
       "binary_blocklist_extensions": [
         ".exe",

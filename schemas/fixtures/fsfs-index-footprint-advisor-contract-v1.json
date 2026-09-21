@@ -4,19 +4,8 @@
   "dry_run_only": true,
   "automatic_deletion_allowed": false,
   "policy_version": "fsfs-index-footprint-advisor-policy-v1",
-  "required_domains": [
-    "vector_index",
-    "lexical_index",
-    "metadata",
-    "model_cache",
-    "artifact"
-  ],
-  "required_actions": [
-    "compaction",
-    "rebuild",
-    "retention",
-    "feature_adjustment"
-  ],
+  "required_domains": ["vector_index", "lexical_index", "metadata", "model_cache", "artifact"],
+  "required_actions": ["compaction", "rebuild", "retention", "feature_adjustment"],
   "policy": {
     "small_index_max_bytes": 134217728,
     "fragmentation_threshold_per_mille": 200,

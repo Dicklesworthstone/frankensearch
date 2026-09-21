@@ -4,13 +4,7 @@
   "title": "frankensearch Unified E2E Artifact Envelope v1",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "v",
-    "schema",
-    "run_id",
-    "ts",
-    "body"
-  ],
+  "required": ["v", "schema", "run_id", "ts", "body"],
   "properties": {
     "v": {
       "type": "integer",
@@ -101,10 +95,7 @@
     "correlation": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "event_id",
-        "root_request_id"
-      ],
+      "required": ["event_id", "root_request_id"],
       "properties": {
         "event_id": {
           "$ref": "#/$defs/ulid"
@@ -113,10 +104,7 @@
           "$ref": "#/$defs/ulid"
         },
         "parent_event_id": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
         }
       }
@@ -124,10 +112,7 @@
     "modelVersion": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "name",
-        "revision"
-      ],
+      "required": ["name", "revision"],
       "properties": {
         "name": {
           "type": "string",
@@ -145,10 +130,7 @@
     "artifactEntry": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "file",
-        "checksum"
-      ],
+      "required": ["file", "checksum"],
       "properties": {
         "file": {
           "type": "string",
@@ -170,14 +152,10 @@
                 "pattern": "\\.jsonl$"
               }
             },
-            "required": [
-              "file"
-            ]
+            "required": ["file"]
           },
           "then": {
-            "required": [
-              "line_count"
-            ]
+            "required": ["line_count"]
           }
         },
         {
@@ -187,15 +165,11 @@
                 "pattern": "\\.(json|txt)$"
               }
             },
-            "required": [
-              "file"
-            ]
+            "required": ["file"]
           },
           "then": {
             "not": {
-              "required": [
-                "line_count"
-              ]
+              "required": ["line_count"]
             }
           }
         }
@@ -220,20 +194,11 @@
       "properties": {
         "suite": {
           "type": "string",
-          "enum": [
-            "core",
-            "fsfs",
-            "ops",
-            "interaction"
-          ]
+          "enum": ["core", "fsfs", "ops", "interaction"]
         },
         "determinism_tier": {
           "type": "string",
-          "enum": [
-            "bit_exact",
-            "semantic",
-            "statistical"
-          ]
+          "enum": ["bit_exact", "semantic", "statistical"]
         },
         "seed": {
           "type": "integer",
@@ -255,11 +220,7 @@
         "platform": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "os",
-            "arch",
-            "rustc"
-          ],
+          "required": ["os", "arch", "rustc"],
           "properties": {
             "os": {
               "type": "string",
@@ -277,11 +238,7 @@
         },
         "clock_mode": {
           "type": "string",
-          "enum": [
-            "simulated",
-            "frozen",
-            "realtime"
-          ]
+          "enum": ["simulated", "frozen", "realtime"]
         },
         "tie_break_policy": {
           "type": "string",
@@ -300,11 +257,7 @@
         },
         "exit_status": {
           "type": "string",
-          "enum": [
-            "pass",
-            "fail",
-            "error"
-          ]
+          "enum": ["pass", "fail", "error"]
         }
       },
       "allOf": [
@@ -313,9 +266,7 @@
             "artifacts": {
               "contains": {
                 "type": "object",
-                "required": [
-                  "file"
-                ],
+                "required": ["file"],
                 "properties": {
                   "file": {
                     "const": "structured_events.jsonl"
@@ -329,15 +280,10 @@
           "if": {
             "properties": {
               "exit_status": {
-                "enum": [
-                  "fail",
-                  "error"
-                ]
+                "enum": ["fail", "error"]
               }
             },
-            "required": [
-              "exit_status"
-            ]
+            "required": ["exit_status"]
           },
           "then": {
             "properties": {
@@ -346,9 +292,7 @@
                   {
                     "contains": {
                       "type": "object",
-                      "required": [
-                        "file"
-                      ],
+                      "required": ["file"],
                       "properties": {
                         "file": {
                           "const": "artifacts_index.json"
@@ -359,9 +303,7 @@
                   {
                     "contains": {
                       "type": "object",
-                      "required": [
-                        "file"
-                      ],
+                      "required": ["file"],
                       "properties": {
                         "file": {
                           "const": "replay_command.txt"
@@ -381,25 +323,17 @@
                 "const": "ops"
               },
               "exit_status": {
-                "enum": [
-                  "fail",
-                  "error"
-                ]
+                "enum": ["fail", "error"]
               }
             },
-            "required": [
-              "suite",
-              "exit_status"
-            ]
+            "required": ["suite", "exit_status"]
           },
           "then": {
             "properties": {
               "artifacts": {
                 "contains": {
                   "type": "object",
-                  "required": [
-                    "file"
-                  ],
+                  "required": ["file"],
                   "properties": {
                     "file": {
                       "const": "terminal_transcript.txt"
@@ -415,11 +349,7 @@
     "eventBody": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "type",
-        "correlation",
-        "severity"
-      ],
+      "required": ["type", "correlation", "severity"],
       "properties": {
         "type": {
           "type": "string",
@@ -438,11 +368,7 @@
         },
         "severity": {
           "type": "string",
-          "enum": [
-            "info",
-            "warn",
-            "error"
-          ]
+          "enum": ["info", "warn", "error"]
         },
         "lane_id": {
           "type": "string",
@@ -454,11 +380,7 @@
         },
         "outcome": {
           "type": "string",
-          "enum": [
-            "pass",
-            "fail",
-            "skip"
-          ]
+          "enum": ["pass", "fail", "skip"]
         },
         "reason_code": {
           "$ref": "#/$defs/reasonCode"
@@ -480,10 +402,7 @@
             "properties": { "type": { "const": "oracle_check" } }
           },
           "then": {
-            "required": [
-              "oracle_id",
-              "outcome"
-            ]
+            "required": ["oracle_id", "outcome"]
           }
         },
         {
@@ -491,9 +410,7 @@
             "properties": { "type": { "const": "lane_start" } }
           },
           "then": {
-            "required": [
-              "lane_id"
-            ]
+            "required": ["lane_id"]
           }
         },
         {
@@ -501,29 +418,20 @@
             "properties": { "type": { "const": "lane_end" } }
           },
           "then": {
-            "required": [
-              "lane_id"
-            ]
+            "required": ["lane_id"]
           }
         },
         {
           "if": {
             "properties": {
               "outcome": {
-                "enum": [
-                  "fail",
-                  "skip"
-                ]
+                "enum": ["fail", "skip"]
               }
             },
-            "required": [
-              "outcome"
-            ]
+            "required": ["outcome"]
           },
           "then": {
-            "required": [
-              "reason_code"
-            ]
+            "required": ["reason_code"]
           }
         }
       ]
@@ -531,10 +439,7 @@
     "oracleVerdict": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "oracle_id",
-        "outcome"
-      ],
+      "required": ["oracle_id", "outcome"],
       "properties": {
         "oracle_id": {
           "type": "string",
@@ -542,11 +447,7 @@
         },
         "outcome": {
           "type": "string",
-          "enum": [
-            "pass",
-            "fail",
-            "skip"
-          ]
+          "enum": ["pass", "fail", "skip"]
         },
         "context": {
           "type": "string",
@@ -606,10 +507,7 @@
     "oracleReportBody": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "lanes",
-        "totals"
-      ],
+      "required": ["lanes", "totals"],
       "properties": {
         "lanes": {
           "type": "array",
@@ -659,21 +557,11 @@
     "replayBody": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "type",
-        "offset_ms",
-        "seq",
-        "payload"
-      ],
+      "required": ["type", "offset_ms", "seq", "payload"],
       "properties": {
         "type": {
           "type": "string",
-          "enum": [
-            "query",
-            "config_change",
-            "clock_advance",
-            "signal"
-          ]
+          "enum": ["query", "config_change", "clock_advance", "signal"]
         },
         "offset_ms": {
           "type": "integer",
@@ -691,12 +579,7 @@
     "diffEntry": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "field_path",
-        "baseline",
-        "current",
-        "within_tolerance"
-      ],
+      "required": ["field_path", "baseline", "current", "within_tolerance"],
       "properties": {
         "field_path": {
           "type": "string",
@@ -722,21 +605,11 @@
     "snapshotDiffBody": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "comparison_mode",
-        "baseline_run_id",
-        "diffs",
-        "pass",
-        "mismatch_count"
-      ],
+      "required": ["comparison_mode", "baseline_run_id", "diffs", "pass", "mismatch_count"],
       "properties": {
         "comparison_mode": {
           "type": "string",
-          "enum": [
-            "bit_exact",
-            "semantic",
-            "statistical"
-          ]
+          "enum": ["bit_exact", "semantic", "statistical"]
         },
         "baseline_run_id": {
           "$ref": "#/$defs/ulid"

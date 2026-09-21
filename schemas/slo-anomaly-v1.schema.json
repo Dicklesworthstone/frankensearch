@@ -17,15 +17,7 @@
     },
     "window": {
       "type": "string",
-      "enum": [
-        "1m",
-        "15m",
-        "1h",
-        "6h",
-        "24h",
-        "3d",
-        "1w"
-      ]
+      "enum": ["1m", "15m", "1h", "6h", "24h", "3d", "1w"]
     },
     "metricId": {
       "type": "string",
@@ -39,9 +31,7 @@
     "windowBudgetObject": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "budget_fraction"
-      ],
+      "required": ["budget_fraction"],
       "properties": {
         "budget_fraction": {
           "type": "number",
@@ -53,15 +43,7 @@
     "windowBudgets": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "1m",
-        "15m",
-        "1h",
-        "6h",
-        "24h",
-        "3d",
-        "1w"
-      ],
+      "required": ["1m", "15m", "1h", "6h", "24h", "3d", "1w"],
       "properties": {
         "1m": {
           "$ref": "#/$defs/windowBudgetObject"
@@ -161,10 +143,7 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "metric_id",
-              "inputs"
-            ],
+            "required": ["metric_id", "inputs"],
             "properties": {
               "metric_id": {
                 "$ref": "#/$defs/metricId"
@@ -172,15 +151,7 @@
               "inputs": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": [
-                  "1m",
-                  "15m",
-                  "1h",
-                  "6h",
-                  "24h",
-                  "3d",
-                  "1w"
-                ],
+                "required": ["1m", "15m", "1h", "6h", "24h", "3d", "1w"],
                 "properties": {
                   "1m": {
                     "$ref": "#/$defs/formulaCase"
@@ -305,28 +276,16 @@
         },
         "severity": {
           "type": "string",
-          "enum": [
-            "info",
-            "warn",
-            "critical"
-          ]
+          "enum": ["info", "warn", "critical"]
         },
         "baseline": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "method",
-            "baseline_value",
-            "lookback_points"
-          ],
+          "required": ["method", "baseline_value", "lookback_points"],
           "properties": {
             "method": {
               "type": "string",
-              "enum": [
-                "rolling_mean",
-                "ewma",
-                "seasonal_median"
-              ]
+              "enum": ["rolling_mean", "ewma", "seasonal_median"]
             },
             "baseline_value": {
               "type": "number"
@@ -343,11 +302,7 @@
         "deviation": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "absolute",
-            "relative_pct",
-            "z_score"
-          ],
+          "required": ["absolute", "relative_pct", "z_score"],
           "properties": {
             "absolute": {
               "type": "number"
@@ -363,31 +318,20 @@
         "suppression": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "is_suppressed"
-          ],
+          "required": ["is_suppressed"],
           "properties": {
             "is_suppressed": {
               "type": "boolean"
             },
             "policy_id": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "until_ts": {
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": ["string", "null"],
               "format": "date-time"
             },
             "suppress_reason_code": {
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": ["string", "null"],
               "pattern": "^(slo|anomaly)\\.[a-z0-9_]+\\.[a-z0-9_]+$"
             }
           },
@@ -401,10 +345,7 @@
                 }
               },
               "then": {
-                "required": [
-                  "policy_id",
-                  "suppress_reason_code"
-                ]
+                "required": ["policy_id", "suppress_reason_code"]
               }
             }
           ]
@@ -412,11 +353,7 @@
         "confidence": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "score",
-            "band",
-            "evidence_points"
-          ],
+          "required": ["score", "band", "evidence_points"],
           "properties": {
             "score": {
               "type": "number",
@@ -425,11 +362,7 @@
             },
             "band": {
               "type": "string",
-              "enum": [
-                "low",
-                "medium",
-                "high"
-              ]
+              "enum": ["low", "medium", "high"]
             },
             "evidence_points": {
               "type": "integer",

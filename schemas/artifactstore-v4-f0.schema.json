@@ -31,12 +31,7 @@
     },
     "principal_role": {
       "type": "string",
-      "enum": [
-        "source_publisher",
-        "build_service",
-        "execution_supervisor",
-        "completion_issuer"
-      ]
+      "enum": ["source_publisher", "build_service", "execution_supervisor", "completion_issuer"]
     },
     "identity_scheme": {
       "type": "string",
@@ -50,11 +45,7 @@
     },
     "authentication": {
       "type": "string",
-      "enum": [
-        "verified_receipt_chain",
-        "integrity_only",
-        "unauthenticated_legacy"
-      ]
+      "enum": ["verified_receipt_chain", "integrity_only", "unauthenticated_legacy"]
     },
     "admission": {
       "type": "string",
@@ -84,14 +75,7 @@
     },
     "terminal_outcome": {
       "type": "string",
-      "enum": [
-        "succeeded",
-        "failed",
-        "cancelled",
-        "timed_out",
-        "interrupted",
-        "unknown"
-      ]
+      "enum": ["succeeded", "failed", "cancelled", "timed_out", "interrupted", "unknown"]
     },
     "signature": {
       "$ref": "#/$defs/signature"
@@ -124,129 +108,144 @@
   "allOf": [
     {
       "if": {
-        "properties": {"authentication": {"const": "verified_receipt_chain"}},
+        "properties": { "authentication": { "const": "verified_receipt_chain" } },
         "required": ["authentication"]
       },
-      "then": {"required": ["signature"]},
-      "else": {"not": {"required": ["signature"]}}
+      "then": { "required": ["signature"] },
+      "else": { "not": { "required": ["signature"] } }
     },
     {
       "if": {
-        "properties": {"authentication": {"const": "unauthenticated_legacy"}},
+        "properties": { "authentication": { "const": "unauthenticated_legacy" } },
         "required": ["authentication"]
       },
       "then": {
         "properties": {
-          "admission": {"const": "unadmitted"},
-          "decision": {"const": "no_decision"},
-          "release": {"const": "not_qualified"}
+          "admission": { "const": "unadmitted" },
+          "decision": { "const": "no_decision" },
+          "release": { "const": "not_qualified" }
         }
       }
     },
     {
       "if": {
-        "properties": {"authentication": {"const": "integrity_only"}},
+        "properties": { "authentication": { "const": "integrity_only" } },
         "required": ["authentication"]
       },
       "then": {
         "properties": {
-          "admission": {"enum": ["unadmitted", "no_decision"]},
-          "release": {"const": "not_qualified"}
+          "admission": { "enum": ["unadmitted", "no_decision"] },
+          "release": { "const": "not_qualified" }
         }
       }
     },
     {
       "if": {
-        "properties": {"release": {"const": "qualified"}},
+        "properties": { "release": { "const": "qualified" } },
         "required": ["release"]
       },
       "then": {
         "properties": {
-          "authentication": {"const": "verified_receipt_chain"},
-          "admission": {"const": "admitted"},
-          "decision": {"const": "pass"},
-          "coverage": {"const": "complete"}
+          "authentication": { "const": "verified_receipt_chain" },
+          "admission": { "const": "admitted" },
+          "decision": { "const": "pass" },
+          "coverage": { "const": "complete" }
         }
       }
     },
     {
       "if": {
-        "properties": {"admission": {"enum": ["unadmitted", "no_decision"]}},
+        "properties": { "admission": { "enum": ["unadmitted", "no_decision"] } },
         "required": ["admission"]
       },
       "then": {
         "properties": {
-          "decision": {"const": "no_decision"},
-          "release": {"const": "not_qualified"}
+          "decision": { "const": "no_decision" },
+          "release": { "const": "not_qualified" }
         }
       }
     },
     {
       "if": {
-        "properties": {"admission": {"const": "admitted"}},
+        "properties": { "admission": { "const": "admitted" } },
         "required": ["admission"]
       },
-      "then": {"properties": {"coverage": {"const": "complete"}}}
+      "then": { "properties": { "coverage": { "const": "complete" } } }
     },
     {
       "if": {
-        "properties": {"decision": {"const": "miss"}},
+        "properties": { "decision": { "const": "miss" } },
         "required": ["decision"]
       },
       "then": {
         "properties": {
-          "authentication": {"const": "verified_receipt_chain"},
-          "admission": {"const": "admitted"},
-          "release": {"const": "not_qualified"}
+          "authentication": { "const": "verified_receipt_chain" },
+          "admission": { "const": "admitted" },
+          "release": { "const": "not_qualified" }
         }
       }
     },
     {
       "if": {
-        "properties": {"decision": {"const": "quarantine"}},
+        "properties": { "decision": { "const": "quarantine" } },
         "required": ["decision"]
       },
-      "then": {"properties": {"release": {"const": "not_qualified"}}}
+      "then": { "properties": { "release": { "const": "not_qualified" } } }
     },
     {
       "if": {
-        "properties": {"object_kind": {"const": "source"}},
+        "properties": { "object_kind": { "const": "source" } },
         "required": ["object_kind"]
       },
       "then": {
         "required": ["source_digest"],
-        "properties": {"principal_role": {"const": "source_publisher"}},
-        "not": {"required": ["predecessor_identity"]}
+        "properties": { "principal_role": { "const": "source_publisher" } },
+        "not": { "required": ["predecessor_identity"] }
       }
     },
     {
       "if": {
-        "properties": {"object_kind": {"const": "build"}},
+        "properties": { "object_kind": { "const": "build" } },
         "required": ["object_kind"]
       },
       "then": {
-        "required": ["predecessor_identity", "source_digest", "cargo_lock_digest", "executable_digest"],
-        "properties": {"principal_role": {"const": "build_service"}}
+        "required": [
+          "predecessor_identity",
+          "source_digest",
+          "cargo_lock_digest",
+          "executable_digest"
+        ],
+        "properties": { "principal_role": { "const": "build_service" } }
       }
     },
     {
       "if": {
-        "properties": {"object_kind": {"const": "execution"}},
+        "properties": { "object_kind": { "const": "execution" } },
         "required": ["object_kind"]
       },
       "then": {
-        "required": ["predecessor_identity", "execution_nonce", "nonce_expires_at_unix_ns", "command_digest"],
-        "properties": {"principal_role": {"const": "execution_supervisor"}}
+        "required": [
+          "predecessor_identity",
+          "execution_nonce",
+          "nonce_expires_at_unix_ns",
+          "command_digest"
+        ],
+        "properties": { "principal_role": { "const": "execution_supervisor" } }
       }
     },
     {
       "if": {
-        "properties": {"object_kind": {"const": "completion"}},
+        "properties": { "object_kind": { "const": "completion" } },
         "required": ["object_kind"]
       },
       "then": {
-        "required": ["predecessor_identity", "artifact_index_digest", "failure_artifact_index_digest", "terminal_outcome"],
-        "properties": {"principal_role": {"const": "completion_issuer"}}
+        "required": [
+          "predecessor_identity",
+          "artifact_index_digest",
+          "failure_artifact_index_digest",
+          "terminal_outcome"
+        ],
+        "properties": { "principal_role": { "const": "completion_issuer" } }
       }
     }
   ],
@@ -264,9 +263,9 @@
       "additionalProperties": false,
       "required": ["algorithm", "key_id", "signature"],
       "properties": {
-        "algorithm": {"type": "string", "const": "ed25519"},
-        "key_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"},
-        "signature": {"type": "string", "pattern": "^[a-f0-9]{128}$"}
+        "algorithm": { "type": "string", "const": "ed25519" },
+        "key_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+        "signature": { "type": "string", "pattern": "^[a-f0-9]{128}$" }
       }
     }
   }

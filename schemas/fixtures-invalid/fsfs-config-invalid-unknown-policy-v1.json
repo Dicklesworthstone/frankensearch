@@ -12,7 +12,25 @@
       "roots": ["$HOME"],
       "exclude_patterns": [".git", "node_modules", "target", "__pycache__"],
       "text_selection_mode": "blocklist",
-      "binary_blocklist_extensions": [".exe", ".dll", ".so", ".o", ".class", ".jar", ".zip", ".tar", ".gz", ".png", ".jpg", ".jpeg", ".mp3", ".mp4", ".wasm", ".pyc", ".pdb"],
+      "binary_blocklist_extensions": [
+        ".exe",
+        ".dll",
+        ".so",
+        ".o",
+        ".class",
+        ".jar",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".mp3",
+        ".mp4",
+        ".wasm",
+        ".pyc",
+        ".pdb"
+      ],
       "max_file_size_mb": 10,
       "follow_symlinks": false
     },
@@ -83,12 +101,7 @@
   },
   "logging": {
     "event_name": "config_loaded",
-    "required_fields": [
-      "source_precedence_applied",
-      "resolved_values",
-      "warnings",
-      "reason_codes"
-    ],
+    "required_fields": ["source_precedence_applied", "resolved_values", "warnings", "reason_codes"],
     "reason_code_prefix": "config."
   }
 }
