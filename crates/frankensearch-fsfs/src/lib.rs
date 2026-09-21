@@ -28,11 +28,13 @@ pub mod expected_loss;
 pub mod explainability_screen;
 pub mod explanation_payload;
 pub mod file_classification;
+pub mod generation_store;
 pub mod high_cost_artifact;
 pub mod incremental_change;
 pub mod interaction_matrix;
 pub mod interaction_primitives;
 pub mod lexical_pipeline;
+#[path = "publication_admission.rs"]
 pub mod lifecycle;
 pub mod migration_compat;
 pub mod mount_info;
@@ -54,6 +56,7 @@ pub mod ranking_priors;
 pub mod redaction;
 pub mod repro;
 pub mod root_discovery;
+#[path = "runtime_retained_generation.rs"]
 pub mod runtime;
 pub mod shutdown;
 pub mod slo_anomaly;
