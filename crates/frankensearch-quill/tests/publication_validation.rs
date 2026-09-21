@@ -522,7 +522,9 @@ fn durable_commit_cancellation_retains_exact_delta_until_one_successful_retry() 
             assert_eq!(pending.pending_identity_count(), 0);
             assert_eq!(pending.uncommitted_id_count(), 1);
             assert_eq!(pending.pending_segment_count(), 1);
-            assert_eq!(pending.pending_owned_segment_count(), 1);
+            // Durable flushes retain the sealed FSLX file on disk. Only the
+            // memory backend retains an owned encoded buffer for publication.
+            assert_eq!(pending.pending_owned_segment_count(), 0);
             assert!(pending.pending_manifest_present());
             let staged = directory_bytes(directory.path());
             if let Some(before) = &pending_before {
@@ -656,7 +658,10 @@ fn tombstone_only_change_revalidates_retained_bytes_before_publication() {
         let installed = retained_manifest(&writer);
         assert_eq!(installed.generation, retained.generation + 1);
         assert_eq!(installed.segments, proposed.segments);
-        assert_eq!(writer.snapshot().expect("installed authority").doc_count(), 1);
+        assert_eq!(
+            writer.snapshot().expect("installed authority").doc_count(),
+            1
+        );
         assert_eq!(std::fs::read(path).expect("retained bytes"), original);
         drop(writer);
         let reopened = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
@@ -669,7 +674,11 @@ fn tombstone_only_change_revalidates_retained_bytes_before_publication() {
         let hits = LexicalRead::search(&reader, &cx, "shared", 10)
             .await
             .expect("search after tombstone-only publication");
-        assert_eq!(hits.len(), 1, "the deleted physical row must stay invisible");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the deleted physical row must stay invisible"
+        );
     });
 }
 
@@ -684,8 +693,9 @@ fn tombstone_only_change_requires_retained_segment_sidecar_and_retries_cleanly()
         let donor_dir = tempfile::tempdir().expect("durable donor directory");
         let recipient_dir = tempfile::tempdir().expect("durable recipient directory");
         let mut first = two_row_manifest(&cx, donor_dir.path()).await;
-        let protector = FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
-            .expect("real durability protector");
+        let protector =
+            FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
+                .expect("real durability protector");
         let mut writer = KeeperWriter::create_durable(
             &cx,
             recipient_dir.path(),
@@ -696,7 +706,9 @@ fn tombstone_only_change_requires_retained_segment_sidecar_and_retries_cleanly()
         .expect("create protected recipient");
         let staged = stage_segments(donor_dir.path(), recipient_dir.path(), &first);
         let path = staged.values().next().expect("staged two-row segment");
-        protector.protect_file(path).expect("protect the real FSLX file");
+        protector
+            .protect_file(path)
+            .expect("protect the real FSLX file");
         first.generation = successor(&writer).generation;
         writer
             .publish(&cx, &first)
@@ -741,7 +753,10 @@ fn tombstone_only_change_requires_retained_segment_sidecar_and_retries_cleanly()
         assert_eq!(directory_bytes(recipient_dir.path()), before);
         assert!(!writer.publication_awaits_reconciliation());
         assert_eq!(retained_manifest(&writer), retained);
-        assert_eq!(writer.snapshot().expect("retained authority").doc_count(), 2);
+        assert_eq!(
+            writer.snapshot().expect("retained authority").doc_count(),
+            2
+        );
 
         std::fs::rename(&saved_sidecar, &sidecar).expect("restore the exact healthy sidecar");
         writer
@@ -798,24 +813,15 @@ fn upsert_preserves_unchanged_segments_and_fresh_reopen_query_results() {
         LexicalWrite::commit(&index, &cx)
             .await
             .expect("publish original and anchor");
-        for (id, text) in [
-            ("two", "shared blue"),
-            ("three", "shared green"),
-        ] {
+        for (id, text) in [("two", "shared blue"), ("three", "shared green")] {
             append_document(&index, &cx, directory.path(), id, text).await;
         }
         let before = load_manifest_pair(directory.path())
             .expect("read retained generation")
             .manifest;
         assert_eq!(before.segments.len(), 3);
-        let after = append_document(
-            &index,
-            &cx,
-            directory.path(),
-            "one",
-            "shared replacement",
-        )
-        .await;
+        let after =
+            append_document(&index, &cx, directory.path(), "one", "shared replacement").await;
         assert_eq!(after.generation, before.generation + 1);
         assert_eq!(after.segments.len(), 4);
         let mut unchanged = 0;
