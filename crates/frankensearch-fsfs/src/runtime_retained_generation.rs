@@ -106,6 +106,32 @@ fn retained_search_checkpoint(cx: &Cx) -> SearchResult<()> {
     })
 }
 
+// Validate path components, not a string prefix: `{index_dir}/../shared.db`
+// and `{index_dir}-other/catalog.db` must never escape a retained generation.
+// Readers need the same rule as builders, otherwise catalog hydration can come
+// from a mutable database that is not authenticated by the selected inventory.
+fn validate_retained_catalog_path(value: &str) -> SearchResult<()> {
+    use std::path::Component;
+
+    let relative = Path::new(value.trim())
+        .strip_prefix(crate::config::STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER)
+        .ok();
+    if relative.is_some_and(|path| {
+        path.file_name().is_some()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+    }) {
+        return Ok(());
+    }
+    Err(SearchError::InvalidConfig {
+        field: "storage.db_path".to_owned(),
+        value: value.to_owned(),
+        reason: "retained generations require a catalog beneath {index_dir}, without parent traversal"
+            .to_owned(),
+    })
+}
+
 impl FsfsRuntime {
     /// Resolve and open the selected complete generation once for repeated reads.
     ///
@@ -114,6 +140,8 @@ impl FsfsRuntime {
     /// to fall back to a legacy index or an arbitrary generation directory.
     /// The source store follows the cooperative immutable-directory contract of
     /// `CompleteGenerationStore`; callers must not modify its sealed files.
+    /// The catalog must also resolve beneath `{index_dir}`, so hydration cannot
+    /// consult an unrelated mutable database outside the selected generation.
     ///
     /// # Errors
     /// Returns missing/corrupt selection, producer mismatch, cancellation or the
@@ -126,6 +154,7 @@ impl FsfsRuntime {
         use crate::generation_store::CompleteGenerationStore;
 
         retained_search_checkpoint(cx)?;
+        validate_retained_catalog_path(&self.config.storage.db_path)?;
         let store = CompleteGenerationStore::open(cx, store_root)?;
         let generation = store
             .active(cx)?
@@ -177,20 +206,7 @@ impl FsfsRuntime {
         use crate::generation_store::CompleteGenerationStore;
 
         let target_root = fs::canonicalize(self.resolve_target_root()?)?;
-        if !self
-            .config
-            .storage
-            .db_path
-            .trim()
-            .starts_with(crate::config::STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER)
-        {
-            return Err(SearchError::InvalidConfig {
-                field: "storage.db_path".to_owned(),
-                value: self.config.storage.db_path.clone(),
-                reason: "retained rebuilds require a generation-local {index_dir} catalog"
-                    .to_owned(),
-            });
-        }
+        validate_retained_catalog_path(&self.config.storage.db_path)?;
         let store = CompleteGenerationStore::create(cx, store_root)?;
         if store.root().starts_with(&target_root) || target_root.starts_with(store.root()) {
             return Err(SearchError::InvalidConfig {
@@ -235,6 +251,43 @@ impl FsfsRuntime {
         build.publish(cx, |_, path| {
             Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)
         })
+    }
+}
+
+#[cfg(test)]
+mod retained_catalog_tests {
+    use super::validate_retained_catalog_path;
+
+    #[test]
+    fn retained_catalog_accepts_only_generation_local_paths() {
+        for path in [
+            "{index_dir}/catalog.sqlite",
+            "{index_dir}/nested/catalog.sqlite",
+            "{index_dir}/./nested/catalog.sqlite",
+        ] {
+            validate_retained_catalog_path(path).expect("generation-local catalog");
+        }
+    }
+
+    #[test]
+    fn retained_catalog_rejects_prefix_aliases_and_parent_traversal() {
+        for path in [
+            "",
+            "{index_dir}",
+            "{index_dir}/",
+            "{index_dir}/.",
+            "{index_dir}-other/catalog.sqlite",
+            "{index_dir}/../catalog.sqlite",
+            "{index_dir}/nested/../../catalog.sqlite",
+            "{index_dir}/nested/../catalog.sqlite",
+            "catalog.sqlite",
+            "/tmp/catalog.sqlite",
+        ] {
+            let error = validate_retained_catalog_path(path).expect_err(path);
+            assert!(
+                matches!(error, frankensearch_core::SearchError::InvalidConfig { field, .. } if field == "storage.db_path")
+            );
+        }
     }
 }
 
@@ -416,6 +469,68 @@ mod retained_search_tests {
             assert_eq!(
                 store.active(&cx).expect("cancel left bundle intact"),
                 Some(reader.generation().clone())
+            );
+        });
+    }
+
+    #[test]
+    fn retained_catalog_refusal_does_not_create_a_store_or_touch_external_data() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, _, root) = fixture(directory.path());
+            let external = directory.path().join("catalog.sqlite");
+            fs::write(&external, b"unrelated catalog sentinel").expect("external data");
+            let mut config = runtime.config().clone();
+            config.storage.db_path = "{index_dir}/../../../catalog.sqlite".to_owned();
+            let invalid = FsfsRuntime::new(config).with_cli_input(runtime.cli_input.clone());
+
+            let error = invalid
+                .rebuild_retained_generation(&cx, &root)
+                .await
+                .expect_err("escaping rebuild catalog");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "storage.db_path")
+            );
+            let error = invalid
+                .open_retained_search(&cx, &root)
+                .await
+                .expect_err("escaping reader catalog");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "storage.db_path")
+            );
+            assert!(!root.exists(), "preflight refusal must not create a store");
+            assert_eq!(
+                fs::read(external).expect("external data"),
+                b"unrelated catalog sentinel"
+            );
+        });
+    }
+
+    #[test]
+    fn retained_reader_rejects_a_foreign_catalog_without_changing_publication() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+            let selected = store.active(&cx).expect("published generation");
+            let external = directory.path().join("foreign.sqlite");
+            fs::write(&external, b"foreign catalog sentinel").expect("external data");
+            let mut config = runtime.config().clone();
+            config.storage.db_path = external.display().to_string();
+            let invalid = FsfsRuntime::new(config).with_cli_input(runtime.cli_input.clone());
+
+            let error = invalid
+                .open_retained_search(&cx, &root)
+                .await
+                .expect_err("foreign catalog must not hydrate retained results");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "storage.db_path")
+            );
+            assert_eq!(store.active(&cx).expect("inventory remains valid"), selected);
+            assert_eq!(
+                fs::read(external).expect("external data"),
+                b"foreign catalog sentinel"
             );
         });
     }
