@@ -290,6 +290,25 @@ impl GenerationBuild {
     where
         F: FnOnce(&Cx, &Path) -> SearchResult<()>,
     {
+        self.publish_with_precommit(cx, validate, |_| Ok(()))
+    }
+
+    /// Recheck caller-owned source authority after sealing, before selection.
+    ///
+    /// `precommit` must be read-only: it may refuse publication but must not
+    /// modify the candidate, selection or predecessor. It supplements, never
+    /// replaces, engine admission and bundle integrity checks. Cancellation,
+    /// the lease fence and predecessor comparison are repeated after this hook.
+    pub(crate) fn publish_with_precommit<F, G>(
+        self,
+        cx: &Cx,
+        validate: F,
+        precommit: G,
+    ) -> SearchResult<GenerationPublication>
+    where
+        F: FnOnce(&Cx, &Path) -> SearchResult<()>,
+        G: FnOnce(&Cx) -> SearchResult<()>,
+    {
         checkpoint(cx)?;
         self.lease.fence("complete-generation validation")?;
         reject_published_write(&self.path)?;
@@ -324,6 +343,7 @@ impl GenerationBuild {
         let pointer = format!("{POINTER_MAGIC}\n{}\n{manifest_sha256}\n", self.id).into_bytes();
         let temporary = self.store.root.join(format!(".FSFS-CURRENT-{}", self.id));
         write_new_synced(&temporary, &pointer)?;
+        precommit(cx)?;
         checkpoint(cx)?;
         self.lease
             .fence("complete-generation pointer publication")?;
@@ -641,6 +661,152 @@ fn invalid(path: &Path, detail: &str) -> SearchError {
 mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
+
+    #[test]
+    fn complete_watch_precommit_refusal_preserves_current_and_releases_the_lease() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let first = publish(&store, &cx, "first");
+            let pointer = root.path().join(COMPLETE_GENERATION_POINTER);
+            let before = fs::read(&pointer).unwrap();
+            let build = store.begin(&cx).unwrap();
+            let candidate = build.path().to_path_buf();
+            write_bundle(&candidate, "successor");
+            let error = build
+                .publish_with_precommit(
+                    &cx,
+                    |_, _| Ok(()),
+                    |_| {
+                        assert!(candidate.join(COMPLETE_GENERATION_MANIFEST).is_file());
+                        assert_eq!(fs::read(&pointer).unwrap(), before);
+                        Err(SearchError::InvalidConfig {
+                            field: "test.source_authority".to_owned(),
+                            value: String::new(),
+                            reason: "source changed after sealing".to_owned(),
+                        })
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "test.source_authority"));
+            assert_eq!(fs::read(&pointer).unwrap(), before);
+            assert_eq!(store.active(&cx).unwrap(), Some(first));
+            assert!(candidate.join(COMPLETE_GENERATION_MANIFEST).is_file());
+            drop(store.begin(&cx).expect("failed precommit released the writer lease"));
+        });
+    }
+
+    #[test]
+    fn complete_watch_cancellation_in_precommit_is_checked_before_the_rename() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let first = publish(&store, &cx, "first");
+            let build = store.begin(&cx).unwrap();
+            write_bundle(build.path(), "successor");
+            let error = build
+                .publish_with_precommit(
+                    &cx,
+                    |_, _| Ok(()),
+                    |cx| {
+                        cx.set_cancel_requested(true);
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert_eq!(store.active(&cx).unwrap(), Some(first));
+            drop(store.begin(&cx).unwrap());
+        });
+    }
+
+    #[test]
+    fn complete_watch_failed_engine_admission_never_reaches_precommit() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let first = publish(&store, &cx, "first");
+            let build = store.begin(&cx).unwrap();
+            write_bundle(build.path(), "invalid successor");
+            let mut invoked = false;
+            let error = build
+                .publish_with_precommit(
+                    &cx,
+                    |_, path| Err(invalid(path, "real admission refused the candidate")),
+                    |_| {
+                        invoked = true;
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(error, SearchError::IndexCorrupted { .. }));
+            assert!(!invoked);
+            assert_eq!(store.active(&cx).unwrap(), Some(first));
+        });
+    }
+
+    #[test]
+    fn complete_watch_successful_precommit_retains_the_complete_predecessor() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let first = publish(&store, &cx, "first");
+            let build = store.begin(&cx).unwrap();
+            write_bundle(build.path(), "successor");
+            let candidate = build.path().to_path_buf();
+            let mut checked = false;
+            let publication = build
+                .publish_with_precommit(
+                    &cx,
+                    |_, _| Ok(()),
+                    |_| {
+                        assert!(candidate.join(COMPLETE_GENERATION_MANIFEST).is_file());
+                        checked = true;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert!(checked);
+            let GenerationPublication::Durable(second) = publication else {
+                panic!("publication was not durable"); // ubs:ignore — cfg(test) assertion.
+            };
+            assert_eq!(store.active(&cx).unwrap(), Some(second));
+            assert!(first.path().is_dir());
+        });
+    }
+
+    #[test]
+    fn complete_watch_predecessor_is_rechecked_after_precommit() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let first = publish(&store, &cx, "first");
+            let pointer = root.path().join(COMPLETE_GENERATION_POINTER);
+            let first_pointer = fs::read(&pointer).unwrap();
+            let second = publish(&store, &cx, "second");
+            let build = store.begin(&cx).unwrap();
+            write_bundle(build.path(), "third");
+            let error = build
+                .publish_with_precommit(
+                    &cx,
+                    |_, _| Ok(()),
+                    |_| {
+                        // Fault injection: simulate out-of-protocol replacement
+                        // exactly between the source check and selection commit.
+                        fs::write(&pointer, &first_pointer)?;
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(error, SearchError::IndexCorrupted { detail, .. }
+                if detail.contains("predecessor changed")));
+            assert_eq!(store.active(&cx).unwrap(), Some(first));
+            assert!(second.path().is_dir());
+            drop(store.begin(&cx).unwrap());
+        });
+    }
 
     #[test]
     fn bundle_digests_preserve_standard_sha256_hex() {
