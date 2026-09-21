@@ -17,12 +17,17 @@ use frankensearch_core::{SearchError, SearchResult};
 use serde::Serialize;
 
 use super::super::{
-    FSFS_DAEMON_CLIENT_TIMEOUT_MS, FSFS_DAEMON_IDLE_TIMEOUT_MS,
-    FSFS_DAEMON_REQUEST_MAX_BYTES, FSFS_DAEMON_SOCKET_FILE, SearchServeRequest,
+    FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_IDLE_TIMEOUT_MS, FSFS_DAEMON_REQUEST_MAX_BYTES,
+    SearchServeRequest,
 };
-use super::{FsfsRuntime, complete_cli_error, emit_complete_serve_line, retained_search_checkpoint};
+use super::{
+    FsfsRuntime, complete_cli_error, emit_complete_serve_line, retained_search_checkpoint,
+};
 
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Complete stores own their endpoint beside the selection pointer, outside
+// every immutable generation. Legacy query sockets use a separate hashed path.
+const FSFS_DAEMON_SOCKET_FILE: &str = "fsfs-query.sock";
 
 #[path = "complete_daemon_control.rs"]
 mod control;
@@ -53,13 +58,17 @@ impl BoundCompleteSocket {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path.with_extension("lock"))?;
         if !lock.metadata()?.is_file() {
-            return Err(complete_cli_error("daemon_lock", "daemon lock is not a regular file"));
+            return Err(complete_cli_error(
+                "daemon_lock",
+                "daemon lock is not a regular file",
+            ));
         }
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-            .map_err(|source| SearchError::SubsystemError {
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |source| SearchError::SubsystemError {
                 subsystem: "fsfs.complete_generation.daemon_lock",
                 source: Box::new(io::Error::from(source)),
-            })?;
+            },
+        )?;
         // Never steal a socket from a legacy/non-cooperating server. In
         // particular, a successful lock is not proof that an existing socket
         // is stale. Crash recovery requires explicitly removing a verified
@@ -117,8 +126,9 @@ impl FsfsRuntime {
             return control::stop(
                 cx,
                 &socket_path,
-                Duration::from_millis(FSFS_DAEMON_CLIENT_TIMEOUT_MS),
-            ).await;
+                Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS),
+            )
+            .await;
         }
         // Admit before opening the transport: no listening socket claims a
         // ready service while its generation or semantic producer is invalid.
@@ -128,7 +138,7 @@ impl FsfsRuntime {
         let mut cache = HashMap::new();
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         let idle_timeout = control::idle_timeout(self.cli_input.daemon_idle_timeout_ms);
-        let peer_timeout = Duration::from_millis(FSFS_DAEMON_CLIENT_TIMEOUT_MS);
+        let peer_timeout = Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS);
         let mut last_activity = Instant::now();
         loop {
             retained_search_checkpoint(cx)?;
@@ -144,14 +154,19 @@ impl FsfsRuntime {
                         if session.refresh(cx).await? {
                             cache.clear();
                         }
-                        session.reader.runtime.execute_search_serve_request(
-                            cx,
-                            request,
-                            &mut session.reader.resources,
-                            cache,
-                            cache_enabled,
-                        ).await
-                    }).await;
+                        session
+                            .reader
+                            .runtime
+                            .execute_search_serve_request(
+                                cx,
+                                request,
+                                &mut session.reader.resources,
+                                cache,
+                                cache_enabled,
+                            )
+                            .await
+                    })
+                    .await;
                     match result {
                         Ok(PeerOutcome::Shutdown) => return Ok(()),
                         Ok(PeerOutcome::Search) => {}
@@ -180,7 +195,13 @@ impl FsfsRuntime {
         let root = fs::canonicalize(root)?;
         let path = self.cli_input.daemon_socket.as_ref().map_or_else(
             || root.join(FSFS_DAEMON_SOCKET_FILE),
-            |path| if path.is_absolute() { path.clone() } else { root.join(path) },
+            |path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    root.join(path)
+                }
+            },
         );
         // Custom names are supported at the store root only. Do not create a
         // socket or its lock inside a sealed bundle or an unrelated directory.
@@ -195,9 +216,9 @@ impl FsfsRuntime {
                 "complete-generation sockets must end in .sock and live directly in the store root",
             ));
         }
-        let name = path.file_name().ok_or_else(|| {
-            complete_cli_error("daemon_socket", "socket must have a file name")
-        })?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| complete_cli_error("daemon_socket", "socket must have a file name"))?;
         Ok(root.join(name))
     }
 }
@@ -226,47 +247,73 @@ where
         Ok(false) => {}
         Err(error) => {
             let response = encode_response(&FsfsRuntime::search_serve_error_response(
-                "", "full", error.to_string(),
+                "",
+                "full",
+                error.to_string(),
             ))?;
             write_response(cx, peer, &response, timeout).await?;
             return Ok(PeerOutcome::Search);
         }
     }
-    let request = std::str::from_utf8(&bytes)
-        .map_err(|_| complete_cli_error("daemon_request", "request is not UTF-8"))
-        .and_then(|raw| FsfsRuntime::parse_search_serve_request(raw.trim()));
+    let request = parse_request(&bytes);
     let response = match request {
         Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
-            "", "full", error.to_string(),
+            "",
+            "full",
+            error.to_string(),
         ))?,
         Ok(request) => {
             let query = request.query.clone();
             let mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
-            if request.stream {
-                // Never disguise a buffered response as progressive frames.
-                encode_response(&FsfsRuntime::search_serve_error_response(
-                    query, mode,
-                    "complete-generation socket serving currently supports buffered requests; use direct search --no-daemon --stream for progressive phases",
-                ))?
-            } else {
-                retained_search_checkpoint(cx)?;
-                match execute(request).await {
-                    Ok(response) => match encode_response(&response) {
-                        Ok(bytes) => bytes,
-                        Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
-                            query, mode, error.to_string(),
-                        ))?,
-                    },
-                    Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+            retained_search_checkpoint(cx)?;
+            match execute(request).await {
+                Ok(response) => match encode_response(&response) {
+                    Ok(bytes) => bytes,
                     Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
-                        query, mode, error.to_string(),
+                        query,
+                        mode,
+                        error.to_string(),
                     ))?,
-                }
+                },
+                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
+                    query,
+                    mode,
+                    error.to_string(),
+                ))?,
             }
         }
     };
     write_response(cx, peer, &response, timeout).await?;
     Ok(PeerOutcome::Search)
+}
+
+fn parse_request(bytes: &[u8]) -> SearchResult<SearchServeRequest> {
+    let raw = std::str::from_utf8(bytes)
+        .map_err(|_| complete_cli_error("daemon_request", "request is not UTF-8"))?
+        .trim();
+    // The established buffered request type intentionally has no stream field.
+    // Inspect the transport selector before serde can ignore that extra field.
+    if raw.starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| complete_cli_error("daemon_request", &error.to_string()))?;
+        match value.get("stream") {
+            None | Some(serde_json::Value::Bool(false)) => {}
+            Some(serde_json::Value::Bool(true)) => {
+                return Err(complete_cli_error(
+                    "daemon_request",
+                    "complete-generation socket serving currently supports buffered requests; use direct search --no-daemon --stream for progressive phases",
+                ));
+            }
+            Some(_) => {
+                return Err(complete_cli_error(
+                    "daemon_request",
+                    "stream must be a boolean",
+                ));
+            }
+        }
+    }
+    FsfsRuntime::parse_search_serve_request(raw)
 }
 
 fn encode_response<T: Serialize>(response: &T) -> SearchResult<Vec<u8>> {
@@ -284,12 +331,16 @@ async fn read_request(cx: &Cx, peer: &mut UnixStream, timeout: Duration) -> Sear
     loop {
         retained_search_checkpoint(cx)?;
         if started.elapsed() >= timeout {
-            return Err(io::Error::new(ErrorKind::TimedOut, "daemon request deadline exceeded").into());
+            return Err(
+                io::Error::new(ErrorKind::TimedOut, "daemon request deadline exceeded").into(),
+            );
         }
         let remaining = (FSFS_DAEMON_REQUEST_MAX_BYTES + 1 - bytes.len()).min(chunk.len());
         match peer.read(&mut chunk[..remaining]) {
             Ok(0) if bytes.is_empty() => {
-                return Err(io::Error::new(ErrorKind::UnexpectedEof, "empty daemon request").into());
+                return Err(
+                    io::Error::new(ErrorKind::UnexpectedEof, "empty daemon request").into(),
+                );
             }
             Ok(0) => return Ok(bytes),
             Ok(count) => {
@@ -297,7 +348,10 @@ async fn read_request(cx: &Cx, peer: &mut UnixStream, timeout: Duration) -> Sear
                 let end = newline.map_or(count, |offset| offset + 1);
                 bytes.extend_from_slice(&chunk[..end]);
                 if bytes.len() > FSFS_DAEMON_REQUEST_MAX_BYTES {
-                    return Err(complete_cli_error("daemon_request", "request exceeds 1 MiB limit"));
+                    return Err(complete_cli_error(
+                        "daemon_request",
+                        "request exceeds 1 MiB limit",
+                    ));
                 }
                 if newline.is_some() {
                     return Ok(bytes);
@@ -322,7 +376,9 @@ async fn write_response(
     while !bytes.is_empty() {
         retained_search_checkpoint(cx)?;
         if started.elapsed() >= timeout {
-            return Err(io::Error::new(ErrorKind::TimedOut, "daemon response deadline exceeded").into());
+            return Err(
+                io::Error::new(ErrorKind::TimedOut, "daemon response deadline exceeded").into(),
+            );
         }
         match peer.write(bytes) {
             Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "daemon peer closed").into()),
@@ -346,7 +402,9 @@ mod tests {
 
     fn pair(request: &[u8]) -> (UnixStream, UnixStream) {
         let (mut client, server) = UnixStream::pair().unwrap();
-        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         client.write_all(request).unwrap();
         client.shutdown(Shutdown::Write).unwrap();
         server.set_nonblocking(true).unwrap();
@@ -355,7 +413,9 @@ mod tests {
 
     fn response(client: UnixStream) -> serde_json::Value {
         let mut line = String::new();
-        std::io::BufReader::new(client).read_line(&mut line).unwrap();
+        std::io::BufReader::new(client)
+            .read_line(&mut line)
+            .unwrap();
         serde_json::from_str(&line).unwrap()
     }
 
@@ -364,12 +424,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("search.sock");
         let first = BoundCompleteSocket::bind(path.clone()).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(BoundCompleteSocket::bind(path.clone()).is_err());
         let lock_inode = fs::metadata(path.with_extension("lock")).unwrap().ino();
         drop(first);
         assert!(!path.exists());
-        assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().ino(), lock_inode);
+        assert_eq!(
+            fs::metadata(path.with_extension("lock")).unwrap().ino(),
+            lock_inode
+        );
         let second = BoundCompleteSocket::bind(path.clone()).unwrap();
         drop(second);
         assert!(!path.exists());
@@ -415,28 +481,48 @@ mod tests {
     #[test]
     fn socket_peer_round_trips_one_request_and_does_not_emit_stdio_ready() {
         run_test_with_cx(|cx| async move {
-            let (client, mut server) = pair(b"{\"query\":\"sharedtoken\",\"limit\":3}\n");
-            serve_peer(&cx, &mut server, Duration::from_secs(2), |request| async move {
-                assert_eq!(request.query, "sharedtoken");
-                assert_eq!(request.limit, Some(3));
-                Ok(serde_json::json!({"ok":true,"query":request.query}))
-            }).await.unwrap();
-            let value = response(client);
-            assert_eq!(value["ok"], true);
-            assert!(value.get("event").is_none());
+            for raw in [
+                b"{\"query\":\"sharedtoken\",\"limit\":3}\n".as_slice(),
+                b"{\"query\":\"sharedtoken\",\"limit\":3,\"stream\":false}\n",
+            ] {
+                let (client, mut server) = pair(raw);
+                serve_peer(
+                    &cx,
+                    &mut server,
+                    Duration::from_secs(2),
+                    |request| async move {
+                        assert_eq!(request.query, "sharedtoken");
+                        assert_eq!(request.limit, Some(3));
+                        Ok(serde_json::json!({"ok":true,"query":request.query}))
+                    },
+                )
+                .await
+                .unwrap();
+                let value = response(client);
+                assert_eq!(value["ok"], true);
+                assert!(value.get("event").is_none());
+            }
         });
     }
 
     #[test]
     fn socket_bad_input_and_progressive_requests_do_not_execute_search() {
         run_test_with_cx(|cx| async move {
-            for raw in [b"\xff\n".as_slice(), b"{invalid\n", b"{\"query\":\"x\",\"stream\":true}\n"] {
+            for raw in [
+                b"\xff\n".as_slice(),
+                b"{invalid\n",
+                b"{\"query\":\"x\",\"stream\":true}\n",
+                b"{\"query\":\"x\",\"stream\":\"true\"}\n",
+                b"{\"query\":\"x\",\"stream\":null}\n",
+            ] {
                 let (client, mut server) = pair(raw);
                 serve_peer(&cx, &mut server, Duration::from_secs(2), |_| async {
-                    panic!("refused request must not execute");
+                    panic!("refused request must not execute"); // ubs:ignore — cfg(test) negative control fails if a refused request reaches execution.
                     #[allow(unreachable_code)]
                     Ok(serde_json::Value::Null)
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
                 assert_eq!(response(client)["ok"], false);
             }
         });
@@ -449,10 +535,14 @@ mod tests {
             server.set_nonblocking(true).unwrap();
             client.set_nonblocking(true).unwrap();
             cx.set_cancel_requested(true);
-            assert!(matches!(read_request(&cx, &mut server, Duration::from_secs(60)).await,
-                Err(SearchError::Cancelled { .. })));
-            assert!(matches!(write_response(&cx, &mut server, b"not visible", Duration::from_secs(60)).await,
-                Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                read_request(&cx, &mut server, Duration::from_secs(60)).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                write_response(&cx, &mut server, b"not visible", Duration::from_secs(60)).await,
+                Err(SearchError::Cancelled { .. })
+            ));
             let error = client.read(&mut [0_u8; 16]).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::WouldBlock);
             cx.set_cancel_requested(false);
@@ -467,7 +557,9 @@ mod tests {
                 panic!("shutdown must not execute search"); // ubs:ignore — cfg(test) assertion.
                 #[allow(unreachable_code)]
                 Ok(serde_json::Value::Null)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert_eq!(outcome, PeerOutcome::Shutdown);
             let acknowledgment = response(client);
             assert_eq!(acknowledgment["ok"], true);
@@ -478,14 +570,15 @@ mod tests {
     #[test]
     fn malformed_control_neither_stops_nor_executes_search() {
         run_test_with_cx(|cx| async move {
-            let (client, mut server) = pair(
-                b"{\"fsfs_complete_daemon\":\"shutdown\",\"version\":2}\n",
-            );
+            let (client, mut server) =
+                pair(b"{\"fsfs_complete_daemon\":\"shutdown\",\"version\":2}\n");
             let outcome = serve_peer(&cx, &mut server, Duration::from_secs(2), |_| async {
                 panic!("malformed control must not execute search"); // ubs:ignore — cfg(test) assertion.
                 #[allow(unreachable_code)]
                 Ok(serde_json::Value::Null)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert_eq!(outcome, PeerOutcome::Search);
             assert_eq!(response(client)["ok"], false);
         });
@@ -497,10 +590,14 @@ mod tests {
             let (_client, mut server) = UnixStream::pair().unwrap();
             server.set_nonblocking(true).unwrap();
             for result in [
-                read_request(&cx, &mut server, Duration::ZERO).await.map(|_| ()),
+                read_request(&cx, &mut server, Duration::ZERO)
+                    .await
+                    .map(|_| ()),
                 write_response(&cx, &mut server, b"response", Duration::ZERO).await,
             ] {
-                assert!(matches!(result, Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut));
+                assert!(
+                    matches!(result, Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut)
+                );
             }
         });
     }
@@ -509,11 +606,11 @@ mod tests {
 #[cfg(all(test, not(feature = "embedded-models")))]
 mod generation_tests {
     use super::*;
-    use asupersync::test_utils::run_test_with_cx;
-    use crate::{CliCommand, CliInput, FsfsConfig, InterfaceMode};
     use crate::generation_store::{
         COMPLETE_GENERATION_POINTER, CompleteGenerationStore, GenerationPublication,
     };
+    use crate::{CliCommand, CliInput, FsfsConfig, InterfaceMode};
+    use asupersync::test_utils::run_test_with_cx;
     use std::io::BufRead;
 
     struct CancelOnDrop(Cx);
@@ -545,14 +642,24 @@ mod generation_tests {
                 quiet: true,
                 ..CliInput::default()
             });
-            assert!(matches!(runtime.rebuild_retained_generation(&cx, &root).await.unwrap(),
-                GenerationPublication::Durable(_)));
+            assert!(matches!(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+                GenerationPublication::Durable(_)
+            ));
             let pointer = root.join(COMPLETE_GENERATION_POINTER);
             let first = fs::read(&pointer).unwrap();
             let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
             fs::write(source.join("beta.md"), "sharedtoken beta document").unwrap();
-            assert!(matches!(runtime.rebuild_retained_generation(&cx, &root).await.unwrap(),
-                GenerationPublication::Durable(_)));
+            assert!(matches!(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+                GenerationPublication::Durable(_)
+            ));
             let successor = fs::read(&pointer).unwrap();
             fs::write(&pointer, &first).unwrap();
             let endpoint = root.join(FSFS_DAEMON_SOCKET_FILE);
@@ -574,18 +681,29 @@ mod generation_tests {
                             }
                         }
                     };
-                    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-                    stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
-                    stream.write_all(b"{\"query\":\"sharedtoken\",\"limit\":10}\n").unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    stream
+                        .write_all(b"{\"query\":\"sharedtoken\",\"limit\":10}\n")
+                        .unwrap();
                     let mut line = String::new();
-                    std::io::BufReader::new(stream).read_line(&mut line).unwrap();
+                    std::io::BufReader::new(stream)
+                        .read_line(&mut line)
+                        .unwrap();
                     serde_json::from_str(&line).unwrap()
                 };
                 let check = |value: serde_json::Value, count, cached| {
                     assert_eq!(value["ok"], true, "{value}");
                     assert_eq!(value["cached"], cached);
                     let phases = value["payloads"].as_array().unwrap();
-                    assert_eq!(phases.last().unwrap()["hits"].as_array().unwrap().len(), count);
+                    assert_eq!(
+                        phases.last().unwrap()["hits"].as_array().unwrap().len(),
+                        count
+                    );
                 };
                 let caching = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
                 check(request(), 1, false);
@@ -602,16 +720,25 @@ mod generation_tests {
                 check(request(), 2, false);
                 check(request(), 2, caching);
             });
-            let result = runtime.run_mode_with_complete_generations(
-                &cx, InterfaceMode::Cli, None, false,
-            ).await;
+            let result = runtime
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await;
             worker.join().unwrap();
-            assert!(matches!(result, Err(SearchError::Cancelled { .. })), "{result:?}");
+            assert!(
+                matches!(result, Err(SearchError::Cancelled { .. })),
+                "{result:?}"
+            );
             cx.set_cancel_requested(false);
             assert!(!endpoint.exists(), "owning command must release the socket");
             let old = pinned.search(&cx, "sharedtoken", 10).await.unwrap();
             assert_eq!(old.last().unwrap().hits.len(), 1);
-            assert!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap().is_some());
+            assert!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap()
+                    .is_some()
+            );
         });
     }
 }

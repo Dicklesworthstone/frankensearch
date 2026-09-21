@@ -693,7 +693,11 @@ mod tests {
             assert_eq!(fs::read(&pointer).unwrap(), before);
             assert_eq!(store.active(&cx).unwrap(), Some(first));
             assert!(candidate.join(COMPLETE_GENERATION_MANIFEST).is_file());
-            drop(store.begin(&cx).expect("failed precommit released the writer lease"));
+            drop(
+                store
+                    .begin(&cx)
+                    .expect("failed precommit released the writer lease"),
+            );
         });
     }
 

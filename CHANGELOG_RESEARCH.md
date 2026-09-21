@@ -1019,3 +1019,35 @@ no panic was removed. The changed-file static scan exits zero with zero critical
 findings, 985 warnings, and 494 informational findings. These are targeted
 maintenance checks and self-verification, not independent review, a full-suite
 pass on the candidate, or an incumbent-relative performance result.
+
+The subsequent combined source `e3f7bb61` exposed uncompiled daemon integration:
+two imported constants did not exist, and the buffered request type had no
+`stream` member. The repair uses the existing client I/O timeout, defines the
+complete-store socket beside its selection pointer, and validates the JSON
+transport selector before buffered deserialization can ignore it. Streamed or
+non-boolean selectors are rejected without executing a search. The new watcher
+files also needed formatting and strict Clippy repairs. The executable fixture
+needed the documented command/source/flags argument order; its acceptance
+assertions were retained.
+
+RCH worker `vmi1152480` passed all-target check, strict all-target Clippy, 71
+complete-generation unit tests, the executable output-format refusal test, and
+both explicitly invoked real-Potion integration tests. The watcher test searches
+through file additions, renames, and deletions while retaining predecessor
+generations. The new daemon test serves a real query, damages only its fixture's
+selection pointer, then proves the executable's stop command terminates the
+daemon and removes its owned socket without rewriting that pointer.
+
+Retrieved terminal receipt SHA-256 is
+`8c3546713374ba320daa1582d28fce85200711d5bc191851555d61ab4f662819`;
+the real-model test log is
+`2464ae07da14a0457016bd3dbae0662eed190ec7deb915eebed20d8666576fe1`.
+All retrieved stage hashes and all five tested Rust source hashes were checked.
+The post-run production executable hash is
+`b26422d6169bf234b7f129d9344c19dae5d9e601d0f72807c707bf9dc2a86d10`.
+The five-file UBS scan reported zero critical findings, 604 warnings, and 115
+informational findings; the final fixture-only rescan reported zero critical
+findings, 82 warnings, and nine informational findings. Earlier failed compile,
+lint, and fixture attempts remain recorded. These focused results do not replace
+clean-commit stock qualification, the still-running full Quill gate, the open R1
+comparison, or final platform release checks.

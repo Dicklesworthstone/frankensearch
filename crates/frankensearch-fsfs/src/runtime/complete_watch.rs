@@ -19,11 +19,11 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::complete_cli::{complete_cli_error, require_durable_publication};
 use super::{FsfsRuntime, retained_search_checkpoint, validate_retained_catalog_path};
+use crate::OutputFormat;
 use crate::config::{DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision};
 use crate::generation_store::{GenerationPublication, PublishedGeneration};
 use crate::mount_info::{MountTable, read_system_mounts};
 use crate::watcher::DEFAULT_DEBOUNCE_MS;
-use crate::OutputFormat;
 
 const DEBOUNCE: Duration = Duration::from_millis(DEFAULT_DEBOUNCE_MS);
 const MAX_DEBOUNCE: Duration = Duration::from_secs(5);
@@ -102,7 +102,11 @@ struct BackendFailure(Arc<notify::Error>);
 
 impl std::fmt::Display for BackendFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "complete-generation notification backend failed: {}", self.0)
+        write!(
+            formatter,
+            "complete-generation notification backend failed: {}",
+            self.0
+        )
     }
 }
 
@@ -144,7 +148,10 @@ fn observation_io(error: std::io::Error) -> SearchError {
 
 fn lock_changes(changes: &Mutex<Changes>) -> SearchResult<MutexGuard<'_, Changes>> {
     changes.lock().map_err(|_| {
-        complete_cli_error("watch_state", "complete-generation notification state was poisoned")
+        complete_cli_error(
+            "watch_state",
+            "complete-generation notification state was poisoned",
+        )
     })
 }
 
@@ -203,10 +210,9 @@ impl SourceRoot {
     fn check(&self) -> SearchResult<()> {
         let original = self.directory.metadata()?;
         let current = fs::symlink_metadata(&self.path)?;
-        if !original.is_dir()
-            || !current.is_dir()
-            || (original.dev(), original.ino()) != (current.dev(), current.ino())
-        {
+        let original_identity = (original.dev(), original.ino());
+        let current_identity = (current.dev(), current.ino());
+        if !original.is_dir() || !current.is_dir() || original_identity != current_identity {
             return Err(complete_cli_error(
                 "watch_source",
                 "the watched source directory was replaced or is not a directory; the selected generation was not discarded",
@@ -236,7 +242,10 @@ impl SourceRoot {
         self.check()?;
         let mounts = MountTable::new(read_system_mounts(), &discovery.mount_override_map());
         let category = mounts.lookup(&self.path).map(|(entry, _)| entry.category);
-        if matches!(discovery.evaluate_root(&self.path, category).scope, DiscoveryScopeDecision::Exclude) {
+        if matches!(
+            discovery.evaluate_root(&self.path, category).scope,
+            DiscoveryScopeDecision::Exclude
+        ) {
             return Err(complete_cli_error(
                 "watch_discovery",
                 "the watched source is excluded by discovery policy; refusing an empty replacement",
@@ -252,7 +261,8 @@ impl SourceRoot {
             // finish; replacement cannot recycle the opened inode underneath us.
             let held = File::open(&directory).map_err(observation_io)?;
             let opened = held.metadata()?;
-            if !opened.is_dir() || (opened.dev(), opened.ino()) != (expected.dev(), expected.ino()) {
+            if !opened.is_dir() || (opened.dev(), opened.ino()) != (expected.dev(), expected.ino())
+            {
                 return Err(source_changed());
             }
             let canonical = fs::canonicalize(&directory).map_err(observation_io)?;
@@ -283,8 +293,10 @@ impl SourceRoot {
                     link
                 };
                 let mut candidate = DiscoveryCandidate::new(
-                    &path, if metadata.is_dir() { 0 } else { metadata.len() },
-                ).with_symlink(is_symlink);
+                    &path,
+                    if metadata.is_dir() { 0 } else { metadata.len() },
+                )
+                .with_symlink(is_symlink);
                 if let Some((mount, _)) = mounts.lookup(&path) {
                     candidate = candidate.with_mount_category(mount.category);
                 }
@@ -307,7 +319,10 @@ impl SourceRoot {
         }
         self.check()?;
         retained_search_checkpoint(cx)?;
-        Ok(SourceObservation { stamps, directories })
+        Ok(SourceObservation {
+            stamps,
+            directories,
+        })
     }
 }
 
@@ -346,10 +361,11 @@ fn touches_observed_files(
     current: &SourceObservation,
     previous: Option<&SourceObservation>,
 ) -> bool {
-    hint.force_rebuild || hint.paths.iter().any(|path| {
-        current.stamps.contains_key(path)
-            || previous.is_some_and(|observation| observation.stamps.contains_key(path))
-    })
+    hint.force_rebuild
+        || hint.paths.iter().any(|path| {
+            current.stamps.contains_key(path)
+                || previous.is_some_and(|observation| observation.stamps.contains_key(path))
+        })
 }
 
 /// A read-only preflight: do not create a staging tree inside the source even
@@ -361,7 +377,9 @@ fn resolve_watch_store(source: &Path, root: &Path) -> SearchResult<PathBuf> {
             let name = root.file_name().ok_or_else(|| {
                 complete_cli_error("store_root", "a store root needs a directory name")
             })?;
-            let parent = root.parent().filter(|path| !path.as_os_str().is_empty())
+            let parent = root
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
             fs::canonicalize(parent)?.join(name)
         }
@@ -398,22 +416,26 @@ impl CompleteWatchSession {
         // Preserve the store's refusal of a symlink supplied by the caller;
         // canonicalization above is only for overlap checking and anchoring.
         if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-            return Err(complete_cli_error("store_root", "symlinked store roots are unsupported"));
+            return Err(complete_cli_error(
+                "store_root",
+                "symlinked store roots are unsupported",
+            ));
         }
         let changes = Arc::new(Mutex::new(Changes::default()));
         let callback_changes = Arc::clone(&changes);
         let mut watcher = notify::recommended_watcher(move |result| {
             record_notification(&callback_changes, result, Instant::now());
-        }).map_err(|source| SearchError::SubsystemError {
+        })
+        .map_err(|source| SearchError::SubsystemError {
             subsystem: "fsfs.complete_generation.watch",
             source: Box::new(source),
         })?;
-        watcher.watch(&source.path, RecursiveMode::Recursive).map_err(|source| {
-            SearchError::SubsystemError {
+        watcher
+            .watch(&source.path, RecursiveMode::Recursive)
+            .map_err(|source| SearchError::SubsystemError {
                 subsystem: "fsfs.complete_generation.watch",
                 source: Box::new(source),
-            }
-        })?;
+            })?;
         source.check()?;
         retained_search_checkpoint(cx)?;
         let mut runtime = runtime.clone();
@@ -432,15 +454,14 @@ impl CompleteWatchSession {
 
     #[allow(clippy::future_not_send)]
     async fn attempt(
-        &mut self,
+        &self,
         cx: &Cx,
         force_rebuild: bool,
         pending: Option<&DirtyWindow>,
     ) -> SearchResult<Option<(SourceObservation, GenerationPublication)>> {
         let observed = self.source.observe(cx, &self.runtime.config.discovery)?;
-        let touched = pending.is_some_and(|hint| {
-            touches_observed_files(hint, &observed, self.baseline.as_ref())
-        });
+        let touched = pending
+            .is_some_and(|hint| touches_observed_files(hint, &observed, self.baseline.as_ref()));
         if !force_rebuild && !touched && self.baseline.as_ref() == Some(&observed) {
             // Excluded-file notifications do not force re-embedding the corpus.
             return Ok(None);
@@ -451,10 +472,9 @@ impl CompleteWatchSession {
         let discovery = &self.runtime.config.discovery;
         let changes = &self.changes;
         let expected = &observed;
-        let publication = self.runtime.rebuild_retained_generation_with_precommit(
-            cx,
-            &self.store_root,
-            move |cx| {
+        let publication = self
+            .runtime
+            .rebuild_retained_generation_with_precommit(cx, &self.store_root, move |cx| {
                 check_backend(changes)?;
                 let current = source.observe(cx, discovery)?;
                 if &current != expected {
@@ -464,19 +484,26 @@ impl CompleteWatchSession {
                 // queued in-scope content hint is still evidence of a raced
                 // build, and must not be acknowledged by this publication.
                 let changes = lock_changes(changes)?;
-                if changes.dirty.as_ref().is_some_and(|hint| {
-                    touches_observed_files(hint, &current, Some(expected))
-                }) {
+                if changes
+                    .dirty
+                    .as_ref()
+                    .is_some_and(|hint| touches_observed_files(hint, &current, Some(expected)))
+                {
                     return Err(source_changed());
                 }
+                drop(changes);
                 Ok(())
-            },
-        ).await?;
+            })
+            .await?;
         Ok(Some((observed, publication)))
     }
 
     #[allow(clippy::future_not_send)]
-    async fn advance(&mut self, cx: &Cx, now: Instant) -> SearchResult<Option<GenerationPublication>> {
+    async fn advance(
+        &mut self,
+        cx: &Cx,
+        now: Instant,
+    ) -> SearchResult<Option<GenerationPublication>> {
         retained_search_checkpoint(cx)?;
         check_backend(&self.changes)?;
         self.source.check()?;
@@ -522,6 +549,7 @@ impl CompleteWatchSession {
                     window.first = retry_at;
                     window.paths.clear();
                 }
+                drop(changes);
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -580,7 +608,10 @@ impl FsfsRuntime {
         root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
-        if !matches!(self.cli_input.format, OutputFormat::Table | OutputFormat::Jsonl | OutputFormat::Toon) {
+        if !matches!(
+            self.cli_input.format,
+            OutputFormat::Table | OutputFormat::Jsonl | OutputFormat::Toon
+        ) {
             return Err(complete_cli_error(
                 "watch_format",
                 "complete-generation watch requires --format table, jsonl, or toon; a sequence of standalone JSON or CSV documents is not emitted",
@@ -588,7 +619,8 @@ impl FsfsRuntime {
         }
         self.watch_retained_generations(cx, root, |generation| {
             self.emit_complete_generation_receipt(root, generation, "watch", writer)
-        }).await
+        })
+        .await
     }
 }
 
@@ -596,7 +628,7 @@ impl FsfsRuntime {
 mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
-    use notify::event::{AccessKind, ModifyKind, DataChange, Flag};
+    use notify::event::{AccessKind, DataChange, Flag, ModifyKind};
 
     #[test]
     fn complete_watch_debounce_does_not_starve_under_a_continuous_burst() {
@@ -632,23 +664,48 @@ mod tests {
     fn complete_watch_access_does_not_rebuild_but_rescan_even_on_access_does() {
         let changes = Mutex::new(Changes::default());
         let now = Instant::now();
-        record_notification(&changes, Ok(Event::new(EventKind::Access(AccessKind::Any))), now);
+        record_notification(
+            &changes,
+            Ok(Event::new(EventKind::Access(AccessKind::Any))),
+            now,
+        );
         assert!(lock_changes(&changes).unwrap().dirty.is_none());
-        record_notification(&changes, Ok(
-            Event::new(EventKind::Access(AccessKind::Any)).set_flag(Flag::Rescan)
-        ), now);
-        assert!(lock_changes(&changes).unwrap().dirty.as_ref().unwrap().force_rebuild);
+        record_notification(
+            &changes,
+            Ok(Event::new(EventKind::Access(AccessKind::Any)).set_flag(Flag::Rescan)),
+            now,
+        );
+        assert!(
+            lock_changes(&changes)
+                .unwrap()
+                .dirty
+                .as_ref()
+                .unwrap()
+                .force_rebuild
+        );
     }
 
     #[test]
     fn complete_watch_backend_error_is_sticky_and_preserves_the_original_source() {
         let changes = Mutex::new(Changes::default());
-        record_notification(&changes, Err(notify::Error::generic("injected backend failure")), Instant::now());
+        record_notification(
+            &changes,
+            Err(notify::Error::generic("injected backend failure")),
+            Instant::now(),
+        );
         for _ in 0..2 {
             let error = check_backend(&changes).unwrap_err();
-            let SearchError::SubsystemError { source, .. } = error else { panic!("subsystem error") };
+            let SearchError::SubsystemError { source, .. } = error else {
+                panic!("subsystem error") // ubs:ignore — cfg(test) assertion requires the injected backend error to retain its typed source.
+            };
             assert!(source.to_string().contains("injected backend failure"));
-            assert!(source.source().unwrap().to_string().contains("injected backend failure"));
+            assert!(
+                source
+                    .source()
+                    .unwrap()
+                    .to_string()
+                    .contains("injected backend failure")
+            );
         }
     }
 
@@ -657,14 +714,19 @@ mod tests {
         let changes = Mutex::new(Changes::default());
         let now = Instant::now();
         for _ in 0..10_000 {
-            record_notification(&changes, Ok(
-                Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
-                    .add_path(PathBuf::from("/source/document.md"))
-            ), now);
+            record_notification(
+                &changes,
+                Ok(
+                    Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
+                        .add_path(PathBuf::from("/source/document.md")),
+                ),
+                now,
+            );
         }
         let mut changes = lock_changes(&changes).unwrap();
         assert!(changes.take_due(now + DEBOUNCE).is_some());
         assert!(changes.take_due(now + DEBOUNCE).is_none());
+        drop(changes);
     }
 
     #[test]
@@ -683,7 +745,10 @@ mod tests {
 
     #[test]
     fn complete_watch_relative_or_oversized_hint_cannot_be_silently_missed() {
-        for path in [PathBuf::from("relative.md"), PathBuf::from(format!("/{}", "x".repeat(MAX_HINT_PATH_BYTES)))] {
+        for path in [
+            PathBuf::from("relative.md"),
+            PathBuf::from(format!("/{}", "x".repeat(MAX_HINT_PATH_BYTES))),
+        ] {
             let mut changes = Changes::default();
             changes.record(Instant::now(), false);
             changes.record_path(&path);
@@ -703,11 +768,19 @@ mod tests {
             let mut changes = Changes::default();
             changes.record(Instant::now(), false);
             changes.record_path(&path);
-            assert!(touches_observed_files(changes.dirty.as_ref().unwrap(), &observed, Some(&observed)));
+            assert!(touches_observed_files(
+                changes.dirty.as_ref().unwrap(),
+                &observed,
+                Some(&observed)
+            ));
             let mut excluded = Changes::default();
             excluded.record(Instant::now(), false);
             excluded.record_path(&source.path.join("not-in-the-observation.bin"));
-            assert!(!touches_observed_files(excluded.dirty.as_ref().unwrap(), &observed, Some(&observed)));
+            assert!(!touches_observed_files(
+                excluded.dirty.as_ref().unwrap(),
+                &observed,
+                Some(&observed)
+            ));
         });
     }
 
@@ -744,8 +817,12 @@ mod tests {
             let before = source.observe(&cx, &discovery).unwrap();
             let replacement = source.path.join("replacement.tmp");
             fs::write(&replacement, "other").unwrap();
-            File::options().write(true).open(&replacement).unwrap()
-                .set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
+            File::options()
+                .write(true)
+                .open(&replacement)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
             fs::rename(&replacement, &path).unwrap();
             let after = source.observe(&cx, &discovery).unwrap();
             assert_eq!(before.stamps.len(), 1);
@@ -760,7 +837,10 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let source = SourceRoot::open(fs::canonicalize(directory.path()).unwrap()).unwrap();
             cx.set_cancel_requested(true);
-            assert!(matches!(source.observe(&cx, &DiscoveryConfig::default()), Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                source.observe(&cx, &DiscoveryConfig::default()),
+                Err(SearchError::Cancelled { .. })
+            ));
         });
     }
 
@@ -773,15 +853,27 @@ mod tests {
             }
             let source = SourceRoot::open(fs::canonicalize(directory.path()).unwrap()).unwrap();
             let mut visited = 0;
-            let error = source.observe_with_entry_check(&cx, &DiscoveryConfig::default(), |_| {
-                visited += 1;
-                cx.set_cancel_requested(true);
-                Ok(())
-            }).unwrap_err();
+            let error = source
+                .observe_with_entry_check(&cx, &DiscoveryConfig::default(), |_| {
+                    visited += 1;
+                    cx.set_cancel_requested(true);
+                    Ok(())
+                })
+                .unwrap_err();
             assert!(matches!(error, SearchError::Cancelled { .. }));
-            assert_eq!(visited, 1, "stop inside a flat listing, not after traversal");
+            assert_eq!(
+                visited, 1,
+                "stop inside a flat listing, not after traversal"
+            );
             cx.set_cancel_requested(false);
-            assert_eq!(source.observe(&cx, &DiscoveryConfig::default()).unwrap().stamps.len(), 3);
+            assert_eq!(
+                source
+                    .observe(&cx, &DiscoveryConfig::default())
+                    .unwrap()
+                    .stamps
+                    .len(),
+                3
+            );
         });
     }
 
@@ -791,9 +883,15 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             fs::write(directory.path().join("alpha.md"), "source content").unwrap();
             let source = SourceRoot::open(fs::canonicalize(directory.path()).unwrap()).unwrap();
-            let error = source.observe_with_entry_check(&cx, &DiscoveryConfig::default(), |_| {
-                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected denied entry").into())
-            }).unwrap_err();
+            let error = source
+                .observe_with_entry_check(&cx, &DiscoveryConfig::default(), |_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected denied entry",
+                    )
+                    .into())
+                })
+                .unwrap_err();
             assert!(matches!(error, SearchError::Io(source)
                 if source.kind() == std::io::ErrorKind::PermissionDenied
                     && source.to_string().contains("injected denied entry")));
@@ -809,18 +907,25 @@ mod tests {
             fs::write(root.join("alpha.md"), "source content").unwrap();
             let source = SourceRoot::open(fs::canonicalize(&root).unwrap()).unwrap();
             let mut replaced = false;
-            let error = source.observe_with_entry_check(&cx, &DiscoveryConfig::default(), |_| {
-                if !replaced {
-                    fs::rename(&root, directory.path().join("retained-original"))?;
-                    fs::create_dir(&root)?;
-                    fs::write(root.join("alpha.md"), "replacement source")?;
-                    replaced = true;
-                }
-                Ok(())
-            }).unwrap_err();
+            let error = source
+                .observe_with_entry_check(&cx, &DiscoveryConfig::default(), |_| {
+                    if !replaced {
+                        fs::rename(&root, directory.path().join("retained-original"))?;
+                        fs::create_dir(&root)?;
+                        fs::write(root.join("alpha.md"), "replacement source")?;
+                        replaced = true;
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
             assert!(replaced);
             assert!(is_source_changed(&error));
-            assert!(directory.path().join("retained-original/alpha.md").is_file());
+            assert!(
+                directory
+                    .path()
+                    .join("retained-original/alpha.md")
+                    .is_file()
+            );
         });
     }
 
@@ -831,8 +936,11 @@ mod tests {
         let sink = Arc::clone(&changes);
         let mut watcher = notify::recommended_watcher(move |result| {
             record_notification(&sink, result, Instant::now());
-        }).unwrap();
-        watcher.watch(directory.path(), RecursiveMode::Recursive).unwrap();
+        })
+        .unwrap();
+        watcher
+            .watch(directory.path(), RecursiveMode::Recursive)
+            .unwrap();
         fs::write(directory.path().join("alpha.md"), "native notification").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -840,7 +948,10 @@ mod tests {
             if lock_changes(&changes).unwrap().dirty.is_some() {
                 break;
             }
-            assert!(Instant::now() < deadline, "native watcher produced no write notification");
+            assert!(
+                Instant::now() < deadline,
+                "native watcher produced no write notification"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -849,9 +960,9 @@ mod tests {
 #[cfg(all(test, not(feature = "embedded-models")))]
 mod lifecycle_tests {
     use super::*;
-    use asupersync::test_utils::run_test_with_cx;
+    use crate::generation_store::{COMPLETE_GENERATION_POINTER, CompleteGenerationStore};
     use crate::{CliCommand, CliInput, FsfsConfig};
-    use crate::generation_store::{CompleteGenerationStore, COMPLETE_GENERATION_POINTER};
+    use asupersync::test_utils::run_test_with_cx;
 
     fn fixture(parent: &Path) -> (FsfsRuntime, PathBuf, PathBuf) {
         let source = parent.join("source");
@@ -859,7 +970,7 @@ mod lifecycle_tests {
         fs::create_dir(&source).unwrap();
         fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
         let mut config = FsfsConfig::default();
-        config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+        "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
         config.indexing.offline = true;
         config.indexing.quality_model.clear();
         config.search.fast_only = true;
@@ -885,7 +996,7 @@ mod lifecycle_tests {
                 return require_durable_publication(publication).unwrap();
             }
         }
-        panic!("no publication after bounded settling attempts")
+        panic!("no publication after bounded settling attempts") // ubs:ignore — cfg(test) bounded wait must fail when publication never occurs.
     }
 
     #[test]
@@ -900,8 +1011,27 @@ mod lifecycle_tests {
             fs::write(source.join("beta.md"), "sharedtoken beta document").unwrap();
             let second = publish_tick(&mut session, &cx).await;
             assert_ne!(first, second);
-            assert_eq!(pinned.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 1);
-            assert_eq!(live.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 2);
+            assert_eq!(
+                pinned
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert_eq!(
+                live.search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
             fs::rename(source.join("alpha.md"), source.join("renamed.md")).unwrap();
             fs::remove_file(source.join("beta.md")).unwrap();
             let third = publish_tick(&mut session, &cx).await;
@@ -911,7 +1041,13 @@ mod lifecycle_tests {
             assert!(hits[0].path.ends_with("renamed.md"));
             assert_eq!(pinned.generation(), &first);
             assert!(first.path().is_dir());
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(third));
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(third)
+            );
             // The native watcher is STILL owned and registered at these reads.
             session.source.check().unwrap();
         });
@@ -924,14 +1060,29 @@ mod lifecycle_tests {
             let (runtime, source, root) = fixture(directory.path());
             let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
             publish_tick(&mut session, &cx).await;
-            session._watcher.unwatch(&session.source.path).unwrap();
+            let CompleteWatchSession {
+                _watcher: watcher,
+                source: watched_source,
+                ..
+            } = &mut session;
+            watcher.unwatch(&watched_source.path).unwrap();
             lock_changes(&session.changes).unwrap().dirty = None;
             fs::write(source.join("beta.md"), "sharedtoken beta document").unwrap();
             let deadline = session.last_reconcile + RECONCILE_INTERVAL;
             let publication = session.advance(&cx, deadline).await.unwrap().unwrap();
             require_durable_publication(publication).unwrap();
             let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
-            assert_eq!(reader.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 2);
+            assert_eq!(
+                reader
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
         });
     }
 
@@ -943,8 +1094,19 @@ mod lifecycle_tests {
             let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
             let before = publish_tick(&mut session, &cx).await;
             fs::rename(source, directory.path().join("offline-source")).unwrap();
-            assert!(session.advance(&cx, Instant::now() + MAX_DEBOUNCE).await.is_err());
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(before));
+            assert!(
+                session
+                    .advance(&cx, Instant::now() + MAX_DEBOUNCE)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(before)
+            );
         });
     }
 
@@ -954,15 +1116,22 @@ mod lifecycle_tests {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(directory.path());
             let mut received = None;
-            let error = runtime.watch_retained_generations(&cx, &root, |generation| {
-                received = Some(generation.clone());
-                Err(complete_cli_error("test_sink", "injected output failure"))
-            }).await.unwrap_err();
-            assert!(matches!(error, SearchError::InvalidConfig { field, .. } if field == "complete_generation.test_sink"));
+            let error = runtime
+                .watch_retained_generations(&cx, &root, |generation| {
+                    received = Some(generation.clone());
+                    Err(complete_cli_error("test_sink", "injected output failure"))
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "complete_generation.test_sink")
+            );
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
             assert_eq!(store.active(&cx).unwrap(), received);
             assert!(received.is_some());
-            let next = store.begin(&cx).expect("writer lease released after sink failure");
+            let next = store
+                .begin(&cx)
+                .expect("writer lease released after sink failure");
             drop(next);
         });
     }
@@ -973,11 +1142,14 @@ mod lifecycle_tests {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(directory.path());
             let mut delivered = 0;
-            let error = runtime.watch_retained_generations(&cx, &root, |_| {
-                delivered += 1;
-                cx.set_cancel_requested(true);
-                Ok(())
-            }).await.unwrap_err();
+            let error = runtime
+                .watch_retained_generations(&cx, &root, |_| {
+                    delivered += 1;
+                    cx.set_cancel_requested(true);
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
             assert!(matches!(error, SearchError::Cancelled { .. }));
             assert_eq!(delivered, 1);
             cx.set_cancel_requested(false);
@@ -994,10 +1166,13 @@ mod lifecycle_tests {
             let (runtime, _, root) = fixture(directory.path());
             cx.set_cancel_requested(true);
             let mut delivered = 0;
-            let error = runtime.watch_retained_generations(&cx, &root, |_| {
-                delivered += 1;
-                Ok(())
-            }).await.unwrap_err();
+            let error = runtime
+                .watch_retained_generations(&cx, &root, |_| {
+                    delivered += 1;
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
             assert!(matches!(error, SearchError::Cancelled { .. }));
             assert_eq!(delivered, 0);
             assert!(!root.exists());
@@ -1009,18 +1184,29 @@ mod lifecycle_tests {
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, source, root) = fixture(directory.path());
-            require_durable_publication(runtime.rebuild_retained_generation(&cx, &root).await.unwrap()).unwrap();
+            require_durable_publication(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
             let pointer = root.join(COMPLETE_GENERATION_POINTER);
             let before = fs::read(&pointer).unwrap();
             let observed_source = SourceRoot::open(fs::canonicalize(&source).unwrap()).unwrap();
-            let observed = observed_source.observe(&cx, &runtime.config.discovery).unwrap();
-            let error = runtime.rebuild_retained_generation_with_precommit(&cx, &root, |cx| {
-                fs::write(source.join("beta.md"), "sharedtoken beta document")?;
-                if observed_source.observe(cx, &runtime.config.discovery)? != observed {
-                    return Err(source_changed());
-                }
-                Ok(())
-            }).await.unwrap_err();
+            let observed = observed_source
+                .observe(&cx, &runtime.config.discovery)
+                .unwrap();
+            let error = runtime
+                .rebuild_retained_generation_with_precommit(&cx, &root, |cx| {
+                    fs::write(source.join("beta.md"), "sharedtoken beta document")?;
+                    if observed_source.observe(cx, &runtime.config.discovery)? != observed {
+                        return Err(source_changed());
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
             assert!(is_source_changed(&error));
             assert_eq!(fs::read(pointer).unwrap(), before);
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
@@ -1036,9 +1222,13 @@ mod lifecycle_tests {
             let (mut runtime, _, root) = fixture(directory.path());
             runtime.cli_input.format = OutputFormat::Json;
             let mut output = Vec::new();
-            let error = runtime.run_complete_generation_watch_with_writer(&cx, &root, &mut output)
-                .await.unwrap_err();
-            assert!(matches!(error, SearchError::InvalidConfig { field, .. } if field == "complete_generation.watch_format"));
+            let error = runtime
+                .run_complete_generation_watch_with_writer(&cx, &root, &mut output)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "complete_generation.watch_format")
+            );
             assert!(output.is_empty());
             assert!(!root.exists());
         });

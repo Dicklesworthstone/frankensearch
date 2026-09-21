@@ -17,8 +17,8 @@ use frankensearch_core::{SearchError, SearchResult};
 use serde::Deserialize;
 
 use super::{
-    FSFS_DAEMON_IDLE_TIMEOUT_MS, FSFS_DAEMON_REQUEST_MAX_BYTES, IO_POLL_INTERVAL, complete_cli_error,
-    retained_search_checkpoint, write_response,
+    FSFS_DAEMON_IDLE_TIMEOUT_MS, FSFS_DAEMON_REQUEST_MAX_BYTES, IO_POLL_INTERVAL,
+    complete_cli_error, retained_search_checkpoint, write_response,
 };
 
 const CONTROL_PROTOCOL: &str = "fsfs.complete_generation.control";
@@ -62,11 +62,17 @@ pub(super) fn is_shutdown_request(bytes: &[u8]) -> SearchResult<bool> {
     // Deserialize the original bytes, not `value`: this also rejects duplicate
     // keys instead of letting a last-key-wins object authorize shutdown.
     let request: ShutdownRequest = serde_json::from_slice(bytes).map_err(|error| {
-        complete_cli_error("daemon_control", &format!("invalid control request: {error}"))
+        complete_cli_error(
+            "daemon_control",
+            &format!("invalid control request: {error}"),
+        )
     })?;
     let ShutdownCommand::Shutdown = request.fsfs_complete_daemon;
     if request.version != 1 {
-        return Err(complete_cli_error("daemon_control", "unsupported control version"));
+        return Err(complete_cli_error(
+            "daemon_control",
+            "unsupported control version",
+        ));
     }
     Ok(true)
 }
@@ -77,9 +83,19 @@ pub(super) fn idle_timeout(override_ms: Option<u64>) -> Option<Duration> {
 }
 
 pub(super) async fn stop(cx: &Cx, path: &Path, timeout: Duration) -> SearchResult<()> {
-    let bytes = exchange(cx, path, SHUTDOWN_REQUEST, CONTROL_RESPONSE_MAX_BYTES, timeout).await?;
+    let bytes = exchange(
+        cx,
+        path,
+        SHUTDOWN_REQUEST,
+        CONTROL_RESPONSE_MAX_BYTES,
+        timeout,
+    )
+    .await?;
     let response: ShutdownResponse = serde_json::from_slice(&bytes).map_err(|error| {
-        complete_cli_error("daemon_control", &format!("invalid shutdown acknowledgment: {error}"))
+        complete_cli_error(
+            "daemon_control",
+            &format!("invalid shutdown acknowledgment: {error}"),
+        )
     })?;
     let ShutdownCommand::Shutdown = response.event;
     if !response.ok || response.version != 1 || response.protocol != CONTROL_PROTOCOL {
@@ -108,10 +124,16 @@ pub(super) async fn exchange(
         || request.last() != Some(&b'\n')
         || request[..request.len() - 1].contains(&b'\n')
     {
-        return Err(complete_cli_error("daemon_request", "expected one bounded request frame"));
+        return Err(complete_cli_error(
+            "daemon_request",
+            "expected one bounded request frame",
+        ));
     }
     if !fs::symlink_metadata(path)?.file_type().is_socket() {
-        return Err(complete_cli_error("daemon_socket", "expected a non-symlink Unix socket"));
+        return Err(complete_cli_error(
+            "daemon_socket",
+            "expected a non-symlink Unix socket",
+        ));
     }
     let mut peer = connect(cx, path, started, timeout).await?;
     write_response(cx, &mut peer, request, remaining(started, timeout)?).await?;
@@ -139,7 +161,8 @@ async fn connect(
         SocketType::STREAM,
         SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
         None,
-    ).map_err(io::Error::from)?;
+    )
+    .map_err(io::Error::from)?;
     match rustix::net::connect(&socket, &address) {
         Ok(()) => return Ok(UnixStream::from(socket)),
         Err(rustix::io::Errno::INPROGRESS) => {}
@@ -165,9 +188,15 @@ async fn connect(
 }
 
 fn remaining(started: Instant, timeout: Duration) -> SearchResult<Duration> {
-    timeout.checked_sub(started.elapsed()).filter(|left| !left.is_zero()).ok_or_else(|| {
-        SearchError::Io(io::Error::new(ErrorKind::TimedOut, "complete-daemon client deadline exceeded"))
-    })
+    timeout
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| {
+            SearchError::Io(io::Error::new(
+                ErrorKind::TimedOut,
+                "complete-daemon client deadline exceeded",
+            ))
+        })
 }
 
 async fn read_response(
@@ -187,18 +216,31 @@ async fn read_response(
         let left = remaining(started, timeout)?;
         let count_limit = (capacity - bytes.len()).min(chunk.len());
         match peer.read(&mut chunk[..count_limit]) {
-            Ok(0) => return Err(io::Error::new(
-                ErrorKind::UnexpectedEof, "daemon closed before a complete response frame",
-            ).into()),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "daemon closed before a complete response frame",
+                )
+                .into());
+            }
             Ok(count) => {
                 bytes.extend_from_slice(&chunk[..count]);
                 if bytes.len() > limit {
-                    return Err(complete_cli_error("daemon_response", "response exceeds its byte limit"));
+                    return Err(complete_cli_error(
+                        "daemon_response",
+                        "response exceeds its byte limit",
+                    ));
                 }
                 if let Some(offset) = chunk[..count].iter().position(|byte| *byte == b'\n') {
                     let newline = bytes.len() - count + offset;
-                    if bytes[newline + 1..].iter().any(|byte| !byte.is_ascii_whitespace()) {
-                        return Err(complete_cli_error("daemon_response", "multiple response frames on one connection"));
+                    if bytes[newline + 1..]
+                        .iter()
+                        .any(|byte| !byte.is_ascii_whitespace())
+                    {
+                        return Err(complete_cli_error(
+                            "daemon_response",
+                            "multiple response frames on one connection",
+                        ));
                     }
                     bytes.truncate(newline + 1);
                     return Ok(bytes);
@@ -224,7 +266,11 @@ mod tests {
     #[test]
     fn lifecycle_controls_are_versioned_and_not_search_queries() {
         assert!(is_shutdown_request(SHUTDOWN_REQUEST).unwrap());
-        for query in [b"shutdown".as_slice(), b"{\"query\":\"shutdown\"}\n", b"{broken"] {
+        for query in [
+            b"shutdown".as_slice(),
+            b"{\"query\":\"shutdown\"}\n",
+            b"{broken",
+        ] {
             assert!(!is_shutdown_request(query).unwrap());
         }
         for invalid in [
@@ -242,7 +288,10 @@ mod tests {
     fn idle_timeout_override_preserves_zero_as_keep_alive() {
         assert_eq!(idle_timeout(Some(0)), None);
         assert_eq!(idle_timeout(Some(17)), Some(Duration::from_millis(17)));
-        assert_eq!(idle_timeout(None), idle_timeout(Some(FSFS_DAEMON_IDLE_TIMEOUT_MS)));
+        assert_eq!(
+            idle_timeout(None),
+            idle_timeout(Some(FSFS_DAEMON_IDLE_TIMEOUT_MS))
+        );
     }
 
     #[test]
@@ -267,8 +316,10 @@ mod tests {
             let listener = UnixListener::bind(&path).unwrap();
             listener.set_nonblocking(true).unwrap();
             cx.set_cancel_requested(true);
-            assert!(matches!(stop(&cx, &path, Duration::from_secs(60)).await,
-                Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                stop(&cx, &path, Duration::from_secs(60)).await,
+                Err(SearchError::Cancelled { .. })
+            ));
             cx.set_cancel_requested(false);
             assert!(matches!(stop(&cx, &path, Duration::ZERO).await,
                 Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut));
@@ -288,12 +339,21 @@ mod tests {
                 peer.set_nonblocking(true).unwrap();
                 sender.write_all(response).unwrap();
                 sender.shutdown(Shutdown::Write).unwrap();
-                assert!(read_response(&cx, &mut peer, limit, Duration::from_secs(1)).await.is_err());
+                assert!(
+                    read_response(&cx, &mut peer, limit, Duration::from_secs(1))
+                        .await
+                        .is_err()
+                );
             }
             let (mut peer, mut sender) = UnixStream::pair().unwrap();
             peer.set_nonblocking(true).unwrap();
             sender.write_all(b"{}\n").unwrap();
-            assert_eq!(read_response(&cx, &mut peer, 3, Duration::from_secs(1)).await.unwrap(), b"{}\n");
+            assert_eq!(
+                read_response(&cx, &mut peer, 3, Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+                b"{}\n"
+            );
         });
     }
 
@@ -303,19 +363,23 @@ mod tests {
             let (mut peer, _sender) = UnixStream::pair().unwrap();
             peer.set_nonblocking(true).unwrap();
             cx.set_cancel_requested(true);
-            assert!(matches!(read_response(&cx, &mut peer, 20, Duration::from_secs(60)).await,
-                Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                read_response(&cx, &mut peer, 20, Duration::from_secs(60)).await,
+                Err(SearchError::Cancelled { .. })
+            ));
             cx.set_cancel_requested(false);
-            assert!(matches!(read_response(&cx, &mut peer, 20, Duration::ZERO).await,
-                Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut));
+            assert!(
+                matches!(read_response(&cx, &mut peer, 20, Duration::ZERO).await,
+                Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut)
+            );
         });
     }
 
     #[test]
     fn stop_command_round_trips_without_admitting_a_corrupt_generation() {
         run_test_with_cx(|cx| async move {
-            use crate::{CliCommand, CliInput, FsfsConfig, FsfsRuntime};
             use super::super::BoundCompleteSocket;
+            use crate::{CliCommand, CliInput, FsfsConfig, FsfsRuntime};
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().to_path_buf();
             let path = root.join("controlled.sock");
@@ -336,7 +400,8 @@ mod tests {
                 };
                 peer.set_nonblocking(false).unwrap();
                 peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                peer.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
                 let mut request = vec![0; SHUTDOWN_REQUEST.len()];
                 peer.read_exact(&mut request).unwrap();
                 assert_eq!(request, SHUTDOWN_REQUEST);
@@ -356,9 +421,11 @@ mod tests {
             server.join().unwrap();
             result.unwrap();
             assert!(!path.exists());
-            assert_eq!(fs::read(&pointer).unwrap(), b"intentionally corrupt selection");
+            assert_eq!(
+                fs::read(&pointer).unwrap(),
+                b"intentionally corrupt selection"
+            );
             assert!(!root.join("generations").exists());
         });
     }
-
 }

@@ -86,6 +86,19 @@ reads block on the command's owning lane: cancellation is observed between
 reads and requests, not promised to interrupt an idle blocked read. No detached
 input worker is introduced.
 
+On Unix, the buffered daemon uses a socket owned by the complete store:
+
+```sh
+fsfs daemon --index-dir /work/search-store --config /work/fsfs.toml --idle-timeout-ms 0
+fsfs daemon --index-dir /work/search-store --config /work/fsfs.toml --stop
+```
+
+The first command stays in the foreground and listens at
+`/work/search-store/fsfs-query.sock`; zero disables idle expiry. Each connection
+accepts one newline-terminated query and returns one buffered response. The stop
+command addresses that socket and remains usable if the generation selection is
+damaged. It does not start a replacement daemon or repair the selection.
+
 ## Watching and current boundaries
 
 Complete-store routing also supports `watch` and `index --watch`, using full
