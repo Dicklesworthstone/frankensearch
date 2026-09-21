@@ -968,3 +968,54 @@ the additional fixed-hash consumers. UBS returned exit 3 for JSON alone because
 it has no JSON scanner; this is not a pass. A cumulative scan including the two
 actual Rust files repaired in this work block exited zero, but does not validate
 JSON. Historical-byte comparisons and the consumer tests provide that evidence.
+
+The clean committed source `af1d6db2b8484ca465fcb1f6ceda1a9024522af9`
+subsequently passed the unchanged full stock quality gate on RCH worker
+`vmi1152480`, finishing on 2026-09-21 at 19:39 UTC. All eleven stage rows passed:
+formatting, workspace check, workspace and hybrid Clippy, Windows compile guard,
+workspace library tests, bounded Quill, fsfs, facade, real-model E2E, and executable
+quickstart. Workspace test summaries reported 8,255 passes and 59 existing ignores;
+fsfs reported 2,478 passes and 21 ignores; facade reported 395 passes; all nine
+real-model E2E tests passed. Bounded Quill executed 59 tests without failures or
+ignores. Counts are scoped to their stages and include repeated tests across
+stages; they are not a unique-test total.
+
+The retrieved terminal receipt is SHA-256
+`f3ebfe6c462a945a4e1fa67d3f6847eed9cc008dc2216883a5f4822422852167`;
+the complete quality log is
+`ccaac760d5781ad6f8f2165331bf26a411a1f7e11877c66ea017d4b722405d0c`.
+All stage log hashes were checked after retrieval. Quickstart receipt
+`a83a3d3a9fc5b0a5177df9c245f63d45332f2e479d3ccb840e21a162cd440bd4`
+binds the invocation-built and installed executable to that same source and
+binary SHA-256 `24ffeb93d506adb0d6f3e75a83ebeadf524b2db32076501527b5fd07d6ca932b`,
+independently checked against the retrieved executable. Its 18 negative controls
+passed, its warm query recorded zero Internet operations, and no owned process
+remained. The separate benchmark baseline matrix also passed all 24 tests.
+
+This is a stock quality-gate pass, not a release completion claim. The full
+default/all-feature Quill run is separate and still in progress; the unchanged
+339-passage, six-query R1 acceptance test still fails three queries. No exact
+repair or controlled residual has been established. The later candidate that
+avoids repeated immutable authority validation is not covered by this receipt.
+Final platform artifacts, release publication, and any changed final source
+retain their own qualification obligations.
+
+During that full Quill run, a bounded live backtrace located repeated whole-plan
+authority validation inside the per-sample stream loop. The maintenance candidate
+keeps the existing immutable authority validation at stream entry and reuses its
+result only within that call. The standalone binding entry points still validate
+their authorities; every per-binding predicate and error reason is retained.
+The existing hostile-mutation test gained direct stream checks for a forged row
+capability and invalid-authority error precedence.
+
+RCH worker `vmi1152480` passed strict all-target/all-feature Clippy, the hostile
+test, all 26 QG-1 tests in each of the default and all-feature configurations,
+and the unchanged `arbitrary_partial_source_no_claim_cannot_be_laundered_into_readiness`
+assembly test. Retrieved receipt SHA-256:
+`779a85b247b6457773ea3e4d1958039883474d72b59b4bf0b8cb63de202a7c12`.
+Every stage log hash was checked. The final Rust source differs from that tested
+snapshot only by three reviewed UBS comments on existing intentional test panics;
+no panic was removed. The changed-file static scan exits zero with zero critical
+findings, 985 warnings, and 494 informational findings. These are targeted
+maintenance checks and self-verification, not independent review, a full-suite
+pass on the candidate, or an incumbent-relative performance result.
