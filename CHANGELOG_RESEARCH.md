@@ -897,3 +897,19 @@ is explicitly excluded. Subsequent fresh-target runs reproduced the mismatch.
 No failed test, ignored test, pending full gate, R1 comparison, native quality
 deadline, or platform build is promoted to a release verdict. This was solo
 re-execution and review, not independent verification.
+
+The subsequent JSON-order repair completed its fresh remote run on worker
+vmi1264463: 117 tests passed (13 golden, 55 producer identity, 49 config and
+generation/CLI), plus strict fsfs all-target Clippy. The explicit production
+`serde_json/preserve_order` feature removes accidental workspace feature
+unification from receipt hashing. Four CLI fixtures retain their pre-format
+values and serialization layout; expected hashes were not regenerated.
+Retrieved logs and receipt are under
+`/data/release-work/frankensearch-release-20260912/dependencies/json-contract-validation/`.
+Every stage log was checked against its receipt hash. Receipt SHA-256:
+`f3698907fbdf35b7384827a5030726f73ec10befcbd0e8ccc07594aa8636a4d2`;
+strict Clippy log: `adb6bb39e9d14dc1b3cd2b50c76a6281ea3e6c8bd33c258e194abf3fc867e1ac`.
+This closes the four observed CLI golden failures only. The separate complete
+quality gate exposed TUI/sealed-Quill fixture formatting damage and a Quill
+test guard lifetime lint; those repairs and the native cold-start test correction
+remain under validation. R1 and platform release qualification remain open.

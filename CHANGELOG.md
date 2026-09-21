@@ -266,6 +266,14 @@ qualified; individual results below are narrower than release acceptance.
   [Fix and tests](https://github.com/Dicklesworthstone/frankensearch/commit/e7808fe60eb20750430b05b8055a6a5d132ace74).
 
 - **Numeric filters compose with other Boolean clauses after a document is
+- **fsfs receipt hashes retain JSON insertion order in standalone builds.**
+  The CLI now requests the JSON ordering feature directly, rather than relying
+  on another workspace member to enable it. This restores the original receipt
+  hashes across package selections. Thirteen golden checks, 55 producer-identity
+  tests, and 49 config/generation/CLI tests pass, along with strict fsfs Clippy.
+  This is focused validation; the complete release gate remains pending.
+
+- **Numeric filters compose with other Boolean clauses after a document is
   deleted ([#49](https://github.com/Dicklesworthstone/frankensearch/issues/49)).**
   Quill validates persisted numeric columns against their original row count,
   while range and set scorers use the live document count shared by other

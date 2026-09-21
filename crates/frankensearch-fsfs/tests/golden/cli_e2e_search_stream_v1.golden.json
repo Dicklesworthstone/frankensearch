@@ -3,7 +3,13 @@
   "scenario": {
     "id": "cli-search-stream",
     "kind": "search",
-    "args": ["search", "rust async cancellation", "--stream", "--format", "jsonl"],
+    "args": [
+      "search",
+      "rust async cancellation",
+      "--stream",
+      "--format",
+      "jsonl"
+    ],
     "expected_exit_code": 0,
     "expected_reason_code": "e2e.cli.scenario_pass",
     "summary": "Run progressive search stream with NDJSON framing"
@@ -175,7 +181,13 @@
         "payload": {
           "scenario_id": "cli-search-stream",
           "scenario_kind": "search",
-          "args": ["search", "rust async cancellation", "--stream", "--format", "jsonl"],
+          "args": [
+            "search",
+            "rust async cancellation",
+            "--stream",
+            "--format",
+            "jsonl"
+          ],
           "expected_reason_code": "e2e.cli.scenario_pass"
         }
       }

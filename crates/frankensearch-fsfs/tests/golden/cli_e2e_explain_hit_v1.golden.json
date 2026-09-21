@@ -3,7 +3,12 @@
   "scenario": {
     "id": "cli-explain-hit",
     "kind": "explain",
-    "args": ["explain", "R0", "--format", "toon"],
+    "args": [
+      "explain",
+      "R0",
+      "--format",
+      "toon"
+    ],
     "expected_exit_code": 0,
     "expected_reason_code": "e2e.cli.scenario_pass",
     "summary": "Emit explainability payload in TOON format"
@@ -175,7 +180,12 @@
         "payload": {
           "scenario_id": "cli-explain-hit",
           "scenario_kind": "explain",
-          "args": ["explain", "R0", "--format", "toon"],
+          "args": [
+            "explain",
+            "R0",
+            "--format",
+            "toon"
+          ],
           "expected_reason_code": "e2e.cli.scenario_pass"
         }
       }
