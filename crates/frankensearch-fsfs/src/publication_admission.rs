@@ -71,7 +71,10 @@ mod tests {
         assert!(!lock.exists());
         std::fs::write(&lock, b"preserve this record").expect("existing lock");
         assert!(PublicationLease::acquire(root.path()).is_err());
-        assert_eq!(std::fs::read(lock).expect("retained record"), b"preserve this record");
+        assert_eq!(
+            std::fs::read(lock).expect("retained record"),
+            b"preserve this record"
+        );
     }
 
     #[test]

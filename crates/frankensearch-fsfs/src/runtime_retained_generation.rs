@@ -3,14 +3,164 @@
 // source of truth. The existing runtime source is left byte-for-byte intact.
 include!("runtime.rs");
 
+/// A reusable search reader bound to one admitted complete generation.
+///
+/// Publishing a successor does not retarget this reader. Open a new reader to
+/// observe that successor; an in-flight query and all of its progressive phases
+/// continue to use the original lexical, vector and catalog generation.
+///
+/// Searches use the ordinary ranking and producer-admission paths, but bypass
+/// the CLI's persistent query cache and explanation-session writes: neither may
+/// mutate the sealed bundle. Model initialization remains shared with the
+/// caller's runtime and uses its existing blocking pool.
+pub struct RetainedSearchReader {
+    runtime: FsfsRuntime,
+    generation: crate::generation_store::PublishedGeneration,
+    resources: SearchExecutionResources,
+}
+
+impl std::fmt::Debug for RetainedSearchReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedSearchReader")
+            .field("generation", &self.generation.id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedSearchReader {
+    /// The stable generation selected when this reader was opened.
+    #[must_use]
+    pub const fn generation(&self) -> &crate::generation_store::PublishedGeneration {
+        &self.generation
+    }
+
+    /// Execute one query against the pinned generation without persistent writes.
+    ///
+    /// The returned payloads preserve the ordinary Initial/Refined/failure phase
+    /// semantics. This is direct retrieval, not CLI daemon forwarding or query
+    /// expansion. Filters and ranking options come from the opening runtime.
+    ///
+    /// # Errors
+    /// Returns the original admission, retrieval, identity or cancellation error.
+    pub async fn search(
+        &mut self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        self.search_inner(cx, query, limit, None).await
+    }
+
+    /// Execute a query and deliver each phase as the existing pipeline emits it.
+    ///
+    /// The sink can stop delivery by returning an error. A failed sink or a
+    /// cancelled future cannot publish an explanation file or a cached result.
+    ///
+    /// # Errors
+    /// Returns retrieval/cancellation errors or the sink's original error.
+    pub async fn search_with_phase_sink(
+        &mut self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        sink: &mut (dyn FnMut(&SearchPayload) -> SearchResult<()> + Send),
+    ) -> SearchResult<Vec<SearchPayload>> {
+        self.search_inner(cx, query, limit, Some(sink)).await
+    }
+
+    async fn search_inner(
+        &mut self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        sink: Option<SearchPhaseSink<'_>>,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        retained_search_checkpoint(cx)?;
+        let artifacts = Box::pin(
+            self.runtime.execute_search_phase_artifacts_with_mode_using_resources(
+                cx,
+                query,
+                limit,
+                SearchExecutionMode::Full,
+                &mut self.resources,
+                SearchExecutionFlags {
+                    include_snippets: true,
+                    persist_explain_session: false,
+                },
+                sink,
+            ),
+        )
+        .await?;
+        Ok(artifacts
+            .into_iter()
+            .map(|artifact| artifact.payload)
+            .collect())
+    }
+}
+
+fn retained_search_checkpoint(cx: &Cx) -> SearchResult<()> {
+    cx.checkpoint().map_err(|_| SearchError::Cancelled {
+        phase: "fsfs.complete_generation.search".to_owned(),
+        reason: "retained-generation search cancelled".to_owned(),
+    })
+}
+
 impl FsfsRuntime {
+    /// Resolve and open the selected complete generation once for repeated reads.
+    ///
+    /// Bundle hashes are verified before the ordinary full-search admission and
+    /// resource opens. Missing or corrupt selection is an error, never an excuse
+    /// to fall back to a legacy index or an arbitrary generation directory.
+    /// The source store follows the cooperative immutable-directory contract of
+    /// `CompleteGenerationStore`; callers must not modify its sealed files.
+    ///
+    /// # Errors
+    /// Returns missing/corrupt selection, producer mismatch, cancellation or the
+    /// ordinary search-resource admission error. The store is not modified.
+    pub async fn open_retained_search(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+    ) -> SearchResult<RetainedSearchReader> {
+        use crate::generation_store::CompleteGenerationStore;
+
+        retained_search_checkpoint(cx)?;
+        let store = CompleteGenerationStore::open(cx, store_root)?;
+        let generation = store
+            .active(cx)?
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "complete_generation.selection".to_owned(),
+                value: store.root().display().to_string(),
+                reason: "no complete generation has been published; rebuild the store first"
+                    .to_owned(),
+            })?;
+        let mut runtime = self.clone();
+        runtime.cli_input.index_dir = Some(generation.path().to_path_buf());
+        // Retained readers never start a daemon or write a socket/cache under
+        // an immutable generation, even when their caller originated in a CLI.
+        runtime.cli_input.daemon = false;
+        let resources = Box::pin(runtime.prepare_search_execution_resources_at_root_with_modes(
+            cx,
+            generation.path(),
+            SearchExecutionMode::Full,
+            SearchExecutionMode::Full,
+        ))
+        .await?;
+        retained_search_checkpoint(cx)?;
+        Ok(RetainedSearchReader {
+            runtime,
+            generation,
+            resources,
+        })
+    }
+
     /// Rebuild into an isolated complete-generation store and activate only
     /// after the ordinary full-search admission succeeds.
     ///
     /// This explicit library entry point does not change legacy CLI/watch root
-    /// discovery. Consumers select a generation once with
-    /// `CompleteGenerationStore::active` and use its stable physical path for
-    /// every component of a read operation. Existing generations are retained.
+    /// discovery. Open a `RetainedSearchReader` to serve a selected generation;
+    /// existing readers and directories survive subsequent publications.
     /// The store must be outside the source tree, and the catalog must use the
     /// `{index_dir}` layout so no old-generation database is modified.
     ///
@@ -56,7 +206,10 @@ impl FsfsRuntime {
         input.index_dir = Some(build.path().to_path_buf());
         input.watch = false;
         input.quiet = true;
-        let candidate = Self::new(self.config.clone()).with_cli_input(input);
+        // Preserve caller-owned native capacity, bundled-model materialization
+        // and already initialized model slots rather than constructing an
+        // unrelated runtime with no blocking pool.
+        let candidate = self.clone().with_cli_input(input);
         Box::pin(candidate.run_one_shot_index_scaffold_internal(
             cx,
             CliCommand::Index,
@@ -69,16 +222,201 @@ impl FsfsRuntime {
         // Apply the same full-generation admission used by actual search, then
         // open its real lexical/vector/producer resources before sealing.
         Self::validate_search_generation_at_root(build.path(), SearchExecutionMode::Full)?;
-        let resources = Box::pin(candidate.prepare_search_execution_resources_at_root_with_modes(
-            cx,
-            build.path(),
-            SearchExecutionMode::Full,
-            SearchExecutionMode::Full,
-        ))
+        let resources = Box::pin(
+            candidate.prepare_search_execution_resources_at_root_with_modes(
+                cx,
+                build.path(),
+                SearchExecutionMode::Full,
+                SearchExecutionMode::Full,
+            ),
+        )
         .await?;
         drop(resources);
         build.publish(cx, |_, path| {
             Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)
         })
+    }
+}
+
+#[cfg(all(test, unix, not(feature = "embedded-models")))]
+mod retained_search_tests {
+    use asupersync::test_utils::run_test_with_cx;
+
+    use super::*;
+    use crate::generation_store::{CompleteGenerationStore, GenerationPublication};
+
+    fn fixture(parent: &Path) -> (FsfsRuntime, PathBuf, PathBuf) {
+        let source = parent.join("source");
+        let store = parent.join("index");
+        fs::create_dir(&source).expect("source directory");
+        fs::write(source.join("alpha.md"), "sharedtoken alpha retained document")
+            .expect("first source");
+        let mut config = FsfsConfig::default();
+        config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+        config.indexing.offline = true;
+        config.indexing.quality_model.clear();
+        config.search.fast_only = true;
+        config.search.rerank = false;
+        let input = CliInput {
+            command: CliCommand::Index,
+            target_path: Some(source.clone()),
+            index_dir: Some(store.clone()),
+            quiet: true,
+            ..CliInput::default()
+        };
+        (FsfsRuntime::new(config).with_cli_input(input), source, store)
+    }
+
+    async fn publish(runtime: &FsfsRuntime, cx: &Cx, root: &Path) {
+        assert!(matches!(
+            runtime
+                .rebuild_retained_generation(cx, root)
+                .await
+                .expect("rebuild"),
+            GenerationPublication::Durable(_)
+        ));
+    }
+
+    #[test]
+    fn retained_reader_survives_rebuild_and_search_does_not_change_inventory() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+            let mut old = runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .expect("old reader");
+            let old_generation = old.generation().clone();
+            let before = old.search(&cx, "sharedtoken", 10).await.expect("first query");
+            assert_eq!(before.last().expect("initial phase").hits.len(), 1);
+            assert_eq!(
+                store.active(&cx).expect("query left bundle intact"),
+                Some(old_generation.clone())
+            );
+
+            fs::write(source.join("beta.md"), "sharedtoken beta new document")
+                .expect("new source");
+            publish(&runtime, &cx, &root).await;
+            let mut current = runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .expect("new reader");
+            assert_ne!(current.generation().id(), old_generation.id());
+            let retained = old
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("retained query");
+            let fresh = current
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("fresh query");
+            assert_eq!(retained.last().expect("retained phase").hits.len(), 1);
+            assert_eq!(fresh.last().expect("fresh phase").hits.len(), 2);
+            assert_eq!(old.generation(), &old_generation);
+            assert!(old_generation.path().exists());
+            assert_eq!(
+                store.active(&cx).expect("both queries leave bundle intact"),
+                Some(current.generation().clone())
+            );
+        });
+    }
+
+    #[test]
+    fn retained_phase_sink_failure_is_propagated_without_persisting_results() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut reader = runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .expect("reader");
+            let mut delivered = 0;
+            let mut sink = |_: &SearchPayload| {
+                delivered += 1;
+                Err(SearchError::InvalidConfig {
+                    field: "test.retained_sink".to_owned(),
+                    value: "stop".to_owned(),
+                    reason: "injected sink failure".to_owned(),
+                })
+            };
+            let error = reader
+                .search_with_phase_sink(&cx, "sharedtoken", 10, &mut sink)
+                .await
+                .expect_err("sink refusal");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "test.retained_sink")
+            );
+            assert_eq!(delivered, 1);
+            let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+            assert_eq!(
+                store.active(&cx).expect("failed sink left bundle intact"),
+                Some(reader.generation().clone())
+            );
+            assert!(!reader.generation().path().join(FSFS_EXPLAIN_SESSION_FILE).exists());
+            reader
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("reader remains usable");
+        });
+    }
+
+    #[test]
+    fn retained_reader_rejects_absent_and_corrupt_selection_without_fallback() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, _, root) = fixture(directory.path());
+            CompleteGenerationStore::create(&cx, &root).expect("empty store");
+            let error = runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .expect_err("no selection");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "complete_generation.selection")
+            );
+            publish(&runtime, &cx, &root).await;
+            fs::write(
+                root.join(crate::generation_store::COMPLETE_GENERATION_POINTER),
+                b"broken pointer",
+            )
+            .expect("inject corruption");
+            runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .expect_err("no legacy fallback");
+        });
+    }
+
+    #[test]
+    fn cancelled_retained_search_delivers_no_phase_and_leaves_selection_intact() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut reader = runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .expect("reader");
+            cx.set_cancel_requested(true);
+            let mut delivered = 0;
+            let mut sink = |_: &SearchPayload| {
+                delivered += 1;
+                Ok(())
+            };
+            let error = reader
+                .search_with_phase_sink(&cx, "sharedtoken", 10, &mut sink)
+                .await
+                .expect_err("cancelled query");
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            assert_eq!(delivered, 0);
+            cx.set_cancel_requested(false);
+            let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+            assert_eq!(
+                store.active(&cx).expect("cancel left bundle intact"),
+                Some(reader.generation().clone())
+            );
+        });
     }
 }
