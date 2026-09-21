@@ -86,19 +86,15 @@ reads block on the command's owning lane: cancellation is observed between
 reads and requests, not promised to interrupt an idle blocked read. No detached
 input worker is introduced.
 
-## Watching and current boundaries
+## Current boundaries
 
-Complete-store routing also supports `watch` and `index --watch`, using full
-replacement builds without holding a serving-index writer between publications.
-See [complete-generation watch](complete-generation-watch.md) for the bounded
-notification queue, source recheck, framed receipts and remaining update costs.
-The existing buffered Unix socket server and daemon shutdown path are preserved.
-
-TUI, direct query expansion, automatic search-to-daemon forwarding and in-place
-mutators remain outside this route. Legacy roots without a complete-generation
-selection or staging tree retain their ordinary behavior when the new layout is
-not explicitly selected. The legacy mutable watch/search exclusion issue is not
-resolved by this opt-in route, nor is incremental artifact/embedding reuse.
+Complete-store CLI routing supports one-shot `index`, direct `search` (including
+JSONL/TOON streaming), stdio `serve`, `status`, and `doctor`. It refuses watch
+mode, TUI, daemon/socket serving, direct query expansion and in-place mutators
+rather than pretending that those paths have been migrated. Existing legacy
+roots without a complete-generation selection or staging tree retain their
+ordinary behavior when the new layout is not explicitly selected. The legacy
+watch/search exclusion issue is not resolved by this opt-in route.
 
 There is no automatic garbage collection. Retained predecessors and failed
 builds consume disk space. The store assumes cooperating writers and a trusted

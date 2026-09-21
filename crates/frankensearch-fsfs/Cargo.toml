@@ -82,7 +82,7 @@ frankensearch-embed = { workspace = true, default-features = false, features = [
 frankensearch-fusion = { workspace = true }
 frankensearch-index = { workspace = true }
 frankensearch-quill = { workspace = true, features = ["durability"] }
-rustix = { version = "1.1.5", features = ["fs", "net"] }
+rustix = { version = "1.1.5", features = ["fs"] }
 frankensearch-durability = { workspace = true }
 frankensearch-rerank = { workspace = true, optional = true, default-features = false, features = ["native"] }
 frankensearch-lexical = { workspace = true, optional = true }

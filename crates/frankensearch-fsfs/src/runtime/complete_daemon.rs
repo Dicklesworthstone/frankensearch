@@ -24,15 +24,6 @@ use super::{FsfsRuntime, complete_cli_error, emit_complete_serve_line, retained_
 
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-#[path = "complete_daemon_control.rs"]
-mod control;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerOutcome {
-    Search,
-    Shutdown,
-}
-
 /// Keep the singleton lock through listener teardown. The lock file is never
 /// unlinked: replacing it would let two processes lock different inodes.
 struct BoundCompleteSocket {
@@ -111,15 +102,6 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         retained_search_checkpoint(cx)?;
         let socket_path = self.complete_generation_socket_path(root)?;
-        if self.cli_input.daemon_stop {
-            // Stop must remain usable when selection or model admission fails.
-            // It must never acquire a listener lock or start a replacement.
-            return control::stop(
-                cx,
-                &socket_path,
-                Duration::from_millis(FSFS_DAEMON_CLIENT_TIMEOUT_MS),
-            ).await;
-        }
         // Admit before opening the transport: no listening socket claims a
         // ready service while its generation or semantic producer is invalid.
         let mut session = self.open_live_retained_search(cx, root).await?;
@@ -127,7 +109,7 @@ impl FsfsRuntime {
         let bound = BoundCompleteSocket::bind(socket_path)?;
         let mut cache = HashMap::new();
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
-        let idle_timeout = control::idle_timeout(self.cli_input.daemon_idle_timeout_ms);
+        let idle_timeout = Duration::from_millis(FSFS_DAEMON_IDLE_TIMEOUT_MS);
         let peer_timeout = Duration::from_millis(FSFS_DAEMON_CLIENT_TIMEOUT_MS);
         let mut last_activity = Instant::now();
         loop {
@@ -152,20 +134,18 @@ impl FsfsRuntime {
                             cache_enabled,
                         ).await
                     }).await;
-                    match result {
-                        Ok(PeerOutcome::Shutdown) => return Ok(()),
-                        Ok(PeerOutcome::Search) => {}
-                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-                        Err(error) => {
-                            // A broken/slow client does not take down the listener
-                            // or strand a task holding the selected generation.
-                            tracing::debug!(%error, "complete-generation daemon client ended");
+                    if let Err(error) = result {
+                        if matches!(error, SearchError::Cancelled { .. }) {
+                            return Err(error);
                         }
+                        // A broken/slow client does not take down the listener
+                        // or strand a task holding the selected generation.
+                        tracing::debug!(%error, "complete-generation daemon client ended");
                     }
                     last_activity = Instant::now();
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if idle_timeout.is_some_and(|timeout| last_activity.elapsed() >= timeout) {
+                    if last_activity.elapsed() >= idle_timeout {
                         return Ok(());
                     }
                     asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL).await;
@@ -176,7 +156,7 @@ impl FsfsRuntime {
         }
     }
 
-    pub(super) fn complete_generation_socket_path(&self, root: &Path) -> SearchResult<PathBuf> {
+    fn complete_generation_socket_path(&self, root: &Path) -> SearchResult<PathBuf> {
         let root = fs::canonicalize(root)?;
         let path = self.cli_input.daemon_socket.as_ref().map_or_else(
             || root.join(FSFS_DAEMON_SOCKET_FILE),
@@ -209,29 +189,13 @@ async fn serve_peer<T, F, Fut>(
     peer: &mut UnixStream,
     timeout: Duration,
     execute: F,
-) -> SearchResult<PeerOutcome>
+) -> SearchResult<()>
 where
     T: Serialize,
     F: FnOnce(SearchServeRequest) -> Fut,
     Fut: Future<Output = SearchResult<T>>,
 {
     let bytes = read_request(cx, peer, timeout).await?;
-    match control::is_shutdown_request(&bytes) {
-        Ok(true) => {
-            // No model/search work and no selection refresh for an explicit
-            // control. A failed acknowledgment never claims a successful stop.
-            write_response(cx, peer, control::SHUTDOWN_RESPONSE, timeout).await?;
-            return Ok(PeerOutcome::Shutdown);
-        }
-        Ok(false) => {}
-        Err(error) => {
-            let response = encode_response(&FsfsRuntime::search_serve_error_response(
-                "", "full", error.to_string(),
-            ))?;
-            write_response(cx, peer, &response, timeout).await?;
-            return Ok(PeerOutcome::Search);
-        }
-    }
     let request = std::str::from_utf8(&bytes)
         .map_err(|_| complete_cli_error("daemon_request", "request is not UTF-8"))
         .and_then(|raw| FsfsRuntime::parse_search_serve_request(raw.trim()));
@@ -265,8 +229,7 @@ where
             }
         }
     };
-    write_response(cx, peer, &response, timeout).await?;
-    Ok(PeerOutcome::Search)
+    write_response(cx, peer, &response, timeout).await
 }
 
 fn encode_response<T: Serialize>(response: &T) -> SearchResult<Vec<u8>> {
@@ -456,38 +419,6 @@ mod tests {
             let error = client.read(&mut [0_u8; 16]).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::WouldBlock);
             cx.set_cancel_requested(false);
-        });
-    }
-
-    #[test]
-    fn explicit_shutdown_is_acknowledged_without_executing_search() {
-        run_test_with_cx(|cx| async move {
-            let (client, mut server) = pair(control::SHUTDOWN_REQUEST);
-            let outcome = serve_peer(&cx, &mut server, Duration::from_secs(2), |_| async {
-                panic!("shutdown must not execute search"); // ubs:ignore — cfg(test) assertion.
-                #[allow(unreachable_code)]
-                Ok(serde_json::Value::Null)
-            }).await.unwrap();
-            assert_eq!(outcome, PeerOutcome::Shutdown);
-            let acknowledgment = response(client);
-            assert_eq!(acknowledgment["ok"], true);
-            assert_eq!(acknowledgment["event"], "shutdown");
-        });
-    }
-
-    #[test]
-    fn malformed_control_neither_stops_nor_executes_search() {
-        run_test_with_cx(|cx| async move {
-            let (client, mut server) = pair(
-                b"{\"fsfs_complete_daemon\":\"shutdown\",\"version\":2}\n",
-            );
-            let outcome = serve_peer(&cx, &mut server, Duration::from_secs(2), |_| async {
-                panic!("malformed control must not execute search"); // ubs:ignore — cfg(test) assertion.
-                #[allow(unreachable_code)]
-                Ok(serde_json::Value::Null)
-            }).await.unwrap();
-            assert_eq!(outcome, PeerOutcome::Search);
-            assert_eq!(response(client)["ok"], false);
         });
     }
 
