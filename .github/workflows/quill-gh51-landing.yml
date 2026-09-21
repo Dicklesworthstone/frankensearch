@@ -1,0 +1,334 @@
+# One-shot, exact-preimage landing job for the reviewed gh#51 production patch.
+# No PR trigger, schedule, force push, dependency update, or gate bypass.
+name: Quill gh51 delta-preflight landing
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/quill-gh51-landing.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quill-gh51-landing
+  cancel-in-progress: false
+
+jobs:
+  validate-and-land:
+    if: github.repository == 'Dicklesworthstone/frankensearch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Check out current main without destructive cleanup
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 1
+          clean: false
+
+      - name: Apply the exact reviewed production diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          keeper=crates/frankensearch-quill/src/keeper.rs
+          test "$(git rev-parse "HEAD:$keeper")" = 19b4b3b6ae02001eabfa40e3221ffc76d3ad270f
+          test "$(git rev-parse HEAD:crates/frankensearch-quill/tests/publication_validation.rs)" = e155661edd2466cc1224738ad7568ca41d99f998
+          test -z "$(git status --porcelain)"
+          cat > "$RUNNER_TEMP/gh51.patch" <<'PATCH'
+          diff --git a/crates/frankensearch-quill/src/keeper.rs b/crates/frankensearch-quill/src/keeper.rs
+          --- a/crates/frankensearch-quill/src/keeper.rs
+          +++ b/crates/frankensearch-quill/src/keeper.rs
+          @@ -5232,0 +5233,8 @@
+          +    ///
+          +    /// Preflight fully validates new or changed segment entries against the
+          +    /// reconciled retained snapshot. Only complete, identical entries skip
+          +    /// preflight; a tombstone change still requires admission. The published
+          +    /// snapshot is always freshly opened and authenticated from disk. Thus
+          +    /// damage to a retained file can fail that open after MANIFEST advances;
+          +    /// the pending-publication marker keeps checked writer reads fail-closed
+          +    /// until reconciliation proves the installed authority.
+          @@ -5278,1 +5286,6 @@
+          -        let preflight_manifest = manifest.clone();
+          +        let preflight_segments = proposed_manifest_segment_delta(
+          +            &self.snapshot.loaded_manifest().manifest,
+          +            manifest,
+          +        )
+          +        .cloned()
+          +        .collect::<Vec<_>>();
+          @@ -5284,1 +5297,1 @@
+          -                &preflight_manifest,
+          +                &preflight_segments,
+          @@ -10986,0 +11000,25 @@
+          +/// Select complete entries that were not admitted by the retained snapshot.
+          +///
+          +/// Both manifests must already be validated and sorted by `docid_lo`. A merge
+          +/// walk is linear in their entry counts (plus tombstone equality comparisons),
+          +/// without assuming that random segment ids have the same order. In particular,
+          +/// a retained id with changed tombstones must still receive full preflight.
+          +///
+          +/// This is only a pre-publication admission filter, not a reusable file witness.
+          +/// The post-publication opener must authenticate every selected durable file.
+          +fn proposed_manifest_segment_delta<'a>(
+          +    retained: &'a Manifest,
+          +    proposed: &'a Manifest,
+          +) -> impl Iterator<Item = &'a ManifestSegment> {
+          +    let mut previous = retained.segments.iter().peekable();
+          +    proposed.segments.iter().filter(move |segment| {
+          +        while previous
+          +            .peek()
+          +            .is_some_and(|prior| prior.docid_lo < segment.docid_lo)
+          +        {
+          +            let _ = previous.next();
+          +        }
+          +        previous.peek().is_none_or(|prior| *prior != *segment)
+          +    })
+          +}
+          +
+          @@ -10989,1 +11027,1 @@
+          -    manifest: &Manifest,
+          +    segments: &[ManifestSegment],
+          @@ -10993,1 +11031,1 @@
+          -    for manifest_segment in &manifest.segments {
+          +    for manifest_segment in segments {
+          @@ -24247,0 +24286,131 @@
+          +    #[test]
+          +    fn gh51_preflight_delta_requires_complete_entry_equality() {
+          +        let schema_id = DEFAULT_SCHEMA.schema_id().expect("schema id");
+          +        let mut retained = Manifest::empty(2, schema_id, 5);
+          +        retained.segments.push(ManifestSegment {
+          +            segment_id: 0x5101,
+          +            seal_seq: 1,
+          +            file_len: 256,
+          +            file_xxh3: 51,
+          +            docid_lo: 0,
+          +            docid_hi: 3,
+          +            doc_count: 2,
+          +            tombstones: TombstoneSet::new(),
+          +        });
+          +        retained.validate().expect("valid retained manifest");
+          +        let mut proposed = retained.clone();
+          +        proposed.generation += 1;
+          +        proposed.last_publish_unix_s += 1;
+          +        assert_eq!(
+          +            proposed_manifest_segment_delta(&retained, &proposed).count(),
+          +            0
+          +        );
+          +
+          +        // Every field participates, not just the id or the file hash. Some of
+          +        // these mutations are also rejected by successor validation, which
+          +        // remains ahead of selection in the production publication path.
+          +        for field in 0..8 {
+          +            let mut changed = proposed.clone();
+          +            let entry = &mut changed.segments[0];
+          +            match field {
+          +                0 => entry.segment_id ^= 1,
+          +                1 => entry.seal_seq += 1,
+          +                2 => entry.file_len += 1,
+          +                3 => entry.file_xxh3 ^= 1,
+          +                4 => entry.docid_lo += 1,
+          +                5 => entry.docid_hi += 1,
+          +                6 => entry.doc_count += 1,
+          +                _ => {
+          +                    entry.tombstones.insert(0).expect("tombstone");
+          +                }
+          +            }
+          +            changed.validate().expect("valid changed manifest");
+          +            assert_eq!(
+          +                proposed_manifest_segment_delta(&retained, &changed).collect::<Vec<_>>(),
+          +                vec![&changed.segments[0]],
+          +                "changed field {field} must not inherit an admission"
+          +            );
+          +        }
+          +        let empty = Manifest::empty(1, schema_id, 0);
+          +        assert_eq!(
+          +            proposed_manifest_segment_delta(&empty, &proposed).collect::<Vec<_>>(),
+          +            proposed.segments.iter().collect::<Vec<_>>()
+          +        );
+          +        assert_eq!(proposed_manifest_segment_delta(&retained, &empty).count(), 0);
+          +    }
+          +
+          +    #[test]
+          +    fn gh51_preflight_delta_tracks_added_changed_removed_and_merged_entries() {
+          +        let schema_id = DEFAULT_SCHEMA.schema_id().expect("schema id");
+          +        for count in [1_u64, 8, 64] {
+          +            let mut retained = Manifest::empty(2, schema_id, (count + 1) * 4);
+          +            retained.segments = (0..count)
+          +                .map(|position| ManifestSegment {
+          +                    // Deliberately descending ids: canonical order is by range.
+          +                    segment_id: 0x5200 - position,
+          +                    seal_seq: position + 1,
+          +                    file_len: 256,
+          +                    file_xxh3: position,
+          +                    docid_lo: position * 4,
+          +                    docid_hi: position * 4 + 3,
+          +                    doc_count: 2,
+          +                    tombstones: TombstoneSet::new(),
+          +                })
+          +                .collect();
+          +            retained.validate().expect("valid retained manifest");
+          +            let mut proposed = retained.clone();
+          +            proposed.generation += 1;
+          +            let mut added = retained.segments[0].clone();
+          +            added.segment_id = 0x5300;
+          +            added.seal_seq = count + 1;
+          +            added.docid_lo = count * 4;
+          +            added.docid_hi = count * 4 + 3;
+          +            proposed.segments.push(added);
+          +            proposed.validate().expect("valid additive manifest");
+          +            assert_eq!(
+          +                proposed_manifest_segment_delta(&retained, &proposed)
+          +                    .map(|segment| segment.segment_id)
+          +                    .collect::<Vec<_>>(),
+          +                vec![0x5300],
+          +                "one addition must select one preflight at every retained-set size"
+          +            );
+          +            proposed.segments[0].tombstones.insert(0).expect("tombstone");
+          +            assert_eq!(
+          +                proposed_manifest_segment_delta(&retained, &proposed).count(),
+          +                2
+          +            );
+          +
+          +            // Removing entries must not shift the matching of later ranges.
+          +            proposed.segments.remove(0);
+          +            assert_eq!(
+          +                proposed_manifest_segment_delta(&retained, &proposed).count(),
+          +                1
+          +            );
+          +            proposed.segments.clear();
+          +            assert_eq!(
+          +                proposed_manifest_segment_delta(&retained, &proposed).count(),
+          +                0
+          +            );
+          +
+          +            // A merge output at an old lower bound is new, and the retained
+          +            // tail must still match after the absorbed source ranges.
+          +            if count > 1 {
+          +                proposed.segments = retained.segments.clone();
+          +                let mut merged = proposed.segments.remove(0);
+          +                let absorbed = proposed.segments.remove(0);
+          +                merged.segment_id = 0x5400;
+          +                merged.seal_seq = count + 1;
+          +                merged.docid_hi = absorbed.docid_hi;
+          +                merged.doc_count += absorbed.doc_count;
+          +                proposed.segments.insert(0, merged);
+          +                proposed.validate().expect("valid merged manifest");
+          +                assert_eq!(
+          +                    proposed_manifest_segment_delta(&retained, &proposed)
+          +                        .map(|segment| segment.segment_id)
+          +                        .collect::<Vec<_>>(),
+          +                    vec![0x5400]
+          +                );
+          +            }
+          +        }
+          +    }
+          +
+          diff --git a/crates/frankensearch-quill/tests/publication_validation.rs b/crates/frankensearch-quill/tests/publication_validation.rs
+          --- a/crates/frankensearch-quill/tests/publication_validation.rs
+          +++ b/crates/frankensearch-quill/tests/publication_validation.rs
+          @@ -936,26 +936,21 @@
+          -            if installed.generation == retained.generation {
+          -                // Incumbent full preflight detects the fault before promotion.
+          -                assert_eq!(installed, retained);
+          -                assert_eq!(retained_manifest(&writer), retained);
+          -                assert!(!writer.publication_awaits_reconciliation());
+          -            } else {
+          -                // Delta preflight may promote unchanged bindings, but a failed
+          -                // mandatory fresh open must not expose the old snapshot as new.
+          -                assert_eq!(installed.generation, proposed.generation);
+          -                assert_eq!(installed.segments, proposed.segments);
+          -                assert!(writer.publication_awaits_reconciliation());
+          -                assert!(matches!(
+          -                    writer.snapshot(),
+          -                    Err(KeeperError::PublicationReconciliationRequired {
+          -                        retained_generation,
+          -                        proposed_generation,
+          -                    }) if retained_generation == retained.generation
+          -                        && proposed_generation == proposed.generation
+          -                ));
+          -                assert!(
+          -                    writer.reconcile_publication(&cx).await.is_err(),
+          -                    "reconciliation must not adopt still-damaged backing files"
+          -                );
+          -                assert!(writer.publication_awaits_reconciliation());
+          -                assert!(writer.snapshot().is_err());
+          -            }
+          +            // Exact retained bindings skip preflight. The mandatory fresh
+          +            // open must detect damage after promotion, never return success
+          +            // or expose the stale snapshot as authoritative. These assertions
+          +            // also fail if publication regresses to full-generation preflight.
+          +            assert_eq!(installed.generation, proposed.generation);
+          +            assert_eq!(installed.segments, proposed.segments);
+          +            assert!(writer.publication_awaits_reconciliation());
+          +            assert!(matches!(
+          +                writer.snapshot(),
+          +                Err(KeeperError::PublicationReconciliationRequired {
+          +                    retained_generation,
+          +                    proposed_generation,
+          +                }) if retained_generation == retained.generation
+          +                    && proposed_generation == proposed.generation
+          +            ));
+          +            assert!(
+          +                writer.reconcile_publication(&cx).await.is_err(),
+          +                "reconciliation must not adopt still-damaged backing files"
+          +            );
+          +            assert!(writer.publication_awaits_reconciliation());
+          +            assert!(writer.snapshot().is_err());
+          PATCH
+          git apply --unidiff-zero --check "$RUNNER_TEMP/gh51.patch"
+          git apply --unidiff-zero "$RUNNER_TEMP/gh51.patch"
+          git diff --check
+
+      - name: Install the repository-pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          test "$(rustup show active-toolchain | cut -d' ' -f1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc --version
+          cargo --version
+
+      - name: Format only the two changed Rust files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 crates/frankensearch-quill/src/keeper.rs crates/frankensearch-quill/tests/publication_validation.rs
+          rustfmt --edition 2024 --check crates/frankensearch-quill/src/keeper.rs crates/frankensearch-quill/tests/publication_validation.rs
+          git diff --check
+
+      - name: Strict Quill library and publication lint checks
+        run: cargo clippy --locked -p frankensearch-quill --lib --test publication_validation --test cancellation_contract --features durability,conformance-internals -- -D warnings
+
+      - name: Default-feature Quill library and publication tests
+        run: cargo test --locked -p frankensearch-quill --lib --test publication_validation --test cancellation_contract
+
+      - name: Durability and deterministic cancellation regression tests
+        run: cargo test --locked -p frankensearch-quill --lib --test publication_validation --test cancellation_contract --features durability,conformance-internals
+
+      - name: Commit only validated production changes directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import subprocess
+          expected = {
+              'crates/frankensearch-quill/src/keeper.rs',
+              'crates/frankensearch-quill/tests/publication_validation.rs',
+          }
+          actual = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          if actual != expected:
+              raise SystemExit(f'Refusing unexpected changed paths: {sorted(actual)}')
+          PYTHON
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- crates/frankensearch-quill/src/keeper.rs crates/frankensearch-quill/tests/publication_validation.rs
+          git commit -m 'perf(quill): preflight only changed manifest entries (#51)' -m 'Compare complete manifest bindings after reconciliation and successor validation. A linear range-ordered merge walk selects only new or changed entries, including tombstone-only changes, for full preflight. Preserve post-publication fresh-open authentication, cancellation, generation claims, and fail-closed reconciliation. Add complete-entry selection tests and require retained-file damage to be caught by the mandatory post-promotion fresh open.' -m 'Validation: pinned-toolchain rustfmt on both files; strict Quill library/publication/cancellation Clippy; library and publication/cancellation tests with default features and with durability,conformance-internals. No end-to-end speedup or issue closure is claimed.'
+          # A concurrent main update rejects this ordinary push. Never force it
+          # or adopt an untested rebase; rerunning starts from fresh main instead.
+          git push origin HEAD:refs/heads/main
+          git rev-parse HEAD
