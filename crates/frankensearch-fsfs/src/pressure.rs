@@ -1934,10 +1934,8 @@ mod tests {
                 assert_eq!(pending.to, PressureState::Normal);
                 assert_eq!(pending.consecutive_observed, 1);
 
-                let breach = controller.observe(
-                    PressureSignal::new(10.0, emergency_pct, 10.0, 10.0),
-                    1,
-                );
+                let breach =
+                    controller.observe(PressureSignal::new(10.0, emergency_pct, 10.0, 10.0), 1);
                 assert_eq!(breach.from, PressureState::Normal);
                 assert_eq!(breach.to, PressureState::Emergency);
                 assert!(breach.changed);
@@ -2034,10 +2032,8 @@ mod tests {
             })
             .expect("valid config");
             for timestamp in 0..3 {
-                let _ = controller.observe(
-                    PressureSignal::new(cpu_pct, 10.0, 10.0, 10.0),
-                    timestamp,
-                );
+                let _ =
+                    controller.observe(PressureSignal::new(cpu_pct, 10.0, 10.0, 10.0), timestamp);
             }
             assert_eq!(controller.state(), expected);
             let breach = controller.observe(PressureSignal::new(10.0, 95.0, 10.0, 10.0), 3);
@@ -2062,10 +2058,8 @@ mod tests {
             })
             .expect("valid config");
             let _ = controller.observe(PressureSignal::new(10.0, 10.0, 10.0, 10.0), 0);
-            let breach = controller.observe(
-                PressureSignal::new(10.0, emergency_pct, 10.0, 10.0),
-                1,
-            );
+            let breach =
+                controller.observe(PressureSignal::new(10.0, emergency_pct, 10.0, 10.0), 1);
             let input = resource_input(breach.snapshot.state, breach.snapshot.smoothed);
             for lane in [
                 ResourceLane::Indexing,

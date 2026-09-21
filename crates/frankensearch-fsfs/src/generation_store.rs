@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_storage::ContentHasher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -431,7 +432,7 @@ fn hash_file(cx: &Cx, path: &Path) -> SearchResult<(u64, String)> {
     let mut file = open_regular(path)?;
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         checkpoint(cx)?;
         let count = file.read(&mut buffer)?;
@@ -443,7 +444,7 @@ fn hash_file(cx: &Cx, path: &Path) -> SearchResult<(u64, String)> {
             .ok_or_else(|| invalid(path, "artifact length overflow"))?;
         hasher.update(&buffer[..count]);
     }
-    Ok((total, format!("{:x}", hasher.finalize())))
+    Ok((total, ContentHasher::to_hex(&hasher.finalize().into())))
 }
 
 fn sync_tree(cx: &Cx, root: &Path, depth: usize) -> SearchResult<()> {
@@ -604,7 +605,7 @@ fn require_supported_platform() -> SearchResult<()> {
 }
 
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    ContentHasher::to_hex(&Sha256::digest(bytes).into())
 }
 
 fn invalid(path: &Path, detail: &str) -> SearchError {
@@ -618,6 +619,40 @@ fn invalid(path: &Path, detail: &str) -> SearchError {
 mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
+
+    #[test]
+    fn bundle_digests_preserve_standard_sha256_hex() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("artifact");
+            for (bytes, expected) in [
+                (
+                    b"".as_slice(),
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                ),
+                (
+                    b"abc".as_slice(),
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                ),
+            ] {
+                fs::write(&path, bytes).unwrap();
+                assert_eq!(digest(bytes), expected);
+                assert_eq!(
+                    hash_file(&cx, &path).unwrap(),
+                    (bytes.len() as u64, expected.to_owned())
+                );
+            }
+            // Standard million-'a' vector spans multiple file-read buffers.
+            let bytes = vec![b'a'; 1_000_000];
+            let expected = "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(digest(&bytes), expected);
+            assert_eq!(
+                hash_file(&cx, &path).unwrap(),
+                (1_000_000, expected.to_owned())
+            );
+        });
+    }
 
     fn write_bundle(path: &Path, value: &str) {
         fs::create_dir(path.join("lexical")).unwrap();
@@ -637,7 +672,7 @@ mod tests {
         match build.publish(cx, |_, _| Ok(())).unwrap() {
             GenerationPublication::Durable(generation) => generation,
             GenerationPublication::VisibleButDurabilityUncertain { source, .. } => {
-                panic!("sync: {source}");
+                panic!("sync: {source}"); // ubs:ignore — cfg(test) assertion: uncertain durability must fail the test.
             }
         }
     }

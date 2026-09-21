@@ -78,18 +78,19 @@ impl RetainedSearchReader {
     ) -> SearchResult<Vec<SearchPayload>> {
         retained_search_checkpoint(cx)?;
         let artifacts = Box::pin(
-            self.runtime.execute_search_phase_artifacts_with_mode_using_resources(
-                cx,
-                query,
-                limit,
-                SearchExecutionMode::Full,
-                &mut self.resources,
-                SearchExecutionFlags {
-                    include_snippets: true,
-                    persist_explain_session: false,
-                },
-                sink,
-            ),
+            self.runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    cx,
+                    query,
+                    limit,
+                    SearchExecutionMode::Full,
+                    &mut self.resources,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: false,
+                    },
+                    sink,
+                ),
         )
         .await?;
         Ok(artifacts
@@ -140,12 +141,14 @@ impl FsfsRuntime {
         // Retained readers never start a daemon or write a socket/cache under
         // an immutable generation, even when their caller originated in a CLI.
         runtime.cli_input.daemon = false;
-        let resources = Box::pin(runtime.prepare_search_execution_resources_at_root_with_modes(
-            cx,
-            generation.path(),
-            SearchExecutionMode::Full,
-            SearchExecutionMode::Full,
-        ))
+        let resources = Box::pin(
+            runtime.prepare_search_execution_resources_at_root_with_modes(
+                cx,
+                generation.path(),
+                SearchExecutionMode::Full,
+                SearchExecutionMode::Full,
+            ),
+        )
         .await?;
         retained_search_checkpoint(cx)?;
         Ok(RetainedSearchReader {
@@ -249,10 +252,13 @@ mod retained_search_tests {
         let source = parent.join("source");
         let store = parent.join("index");
         fs::create_dir(&source).expect("source directory");
-        fs::write(source.join("alpha.md"), "sharedtoken alpha retained document")
-            .expect("first source");
+        fs::write(
+            source.join("alpha.md"),
+            "sharedtoken alpha retained document",
+        )
+        .expect("first source");
         let mut config = FsfsConfig::default();
-        config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+        "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
         config.indexing.offline = true;
         config.indexing.quality_model.clear();
         config.search.fast_only = true;
@@ -264,7 +270,11 @@ mod retained_search_tests {
             quiet: true,
             ..CliInput::default()
         };
-        (FsfsRuntime::new(config).with_cli_input(input), source, store)
+        (
+            FsfsRuntime::new(config).with_cli_input(input),
+            source,
+            store,
+        )
     }
 
     async fn publish(runtime: &FsfsRuntime, cx: &Cx, root: &Path) {
@@ -289,15 +299,17 @@ mod retained_search_tests {
                 .await
                 .expect("old reader");
             let old_generation = old.generation().clone();
-            let before = old.search(&cx, "sharedtoken", 10).await.expect("first query");
+            let before = old
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("first query");
             assert_eq!(before.last().expect("initial phase").hits.len(), 1);
             assert_eq!(
                 store.active(&cx).expect("query left bundle intact"),
                 Some(old_generation.clone())
             );
 
-            fs::write(source.join("beta.md"), "sharedtoken beta new document")
-                .expect("new source");
+            fs::write(source.join("beta.md"), "sharedtoken beta new document").expect("new source");
             publish(&runtime, &cx, &root).await;
             let mut current = runtime
                 .open_retained_search(&cx, &root)
@@ -355,7 +367,13 @@ mod retained_search_tests {
                 store.active(&cx).expect("failed sink left bundle intact"),
                 Some(reader.generation().clone())
             );
-            assert!(!reader.generation().path().join(FSFS_EXPLAIN_SESSION_FILE).exists());
+            assert!(
+                !reader
+                    .generation()
+                    .path()
+                    .join(FSFS_EXPLAIN_SESSION_FILE)
+                    .exists()
+            );
             reader
                 .search(&cx, "sharedtoken", 10)
                 .await

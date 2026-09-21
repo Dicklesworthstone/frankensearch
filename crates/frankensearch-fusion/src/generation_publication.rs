@@ -28,28 +28,27 @@ use std::sync::Arc;
 
 use asupersync::Cx;
 use frankensearch_core::generation::{
-    ActivationManifestV1, ArtifactGenerationIdentityV1,
-    AuthorityRefV1, AuthoritySlotV1, ExactGenerationComponentsV1,
-    GENERATION_AUTHORITY_SLOT_BYTES_V1, GENERATION_LOCK_FRAME_BYTES_V1,
-    GenerationAuthorityActionV1, GenerationAuthorityErrorV1, GenerationComponentReceiptV1,
-    GenerationComponentReceiptsV1, GenerationComponentRole, GenerationLockFrameKindV1,
-    GenerationLockFrameV1, GenerationRootSecurityProfileV1, resolve_authority_slots_v1,
-    verify_authority_manifest_reference_v1,
+    ActivationManifestV1, ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1,
+    ExactGenerationComponentsV1, GENERATION_AUTHORITY_SLOT_BYTES_V1,
+    GENERATION_LOCK_FRAME_BYTES_V1, GenerationAuthorityActionV1, GenerationAuthorityErrorV1,
+    GenerationComponentReceiptV1, GenerationComponentReceiptsV1, GenerationComponentRole,
+    GenerationLockFrameKindV1, GenerationLockFrameV1, GenerationRootSecurityProfileV1,
+    resolve_authority_slots_v1, verify_authority_manifest_reference_v1,
 };
 use frankensearch_index::generation_root::authority_publisher::{
     AUTHORITY_PUBLISHER_LOCK_BYTES_V1, AntiRollbackFloorProviderV1, AttemptPermitV1,
     AuthorityPublisherV1, ExpectedAuthorityPairV1, PublicationOutcomeV1,
 };
 use frankensearch_index::generation_root::generation_reader::{
-    GenerationSnapshotCellV1, OpenedGenerationSnapshotV1, SnapshotOpenOutcomeV1,
-    SnapshotRefusalV1, activation_manifest_name_v1, activation_manifest_path_v1,
-    component_object_path_v1, is_retained_object_name_v1,
+    GenerationSnapshotCellV1, OpenedGenerationSnapshotV1, SnapshotOpenOutcomeV1, SnapshotRefusalV1,
+    activation_manifest_name_v1, activation_manifest_path_v1, component_object_path_v1,
+    is_retained_object_name_v1,
 };
 use frankensearch_index::generation_root::{
     GENERATION_ROOT_AUTHORITY_FILE_NAME, GENERATION_ROOT_IMMUTABLE_FILE_MODE,
     GENERATION_ROOT_LOCK_FILE_NAME, GENERATION_ROOT_MAX_FILE_BYTES, GenerationFileExpectation,
-    GenerationRootEntryKind, GenerationRootError, GenerationRootInventory,
-    QualifiedGenerationFile, QualifiedGenerationRoot,
+    GenerationRootEntryKind, GenerationRootError, GenerationRootInventory, QualifiedGenerationFile,
+    QualifiedGenerationRoot,
 };
 
 /// A refusal before entering the authority publisher. No authority bytes were
@@ -252,9 +251,15 @@ fn component_receipts(
 ) -> [(GenerationComponentRole, GenerationComponentReceiptV1); 4] {
     [
         (GenerationComponentRole::Vector, manifest.components.vector),
-        (GenerationComponentRole::Lexical, manifest.components.lexical),
+        (
+            GenerationComponentRole::Lexical,
+            manifest.components.lexical,
+        ),
         (GenerationComponentRole::Ann, manifest.components.ann),
-        (GenerationComponentRole::Metadata, manifest.components.metadata),
+        (
+            GenerationComponentRole::Metadata,
+            manifest.components.metadata,
+        ),
     ]
 }
 
@@ -423,8 +428,9 @@ fn prepare(
     Ok(files)
 }
 
-/// Reader activation after a KNOWN successful authority switch. An inability to
-/// open the committed generation is not a failed commit and must not be retried
+/// Reader activation after a known successful authority switch.
+///
+/// An inability to open the committed generation is not a failed commit and must not be retried
 /// as one. In every non-installed case the previous snapshot remains installed.
 #[derive(Debug)]
 pub enum GenerationActivationV1 {
@@ -562,12 +568,9 @@ impl<'root> GenerationPublisherV1<'root> {
             max_owned_image_bytes,
         )?;
         checkpoint(cx, "generation.publish")?;
-        let publication = self.publisher.publish(
-            candidate.authority,
-            expected,
-            floor,
-            idempotency_key,
-        )?;
+        let publication =
+            self.publisher
+                .publish(candidate.authority, expected, floor, idempotency_key)?;
         // Do not retain a second complete copy beside the serving snapshot.
         drop(prepared);
         let activation = match &publication {
@@ -592,7 +595,10 @@ impl<'root> GenerationPublisherV1<'root> {
         if checkpoint(cx, "generation.activate").is_err() {
             return GenerationActivationV1::DeferredByCancellation;
         }
-        match self.snapshots.refresh(self.root, self.root_id, self.profile, floor) {
+        match self
+            .snapshots
+            .refresh(self.root, self.root_id, self.profile, floor)
+        {
             Ok(SnapshotOpenOutcomeV1::Opened(snapshot)) => {
                 GenerationActivationV1::Installed(snapshot)
             }
@@ -618,8 +624,8 @@ mod tests {
     }
 
     fn joined(generation: u8, with_ann: bool) -> ExactGenerationComponentsV1 {
-        let documents = CanonicalDocsetV1::from_ordered_live_documents(["doc-a", "doc-b"])
-            .expect("docset");
+        let documents =
+            CanonicalDocsetV1::from_ordered_live_documents(["doc-a", "doc-b"]).expect("docset");
         let checkpoint = SourceCheckpointV1::derive(&CommitRange {
             low: 1,
             high: u64::from(generation),
@@ -667,7 +673,10 @@ mod tests {
             .expect("canonical manifest");
         verify_authority_manifest_reference_v1(&candidate.authority(), &manifest)
             .expect("exact reference");
-        assert_eq!(manifest.source_checkpoint_sha256, joined.source_checkpoint());
+        assert_eq!(
+            manifest.source_checkpoint_sha256,
+            joined.source_checkpoint()
+        );
         assert_eq!(manifest.document_set_sha256, joined.docset_digest());
         assert_eq!(manifest.components.vector, joined.vector().bytes);
         assert_eq!(manifest.components.lexical, joined.lexical().bytes);
@@ -754,8 +763,7 @@ mod tests {
         let candidate = candidate(1, None);
         let slot = AuthoritySlotV1::new(1, root, candidate.authority()).expect("slot");
         let mut image = vec![0; 2 * GENERATION_AUTHORITY_SLOT_BYTES_V1];
-        image[GENERATION_AUTHORITY_SLOT_BYTES_V1..]
-            .copy_from_slice(&slot.encode().expect("frame"));
+        image[GENERATION_AUTHORITY_SLOT_BYTES_V1..].copy_from_slice(&slot.encode().expect("frame"));
         let observed = authenticated_pair(&image, root).expect("pair");
         assert_eq!(observed.second, Some(slot));
         image[GENERATION_AUTHORITY_SLOT_BYTES_V1 + 100] ^= 1;
@@ -782,8 +790,7 @@ mod tests {
             first.authority().fingerprint(),
         )
         .expect("attempt");
-        bytes[GENERATION_LOCK_FRAME_BYTES_V1..]
-            .copy_from_slice(&attempt.encode().expect("encode"));
+        bytes[GENERATION_LOCK_FRAME_BYTES_V1..].copy_from_slice(&attempt.encode().expect("encode"));
         assert_eq!(
             check_completed_attempt(&bytes, root, pair),
             Err(GenerationPublicationErrorV1::PendingReconciliation)
@@ -797,8 +804,7 @@ mod tests {
             first.authority().fingerprint(),
         )
         .expect("owner");
-        bytes[..GENERATION_LOCK_FRAME_BYTES_V1]
-            .copy_from_slice(&owner.encode().expect("encode"));
+        bytes[..GENERATION_LOCK_FRAME_BYTES_V1].copy_from_slice(&owner.encode().expect("encode"));
         assert!(check_completed_attempt(&bytes, root, pair).is_ok());
         let foreign_owner = GenerationLockFrameV1::new(
             GenerationLockFrameKindV1::Owner,
@@ -912,8 +918,7 @@ mod tests {
         fn admit(path: &Path) -> QualifiedGenerationRoot {
             QualifiedGenerationRoot::admit(
                 path,
-                GenerationRootAnchorLayout::new(AUTHORITY_PUBLISHER_LOCK_BYTES_V1)
-                    .expect("layout"),
+                GenerationRootAnchorLayout::new(AUTHORITY_PUBLISHER_LOCK_BYTES_V1).expect("layout"),
             )
             .expect("qualified root")
         }
@@ -992,7 +997,7 @@ mod tests {
                     )
                     .expect("fresh open");
                 let SnapshotOpenOutcomeV1::Opened(reopened) = reopened else {
-                    panic!("fresh admission refused");
+                    panic!("fresh admission refused"); // ubs:ignore — cfg(test) assertion: a refused fresh open must fail the publication test.
                 };
                 assert_eq!(reopened.head().authority, second.authority());
             });
@@ -1081,7 +1086,10 @@ mod tests {
                     Err(GenerationPublicationErrorV1::Cancelled { .. })
                 ));
                 cx.set_cancel_requested(false);
-                assert_eq!(fs::read(path.join("AUTHORITY")).expect("authority"), authority);
+                assert_eq!(
+                    fs::read(path.join("AUTHORITY")).expect("authority"),
+                    authority
+                );
                 assert_eq!(fs::read(path.join("LOCK")).expect("lock"), lock);
                 assert!(session.snapshot().is_none());
             });

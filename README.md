@@ -796,10 +796,14 @@ Use this as a pragmatic hardening pass before rollout:
 
 Publication runs on a real host with configured Cargo registry credentials.
 GitHub Actions does not publish this repository. The two release lines are
-versioned independently: `v*` tags identify fsfs binary releases and `crates-v*`
-tags identify library bundles. Published versions are `fsfs 1.10.0` and
-`frankensearch 0.5.0` (2026-09-08); the changelog lists every member and the index rebuild
-requirement. The GitHub releases record published bundles and validation receipts.
+versioned independently: `v*` tags identify fsfs binary releases. As of
+2026-09-21, the latest downloadable binary is **fsfs 1.10.0** (September 8),
+while crates.io carries **frankensearch 0.6.1** and **frankensearch-fsfs 1.11.0**
+(September 19). That crate family is tagged `frankensearch-v0.6.1`; earlier
+library bundles used `crates-v*` tags. The next binary release is still pending.
+The [changelog](CHANGELOG.md) lists every member, source revision and semantic
+index rebuild requirement. A crate publication or git tag does not establish
+cross-platform binary qualification.
 
 Run `scripts/check_crates_publish_contract.sh --mode gate --scope workspace`
 against the clean intended revision and the live registry. Build-verify every

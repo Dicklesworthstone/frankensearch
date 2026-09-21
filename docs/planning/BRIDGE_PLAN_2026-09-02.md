@@ -1,6 +1,271 @@
 # Bridge Plan: frankensearch
 
-## Current assessment — 2026-09-08
+## Current assessment — 2026-09-21
+
+**Verdict: the core search product is real, but current main is not release-ready.**
+The next useful work is to restore compilation, finish the existing exact
+conformance and release gates, and then wire the retained-generation foundation
+into ordinary indexing/watch/search. Another search engine, evidence framework,
+or planning epic is not the missing ingredient.
+
+Baseline: `365a20c4` on main. This assessment preserves the source changes already
+in the shared checkout. The user requested a complete reality check; this is
+requested planning, not a runtime improvement or a claim of release completion.
+The September 8 assessment below is historical, including its then-current
+release versions and unfinished daemon/gate tasks.
+
+### Evidence boundaries and current findings
+
+Read the complete suite and project AGENTS files and all 1,171 README lines.
+Reviewed the architecture maps, Quill design, existing bridge and bug plans,
+current release receipts, source call sites, tests, and full Beads inventory.
+Historical upgrade logs and every ancillary contract were not exhaustively
+re-audited; this is a comprehensive product/architecture assessment, not a
+claim that every repository document or source line was inspected.
+
+Evidence root **W** is `/data/release-work/frankensearch-release-20260912`.
+Existing execution evidence retains its source, feature, model and host scope.
+No new local build, benchmark or synthetic success is substituted for RCH.
+
+| Observation | Meaning and limit |
+|---|---|
+| RCH clean `365a20c4`, `cargo check --locked -p frankensearch-fsfs --all-targets`, worker vmi1293453, terminal 101 at 14:24:59 UTC; W/dependencies/current-retained-check-controller.log | **Current compilation fails.** `generation_store.rs:446,607` formats SHA-256 output with `LowerHex`, unavailable for the sha2 0.11 output type. The new generation code needs the same explicit byte encoding used by other migrated callers. Older green gates do not cover this change. |
+| W/dependencies/durable-retry-publication-stage.json | Corrected frozen publication validation passes **5 tests**, preserving durable pending state, cancellation, old authority and retry semantics. This does not cover all current publication tests or current main. |
+| Prior complete default quality execution at 9c37418e | Many product/library stages passed, but native real-model qualification failed; later fixes and focused passes are not one complete current-source green gate. |
+| Prior full Quill execution | Default gauntlet reported 906 pass, 1 failure, 5 ignored; replay framing was subsequently repaired. All-feature execution was interrupted. Neither is a full-lane pass. |
+| Live GitHub release and Actions APIs, September 21 | Latest binary release remains `v1.10.0`, September 8, six variants; Actions are disabled. Candidate Windows and later-source binaries are not publicly shipped by their existence in W. |
+| Live crates.io API, September 21 | `frankensearch 0.6.1`, `frankensearch-fsfs 1.11.0`, `fsqlite 0.4.4` exist. Current storage manifest and Cargo.lock already use FrankenSQLite 0.4.4. README/AGENTS published-version summaries lag the registry. Occupied versions cannot be republished. |
+| Current source, explicit retained APIs | `runtime_retained_generation.rs` implements rebuild/open/search, but explicitly leaves CLI/watch discovery unchanged. `generation_store.rs` documents a cooperative trusted-directory protocol. It is not the complete hostile-directory, antirollback, fixed-authority v2 migration. |
+| Current gate manifest | All ten Quill `activated` entries remain false. Dated absolute latency receipts and passing correctness tests do not certify competitive wins. |
+
+Initial Beads inventory: **1,153 closed, 89 open, 46 in progress, 6 blocked,
+4 deferred** (1,298 total). `br ready` returns just the publication-reconciliation
+task `bd-8nqz.6`; this does not authorize taking over the many owned or blocked
+implementation tasks. Completion percentages are not a product metric.
+
+### Vision checklist and gap coverage
+
+V1–V24 retain the September 8 numbering. WORKING below refers to previously
+executed, scoped functionality; it never asserts a passing current-main build.
+
+| Goal | Reality now | Existing completion owner |
+|---|---|---|
+| V1 Semantic installation on supported platforms | PARTIAL: released GNU x86 and Apple ARM full, four explicit lite variants; Windows candidate is not a shipped installer result. | `bd-fsfs-cross-platform-semantic-installer-46z3u`, platform qualifiers, `bd-dsbym` |
+| V2 Durable one-shot indexing of both tiers | WORKING on qualified older product; interrupted replacement must preserve the old complete generation. | `bd-pz8va`, `bd-xomn.3` |
+| V3 Progressive direct and warm-daemon delivery | IMPLEMENTED and previously qualified; the prior daemon wiring gap is closed. Current release requalification remains. | Closed `bd-fsfs-progressive-daemon-dq48i`; `bd-dsbym` |
+| V4 Configured semantic blending | WORKING in shared blend and actual fsfs routes; ranking improvement is a separate question. | Closed `bd-fsfs-quality-weight-38u9y`; E6.7 |
+| V5 Timeout/cancellation preserves Initial | IMPLEMENTED; native cold constructor recovery and warm reuse need current terminal proof. | `bd-2ba5`, `bd-dsbym` |
+| V6 Machine output, snippets, explanation | IMPLEMENTED; complete lexical backend metadata/snippet equivalence remains unproven. | `bd-qwkq`, E6.4/E6.7 |
+| V7 Search while watch remains alive | PARTIAL: ordinary paths still hold lifetime vector writer locks; explicit retained API is not CLI cutover. | `bd-z2nfa`, `bd-fsfs-identity-bound-watch-staging-t9m9m` |
+| V8 Append/delete/compact/flush/daemon consistency | WORKING pieces; immutable all-arm lifecycle and fragmented-session merge/fuel repairs remain incomplete. | `bd-458gu`, `bd-xomn.3`, `bd-immutable-generation-lifecycle-migration-rgcvv` |
+| V9 Truthful doctor/status | IMPLEMENTED with real producer checks; automated recovery is incomplete. | `bd-p6z6.4`, `bd-3fy9` |
+| V10 Reusable published facade | WORKING registry route; current changed code is newer than published archives. | `bd-dsbym`, `bd-8nqz.6` |
+| V11 Full Quill used-surface conformance | PARTIAL: real engine and bounded gate, unresolved exact R1 and broader census. | `bd-r1-exact-repair-or-residual-1i4j4`, E6/E7, `bd-q4rg` |
+| V12 One retained identity-bound generation | PARTIAL and current fsfs compile-broken: APIs exist, production cutover and authority equivalence do not. | `bd-xomn.1`–`.4`, publisher/snapshot/security/retention owners |
+| V13 Recovery without mixed generations | PARTIAL: FEC and typed rebuild behavior exist; unified recovery lifecycle unfinished. | `bd-p6z6.3/.4`, `bd-3fy9`, immutable lifecycle |
+| V14 Bounded large-corpus native ANN | PARTIAL: optional ANN still resolves registry frankenhnsw; native graph is not the fsfs route. | `bd-kcek`, retained generation/ANN admission |
+| V15 Real optional cross-encoder rerank | WORKING on scoped release/model evidence; not missing implementation. | `bd-dsbym` requalification; E6.7 quality |
+| V16 Native quality replaces ONNX | PARTIAL: native F32 and explicit source profile exist; default remains ONNX, cross-platform numerical and cost obligations remain. | `bd-2ba5`, `bd-6kafg` |
+| V17 Better relevance on held-out workloads | UNPROVEN broadly: Refined/known-item success does not establish a relevance gain. | E6.6/E6.7, `bd-2g2l`, `bd-q4rg` |
+| V18 Honest latency/memory/indexing envelopes | Dated scoped receipts exist; current changed-source wider envelope unproven. | Existing performance campaign, `bd-u8cof` |
+| V19 Frozen Quill competitive targets | UNPROVEN: 0/10 activated; retain losses and no-verdicts. | E8/E8-H and `bd-h6eh` |
+| V20 Real CASS/xf/Mail adoption | PARTIAL: adapters and registry consumers exist; host-owned semantic lifecycle still needs proof. | `bd-cass-semantic-cross-repo-receipt-91k2`, total lexical contract |
+| V21 Privacy, pressure, scope and replay | IMPLEMENTED components; interruption-safe replacement and complete fault matrix remain. | `bd-pz8va`, generation/cache/recovery tasks |
+| V22 Complete real-host release gates | PARTIAL: bounded gate and A5 landed; current compilation and full/native terminal gaps block release. | `bd-dsbym`, existing R1 owner |
+| V23 Accurate active guidance | PARTIAL: published versions lag; historical plan claims must not override current source. | `bd-dsbym` release documentation; `bd-d7xk1` dormant-file disposition |
+| V24 Ops/distributed expansion | Explicitly experimental/design-only; no production telemetry producer or distributed product claim. | Existing scope decision; not a new release blocker |
+
+### Bridge work and granular execution checklist
+
+**R — Restore one coherent releasable source (S repair; L qualification),
+`bd-dsbym`, V1/V10/V22/V23.**
+
+- [ ] Encode both SHA-256 results in `generation_store.rs` explicitly as
+  lowercase hex, preserving the 64-character persisted digest contract.
+- [ ] Exercise its real seal/open/reopen/tamper and retained-reader tests; a
+  compiler pass alone does not establish durable publication.
+- [ ] Finish the outstanding publication/native/replay run, retaining each
+  stage's terminal result separately. Five publication passes do not pass
+  the later native or replay stages.
+- [ ] Resolve exact R1 through its current owner and original family probe;
+  do not replace it with a smaller passing fixture or relaxed score tolerance.
+- [ ] Qualify the final source/lock/feature set with all required stock and
+  complete Quill lanes, native and registry consumers, strict lint and UBS.
+  Use valid feature combinations: the Quill publication test needs
+  `durability,conformance-internals`; indiscriminately enabling conflicting
+  bench/profile instrumentation is not the full-gauntlet all-feature lane.
+- [ ] Choose forward-only versions after live registry verification; build
+  the established platform variants from that qualified source through DSR/RCH.
+- [ ] Verify installed archives, checksums, actual index/search/update behavior,
+  source/ELF identity and full-versus-lite capability on each promised route.
+- [ ] Publish authorized venues with Actions disabled; verify GitHub latest
+  still selects the binary release, verify registry consumers, determine
+  Homebrew applicability from the actual distribution configuration.
+- [ ] Update CHANGELOG/README/AGENTS to the verified public state, not the
+  intended state. Keep failed/interrupted and older-source receipts visible.
+
+**G — Make existing generation work serve ordinary users (L–XL),
+`bd-xomn.3` and watch staging, V2/V7/V8/V12/V13/V21.**
+
+- [ ] Map the explicit cooperative store to the existing fixed-authority,
+  antirollback and retained-owner contracts before claiming v2 completion.
+- [ ] Reuse the same ranking/admission path; migrate ordinary CLI, daemon,
+  watch, facade and storage sinks to one selected complete generation.
+- [ ] Bind independent fast/quality identities, lexical/catalog membership,
+  source watermark, optional ANN and cache identity to that publication.
+- [ ] Preserve update/delete/rename/replay, fast-only and partial quality;
+  retrieve quality candidates independently, including outside fast top-k.
+- [ ] Hold old readers across publication while new independent readers see
+  the successor. Inject cancellation, crash and unknown durability outcome
+  at build/seal/publish/install; never serve a mixed bundle.
+- [ ] Measure event-to-visible while watcher and daemon remain alive, not
+  event-to-applied or search after watcher exit. Keep bounded failure logs.
+- [ ] Finish cross-process retention roots and platform qualification before
+  retirement of legacy APIs; no deletion or GC authorization inferred.
+
+**Q — Close exactness and user-value evidence (L), existing R1/E6 owners,
+V6/V11/V17/V20.**
+
+- [ ] Pair Quill and pinned Tantivy on identical public lenient queries,
+  corpus, segmentation and actual addition route; strict-parser traces are
+  not interchangeable with public-lenient output.
+- [ ] Classify/fix every original exact-family mismatch under the existing
+  contract; preserve ordered IDs and score bits, snippets/metadata/errors.
+- [ ] Execute lexical/fast/Initial/Refined/rerank held-out ablations through
+  real serving routes and persisted reopen; retain per-slice regressions.
+- [ ] Apply existing paired statistical lower-bound rules with fixed queries,
+  models, candidate budgets and multiplicity; no tuned-on-test superiority.
+- [ ] Obtain the actual consuming project's CASS semantic/recovery receipt
+  against the published dependency, not only a workspace adapter test.
+
+**N — Finish useful optional execution paths (L–XL), `bd-2ba5`/`bd-kcek`,
+V14/V16/V18.** Native inference keeps its original parity, ranking, latency,
+feature-matrix and no-C/C++ acceptance. Native ANN needs real routing, retained
+vector ownership, persisted restart, tombstone recall and an exact oracle.
+Neither should displace the release compilation repair. Reuse existing modules;
+do not add another backend or claim native reranking proves native embedding.
+
+**P — Execute the existing performance program (open-ended), E8/E8-H, V19.**
+Use current executable provenance, admitted hosts, same-invocation Tantivy,
+valid null controls and frozen workloads. Rank actual profile costs before
+kernel work; report every valid loss. Do not make ten wins a new prerequisite
+for an owner-authorized release, and do not call them achieved because Quill
+is already default. Ops/distributed remain outside this local-product bridge.
+
+**Would completing the existing queue suffice?** It covers the identified
+product goals if completion means the actual end-to-end acceptance above.
+The initial queue lacked the newly observed sha2 call sites and did not make
+the distinction between cooperative retained APIs and the promised authority
+cutover sufficiently visible. These are subitems of existing release/migration
+beads, not new epics. Broad relevance or competitive success is an empirical
+outcome, so no finite task count guarantees those goals. There is no newly
+discovered top-level unowned product goal in this pass.
+
+### Skill execution and refinement record
+
+Phase 1 and Phase 2 are recorded above. Phase 3a applies the following frozen
+instruction to existing owners; tests remain with implementation under suite
+work-graph rules:
+
+```text
+OK so please take ALL of that and elaborate on it and use it to create a comprehensive and granular
+set of beads for all this with tasks, subtasks, and dependency structure overlaid, with detailed
+comments so that the whole thing is totally self-contained and self-documenting (including relevant
+background, reasoning/justification, considerations, etc.-- anything we'd want our "future self" to
+know about the goals and intentions and thought process and how it serves the over-arching goals of
+the project.) The beads should be so detailed that we never need to consult back to the original
+markdown plan document. Remember to ONLY use the `br` tool to create and modify the beads and add
+the dependencies.
+```
+
+**Ambition round 1 — make the concurrency fix economical.** A whole-corpus
+retained rebuild is a useful replacement-index primitive, but blindly invoking
+it for every watch event could remove lock exclusion while making freshness,
+embedding cost and disk growth worse. Watch staging must reuse validated
+unchanged artifacts and batch changed documents through existing incremental
+machinery. Measure candidate-build bytes/work and source-event-to-visible time
+separately. Preserve a final catch-up watermark: publishing a complete but
+already stale candidate without replaying concurrent changes is not a watch
+fix. Bound pending work; retain typed pressure/backlog behavior without silently
+dropping mutations. This strengthens the existing watch task, not a second
+index or a claim that cooperative FSFS-CURRENT satisfies fixed AUTHORITY.
+
+**Ambition round 2 — qualify the user session, not one lucky query.** Native
+quality initialization may legitimately exceed the documented 500 ms cold
+budget. The current test contains both an unconditional first-daemon Refined
+assertion and a separate forced-cold-timeout/warm-reuse sequence. Preserve the
+observed failure and investigate which branch failed before changing anything.
+If a test/contract defect is established, a correction needs original RED,
+causal evidence, reviewed contract, replacement positive/negative controls,
+and an explicit account of newly admitted results. Never raise the deadline
+or accept arbitrary failure to turn the lane green. Prove Initial preservation,
+typed deadline failure, one retained successful constructor, uncached warm
+Refined under the original budget, wrong-producer refusal and clean shutdown.
+Keep successful phase delivery distinct from held-out relevance improvement.
+
+Phase 3a is reapplied unchanged after these two rounds; the added requirements
+belong to existing watch/native/release owners. Existing acceptance, assignees
+and graph structure remain intact.
+
+Each refinement pass below applies this frozen instruction:
+
+```text
+Check over each bead super carefully-- are you sure it makes sense? Is it optimal? Could we change
+anything to make the system work better for users? If so, revise the beads. It's a lot easier and
+faster to operate in "plan space" before we start implementing these things! DO NOT OVERSIMPLIFY
+THINGS! DO NOT LOSE ANY FEATURES OR FUNCTIONALITY! Also make sure that as part of the beads we
+include comprehensive unit tests and e2e test scripts with great, detailed logging so we can be
+sure that everything is working perfectly after implementation. Make sure to ONLY use the `br` cli
+tool for all changes, and you can and should also use the `bv` tool to help diagnose potential
+problems with the beads.
+```
+
+1. **Coverage review:** compared all 24 goals with current and closed task
+   records. Restored explicit fragmented-session merge/fuel coverage (`bd-458gu`)
+   to V8 rather than allowing the generation program to hide that separate
+   bug. Closed daemon, A5 and bounded-gate tasks remain credited at their
+   actual source; none is reopened just because the next release is pending.
+2. **Dependency/ownership review:** current compilation repair is immediately
+   actionable inside the already owned release task. Full watch cutover still
+   consumes publisher/snapshot/identity prerequisites; it is not an artificial
+   prerequisite for every release fix. Existing R1 ownership remains intact.
+   `br dep cycles` reports zero active cycles (two archived closed-only cycles).
+   No graph structure or assignee was changed by this assessment.
+3. **Test/negative-path review:** distinguish Quill engine publication features
+   from the gauntlet's all-feature lane. Added explicit selection above;
+   preserve all original tests rather than mistaking mutually exclusive
+   instrumentation for a runtime bug. Native cold/warm tests retain stock
+   policy, refusal and shutdown checks; score/conformance gates are unchanged.
+4. **Provenance/release review:** re-read the publication stage JSON (exit 0,
+   log SHA `12a33360cde5b326703ba056cdeee40cefa994d9d83315dcc4993e7aab62910d`),
+   the failed current-source check and live public versions. The native stage
+   was still compiling at the final observation; later replay stages had no
+   verdict. Current source remains 365a20c4. Existing candidate platform builds
+   and published crates cannot be relabeled as this source. No fresh full
+   product E2E or all-platform pass is claimed by this assessment.
+5. **Convergence review:** compared final records against the initial inventory:
+   no new/deleted issues or changed descriptions, acceptance, assignees or
+   statuses. Four existing beads received the five focused comments above;
+   no implementation closure. All 24 vision goals have an explicit disposition
+   and existing owner/scope. No further planning change was identified.
+
+Final validation uses `bv --db .beads/issues.jsonl --robot-triage`, not the stale
+merge base: 1,298 records, 145 not closed, 36 graph-actionable and no active
+cycles. Graph-actionable is not the same as `br ready` or unowned work. Existing
+publisher/snapshot/retention blockers explain the watch chain; there is no new
+dependency overlay to invent. `br sync --flush-only` and `git diff --check`
+complete this documentation/Beads pass. No source edits, gate changes, new
+frameworks, benchmark claims or public releases were made in this assessment.
+
+The next execution should repair the two SHA call sites under `bd-dsbym`,
+finish the pending gate results and exact R1 disposition, and qualify one
+frozen release source. Continue the owned generation chain for watch/search
+availability alongside that bounded release work. These are remaining tasks,
+not accomplishments of this plan.
+
+---
+
+## Historical September 8 assessment (superseded)
 
 **Verdict:** the core two-tier library and fsfs product work and are published.
 The project is not complete against its full vision. The largest remaining
