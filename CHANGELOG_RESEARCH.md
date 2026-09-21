@@ -867,3 +867,33 @@ passed. The retrieved full-gate log SHA-256 is
 The assertion is repaired with `expect_err`; the timeout remains under
 investigation. Neither this repair nor an isolated replay replaces a complete
 release verdict. The full Quill invocation remains nonterminal.
+
+### September 21 executable generation and configuration supplement
+
+Narrow scope: the complete-generation commits `83a558f6`, `ceea888b`,
+`1ff0bb1d`, `a2bae41d`, and `a6992b70`, integrated at `e57980ae`, plus
+the owned repairs `4f30ffee` and `e7808fe6`. Reviewed their source diffs,
+the command parser, config init/reset callers, and release bead `bd-dsbym`.
+This is a supplement to the earlier history, not a new publication record.
+The GitHub API still reports binary release v1.10.0 (September 8); Actions
+remain disabled, checked September 21.
+
+RCH worker vmi1264463 validated frozen source `e57980ae` plus the exact
+repair diff now committed in `e7808fe6`. Retrieved evidence is under
+`/data/release-work/frankensearch-release-20260912/dependencies/config-toml-validation/`:
+42 generation unit tests, two configuration regressions, five executable
+tests including the explicitly enabled real-Potion case, and strict fsfs
+all-target Clippy passed. The production executable test log SHA-256 is
+`0db2f1fdb510f40020b6afb051450067f87ed458b6a9b4dd6bbf34f0189634a7`;
+its test ELF is `6e7ff18d80ea64efd7040683aed3a61126bbc633a327fa72b28e68066fbc053e`.
+The tested production binary was separately hashed after the test as
+`9994481a7a8b761198575f0d2e91b649b93bc99ece9f5bc24dd397a320c64f2f`.
+
+The overall receipt remains FAIL: four pre-existing golden receipt checks
+still differed. Diagnostics isolated JSON map ordering and receipt hashes;
+that follow-through is not credited as complete here. An earlier golden
+rerun reused a test ELF embedding the previous snapshot's fixture path and
+is explicitly excluded. Subsequent fresh-target runs reproduced the mismatch.
+No failed test, ignored test, pending full gate, R1 comparison, native quality
+deadline, or platform build is promoted to a release verdict. This was solo
+re-execution and review, not independent verification.

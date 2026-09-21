@@ -19,11 +19,14 @@ A September 20 supplement below separates changes landed after the 0.6.1
 publication from that immutable crate release. Cross-platform binaries and
 complete release qualification remain pending.
 
+The September 21 supplement records executable complete-generation integration
+and reloadable default configuration files. These fixes remain unreleased.
+
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased fsfs | Release preparation | 2026-09-09–17 | Progressive warm-daemon streaming, indexing cancellation and pressure checks, model reuse, native MiniLM numerical fixes, doctor producer admission, installer profile/offline fixes, and lexical-flush retry retention |
+| Unreleased fsfs | Release preparation | 2026-09-09–21 | Progressive warm-daemon streaming, complete-generation CLI integration, reloadable config defaults, indexing and model fixes, installer profile/offline fixes, and lexical-flush retry retention |
 | frankensearch 0.6.1 | crates.io publication + `frankensearch-v0.6.1` git tag | 2026-09-19 | Native ANN over sealed source cohorts, progressive lazy reranking, optional Tantivy lexical arm, cancellation-safe embedding leases, NEON/x86 reranker bit parity, Windows publication leases |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
@@ -233,11 +236,34 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ## Unreleased changes after frankensearch 0.6.1
 
-This section covers landed source through
+The September 20 entries cover landed source through
 [`aaf8bae1`](https://github.com/Dicklesworthstone/frankensearch/commit/aaf8bae1169f39acdaf12c0e58b65a0ab876ab7c).
 These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
+
+- **Complete-generation rebuilds and searches reach the executable.** Opting in
+  with `FSFS_COMPLETE_GENERATIONS=1` publishes a complete bundle; subsequent
+  index/search commands recognize that store. Warm stdio serving admits a
+  successor between requests and invalidates its query cache. Invalid selection
+  and catalog paths are refused without entering the legacy mutable layout.
+  Integration repairs remove a non-Send stdin guard and restore SHA-256 encoding
+  with the current dependency API. Forty-two focused unit tests and five real
+  executable tests pass, including a Potion-backed successor rebuild, retained
+  predecessor, direct/streaming search, and malformed-request recovery followed
+  by a cached stdio result. This does not qualify watch/socket-daemon routing or
+  the full release matrix.
+  [Executable wiring](https://github.com/Dicklesworthstone/frankensearch/commit/a2bae41dffdf32e1efdf545fad05d2e2a93355e3);
+  [warm serving](https://github.com/Dicklesworthstone/frankensearch/commit/a6992b70fa350fc49e1d5f7b8aeb0210311291b7);
+  [digest repair](https://github.com/Dicklesworthstone/frankensearch/commit/4f30ffee34e9860e9a0b9a94b31d5e348be7d3cb);
+  [executable validation and fixes](https://github.com/Dicklesworthstone/frankensearch/commit/e7808fe60eb20750430b05b8055a6a5d132ace74).
+
+- **`config init` and `config reset` emit reloadable defaults.** On 64-bit hosts,
+  directly serializing the unlimited-result sentinel produced an integer TOML
+  could not read. `FsfsConfig::to_toml` writes the existing `0 = unlimited`
+  spelling while preserving in-memory and JSON values. Regression tests reload
+  bounded/unlimited configurations and files written by both command handlers.
+  [Fix and tests](https://github.com/Dicklesworthstone/frankensearch/commit/e7808fe60eb20750430b05b8055a6a5d132ace74).
 
 - **Numeric filters compose with other Boolean clauses after a document is
   deleted ([#49](https://github.com/Dicklesworthstone/frankensearch/issues/49)).**
