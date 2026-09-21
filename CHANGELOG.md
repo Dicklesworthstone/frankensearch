@@ -283,6 +283,24 @@ qualified; individual results below are narrower than release acceptance.
   [scoped retrieval](https://github.com/Dicklesworthstone/frankensearch/commit/8b1c89edb78391b794656bd9cbc9b375a9ed3c14);
   [configured deadline collection](https://github.com/Dicklesworthstone/frankensearch/commit/9835ba53318ad23a53ae5a9f18cf261c46240950).
 
+- **Dropping a shutdown coordinator releases its signal listener.** The listener
+  now holds a weak reference, so it cannot keep its owner and process-wide
+  handlers alive indefinitely. Registration and stop/restart are serialized;
+  destruction closes the listener and joins it unless destruction occurs on
+  that listener's own thread. Regression tests cover owner drop, repeated
+  registration, concurrent stop/restart, and self-join avoidance.
+  [Implementation and regressions](https://github.com/Dicklesworthstone/frankensearch/commit/cfcb6831f9693513ec4039a3df349fee11ad84ac).
+
+- **Quill charges cached snapshot document frequencies only for work performed
+  ([#41](https://github.com/Dicklesworthstone/frankensearch/issues/41)).** A cache
+  hit still polls cancellation but no longer charges dictionary scans that it
+  did not repeat. Range, set, and glob expansions reuse the same query-local
+  statistics table. The query-work ceiling accounts for one snapshot scan per
+  term when the table is active, while retaining actual uncached work below
+  its two-segment threshold. This prevents redundant accounting from exhausting
+  query budgets as segment counts grow; it is not a measured latency claim.
+  [Implementation](https://github.com/Dicklesworthstone/frankensearch/commit/0642c5fc5e3f47cecb4b84453c80fa207b8bca9d).
+
 The archived Quill publication-reuse proposal is outside the compilation tree;
 its presence does not enable or qualify a production optimization.
 [Candidate status](https://github.com/Dicklesworthstone/frankensearch/commit/83c7ba743d61756369ed43245835712034c427b0).

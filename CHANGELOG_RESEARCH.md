@@ -832,3 +832,28 @@ quality gate now target frozen `aaf8bae1`. The complete Quill inventory,
 exact public R1 comparison, and all current-source release gates remain open.
 An identical dependency-update bullet was removed from the changelog without
 changing its recorded qualification scope.
+
+### September 20 follow-through through `9c37418e`
+
+Reviewed the complete commit inventory after `1a5a5b87`, including the merged
+Quill document-frequency accounting fix `0642c5fc`, its linear-ceiling tests
+`86c2e99c` and `0a779d12`, the configuration explanation `c3e15633`, publication
+regressions `500b89ff` and `dc02682a`, and signal ownership fix `cfcb6831`.
+The production fixes are recorded in the existing unreleased section.
+Native ANN helper/fixture repairs and formatting are validation maintenance;
+publication tests do not imply that the archived reuse proposal is enabled.
+
+Both new representative commit URLs resolved through the GitHub API on
+September 20. A fresh release-list query still returned `crates-v0.5.0` and
+`v1.10.0` as the latest crate-bundle and binary releases. No new publication
+is inferred from the source commits.
+
+The unchanged clean-source quickstart gate passed on `6fd1362a`: 12 executable
+checks, 18 negative controls, no remaining owned processes. Its retrieved
+receipt SHA-256 is
+`34c3fefbc20b6e0a6e396ab5604ff07ae0936c62579aeb7049c053015013ac29`.
+The complete default gate and full Quill inventories on `9c37418e` are running
+through RCH jobs `30023605353973348` and `30023605353973346`, respectively;
+these are not terminal success receipts. Exact public R1 acceptance remains
+open independently. Detailed evidence and the current checklist remain in
+the release-work directory cited above.
