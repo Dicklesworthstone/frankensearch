@@ -860,3 +860,6 @@ mod retained_search_tests {
         });
     }
 }
+
+#[path = "runtime/complete_cli.rs"]
+mod complete_cli;
