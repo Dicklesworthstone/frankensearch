@@ -35,9 +35,7 @@
           "regression_test": "runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope",
           "minimized": true
         },
-        "mismatch_signatures": [
-          "15c251dd6671f6766082fc47e653cda26b72cb7b6e1b642ba4b795fb906133ec"
-        ],
+        "mismatch_signatures": ["15c251dd6671f6766082fc47e653cda26b72cb7b6e1b642ba4b795fb906133ec"],
         "observed_behavior": "Quill scores one document in a plain three-clause disjunction one ULP away from the pinned oracle; the returned document set and every rank position are identical.",
         "expected_behavior": "the pinned oracle's score for that document, bit for bit, under the campaign comparator's zero-tolerance default configuration.",
         "root_cause": "the DIV-007 mechanism outside its documented qualifiers: Quill's Term scorer fuses each unfielded term's [content, 2.0x title] expansion into one summed contribution while the pinned oracle accumulates interleaved per-field clause outputs, so f32 summation association differs. Observed at three leaves with no boost and no mixed-occur nesting, where DIV-007 documents eight leaves.",
@@ -118,9 +116,7 @@
           "regression_test": "runner::tests::live_default_profile_campaign_ingests_its_unclassified_divergence",
           "minimized": true
         },
-        "mismatch_signatures": [
-          "f708f094b609cf06c3a3d177ef8093db134c08c707914800cd185834040d1b05"
-        ],
+        "mismatch_signatures": ["f708f094b609cf06c3a3d177ef8093db134c08c707914800cd185834040d1b05"],
         "observed_behavior": "the two engines disagree about which documents MATCH a negation inside a boosted group: the pinned oracle re-nests the negation as a positive alternative and returns the documents it was told to exclude.",
         "expected_behavior": "the same document set from both engines; a negation inside a boosted group excludes exactly what it names.",
         "root_cause": "an oracle-side LOWERING defect, not a Quill scoring one and not a parse recovery: the MustNot clause survives parsing, but boosting the group nests it as its own boolean and attaches that as a positive alternative, so the group stops excluding (bd-f20ye). Quill lowers it correctly. Membership differs, so no score-tolerance class can ever cover it -- the lane's reviewed summation-association tolerance covers score bits on identical document sets and deliberately does not reach here. The class recorded is OracleBug because the blame was PROVED on three independent pieces of evidence: the query shape, the membership symptom, and the side -- the oracle returned a strict superset of the subject's documents, which is the failure-to-exclude this defect produces (bd-bxya1).",
@@ -182,9 +178,7 @@
           "regression_test": "runner::tests::live_default_profile_campaign_ingests_its_unclassified_divergence",
           "minimized": true
         },
-        "mismatch_signatures": [
-          "3cb5d0235fc8d81e6e93dd26ef6a918b7a8041782c7e4a318bdb3d5ab52d3978"
-        ],
+        "mismatch_signatures": ["3cb5d0235fc8d81e6e93dd26ef6a918b7a8041782c7e4a318bdb3d5ab52d3978"],
         "observed_behavior": "the two engines disagree about which documents MATCH a conjunction that carries a negation: the pinned oracle returns NOTHING at all, while the subject returns the documents the query asks for.",
         "expected_behavior": "the same document set from both engines; a negation inside an explicit conjunction excludes what it names rather than emptying the conjunction.",
         "root_cause": "an oracle-side LOWERING defect in tantivy 0.26.1: `A AND NOT B` lowers to a conjunction whose second Must operand is a boolean holding only a MustNot clause, which has no positive term, matches nothing, and empties whatever it is conjoined with. Quill lowers it correctly since bd-quill-shipping-conformance-parse-split-w7bsu, and frankensearch-lexical's SHIPPING path repairs it while every oracle_observe_* caller stays bit-faithful to the defect. The blame is ATTRIBUTED BY A CONTROL, not by this record: the same oracle answers the same operands spelled without the explicit AND with the exact document set the subject returns, which isolates the AND keyword as the trigger. That control is a SEPARATE campaign case, which is why this observation carries the raw class rather than the semantic one (bd-4oiwf).",
@@ -246,9 +240,7 @@
           "regression_test": "runner::tests::live_default_profile_campaign_ingests_its_unclassified_divergence",
           "minimized": true
         },
-        "mismatch_signatures": [
-          "498db47b76609909361e374ebddce7808a5dd3320cc85243b9e44b855a115c52"
-        ],
+        "mismatch_signatures": ["498db47b76609909361e374ebddce7808a5dd3320cc85243b9e44b855a115c52"],
         "observed_behavior": "the two engines disagree about which documents MATCH a conjunction that carries a negation: the pinned oracle returns NOTHING at all, while the subject returns the documents the query asks for.",
         "expected_behavior": "the same document set from both engines; a negation inside an explicit conjunction excludes what it names rather than emptying the conjunction.",
         "root_cause": "an oracle-side LOWERING defect in tantivy 0.26.1: `A AND NOT B` lowers to a conjunction whose second Must operand is a boolean holding only a MustNot clause, which has no positive term, matches nothing, and empties whatever it is conjoined with. Quill lowers it correctly since bd-quill-shipping-conformance-parse-split-w7bsu, and frankensearch-lexical's SHIPPING path repairs it while every oracle_observe_* caller stays bit-faithful to the defect. The blame is ATTRIBUTED BY THE STORED CONTROL: the same oracle answers the same operands spelled without the explicit AND exactly, and that control's membership equals the witness subject's. A genuine subject-side defect wearing the same shape is refused when it disagrees with the control (bd-4oiwf).",

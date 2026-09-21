@@ -29,9 +29,7 @@
           "regression_test": "runner::tests::divergence_ledger_schema_fixture_round_trips",
           "minimized": true
         },
-        "mismatch_signatures": [
-          "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        ],
+        "mismatch_signatures": ["eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"],
         "observed_behavior": "The subject lowers the synthetic oversized atom to MatchNone.",
         "expected_behavior": "The oracle retains an unmatchable posting-list leaf.",
         "root_cause": "The subject applies its symmetric token-admission bound during AST lowering.",
