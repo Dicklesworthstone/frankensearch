@@ -946,3 +946,25 @@ statements remain intact; scanner configuration did not change. The static scan
 exited zero with zero critical findings, 3,773 warnings, and 488 informational
 findings. It is not a warning-free result. Byte-fixture and full-gate validation
 remain separate obligations.
+
+The full gate on the earlier dirty JSON-order snapshot finished FAIL. Its
+retrieved receipt SHA-256 is
+`72d92795e80e9defabfa69dbd2961560602e6d891691e811a02664ccacb5ffe9`.
+The failing stages were Clippy, workspace library tests (three TUI goldens),
+bounded Quill (five sealed-campaign failures), fsfs (one benchmark-fixture hash),
+native E2E (the cold assertion), and quick-start provenance. The last failure
+was my validation setup: `--require-source` correctly rejects a dirty checkout,
+even when the overlay is frozen and separately hashed. The next complete gate
+must use a clean checkout of the committed repairs; that check is not relaxed.
+
+Byte restoration covers 15 Quill archive fixtures, the normative machine
+registry, three TUI goldens, and three benchmark baseline fixtures. Every JSON
+value matches the historical source at `4f30ffee`; every file matches those bytes
+modulo its final newline. Sealed SHA constants, benchmark thresholds, and test
+expectations remain untouched. The three restored TUI tests passed remotely;
+the Quill archive tests and benchmark rerun remain pending here. A read-only
+scan of all 420 reformatted JSON paths against 554 Rust source files identified
+the additional fixed-hash consumers. UBS returned exit 3 for JSON alone because
+it has no JSON scanner; this is not a pass. A cumulative scan including the two
+actual Rust files repaired in this work block exited zero, but does not validate
+JSON. Historical-byte comparisons and the consumer tests provide that evidence.

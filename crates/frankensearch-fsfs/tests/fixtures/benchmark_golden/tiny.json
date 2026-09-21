@@ -27,5 +27,8 @@
     "searching_peak_memory_mb": 95,
     "index_size_bytes_per_document": 1820
   },
-  "notes": ["Single developer laptop profile", "Used as smoke/regression baseline"]
+  "notes": [
+    "Single developer laptop profile",
+    "Used as smoke/regression baseline"
+  ]
 }
