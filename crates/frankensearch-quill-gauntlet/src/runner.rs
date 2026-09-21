@@ -27503,8 +27503,11 @@ mod tests {
                 derived, pinned,
                 "fresh-process derivation must equal the pinned corpus exactly"
             );
+            // With one test thread, libtest leaves its progress prefix on the
+            // current line. Start the receipt on its own line so the parent
+            // decodes exactly the JSON emitted here, not libtest's prefix.
             println!(
-                "{}",
+                "\n{}",
                 stored_v7_replay_receipt().expect("fresh process must emit a receipt")
             );
         }
