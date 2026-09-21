@@ -155,6 +155,7 @@ mod loader_only {
         }
 
         fn command(&self, cwd: &Path) -> Command {
+            // ubs:ignore -- fsfs_binary validates the explicit test executable or uses Cargo's binary.
             let mut command = Command::new(&self.binary);
             command
                 .current_dir(cwd)
@@ -1380,6 +1381,74 @@ mod loader_only {
         assert_eq!(fs::read(&executable).unwrap(), executable_before);
     }
 
+    // Cold initialization is inside the public quality deadline. README's
+    // native contract permits a typed timeout with retained Initial hits;
+    // the real daemon test below separately requires uncached warm refinement.
+    #[cfg(feature = "rerank")]
+    fn validate_native_cold_result(payload: &Value) -> Result<(), &'static str> {
+        let hits = payload["hits"].as_array().ok_or("missing hits")?;
+        if hits.is_empty() || payload["returned_hits"].as_u64() != u64::try_from(hits.len()).ok() {
+            return Err("cold search must retain populated hits");
+        }
+        match payload["phase"].as_str() {
+            Some("refined")
+                if payload["quality_timeout"].is_null() && payload["skip_reason"].is_null() =>
+            {
+                Ok(())
+            }
+            Some("refinement_failed")
+                if payload["skip_reason"] == "quality_timeout"
+                    && payload["quality_timeout"]["reason_code"] == "query.quality.timeout"
+                    && payload["quality_timeout"]["budget_ms"] == 500
+                    && payload["quality_timeout"]["elapsed_ms"]
+                        .as_u64()
+                        .is_some_and(|elapsed| elapsed >= 500) =>
+            {
+                Ok(())
+            }
+            _ => Err("cold search must refine or report its actual 500ms timeout"),
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn native_cold_contract_rejects_other_failures_and_empty_results() {
+        let timeout = serde_json::json!({
+            "phase": "refinement_failed", "hits": [{"path": "castaway.md"}],
+            "returned_hits": 1, "skip_reason": "quality_timeout",
+            "quality_timeout": {
+                "reason_code": "query.quality.timeout", "budget_ms": 500, "elapsed_ms": 501
+            }
+        });
+        assert_eq!(validate_native_cold_result(&timeout), Ok(()));
+        for (pointer, replacement) in [
+            ("/hits", serde_json::json!([])),
+            ("/returned_hits", serde_json::json!(0)),
+            ("/phase", serde_json::json!("initial")),
+            (
+                "/skip_reason",
+                serde_json::json!("embedding_space_unverifiable"),
+            ),
+            (
+                "/quality_timeout/reason_code",
+                serde_json::json!("model_load_failed"),
+            ),
+            ("/quality_timeout/budget_ms", serde_json::json!(1000)),
+            ("/quality_timeout/elapsed_ms", serde_json::json!(499)),
+        ] {
+            let mut invalid = timeout.clone();
+            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            assert!(validate_native_cold_result(&invalid).is_err(), "{invalid}");
+        }
+        let mut refined = timeout;
+        refined["phase"] = serde_json::json!("refined");
+        assert!(validate_native_cold_result(&refined).is_err());
+        refined["quality_timeout"] = Value::Null;
+        assert!(validate_native_cold_result(&refined).is_err());
+        refined["skip_reason"] = Value::Null;
+        assert_eq!(validate_native_cold_result(&refined), Ok(()));
+    }
+
     #[cfg(feature = "rerank")]
     #[test]
     #[ignore = "requires real native MiniLM, Potion and ONNX fixtures; explicit native CLI integration"]
@@ -1411,6 +1480,7 @@ mod loader_only {
             let source = std::env::var_os(variable)
                 .map_or_else(|| configured_model_root().join(directory), PathBuf::from);
             manifest.verify_dir(&source).unwrap_or_else(|error| {
+                // ubs:ignore -- Missing real model fixtures must fail this integration test.
                 panic!("native CLI fixture {directory} at {} is unavailable: {error}; install it with fsfs download-models {} or set {variable}", source.display(), manifest.id)
             });
             let destination = models.join(directory);
@@ -1633,7 +1703,11 @@ mod loader_only {
         };
         let initial_search = search("native-search", true, false, false);
         let result = parse_success_envelope("native search", &initial_search);
-        assert_eq!(result["data"]["phase"], "refined", "{result}");
+        assert_eq!(
+            validate_native_cold_result(&result["data"]),
+            Ok(()),
+            "{result}"
+        );
         let phases = |outcome: &CommandOutcome| {
             assert_finished_successfully("stream search", outcome);
             outcome
@@ -1655,11 +1729,33 @@ mod loader_only {
                 .iter()
                 .any(|phase| phase == "query.stream.initial_ready")
         );
-        assert!(
-            native_phases
+        if !native_phases
+            .iter()
+            .any(|phase| phase == "query.stream.refined_ready")
+        {
+            let frames: Vec<Value> = native_stream
+                .stdout
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let failure = frames
                 .iter()
-                .any(|phase| phase == "query.stream.refined_ready")
-        );
+                .find(|frame| frame["payload"]["reason_code"] == "query.stream.refinement_failed")
+                .expect("cold stream must refine or report a quality timeout");
+            assert!(
+                failure["payload"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("quality refinement exceeded 500ms (observed "),
+                "{failure}"
+            );
+            assert!(
+                frames.iter().any(|frame| frame["payload"]["item"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("castaway.md"))),
+                "{frames:?}"
+            );
+        }
         let wrong_backend = search("onnx-cannot-reuse-native-cache", false, true, false);
         let wrong_phases = phases(&wrong_backend);
         assert!(
@@ -1707,7 +1803,11 @@ mod loader_only {
             ];
             let served = fsfs.run(temp.path(), "native-daemon", args, QUICKSTART_TIMEOUT);
             let result = parse_success_envelope("native daemon", &served);
-            assert_eq!(result["data"]["phase"], "refined", "{result}");
+            assert_eq!(
+                validate_native_cold_result(&result["data"]),
+                Ok(()),
+                "{result}"
+            );
             assert!(
                 !served
                     .stderr
@@ -1728,8 +1828,10 @@ mod loader_only {
             let response: Value = serde_json::from_str(&raw).unwrap();
             assert_eq!(response["policy"]["quality_model"], "allminilml6v2native");
             assert_eq!(
-                response["payloads"].as_array().unwrap().last().unwrap()["phase"],
-                "refined",
+                validate_native_cold_result(
+                    response["payloads"].as_array().unwrap().last().unwrap()
+                ),
+                Ok(()),
                 "{response}"
             );
             let wrong = fsfs.run(
@@ -1909,7 +2011,11 @@ mod loader_only {
             "native after append",
             &search("native-search-appended", true, false, false),
         );
-        assert_eq!(after_append["data"]["phase"], "refined");
+        assert_eq!(
+            validate_native_cold_result(&after_append["data"]),
+            Ok(()),
+            "{after_append}"
+        );
         assert!(after_append.to_string().contains("second-castaway.md"));
 
         let before = [
@@ -2022,6 +2128,7 @@ mod loader_only {
             let source = std::env::var_os(variable)
                 .map_or_else(|| configured_model_root().join(directory), PathBuf::from);
             manifest.verify_dir(&source).unwrap_or_else(|error| {
+                // ubs:ignore -- Missing real multilingual fixtures must fail this integration test.
                 panic!(
                     "multilingual CLI fixture {} at {} is unavailable: {error}; set {variable}",
                     manifest.id,
@@ -3344,6 +3451,7 @@ mod loader_only {
                     "the frozen manifest must identify the corrupted tokenizer: {source}"
                 );
             }
+            // ubs:ignore -- An unexpected error must fail this checksum regression test.
             other => panic!("expected frozen artifact checksum rejection, got {other}"),
         }
         assert_eq!(
@@ -4047,6 +4155,7 @@ fn embedded_materializer_child_verifies_models_and_observers_leave_cache_absent(
     let models = root.path().join("models");
     let binary = env!("CARGO_BIN_EXE_fsfs");
     for command in ["status", "doctor"] {
+        // ubs:ignore -- Cargo supplies this integration-test executable path, not user input.
         let output = Command::new(binary)
             .args([command, "--format", "json", "--index-dir"])
             .arg(root.path().join("index"))
@@ -4064,6 +4173,7 @@ fn embedded_materializer_child_verifies_models_and_observers_leave_cache_absent(
         );
         assert!(!models.exists(), "{command} materialized bundled models");
     }
+    // ubs:ignore -- Cargo supplies this integration-test executable path, not user input.
     let output = Command::new(binary)
         .arg(BUNDLED_MODEL_MATERIALIZER_FLAG)
         .arg(&models)

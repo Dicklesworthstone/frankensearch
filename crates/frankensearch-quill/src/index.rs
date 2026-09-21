@@ -18545,6 +18545,7 @@ mod tests {
             position_docs,
         } = error
         else {
+            // ubs:ignore -- Test helper must reject the wrong query-fuel error variant.
             panic!("expected typed query fuel exhaustion, got {error:?}");
         };
         (
@@ -19330,9 +19331,10 @@ mod tests {
     fn lab_seed_corpus(pinned: &[u64], random_seed_count_env: &str, salt: u64) -> Vec<u64> {
         let random_seed_count = match std::env::var(random_seed_count_env) {
             Ok(value) => value.parse::<usize>().unwrap_or_else(|error| {
-                panic!("{random_seed_count_env}={value:?} is not a seed count: {error}")
+                panic!("{random_seed_count_env}={value:?} is not a seed count: {error}") // ubs:ignore -- Invalid test seeds must fail rather than skip cases.
             }),
             Err(std::env::VarError::NotPresent) => 0,
+            // ubs:ignore -- Invalid test seed configuration must fail, not silently skip cases.
             Err(error) => panic!("failed to read {random_seed_count_env}: {error}"),
         };
         let mut seeds = pinned.to_vec();
@@ -20098,9 +20100,11 @@ mod tests {
             .map(|query| {
                 let ranked = index
                     .search_paginated(cx, query, 100, 0, true)
+                    // ubs:ignore -- A failed ranked query must fail this test's observation helper.
                     .unwrap_or_else(|error| panic!("E6.5 ranked query {query:?}: {error}"));
                 let docids = index
                     .collect_docids(cx, query)
+                    // ubs:ignore -- A failed scoreless query must fail this test's observation helper.
                     .unwrap_or_else(|error| panic!("E6.5 scoreless query {query:?}: {error}"));
                 ((*query).to_owned(), ranked, docids)
             })
@@ -20887,8 +20891,8 @@ mod tests {
                             "traced search replaced cache slot {slot} for {expected_mode:?}",
                         ),
                         (None, None) => {}
-                        _ => panic!(
-                            "traced search changed cache slot occupancy at {slot} for {expected_mode:?}",
+                        _ => panic! /* ubs:ignore -- Test rejects changed cache occupancy. */ (
+                            "traced search changed cache slot occupancy at {slot} for {expected_mode:?}"
                         ),
                     }
                 }
@@ -21514,7 +21518,7 @@ mod tests {
                         winner.metadata.as_deref(),
                         Some(&serde_json::json!({"path": "src/second.rs"}))
                     ),
-                    other => panic!("unexpected stored-value winner {other}"),
+                    other => panic!("unexpected stored-value winner {other}"), // ubs:ignore -- Test rejects an unexpected stored-value winner.
                 }
             }
             assert_eq!(segment.source_bytes(), exact_segment_bytes.as_slice());
@@ -21589,7 +21593,7 @@ mod tests {
                 let mut task_cx = Context::from_waker(waker);
                 match candidate_future.as_mut().poll(&mut task_cx) {
                     Poll::Ready(result) => result.expect("fusion candidates"),
-                    Poll::Pending => panic!("Quill fusion candidates must be first-poll ready"),
+                    Poll::Pending => panic!("Quill fusion candidates must be first-poll ready"), // ubs:ignore -- Test requires first-poll readiness.
                 }
             };
             drop(candidate_future);
@@ -22091,6 +22095,7 @@ mod tests {
     fn hit_count(index: &QuillIndex, cx: &Cx, query: &str) -> usize {
         index
             .search_doc_ids(cx, query, 10)
+            // ubs:ignore -- Search failure must fail the test helper rather than produce a count.
             .unwrap_or_else(|error| panic!("search {query:?}: {error}"))
             .len()
     }
@@ -22291,9 +22296,9 @@ mod tests {
                     assert_eq!((previous_live_docs, proposed_live_docs), (3, 2));
                 }
                 Err(other) => {
-                    panic!("commit must refuse with the live-document floor, got {other:?}")
+                    panic!("commit must refuse with the live-document floor, got {other:?}") // ubs:ignore -- Test requires the exact live-document refusal.
                 }
-                Ok(_) => panic!("commit must refuse a proposal that deletes without replacing"),
+                Ok(_) => panic!("commit must refuse a proposal that deletes without replacing"), // ubs:ignore -- Test rejects a destructive proposal.
             }
             assert_eq!(index.doc_count().expect("doc count"), 3);
             assert_eq!(hit_count(&index, &cx, "alpha"), 3);
@@ -22713,7 +22718,7 @@ mod tests {
             assert_eq!(receipt.fanout_eligible(), Some(false));
             assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
             let Some((work_upper_bound, _metering)) = receipt.work_plan() else {
-                panic!("profiled ordinary query did not bind its work plan");
+                panic!("profiled ordinary query did not bind its work plan"); // ubs:ignore -- Test requires its profiling work plan.
             };
             assert!(work_upper_bound > 0);
             assert_eq!(
@@ -22740,7 +22745,7 @@ mod tests {
             let repeat_receipt = match repeat {
                 QuillProfiledSearchOutcome::Completed { receipt, .. } => receipt,
                 QuillProfiledSearchOutcome::Failed { error, .. } => {
-                    panic!("repeat profiled ordinary search unexpectedly failed: {error}")
+                    panic!("repeat profiled ordinary search unexpectedly failed: {error}") // ubs:ignore -- Failed search must fail this positive test.
                 }
             };
             assert_eq!(repeat_receipt.cache(), QuillProfileCacheDisposition::Hit);
@@ -22774,7 +22779,7 @@ mod tests {
                 .expect("profile admission must preserve ordinary cancellation");
             let (error, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { .. } => {
-                    panic!("pre-cancelled profiled search unexpectedly completed")
+                    panic!("pre-cancelled profiled search unexpectedly completed") // ubs:ignore -- Ignored cancellation must fail this test.
                 }
                 QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
             };
@@ -22825,7 +22830,7 @@ mod tests {
             let (result, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
                 QuillProfiledSearchOutcome::Failed { error, .. } => {
-                    panic!("disabled-cache profiled search unexpectedly failed: {error}")
+                    panic!("disabled-cache profiled search unexpectedly failed: {error}") // ubs:ignore -- Failed search must fail this positive test.
                 }
             };
             assert_eq!(result.hits.len(), 1);
@@ -22873,7 +22878,7 @@ mod tests {
             controller.disarm();
             let (error, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { .. } => {
-                    panic!("checkpoint-cancelled profiled search unexpectedly completed")
+                    panic!("checkpoint-cancelled profiled search unexpectedly completed") // ubs:ignore -- Ignored cancellation must fail this test.
                 }
                 QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
             };
@@ -22922,7 +22927,7 @@ mod tests {
                 .expect("profile admission must preserve fuel exhaustion");
             let (error, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { .. } => {
-                    panic!("fuel-limited profiled search unexpectedly completed")
+                    panic!("fuel-limited profiled search unexpectedly completed") // ubs:ignore -- Ignored fuel exhaustion must fail this test.
                 }
                 QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
             };
@@ -22938,7 +22943,7 @@ mod tests {
             assert_eq!(receipt.fanout_eligible(), Some(false));
             assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
             let Some((work_upper_bound, metering)) = receipt.work_plan() else {
-                panic!("fuel-limited profiled search did not bind work plan")
+                panic!("fuel-limited profiled search did not bind work plan") // ubs:ignore -- Test requires its profiling work plan.
             };
             assert!(work_upper_bound > 1);
             assert!(metering);
@@ -22968,7 +22973,7 @@ mod tests {
             let (result, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
                 QuillProfiledSearchOutcome::Failed { error, .. } => {
-                    panic!("empty profiled search unexpectedly failed: {error}")
+                    panic!("empty profiled search unexpectedly failed: {error}") // ubs:ignore -- Failed search must fail this positive test.
                 }
             };
             assert!(result.hits.is_empty());
@@ -23013,7 +23018,7 @@ mod tests {
             let (result, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
                 QuillProfiledSearchOutcome::Failed { error, .. } => {
-                    panic!("two-segment profiled search unexpectedly failed: {error}")
+                    panic!("two-segment profiled search unexpectedly failed: {error}") // ubs:ignore -- Failed search must fail this positive test.
                 }
             };
             assert_eq!(result.hits.len(), 2);
@@ -23158,7 +23163,7 @@ mod tests {
             let (result, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
                 QuillProfiledSearchOutcome::Failed { error, .. } => {
-                    panic!("fragmented profiled search unexpectedly failed: {error}")
+                    panic!("fragmented profiled search unexpectedly failed: {error}") // ubs:ignore -- Failed search must fail this positive test.
                 }
             };
             let expected_segments = u64::try_from(SEGMENT_COUNT_FANOUT_THRESHOLD)
@@ -23210,7 +23215,7 @@ mod tests {
             let (successor_result, successor_receipt) = match successor {
                 QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
                 QuillProfiledSearchOutcome::Failed { error, .. } => {
-                    panic!("successor fragmented profile search unexpectedly failed: {error}")
+                    panic!("successor fragmented profile search unexpectedly failed: {error}") // ubs:ignore -- Failed successor must fail this positive test.
                 }
             };
             let successor_segments = expected_segments + 1;
@@ -23293,7 +23298,7 @@ mod tests {
                         .expect_err("allocation failure must never fall back to an uncached scan");
                     let QuillIndexError::Argus(ArgusError::Allocation { resource, count }) = error
                     else {
-                        panic!("expected allocation refusal before dictionary admission: {error}");
+                        panic!("expected allocation refusal before dictionary admission: {error}"); // ubs:ignore -- Test requires the exact allocation refusal.
                     };
                     assert_eq!(
                         (resource, count),
@@ -23311,16 +23316,16 @@ mod tests {
                     {
                         let entries = prepared.entries.lock().expect("unpoisoned cache");
                         let field = entries.get(&CONTENT_FIELD);
-                        assert!(
-                            field
-                                .and_then(|values| values.get(b"alpha".as_slice()))
-                                .is_none()
-                        );
+                        let alpha = field
+                            .and_then(|values| values.get(b"alpha".as_slice()))
+                            .copied();
+                        let beta = field
+                            .and_then(|values| values.get(b"beta".as_slice()))
+                            .copied();
+                        drop(entries);
+                        assert!(alpha.is_none());
                         if site == 3 {
-                            assert_eq!(
-                                field.and_then(|values| values.get(b"beta".as_slice())),
-                                Some(&2)
-                            );
+                            assert_eq!(beta, Some(2));
                         }
                     }
                     prepared.reservation_overrides = SnapshotDocFreqReservationOverrides::default();
@@ -23391,7 +23396,7 @@ mod tests {
                 assert_eq!(
                     prepared
                         .get_or_compute(&checkpoint, &snapshot, CONTENT_FIELD, b"alpha")
-                        .unwrap_or_else(|error| panic!(
+                        .unwrap_or_else(|error| panic! /* ubs:ignore -- Test requires repeat lookup within fuel. */ (
                             "cached repeat {repeat} must not charge a second scan: {error}"
                         )),
                     2
@@ -24009,6 +24014,7 @@ mod tests {
         let Err(error) =
             QuillSearchSnapshot::compose(0, Arc::clone(&keeper), vec![Arc::new(stale)])
         else {
+            // ubs:ignore -- Accepting stale state must fail this negative test.
             panic!("stale Delta generation was accepted");
         };
         assert!(matches!(
@@ -24022,6 +24028,7 @@ mod tests {
         let Err(error) =
             QuillSearchSnapshot::compose(0, Arc::clone(&keeper), vec![Arc::new(wrong_schema)])
         else {
+            // ubs:ignore -- Accepting the wrong schema must fail this negative test.
             panic!("wrong-schema Delta was accepted");
         };
         assert!(matches!(error, SnapshotError::SchemaMismatch { .. }));
@@ -24039,6 +24046,7 @@ mod tests {
         let Err(error) =
             QuillSearchSnapshot::compose(0, Arc::clone(&keeper), vec![Arc::clone(&first), second])
         else {
+            // ubs:ignore -- Accepting overlapping leases must fail this negative test.
             panic!("overlapping Delta leases were accepted");
         };
         assert!(matches!(
@@ -24219,7 +24227,7 @@ mod tests {
                 Arc::clone(&keeper),
                 vec![Arc::new(overlapping.freeze(generation))],
             ) else {
-                panic!("occupied Keeper/Delta docid overlap was accepted");
+                panic!("occupied Keeper/Delta docid overlap was accepted"); // ubs:ignore -- Test rejects overlapping document IDs.
             };
             assert_eq!(
                 error,
@@ -24283,7 +24291,7 @@ mod tests {
             assert_eq!(alpha_snapshot_tuple(&accepted), (1, 1, 1, 1, 1));
 
             let Err(rollback) = snapshot_source.publish_complete(genesis, Vec::new()) else {
-                panic!("stale Keeper rollback was accepted");
+                panic!("stale Keeper rollback was accepted"); // ubs:ignore -- Test rejects rollback.
             };
             assert_eq!(
                 rollback,
@@ -24307,7 +24315,7 @@ mod tests {
                 .snapshot()
                 .expect("colliding successor snapshot is authoritative");
             let Err(collision) = snapshot_source.publish_complete(collision, Vec::new()) else {
-                panic!("same-generation divergent MANIFEST was accepted");
+                panic!("same-generation divergent MANIFEST was accepted"); // ubs:ignore -- Test rejects a divergent manifest.
             };
             assert_eq!(
                 collision,
@@ -24339,7 +24347,7 @@ mod tests {
                     .freeze(generation),
             );
             let Err(error) = index.publish_delta_table(vec![empty_delta]) else {
-                panic!("Delta publication overtook scalar pending state");
+                panic!("Delta publication overtook scalar pending state"); // ubs:ignore -- Test rejects publication order violation.
             };
             assert!(error.to_string().contains("fully committed"));
             index.commit(&cx).await.expect("commit scalar row");
@@ -24376,7 +24384,7 @@ mod tests {
                 .expect_err("scalar ingest must reject an active Delta epoch");
             assert!(error.to_string().contains("Delta epochs are active"));
             let Err(error) = index.commit(&cx).await else {
-                panic!("scalar commit accepted an active Delta epoch");
+                panic!("scalar commit accepted an active Delta epoch"); // ubs:ignore -- Test rejects conflicting scalar publication.
             };
             assert!(error.to_string().contains("Delta epochs are active"));
 
@@ -25033,7 +25041,7 @@ mod tests {
                 )
                 .await
             else {
-                panic!("seal must not discard an independently published shard");
+                panic!("seal must not discard an independently published shard"); // ubs:ignore -- Test rejects loss of a published shard.
             };
             assert!(matches!(
                 error,
@@ -25145,7 +25153,7 @@ mod tests {
                 )
                 .await
             else {
-                panic!("seal must reject an older freeze of the surviving shard");
+                panic!("seal must reject an older freeze of the surviving shard"); // ubs:ignore -- Test rejects a stale shard freeze.
             };
             assert!(matches!(
                 error,
@@ -25380,7 +25388,7 @@ mod tests {
                     .create_task(region, Budget::INFINITE, async move {
                         let task_cx = Cx::for_testing();
                         commit_index.commit(&task_cx).await.unwrap_or_else(|error| {
-                            panic!("seed={seed:#018x}: commit failed: {error}")
+                            panic!("seed={seed:#018x}: commit failed: {error}") // ubs:ignore -- Failed commit must fail this seeded test.
                         });
                         commit_result.store(true, Ordering::SeqCst);
                     })
@@ -25400,10 +25408,10 @@ mod tests {
                                 2
                             }
                             Ok(false) => {
-                                panic!("seed={seed:#018x}: live alpha was not deleted")
+                                panic!("seed={seed:#018x}: live alpha was not deleted") // ubs:ignore -- Missing deletion must fail this test.
                             }
                             Err(error) => {
-                                panic!("seed={seed:#018x}: unexpected delete result: {error}")
+                                panic!("seed={seed:#018x}: unexpected delete result: {error}") // ubs:ignore -- Unexpected deletion error must fail this test.
                             }
                         };
                         delete_result.store(outcome, Ordering::SeqCst);
@@ -25503,7 +25511,7 @@ mod tests {
                                 cancel_observed.store(true, Ordering::SeqCst);
                             }
                             result => {
-                                panic!(
+                                panic!( // ubs:ignore -- Wrong cancellation outcome must fail this seeded test.
                                     "seed={seed:#018x}: unexpected cancelled-ingest result: {result:?}"
                                 )
                             }
@@ -25596,9 +25604,9 @@ mod tests {
                                 cancel_observed.store(true, Ordering::SeqCst);
                             }
                             Ok(_) => {
-                                panic!("seed={seed:#018x}: cancelled merge unexpectedly succeeded")
+                                panic!("seed={seed:#018x}: cancelled merge unexpectedly succeeded") // ubs:ignore -- Ignored cancellation must fail this test.
                             }
-                            Err(error) => panic!(
+                            Err(error) => panic! /* ubs:ignore -- Test rejects the wrong cancellation error. */ (
                                 "seed={seed:#018x}: unexpected cancelled-merge error: {error}"
                             ),
                         }
@@ -25699,7 +25707,7 @@ mod tests {
                         .compact(&cx, CompactionPolicy::default())
                         .await
                         .unwrap_or_else(|error| {
-                            panic!("seed={seed:#018x}: compaction failed: {error}")
+                            panic!("seed={seed:#018x}: compaction failed: {error}") // ubs:ignore -- Failed compaction must fail this positive test.
                         });
                     assert!(report.changed(), "seed={seed:#018x}: expected compaction");
                     writer_finished.store(true, Ordering::SeqCst);
@@ -25729,6 +25737,7 @@ mod tests {
             assert_eq!(held.loaded_manifest().manifest.generation, held_generation);
             held.segments()[0]
                 .verify()
+                // ubs:ignore -- Invalid held segment must fail this retention test.
                 .unwrap_or_else(|error| panic!("seed={seed:#018x}: held segment failed: {error}"));
             assert!(
                 weak.upgrade().is_some(),
@@ -25806,7 +25815,7 @@ mod tests {
                             } else if observed == reader_new {
                                 reader_new_seen.store(true, Ordering::SeqCst);
                             } else {
-                                panic!(
+                                panic! /* ubs:ignore -- A torn publication must fail this test. */ (
                                     "seed={seed:#018x}: reader observed a torn ingest publication"
                                 );
                             }
@@ -25836,7 +25845,7 @@ mod tests {
                             .index_documents(&task_cx, &additions)
                             .await
                             .unwrap_or_else(|error| {
-                                panic!("seed={seed:#018x}: concurrent ingest failed: {error}")
+                                panic!("seed={seed:#018x}: concurrent ingest failed: {error}") // ubs:ignore -- Failed ingest must fail this positive test.
                             });
                         assert_eq!(
                             e6_5_query_artifact(&writer_index, &task_cx),
@@ -25845,7 +25854,7 @@ mod tests {
                         );
                         yield_now().await;
                         writer_index.commit(&task_cx).await.unwrap_or_else(|error| {
-                            panic!("seed={seed:#018x}: concurrent commit failed: {error}")
+                            panic!("seed={seed:#018x}: concurrent commit failed: {error}") // ubs:ignore -- Failed commit must fail this positive test.
                         });
                         writer_finished.store(true, Ordering::SeqCst);
                     })
@@ -25936,9 +25945,9 @@ mod tests {
                                 operation_cancelled.store(true, Ordering::SeqCst);
                             }
                             Ok(_) => {
-                                panic!("seed={seed:#018x}: cancelled commit unexpectedly succeeded")
+                                panic!("seed={seed:#018x}: cancelled commit unexpectedly succeeded") // ubs:ignore -- Ignored cancellation must fail this test.
                             }
-                            Err(error) => panic!(
+                            Err(error) => panic! /* ubs:ignore -- Test rejects the wrong cancellation error. */ (
                                 "seed={seed:#018x}: unexpected cancelled-commit error: {error}"
                             ),
                         }
@@ -26067,9 +26076,9 @@ mod tests {
                                 operation_cancelled.store(true, Ordering::SeqCst);
                             }
                             Ok(_) => {
-                                panic!("seed={seed:#018x}: cancelled seal unexpectedly succeeded")
+                                panic!("seed={seed:#018x}: cancelled seal unexpectedly succeeded") // ubs:ignore -- Ignored cancellation must fail this test.
                             }
-                            Err(error) => panic!(
+                            Err(error) => panic! /* ubs:ignore -- Test rejects the wrong cancellation error. */ (
                                 "seed={seed:#018x}: unexpected cancelled-seal error: {error}"
                             ),
                         }
@@ -26204,7 +26213,7 @@ mod tests {
                                 .iter()
                                 .position(|expected| *expected == artifact)
                             else {
-                                panic!(
+                                panic! /* ubs:ignore -- A torn generation must fail this test. */ (
                                     "seed={seed:#018x}: watch reader observed a torn generation"
                                 );
                             };
@@ -26239,7 +26248,7 @@ mod tests {
                         )
                         .await
                         .unwrap_or_else(|error| {
-                            panic!("seed={seed:#018x}: watch upsert failed: {error}")
+                            panic!("seed={seed:#018x}: watch upsert failed: {error}") // ubs:ignore -- Failed watch upsert must fail this test.
                         });
                         while writer_observed.load(Ordering::SeqCst) & (1 << 1) == 0 {
                             yield_now().await;
@@ -26250,7 +26259,7 @@ mod tests {
                                 .delete_document(&task_cx, "second")
                                 .await
                                 .unwrap_or_else(|error| {
-                                    panic!("seed={seed:#018x}: watch delete failed: {error}")
+                                    panic!("seed={seed:#018x}: watch delete failed: {error}") // ubs:ignore -- Failed watch deletion must fail this test.
                                 })
                         );
                         while writer_observed.load(Ordering::SeqCst) & (1 << 2) == 0 {
@@ -26264,7 +26273,7 @@ mod tests {
                         )
                         .await
                         .unwrap_or_else(|error| {
-                            panic!("seed={seed:#018x}: watch newcomer ingest failed: {error}")
+                            panic!("seed={seed:#018x}: watch newcomer ingest failed: {error}") // ubs:ignore -- Failed newcomer ingest must fail this test.
                         });
                         assert_eq!(
                             e6_5_query_artifact(&writer_index, &task_cx),
@@ -26274,7 +26283,7 @@ mod tests {
                         LexicalWrite::commit(writer_index.as_ref(), &task_cx)
                             .await
                             .unwrap_or_else(|error| {
-                                panic!("seed={seed:#018x}: watch commit failed: {error}")
+                                panic!("seed={seed:#018x}: watch commit failed: {error}") // ubs:ignore -- Failed watch commit must fail this test.
                             });
                         writer_done_flag.store(true, Ordering::SeqCst);
                     })
@@ -26305,7 +26314,7 @@ mod tests {
                     let reopened = QuillIndex::open(&cx, directory.path(), deterministic_config())
                         .await
                         .unwrap_or_else(|error| {
-                            panic!("{replay}: recovery round {recovery_round} failed: {error}")
+                            panic!("{replay}: recovery round {recovery_round} failed: {error}") // ubs:ignore -- Failed recovery must fail this replay test.
                         });
                     assert_eq!(
                         e6_5_query_artifact(&reopened, &cx),
@@ -26357,11 +26366,11 @@ mod tests {
                         .index_documents(&task_cx, &first_documents)
                         .await
                         .unwrap_or_else(|error| {
-                            panic!("seed={seed:#018x}: first replay ingest failed: {error}")
+                            panic!("seed={seed:#018x}: first replay ingest failed: {error}") // ubs:ignore -- Failed replay ingest must fail this test.
                         });
                     yield_now().await;
                     first_index.commit(&task_cx).await.unwrap_or_else(|error| {
-                        panic!("seed={seed:#018x}: first replay commit failed: {error}")
+                        panic!("seed={seed:#018x}: first replay commit failed: {error}") // ubs:ignore -- Failed replay commit must fail this test.
                     });
                 })
                 .expect("create first E6.5 replay");
@@ -26375,11 +26384,11 @@ mod tests {
                         .index_documents(&task_cx, &documents)
                         .await
                         .unwrap_or_else(|error| {
-                            panic!("seed={seed:#018x}: second replay ingest failed: {error}")
+                            panic!("seed={seed:#018x}: second replay ingest failed: {error}") // ubs:ignore -- Failed replay ingest must fail this test.
                         });
                     yield_now().await;
                     second_index.commit(&task_cx).await.unwrap_or_else(|error| {
-                        panic!("seed={seed:#018x}: second replay commit failed: {error}")
+                        panic!("seed={seed:#018x}: second replay commit failed: {error}") // ubs:ignore -- Failed replay commit must fail this test.
                     });
                 })
                 .expect("create second E6.5 replay");
@@ -26462,7 +26471,7 @@ mod tests {
             .expect("live Delta emits a segment");
             let writer = match &mut index.writer_mut().backend {
                 IndexBackend::Durable(writer) => writer,
-                IndexBackend::Memory(_) => panic!("fixture must use a durable Keeper"),
+                IndexBackend::Memory(_) => panic!("fixture must use a durable Keeper"), // ubs:ignore -- Test fixture requires a durable backend.
             };
             let pending = encoded
                 .write_temp_retryable(directory.path())
@@ -26567,7 +26576,7 @@ mod tests {
 
             let writer = match &mut index.writer_mut().backend {
                 IndexBackend::Durable(writer) => writer,
-                IndexBackend::Memory(_) => panic!("fixture must use a durable Keeper"),
+                IndexBackend::Memory(_) => panic!("fixture must use a durable Keeper"), // ubs:ignore -- Test fixture requires a durable backend.
             };
             writer
                 .publish_encoded_segment_retryable(&cx, Arc::clone(&encoded))
@@ -27368,6 +27377,7 @@ mod tests {
         macro_rules! assert_refused {
             ($result:expr, $facade:literal) => {{
                 let Err(error) = $result else {
+                    // ubs:ignore -- This test macro must fail when a negative control is accepted.
                     panic!(concat!($facade, " must fail closed"));
                 };
                 assert!(
@@ -27828,7 +27838,7 @@ mod tests {
                 .expect("stage maximum-generation in-memory document");
 
             let Err(error) = index.commit(&cx).await else {
-                panic!("public in-memory commit must reject an unrepresentable successor");
+                panic!("public in-memory commit must reject an unrepresentable successor"); // ubs:ignore -- Test rejects an overflowing generation.
             };
             assert!(matches!(
                 error,
@@ -29562,11 +29572,11 @@ mod tests {
                         &[IndexableDocument::new("aihri-live", "alpha original")],
                     )
                     .await
-                    .unwrap_or_else(|error| panic!("{label}: seed ingest: {error}"));
+                    .unwrap_or_else(|error| panic!("{label}: seed ingest: {error}")); // ubs:ignore -- Failed seed ingest must fail test setup.
                 index
                     .commit(&cx)
                     .await
-                    .unwrap_or_else(|error| panic!("{label}: seed commit: {error}"));
+                    .unwrap_or_else(|error| panic!("{label}: seed commit: {error}")); // ubs:ignore -- Failed seed commit must fail test setup.
                 assert_eq!(
                     index.doc_count().expect("seed count is authoritative"),
                     1,
@@ -29601,7 +29611,7 @@ mod tests {
                 index
                     .commit(&cx)
                     .await
-                    .unwrap_or_else(|error| panic!("{label}: commit after rejection: {error}"));
+                    .unwrap_or_else(|error| panic!("{label}: commit after rejection: {error}")); // ubs:ignore -- Failed recovery commit must fail this test.
 
                 // 1. nothing from the rejected batch was published.
                 assert_eq!(
@@ -29615,7 +29625,7 @@ mod tests {
                 assert_eq!(
                     index
                         .search_paginated(&cx, "beta", 10, 0, true)
-                        .unwrap_or_else(|error| panic!("{label}: search beta: {error}"))
+                        .unwrap_or_else(|error| panic!("{label}: search beta: {error}")) // ubs:ignore -- Failed query must not count as an empty result.
                         .hits
                         .len(),
                     0,
@@ -29629,12 +29639,12 @@ mod tests {
                     )
                     .await
                     .unwrap_or_else(|error| {
-                        panic!("{label}: rejected id must not stay claimed: {error}")
+                        panic!("{label}: rejected id must not stay claimed: {error}") // ubs:ignore -- A leaked identity claim must fail this test.
                     });
                 index
                     .commit(&cx)
                     .await
-                    .unwrap_or_else(|error| panic!("{label}: reingest commit: {error}"));
+                    .unwrap_or_else(|error| panic!("{label}: reingest commit: {error}")); // ubs:ignore -- Failed reingest commit must fail this test.
                 assert_eq!(
                     index
                         .doc_count()
@@ -29676,11 +29686,11 @@ mod tests {
                         &[IndexableDocument::new("aihri-guard-live", "alpha original")],
                     )
                     .await
-                    .unwrap_or_else(|error| panic!("{label}: seed ingest: {error}"));
+                    .unwrap_or_else(|error| panic!("{label}: seed ingest: {error}")); // ubs:ignore -- Failed seed ingest must fail test setup.
                 index
                     .commit(&cx)
                     .await
-                    .unwrap_or_else(|error| panic!("{label}: seed commit: {error}"));
+                    .unwrap_or_else(|error| panic!("{label}: seed commit: {error}")); // ubs:ignore -- Failed seed commit must fail test setup.
 
                 let mut rejected = Vec::with_capacity(filler_count + 2);
                 rejected.push(IndexableDocument::new(
@@ -29710,12 +29720,12 @@ mod tests {
                     )
                     .await
                     .unwrap_or_else(|error| {
-                        panic!("{label}: a rejected batch must not block the next ingest: {error}")
+                        panic!("{label}: a rejected batch must not block the next ingest: {error}") // ubs:ignore -- A blocked successor must fail this test.
                     });
                 index
                     .commit(&cx)
                     .await
-                    .unwrap_or_else(|error| panic!("{label}: commit: {error}"));
+                    .unwrap_or_else(|error| panic!("{label}: commit: {error}")); // ubs:ignore -- Failed commit must fail this positive test.
                 assert_eq!(
                     index
                         .doc_count()
@@ -29821,7 +29831,7 @@ mod tests {
                         Some(&annotated),
                         "present metadata must survive the same boundary",
                     ),
-                    other => panic!("unexpected document id {other}"),
+                    other => panic!("unexpected document id {other}"), // ubs:ignore -- Wrong identity must fail this hydration test.
                 }
             }
 
@@ -29851,7 +29861,7 @@ mod tests {
                         Some(&annotated),
                         "hydration must restore the annotated metadata verbatim",
                     ),
-                    other => panic!("unexpected document id {other}"),
+                    other => panic!("unexpected document id {other}"), // ubs:ignore -- Wrong identity must fail this hydration test.
                 }
             }
         });
@@ -30170,12 +30180,12 @@ mod tests {
                 let control = positioned
                     .search_paginated(&cx, query, 10, 0, true)
                     .unwrap_or_else(|error| {
-                        panic!("positioned control failed for {query:?}: {error}")
+                        panic!("positioned control failed for {query:?}: {error}") // ubs:ignore -- Failed live control must fail this test.
                     });
                 let candidate = positionless
                     .search_paginated(&cx, query, 10, 0, true)
                     .unwrap_or_else(|error| {
-                        panic!("positionless fixture failed for {query:?}: {error}")
+                        panic!("positionless fixture failed for {query:?}: {error}") // ubs:ignore -- Failed candidate must fail this test.
                     });
                 assert_eq!(
                     candidate, control,
@@ -30238,7 +30248,7 @@ mod tests {
                         .hits
                         .iter()
                         .find(|hit| hit.document_id == document_id)
-                        .unwrap_or_else(|| panic!("{phase}: missing {document_id} hit"))
+                        .unwrap_or_else(|| panic!("{phase}: missing {document_id} hit")) // ubs:ignore -- Missing hit must fail this scoring test.
                         .score
                 };
                 let basic_repeat = score(positionless, "repeat");
@@ -30755,7 +30765,7 @@ mod tests {
                     .expect("invalid-policy snapshot is authoritative")
                     .compact_owned(CompactionPolicy::new(density), 0)
                 else {
-                    panic!("invalid density {density:?} unexpectedly compacted");
+                    panic!("invalid density {density:?} unexpectedly compacted"); // ubs:ignore -- Test rejects invalid density.
                 };
                 assert!(matches!(
                     error,
@@ -30814,7 +30824,7 @@ mod tests {
                         .await
                         .expect("publish durable Q1-OB4 tombstones");
                 }
-                IndexBackend::Memory(_) => panic!("durable fixture must own KeeperWriter"),
+                IndexBackend::Memory(_) => panic!("durable fixture must own KeeperWriter"), // ubs:ignore -- Test fixture requires a durable backend.
             }
             drop(index);
             let index = QuillIndex::open(&cx, directory.path(), deterministic_config())
@@ -31603,6 +31613,7 @@ mod tests {
                 canonical_metadata: Some(metadata),
             } = document_bound
             else {
+                // ubs:ignore -- Missing fixture metadata must fail this budget test.
                 panic!("unbounded fixture must produce reusable canonical metadata");
             };
             cumulative_upper_bound = cumulative_upper_bound
@@ -31710,6 +31721,7 @@ mod tests {
             canonical_metadata: Some(full_metadata),
         } = full
         else {
+            // ubs:ignore -- Missing fixture metadata must fail this token budget test.
             panic!("unbounded token fixture must produce reusable canonical metadata");
         };
 
@@ -31739,6 +31751,7 @@ mod tests {
             canonical_metadata: Some(fitting_metadata),
         } = fitting
         else {
+            // ubs:ignore -- Rejected fitting metadata must fail this boundary test.
             panic!("one byte of slack must admit reusable canonical metadata");
         };
         assert_eq!(fitting_bound, full);
@@ -32228,6 +32241,7 @@ mod tests {
         let panicked = ParallelBatchObservation::default();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = panicked.enter_shard();
+            // ubs:ignore -- Deliberate panic injection tests catch_unwind and shard cleanup below.
             panic!("shard panics mid-accumulation");
         }));
         assert!(outcome.is_err());
@@ -32323,6 +32337,7 @@ mod tests {
         let needle = format!("{key}=");
         let start = captured
             .find(&needle)
+            // ubs:ignore -- Missing trace fields must fail this test observation helper.
             .unwrap_or_else(|| panic!("field {key} missing from:\n{captured}"))
             + needle.len();
         let rest = &captured[start..];
@@ -32333,6 +32348,7 @@ mod tests {
         if let Some(body) = rest.strip_prefix('"') {
             let end = body
                 .find('"')
+                // ubs:ignore -- Malformed trace fields must fail this test observation helper.
                 .unwrap_or_else(|| panic!("unterminated quoted {key} in:\n{captured}"));
             return &body[..end];
         }
@@ -32838,6 +32854,7 @@ mod tests {
                 .worker_ids
                 .lock()
                 .expect("lock is not yet poisoned");
+            // ubs:ignore -- Deliberate panic injection poisons the test lock; join failure is asserted.
             panic!("expected: poisoning the worker-id lock for the fail-closed test");
         })
         .join();
@@ -34009,6 +34026,7 @@ mod tests {
     #[test]
     fn parallel_worker_panic_is_a_typed_precommit_failure() {
         let error = catch_parallel_ingest_worker(7, || -> Result<(), QuillIndexError> {
+            // ubs:ignore -- Deliberate panic injection tests conversion to the typed worker failure.
             panic!("injected parallel worker panic");
         })
         .expect_err("worker panic must be caught");
@@ -34856,7 +34874,7 @@ mod tests {
                 .concat_merge(&cx, &reversed, output_segment_id, 19)
                 .await
             else {
-                panic!("reversed concat-merge run unexpectedly published");
+                panic!("reversed concat-merge run unexpectedly published"); // ubs:ignore -- Test rejects reversed merge runs.
             };
             assert!(matches!(
                 error,
@@ -34879,7 +34897,7 @@ mod tests {
                 .concat_merge(&cx, &skipped, output_segment_id, 23)
                 .await
             else {
-                panic!("skipped concat-merge run unexpectedly published");
+                panic!("skipped concat-merge run unexpectedly published"); // ubs:ignore -- Test rejects skipped merge runs.
             };
             assert!(matches!(
                 error,
@@ -34902,7 +34920,7 @@ mod tests {
                 .concat_merge(&cx, &wrapped, output_segment_id, 29)
                 .await
             else {
-                panic!("manifest-wrapping concat-merge run unexpectedly published");
+                panic!("manifest-wrapping concat-merge run unexpectedly published"); // ubs:ignore -- Test rejects wrapped merge runs.
             };
             assert!(matches!(
                 error,
@@ -35150,7 +35168,7 @@ mod tests {
                 .expect("accumulate document");
 
             let Err(error) = index.commit(&cx).await else {
-                panic!("field stats overflow unexpectedly committed");
+                panic!("field stats overflow unexpectedly committed"); // ubs:ignore -- Test rejects overflowing statistics.
             };
             assert!(matches!(error, QuillIndexError::InvalidState { .. }));
             let writer = index.writer_mut();

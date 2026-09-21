@@ -913,3 +913,36 @@ This closes the four observed CLI golden failures only. The separate complete
 quality gate exposed TUI/sealed-Quill fixture formatting damage and a Quill
 test guard lifetime lint; those repairs and the native cold-start test correction
 remain under validation. R1 and platform release qualification remain open.
+
+The native cold-start correction subsequently passed its actual production CLI
+test on RCH worker vmi1264463 in 94.95 seconds. The pre-existing README explicitly
+allows cold model initialization to exceed 500 ms. The test now admits only that
+typed timeout with populated Initial hits, or successful refinement; negative
+controls reject empty results, wrong counts, unrelated failures, inconsistent
+refined payloads, and changed timeout budgets. Runtime deadlines are unchanged.
+The original forced 50 ms cold timeout, observed loader completion, uncached
+500 ms warm refinement, single constructor, and clean shutdown assertions all
+remain and executed successfully. Missing/corrupt models, producer mismatch,
+append, and vector preservation checks also passed.
+
+Observed split: direct and streaming cold requests returned the typed 500 ms
+timeout with Initial hits; the daemon and post-append requests refined. These
+degraded responses are not performance wins. The unchanged old test failed again
+in the separate full gate on worker vmi1152480 (seven passes, one native failure).
+This is solo re-execution against the existing contract, not independent review
+or full release acceptance.
+
+Retrieved native log SHA-256:
+`a3c7751d0c27a2cb237109683b7aef647132248e0cdaaca51eaf478b6b7d0ac4`;
+test ELF: `f56cb403d658bba829d120051499ecb05b24208160c6806fd6734e61dd0f008f`;
+production executable: `3a4b87584f4d61a6100e97bad5f92189880fbd1713e9700592aa1bad9824aefd`.
+The negative-control test and both Quill snapshot-statistics regressions passed.
+Strict fsfs/Quill all-target Clippy passed after shortening the test mutex guard
+lifetime; its log SHA-256 is
+`aa753839346cfad88db44272df91ef4566aebc90e50ca8fc8ba63c6d36b070b0`.
+The two Rust files received 94 explained, site-specific UBS annotations for
+91 intentional test panics and three validated test-executable launches. Those
+statements remain intact; scanner configuration did not change. The static scan
+exited zero with zero critical findings, 3,773 warnings, and 488 informational
+findings. It is not a warning-free result. Byte-fixture and full-gate validation
+remain separate obligations.
