@@ -5,11 +5,13 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
@@ -250,7 +252,7 @@ where
                 ))?
             } else {
                 retained_search_checkpoint(cx)?;
-                match execute(request).await {
+                match run_request(cx, timeout, execute(request)).await {
                     Ok(response) => match encode_response(&response) {
                         Ok(bytes) => bytes,
                         Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
@@ -267,6 +269,47 @@ where
     };
     write_response(cx, peer, &response, timeout).await?;
     Ok(PeerOutcome::Search)
+}
+
+/// Own the request future until completion, cancellation or its deadline.
+///
+/// Read/write timeouts alone do not bound an asynchronous admission or search
+/// that never completes. Periodic checkpoints also observe a shutdown even
+/// when that future never wakes itself. Dropping a timed-out future releases
+/// its borrows before the next peer; it must not cancel the shared daemon Cx.
+/// This is cooperative: a synchronous poll that blocks cannot be preempted.
+async fn run_request<T>(
+    cx: &Cx,
+    timeout: Duration,
+    request: impl Future<Output = SearchResult<T>>,
+) -> SearchResult<T> {
+    let mut request = pin!(request);
+    let mut deadline = pin!(asupersync::time::sleep(cx.now(), timeout));
+    loop {
+        let mut tick = pin!(asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL));
+        let result = poll_fn(|task| {
+            if let Err(error) = retained_search_checkpoint(cx) {
+                return Poll::Ready(Err(error));
+            }
+            if deadline.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "complete-generation daemon search deadline exceeded",
+                ).into()));
+            }
+            if let Poll::Ready(result) = request.as_mut().poll(task) {
+                return Poll::Ready(retained_search_checkpoint(cx).and(result).map(Some));
+            }
+            if tick.as_mut().poll(task).is_ready() {
+                Poll::Ready(Ok(None))
+            } else {
+                Poll::Pending
+            }
+        }).await?;
+        if let Some(result) = result {
+            return Ok(result);
+        }
+    }
 }
 
 fn encode_response<T: Serialize>(response: &T) -> SearchResult<Vec<u8>> {
@@ -343,6 +386,96 @@ mod tests {
     use asupersync::test_utils::run_test_with_cx;
     use std::io::BufRead;
     use std::net::Shutdown;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct MarkReleased(Arc<AtomicBool>);
+
+    impl Drop for MarkReleased {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn request_deadline_releases_an_unresponsive_future_without_cancelling_daemon() {
+        run_test_with_cx(|cx| async move {
+            let released = Arc::new(AtomicBool::new(false));
+            let owned = MarkReleased(Arc::clone(&released));
+            let result: SearchResult<()> = run_request(&cx, Duration::from_millis(1), async move {
+                let _owned = owned;
+                std::future::pending().await
+            }).await;
+            assert!(matches!(result, Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut));
+            assert!(released.load(Ordering::SeqCst));
+            retained_search_checkpoint(&cx).expect("one timeout must not cancel the daemon");
+            assert_eq!(run_request(&cx, Duration::from_secs(1), async { Ok(42) }).await.unwrap(), 42);
+        });
+    }
+
+    #[test]
+    fn expired_request_is_dropped_without_polling_or_delivering_results() {
+        run_test_with_cx(|cx| async move {
+            let released = Arc::new(AtomicBool::new(false));
+            let owned = MarkReleased(Arc::clone(&released));
+            let mut polled = false;
+            let result = run_request(&cx, Duration::ZERO, async {
+                let _owned = owned;
+                polled = true;
+                Ok(())
+            }).await;
+            assert!(matches!(result, Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut));
+            assert!(!polled);
+            assert!(released.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn request_checkpoint_observes_cancellation_without_an_inner_wakeup() {
+        run_test_with_cx(|cx| async move {
+            let released = Arc::new(AtomicBool::new(false));
+            let owned = MarkReleased(Arc::clone(&released));
+            let result: SearchResult<()> = run_request(&cx, Duration::from_secs(1), async {
+                let _owned = owned;
+                cx.set_cancel_requested(true);
+                std::future::pending().await
+            }).await;
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert!(released.load(Ordering::SeqCst));
+            cx.set_cancel_requested(false);
+        });
+    }
+
+    #[test]
+    fn request_execution_preserves_the_underlying_failure() {
+        run_test_with_cx(|cx| async move {
+            let result: SearchResult<()> = run_request(&cx, Duration::from_secs(1), async {
+                Err(complete_cli_error("test_admission", "original refusal"))
+            }).await;
+            assert!(matches!(result, Err(SearchError::InvalidConfig { field, reason, .. })
+                if field == "complete_generation.test_admission" && reason == "original refusal"));
+        });
+    }
+
+    #[test]
+    fn socket_reports_search_deadline_and_accepts_a_subsequent_request() {
+        run_test_with_cx(|cx| async move {
+            let (client, mut server) = pair(b"{\"query\":\"stall\"}\n");
+            let result = serve_peer::<serde_json::Value, _, _>(
+                &cx, &mut server, Duration::from_millis(100), |_| std::future::pending(),
+            ).await.unwrap();
+            assert_eq!(result, PeerOutcome::Search);
+            let failure = response(client);
+            assert_eq!(failure["ok"], false);
+            assert!(failure.to_string().contains("search deadline exceeded"));
+
+            let (client, mut server) = pair(b"{\"query\":\"healthy\"}\n");
+            serve_peer(&cx, &mut server, Duration::from_secs(1), |_| async {
+                Ok(serde_json::json!({"ok": true}))
+            }).await.unwrap();
+            assert_eq!(response(client)["ok"], true);
+        });
+    }
 
     fn pair(request: &[u8]) -> (UnixStream, UnixStream) {
         let (mut client, server) = UnixStream::pair().unwrap();
