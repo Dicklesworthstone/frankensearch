@@ -492,8 +492,7 @@ fn durable_commit_cancellation_retains_exact_delta_until_one_successful_retry() 
                 .expect("arm real pre-publication checkpoint");
             let error = LexicalWrite::commit(&index, &cx)
                 .await
-                .err()
-                .expect("checkpoint must cancel the actual durable commit");
+                .expect_err("checkpoint must cancel the actual durable commit");
             assert!(matches!(
                 error,
                 SearchError::Cancelled { phase, reason }
