@@ -4644,7 +4644,7 @@ impl QueryWorkShape {
     }
 }
 
-/// Snapshot-global BM25 statistics reused only by syntactic exact terms.
+/// Snapshot-global BM25 statistics reused by lowered query terms.
 ///
 /// Ranked and identifier-only search lower the same query independently for
 /// every sealed segment. Without this query-local table, each lowering opens
@@ -4655,12 +4655,25 @@ impl QueryWorkShape {
 /// boundary.
 struct PreparedSnapshotDocFreqs {
     entries: StdMutex<HashMap<u16, HashMap<Vec<u8>, u64>>>,
+    #[cfg(test)]
+    reservation_overrides: SnapshotDocFreqReservationOverrides,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SnapshotDocFreqReservationOverrides {
+    term: Option<usize>,
+    outer_map: Option<usize>,
+    new_field_map: Option<usize>,
+    existing_field_map: Option<usize>,
 }
 
 impl PreparedSnapshotDocFreqs {
     fn new() -> Self {
         Self {
             entries: StdMutex::new(HashMap::new()),
+            #[cfg(test)]
+            reservation_overrides: SnapshotDocFreqReservationOverrides::default(),
         }
     }
 
@@ -4692,33 +4705,52 @@ impl PreparedSnapshotDocFreqs {
             return Ok(cached);
         }
 
-        // The cache is optional work. Surface cancellation before allocating
-        // its owned key, but charge no fuel because the baseline query-work
-        // ceiling already accounts only for physical dictionary operations.
+        // The linear work ceiling requires this cache. Surface cancellation
+        // before allocating, and refuse allocation failure before scanning;
+        // an uncached fallback could exceed the ceiling with metering disabled.
         checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
         let mut owned_term = Vec::new();
-        if owned_term.try_reserve_exact(term.len()).is_err() {
+        let term_capacity = term.len();
+        #[cfg(test)]
+        let term_capacity = self.reservation_overrides.term.unwrap_or(term_capacity);
+        if owned_term.try_reserve_exact(term_capacity).is_err() {
             drop(entries);
-            return checkpointed_snapshot_doc_freq(
-                checkpoint,
-                snapshot,
-                field_ord,
-                term,
-                SnapshotDocFreqDeltaAdmission::Ranking,
-            );
+            return Err(ArgusError::Allocation {
+                resource: "snapshot document-frequency term",
+                count: term.len(),
+            }
+            .into());
         }
         owned_term.extend_from_slice(term);
 
         checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
         let mut new_field_entries = None;
+        let outer_capacity = 1;
+        #[cfg(test)]
+        let outer_capacity = self
+            .reservation_overrides
+            .outer_map
+            .unwrap_or(outer_capacity);
         let reserve_failed = if let Some(field_entries) = entries.get_mut(&field_ord) {
-            field_entries.try_reserve(1).is_err()
-        } else if entries.try_reserve(1).is_err() {
+            let field_capacity = 1;
+            #[cfg(test)]
+            let field_capacity = self
+                .reservation_overrides
+                .existing_field_map
+                .unwrap_or(field_capacity);
+            field_entries.try_reserve(field_capacity).is_err()
+        } else if entries.try_reserve(outer_capacity).is_err() {
             true
         } else {
             checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
             let mut field_entries = HashMap::new();
-            if field_entries.try_reserve(1).is_err() {
+            let field_capacity = 1;
+            #[cfg(test)]
+            let field_capacity = self
+                .reservation_overrides
+                .new_field_map
+                .unwrap_or(field_capacity);
+            if field_entries.try_reserve(field_capacity).is_err() {
                 true
             } else {
                 new_field_entries = Some(field_entries);
@@ -4727,13 +4759,11 @@ impl PreparedSnapshotDocFreqs {
         };
         if reserve_failed {
             drop(entries);
-            return checkpointed_snapshot_doc_freq(
-                checkpoint,
-                snapshot,
-                field_ord,
-                term,
-                SnapshotDocFreqDeltaAdmission::Ranking,
-            );
+            return Err(ArgusError::Allocation {
+                resource: "snapshot document-frequency cache",
+                count: 1,
+            }
+            .into());
         }
 
         let computed = checkpointed_snapshot_doc_freq(
@@ -23202,6 +23232,113 @@ mod tests {
             assert_eq!(successor_receipt.counters().1, successor_segments);
             assert_eq!(successor_receipt.counters().2, successor_segments * 2);
             assert_eq!(successor_receipt.counters().3, successor_segments);
+        });
+    }
+
+    #[test]
+    fn snapshot_term_statistics_allocation_failure_refuses_before_dictionary_work() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("DF allocation fixture directory");
+            let config = QuillConfig {
+                tier_fanout: 3,
+                ..deterministic_config()
+            };
+            let writer = QuillIndex::create(&cx, directory.path(), config)
+                .await
+                .expect("create DF allocation fixture");
+            for ordinal in 0..2 {
+                LexicalWrite::index_document(
+                    &writer,
+                    &cx,
+                    &IndexableDocument::new(format!("allocation-{ordinal}"), "alpha beta"),
+                )
+                .await
+                .expect("stage DF allocation document");
+                LexicalWrite::commit(&writer, &cx)
+                    .await
+                    .expect("publish DF allocation segment");
+            }
+            let snapshot = writer.search_snapshot().expect("DF allocation snapshot");
+            assert_eq!(snapshot.keeper_snapshot().segments().len(), 2);
+            for site in 0..4 {
+                for metered in [false, true] {
+                    let mut prepared = PreparedSnapshotDocFreqs::new();
+                    if site == 3 {
+                        let seed: QueryCheckpointHandle<'_> =
+                            QueryCheckpoint::new(&cx, "seed_df", 2, 3);
+                        assert_eq!(
+                            prepared
+                                .get_or_compute(&seed, &snapshot, CONTENT_FIELD, b"beta")
+                                .expect("seed the existing field map"),
+                            2
+                        );
+                    }
+                    // Capacity overflow forces the real fallible reservation
+                    // path without a process-wide allocator or memory pressure.
+                    match site {
+                        0 => prepared.reservation_overrides.term = Some(usize::MAX),
+                        1 => prepared.reservation_overrides.outer_map = Some(usize::MAX),
+                        2 => prepared.reservation_overrides.new_field_map = Some(usize::MAX),
+                        _ => prepared.reservation_overrides.existing_field_map = Some(usize::MAX),
+                    }
+                    let checkpoint = if metered {
+                        QueryCheckpoint::new(&cx, "failed_df", 0, 1)
+                    } else {
+                        QueryCheckpoint::new(&cx, "failed_df", 2, 2)
+                    };
+                    assert_eq!(checkpoint.metering(), metered);
+                    let checkpoint_handle: QueryCheckpointHandle<'_> = checkpoint.clone();
+                    let error = prepared
+                        .get_or_compute(&checkpoint_handle, &snapshot, CONTENT_FIELD, b"alpha")
+                        .expect_err("allocation failure must never fall back to an uncached scan");
+                    let QuillIndexError::Argus(ArgusError::Allocation { resource, count }) = error
+                    else {
+                        panic!("expected allocation refusal before dictionary admission: {error}");
+                    };
+                    assert_eq!(
+                        (resource, count),
+                        if site == 0 {
+                            ("snapshot document-frequency term", 5)
+                        } else {
+                            ("snapshot document-frequency cache", 1)
+                        }
+                    );
+                    assert_eq!(checkpoint.state.consumed.load(Ordering::Acquire), 0);
+                    assert_eq!(
+                        checkpoint.state.dictionary_blocks.load(Ordering::Acquire),
+                        0
+                    );
+                    {
+                        let entries = prepared.entries.lock().expect("unpoisoned cache");
+                        let field = entries.get(&CONTENT_FIELD);
+                        assert!(
+                            field
+                                .and_then(|values| values.get(b"alpha".as_slice()))
+                                .is_none()
+                        );
+                        if site == 3 {
+                            assert_eq!(
+                                field.and_then(|values| values.get(b"beta".as_slice())),
+                                Some(&2)
+                            );
+                        }
+                    }
+                    prepared.reservation_overrides = SnapshotDocFreqReservationOverrides::default();
+                    let retry = QueryCheckpoint::new(&cx, "retry_df", 2, 3);
+                    let retry_handle: QueryCheckpointHandle<'_> = retry.clone();
+                    for _ in 0..2 {
+                        assert_eq!(
+                            prepared
+                                .get_or_compute(&retry_handle, &snapshot, CONTENT_FIELD, b"alpha")
+                                .expect(
+                                    "retry and cache hit retain the correct document frequency"
+                                ),
+                            2
+                        );
+                    }
+                    assert_eq!(retry.state.dictionary_blocks.load(Ordering::Acquire), 2);
+                }
+            }
         });
     }
 
