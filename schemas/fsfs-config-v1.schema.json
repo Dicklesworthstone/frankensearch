@@ -17,20 +17,11 @@
     "diagnostic": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "severity",
-        "reason_code",
-        "field",
-        "message"
-      ],
+      "required": ["severity", "reason_code", "field", "message"],
       "properties": {
         "severity": {
           "type": "string",
-          "enum": [
-            "info",
-            "warn",
-            "error"
-          ]
+          "enum": ["info", "warn", "error"]
         },
         "reason_code": {
           "type": "string",
@@ -42,13 +33,7 @@
         },
         "source": {
           "type": "string",
-          "enum": [
-            "cli",
-            "env",
-            "file",
-            "defaults",
-            "runtime"
-          ]
+          "enum": ["cli", "env", "file", "defaults", "runtime"]
         },
         "message": {
           "type": "string",
@@ -59,15 +44,7 @@
     "configValues": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "discovery",
-        "indexing",
-        "search",
-        "pressure",
-        "tui",
-        "storage",
-        "privacy"
-      ],
+      "required": ["discovery", "indexing", "search", "pressure", "tui", "storage", "privacy"],
       "properties": {
         "discovery": {
           "type": "object",
@@ -98,10 +75,7 @@
             },
             "text_selection_mode": {
               "type": "string",
-              "enum": [
-                "blocklist",
-                "allowlist"
-              ]
+              "enum": ["blocklist", "allowlist"]
             },
             "binary_blocklist_extensions": {
               "type": "array",
@@ -227,19 +201,11 @@
         "pressure": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "profile",
-            "cpu_ceiling_pct",
-            "memory_ceiling_mb"
-          ],
+          "required": ["profile", "cpu_ceiling_pct", "memory_ceiling_mb"],
           "properties": {
             "profile": {
               "type": "string",
-              "enum": [
-                "strict",
-                "performance",
-                "degraded"
-              ]
+              "enum": ["strict", "performance", "degraded"]
             },
             "cpu_ceiling_pct": {
               "type": "integer",
@@ -255,20 +221,11 @@
         "tui": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "theme",
-            "frame_budget_ms",
-            "show_explanations",
-            "density"
-          ],
+          "required": ["theme", "frame_budget_ms", "show_explanations", "density"],
           "properties": {
             "theme": {
               "type": "string",
-              "enum": [
-                "auto",
-                "light",
-                "dark"
-              ]
+              "enum": ["auto", "light", "dark"]
             },
             "frame_budget_ms": {
               "type": "integer",
@@ -280,22 +237,14 @@
             },
             "density": {
               "type": "string",
-              "enum": [
-                "compact",
-                "normal",
-                "expanded"
-              ]
+              "enum": ["compact", "normal", "expanded"]
             }
           }
         },
         "storage": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "db_path",
-            "evidence_retention_days",
-            "summary_retention_days"
-          ],
+          "required": ["db_path", "evidence_retention_days", "summary_retention_days"],
           "properties": {
             "db_path": {
               "type": "string",
@@ -316,10 +265,7 @@
         "privacy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "redact_file_contents_in_logs",
-            "redact_paths_in_telemetry"
-          ],
+          "required": ["redact_file_contents_in_logs", "redact_paths_in_telemetry"],
           "properties": {
             "redact_file_contents_in_logs": {
               "type": "boolean"
@@ -493,21 +439,12 @@
         },
         "source_precedence": {
           "type": "array",
-          "const": [
-            "cli",
-            "env",
-            "file",
-            "defaults"
-          ]
+          "const": ["cli", "env", "file", "defaults"]
         },
         "config_file_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "primary",
-            "fallback",
-            "expand_tilde"
-          ],
+          "required": ["primary", "fallback", "expand_tilde"],
           "properties": {
             "primary": {
               "type": "string",
@@ -535,12 +472,7 @@
         "validation": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "unknown_key_policy",
-            "path_expansion",
-            "conflict_rules",
-            "invariants"
-          ],
+          "required": ["unknown_key_policy", "path_expansion", "conflict_rules", "invariants"],
           "properties": {
             "unknown_key_policy": {
               "type": "string",
@@ -573,11 +505,7 @@
         "logging": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "event_name",
-            "required_fields",
-            "reason_code_prefix"
-          ],
+          "required": ["event_name", "required_fields", "reason_code_prefix"],
           "properties": {
             "event_name": {
               "type": "string",
@@ -648,21 +576,12 @@
         },
         "source_precedence_applied": {
           "type": "array",
-          "const": [
-            "cli",
-            "env",
-            "file",
-            "defaults"
-          ]
+          "const": ["cli", "env", "file", "defaults"]
         },
         "sources": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "cli_flags_used",
-            "env_keys_used",
-            "config_file_used"
-          ],
+          "required": ["cli_flags_used", "env_keys_used", "config_file_used"],
           "properties": {
             "cli_flags_used": {
               "type": "array",
@@ -679,10 +598,7 @@
               }
             },
             "config_file_used": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             }
           }
         },
@@ -694,12 +610,7 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "field",
-              "raw",
-              "expanded",
-              "source"
-            ],
+            "required": ["field", "raw", "expanded", "source"],
             "properties": {
               "field": {
                 "type": "string",
@@ -715,12 +626,7 @@
               },
               "source": {
                 "type": "string",
-                "enum": [
-                  "cli",
-                  "env",
-                  "file",
-                  "defaults"
-                ]
+                "enum": ["cli", "env", "file", "defaults"]
               }
             }
           }
@@ -736,9 +642,7 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "enum": [
-              "config.search.fast_only_with_quality_model"
-            ]
+            "enum": ["config.search.fast_only_with_quality_model"]
           }
         }
       },
@@ -835,12 +739,7 @@
         },
         "source_precedence_applied": {
           "type": "array",
-          "const": [
-            "cli",
-            "env",
-            "file",
-            "defaults"
-          ]
+          "const": ["cli", "env", "file", "defaults"]
         },
         "resolved_values": {
           "$ref": "#/$defs/configValues"
@@ -860,10 +759,7 @@
           }
         },
         "config_file_used": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "warnings": {
           "type": "array",
@@ -881,10 +777,7 @@
         "redaction_applied": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "redact_file_contents_in_logs",
-            "redact_paths_in_telemetry"
-          ],
+          "required": ["redact_file_contents_in_logs", "redact_paths_in_telemetry"],
           "properties": {
             "redact_file_contents_in_logs": {
               "type": "boolean",

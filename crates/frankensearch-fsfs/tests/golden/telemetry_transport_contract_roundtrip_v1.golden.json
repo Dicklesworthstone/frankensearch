@@ -24,10 +24,7 @@
     "auth_mode": "uid_match",
     "framing": "length_prefixed",
     "socket_path_template": "${XDG_RUNTIME_DIR}/frankensearch/{instance_id}.sock",
-    "supported_codecs": [
-      "msgpack",
-      "cbor"
-    ],
+    "supported_codecs": ["msgpack", "cbor"],
     "type": "unix_domain_socket"
   },
   "security": {

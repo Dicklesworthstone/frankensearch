@@ -3,10 +3,6 @@
   "generated_at": "2026-02-14T00:00:00Z",
   "bead": "bd-3un.52.6",
   "pass_threshold": "all_required_tests_pass",
-  "required_tests": [
-    "cargo test"
-  ],
-  "required_failure_artifacts": [
-    "failure.json"
-  ]
+  "required_tests": ["cargo test"],
+  "required_failure_artifacts": ["failure.json"]
 }

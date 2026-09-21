@@ -4,12 +4,7 @@
   "title": "Quill Divergence Register ledger v1",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "register_id",
-    "redaction_policy_version",
-    "events"
-  ],
+  "required": ["schema_version", "register_id", "redaction_policy_version", "events"],
   "properties": {
     "schema_version": {
       "const": 1
@@ -91,12 +86,7 @@
     "event_header": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "sequence",
-        "supersedes",
-        "recorded_by",
-        "recorded_at"
-      ],
+      "required": ["sequence", "supersedes", "recorded_by", "recorded_at"],
       "properties": {
         "sequence": {
           "type": "integer",
@@ -155,12 +145,7 @@
     "fixture_evidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "fixture_id",
-        "fixture_sha256",
-        "regression_test",
-        "minimized"
-      ],
+      "required": ["fixture_id", "fixture_sha256", "regression_test", "minimized"],
       "properties": {
         "fixture_id": {
           "type": "string",
@@ -182,10 +167,7 @@
     "diagnostic": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "payload_sha256",
-        "marker"
-      ],
+      "required": ["payload_sha256", "marker"],
       "properties": {
         "payload_sha256": {
           "$ref": "#/$defs/sha256"
@@ -267,13 +249,7 @@
     "accepted_disposition": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "equivalence_law",
-        "rationale",
-        "reviewer",
-        "reviewed_at"
-      ],
+      "required": ["kind", "equivalence_law", "rationale", "reviewer", "reviewed_at"],
       "properties": {
         "kind": {
           "const": "accepted"
@@ -295,13 +271,7 @@
     "fixed_disposition": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "fixing_commit",
-        "regression_test",
-        "reviewer",
-        "reviewed_at"
-      ],
+      "required": ["kind", "fixing_commit", "regression_test", "reviewer", "reviewed_at"],
       "properties": {
         "kind": {
           "const": "fixed"
@@ -323,13 +293,7 @@
     "blocking_disposition": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "bead_id",
-        "rationale",
-        "reviewer",
-        "reviewed_at"
-      ],
+      "required": ["kind", "bead_id", "rationale", "reviewer", "reviewed_at"],
       "properties": {
         "kind": {
           "const": "blocking"
@@ -364,11 +328,7 @@
     "disposition_event": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "header",
-        "divergence_id",
-        "disposition"
-      ],
+      "required": ["header", "divergence_id", "disposition"],
       "properties": {
         "header": {
           "$ref": "#/$defs/event_header"
@@ -384,12 +344,7 @@
     "declared_prediction": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "rationale",
-        "owner",
-        "bead_id"
-      ],
+      "required": ["kind", "rationale", "owner", "bead_id"],
       "properties": {
         "kind": {
           "const": "declared"
@@ -408,12 +363,7 @@
     "observed_prediction": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "divergence_id",
-        "reviewer",
-        "reviewed_at"
-      ],
+      "required": ["kind", "divergence_id", "reviewer", "reviewed_at"],
       "properties": {
         "kind": {
           "const": "observed"
@@ -432,13 +382,7 @@
     "retired_prediction": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "proof_sha256",
-        "rationale",
-        "reviewer",
-        "reviewed_at"
-      ],
+      "required": ["kind", "proof_sha256", "rationale", "reviewer", "reviewed_at"],
       "properties": {
         "kind": {
           "const": "retired"
@@ -473,12 +417,7 @@
     "prediction_event": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "header",
-        "prediction_id",
-        "class",
-        "state"
-      ],
+      "required": ["header", "prediction_id", "class", "state"],
       "properties": {
         "header": {
           "$ref": "#/$defs/event_header"
@@ -497,10 +436,7 @@
     "observation_wrapper": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "event_type",
-        "event"
-      ],
+      "required": ["event_type", "event"],
       "properties": {
         "event_type": {
           "const": "observation"
@@ -513,10 +449,7 @@
     "disposition_wrapper": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "event_type",
-        "event"
-      ],
+      "required": ["event_type", "event"],
       "properties": {
         "event_type": {
           "const": "disposition"
@@ -529,10 +462,7 @@
     "prediction_wrapper": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "event_type",
-        "event"
-      ],
+      "required": ["event_type", "event"],
       "properties": {
         "event_type": {
           "const": "prediction"

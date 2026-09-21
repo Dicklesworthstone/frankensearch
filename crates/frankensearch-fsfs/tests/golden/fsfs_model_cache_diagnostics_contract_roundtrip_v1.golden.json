@@ -14,14 +14,8 @@
     "offline",
     "fallback_path"
   ],
-  "advice_env_vars": [
-    "FRANKENSEARCH_MODEL_DIR",
-    "FSFS_DOWNLOAD_MODE"
-  ],
-  "advice_config_knobs": [
-    "indexing.model_dir",
-    "search.fast_only"
-  ],
+  "advice_env_vars": ["FRANKENSEARCH_MODEL_DIR", "FSFS_DOWNLOAD_MODE"],
+  "advice_config_knobs": ["indexing.model_dir", "search.fast_only"],
   "state_rules": [
     {
       "rule_id": "warm-ready",

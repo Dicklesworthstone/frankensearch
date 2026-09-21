@@ -21,9 +21,7 @@
     "redaction": {
       "policy_version": "v1",
       "contains_sensitive_source": true,
-      "transforms_applied": [
-        "truncate_preview"
-      ]
+      "transforms_applied": ["truncate_preview"]
     },
     "payload": {
       "raw_query": "user@example.com financial records",

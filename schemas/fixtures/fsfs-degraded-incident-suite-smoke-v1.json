@@ -8,16 +8,7 @@
   "generated_at": "2026-05-08T12:00:00Z",
   "command": {
     "client_surface": "cli",
-    "argv": [
-      "fsfs",
-      "incident-suite",
-      "--mode",
-      "smoke",
-      "--seed",
-      "424242",
-      "--format",
-      "jsonl"
-    ],
+    "argv": ["fsfs", "incident-suite", "--mode", "smoke", "--seed", "424242", "--format", "jsonl"],
     "working_dir": "/data/projects/frankensearch"
   },
   "environment": {
@@ -92,9 +83,7 @@
         "reason_code": "degrade.advice.timeout",
         "preserves_initial_results": true,
         "degradation_stage": "embed_deferred",
-        "artifact_refs": [
-          "incident-quality-embedder-timeout-events"
-        ]
+        "artifact_refs": ["incident-quality-embedder-timeout-events"]
       },
       "replay_command": "fsfs incident-suite replay --scenario incident-quality-embedder-timeout --format jsonl"
     },
@@ -112,9 +101,7 @@
         "reason_code": "degrade.advice.index_corrupt",
         "preserves_initial_results": false,
         "degradation_stage": "lexical_only",
-        "artifact_refs": [
-          "incident-corrupt-vector-artifact-events"
-        ]
+        "artifact_refs": ["incident-corrupt-vector-artifact-events"]
       },
       "replay_command": "fsfs incident-suite replay --scenario incident-corrupt-vector-artifact --format jsonl"
     }

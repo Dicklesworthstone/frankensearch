@@ -1,11 +1,7 @@
 {
   "kind": "ops_config_definition",
   "v": 1,
-  "source_precedence": [
-    "file",
-    "env",
-    "defaults"
-  ],
+  "source_precedence": ["file", "env", "defaults"],
   "file_path_policy": {
     "primary": "${XDG_CONFIG_HOME}/frankensearch/ops.toml",
     "fallback": "~/.config/frankensearch/ops.toml"

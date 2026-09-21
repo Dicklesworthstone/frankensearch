@@ -23,206 +23,113 @@
     {
       "name": "eavesdropped_mutiny",
       "query": "a young lad hidden inside a cask secretly learns the sailors plan to turn against their officers",
-      "expect_chapters": [
-        11
-      ],
-      "avoid_terms": [
-        "apple",
-        "barrel",
-        "mutiny"
-      ],
+      "expect_chapters": [11],
+      "avoid_terms": ["apple", "barrel", "mutiny"],
       "note": "Ch 11 — Jim hides in the apple barrel and overhears Silver recruiting for the mutiny."
     },
     {
       "name": "lone_castaway",
       "query": "a ragged solitary castaway who has survived by himself for three years on an empty shore",
-      "expect_chapters": [
-        15
-      ],
-      "avoid_terms": [
-        "maroon",
-        "marooned",
-        "gunn",
-        "cheese"
-      ],
+      "expect_chapters": [15],
+      "avoid_terms": ["maroon", "marooned", "gunn", "cheese"],
       "note": "Ch 15 — Ben Gunn, three years alone on the island."
     },
     {
       "name": "digging_for_riches",
       "query": "the party digs in the ground hunting for wealth hidden long ago by a dead buccaneer",
-      "expect_chapters": [
-        31,
-        32,
-        33
-      ],
-      "avoid_terms": [
-        "treasure-hunt",
-        "pointer"
-      ],
+      "expect_chapters": [31, 32, 33],
+      "avoid_terms": ["treasure-hunt", "pointer"],
       "note": "Ch 31-33 — the treasure hunt following Flint's directions."
     },
     {
       "name": "parley_terms",
       "query": "the opposing leader walks up to the fort wanting to bargain and settle the quarrel",
-      "expect_chapters": [
-        20
-      ],
-      "avoid_terms": [
-        "embassy",
-        "truce",
-        "parley"
-      ],
+      "expect_chapters": [20],
+      "avoid_terms": ["embassy", "truce", "parley"],
       "note": "Ch 20 — Silver's Embassy; he comes to the stockade to make terms."
     },
     {
       "name": "duel_aloft",
       "query": "a struggle to the death high above the deck while scrambling up the mast",
-      "expect_chapters": [
-        26
-      ],
-      "avoid_terms": [
-        "israel",
-        "hands",
-        "rigging"
-      ],
+      "expect_chapters": [26],
+      "avoid_terms": ["israel", "hands", "rigging"],
       "note": "Ch 26 — Jim and Israel Hands fight in the rigging."
     },
     {
       "name": "frightening_lodger",
       "query": "a rough old sailor rents a room at a quiet seaside tavern and terrifies everyone there",
-      "expect_chapters": [
-        1,
-        2
-      ],
-      "avoid_terms": [
-        "benbow",
-        "inn",
-        "sea-dog"
-      ],
+      "expect_chapters": [1, 2],
+      "avoid_terms": ["benbow", "inn", "sea-dog"],
       "note": "Ch 1-2 — Billy Bones lodging at the Admiral Benbow."
     },
     {
       "name": "blind_messenger",
       "query": "a sightless stranger presses a paper of condemnation into another man's hand",
-      "expect_chapters": [
-        3
-      ],
-      "avoid_terms": [
-        "black spot",
-        "pew",
-        "blind"
-      ],
+      "expect_chapters": [3],
+      "avoid_terms": ["black spot", "pew", "blind"],
       "note": "Ch 3 — blind Pew delivers the black spot to Billy Bones."
     },
     {
       "name": "adrift_small_craft",
       "query": "drifting helplessly alone at sea in a tiny fragile homemade craft tossed by the swell",
-      "expect_chapters": [
-        23,
-        24
-      ],
-      "avoid_terms": [
-        "coracle",
-        "ebb-tide"
-      ],
+      "expect_chapters": [23, 24],
+      "avoid_terms": ["coracle", "ebb-tide"],
       "note": "Ch 23-24 — Jim adrift in Ben Gunn's coracle."
     },
     {
       "name": "opening_the_sea_chest",
       "query": "a boy and his mother unlock a dead lodger's heavy trunk to take only what they are owed",
-      "expect_chapters": [
-        4
-      ],
-      "avoid_terms": [
-        "sea-chest",
-        "chest"
-      ],
+      "expect_chapters": [4],
+      "avoid_terms": ["sea-chest", "chest"],
       "note": "Ch 4 - Jim and his mother open Billy Bones's chest."
     },
     {
       "name": "trampled_in_the_road",
       "query": "riders come down the road at a gallop and a fleeing sightless beggar is knocked down and killed",
-      "expect_chapters": [
-        5
-      ],
-      "avoid_terms": [
-        "blind",
-        "pew",
-        "trampled"
-      ],
+      "expect_chapters": [5],
+      "avoid_terms": ["blind", "pew", "trampled"],
       "note": "Ch 5 - Pew is ridden down by the revenue officers' horses."
     },
     {
       "name": "leaving_for_the_port",
       "query": "the lad says goodbye to his home and travels to a busy harbour town where a vessel is being fitted out",
-      "expect_chapters": [
-        7
-      ],
-      "avoid_terms": [
-        "bristol",
-        "voyage"
-      ],
+      "expect_chapters": [7],
+      "avoid_terms": ["bristol", "voyage"],
       "note": "Ch 7 - I Go to Bristol."
     },
     {
       "name": "murder_in_the_marsh",
       "query": "he watches from hiding as one crewman kills another with a blade among the boggy ground",
-      "expect_chapters": [
-        14
-      ],
-      "avoid_terms": [
-        "first blow",
-        "marsh"
-      ],
+      "expect_chapters": [14],
+      "avoid_terms": ["first blow", "marsh"],
       "note": "Ch 14 - Jim witnesses Silver murder Tom."
     },
     {
       "name": "assault_repelled",
       "query": "the defenders inside the wooden walls fight off a rush of assailants and count their dead",
-      "expect_chapters": [
-        21
-      ],
-      "avoid_terms": [
-        "attack",
-        "stockade"
-      ],
+      "expect_chapters": [21],
+      "avoid_terms": ["attack", "stockade"],
       "note": "Ch 21 - The Attack."
     },
     {
       "name": "surgeon_tends_enemies",
       "query": "having given his word of honour, the physician crosses over to treat the sick and injured among his foes",
-      "expect_chapters": [
-        30
-      ],
-      "avoid_terms": [
-        "parole",
-        "doctor",
-        "livesey"
-      ],
+      "expect_chapters": [30],
+      "avoid_terms": ["parole", "doctor", "livesey"],
       "note": "Ch 30 - On Parole."
     },
     {
       "name": "dividing_the_fortune",
       "query": "the survivors share out the wealth and each goes on to a different life back at home",
-      "expect_chapters": [
-        34
-      ],
-      "avoid_terms": [
-        "and last",
-        "treasure"
-      ],
+      "expect_chapters": [34],
+      "avoid_terms": ["and last", "treasure"],
       "note": "Ch 34 - And Last."
     },
     {
       "name": "secret_council",
       "query": "the trustworthy few gather quietly in the captain's quarters to decide how to handle the traitors",
-      "expect_chapters": [
-        12
-      ],
-      "avoid_terms": [
-        "council of war",
-        "council"
-      ],
+      "expect_chapters": [12],
+      "avoid_terms": ["council of war", "council"],
       "note": "Ch 12 - Council of War."
     }
   ],

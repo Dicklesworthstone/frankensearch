@@ -26,9 +26,6 @@
       "Wait for automatic reconnect attempts.",
       "If disconnect burst continues, inspect transport diagnostics."
     ],
-    "suggested_commands": [
-      "ops.reconnect_stream",
-      "ops.capture_snapshot"
-    ]
+    "suggested_commands": ["ops.reconnect_stream", "ops.capture_snapshot"]
   }
 }

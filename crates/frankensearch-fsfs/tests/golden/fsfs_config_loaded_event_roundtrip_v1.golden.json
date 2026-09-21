@@ -3,22 +3,11 @@
   "v": 1,
   "event": "config_loaded",
   "event_ts": "2026-02-14T03:30:10Z",
-  "source_precedence_applied": [
-    "cli",
-    "env",
-    "file",
-    "defaults"
-  ],
+  "source_precedence_applied": ["cli", "env", "file", "defaults"],
   "resolved_values": {
     "discovery": {
-      "roots": [
-        "/home/test"
-      ],
-      "exclude_patterns": [
-        ".git",
-        "node_modules",
-        "target"
-      ],
+      "roots": ["/home/test"],
+      "exclude_patterns": [".git", "node_modules", "target"],
       "text_selection_mode": "blocklist",
       "binary_blocklist_extensions": [
         ".exe",
@@ -85,13 +74,8 @@
       "redact_paths_in_telemetry": true
     }
   },
-  "cli_flags_used": [
-    "--fast-only"
-  ],
-  "env_keys_used": [
-    "FSFS_SEARCH_FAST_ONLY",
-    "FSFS_TUI_THEME"
-  ],
+  "cli_flags_used": ["--fast-only"],
+  "env_keys_used": ["FSFS_SEARCH_FAST_ONLY", "FSFS_TUI_THEME"],
   "config_file_used": "/home/test/.config/fsfs/config.toml",
   "warnings": [
     {
@@ -109,18 +93,10 @@
       "message": "Unknown key search.legacy_blend_mode ignored"
     }
   ],
-  "reason_codes": [
-    "config.search.fast_only_with_quality_model",
-    "config.unknown_key.warning"
-  ],
+  "reason_codes": ["config.search.fast_only_with_quality_model", "config.unknown_key.warning"],
   "redaction_applied": {
     "redact_file_contents_in_logs": true,
     "redact_paths_in_telemetry": true
   },
-  "emit_fields": [
-    "source_precedence_applied",
-    "resolved_values",
-    "warnings",
-    "reason_codes"
-  ]
+  "emit_fields": ["source_precedence_applied", "resolved_values", "warnings", "reason_codes"]
 }

@@ -4,13 +4,7 @@
   "title": "Crate Placement Registry v1",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "version",
-    "generated_from",
-    "last_updated",
-    "rules",
-    "change_management"
-  ],
+  "required": ["version", "generated_from", "last_updated", "rules", "change_management"],
   "properties": {
     "version": {
       "const": "1.0.0"
@@ -68,11 +62,7 @@
         },
         "placement_status": {
           "type": "string",
-          "enum": [
-            "resolved",
-            "conflict",
-            "unknown"
-          ]
+          "enum": ["resolved", "conflict", "unknown"]
         },
         "target_paths": {
           "type": "array",
@@ -106,12 +96,7 @@
         },
         "blocking_impact": {
           "type": "string",
-          "enum": [
-            "low",
-            "medium",
-            "high",
-            "critical"
-          ]
+          "enum": ["low", "medium", "high", "critical"]
         },
         "notes": {
           "type": "string"
@@ -122,19 +107,12 @@
           "if": {
             "properties": {
               "placement_status": {
-                "enum": [
-                  "conflict",
-                  "unknown"
-                ]
+                "enum": ["conflict", "unknown"]
               }
             }
           },
           "then": {
-            "required": [
-              "resolution_owner",
-              "resolution_deadline",
-              "blocking_impact"
-            ]
+            "required": ["resolution_owner", "resolution_deadline", "blocking_impact"]
           }
         },
         {
@@ -149,19 +127,13 @@
             "not": {
               "anyOf": [
                 {
-                  "required": [
-                    "resolution_owner"
-                  ]
+                  "required": ["resolution_owner"]
                 },
                 {
-                  "required": [
-                    "resolution_deadline"
-                  ]
+                  "required": ["resolution_deadline"]
                 },
                 {
-                  "required": [
-                    "blocking_impact"
-                  ]
+                  "required": ["blocking_impact"]
                 }
               ]
             }
@@ -172,11 +144,7 @@
     "change_management": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "owner",
-        "update_workflow",
-        "lint_commands"
-      ],
+      "required": ["owner", "update_workflow", "lint_commands"],
       "properties": {
         "owner": {
           "type": "string",

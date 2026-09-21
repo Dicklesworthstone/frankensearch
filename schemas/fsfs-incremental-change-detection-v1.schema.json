@@ -21,12 +21,7 @@
     "fileState": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "file_id",
-        "size_bytes",
-        "mtime_ns",
-        "content_hash"
-      ],
+      "required": ["file_id", "size_bytes", "mtime_ns", "content_hash"],
       "properties": {
         "file_id": {
           "type": "string",
@@ -97,18 +92,11 @@
         "hash_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "algorithm",
-            "sample_prefix_bytes",
-            "full_hash_threshold_bytes"
-          ],
+          "required": ["algorithm", "sample_prefix_bytes", "full_hash_threshold_bytes"],
           "properties": {
             "algorithm": {
               "type": "string",
-              "enum": [
-                "sha256",
-                "blake3"
-              ]
+              "enum": ["sha256", "blake3"]
             },
             "sample_prefix_bytes": {
               "type": "integer",
@@ -133,11 +121,7 @@
               "type": "array",
               "items": {
                 "type": "string",
-                "enum": [
-                  "device",
-                  "inode",
-                  "content_hash"
-                ]
+                "enum": ["device", "inode", "content_hash"]
               },
               "minItems": 1,
               "uniqueItems": true
@@ -148,21 +132,14 @@
             },
             "cross_device_move": {
               "type": "string",
-              "enum": [
-                "treat_as_delete_create",
-                "hash_confirm"
-              ]
+              "enum": ["treat_as_delete_create", "hash_confirm"]
             }
           }
         },
         "recovery_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "journal_required",
-            "replay_order",
-            "pending_ttl_seconds"
-          ],
+          "required": ["journal_required", "replay_order", "pending_ttl_seconds"],
           "properties": {
             "journal_required": {
               "type": "boolean",
@@ -181,11 +158,7 @@
         "reconciliation_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "full_scan_interval_seconds",
-            "stale_after_seconds",
-            "orphan_entry_action"
-          ],
+          "required": ["full_scan_interval_seconds", "stale_after_seconds", "orphan_entry_action"],
           "properties": {
             "full_scan_interval_seconds": {
               "type": "integer",
@@ -197,11 +170,7 @@
             },
             "orphan_entry_action": {
               "type": "string",
-              "enum": [
-                "delete",
-                "quarantine",
-                "mark_stale"
-              ]
+              "enum": ["delete", "quarantine", "mark_stale"]
             }
           }
         }
@@ -235,23 +204,11 @@
         },
         "event_type": {
           "type": "string",
-          "enum": [
-            "create",
-            "modify",
-            "delete",
-            "rename",
-            "move",
-            "reconcile"
-          ]
+          "enum": ["create", "modify", "delete", "rename", "move", "reconcile"]
         },
         "detection_mode": {
           "type": "string",
-          "enum": [
-            "mtime_size_fastpath",
-            "hash_confirm",
-            "full_reconcile",
-            "journal_replay"
-          ]
+          "enum": ["mtime_size_fastpath", "hash_confirm", "full_reconcile", "journal_replay"]
         },
         "previous_state": {
           "$ref": "#/$defs/fileState"
@@ -296,10 +253,7 @@
             }
           },
           "then": {
-            "required": [
-              "rename_from",
-              "rename_to"
-            ]
+            "required": ["rename_from", "rename_to"]
           }
         },
         {
@@ -311,10 +265,7 @@
             }
           },
           "then": {
-            "required": [
-              "rename_from",
-              "rename_to"
-            ]
+            "required": ["rename_from", "rename_to"]
           }
         },
         {
@@ -328,11 +279,7 @@
           "then": {
             "properties": {
               "queue_action": {
-                "enum": [
-                  "drop_missing",
-                  "mark_stale",
-                  "reconcile_full"
-                ]
+                "enum": ["drop_missing", "mark_stale", "reconcile_full"]
               }
             }
           }
@@ -383,11 +330,7 @@
         },
         "action_on_restart": {
           "type": "string",
-          "enum": [
-            "replay_pending",
-            "force_reconcile",
-            "resume_tail"
-          ]
+          "enum": ["replay_pending", "force_reconcile", "resume_tail"]
         },
         "reason_code": {
           "$ref": "#/$defs/reasonCode"

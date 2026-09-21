@@ -159,17 +159,7 @@
   },
   "coordination": {
     "agent": "RoseMaple",
-    "file_reservations": [
-      12276,
-      12277,
-      12278,
-      12279,
-      12280,
-      12281,
-      12282,
-      12283,
-      12284
-    ],
+    "file_reservations": [12276, 12277, 12278, 12279, 12280, 12281, 12282, 12283, 12284],
     "reservation_conflicts": 0,
     "agent_mail_thread": "bd-quill-e5-delta-nnqf.6"
   },

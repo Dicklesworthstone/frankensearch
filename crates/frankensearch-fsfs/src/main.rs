@@ -243,6 +243,14 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         );
     }
 
+    // Opt in only for the first complete-store build. Existing selections are
+    // always recognized, even after this variable is unset or explicitly false.
+    let initialize_complete_store = parse_env_bool(
+        &env_map,
+        "FRANKENSEARCH_COMPLETE_GENERATIONS",
+        "FSFS_COMPLETE_GENERATIONS",
+    )?
+    .unwrap_or(false);
     let mut resolved_config = loaded.config;
     if runtime_cli_input.watch {
         resolved_config.indexing.watch_mode = true;
@@ -313,13 +321,14 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     let run_task = scheduler.handle().spawn(async move {
         let cx = request_pool
             .context(Cx::current().expect("asupersync runtime installs a request context"));
-        let run_result = if run_with_shutdown {
-            app_runtime
-                .run_mode_with_shutdown(&cx, interface_mode, shutdown_for_run.as_ref())
-                .await
-        } else {
-            app_runtime.run_mode(&cx, interface_mode).await
-        };
+        let run_result = app_runtime
+            .run_mode_with_complete_generations(
+                &cx,
+                interface_mode,
+                run_with_shutdown.then_some(shutdown_for_run.as_ref()),
+                initialize_complete_store,
+            )
+            .await;
 
         if let Err(error) = &run_result {
             shutdown_for_run.request_shutdown(ShutdownReason::Error(error.to_string()));
@@ -406,7 +415,7 @@ fn run_config_command(
                 print!("config is valid");
                 if payload.warning_count > 0 {
                     println!(" (warnings: {})", payload.warning_count);
-                    for warning in &payload.warnings {
+                    for warning in &loaded.warnings {
                         println!(
                             "- [{}] {} ({})",
                             warning.reason_code, warning.field, warning.message

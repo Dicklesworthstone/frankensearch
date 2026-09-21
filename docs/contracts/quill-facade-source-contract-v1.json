@@ -55,157 +55,92 @@
   "required_facade_targets": [
     {
       "name": "basic_search",
-      "kind": [
-        "example"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["example"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "bench_quick",
-      "kind": [
-        "example"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["example"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "config_override",
-      "kind": [
-        "example"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["example"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "cross_component",
-      "kind": [
-        "test"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["test"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "custom_embedder",
-      "kind": [
-        "example"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["example"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "frankensearch",
-      "kind": [
-        "lib"
-      ],
-      "crate_types": [
-        "lib"
-      ],
+      "kind": ["lib"],
+      "crate_types": ["lib"],
       "required_features": []
     },
     {
       "name": "index_builder_lexical_staging",
-      "kind": [
-        "bench"
-      ],
-      "crate_types": [
-        "bin"
-      ],
-      "required_features": [
-        "bench-internals",
-        "lexical"
-      ]
+      "kind": ["bench"],
+      "crate_types": ["bin"],
+      "required_features": ["bench-internals", "lexical"]
     },
     {
       "name": "integration",
-      "kind": [
-        "test"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["test"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "reconciliation",
-      "kind": [
-        "test"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["test"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "search_bench",
-      "kind": [
-        "bench"
-      ],
-      "crate_types": [
-        "bin"
-      ],
-      "required_features": [
-        "lexical-tantivy"
-      ]
+      "kind": ["bench"],
+      "crate_types": ["bin"],
+      "required_features": ["lexical-tantivy"]
     },
     {
       "name": "streaming_search",
-      "kind": [
-        "example"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["example"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "treasure_island_e2e",
-      "kind": [
-        "test"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["test"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "validate_full_pipeline",
-      "kind": [
-        "example"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["example"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "validate_fusion",
-      "kind": [
-        "example"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["example"],
+      "crate_types": ["bin"],
       "required_features": []
     },
     {
       "name": "validate_index_io",
-      "kind": [
-        "example"
-      ],
-      "crate_types": [
-        "bin"
-      ],
+      "kind": ["example"],
+      "crate_types": ["bin"],
       "required_features": []
     }
   ],
@@ -217,11 +152,7 @@
       "expected_lexical_backend": "none",
       "expected_selected_backend": "none",
       "required_packages": [],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "frankensearch-quill",
-        "tantivy"
-      ],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "frankensearch-quill", "tantivy"],
       "behavior_test": "feature_matrix_smoke::no_default_lane_behavior"
     },
     {
@@ -231,231 +162,137 @@
       "expected_lexical_backend": "none",
       "expected_selected_backend": "none",
       "required_packages": [],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "frankensearch-quill",
-        "tantivy"
-      ],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "frankensearch-quill", "tantivy"],
       "behavior_test": "feature_matrix_smoke::default_lane_behavior"
     },
     {
       "name": "hash",
       "feature_mode": "no-default",
-      "requested_features": [
-        "hash"
-      ],
+      "requested_features": ["hash"],
       "expected_lexical_backend": "none",
       "expected_selected_backend": "none",
       "required_packages": [],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "frankensearch-quill",
-        "tantivy"
-      ],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "frankensearch-quill", "tantivy"],
       "behavior_test": "feature_matrix_smoke::hash_lane_behavior"
     },
     {
       "name": "quill",
       "feature_mode": "no-default",
-      "requested_features": [
-        "quill"
-      ],
+      "requested_features": ["quill"],
       "expected_lexical_backend": "quill",
       "expected_selected_backend": "quill",
-      "required_packages": [
-        "frankensearch-quill"
-      ],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "tantivy"
-      ],
+      "required_packages": ["frankensearch-quill"],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "tantivy"],
       "behavior_test": "feature_matrix_smoke::quill_lane_behavior"
     },
     {
       "name": "lexical",
       "feature_mode": "no-default",
-      "requested_features": [
-        "lexical"
-      ],
+      "requested_features": ["lexical"],
       "expected_lexical_backend": "quill",
       "expected_selected_backend": "quill",
-      "required_packages": [
-        "frankensearch-quill"
-      ],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "tantivy"
-      ],
+      "required_packages": ["frankensearch-quill"],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "tantivy"],
       "behavior_test": "feature_matrix_smoke::lexical_lane_behavior"
     },
     {
       "name": "lexical-bench",
       "feature_mode": "no-default",
-      "requested_features": [
-        "bench-internals",
-        "lexical"
-      ],
+      "requested_features": ["bench-internals", "lexical"],
       "expected_lexical_backend": "quill",
       "expected_selected_backend": "quill",
-      "required_packages": [
-        "frankensearch-quill"
-      ],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "tantivy"
-      ],
+      "required_packages": ["frankensearch-quill"],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "tantivy"],
       "behavior_test": "feature_matrix_smoke::lexical_bench_lane_behavior"
     },
     {
       "name": "lexical-tantivy",
       "feature_mode": "no-default",
-      "requested_features": [
-        "lexical-tantivy"
-      ],
+      "requested_features": ["lexical-tantivy"],
       "expected_lexical_backend": "tantivy",
       "expected_selected_backend": "tantivy",
-      "required_packages": [
-        "frankensearch-lexical",
-        "tantivy"
-      ],
-      "forbidden_package_prefixes": [
-        "frankensearch-quill"
-      ],
+      "required_packages": ["frankensearch-lexical", "tantivy"],
+      "forbidden_package_prefixes": ["frankensearch-quill"],
       "behavior_test": "feature_matrix_smoke::lexical_tantivy_lane_behavior"
     },
     {
       "name": "cass-compat",
       "feature_mode": "no-default",
-      "requested_features": [
-        "cass-compat"
-      ],
+      "requested_features": ["cass-compat"],
       "expected_lexical_backend": "tantivy",
       "expected_selected_backend": "tantivy",
-      "required_packages": [
-        "frankensearch-lexical",
-        "tantivy"
-      ],
-      "forbidden_package_prefixes": [
-        "frankensearch-quill"
-      ],
+      "required_packages": ["frankensearch-lexical", "tantivy"],
+      "forbidden_package_prefixes": ["frankensearch-quill"],
       "behavior_test": "feature_matrix_smoke::cass_compat_lane_behavior"
     },
     {
       "name": "both-backends",
       "feature_mode": "no-default",
-      "requested_features": [
-        "lexical",
-        "lexical-tantivy"
-      ],
+      "requested_features": ["lexical", "lexical-tantivy"],
       "expected_lexical_backend": "quill+tantivy",
       "expected_selected_backend": "quill",
-      "required_packages": [
-        "frankensearch-lexical",
-        "frankensearch-quill",
-        "tantivy"
-      ],
+      "required_packages": ["frankensearch-lexical", "frankensearch-quill", "tantivy"],
       "forbidden_package_prefixes": [],
       "behavior_test": "feature_matrix_smoke::both_backends_lane_behavior"
     },
     {
       "name": "semantic",
       "feature_mode": "no-default",
-      "requested_features": [
-        "semantic"
-      ],
+      "requested_features": ["semantic"],
       "expected_lexical_backend": "none",
       "expected_selected_backend": "none",
       "required_packages": [],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "frankensearch-quill",
-        "tantivy"
-      ],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "frankensearch-quill", "tantivy"],
       "behavior_test": "feature_matrix_smoke::semantic_lane_behavior"
     },
     {
       "name": "hybrid",
       "feature_mode": "no-default",
-      "requested_features": [
-        "hybrid"
-      ],
+      "requested_features": ["hybrid"],
       "expected_lexical_backend": "quill",
       "expected_selected_backend": "quill",
-      "required_packages": [
-        "frankensearch-quill"
-      ],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "tantivy"
-      ],
+      "required_packages": ["frankensearch-quill"],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "tantivy"],
       "behavior_test": "feature_matrix_smoke::hybrid_lane_behavior"
     },
     {
       "name": "persistent",
       "feature_mode": "no-default",
-      "requested_features": [
-        "persistent"
-      ],
+      "requested_features": ["persistent"],
       "expected_lexical_backend": "quill",
       "expected_selected_backend": "quill",
-      "required_packages": [
-        "frankensearch-quill"
-      ],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "tantivy"
-      ],
+      "required_packages": ["frankensearch-quill"],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "tantivy"],
       "behavior_test": "feature_matrix_smoke::persistent_lane_behavior"
     },
     {
       "name": "durable",
       "feature_mode": "no-default",
-      "requested_features": [
-        "durable"
-      ],
+      "requested_features": ["durable"],
       "expected_lexical_backend": "quill",
       "expected_selected_backend": "quill",
-      "required_packages": [
-        "frankensearch-quill"
-      ],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "tantivy"
-      ],
+      "required_packages": ["frankensearch-quill"],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "tantivy"],
       "behavior_test": "feature_matrix_smoke::durable_lane_behavior"
     },
     {
       "name": "full",
       "feature_mode": "no-default",
-      "requested_features": [
-        "full"
-      ],
+      "requested_features": ["full"],
       "expected_lexical_backend": "quill",
       "expected_selected_backend": "quill",
-      "required_packages": [
-        "frankensearch-quill"
-      ],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "tantivy"
-      ],
+      "required_packages": ["frankensearch-quill"],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "tantivy"],
       "behavior_test": "feature_matrix_smoke::full_lane_behavior"
     },
     {
       "name": "full-fts5",
       "feature_mode": "no-default",
-      "requested_features": [
-        "full-fts5"
-      ],
+      "requested_features": ["full-fts5"],
       "expected_lexical_backend": "quill",
       "expected_selected_backend": "quill",
-      "required_packages": [
-        "frankensearch-quill"
-      ],
-      "forbidden_package_prefixes": [
-        "frankensearch-lexical",
-        "tantivy"
-      ],
+      "required_packages": ["frankensearch-quill"],
+      "forbidden_package_prefixes": ["frankensearch-lexical", "tantivy"],
       "behavior_test": "feature_matrix_smoke::full_fts5_lane_behavior"
     },
     {
@@ -464,11 +301,7 @@
       "requested_features": [],
       "expected_lexical_backend": "quill+tantivy",
       "expected_selected_backend": "quill",
-      "required_packages": [
-        "frankensearch-lexical",
-        "frankensearch-quill",
-        "tantivy"
-      ],
+      "required_packages": ["frankensearch-lexical", "frankensearch-quill", "tantivy"],
       "forbidden_package_prefixes": [],
       "behavior_test": "feature_matrix_smoke::all_features_lane_behavior"
     }

@@ -26,40 +26,19 @@
     },
     "scenarioKind": {
       "type": "string",
-      "enum": [
-        "search",
-        "index",
-        "doctor",
-        "audit",
-        "degraded_mode"
-      ]
+      "enum": ["search", "index", "doctor", "audit", "degraded_mode"]
     },
     "clientSurface": {
       "type": "string",
-      "enum": [
-        "cli",
-        "tui"
-      ]
+      "enum": ["cli", "tui"]
     },
     "phase": {
       "type": "string",
-      "enum": [
-        "initial",
-        "refined",
-        "index_build",
-        "doctor",
-        "audit",
-        "degraded_mode"
-      ]
+      "enum": ["initial", "refined", "index_build", "doctor", "audit", "degraded_mode"]
     },
     "outcomeStatus": {
       "type": "string",
-      "enum": [
-        "succeeded",
-        "degraded",
-        "skipped",
-        "failed"
-      ]
+      "enum": ["succeeded", "degraded", "skipped", "failed"]
     },
     "stringList": {
       "type": "array",
@@ -120,11 +99,7 @@
     "envEntry": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "key",
-        "value",
-        "redacted"
-      ],
+      "required": ["key", "value", "redacted"],
       "properties": {
         "key": {
           "$ref": "#/$defs/nonEmptyString"
@@ -140,10 +115,7 @@
     "envSnapshot": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "variables",
-        "redaction_note"
-      ],
+      "required": ["variables", "redaction_note"],
       "properties": {
         "variables": {
           "type": "array",
@@ -159,11 +131,7 @@
     "command": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "client_surface",
-        "argv",
-        "working_dir"
-      ],
+      "required": ["client_surface", "argv", "working_dir"],
       "properties": {
         "client_surface": {
           "$ref": "#/$defs/clientSurface"
@@ -179,11 +147,7 @@
     "environment": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "seed",
-        "config_hash",
-        "snapshot"
-      ],
+      "required": ["seed", "config_hash", "snapshot"],
       "properties": {
         "seed": {
           "type": "integer",
@@ -200,11 +164,7 @@
     "fixtureRef": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "fixture_id",
-        "path",
-        "checksum_sha256"
-      ],
+      "required": ["fixture_id", "path", "checksum_sha256"],
       "properties": {
         "fixture_id": {
           "$ref": "#/$defs/nonEmptyString"
@@ -220,13 +180,7 @@
     "artifactRef": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "artifact_id",
-        "path",
-        "content_type",
-        "checksum_sha256",
-        "required"
-      ],
+      "required": ["artifact_id", "path", "content_type", "checksum_sha256", "required"],
       "properties": {
         "artifact_id": {
           "$ref": "#/$defs/nonEmptyString"
@@ -248,9 +202,7 @@
     "artifactManifest": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "artifacts"
-      ],
+      "required": ["artifacts"],
       "properties": {
         "artifacts": {
           "type": "array",
@@ -264,11 +216,7 @@
     "expectedPhaseOutcome": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "phase",
-        "status",
-        "artifact_refs"
-      ],
+      "required": ["phase", "status", "artifact_refs"],
       "properties": {
         "phase": {
           "$ref": "#/$defs/phase"
@@ -288,21 +236,13 @@
           "if": {
             "properties": {
               "status": {
-                "enum": [
-                  "degraded",
-                  "skipped",
-                  "failed"
-                ]
+                "enum": ["degraded", "skipped", "failed"]
               }
             },
-            "required": [
-              "status"
-            ]
+            "required": ["status"]
           },
           "then": {
-            "required": [
-              "reason_code"
-            ]
+            "required": ["reason_code"]
           }
         }
       ]

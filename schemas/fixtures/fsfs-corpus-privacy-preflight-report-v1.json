@@ -14,14 +14,8 @@
       "path": "/home/ubuntu/.ssh/id_ed25519",
       "decision": "skip",
       "reason_code": "privacy.secret.private_key",
-      "signals": [
-        "private_key",
-        "sensitive_path"
-      ],
-      "sensitive_classes": [
-        "private_keys",
-        "ssh_material"
-      ],
+      "signals": ["private_key", "sensitive_path"],
+      "sensitive_classes": ["private_keys", "ssh_material"],
       "redaction_action": "drop_content",
       "evidence": {
         "evidence_id": "ssh-key",
@@ -38,13 +32,8 @@
       "path": "/home/ubuntu/project/.env",
       "decision": "skip",
       "reason_code": "privacy.secret.token",
-      "signals": [
-        "credential_token"
-      ],
-      "sensitive_classes": [
-        "credentials",
-        "tokens"
-      ],
+      "signals": ["credential_token"],
+      "sensitive_classes": ["credentials", "tokens"],
       "redaction_action": "mask_excerpt",
       "evidence": {
         "evidence_id": "env-token",
@@ -61,10 +50,7 @@
       "path": "/home/ubuntu/project/target/debug/app",
       "decision": "defer",
       "reason_code": "privacy.artifact.generated",
-      "signals": [
-        "generated_artifact",
-        "oversized_binary"
-      ],
+      "signals": ["generated_artifact", "oversized_binary"],
       "sensitive_classes": [],
       "redaction_action": "metadata_only",
       "evidence": {
@@ -82,12 +68,8 @@
       "path": "/home/ubuntu/project/docs/token-format.md",
       "decision": "include",
       "reason_code": "privacy.false_positive.suppressed",
-      "signals": [
-        "credential_token"
-      ],
-      "sensitive_classes": [
-        "tokens"
-      ],
+      "signals": ["credential_token"],
+      "sensitive_classes": ["tokens"],
       "redaction_action": "mask_excerpt",
       "evidence": {
         "evidence_id": "token-doc",
@@ -105,13 +87,8 @@
       "path": "/home/ubuntu/project/export/customer_dump.bin",
       "decision": "defer",
       "reason_code": "privacy.artifact.oversized_binary",
-      "signals": [
-        "oversized_binary",
-        "personal_data"
-      ],
-      "sensitive_classes": [
-        "personal_data"
-      ],
+      "signals": ["oversized_binary", "personal_data"],
+      "sensitive_classes": ["personal_data"],
       "redaction_action": "metadata_only",
       "evidence": {
         "evidence_id": "customer-dump",

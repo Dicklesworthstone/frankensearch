@@ -90,19 +90,12 @@
         },
         "source_precedence": {
           "type": "array",
-          "const": [
-            "env",
-            "file",
-            "defaults"
-          ]
+          "const": ["env", "file", "defaults"]
         },
         "file_path_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "primary",
-            "fallback"
-          ],
+          "required": ["primary", "fallback"],
           "properties": {
             "primary": {
               "type": "string",
@@ -147,14 +140,7 @@
     "opsConfigEffective": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "resolved_at_ts",
-        "source_precedence_applied",
-        "sources",
-        "values"
-      ],
+      "required": ["kind", "v", "resolved_at_ts", "source_precedence_applied", "sources", "values"],
       "properties": {
         "kind": {
           "type": "string",
@@ -170,19 +156,12 @@
         },
         "source_precedence_applied": {
           "type": "array",
-          "const": [
-            "env",
-            "file",
-            "defaults"
-          ]
+          "const": ["env", "file", "defaults"]
         },
         "sources": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "env_keys_used",
-            "config_file_used"
-          ],
+          "required": ["env_keys_used", "config_file_used"],
           "properties": {
             "env_keys_used": {
               "type": "array",
@@ -192,10 +171,7 @@
               }
             },
             "config_file_used": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             }
           }
         },

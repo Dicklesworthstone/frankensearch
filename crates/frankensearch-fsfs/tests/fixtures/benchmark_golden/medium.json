@@ -27,8 +27,5 @@
     "searching_peak_memory_mb": 540,
     "index_size_bytes_per_document": 2360
   },
-  "notes": [
-    "Large machine-wide corpus profile",
-    "Nightly benchmark comparator"
-  ]
+  "notes": ["Large machine-wide corpus profile", "Nightly benchmark comparator"]
 }

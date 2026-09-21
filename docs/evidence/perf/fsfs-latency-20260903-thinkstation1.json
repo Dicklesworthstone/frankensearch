@@ -1,17 +1,9 @@
 {
   "cargo_profile": "release",
   "cold_start_search_ms": {
-    "phases": [
-      "refined",
-      "refined",
-      "refined"
-    ],
+    "phases": ["refined", "refined", "refined"],
     "runs": 3,
-    "samples": [
-      3430.13256,
-      3553.323227,
-      3615.23915
-    ],
+    "samples": [3430.13256, 3553.323227, 3615.23915],
     "summary": {
       "max_ms": 3615.23915,
       "mean_ms": 3532.8983123333333,

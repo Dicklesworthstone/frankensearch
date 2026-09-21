@@ -14,12 +14,8 @@
       "path": "/home/ubuntu/project/.env",
       "decision": "skip",
       "reason_code": "privacy.secret.token",
-      "signals": [
-        "credential_token"
-      ],
-      "sensitive_classes": [
-        "tokens"
-      ],
+      "signals": ["credential_token"],
+      "sensitive_classes": ["tokens"],
       "redaction_action": "mask_excerpt",
       "evidence": {
         "evidence_id": "raw-env-token",

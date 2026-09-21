@@ -76,10 +76,7 @@
       "properties": {
         "sequence": { "type": "integer", "minimum": 1 },
         "supersedes": {
-          "oneOf": [
-            { "type": "null" },
-            { "type": "integer", "minimum": 1 }
-          ]
+          "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 1 }]
         },
         "recorded_by": { "$ref": "#/$defs/reviewer" },
         "recorded_at": { "$ref": "#/$defs/timestamp" }

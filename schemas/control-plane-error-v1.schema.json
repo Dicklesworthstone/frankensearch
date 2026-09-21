@@ -32,19 +32,11 @@
     },
     "severityClass": {
       "type": "string",
-      "enum": [
-        "Fatal",
-        "Degraded",
-        "Transient"
-      ]
+      "enum": ["Fatal", "Degraded", "Transient"]
     },
     "uiSurface": {
       "type": "string",
-      "enum": [
-        "toast",
-        "status_badge",
-        "full_screen_panel"
-      ]
+      "enum": ["toast", "status_badge", "full_screen_panel"]
     },
     "reasonCode": {
       "type": "string",
@@ -52,20 +44,12 @@
     },
     "window": {
       "type": "string",
-      "enum": [
-        "1m",
-        "15m",
-        "1h"
-      ]
+      "enum": ["1m", "15m", "1h"]
     },
     "errorCatalog": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "variants"
-      ],
+      "required": ["kind", "v", "variants"],
       "properties": {
         "kind": {
           "type": "string",
@@ -168,32 +152,20 @@
           "minLength": 1
         },
         "instance_id": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
         },
         "correlation": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "root_request_id",
-            "parent_event_id"
-          ],
+          "required": ["root_request_id", "parent_event_id"],
           "properties": {
             "root_request_id": {
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": ["string", "null"],
               "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
             },
             "parent_event_id": {
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": ["string", "null"],
               "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
             }
           }
@@ -208,11 +180,7 @@
         "ui_mapping": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "surface",
-            "status_badge",
-            "escalation_after_count"
-          ],
+          "required": ["surface", "status_badge", "escalation_after_count"],
           "properties": {
             "surface": {
               "$ref": "#/$defs/uiSurface"
@@ -230,19 +198,11 @@
         "recovery": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "retry_policy",
-            "operator_steps",
-            "suggested_commands"
-          ],
+          "required": ["retry_policy", "operator_steps", "suggested_commands"],
           "properties": {
             "retry_policy": {
               "type": "string",
-              "enum": [
-                "none",
-                "immediate",
-                "exponential_backoff"
-              ]
+              "enum": ["none", "immediate", "exponential_backoff"]
             },
             "operator_steps": {
               "type": "array",
@@ -299,10 +259,7 @@
           "minLength": 1
         },
         "instance_id": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
         },
         "reason_code": {

@@ -24,9 +24,7 @@
         "lexical_fanout": 0,
         "semantic_fanout": 0,
         "quality_enabled": false,
-        "tie_break_rules": [
-          "doc_id_asc"
-        ]
+        "tie_break_rules": ["doc_id_asc"]
       },
       "invariants": [
         {

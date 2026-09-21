@@ -100,6 +100,93 @@ impl RetainedSearchReader {
     }
 }
 
+/// A long-lived reader that admits published successors between queries.
+///
+/// Each search checks the bounded selection descriptor, reusing the existing
+/// lexical/vector/catalog resources when it has not changed. A replacement is
+/// fully verified and opened before the old reader is swapped out. Every phase
+/// of an admitted query stays on one generation even if publication happens
+/// while its sink is running. This does not change legacy CLI/watch routing.
+///
+/// Invalid selection, failed admission and cancellation are returned to the
+/// caller; they never trigger an implicit stale-result or legacy-index fallback.
+#[derive(Debug)]
+pub struct LiveRetainedSearchReader {
+    store: crate::generation_store::CompleteGenerationStore,
+    reader: RetainedSearchReader,
+}
+
+impl LiveRetainedSearchReader {
+    /// The currently loaded generation, not an assertion about a later pointer.
+    #[must_use]
+    pub const fn generation(&self) -> &crate::generation_store::PublishedGeneration {
+        self.reader.generation()
+    }
+
+    /// Admit the selected generation if it differs from the loaded one.
+    ///
+    /// Returns true only when a different generation was installed. There is
+    /// at most one replacement open per call: continuous publication cannot
+    /// force an unbounded retry loop. A subsequent query observes later changes.
+    /// Errors leave the original reader intact so admission can be retried
+    /// after repair, or the caller can explicitly opt into `into_retained`.
+    ///
+    /// # Errors
+    /// Returns the original selection, integrity, producer or cancellation error.
+    pub async fn refresh(&mut self, cx: &Cx) -> SearchResult<bool> {
+        retained_search_checkpoint(cx)?;
+        if self.store.is_selected(cx, self.reader.generation())? {
+            return Ok(false);
+        }
+        let replacement = self
+            .reader
+            .runtime
+            .open_retained_search(cx, self.store.root())
+            .await?;
+        retained_search_checkpoint(cx)?;
+        let changed = replacement.generation() != self.reader.generation();
+        self.reader = replacement;
+        Ok(changed)
+    }
+
+    /// Refresh once, then execute the whole query against that retained reader.
+    ///
+    /// # Errors
+    /// Returns refresh, retrieval, producer-identity or cancellation errors.
+    pub async fn search(
+        &mut self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        self.refresh(cx).await?;
+        self.reader.search(cx, query, limit).await
+    }
+
+    /// Refresh before the first phase and never switch or retry after delivery.
+    ///
+    /// # Errors
+    /// Returns refresh/retrieval/cancellation errors or the sink's original error.
+    pub async fn search_with_phase_sink(
+        &mut self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        sink: &mut (dyn FnMut(&SearchPayload) -> SearchResult<()> + Send),
+    ) -> SearchResult<Vec<SearchPayload>> {
+        self.refresh(cx).await?;
+        self.reader
+            .search_with_phase_sink(cx, query, limit, sink)
+            .await
+    }
+
+    /// Explicitly stop following publication and keep the last admitted reader.
+    #[must_use]
+    pub fn into_retained(self) -> RetainedSearchReader {
+        self.reader
+    }
+}
+
 fn retained_search_checkpoint(cx: &Cx) -> SearchResult<()> {
     cx.checkpoint().map_err(|_| SearchError::Cancelled {
         phase: "fsfs.complete_generation.search".to_owned(),
@@ -107,7 +194,55 @@ fn retained_search_checkpoint(cx: &Cx) -> SearchResult<()> {
     })
 }
 
+// Validate path components, not a string prefix: `{index_dir}/../shared.db`
+// and `{index_dir}-other/catalog.db` must never escape a retained generation.
+// Readers need the same rule as builders, otherwise catalog hydration can come
+// from a mutable database that is not authenticated by the selected inventory.
+fn validate_retained_catalog_path(value: &str) -> SearchResult<()> {
+    use std::path::Component;
+
+    let relative = Path::new(value.trim())
+        .strip_prefix(crate::config::STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER)
+        .ok();
+    if relative.is_some_and(|path| {
+        path.file_name().is_some()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+    }) {
+        return Ok(());
+    }
+    Err(SearchError::InvalidConfig {
+        field: "storage.db_path".to_owned(),
+        value: value.to_owned(),
+        reason: "retained generations require a catalog beneath {index_dir}, without parent traversal"
+            .to_owned(),
+    })
+}
+
 impl FsfsRuntime {
+    /// Open a reusable reader that follows complete-generation publication.
+    ///
+    /// Model state and caller-owned blocking capacity are shared exactly as for
+    /// `open_retained_search`. Each query refreshes before admission, while all
+    /// of its phases retain one immutable resource set. No daemon, background
+    /// worker, persistent result cache or explanation file is created.
+    ///
+    /// # Errors
+    /// Returns the same configuration, selection and admission errors as
+    /// `open_retained_search`. Missing selection never falls back to legacy data.
+    pub async fn open_live_retained_search(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+    ) -> SearchResult<LiveRetainedSearchReader> {
+        retained_search_checkpoint(cx)?;
+        validate_retained_catalog_path(&self.config.storage.db_path)?;
+        let store = crate::generation_store::CompleteGenerationStore::open(cx, store_root)?;
+        let reader = self.open_retained_search(cx, store.root()).await?;
+        Ok(LiveRetainedSearchReader { store, reader })
+    }
+
     /// Resolve and open the selected complete generation once for repeated reads.
     ///
     /// Bundle hashes are verified before the ordinary full-search admission and
@@ -115,6 +250,8 @@ impl FsfsRuntime {
     /// to fall back to a legacy index or an arbitrary generation directory.
     /// The source store follows the cooperative immutable-directory contract of
     /// `CompleteGenerationStore`; callers must not modify its sealed files.
+    /// The catalog must also resolve beneath `{index_dir}`, so hydration cannot
+    /// consult an unrelated mutable database outside the selected generation.
     ///
     /// # Errors
     /// Returns missing/corrupt selection, producer mismatch, cancellation or the
@@ -127,6 +264,7 @@ impl FsfsRuntime {
         use crate::generation_store::CompleteGenerationStore;
 
         retained_search_checkpoint(cx)?;
+        validate_retained_catalog_path(&self.config.storage.db_path)?;
         let store = CompleteGenerationStore::open(cx, store_root)?;
         let generation = store
             .active(cx)?
@@ -180,20 +318,7 @@ impl FsfsRuntime {
         use crate::generation_store::CompleteGenerationStore;
 
         let target_root = fs::canonicalize(self.resolve_target_root()?)?;
-        if !self
-            .config
-            .storage
-            .db_path
-            .trim()
-            .starts_with(crate::config::STORAGE_DB_PATH_INDEX_DIR_PLACEHOLDER)
-        {
-            return Err(SearchError::InvalidConfig {
-                field: "storage.db_path".to_owned(),
-                value: self.config.storage.db_path.clone(),
-                reason: "retained rebuilds require a generation-local {index_dir} catalog"
-                    .to_owned(),
-            });
-        }
+        validate_retained_catalog_path(&self.config.storage.db_path)?;
         let store = CompleteGenerationStore::create(cx, store_root)?;
         if store.root().starts_with(&target_root) || target_root.starts_with(store.root()) {
             return Err(SearchError::InvalidConfig {
@@ -238,6 +363,43 @@ impl FsfsRuntime {
         build.publish(cx, |_, path| {
             Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)
         })
+    }
+}
+
+#[cfg(test)]
+mod retained_catalog_tests {
+    use super::validate_retained_catalog_path;
+
+    #[test]
+    fn retained_catalog_accepts_only_generation_local_paths() {
+        for path in [
+            "{index_dir}/catalog.sqlite",
+            "{index_dir}/nested/catalog.sqlite",
+            "{index_dir}/./nested/catalog.sqlite",
+        ] {
+            validate_retained_catalog_path(path).expect("generation-local catalog");
+        }
+    }
+
+    #[test]
+    fn retained_catalog_rejects_prefix_aliases_and_parent_traversal() {
+        for path in [
+            "",
+            "{index_dir}",
+            "{index_dir}/",
+            "{index_dir}/.",
+            "{index_dir}-other/catalog.sqlite",
+            "{index_dir}/../catalog.sqlite",
+            "{index_dir}/nested/../../catalog.sqlite",
+            "{index_dir}/nested/../catalog.sqlite",
+            "catalog.sqlite",
+            "/tmp/catalog.sqlite",
+        ] {
+            let error = validate_retained_catalog_path(path).expect_err(path);
+            assert!(
+                matches!(error, frankensearch_core::SearchError::InvalidConfig { field, .. } if field == "storage.db_path")
+            );
+        }
     }
 }
 
@@ -437,4 +599,285 @@ mod retained_search_tests {
             );
         });
     }
+
+    #[test]
+    fn retained_catalog_refusal_does_not_create_a_store_or_touch_external_data() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, _, root) = fixture(directory.path());
+            let external = directory.path().join("catalog.sqlite");
+            fs::write(&external, b"unrelated catalog sentinel").expect("external data");
+            let mut config = runtime.config().clone();
+            config.storage.db_path = "{index_dir}/../../../catalog.sqlite".to_owned();
+            let invalid = FsfsRuntime::new(config).with_cli_input(runtime.cli_input.clone());
+
+            let error = invalid
+                .rebuild_retained_generation(&cx, &root)
+                .await
+                .expect_err("escaping rebuild catalog");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "storage.db_path")
+            );
+            let error = invalid
+                .open_retained_search(&cx, &root)
+                .await
+                .expect_err("escaping reader catalog");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "storage.db_path")
+            );
+            assert!(!root.exists(), "preflight refusal must not create a store");
+            assert_eq!(
+                fs::read(external).expect("external data"),
+                b"unrelated catalog sentinel"
+            );
+        });
+    }
+
+    #[test]
+    fn retained_reader_rejects_a_foreign_catalog_without_changing_publication() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+            let selected = store.active(&cx).expect("published generation");
+            let external = directory.path().join("foreign.sqlite");
+            fs::write(&external, b"foreign catalog sentinel").expect("external data");
+            let mut config = runtime.config().clone();
+            config.storage.db_path = external.display().to_string();
+            let invalid = FsfsRuntime::new(config).with_cli_input(runtime.cli_input.clone());
+
+            let error = invalid
+                .open_retained_search(&cx, &root)
+                .await
+                .expect_err("foreign catalog must not hydrate retained results");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "storage.db_path")
+            );
+            assert_eq!(store.active(&cx).expect("inventory remains valid"), selected);
+            assert_eq!(
+                fs::read(external).expect("external data"),
+                b"foreign catalog sentinel"
+            );
+        });
+    }
+
+    #[test]
+    fn live_retained_search_observes_add_delete_and_rename_without_retargeting_old_reader() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut live = runtime
+                .open_live_retained_search(&cx, &root)
+                .await
+                .expect("live reader");
+            let mut pinned = runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .expect("pinned reader");
+            let first = live.generation().clone();
+            assert!(!live.refresh(&cx).await.expect("unchanged selection"));
+
+            fs::write(source.join("beta.md"), "sharedtoken beta new document").expect("new source");
+            publish(&runtime, &cx, &root).await;
+            let added = live
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("live addition");
+            assert_eq!(added.last().expect("phase").hits.len(), 2);
+            assert_ne!(live.generation(), &first);
+            let old = pinned
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("pinned query");
+            assert_eq!(old.last().expect("phase").hits.len(), 1);
+            assert_eq!(pinned.generation(), &first);
+
+            fs::rename(source.join("alpha.md"), source.join("renamed.md")).expect("rename source");
+            fs::remove_file(source.join("beta.md")).expect("delete fixture source");
+            publish(&runtime, &cx, &root).await;
+            let renamed = live
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("live rename and delete");
+            let hits = &renamed.last().expect("phase").hits;
+            assert_eq!(hits.len(), 1);
+            assert!(hits[0].path.ends_with("renamed.md"));
+            assert!(!live.refresh(&cx).await.expect("reuse admitted resources"));
+            let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+            assert_eq!(
+                store.active(&cx).expect("sealed inventory"),
+                Some(live.generation().clone())
+            );
+        });
+    }
+
+    #[test]
+    fn failed_live_admission_emits_nothing_preserves_old_reader_and_can_retry() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut live = runtime
+                .open_live_retained_search(&cx, &root)
+                .await
+                .expect("live reader");
+            let first = live.generation().clone();
+            fs::write(source.join("beta.md"), "sharedtoken beta new document").expect("new source");
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+            let second = store.active(&cx).expect("selection").expect("generation");
+            let manifest = second
+                .path()
+                .join(crate::generation_store::COMPLETE_GENERATION_MANIFEST);
+            let original = fs::read(&manifest).expect("save inventory");
+            fs::write(&manifest, "corrupt inventory").expect("inject corruption");
+            let mut delivered = 0;
+            let mut sink = |_: &SearchPayload| {
+                delivered += 1;
+                Ok(())
+            };
+            live.search_with_phase_sink(&cx, "sharedtoken", 10, &mut sink)
+                .await
+                .expect_err("corrupt successor must not yield stale results");
+            assert_eq!(delivered, 0);
+            assert_eq!(live.generation(), &first);
+            let old = live
+                .reader
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("old handle intact");
+            assert_eq!(old.last().expect("phase").hits.len(), 1);
+
+            fs::write(manifest, original).expect("restore exact inventory");
+            let fresh = live
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("retry repaired selection");
+            assert_eq!(fresh.last().expect("phase").hits.len(), 2);
+            assert_eq!(live.generation(), &second);
+        });
+    }
+
+    #[test]
+    fn live_query_pins_its_generation_when_publication_changes_inside_phase_sink() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let pointer = root.join(crate::generation_store::COMPLETE_GENERATION_POINTER);
+            let first_pointer = fs::read(&pointer).expect("first pointer");
+            fs::write(source.join("beta.md"), "sharedtoken beta new document").expect("new source");
+            publish(&runtime, &cx, &root).await;
+            let second_pointer = fs::read(&pointer).expect("second pointer");
+            // Both bundles were built and admitted by the real indexing path.
+            // Replay their genuine descriptors to control the exact rename
+            // boundary synchronously inside the production phase callback.
+            let switch = root.join("test-pointer-switch");
+            fs::write(&switch, first_pointer).expect("stage first pointer");
+            fs::rename(&switch, &pointer).expect("select first bundle");
+            let mut live = runtime
+                .open_live_retained_search(&cx, &root)
+                .await
+                .expect("live reader");
+            let first = live.generation().clone();
+            fs::write(&switch, second_pointer).expect("stage successor pointer");
+            let mut switched = false;
+            let mut sink = |phase: &SearchPayload| -> SearchResult<()> {
+                assert_eq!(phase.hits.len(), 1);
+                assert!(phase.hits[0].path.ends_with("alpha.md"));
+                if !switched {
+                    fs::rename(&switch, &pointer)?;
+                    switched = true;
+                }
+                Ok(())
+            };
+            let phases = live
+                .search_with_phase_sink(&cx, "sharedtoken", 10, &mut sink)
+                .await
+                .expect("admitted query completes on original bundle");
+            assert!(switched);
+            assert!(phases.iter().all(|phase| phase.hits.len() == 1));
+            assert_eq!(live.generation(), &first);
+            let fresh = live
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("next query sees successor");
+            assert_eq!(fresh.last().expect("phase").hits.len(), 2);
+            assert_ne!(live.generation(), &first);
+        });
+    }
+
+    #[test]
+    fn cancelled_live_refresh_keeps_the_old_reader_and_emits_no_phase() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut live = runtime
+                .open_live_retained_search(&cx, &root)
+                .await
+                .expect("live reader");
+            let first = live.generation().clone();
+            fs::write(source.join("beta.md"), "sharedtoken beta new document").expect("new source");
+            publish(&runtime, &cx, &root).await;
+            cx.set_cancel_requested(true);
+            let mut delivered = 0;
+            let mut sink = |_: &SearchPayload| {
+                delivered += 1;
+                Ok(())
+            };
+            let error = live
+                .search_with_phase_sink(&cx, "sharedtoken", 10, &mut sink)
+                .await
+                .expect_err("cancelled refresh");
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            assert_eq!(delivered, 0);
+            assert_eq!(live.generation(), &first);
+            cx.set_cancel_requested(false);
+            let fresh = live
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("retry after cancellation");
+            assert_eq!(fresh.last().expect("phase").hits.len(), 2);
+        });
+    }
+
+    #[test]
+    fn missing_live_selection_fails_closed_and_retained_opt_out_is_explicit() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut live = runtime
+                .open_live_retained_search(&cx, &root)
+                .await
+                .expect("live reader");
+            let first = live.generation().clone();
+            fs::rename(
+                root.join(crate::generation_store::COMPLETE_GENERATION_POINTER),
+                root.join("saved-pointer"),
+            )
+            .expect("remove selection without removing its bundle");
+            let error = live
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect_err("missing selection");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "complete_generation.selection")
+            );
+            assert_eq!(live.generation(), &first);
+            let mut pinned = live.into_retained();
+            let result = pinned
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("explicit pinned read");
+            assert_eq!(result.last().expect("phase").hits.len(), 1);
+            assert_eq!(pinned.generation(), &first);
+        });
+    }
 }
+
+#[path = "runtime/complete_cli.rs"]
+mod complete_cli;

@@ -23,14 +23,7 @@
     },
     "topic": {
       "type": "string",
-      "enum": [
-        "search",
-        "embedding",
-        "index",
-        "resource",
-        "anomaly",
-        "lifecycle"
-      ]
+      "enum": ["search", "embedding", "index", "resource", "anomaly", "lifecycle"]
     },
     "contractDefinition": {
       "type": "object",
@@ -58,13 +51,7 @@
         "primary_transport": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "type",
-            "socket_path_template",
-            "framing",
-            "supported_codecs",
-            "auth_mode"
-          ],
+          "required": ["type", "socket_path_template", "framing", "supported_codecs", "auth_mode"],
           "properties": {
             "type": {
               "type": "string",
@@ -84,10 +71,7 @@
               "minItems": 2,
               "items": {
                 "type": "string",
-                "enum": [
-                  "msgpack",
-                  "cbor"
-                ]
+                "enum": ["msgpack", "cbor"]
               },
               "allOf": [
                 {
@@ -111,10 +95,7 @@
         "fallback_transport": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "type",
-            "path_template"
-          ],
+          "required": ["type", "path_template"],
           "properties": {
             "type": {
               "type": "string",
@@ -185,10 +166,7 @@
         "multi_consumer": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "mode",
-            "max_consumers"
-          ],
+          "required": ["mode", "max_consumers"],
           "properties": {
             "mode": {
               "type": "string",
@@ -203,10 +181,7 @@
         "security": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "local_only",
-            "network_transport_allowed"
-          ],
+          "required": ["local_only", "network_transport_allowed"],
           "properties": {
             "local_only": {
               "type": "boolean",
@@ -221,10 +196,7 @@
         "slo_targets": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "p95_delivery_lag_ms_target",
-            "throughput_eps_target"
-          ],
+          "required": ["p95_delivery_lag_ms_target", "throughput_eps_target"],
           "properties": {
             "p95_delivery_lag_ms_target": {
               "type": "number",
@@ -286,10 +258,7 @@
         },
         "codec": {
           "type": "string",
-          "enum": [
-            "msgpack",
-            "cbor"
-          ]
+          "enum": ["msgpack", "cbor"]
         },
         "auth_mode": {
           "type": "string",
@@ -347,10 +316,7 @@
           }
         },
         "resume_cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "heartbeat_ms": {
           "type": "integer",
@@ -390,19 +356,11 @@
         },
         "frame_type": {
           "type": "string",
-          "enum": [
-            "event",
-            "control",
-            "heartbeat",
-            "error"
-          ]
+          "enum": ["event", "control", "heartbeat", "error"]
         },
         "transport": {
           "type": "string",
-          "enum": [
-            "unix_domain_socket",
-            "jsonl_fallback"
-          ]
+          "enum": ["unix_domain_socket", "jsonl_fallback"]
         },
         "connection_id": {
           "$ref": "#/$defs/ulid"
@@ -447,18 +405,11 @@
             },
             "encoding": {
               "type": "string",
-              "enum": [
-                "msgpack",
-                "cbor",
-                "json"
-              ]
+              "enum": ["msgpack", "cbor", "json"]
             },
             "control_type": {
               "type": "string",
-              "enum": [
-                "backpressure",
-                "reconnect_advisory"
-              ]
+              "enum": ["backpressure", "reconnect_advisory"]
             },
             "reason_code": {
               "type": "string",
@@ -491,13 +442,7 @@
           "then": {
             "properties": {
               "payload": {
-                "required": [
-                  "cursor",
-                  "event_id",
-                  "topic",
-                  "bytes",
-                  "encoding"
-                ]
+                "required": ["cursor", "event_id", "topic", "bytes", "encoding"]
               }
             }
           }
@@ -513,10 +458,7 @@
           "then": {
             "properties": {
               "payload": {
-                "required": [
-                  "control_type",
-                  "reason_code"
-                ]
+                "required": ["control_type", "reason_code"]
               }
             }
           }
@@ -532,9 +474,7 @@
           "then": {
             "properties": {
               "payload": {
-                "required": [
-                  "heartbeat_seq"
-                ]
+                "required": ["heartbeat_seq"]
               }
             }
           }
@@ -550,11 +490,7 @@
           "then": {
             "properties": {
               "payload": {
-                "required": [
-                  "error_code",
-                  "reason_code",
-                  "retry_after_ms"
-                ]
+                "required": ["error_code", "reason_code", "retry_after_ms"]
               }
             }
           }

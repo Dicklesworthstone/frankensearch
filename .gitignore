@@ -59,6 +59,10 @@ target-codex*/
 # Per-job Cargo homes/checkouts created by RCH inside the synced workspace.
 # Dependency source bytes are attested separately by evidence runners.
 .rch-tmp/
+# RCH doctor/producer result trees (build.jsonl, sha256 receipts, stderr)
+.rch-results/
+# insta/golden leftovers from a failing comparison
+*.golden.actual.json
 
 # Agent scratch trees. Grow without bound and are reclaimed by mtime.
 .scratch/

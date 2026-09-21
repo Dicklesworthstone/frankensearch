@@ -12,10 +12,7 @@
       "reason_code": "privacy.secret.token",
       "redaction_action": "mask_excerpt",
       "override_allowed": true,
-      "false_positive_suppressions": [
-        "documented-placeholder",
-        "test-fixture-token"
-      ]
+      "false_positive_suppressions": ["documented-placeholder", "test-fixture-token"]
     },
     {
       "rule_id": "private-key",
@@ -33,9 +30,7 @@
       "reason_code": "privacy.artifact.generated",
       "redaction_action": "metadata_only",
       "override_allowed": true,
-      "false_positive_suppressions": [
-        "checked-in-golden"
-      ]
+      "false_positive_suppressions": ["checked-in-golden"]
     },
     {
       "rule_id": "oversized-binary",
@@ -62,9 +57,7 @@
       "reason_code": "privacy.personal_data.detected",
       "redaction_action": "mask_excerpt",
       "override_allowed": true,
-      "false_positive_suppressions": [
-        "public-contact-page"
-      ]
+      "false_positive_suppressions": ["public-contact-page"]
     },
     {
       "rule_id": "token-doc-false-positive",
@@ -73,9 +66,7 @@
       "reason_code": "privacy.false_positive.suppressed",
       "redaction_action": "mask_excerpt",
       "override_allowed": false,
-      "false_positive_suppressions": [
-        "documented-placeholder"
-      ]
+      "false_positive_suppressions": ["documented-placeholder"]
     }
   ],
   "required_report_fields": [

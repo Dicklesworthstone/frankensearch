@@ -14,12 +14,8 @@
       "path": "/home/ubuntu/project/docs/example.env",
       "decision": "include",
       "reason_code": "privacy.override.user_approved",
-      "signals": [
-        "credential_token"
-      ],
-      "sensitive_classes": [
-        "tokens"
-      ],
+      "signals": ["credential_token"],
+      "sensitive_classes": ["tokens"],
       "redaction_action": "mask_excerpt",
       "evidence": {
         "evidence_id": "override-missing-reason",

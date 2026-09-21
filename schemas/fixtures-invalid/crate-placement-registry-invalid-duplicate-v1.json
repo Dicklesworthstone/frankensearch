@@ -7,9 +7,7 @@
       "rule_id": "R-DUP",
       "id_pattern": "^bd-2hz(?:\\.|$)",
       "placement_status": "resolved",
-      "target_paths": [
-        "crates/frankensearch-fsfs/src/**"
-      ],
+      "target_paths": ["crates/frankensearch-fsfs/src/**"],
       "owner": "fsfs-stream",
       "rationale": "Broad fsfs mapping"
     },
@@ -17,9 +15,7 @@
       "rule_id": "R-DUP",
       "id_pattern": "^bd-2hz\\.10(?:\\.|$)",
       "placement_status": "resolved",
-      "target_paths": [
-        "crates/frankensearch-fsfs/src/testing/**"
-      ],
+      "target_paths": ["crates/frankensearch-fsfs/src/testing/**"],
       "owner": "fsfs-stream",
       "rationale": "Overlapping duplicate intended to trigger duplicate-placement lint"
     },
@@ -27,21 +23,14 @@
       "rule_id": "R-2YU",
       "id_pattern": "^bd-2yu(?:\\.|$)",
       "placement_status": "resolved",
-      "target_paths": [
-        "crates/frankensearch-ops/src/**"
-      ],
+      "target_paths": ["crates/frankensearch-ops/src/**"],
       "owner": "ops-stream",
       "rationale": "Ops mapping"
     }
   ],
   "change_management": {
     "owner": "bd-33iv",
-    "update_workflow": [
-      "update registry",
-      "run lint"
-    ],
-    "lint_commands": [
-      "scripts/check_crate_placement_registry.sh --mode all"
-    ]
+    "update_workflow": ["update registry", "run lint"],
+    "lint_commands": ["scripts/check_crate_placement_registry.sh --mode all"]
   }
 }

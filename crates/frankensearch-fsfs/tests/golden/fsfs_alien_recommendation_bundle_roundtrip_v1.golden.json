@@ -22,32 +22,18 @@
       },
       "baseline_comparator": "Naive immediate indexing for every discovered artifact.",
       "isomorphism_proof_plan": {
-        "invariants": [
-          "Deterministic include/exclude decision for identical path snapshots."
-        ],
+        "invariants": ["Deterministic include/exclude decision for identical path snapshots."],
         "baseline_harness": "tests/e2e_ingest_replay.sh",
-        "replay_checks": [
-          "decision_trace_equivalence"
-        ]
+        "replay_checks": ["decision_trace_equivalence"]
       },
       "repro_artifacts": {
-        "manifest_fields": [
-          "seed",
-          "config_hash",
-          "subsystem",
-          "scenario_id"
-        ],
-        "artifact_outputs": [
-          "ingest_decisions.jsonl",
-          "ingest_summary.json"
-        ],
+        "manifest_fields": ["seed", "config_hash", "subsystem", "scenario_id"],
+        "artifact_outputs": ["ingest_decisions.jsonl", "ingest_summary.json"],
         "replay_command": "cargo test -p frankensearch --test ingest_replay"
       },
       "rollback_plan": {
         "rollback_command": "git revert <recommendation-commit> && cargo test -p frankensearch --test ingest_replay",
-        "abort_conditions": [
-          "recall_drop_gt_5pct"
-        ]
+        "abort_conditions": ["recall_drop_gt_5pct"]
       }
     },
     {
@@ -74,29 +60,16 @@
           "State transition order remains deterministic for identical telemetry streams."
         ],
         "baseline_harness": "tests/e2e_degrade_replay.sh",
-        "replay_checks": [
-          "state_machine_trace_equivalence"
-        ]
+        "replay_checks": ["state_machine_trace_equivalence"]
       },
       "repro_artifacts": {
-        "manifest_fields": [
-          "seed",
-          "config_hash",
-          "subsystem",
-          "policy_version",
-          "scenario_id"
-        ],
-        "artifact_outputs": [
-          "degrade_transitions.jsonl",
-          "pressure_summary.json"
-        ],
+        "manifest_fields": ["seed", "config_hash", "subsystem", "policy_version", "scenario_id"],
+        "artifact_outputs": ["degrade_transitions.jsonl", "pressure_summary.json"],
         "replay_command": "cargo test -p frankensearch --test degrade_replay"
       },
       "rollback_plan": {
         "rollback_command": "git revert <recommendation-commit> && cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture",
-        "abort_conditions": [
-          "state_oscillation_gt_3_per_hour"
-        ]
+        "abort_conditions": ["state_oscillation_gt_3_per_hour"]
       }
     },
     {
@@ -124,30 +97,16 @@
           "Fallback ranking does not violate deterministic candidate ordering."
         ],
         "baseline_harness": "tests/e2e_ranking_replay.sh",
-        "replay_checks": [
-          "rank_delta_bounds",
-          "tie_break_stability"
-        ]
+        "replay_checks": ["rank_delta_bounds", "tie_break_stability"]
       },
       "repro_artifacts": {
-        "manifest_fields": [
-          "seed",
-          "config_hash",
-          "subsystem",
-          "scenario_id"
-        ],
-        "artifact_outputs": [
-          "ranking_trace.jsonl",
-          "ranking_delta_report.json"
-        ],
+        "manifest_fields": ["seed", "config_hash", "subsystem", "scenario_id"],
+        "artifact_outputs": ["ranking_trace.jsonl", "ranking_delta_report.json"],
         "replay_command": "cargo test -p frankensearch --test ranking_replay"
       },
       "rollback_plan": {
         "rollback_command": "git revert <recommendation-commit> && cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture",
-        "abort_conditions": [
-          "ndcg_drop_gt_0.05",
-          "latency_p95_regression_gt_15pct"
-        ]
+        "abort_conditions": ["ndcg_drop_gt_0.05", "latency_p95_regression_gt_15pct"]
       }
     }
   ]

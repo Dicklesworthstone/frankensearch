@@ -196,6 +196,28 @@ impl CompleteGenerationStore {
         }))
     }
 
+    /// Check whether an already admitted generation is still selected.
+    ///
+    /// This bounded descriptor read does not rehash the bundle or reopen any
+    /// engine. It is a selection-change probe, not an integrity check: retain
+    /// the previously admitted immutable reader while it returns true, and use
+    /// `active` plus normal engine admission before installing a replacement.
+    /// An absent selection returns false; malformed or unreadable selection is
+    /// an error rather than permission to continue silently with stale results.
+    ///
+    /// # Errors
+    /// Returns cancellation, invalid-descriptor, or filesystem errors.
+    pub fn is_selected(&self, cx: &Cx, generation: &PublishedGeneration) -> SearchResult<bool> {
+        checkpoint(cx)?;
+        let Some(pointer) = read_pointer(&self.root)? else {
+            return Ok(false);
+        };
+        let (id, manifest_sha256) = decode_pointer(&pointer, &self.root)?;
+        Ok(generation.id == id
+            && generation.manifest_sha256 == manifest_sha256
+            && generation.path == self.root.join(GENERATIONS).join(id))
+    }
+
     /// Reserve a fresh directory while excluding every other cooperating writer.
     ///
     /// # Errors
@@ -906,6 +928,87 @@ mod tests {
                 .begin(&cx)
                 .expect("abandoned future released its lease");
             drop(retry);
+        });
+    }
+
+    #[test]
+    fn selection_probe_ignores_staging_and_detects_publication() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let first = publish(&store, &cx, "old");
+            assert!(store.is_selected(&cx, &first).unwrap());
+            let pending = store.begin(&cx).unwrap();
+            fs::write(pending.path().join("partial.idx"), "partial").unwrap();
+            assert!(store.is_selected(&cx, &first).unwrap());
+            drop(pending);
+            let second = publish(&store, &cx, "new");
+            assert!(!store.is_selected(&cx, &first).unwrap());
+            assert!(store.is_selected(&cx, &second).unwrap());
+            assert_eq!(
+                fs::read_to_string(first.path().join("content.txt")).unwrap(),
+                "old"
+            );
+        });
+    }
+
+    #[test]
+    fn selection_probe_binds_root_identity_and_manifest_digest() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let generation = publish(&store, &cx, "complete");
+            let other_root = tempfile::tempdir().unwrap();
+            let other = CompleteGenerationStore::create(&cx, other_root.path()).unwrap();
+            // Even an identical descriptor in another root cannot identify the
+            // first store's retained reader as that other store's selection.
+            fs::copy(
+                store.root().join(COMPLETE_GENERATION_POINTER),
+                other.root().join(COMPLETE_GENERATION_POINTER),
+            )
+            .unwrap();
+            assert!(!other.is_selected(&cx, &generation).unwrap());
+            let mut wrong_digest = generation.clone();
+            wrong_digest.manifest_sha256 = "0".repeat(64);
+            assert!(!store.is_selected(&cx, &wrong_digest).unwrap());
+            assert!(store.is_selected(&cx, &generation).unwrap());
+        });
+    }
+
+    #[test]
+    fn selection_probe_distinguishes_absence_corruption_and_cancellation() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let generation = publish(&store, &cx, "complete");
+            let pointer = root.path().join(COMPLETE_GENERATION_POINTER);
+            let saved = root.path().join("saved-pointer");
+            fs::rename(&pointer, &saved).unwrap();
+            assert!(!store.is_selected(&cx, &generation).unwrap());
+            fs::write(&pointer, "not a complete-generation pointer").unwrap();
+            assert!(store.is_selected(&cx, &generation).is_err());
+            fs::rename(&saved, &pointer).unwrap();
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                store.is_selected(&cx, &generation),
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            assert!(store.is_selected(&cx, &generation).unwrap());
+        });
+    }
+
+    #[test]
+    fn selection_probe_is_not_a_substitute_for_bundle_admission() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let generation = publish(&store, &cx, "complete");
+            // Deliberately violate immutability to distinguish the cheap
+            // selection probe from the full integrity gate used on new opens.
+            fs::write(generation.path().join("vector.idx"), "tampered").unwrap();
+            assert!(store.is_selected(&cx, &generation).unwrap());
+            assert!(store.active(&cx).is_err());
         });
     }
 }

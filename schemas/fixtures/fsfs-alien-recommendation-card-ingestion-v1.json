@@ -23,30 +23,15 @@
       "Exclusion decisions remain stable under deterministic path ordering."
     ],
     "baseline_harness": "tests/e2e_ingest_replay.sh",
-    "replay_checks": [
-      "compare_decision_trace",
-      "compare_index_manifest"
-    ]
+    "replay_checks": ["compare_decision_trace", "compare_index_manifest"]
   },
   "repro_artifacts": {
-    "manifest_fields": [
-      "seed",
-      "config_hash",
-      "subsystem",
-      "policy_version",
-      "scenario_id"
-    ],
-    "artifact_outputs": [
-      "decision_trace.jsonl",
-      "index_manifest.json"
-    ],
+    "manifest_fields": ["seed", "config_hash", "subsystem", "policy_version", "scenario_id"],
+    "artifact_outputs": ["decision_trace.jsonl", "index_manifest.json"],
     "replay_command": "cargo test -p frankensearch --test ingest_replay -- --nocapture"
   },
   "rollback_plan": {
     "rollback_command": "git revert <recommendation-commit> && cargo test -p frankensearch --test ingest_replay",
-    "abort_conditions": [
-      "recall_drop_gt_5pct",
-      "queue_latency_p95_gt_400ms"
-    ]
+    "abort_conditions": ["recall_drop_gt_5pct", "queue_latency_p95_gt_400ms"]
   }
 }

@@ -25,11 +25,7 @@
     "reason_code": "snippet.metadata.binary",
     "unicode_safe": true,
     "offsets_verified": true,
-    "emitted_fields": [
-      "event",
-      "trace_id",
-      "reason_code"
-    ]
+    "emitted_fields": ["event", "trace_id", "reason_code"]
   },
   "degraded": {
     "applied": true,

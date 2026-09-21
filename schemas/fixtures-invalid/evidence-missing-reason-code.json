@@ -20,9 +20,7 @@
     "redaction": {
       "policy_version": "v1",
       "contains_sensitive_source": false,
-      "transforms_applied": [
-        "drop"
-      ]
+      "transforms_applied": ["drop"]
     },
     "payload": {
       "resource_profile": "degraded",

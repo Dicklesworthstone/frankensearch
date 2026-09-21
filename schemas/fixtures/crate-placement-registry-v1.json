@@ -167,11 +167,7 @@
       "rule_id": "R-1GFX",
       "id_pattern": "^bd-1gfx$",
       "placement_status": "conflict",
-      "target_paths": [
-        "crates/**",
-        "tests/**",
-        "benches/**"
-      ],
+      "target_paths": ["crates/**", "tests/**", "benches/**"],
       "owner": "hardening-lane",
       "rationale": "Cross-agent hardening pass is intentionally cross-cutting and cannot be constrained to one crate path.",
       "resolution_owner": "DustyElk",

@@ -4,11 +4,7 @@
   "tag": "v0.4.0",
   "generated_at": "2026-02-14T22:00:00Z",
   "install_script_url": "https://raw.githubusercontent.com/Dicklesworthstone/frankensearch/main/install.sh",
-  "distribution_channels": [
-    "github_release",
-    "curl_installer",
-    "cargo_crates_io"
-  ],
+  "distribution_channels": ["github_release", "curl_installer", "cargo_crates_io"],
   "artifacts": [
     {
       "target_triple": "aarch64-apple-darwin",

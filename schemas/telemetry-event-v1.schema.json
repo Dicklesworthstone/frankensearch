@@ -4,11 +4,7 @@
   "title": "frankensearch Telemetry Event Envelope v1",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "v",
-    "ts",
-    "event"
-  ],
+  "required": ["v", "ts", "event"],
   "properties": {
     "v": {
       "type": "integer",
@@ -46,11 +42,7 @@
     "instance": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "instance_id",
-        "project_key",
-        "host_name"
-      ],
+      "required": ["instance_id", "project_key", "host_name"],
       "properties": {
         "instance_id": {
           "$ref": "#/$defs/ulid"
@@ -64,10 +56,7 @@
           "minLength": 1
         },
         "pid": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 1
         }
       }
@@ -75,10 +64,7 @@
     "correlation": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "event_id",
-        "root_request_id"
-      ],
+      "required": ["event_id", "root_request_id"],
       "properties": {
         "event_id": {
           "$ref": "#/$defs/ulid"
@@ -87,10 +73,7 @@
           "$ref": "#/$defs/ulid"
         },
         "parent_event_id": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
         }
       }
@@ -98,14 +81,7 @@
     "searchEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "type",
-        "instance",
-        "correlation",
-        "query",
-        "results",
-        "metrics"
-      ],
+      "required": ["type", "instance", "correlation", "query", "results", "metrics"],
       "properties": {
         "type": {
           "type": "string",
@@ -120,11 +96,7 @@
         "query": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "text",
-            "class",
-            "phase"
-          ],
+          "required": ["text", "class", "phase"],
           "properties": {
             "text": {
               "type": "string",
@@ -133,31 +105,18 @@
             },
             "class": {
               "type": "string",
-              "enum": [
-                "empty",
-                "identifier",
-                "short_keyword",
-                "natural_language"
-              ]
+              "enum": ["empty", "identifier", "short_keyword", "natural_language"]
             },
             "phase": {
               "type": "string",
-              "enum": [
-                "initial",
-                "refined",
-                "refinement_failed"
-              ]
+              "enum": ["initial", "refined", "refinement_failed"]
             }
           }
         },
         "results": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "result_count",
-            "lexical_count",
-            "semantic_count"
-          ],
+          "required": ["result_count", "lexical_count", "semantic_count"],
           "properties": {
             "result_count": {
               "type": "integer",
@@ -176,20 +135,14 @@
         "metrics": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "latency_us",
-            "memory_bytes"
-          ],
+          "required": ["latency_us", "memory_bytes"],
           "properties": {
             "latency_us": {
               "type": "integer",
               "minimum": 0
             },
             "memory_bytes": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "minimum": 0
             }
           }
@@ -199,15 +152,7 @@
     "embeddingEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "type",
-        "instance",
-        "correlation",
-        "job",
-        "embedder",
-        "status",
-        "duration_ms"
-      ],
+      "required": ["type", "instance", "correlation", "job", "embedder", "status", "duration_ms"],
       "properties": {
         "type": {
           "type": "string",
@@ -222,12 +167,7 @@
         "job": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "job_id",
-            "queue_depth",
-            "doc_count",
-            "stage"
-          ],
+          "required": ["job_id", "queue_depth", "doc_count", "stage"],
           "properties": {
             "job_id": {
               "$ref": "#/$defs/ulid"
@@ -242,22 +182,14 @@
             },
             "stage": {
               "type": "string",
-              "enum": [
-                "fast",
-                "quality",
-                "background"
-              ]
+              "enum": ["fast", "quality", "background"]
             }
           }
         },
         "embedder": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "id",
-            "tier",
-            "dimension"
-          ],
+          "required": ["id", "tier", "dimension"],
           "properties": {
             "id": {
               "type": "string",
@@ -265,11 +197,7 @@
             },
             "tier": {
               "type": "string",
-              "enum": [
-                "hash",
-                "fast",
-                "quality"
-              ]
+              "enum": ["hash", "fast", "quality"]
             },
             "dimension": {
               "type": "integer",
@@ -279,13 +207,7 @@
         },
         "status": {
           "type": "string",
-          "enum": [
-            "queued",
-            "running",
-            "completed",
-            "failed",
-            "cancelled"
-          ]
+          "enum": ["queued", "running", "completed", "failed", "cancelled"]
         },
         "duration_ms": {
           "type": "integer",
@@ -320,25 +242,12 @@
         },
         "operation": {
           "type": "string",
-          "enum": [
-            "build",
-            "rebuild",
-            "append",
-            "compact",
-            "repair",
-            "snapshot"
-          ]
+          "enum": ["build", "rebuild", "append", "compact", "repair", "snapshot"]
         },
         "inventory": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "words",
-            "tokens",
-            "lines",
-            "bytes",
-            "docs"
-          ],
+          "required": ["words", "tokens", "lines", "bytes", "docs"],
           "properties": {
             "words": {
               "type": "integer",
@@ -368,20 +277,11 @@
         },
         "quantization": {
           "type": "string",
-          "enum": [
-            "f32",
-            "f16",
-            "int8",
-            "pq"
-          ]
+          "enum": ["f32", "f16", "int8", "pq"]
         },
         "status": {
           "type": "string",
-          "enum": [
-            "started",
-            "completed",
-            "failed"
-          ]
+          "enum": ["started", "completed", "failed"]
         },
         "duration_ms": {
           "type": "integer",
@@ -392,12 +292,7 @@
     "resourceEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "type",
-        "instance",
-        "correlation",
-        "sample"
-      ],
+      "required": ["type", "instance", "correlation", "sample"],
       "properties": {
         "type": {
           "type": "string",
@@ -412,13 +307,7 @@
         "sample": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "cpu_pct",
-            "rss_bytes",
-            "io_read_bytes",
-            "io_write_bytes",
-            "interval_ms"
-          ],
+          "required": ["cpu_pct", "rss_bytes", "io_read_bytes", "io_write_bytes", "interval_ms"],
           "properties": {
             "cpu_pct": {
               "type": "number",
@@ -442,23 +331,12 @@
               "minimum": 1
             },
             "load_avg_1m": {
-              "type": [
-                "number",
-                "null"
-              ],
+              "type": ["number", "null"],
               "minimum": 0
             },
             "pressure_profile": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "enum": [
-                "strict",
-                "performance",
-                "degraded",
-                null
-              ]
+              "type": ["string", "null"],
+              "enum": ["strict", "performance", "degraded", null]
             }
           }
         }
@@ -467,13 +345,7 @@
     "lifecycleEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "type",
-        "instance",
-        "correlation",
-        "state",
-        "severity"
-      ],
+      "required": ["type", "instance", "correlation", "state", "severity"],
       "properties": {
         "type": {
           "type": "string",
@@ -487,34 +359,17 @@
         },
         "state": {
           "type": "string",
-          "enum": [
-            "started",
-            "stopped",
-            "healthy",
-            "degraded",
-            "stale",
-            "recovering"
-          ]
+          "enum": ["started", "stopped", "healthy", "degraded", "stale", "recovering"]
         },
         "severity": {
           "type": "string",
-          "enum": [
-            "info",
-            "warn",
-            "error"
-          ]
+          "enum": ["info", "warn", "error"]
         },
         "reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "uptime_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         }
       }

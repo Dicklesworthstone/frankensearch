@@ -340,23 +340,13 @@
   {
     "query": "SearchIndex::new",
     "query_class": "Identifier",
-    "relevant_ids": [
-      "test-code-001",
-      "test-adversarial-010",
-      "test-mixed-010",
-      "test-mixed-001"
-    ],
+    "relevant_ids": ["test-code-001", "test-adversarial-010", "test-mixed-010", "test-mixed-001"],
     "note": "Identifier-mode query for Rust function name"
   },
   {
     "query": "Vektorsuche Einbettungen semantische",
     "query_class": "NaturalLanguage",
-    "relevant_ids": [
-      "test-adversarial-012",
-      "test-adversarial-013",
-      "test-ml-001",
-      "test-ml-006"
-    ],
+    "relevant_ids": ["test-adversarial-012", "test-adversarial-013", "test-ml-001", "test-ml-006"],
     "note": "German cross-lingual query - should find German doc and semantically similar English docs"
   },
   {

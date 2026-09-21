@@ -58,15 +58,8 @@
       "operator_command": {
         "schema_version": 1,
         "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
+        "arguments": ["status", "--format", "json"],
+        "preconditions": ["review_diagnostic_output", "select_supported_mutation_workflow"],
         "mutation_class": "read_only_diagnostic",
         "dry_run_support": "unavailable",
         "confirmation_required": false,
@@ -85,15 +78,8 @@
       "operator_command": {
         "schema_version": 1,
         "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
+        "arguments": ["status", "--format", "json"],
+        "preconditions": ["review_diagnostic_output", "select_supported_mutation_workflow"],
         "mutation_class": "read_only_diagnostic",
         "dry_run_support": "unavailable",
         "confirmation_required": false,
@@ -112,15 +98,8 @@
       "operator_command": {
         "schema_version": 1,
         "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
+        "arguments": ["status", "--format", "json"],
+        "preconditions": ["review_diagnostic_output", "select_supported_mutation_workflow"],
         "mutation_class": "read_only_diagnostic",
         "dry_run_support": "unavailable",
         "confirmation_required": false,
@@ -139,15 +118,8 @@
       "operator_command": {
         "schema_version": 1,
         "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
+        "arguments": ["status", "--format", "json"],
+        "preconditions": ["review_diagnostic_output", "select_supported_mutation_workflow"],
         "mutation_class": "read_only_diagnostic",
         "dry_run_support": "unavailable",
         "confirmation_required": false,
@@ -166,15 +138,8 @@
       "operator_command": {
         "schema_version": 1,
         "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
+        "arguments": ["status", "--format", "json"],
+        "preconditions": ["review_diagnostic_output", "select_supported_mutation_workflow"],
         "mutation_class": "read_only_diagnostic",
         "dry_run_support": "unavailable",
         "confirmation_required": false,

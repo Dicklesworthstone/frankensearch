@@ -18,11 +18,7 @@
   },
   "encoding_policy": {
     "normalization": "utf8_nfc",
-    "primary_detectors": [
-      "bom",
-      "utf8_validation",
-      "icu_heuristic"
-    ],
+    "primary_detectors": ["bom", "utf8_validation", "icu_heuristic"],
     "unknown_encoding_action": "quarantine"
   },
   "kind": "fsfs_file_classification_contract_definition",

@@ -17,14 +17,7 @@
     "contractDefinition": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "cx_rules",
-        "execution_boundaries",
-        "patterns",
-        "test_matrix"
-      ],
+      "required": ["kind", "v", "cx_rules", "execution_boundaries", "patterns", "test_matrix"],
       "properties": {
         "kind": {
           "type": "string",
@@ -37,10 +30,7 @@
         "cx_rules": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "async_requires_cx_first",
-            "sync_forbids_cx"
-          ],
+          "required": ["async_requires_cx_first", "sync_forbids_cx"],
           "properties": {
             "async_requires_cx_first": {
               "type": "boolean",
@@ -55,11 +45,7 @@
         "execution_boundaries": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "asupersync_domain",
-            "rayon_domain",
-            "sync_domain"
-          ],
+          "required": ["asupersync_domain", "rayon_domain", "sync_domain"],
           "properties": {
             "asupersync_domain": {
               "type": "array",
@@ -77,19 +63,14 @@
               "type": "array",
               "items": {
                 "type": "string",
-                "enum": [
-                  "cpu_parallel"
-                ]
+                "enum": ["cpu_parallel"]
               }
             },
             "sync_domain": {
               "type": "array",
               "items": {
                 "type": "string",
-                "enum": [
-                  "pure_transform",
-                  "deterministic_math"
-                ]
+                "enum": ["pure_transform", "deterministic_math"]
               }
             }
           }
@@ -99,31 +80,20 @@
           "minItems": 3,
           "items": {
             "type": "string",
-            "enum": [
-              "timeout_bounded",
-              "structured_worker_pool",
-              "two_phase_channel"
-            ]
+            "enum": ["timeout_bounded", "structured_worker_pool", "two_phase_channel"]
           }
         },
         "test_matrix": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "unit",
-            "integration",
-            "e2e"
-          ],
+          "required": ["unit", "integration", "e2e"],
           "properties": {
             "unit": {
               "type": "array",
               "minItems": 2,
               "items": {
                 "type": "string",
-                "enum": [
-                  "async_signatures_have_cx_first",
-                  "sync_signatures_forbid_cx"
-                ]
+                "enum": ["async_signatures_have_cx_first", "sync_signatures_forbid_cx"]
               }
             },
             "integration": {
@@ -152,14 +122,7 @@
     "apiSignatureCase": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "function_name",
-        "function_kind",
-        "cx_position",
-        "valid"
-      ],
+      "required": ["kind", "v", "function_name", "function_kind", "cx_position", "valid"],
       "properties": {
         "kind": {
           "type": "string",
@@ -175,18 +138,11 @@
         },
         "function_kind": {
           "type": "string",
-          "enum": [
-            "async_public",
-            "sync_public"
-          ]
+          "enum": ["async_public", "sync_public"]
         },
         "cx_position": {
           "type": "string",
-          "enum": [
-            "first",
-            "not_first",
-            "absent"
-          ]
+          "enum": ["first", "not_first", "absent"]
         },
         "valid": {
           "type": "boolean"
@@ -277,12 +233,7 @@
         },
         "timeout_outcome": {
           "type": "string",
-          "enum": [
-            "ok",
-            "err",
-            "cancelled",
-            "panicked"
-          ]
+          "enum": ["ok", "err", "cancelled", "panicked"]
         }
       }
     }

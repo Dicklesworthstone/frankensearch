@@ -106,10 +106,7 @@
         "path_policies": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "deny_always_globs",
-            "allow_with_opt_in_globs"
-          ],
+          "required": ["deny_always_globs", "allow_with_opt_in_globs"],
           "properties": {
             "deny_always_globs": {
               "type": "array",
@@ -141,27 +138,15 @@
           "properties": {
             "logs_default_action": {
               "type": "string",
-              "enum": [
-                "mask",
-                "hash",
-                "drop"
-              ]
+              "enum": ["mask", "hash", "drop"]
             },
             "explain_default_action": {
               "type": "string",
-              "enum": [
-                "mask",
-                "hash",
-                "drop"
-              ]
+              "enum": ["mask", "hash", "drop"]
             },
             "replay_default_action": {
               "type": "string",
-              "enum": [
-                "mask",
-                "hash",
-                "drop"
-              ]
+              "enum": ["mask", "hash", "drop"]
             },
             "deterministic_profile_id": {
               "type": "string",
@@ -172,11 +157,7 @@
         "threat_model": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "local_multi_user_assumed",
-            "same_host_read_risk",
-            "mitigations"
-          ],
+          "required": ["local_multi_user_assumed", "same_host_read_risk", "mitigations"],
           "properties": {
             "local_multi_user_assumed": {
               "type": "boolean",
@@ -199,11 +180,7 @@
         "telemetry_emission_rules": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "raw_content_allowed",
-            "reason_code_required",
-            "redaction_version"
-          ],
+          "required": ["raw_content_allowed", "reason_code_required", "redaction_version"],
           "properties": {
             "raw_content_allowed": {
               "type": "boolean",
@@ -251,11 +228,7 @@
         },
         "decision": {
           "type": "string",
-          "enum": [
-            "include",
-            "exclude",
-            "require_opt_in"
-          ]
+          "enum": ["include", "exclude", "require_opt_in"]
         },
         "reason_code": {
           "type": "string",
@@ -330,11 +303,7 @@
         },
         "artifact_type": {
           "type": "string",
-          "enum": [
-            "log",
-            "explain",
-            "replay"
-          ]
+          "enum": ["log", "explain", "replay"]
         },
         "path": {
           "type": "string",

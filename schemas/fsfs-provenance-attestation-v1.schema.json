@@ -123,12 +123,7 @@
         "build": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "source_commit",
-            "build_profile",
-            "rustc_version",
-            "target_triple"
-          ],
+          "required": ["source_commit", "build_profile", "rustc_version", "target_triple"],
           "properties": {
             "source_commit": {
               "type": "string",
@@ -145,11 +140,7 @@
         "runtime": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "binary_hash_sha256",
-            "config_hash_sha256",
-            "index_manifest_hash_sha256"
-          ],
+          "required": ["binary_hash_sha256", "config_hash_sha256", "index_manifest_hash_sha256"],
           "properties": {
             "binary_hash_sha256": { "$ref": "#/$defs/sha256Digest" },
             "config_hash_sha256": { "$ref": "#/$defs/sha256Digest" },

@@ -13,11 +13,7 @@
   "$defs": {
     "profileId": {
       "type": "string",
-      "enum": [
-        "strict",
-        "performance",
-        "degraded"
-      ]
+      "enum": ["strict", "performance", "degraded"]
     },
     "reasonCode": {
       "type": "string",
@@ -25,10 +21,7 @@
     },
     "schedulerMode": {
       "type": "string",
-      "enum": [
-        "fair_share",
-        "latency_sensitive"
-      ]
+      "enum": ["fair_share", "latency_sensitive"]
     },
     "fieldName": {
       "type": "string",
@@ -86,10 +79,7 @@
         "override_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "overridable_fields",
-            "locked_fields"
-          ],
+          "required": ["overridable_fields", "locked_fields"],
           "properties": {
             "overridable_fields": {
               "type": "array",
@@ -112,13 +102,7 @@
     "contractDefinition": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "profiles",
-        "precedence_order",
-        "migration_policy"
-      ],
+      "required": ["kind", "v", "profiles", "precedence_order", "migration_policy"],
       "properties": {
         "kind": {
           "type": "string",
@@ -131,11 +115,7 @@
         "profiles": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "strict",
-            "performance",
-            "degraded"
-          ],
+          "required": ["strict", "performance", "degraded"],
           "properties": {
             "strict": {
               "$ref": "#/$defs/profileConfig"
@@ -191,10 +171,7 @@
             },
             "drift_protection": {
               "type": "string",
-              "enum": [
-                "explicit_migration_required",
-                "compat_layer_with_reason_code"
-              ]
+              "enum": ["explicit_migration_required", "compat_layer_with_reason_code"]
             },
             "deprecated_fields": {
               "type": "array",
@@ -211,24 +188,14 @@
     "overrideDecision": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "field",
-        "source",
-        "requested_value",
-        "applied",
-        "reason_code"
-      ],
+      "required": ["field", "source", "requested_value", "applied", "reason_code"],
       "properties": {
         "field": {
           "$ref": "#/$defs/fieldName"
         },
         "source": {
           "type": "string",
-          "enum": [
-            "cli",
-            "env",
-            "config"
-          ]
+          "enum": ["cli", "env", "config"]
         },
         "requested_value": {},
         "applied": {
@@ -283,11 +250,7 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "field",
-              "clamped_to",
-              "reason_code"
-            ],
+            "required": ["field", "clamped_to", "reason_code"],
             "properties": {
               "field": {
                 "$ref": "#/$defs/fieldName"
@@ -308,12 +271,7 @@
         "diagnostics": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "event",
-            "reason_code",
-            "precedence_chain",
-            "effective_profile_version"
-          ],
+          "required": ["event", "reason_code", "precedence_chain", "effective_profile_version"],
           "properties": {
             "event": {
               "type": "string",
@@ -363,9 +321,7 @@
             }
           },
           "then": {
-            "required": [
-              "conflict_reason_code"
-            ]
+            "required": ["conflict_reason_code"]
           }
         }
       ]

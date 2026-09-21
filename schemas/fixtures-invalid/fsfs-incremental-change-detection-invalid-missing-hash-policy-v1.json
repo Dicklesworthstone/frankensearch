@@ -8,9 +8,7 @@
     "max_fastpath_skips": 3
   },
   "rename_move_policy": {
-    "identity_keys": [
-      "inode"
-    ],
+    "identity_keys": ["inode"],
     "same_device_rename_preserves_identity": true,
     "cross_device_move": "treat_as_delete_create"
   },

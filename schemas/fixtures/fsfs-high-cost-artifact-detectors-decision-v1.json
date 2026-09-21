@@ -2,9 +2,7 @@
   "kind": "fsfs_high_cost_artifact_decision",
   "v": 1,
   "path": "/workspace/logs/app.log",
-  "detectors_fired": [
-    "giant_log"
-  ],
+  "detectors_fired": ["giant_log"],
   "evidence": {
     "size_mb": 180,
     "churn_rate_per_hour": 240,

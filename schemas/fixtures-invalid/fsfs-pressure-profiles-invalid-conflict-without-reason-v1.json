@@ -11,17 +11,10 @@
     "quality_enabled": false,
     "allow_background_indexing": false,
     "pressure_enter_threshold": 0.35,
-    "pressure_exit_threshold": 0.20,
+    "pressure_exit_threshold": 0.2,
     "override_policy": {
-      "overridable_fields": [
-        "scheduler_mode",
-        "max_index_concurrency"
-      ],
-      "locked_fields": [
-        "quality_enabled",
-        "allow_background_indexing",
-        "max_embed_concurrency"
-      ]
+      "overridable_fields": ["scheduler_mode", "max_index_concurrency"],
+      "locked_fields": ["quality_enabled", "allow_background_indexing", "max_embed_concurrency"]
     }
   },
   "safety_clamps": [],

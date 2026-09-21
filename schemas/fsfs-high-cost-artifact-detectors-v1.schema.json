@@ -20,20 +20,11 @@
     },
     "action": {
       "type": "string",
-      "enum": [
-        "index_full",
-        "index_metadata_only",
-        "skip",
-        "quarantine"
-      ]
+      "enum": ["index_full", "index_metadata_only", "skip", "quarantine"]
     },
     "defaultAction": {
       "type": "string",
-      "enum": [
-        "index_metadata_only",
-        "skip",
-        "quarantine"
-      ]
+      "enum": ["index_metadata_only", "skip", "quarantine"]
     },
     "contractDefinition": {
       "type": "object",
@@ -59,11 +50,7 @@
         "giant_log_detector": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "max_size_mb",
-            "churn_window_minutes",
-            "redundancy_ratio_threshold"
-          ],
+          "required": ["max_size_mb", "churn_window_minutes", "redundancy_ratio_threshold"],
           "properties": {
             "max_size_mb": {
               "type": "number",
@@ -83,11 +70,7 @@
         "vendor_generated_detector": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "vendor_path_patterns",
-            "generated_markers",
-            "library_tree_depth_threshold"
-          ],
+          "required": ["vendor_path_patterns", "generated_markers", "library_tree_depth_threshold"],
           "properties": {
             "vendor_path_patterns": {
               "type": "array",
@@ -114,11 +97,7 @@
         "archive_transient_detector": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "archive_extensions",
-            "transient_directories",
-            "build_artifact_patterns"
-          ],
+          "required": ["archive_extensions", "transient_directories", "build_artifact_patterns"],
           "properties": {
             "archive_extensions": {
               "type": "array",
@@ -149,11 +128,7 @@
         "override_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "allow_user_force_include",
-            "requires_reason",
-            "max_override_ttl_seconds"
-          ],
+          "required": ["allow_user_force_include", "requires_reason", "max_override_ttl_seconds"],
           "properties": {
             "allow_user_force_include": {
               "type": "boolean",
@@ -278,10 +253,7 @@
         "user_override": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "requested_action",
-            "reason"
-          ],
+          "required": ["requested_action", "reason"],
           "properties": {
             "requested_action": {
               "$ref": "#/$defs/action"
@@ -324,9 +296,7 @@
             }
           },
           "then": {
-            "required": [
-              "user_override"
-            ]
+            "required": ["user_override"]
           }
         },
         {
@@ -350,15 +320,7 @@
     "overrideEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "path",
-        "requested_action",
-        "approved",
-        "reason",
-        "reason_code"
-      ],
+      "required": ["kind", "v", "path", "requested_action", "approved", "reason", "reason_code"],
       "properties": {
         "kind": {
           "type": "string",

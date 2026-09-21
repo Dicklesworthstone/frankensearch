@@ -2,21 +2,9 @@
   "kind": "fsfs_expected_loss_contract_definition",
   "v": 1,
   "action_families": {
-    "ingest": [
-      "index_now",
-      "index_later",
-      "skip"
-    ],
-    "embed": [
-      "embed_now",
-      "embed_defer",
-      "embed_disable"
-    ],
-    "degrade": [
-      "degrade_enter",
-      "degrade_hold",
-      "degrade_exit"
-    ]
+    "ingest": ["index_now", "index_later", "skip"],
+    "embed": ["embed_now", "embed_defer", "embed_disable"],
+    "degrade": ["degrade_enter", "degrade_hold", "degrade_exit"]
   },
   "cost_asymmetry_definitions": {
     "false_include_vs_false_exclude": "False exclude has higher recall penalty than false include for critical sources.",

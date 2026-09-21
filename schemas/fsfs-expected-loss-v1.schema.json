@@ -16,19 +16,11 @@
   "$defs": {
     "family": {
       "type": "string",
-      "enum": [
-        "ingest",
-        "embed",
-        "degrade"
-      ]
+      "enum": ["ingest", "embed", "degrade"]
     },
     "riskLevel": {
       "type": "string",
-      "enum": [
-        "low",
-        "medium",
-        "high"
-      ]
+      "enum": ["low", "medium", "high"]
     },
     "reasonCode": {
       "type": "string",
@@ -108,11 +100,7 @@
         "action_families": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "ingest",
-            "embed",
-            "degrade"
-          ],
+          "required": ["ingest", "embed", "degrade"],
           "properties": {
             "ingest": {
               "type": "array",
@@ -164,11 +152,7 @@
         "cost_asymmetry_definitions": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "false_include_vs_false_exclude",
-            "latency_vs_quality",
-            "compute_vs_recall"
-          ],
+          "required": ["false_include_vs_false_exclude", "latency_vs_quality", "compute_vs_recall"],
           "properties": {
             "false_include_vs_false_exclude": {
               "type": "string",
@@ -230,10 +214,7 @@
         "fallback_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "required_for_high_risk",
-            "required_fields"
-          ],
+          "required": ["required_for_high_risk", "required_fields"],
           "properties": {
             "required_for_high_risk": {
               "type": "boolean",
@@ -325,10 +306,7 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "state_id",
-              "action_losses"
-            ],
+            "required": ["state_id", "action_losses"],
             "properties": {
               "state_id": {
                 "type": "string",
@@ -393,20 +371,14 @@
                 "const": "ingest"
               }
             },
-            "required": [
-              "family"
-            ]
+            "required": ["family"]
           },
           "then": {
             "properties": {
               "action_space": {
                 "type": "array",
                 "items": {
-                  "enum": [
-                    "index_now",
-                    "index_later",
-                    "skip"
-                  ]
+                  "enum": ["index_now", "index_later", "skip"]
                 }
               }
             }
@@ -419,20 +391,14 @@
                 "const": "embed"
               }
             },
-            "required": [
-              "family"
-            ]
+            "required": ["family"]
           },
           "then": {
             "properties": {
               "action_space": {
                 "type": "array",
                 "items": {
-                  "enum": [
-                    "embed_now",
-                    "embed_defer",
-                    "embed_disable"
-                  ]
+                  "enum": ["embed_now", "embed_defer", "embed_disable"]
                 }
               }
             }
@@ -445,20 +411,14 @@
                 "const": "degrade"
               }
             },
-            "required": [
-              "family"
-            ]
+            "required": ["family"]
           },
           "then": {
             "properties": {
               "action_space": {
                 "type": "array",
                 "items": {
-                  "enum": [
-                    "degrade_enter",
-                    "degrade_hold",
-                    "degrade_exit"
-                  ]
+                  "enum": ["degrade_enter", "degrade_hold", "degrade_exit"]
                 }
               }
             }
@@ -479,21 +439,15 @@
                             "const": "high"
                           }
                         },
-                        "required": [
-                          "risk_level"
-                        ]
+                        "required": ["risk_level"]
                       }
                     }
                   },
-                  "required": [
-                    "action_losses"
-                  ]
+                  "required": ["action_losses"]
                 }
               }
             },
-            "required": [
-              "loss_rows"
-            ]
+            "required": ["loss_rows"]
           },
           "then": {
             "properties": {
@@ -578,14 +532,10 @@
                 "const": true
               }
             },
-            "required": [
-              "fallback_invoked"
-            ]
+            "required": ["fallback_invoked"]
           },
           "then": {
-            "required": [
-              "fallback_reason_code"
-            ]
+            "required": ["fallback_reason_code"]
           }
         }
       ]

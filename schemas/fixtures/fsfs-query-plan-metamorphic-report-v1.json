@@ -24,9 +24,7 @@
         "lexical_fanout": 0,
         "semantic_fanout": 0,
         "quality_enabled": false,
-        "tie_break_rules": [
-          "doc_id_asc"
-        ]
+        "tie_break_rules": ["doc_id_asc"]
       },
       "invariants": [
         {
@@ -201,10 +199,7 @@
         "lexical_fanout": 10,
         "semantic_fanout": 0,
         "quality_enabled": false,
-        "tie_break_rules": [
-          "score_desc",
-          "doc_id_asc"
-        ]
+        "tie_break_rules": ["score_desc", "doc_id_asc"]
       },
       "invariants": [
         {

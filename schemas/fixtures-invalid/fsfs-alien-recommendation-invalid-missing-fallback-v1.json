@@ -13,30 +13,17 @@
   },
   "baseline_comparator": "Static threshold-only degradation logic.",
   "isomorphism_proof_plan": {
-    "invariants": [
-      "Transitions remain deterministic for identical telemetry input."
-    ],
+    "invariants": ["Transitions remain deterministic for identical telemetry input."],
     "baseline_harness": "tests/e2e_degrade_replay.sh",
-    "replay_checks": [
-      "transition_trace_equivalence"
-    ]
+    "replay_checks": ["transition_trace_equivalence"]
   },
   "repro_artifacts": {
-    "manifest_fields": [
-      "seed",
-      "config_hash",
-      "subsystem"
-    ],
-    "artifact_outputs": [
-      "degrade_trace.jsonl",
-      "degrade_summary.json"
-    ],
+    "manifest_fields": ["seed", "config_hash", "subsystem"],
+    "artifact_outputs": ["degrade_trace.jsonl", "degrade_summary.json"],
     "replay_command": "cargo test -p frankensearch --test degrade_replay"
   },
   "rollback_plan": {
     "rollback_command": "fsfsctl policy set degrade.static=true",
-    "abort_conditions": [
-      "state_oscillation_gt_3_per_hour"
-    ]
+    "abort_conditions": ["state_oscillation_gt_3_per_hour"]
   }
 }

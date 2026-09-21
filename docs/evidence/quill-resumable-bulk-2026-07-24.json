@@ -37,10 +37,7 @@
     },
     "public_witness_api": {
       "type": "QuillDocumentWitness",
-      "fields": [
-        "global_docid",
-        "content_hash"
-      ],
+      "fields": ["global_docid", "content_hash"],
       "lookup": "QuillIndex::document_witness",
       "candidate_hash": "indexable_document_content_hash"
     },
@@ -167,16 +164,7 @@
   },
   "coordination": {
     "agent": "RoseMaple",
-    "file_reservations": [
-      12268,
-      12269,
-      12270,
-      12271,
-      12272,
-      12273,
-      12274,
-      12275
-    ],
+    "file_reservations": [12268, 12269, 12270, 12271, 12272, 12273, 12274, 12275],
     "reservation_conflicts": 0,
     "agent_mail_thread": "bd-quill-duel-resumable-bulk-68jm"
   },

@@ -43,10 +43,7 @@
   "render_mode": "json",
   "snippet_segments": [
     {
-      "byte_range": [
-        3821,
-        3897
-      ],
+      "byte_range": [3821, 3897],
       "highlights": [
         {
           "end_byte": 3841,
@@ -60,10 +57,7 @@
           "start_byte": 3857
         }
       ],
-      "line_range": [
-        140,
-        143
-      ],
+      "line_range": [140, 143],
       "segment_id": "seg_0001",
       "text": "classifier routes low signal query to uncertain fallback profile",
       "truncated": false

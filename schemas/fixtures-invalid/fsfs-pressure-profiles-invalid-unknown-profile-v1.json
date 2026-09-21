@@ -13,9 +13,7 @@
     "pressure_enter_threshold": 0.7,
     "pressure_exit_threshold": 0.5,
     "override_policy": {
-      "overridable_fields": [
-        "scheduler_mode"
-      ],
+      "overridable_fields": ["scheduler_mode"],
       "locked_fields": []
     }
   },

@@ -13,11 +13,7 @@
   "$defs": {
     "subsystem": {
       "type": "string",
-      "enum": [
-        "ingestion_policy",
-        "degradation_scheduler",
-        "ranking_policy"
-      ]
+      "enum": ["ingestion_policy", "degradation_scheduler", "ranking_policy"]
     },
     "reasonCode": {
       "type": "string",
@@ -48,11 +44,7 @@
         },
         "priority_tier": {
           "type": "string",
-          "enum": [
-            "A",
-            "B",
-            "C"
-          ]
+          "enum": ["A", "B", "C"]
         },
         "adoption_wedge": {
           "type": "string",
@@ -61,12 +53,7 @@
         "budgeted_mode": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "latency_budget_ms",
-            "memory_budget_mb",
-            "retry_budget",
-            "on_exhaustion"
-          ],
+          "required": ["latency_budget_ms", "memory_budget_mb", "retry_budget", "on_exhaustion"],
           "properties": {
             "latency_budget_ms": {
               "type": "integer",
@@ -89,11 +76,7 @@
         "fallback_trigger": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "condition",
-            "fallback_action",
-            "reason_code"
-          ],
+          "required": ["condition", "fallback_action", "reason_code"],
           "properties": {
             "condition": {
               "type": "string",
@@ -115,11 +98,7 @@
         "isomorphism_proof_plan": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "invariants",
-            "baseline_harness",
-            "replay_checks"
-          ],
+          "required": ["invariants", "baseline_harness", "replay_checks"],
           "properties": {
             "invariants": {
               "type": "array",
@@ -146,24 +125,14 @@
         "repro_artifacts": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "manifest_fields",
-            "artifact_outputs",
-            "replay_command"
-          ],
+          "required": ["manifest_fields", "artifact_outputs", "replay_command"],
           "properties": {
             "manifest_fields": {
               "type": "array",
               "minItems": 3,
               "items": {
                 "type": "string",
-                "enum": [
-                  "seed",
-                  "config_hash",
-                  "subsystem",
-                  "policy_version",
-                  "scenario_id"
-                ]
+                "enum": ["seed", "config_hash", "subsystem", "policy_version", "scenario_id"]
               },
               "allOf": [
                 {
@@ -200,10 +169,7 @@
         "rollback_plan": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "rollback_command",
-            "abort_conditions"
-          ],
+          "required": ["rollback_command", "abort_conditions"],
           "properties": {
             "rollback_command": {
               "type": "string",
@@ -256,11 +222,7 @@
         },
         "priority_tier": {
           "type": "string",
-          "enum": [
-            "A",
-            "B",
-            "C"
-          ]
+          "enum": ["A", "B", "C"]
         },
         "adoption_wedge": {
           "type": "string",
@@ -290,11 +252,7 @@
     "recommendationBundle": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "v",
-        "cards"
-      ],
+      "required": ["kind", "v", "cards"],
       "properties": {
         "kind": {
           "type": "string",
@@ -319,9 +277,7 @@
                     "const": "ingestion_policy"
                   }
                 },
-                "required": [
-                  "subsystem"
-                ]
+                "required": ["subsystem"]
               }
             },
             {
@@ -332,9 +288,7 @@
                     "const": "degradation_scheduler"
                   }
                 },
-                "required": [
-                  "subsystem"
-                ]
+                "required": ["subsystem"]
               }
             },
             {
@@ -345,9 +299,7 @@
                     "const": "ranking_policy"
                   }
                 },
-                "required": [
-                  "subsystem"
-                ]
+                "required": ["subsystem"]
               }
             }
           ]

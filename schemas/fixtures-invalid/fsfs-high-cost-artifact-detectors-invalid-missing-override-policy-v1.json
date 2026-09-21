@@ -7,24 +7,14 @@
     "redundancy_ratio_threshold": 0.8
   },
   "vendor_generated_detector": {
-    "vendor_path_patterns": [
-      "vendor/"
-    ],
-    "generated_markers": [
-      "@generated"
-    ],
+    "vendor_path_patterns": ["vendor/"],
+    "generated_markers": ["@generated"],
     "library_tree_depth_threshold": 4
   },
   "archive_transient_detector": {
-    "archive_extensions": [
-      ".zip"
-    ],
-    "transient_directories": [
-      "target/"
-    ],
-    "build_artifact_patterns": [
-      "*.pyc"
-    ]
+    "archive_extensions": [".zip"],
+    "transient_directories": ["target/"],
+    "build_artifact_patterns": ["*.pyc"]
   },
   "default_actions": {
     "giant_log": "skip",

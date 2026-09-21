@@ -34,9 +34,7 @@
         "max_index_concurrency",
         "allow_background_indexing"
       ],
-      "locked_fields": [
-        "quality_enabled"
-      ]
+      "locked_fields": ["quality_enabled"]
     }
   },
   "safety_clamps": [

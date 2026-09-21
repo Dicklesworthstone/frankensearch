@@ -8,16 +8,7 @@
   "generated_at": "2026-05-08T12:00:00Z",
   "command": {
     "client_surface": "cli",
-    "argv": [
-      "fsfs",
-      "incident-suite",
-      "--mode",
-      "full",
-      "--seed",
-      "424242",
-      "--format",
-      "jsonl"
-    ],
+    "argv": ["fsfs", "incident-suite", "--mode", "full", "--seed", "424242", "--format", "jsonl"],
     "working_dir": "/data/projects/frankensearch"
   },
   "environment": {
@@ -120,9 +111,7 @@
         "reason_code": "degrade.advice.timeout",
         "preserves_initial_results": true,
         "degradation_stage": "embed_deferred",
-        "artifact_refs": [
-          "incident-quality-embedder-timeout-events"
-        ]
+        "artifact_refs": ["incident-quality-embedder-timeout-events"]
       },
       "replay_command": "fsfs incident-suite replay --scenario incident-quality-embedder-timeout --format jsonl"
     },
@@ -140,9 +129,7 @@
         "reason_code": "degrade.advice.quality_model_missing",
         "preserves_initial_results": true,
         "degradation_stage": "embed_deferred",
-        "artifact_refs": [
-          "incident-model-unavailable-events"
-        ]
+        "artifact_refs": ["incident-model-unavailable-events"]
       },
       "replay_command": "fsfs incident-suite replay --scenario incident-model-unavailable --format jsonl"
     },
@@ -160,9 +147,7 @@
         "reason_code": "degrade.advice.index_corrupt",
         "preserves_initial_results": false,
         "degradation_stage": "lexical_only",
-        "artifact_refs": [
-          "incident-corrupt-vector-artifact-events"
-        ]
+        "artifact_refs": ["incident-corrupt-vector-artifact-events"]
       },
       "replay_command": "fsfs incident-suite replay --scenario incident-corrupt-vector-artifact --format jsonl"
     },
@@ -180,9 +165,7 @@
         "reason_code": "fsfs.incident.lexical_backend_failure",
         "preserves_initial_results": false,
         "degradation_stage": "metadata_only",
-        "artifact_refs": [
-          "incident-lexical-backend-failure-events"
-        ]
+        "artifact_refs": ["incident-lexical-backend-failure-events"]
       },
       "replay_command": "fsfs incident-suite replay --scenario incident-lexical-backend-failure --format jsonl"
     },
@@ -200,9 +183,7 @@
         "reason_code": "fsfs.incident.storage_lock_pressure",
         "preserves_initial_results": true,
         "degradation_stage": "lexical_only",
-        "artifact_refs": [
-          "incident-storage-lock-pressure-events"
-        ]
+        "artifact_refs": ["incident-storage-lock-pressure-events"]
       },
       "replay_command": "fsfs incident-suite replay --scenario incident-storage-lock-pressure --format jsonl"
     },
@@ -220,9 +201,7 @@
         "reason_code": "fsfs.incident.watcher_backlog",
         "preserves_initial_results": true,
         "degradation_stage": "embed_deferred",
-        "artifact_refs": [
-          "incident-watcher-backlog-events"
-        ]
+        "artifact_refs": ["incident-watcher-backlog-events"]
       },
       "replay_command": "fsfs incident-suite replay --scenario incident-watcher-backlog --format jsonl"
     }

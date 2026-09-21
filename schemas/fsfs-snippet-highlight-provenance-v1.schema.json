@@ -52,11 +52,7 @@
     "scoreContributor": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "name",
-        "weight",
-        "raw_score"
-      ],
+      "required": ["name", "weight", "raw_score"],
       "properties": {
         "name": {
           "type": "string",
@@ -74,11 +70,7 @@
     "highlightRange": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "start_byte",
-        "end_byte",
-        "highlight_type"
-      ],
+      "required": ["start_byte", "end_byte", "highlight_type"],
       "properties": {
         "start_byte": {
           "type": "integer",
@@ -90,12 +82,7 @@
         },
         "highlight_type": {
           "type": "string",
-          "enum": [
-            "lexical",
-            "semantic",
-            "fallback",
-            "policy"
-          ]
+          "enum": ["lexical", "semantic", "fallback", "policy"]
         },
         "query_term": {
           "type": "string"
@@ -105,14 +92,7 @@
     "snippetSegment": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "segment_id",
-        "text",
-        "line_range",
-        "byte_range",
-        "truncated",
-        "highlights"
-      ],
+      "required": ["segment_id", "text", "line_range", "byte_range", "truncated", "highlights"],
       "properties": {
         "segment_id": {
           "type": "string",
@@ -141,13 +121,7 @@
     "provenancePayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "path",
-        "segment_id",
-        "index_revision",
-        "content_hash",
-        "score_contributors"
-      ],
+      "required": ["path", "segment_id", "index_revision", "content_hash", "score_contributors"],
       "properties": {
         "path": {
           "type": "string",
@@ -228,17 +202,11 @@
             },
             "truncation_strategy": {
               "type": "string",
-              "enum": [
-                "word_boundary_ellipsis",
-                "grapheme_boundary_ellipsis"
-              ]
+              "enum": ["word_boundary_ellipsis", "grapheme_boundary_ellipsis"]
             },
             "binary_fallback": {
               "type": "string",
-              "enum": [
-                "metadata_only",
-                "skip_with_reason"
-              ]
+              "enum": ["metadata_only", "skip_with_reason"]
             }
           }
         },
@@ -274,9 +242,7 @@
         "provenance_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "required_fields"
-          ],
+          "required": ["required_fields"],
           "properties": {
             "required_fields": {
               "type": "array",
@@ -301,10 +267,7 @@
         "diagnostics_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "required_fields",
-            "reason_code_prefixes"
-          ],
+          "required": ["required_fields", "reason_code_prefixes"],
           "properties": {
             "required_fields": {
               "type": "array",
@@ -346,9 +309,7 @@
         "performance_targets": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "max_extraction_ms_per_result"
-          ],
+          "required": ["max_extraction_ms_per_result"],
           "properties": {
             "max_extraction_ms_per_result": {
               "type": "number",
@@ -398,20 +359,11 @@
         },
         "render_mode": {
           "type": "string",
-          "enum": [
-            "cli",
-            "tui",
-            "json",
-            "toon"
-          ]
+          "enum": ["cli", "tui", "json", "toon"]
         },
         "snippet_status": {
           "type": "string",
-          "enum": [
-            "rendered",
-            "metadata_only",
-            "suppressed"
-          ]
+          "enum": ["rendered", "metadata_only", "suppressed"]
         },
         "snippet_segments": {
           "type": "array",
@@ -460,42 +412,25 @@
         "degraded": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "applied",
-            "mode",
-            "fallback_action"
-          ],
+          "required": ["applied", "mode", "fallback_action"],
           "properties": {
             "applied": {
               "type": "boolean"
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "none",
-                "lexical_only",
-                "metadata_only",
-                "safe_mode"
-              ]
+              "enum": ["none", "lexical_only", "metadata_only", "safe_mode"]
             },
             "fallback_action": {
               "type": "string",
-              "enum": [
-                "none",
-                "lexical_only",
-                "metadata_only",
-                "safe_mode"
-              ]
+              "enum": ["none", "lexical_only", "metadata_only", "safe_mode"]
             }
           }
         },
         "binary_metadata": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "media_type",
-            "size_bytes"
-          ],
+          "required": ["media_type", "size_bytes"],
           "properties": {
             "media_type": {
               "type": "string",
@@ -534,9 +469,7 @@
             }
           },
           "then": {
-            "required": [
-              "binary_metadata"
-            ],
+            "required": ["binary_metadata"],
             "properties": {
               "snippet_segments": {
                 "maxItems": 0

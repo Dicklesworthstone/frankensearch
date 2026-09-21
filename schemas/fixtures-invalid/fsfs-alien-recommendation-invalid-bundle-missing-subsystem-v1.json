@@ -22,31 +22,18 @@
       },
       "baseline_comparator": "Naive immediate indexing.",
       "isomorphism_proof_plan": {
-        "invariants": [
-          "Stable include/exclude decisions for identical snapshots."
-        ],
+        "invariants": ["Stable include/exclude decisions for identical snapshots."],
         "baseline_harness": "tests/e2e_ingest_replay.sh",
-        "replay_checks": [
-          "decision_trace_equivalence"
-        ]
+        "replay_checks": ["decision_trace_equivalence"]
       },
       "repro_artifacts": {
-        "manifest_fields": [
-          "seed",
-          "config_hash",
-          "subsystem"
-        ],
-        "artifact_outputs": [
-          "ingest_trace.jsonl",
-          "ingest_summary.json"
-        ],
+        "manifest_fields": ["seed", "config_hash", "subsystem"],
+        "artifact_outputs": ["ingest_trace.jsonl", "ingest_summary.json"],
         "replay_command": "cargo test -p frankensearch --test ingest_replay"
       },
       "rollback_plan": {
         "rollback_command": "fsfsctl policy set ingest.naive=true",
-        "abort_conditions": [
-          "recall_drop_gt_5pct"
-        ]
+        "abort_conditions": ["recall_drop_gt_5pct"]
       }
     },
     {
@@ -69,31 +56,18 @@
       },
       "baseline_comparator": "Threshold-only degradation policy.",
       "isomorphism_proof_plan": {
-        "invariants": [
-          "Deterministic transition order for identical telemetry."
-        ],
+        "invariants": ["Deterministic transition order for identical telemetry."],
         "baseline_harness": "tests/e2e_degrade_replay.sh",
-        "replay_checks": [
-          "transition_trace_equivalence"
-        ]
+        "replay_checks": ["transition_trace_equivalence"]
       },
       "repro_artifacts": {
-        "manifest_fields": [
-          "seed",
-          "config_hash",
-          "subsystem"
-        ],
-        "artifact_outputs": [
-          "degrade_trace.jsonl",
-          "degrade_summary.json"
-        ],
+        "manifest_fields": ["seed", "config_hash", "subsystem"],
+        "artifact_outputs": ["degrade_trace.jsonl", "degrade_summary.json"],
         "replay_command": "cargo test -p frankensearch --test degrade_replay"
       },
       "rollback_plan": {
         "rollback_command": "fsfsctl policy set degrade.static=true",
-        "abort_conditions": [
-          "state_oscillation_gt_3_per_hour"
-        ]
+        "abort_conditions": ["state_oscillation_gt_3_per_hour"]
       }
     }
   ]

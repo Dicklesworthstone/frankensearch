@@ -7,35 +7,14 @@
     "redundancy_ratio_threshold": 0.8
   },
   "vendor_generated_detector": {
-    "vendor_path_patterns": [
-      "vendor/",
-      "node_modules/",
-      "third_party/"
-    ],
-    "generated_markers": [
-      "@generated",
-      "DO NOT EDIT"
-    ],
+    "vendor_path_patterns": ["vendor/", "node_modules/", "third_party/"],
+    "generated_markers": ["@generated", "DO NOT EDIT"],
     "library_tree_depth_threshold": 4
   },
   "archive_transient_detector": {
-    "archive_extensions": [
-      ".zip",
-      ".tar",
-      ".gz",
-      ".7z"
-    ],
-    "transient_directories": [
-      "target/",
-      "dist/",
-      ".cache/"
-    ],
-    "build_artifact_patterns": [
-      "*.pyc",
-      "*.o",
-      "*.class",
-      "*.min.js"
-    ]
+    "archive_extensions": [".zip", ".tar", ".gz", ".7z"],
+    "transient_directories": ["target/", "dist/", ".cache/"],
+    "build_artifact_patterns": ["*.pyc", "*.o", "*.class", "*.min.js"]
   },
   "override_policy": {
     "allow_user_force_include": true,

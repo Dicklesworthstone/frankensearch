@@ -45,10 +45,7 @@
     },
     "invariantStatus": {
       "type": "string",
-      "enum": [
-        "pass",
-        "fail"
-      ]
+      "enum": ["pass", "fail"]
     },
     "reasonCode": {
       "type": "string",
@@ -109,11 +106,7 @@
     "generatorSpec": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "family",
-        "seeds",
-        "description"
-      ],
+      "required": ["family", "seeds", "description"],
       "properties": {
         "family": {
           "$ref": "#/$defs/generatorFamily"
@@ -135,10 +128,7 @@
     "invariantSpec": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "invariant",
-        "description"
-      ],
+      "required": ["invariant", "description"],
       "properties": {
         "invariant": {
           "$ref": "#/$defs/invariant"
@@ -256,10 +246,7 @@
           "type": "string"
         },
         "requested_limit": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "replay_command": {
@@ -334,31 +321,15 @@
         },
         "fallback": {
           "type": "string",
-          "enum": [
-            "none",
-            "empty_query",
-            "low_confidence_lexical_bias",
-            "malformed_lexical_only"
-          ]
+          "enum": ["none", "empty_query", "low_confidence_lexical_bias", "malformed_lexical_only"]
         },
         "mode": {
           "type": "string",
-          "enum": [
-            "empty",
-            "hybrid_rrf",
-            "fast_semantic_only",
-            "lexical_only"
-          ]
+          "enum": ["empty", "hybrid_rrf", "fast_semantic_only", "lexical_only"]
         },
         "budget_profile": {
           "type": "string",
-          "enum": [
-            "empty",
-            "identifier_focused",
-            "balanced",
-            "semantic_focused",
-            "safe_fallback"
-          ]
+          "enum": ["empty", "identifier_focused", "balanced", "semantic_focused", "safe_fallback"]
         },
         "lexical_fanout": {
           "type": "integer",
@@ -375,12 +346,7 @@
           "type": "array",
           "items": {
             "type": "string",
-            "enum": [
-              "score_desc",
-              "in_both_sources_desc",
-              "lexical_score_desc",
-              "doc_id_asc"
-            ]
+            "enum": ["score_desc", "in_both_sources_desc", "lexical_score_desc", "doc_id_asc"]
           }
         }
       }
@@ -388,12 +354,7 @@
     "invariantResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "invariant",
-        "status",
-        "reason_code",
-        "detail"
-      ],
+      "required": ["invariant", "status", "reason_code", "detail"],
       "properties": {
         "invariant": {
           "$ref": "#/$defs/invariant"
@@ -463,11 +424,7 @@
     "reportSummary": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "total_cases",
-        "passed_cases",
-        "failed_cases"
-      ],
+      "required": ["total_cases", "passed_cases", "failed_cases"],
       "properties": {
         "total_cases": {
           "type": "integer",

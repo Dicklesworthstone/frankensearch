@@ -44,26 +44,15 @@
     },
     "suiteMode": {
       "type": "string",
-      "enum": [
-        "smoke",
-        "full"
-      ]
+      "enum": ["smoke", "full"]
     },
     "clientSurface": {
       "type": "string",
-      "enum": [
-        "cli",
-        "tui"
-      ]
+      "enum": ["cli", "tui"]
     },
     "outcomeStatus": {
       "type": "string",
-      "enum": [
-        "succeeded",
-        "degraded",
-        "skipped",
-        "failed"
-      ]
+      "enum": ["succeeded", "degraded", "skipped", "failed"]
     },
     "expectedOutput": {
       "type": "string",
@@ -77,13 +66,7 @@
     },
     "degradationStage": {
       "type": "string",
-      "enum": [
-        "full",
-        "embed_deferred",
-        "lexical_only",
-        "metadata_only",
-        "paused"
-      ]
+      "enum": ["full", "embed_deferred", "lexical_only", "metadata_only", "paused"]
     },
     "contractDefinition": {
       "type": "object",
@@ -138,11 +121,7 @@
     "envEntry": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "key",
-        "value",
-        "redacted"
-      ],
+      "required": ["key", "value", "redacted"],
       "properties": {
         "key": {
           "$ref": "#/$defs/nonEmptyString"
@@ -158,10 +137,7 @@
     "envSnapshot": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "variables",
-        "redaction_note"
-      ],
+      "required": ["variables", "redaction_note"],
       "properties": {
         "variables": {
           "type": "array",
@@ -177,11 +153,7 @@
     "command": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "client_surface",
-        "argv",
-        "working_dir"
-      ],
+      "required": ["client_surface", "argv", "working_dir"],
       "properties": {
         "client_surface": {
           "$ref": "#/$defs/clientSurface"
@@ -197,11 +169,7 @@
     "environment": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "seed",
-        "config_hash",
-        "snapshot"
-      ],
+      "required": ["seed", "config_hash", "snapshot"],
       "properties": {
         "seed": {
           "type": "integer",
@@ -248,11 +216,7 @@
     "structuredLog": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "event_schema",
-        "required_fields",
-        "redaction_note"
-      ],
+      "required": ["event_schema", "required_fields", "redaction_note"],
       "properties": {
         "event_schema": {
           "$ref": "#/$defs/nonEmptyString"
@@ -268,13 +232,7 @@
     "artifactRef": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "artifact_id",
-        "path",
-        "content_type",
-        "checksum_sha256",
-        "required"
-      ],
+      "required": ["artifact_id", "path", "content_type", "checksum_sha256", "required"],
       "properties": {
         "artifact_id": {
           "$ref": "#/$defs/nonEmptyString"
@@ -296,9 +254,7 @@
     "artifactManifest": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "artifacts"
-      ],
+      "required": ["artifacts"],
       "properties": {
         "artifacts": {
           "type": "array",
@@ -312,11 +268,7 @@
     "injection": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "reason_code",
-        "trigger",
-        "deterministic_payload"
-      ],
+      "required": ["reason_code", "trigger", "deterministic_payload"],
       "properties": {
         "reason_code": {
           "$ref": "#/$defs/nonEmptyString"
@@ -364,13 +316,7 @@
     "scenario": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "scenario_id",
-        "incident",
-        "injection",
-        "expected",
-        "replay_command"
-      ],
+      "required": ["scenario_id", "incident", "injection", "expected", "replay_command"],
       "properties": {
         "scenario_id": {
           "$ref": "#/$defs/nonEmptyString"
@@ -469,9 +415,7 @@
                 "const": "full"
               }
             },
-            "required": [
-              "mode"
-            ]
+            "required": ["mode"]
           },
           "then": {
             "properties": {
@@ -485,9 +429,7 @@
                           "const": "quality_embedder_timeout"
                         }
                       },
-                      "required": [
-                        "incident"
-                      ]
+                      "required": ["incident"]
                     }
                   },
                   {
@@ -497,9 +439,7 @@
                           "const": "model_unavailable"
                         }
                       },
-                      "required": [
-                        "incident"
-                      ]
+                      "required": ["incident"]
                     }
                   },
                   {
@@ -509,9 +449,7 @@
                           "const": "corrupt_vector_artifact"
                         }
                       },
-                      "required": [
-                        "incident"
-                      ]
+                      "required": ["incident"]
                     }
                   },
                   {
@@ -521,9 +459,7 @@
                           "const": "lexical_backend_failure"
                         }
                       },
-                      "required": [
-                        "incident"
-                      ]
+                      "required": ["incident"]
                     }
                   },
                   {
@@ -533,9 +469,7 @@
                           "const": "storage_lock_pressure"
                         }
                       },
-                      "required": [
-                        "incident"
-                      ]
+                      "required": ["incident"]
                     }
                   },
                   {
@@ -545,9 +479,7 @@
                           "const": "watcher_backlog"
                         }
                       },
-                      "required": [
-                        "incident"
-                      ]
+                      "required": ["incident"]
                     }
                   }
                 ]

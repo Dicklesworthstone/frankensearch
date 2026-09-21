@@ -90,16 +90,11 @@
                       "const": "project_key"
                     }
                   },
-                  "required": [
-                    "name"
-                  ]
+                  "required": ["name"]
                 }
               }
             },
-            "required": [
-              "name",
-              "columns"
-            ]
+            "required": ["name", "columns"]
           }
         }
       }
@@ -124,17 +119,11 @@
                       "const": "state IN ('started','healthy','degraded','stale','stopped')"
                     }
                   },
-                  "required": [
-                    "name",
-                    "check"
-                  ]
+                  "required": ["name", "check"]
                 }
               }
             },
-            "required": [
-              "name",
-              "columns"
-            ]
+            "required": ["name", "columns"]
           }
         }
       }
@@ -159,17 +148,11 @@
                       "const": "phase IN ('initial','refined','failed')"
                     }
                   },
-                  "required": [
-                    "name",
-                    "check"
-                  ]
+                  "required": ["name", "check"]
                 }
               }
             },
-            "required": [
-              "name",
-              "columns"
-            ]
+            "required": ["name", "columns"]
           }
         }
       }
@@ -194,17 +177,11 @@
                       "const": "window IN ('1m','15m','1h','6h','24h','3d','1w')"
                     }
                   },
-                  "required": [
-                    "name",
-                    "check"
-                  ]
+                  "required": ["name", "check"]
                 }
               }
             },
-            "required": [
-              "name",
-              "columns"
-            ]
+            "required": ["name", "columns"]
           }
         }
       }
@@ -219,9 +196,7 @@
                 "const": "embedding_job_snapshots"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -246,17 +221,11 @@
                       "const": "is_stale IN (0,1)"
                     }
                   },
-                  "required": [
-                    "name",
-                    "check"
-                  ]
+                  "required": ["name", "check"]
                 }
               }
             },
-            "required": [
-              "name",
-              "columns"
-            ]
+            "required": ["name", "columns"]
           }
         }
       }
@@ -271,9 +240,7 @@
                 "const": "resource_samples"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -300,10 +267,7 @@
                           "const": "severity IN ('info','warn','error','critical')"
                         }
                       },
-                      "required": [
-                        "name",
-                        "check"
-                      ]
+                      "required": ["name", "check"]
                     }
                   },
                   {
@@ -317,19 +281,13 @@
                           "const": "state IN ('open','acknowledged','resolved')"
                         }
                       },
-                      "required": [
-                        "name",
-                        "check"
-                      ]
+                      "required": ["name", "check"]
                     }
                   }
                 ]
               }
             },
-            "required": [
-              "name",
-              "columns"
-            ]
+            "required": ["name", "columns"]
           }
         }
       }
@@ -344,9 +302,7 @@
                 "const": "evidence_links"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -371,17 +327,11 @@
                       "const": "reversible IN (0,1)"
                     }
                   },
-                  "required": [
-                    "name",
-                    "check"
-                  ]
+                  "required": ["name", "check"]
                 }
               }
             },
-            "required": [
-              "name",
-              "columns"
-            ]
+            "required": ["name", "columns"]
           }
         }
       }
@@ -396,9 +346,7 @@
                 "const": "ix_inst_pk_hb"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -413,9 +361,7 @@
                 "const": "ix_se_pk_ts"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -430,9 +376,7 @@
                 "const": "ix_se_ii_ts"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -447,9 +391,7 @@
                 "const": "ix_se_corr"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -464,9 +406,7 @@
                 "const": "ix_ss_pk_w"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -481,9 +421,7 @@
                 "const": "ix_ejs_pk"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -498,9 +436,7 @@
                 "const": "ix_iis_pk"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -515,9 +451,7 @@
                 "const": "ix_rs_pk"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -532,9 +466,7 @@
                 "const": "ix_at_pk"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -549,9 +481,7 @@
                 "const": "ix_at_open"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -566,9 +496,7 @@
                 "const": "ix_el_aid"
               }
             },
-            "required": [
-              "name"
-            ]
+            "required": ["name"]
           }
         }
       }
@@ -577,45 +505,25 @@
   "$defs": {
     "window_label": {
       "type": "string",
-      "enum": [
-        "1m",
-        "15m",
-        "1h",
-        "6h",
-        "24h",
-        "3d",
-        "1w"
-      ]
+      "enum": ["1m", "15m", "1h", "6h", "24h", "3d", "1w"]
     },
     "column": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "name",
-        "type",
-        "nullable"
-      ],
+      "required": ["name", "type", "nullable"],
       "properties": {
         "name": {
           "type": "string"
         },
         "type": {
           "type": "string",
-          "enum": [
-            "TEXT",
-            "INTEGER",
-            "REAL"
-          ]
+          "enum": ["TEXT", "INTEGER", "REAL"]
         },
         "nullable": {
           "type": "boolean"
         },
         "default": {
-          "type": [
-            "string",
-            "number",
-            "boolean"
-          ]
+          "type": ["string", "number", "boolean"]
         },
         "check": {
           "type": "string"
@@ -628,12 +536,7 @@
     "table": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "name",
-        "purpose",
-        "primary_key",
-        "columns"
-      ],
+      "required": ["name", "purpose", "primary_key", "columns"],
       "properties": {
         "name": {
           "type": "string",
@@ -680,12 +583,7 @@
     "index": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "name",
-        "table",
-        "columns",
-        "query_goal"
-      ],
+      "required": ["name", "table", "columns", "query_goal"],
       "properties": {
         "name": {
           "type": "string",
@@ -734,11 +632,7 @@
     "dedup_key": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "table",
-        "key",
-        "strategy"
-      ],
+      "required": ["table", "key", "strategy"],
       "properties": {
         "table": {
           "type": "string"
@@ -748,10 +642,7 @@
         },
         "strategy": {
           "type": "string",
-          "enum": [
-            "insert_or_ignore",
-            "upsert"
-          ]
+          "enum": ["insert_or_ignore", "upsert"]
         }
       }
     },
@@ -785,13 +676,7 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "enum": [
-              "version",
-              "name",
-              "applied_at_ms",
-              "checksum",
-              "reversible"
-            ]
+            "enum": ["version", "name", "applied_at_ms", "checksum", "reversible"]
           }
         }
       }
@@ -799,12 +684,7 @@
     "query_pattern": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "name",
-        "filters",
-        "sort",
-        "outputs"
-      ],
+      "required": ["name", "filters", "sort", "outputs"],
       "properties": {
         "name": {
           "type": "string",
@@ -871,11 +751,7 @@
     "query_api": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "latency_window",
-        "live_alerts",
-        "resource_timeline"
-      ],
+      "required": ["latency_window", "live_alerts", "resource_timeline"],
       "properties": {
         "latency_window": {
           "type": "string"
