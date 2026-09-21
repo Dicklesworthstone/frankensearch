@@ -857,3 +857,13 @@ through RCH jobs `30023605353973348` and `30023605353973346`, respectively;
 these are not terminal success receipts. Exact public R1 acceptance remains
 open independently. Detailed evidence and the current checklist remain in
 the release-work directory cited above.
+
+The default gate subsequently finished with two failures: strict workspace
+Clippy rejected `.err().expect()` in the new publication cancellation test,
+and the native-quality daemon's first refinement exceeded its unchanged
+500 ms deadline. All other stages, including the executable quickstart,
+passed. The retrieved full-gate log SHA-256 is
+`e822f9a974289e2ea5742b2baca90844765c16230e784ec0cf23f04dd816c3b2`.
+The assertion is repaired with `expect_err`; the timeout remains under
+investigation. Neither this repair nor an isolated replay replaces a complete
+release verdict. The full Quill invocation remains nonterminal.
