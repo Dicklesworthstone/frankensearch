@@ -265,11 +265,7 @@
           "documents_per_second": 69275,
           "updates_per_second": 1991,
           "update_to_searchable_p95_ms": 43.633,
-          "load_average": [
-            6.08,
-            6.95,
-            6.84
-          ]
+          "load_average": [6.08, 6.95, 6.84]
         }
       }
     ],
@@ -301,11 +297,7 @@
     "agent_mail": "degraded",
     "reason": "database corruption circuit breaker",
     "repair_attempted": false,
-    "fallback_truth": [
-      "git",
-      "worktree",
-      "beads"
-    ]
+    "fallback_truth": ["git", "worktree", "beads"]
   },
   "rch_watchdog": {
     "timer": "active",

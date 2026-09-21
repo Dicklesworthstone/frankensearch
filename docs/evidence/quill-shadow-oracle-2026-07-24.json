@@ -103,12 +103,7 @@
       "enabled mode without observations warns",
       "clean observation stream passes"
     ],
-    "tracing_fields": [
-      "serve_latency",
-      "shadow_latency",
-      "divergence_class",
-      "shed_reason"
-    ]
+    "tracing_fields": ["serve_latency", "shadow_latency", "divergence_class", "shed_reason"]
   },
   "behavioral_proof": {
     "core": [
@@ -193,18 +188,7 @@
   "coordination": {
     "agent": "RoseMaple",
     "file_reservations": [
-      12254,
-      12255,
-      12256,
-      12257,
-      12258,
-      12259,
-      12260,
-      12261,
-      12262,
-      12263,
-      12264,
-      12265
+      12254, 12255, 12256, 12257, 12258, 12259, 12260, 12261, 12262, 12263, 12264, 12265
     ],
     "reservation_conflicts": 0,
     "agent_mail_thread": "bd-quill-duel-shadow-oracle-t6oo"

@@ -171,10 +171,7 @@
     "git_diff_check": "pass",
     "ubs": {
       "result": "reviewed-not-pass",
-      "scope": [
-        "crates/frankensearch-quill/src/index.rs",
-        ".github/workflows/ci.yml"
-      ],
+      "scope": ["crates/frankensearch-quill/src/index.rs", ".github/workflows/ci.yml"],
       "reported": {
         "critical": 96,
         "warnings": 2808,
@@ -185,11 +182,7 @@
   },
   "coordination": {
     "agent": "RoseMaple",
-    "file_reservations": [
-      12246,
-      12247,
-      12248
-    ],
+    "file_reservations": [12246, 12247, 12248],
     "agent_mail": "Reservations were granted conflict-free. Completion messaging remains subject to the known Agent Mail database-integrity failure, so Git, worktree state, and Beads are coordination truth."
   },
   "remote_only": {

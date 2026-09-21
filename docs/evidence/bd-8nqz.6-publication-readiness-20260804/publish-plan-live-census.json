@@ -15,9 +15,7 @@
   "source": {
     "git_sha": "bae865c03848abddbfd26aa39130c4092ff2cc5f",
     "tracked_worktree_dirty": true,
-    "non_ignored_untracked_files": [
-      "..."
-    ],
+    "non_ignored_untracked_files": ["..."],
     "cargo_lock_sha256": "09f199f0031c7ef33ab3a43bc76fd32042132907ffb942e653153b60cc0808db",
     "rustc": "rustc 1.99.0-nightly (9f36de775 2026-07-19)",
     "cargo": "cargo 1.99.0-nightly (3efb1f477 2026-07-17)"
@@ -43,9 +41,7 @@
       "name": "frankensearch-durability",
       "version": "0.2.0",
       "manifest": "crates/frankensearch-durability/Cargo.toml",
-      "internal_dependencies": [
-        "frankensearch-core"
-      ],
+      "internal_dependencies": ["frankensearch-core"],
       "registry": {
         "status": "published",
         "checksum": "10e100cbc6cb37283f74ce8ad578dbac4d2ee5264454a01b0967883232fd6e35",
@@ -59,9 +55,7 @@
       "name": "frankensearch-embed",
       "version": "0.2.1",
       "manifest": "crates/frankensearch-embed/Cargo.toml",
-      "internal_dependencies": [
-        "frankensearch-core"
-      ],
+      "internal_dependencies": ["frankensearch-core"],
       "registry": {
         "status": "published",
         "checksum": "51c5469ac2ef558c069e1396971e5cfbd67fd46c1613bf5109e5443f6f25e271",
@@ -75,9 +69,7 @@
       "name": "frankensearch-index",
       "version": "0.2.1",
       "manifest": "crates/frankensearch-index/Cargo.toml",
-      "internal_dependencies": [
-        "frankensearch-core"
-      ],
+      "internal_dependencies": ["frankensearch-core"],
       "registry": {
         "status": "published",
         "checksum": "cafea894f186445b67383d015ffbae4a2a945a5072025f8f992a1033876c3cb6",
@@ -91,9 +83,7 @@
       "name": "frankensearch-lexical",
       "version": "0.2.1",
       "manifest": "crates/frankensearch-lexical/Cargo.toml",
-      "internal_dependencies": [
-        "frankensearch-core"
-      ],
+      "internal_dependencies": ["frankensearch-core"],
       "registry": {
         "status": "published",
         "checksum": "ec99e727d05bbdb7f426d205984bb374f8e5e4cd73ee8c4af7bf7e58f2439805",
@@ -126,10 +116,7 @@
       "name": "frankensearch-rerank",
       "version": "0.2.2",
       "manifest": "crates/frankensearch-rerank/Cargo.toml",
-      "internal_dependencies": [
-        "frankensearch-core",
-        "frankensearch-embed"
-      ],
+      "internal_dependencies": ["frankensearch-core", "frankensearch-embed"],
       "registry": {
         "status": "published",
         "checksum": "0aba2030939f8535d4855c0f5b5a3c164283f532f60aac912217dad4cbfa4ea8",
@@ -164,9 +151,7 @@
       "name": "frankensearch-storage",
       "version": "0.2.0",
       "manifest": "crates/frankensearch-storage/Cargo.toml",
-      "internal_dependencies": [
-        "frankensearch-core"
-      ],
+      "internal_dependencies": ["frankensearch-core"],
       "registry": {
         "status": "published",
         "checksum": "1eb475291a954bd31dc12b1467aa4c160c62b52801575643fd9dd964efe089bd",
@@ -204,9 +189,7 @@
       "name": "frankensearch-tui",
       "version": "0.2.0",
       "manifest": "crates/frankensearch-tui/Cargo.toml",
-      "internal_dependencies": [
-        "frankensearch-core"
-      ],
+      "internal_dependencies": ["frankensearch-core"],
       "registry": {
         "status": "unpublished",
         "checksum": null,
@@ -243,10 +226,7 @@
       "name": "frankensearch-ops",
       "version": "0.2.0",
       "manifest": "crates/frankensearch-ops/Cargo.toml",
-      "internal_dependencies": [
-        "frankensearch-core",
-        "frankensearch-tui"
-      ],
+      "internal_dependencies": ["frankensearch-core", "frankensearch-tui"],
       "registry": {
         "status": "unpublished",
         "checksum": null,
