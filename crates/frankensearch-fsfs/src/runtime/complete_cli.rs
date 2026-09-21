@@ -72,6 +72,8 @@ impl FsfsRuntime {
             }
             #[cfg(unix)]
             CliCommand::Serve => self.run_complete_generation_serve(cx, &root).await,
+            #[cfg(unix)]
+            CliCommand::Daemon => self.run_complete_generation_daemon(cx, &root).await,
             CliCommand::Status | CliCommand::Doctor => {
                 let store = CompleteGenerationStore::open(cx, &root)?;
                 let selected = store.active(cx)?.ok_or_else(|| {
@@ -88,7 +90,7 @@ impl FsfsRuntime {
             }
             _ => Err(complete_cli_error(
                 "command",
-                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, direct search, stdio serve, status, or doctor",
+                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, direct search, serve, daemon, status, or doctor",
             )),
         }
     }
@@ -285,10 +287,7 @@ impl FsfsRuntime {
     #[allow(clippy::future_not_send)]
     async fn run_complete_generation_serve(&self, cx: &Cx, root: &Path) -> SearchResult<()> {
         if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
-            return Err(complete_cli_error(
-                "serve_transport",
-                "complete-generation serve currently supports stdin/stdout only; no socket daemon fallback was attempted",
-            ));
+            return self.run_complete_generation_daemon(cx, root).await;
         }
         // Keep the command future Send: StdinLock contains a non-Send guard
         // that cannot be retained while a query awaits model/search work.
@@ -826,7 +825,7 @@ mod tests {
             publish(&runtime, &cx, &root).await;
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
             let before = store.active(&cx).unwrap();
-            for command in [CliCommand::Compact, CliCommand::Flush, CliCommand::Daemon] {
+            for command in [CliCommand::Compact, CliCommand::Flush, CliCommand::Watch] {
                 let mut input = runtime.cli_input.clone();
                 input.command = command;
                 runtime
@@ -840,3 +839,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(unix)]
+#[path = "complete_daemon.rs"]
+mod complete_daemon;
