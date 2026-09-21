@@ -5,8 +5,9 @@ A rebuild writes its lexical, vector, catalog and content artifacts into a fresh
 bundle and selects that bundle only after the existing indexing and search
 admission checks succeed. Old bundles and abandoned builds are retained.
 
-This route is currently Unix-only. Use a store outside the source tree, with an
-existing parent directory. Configure a generation-local catalog:
+This route is currently Unix-only. Start with a fresh store outside the source
+tree, with an existing parent directory. In-place migration of a legacy index
+is not qualified by this workflow. Configure a generation-local catalog:
 
 ```toml
 [storage]
@@ -56,14 +57,44 @@ reason to scan for another generation or fall back to the legacy mutable index.
 Setting the opt-in variable to false does not override that protection. Do not
 point mutation commands at a sealed generation subdirectory.
 
+## Warm standard-input serving
+
+A long-lived process can reuse admitted models and indexes while following
+complete-generation publication between requests:
+
+```sh
+fsfs serve --index-dir /work/search-store --config /work/fsfs.toml --format jsonl
+```
+
+Send the existing JSON request shape, for example
+`{"query":"connection pooling","limit":10}`, or a plain query line. Each
+request uses the existing buffered `fsfs.search.serve.v3` response shape, after
+one ready event. Send `quit` or close stdin to stop. This is not the progressive
+socket transport: use direct `search --stream` for immediate phase delivery.
+
+Before executing a request, the server checks the selection and fully admits
+any successor before swapping resources. The runtime's hydration paths and
+its lexical/vector resources stay together. A changed generation invalidates
+the in-memory result cache. A malformed selection or failed admission returns
+an error for that request, even when the old query was cached; repairing the
+selection permits a later retry without silently serving stale hits.
+
+Input is bounded to 1 MiB before JSON parsing; responses are fully encoded under
+the existing 4 MiB daemon-response limit before bytes are emitted. Output errors
+return and release the retained reader. Like the existing stdio server, stdin
+reads block on the command's owning lane: cancellation is observed between
+reads and requests, not promised to interrupt an idle blocked read. No detached
+input worker is introduced.
+
 ## Current boundaries
 
-Complete-store CLI routing currently supports one-shot `index`, direct `search`
-(including JSONL/TOON streaming), `status`, and `doctor`. It refuses watch mode,
-TUI, daemon/socket serving, query expansion and in-place mutators rather than
-pretending that those paths have been migrated. Existing legacy roots without
-a complete-generation selection or staging tree retain their ordinary behavior.
-The legacy watch/search exclusion issue is not resolved by this opt-in route.
+Complete-store CLI routing supports one-shot `index`, direct `search` (including
+JSONL/TOON streaming), stdio `serve`, `status`, and `doctor`. It refuses watch
+mode, TUI, daemon/socket serving, direct query expansion and in-place mutators
+rather than pretending that those paths have been migrated. Existing legacy
+roots without a complete-generation selection or staging tree retain their
+ordinary behavior when the new layout is not explicitly selected. The legacy
+watch/search exclusion issue is not resolved by this opt-in route.
 
 There is no automatic garbage collection. Retained predecessors and failed
 builds consume disk space. The store assumes cooperating writers and a trusted
@@ -89,4 +120,6 @@ FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR=/verified/model-cache \
 
 These tests were added without local Rust execution in the editing environment;
 no compile, formatting, test, performance or full-release qualification is
-asserted by this document.
+asserted by this document. Warm-server tests replay genuine published bundle
+selections at controlled output boundaries; they do not certify a real-model
+cross-process watcher lifecycle.

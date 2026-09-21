@@ -10,9 +10,11 @@ use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 
 use super::{
-    FsfsRuntime, InterfaceMode, SearchExecutionFlags, iso_timestamp_now,
-    pressure_timestamp_ms, retained_search_checkpoint, validate_retained_catalog_path,
+    FsfsRuntime, InterfaceMode, SearchExecutionFlags, iso_timestamp_now, pressure_timestamp_ms,
+    retained_search_checkpoint, validate_retained_catalog_path,
 };
+#[cfg(unix)]
+use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
 use crate::adapters::format_emitter::{emit_envelope, meta_for_format};
 use crate::generation_store::{
     COMPLETE_GENERATION_MANIFEST, COMPLETE_GENERATION_POINTER, CompleteGenerationStore,
@@ -68,6 +70,8 @@ impl FsfsRuntime {
                 self.run_complete_generation_search_with_writer(cx, &root, &mut stdout)
                     .await
             }
+            #[cfg(unix)]
+            CliCommand::Serve => self.run_complete_generation_serve(cx, &root).await,
             CliCommand::Status | CliCommand::Doctor => {
                 let store = CompleteGenerationStore::open(cx, &root)?;
                 let selected = store.active(cx)?.ok_or_else(|| {
@@ -84,7 +88,7 @@ impl FsfsRuntime {
             }
             _ => Err(complete_cli_error(
                 "command",
-                "this command cannot mutate or serve a complete-generation store in place; use a one-shot index rebuild, direct search, status, or doctor",
+                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, direct search, stdio serve, status, or doctor",
             )),
         }
     }
@@ -266,6 +270,133 @@ impl FsfsRuntime {
     }
 }
 
+#[cfg(unix)]
+impl FsfsRuntime {
+    #[allow(clippy::future_not_send)]
+    async fn run_complete_generation_serve(&self, cx: &Cx, root: &Path) -> SearchResult<()> {
+        if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
+            return Err(complete_cli_error(
+                "serve_transport",
+                "complete-generation serve currently supports stdin/stdout only; no socket daemon fallback was attempted",
+            ));
+        }
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        let mut output = std::io::stdout();
+        let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
+        self.run_complete_generation_serve_with_io(cx, root, &mut input, &mut output, cache_enabled)
+            .await
+    }
+
+    // Like the existing stdio server, input is read on the owning command lane.
+    // Cancellation is observed between reads/requests; a blocked stdin read is
+    // not claimed to be preemptible. No detached input worker is introduced.
+    #[allow(clippy::future_not_send)]
+    async fn run_complete_generation_serve_with_io<R: std::io::BufRead, W: Write>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        input: &mut R,
+        output: &mut W,
+        cache_enabled: bool,
+    ) -> SearchResult<()> {
+        use std::collections::HashMap;
+        use std::io::{BufRead, Read};
+
+        let mut live = self.open_live_retained_search(cx, root).await?;
+        let mut cache = HashMap::new();
+        let ready = Self::search_serve_ready_event(
+            self.cli_input.format.to_string(),
+            &live.reader.resources,
+        );
+        emit_complete_serve_line(&ready, output)?;
+        let mut line = Vec::new();
+        loop {
+            retained_search_checkpoint(cx)?;
+            line.clear();
+            // Bound allocation before JSON parsing, including partial clients.
+            // Do not drain an arbitrarily long invalid line before refusing it.
+            let count = (&mut *input)
+                .take(FSFS_DAEMON_REQUEST_MAX_BYTES as u64 + 1)
+                .read_until(b'\n', &mut line)?;
+            if count == 0 {
+                return Ok(());
+            }
+            if line.len() > FSFS_DAEMON_REQUEST_MAX_BYTES {
+                return Err(complete_cli_error("serve_request", "request exceeds 1 MiB limit"));
+            }
+            let raw = match std::str::from_utf8(&line) {
+                Ok(raw) => raw.trim(),
+                Err(_) => {
+                    emit_complete_serve_line(
+                        &Self::search_serve_error_response("", "full", "request is not UTF-8"),
+                        output,
+                    )?;
+                    continue;
+                }
+            };
+            if raw.is_empty() {
+                continue;
+            }
+            if matches!(raw, "quit" | "exit" | ":quit" | ":exit") {
+                return Ok(());
+            }
+            let request = match Self::parse_search_serve_request(raw) {
+                Ok(request) => request,
+                Err(error) => {
+                    emit_complete_serve_line(
+                        &Self::search_serve_error_response("", "full", error.to_string()),
+                        output,
+                    )?;
+                    continue;
+                }
+            };
+            let query = request.query.clone();
+            let mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
+            let result = async {
+                if live.refresh(cx).await? {
+                    cache.clear();
+                }
+                // Both the runtime's hydration paths and the resources belong
+                // to the same admitted generation. Never invoke this handler
+                // with the outer store-root runtime or after a failed refresh.
+                live.reader
+                    .runtime
+                    .execute_search_serve_request(
+                        cx,
+                        request,
+                        &mut live.reader.resources,
+                        &mut cache,
+                        cache_enabled,
+                    )
+                    .await
+            }
+            .await;
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => Self::search_serve_error_response(query, mode, error.to_string()),
+            };
+            emit_complete_serve_line(&response, output)?;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn emit_complete_serve_line<T: serde::Serialize, W: Write>(
+    value: &T,
+    output: &mut W,
+) -> SearchResult<()> {
+    // Encode fully under the existing daemon response bound before exposing
+    // bytes, so an oversized response cannot leave a partial JSON record.
+    let mut bytes = SearchServeFrameBuffer::default();
+    serde_json::to_writer(&mut bytes, value).map_err(|error| {
+        complete_cli_error("serve_response", &format!("cannot encode response: {error}"))
+    })?;
+    bytes.write_all(b"\n")?;
+    output.write_all(&bytes.0)?;
+    output.flush().map_err(SearchError::Io)
+}
+
 fn complete_entry_exists(path: &Path) -> SearchResult<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -331,6 +462,180 @@ mod tests {
         assert_eq!(receipt["ok"], true);
         assert_eq!(receipt["data"]["publication"], "durable");
         receipt
+    }
+
+    struct PublicationWriter {
+        bytes: Vec<u8>,
+        root: PathBuf,
+        flushes: usize,
+        switches: std::collections::VecDeque<(usize, Vec<u8>)>,
+    }
+
+    impl Write for PublicationWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            if self.switches.front().is_some_and(|(after, _)| *after == self.flushes) {
+                let (_, pointer) = self.switches.pop_front().expect("scheduled switch");
+                let temporary = self.root.join("test-selection-switch");
+                fs::write(&temporary, pointer)?;
+                fs::rename(temporary, self.root.join(COMPLETE_GENERATION_POINTER))?;
+            }
+            Ok(())
+        }
+    }
+
+    fn serve_lines(bytes: &[u8]) -> Vec<serde_json::Value> {
+        std::str::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn complete_serve_reuses_warm_cache_then_observes_successor_at_request_boundary() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let pointer_path = root.join(COMPLETE_GENERATION_POINTER);
+            let first = fs::read(&pointer_path).unwrap();
+            fs::write(source.join("beta.md"), "sharedtoken beta document").unwrap();
+            publish(&runtime, &cx, &root).await;
+            let successor = fs::read(&pointer_path).unwrap();
+            // Replay genuine, fully admitted bundles; the output flush places
+            // publication exactly between complete requests, not inside search.
+            fs::write(&pointer_path, first).unwrap();
+            let mut output = PublicationWriter {
+                bytes: Vec::new(),
+                root: root.clone(),
+                flushes: 0,
+                switches: [(3, successor)].into(),
+            };
+            let mut input = std::io::Cursor::new(
+                b"sharedtoken\nsharedtoken\nsharedtoken\nsharedtoken\nquit\n",
+            );
+            runtime
+                .run_complete_generation_serve_with_io(&cx, &root, &mut input, &mut output, true)
+                .await
+                .unwrap();
+            let lines = serve_lines(&output.bytes);
+            assert_eq!(lines.len(), 5);
+            assert_eq!(lines[0]["event"], "ready");
+            for (row, cached, count) in [(1, false, 1), (2, true, 1), (3, false, 2), (4, true, 2)] {
+                assert_eq!(lines[row]["ok"], true);
+                assert_eq!(lines[row]["cached"], cached);
+                let phases = lines[row]["payloads"].as_array().unwrap();
+                assert_eq!(phases.last().unwrap()["hits"].as_array().unwrap().len(), count);
+            }
+            assert!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap()
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn complete_serve_refuses_stale_cache_on_bad_selection_and_recovers_after_repair() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let pointer_path = root.join(COMPLETE_GENERATION_POINTER);
+            let first = fs::read(&pointer_path).unwrap();
+            fs::write(source.join("beta.md"), "sharedtoken beta document").unwrap();
+            publish(&runtime, &cx, &root).await;
+            let successor = fs::read(&pointer_path).unwrap();
+            fs::write(&pointer_path, first).unwrap();
+            let mut output = PublicationWriter {
+                bytes: Vec::new(),
+                root: root.clone(),
+                flushes: 0,
+                switches: [(2, b"corrupt selection".to_vec()), (3, successor)].into(),
+            };
+            let mut input = std::io::Cursor::new(b"sharedtoken\nsharedtoken\nsharedtoken\nquit\n");
+            runtime
+                .run_complete_generation_serve_with_io(&cx, &root, &mut input, &mut output, true)
+                .await
+                .unwrap();
+            let lines = serve_lines(&output.bytes);
+            assert_eq!(lines.len(), 4);
+            assert_eq!(lines[1]["ok"], true);
+            assert_eq!(lines[2]["ok"], false);
+            assert_eq!(lines[2]["cached"], false);
+            assert!(lines[2]["payloads"].as_array().unwrap().is_empty());
+            assert_eq!(lines[3]["ok"], true);
+            assert_eq!(lines[3]["cached"], false);
+            let phases = lines[3]["payloads"].as_array().unwrap();
+            assert_eq!(phases.last().unwrap()["hits"].as_array().unwrap().len(), 2);
+            assert!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap()
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn complete_serve_bounds_unterminated_input_without_mutating_the_bundle() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let before = store.active(&cx).unwrap();
+            let mut input = std::io::Cursor::new(vec![b'a'; FSFS_DAEMON_REQUEST_MAX_BYTES + 1]);
+            let mut output = Vec::new();
+            let error = runtime
+                .run_complete_generation_serve_with_io(&cx, &root, &mut input, &mut output, true)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, .. } if field == "complete_generation.serve_request"
+            ));
+            assert_eq!(serve_lines(&output).len(), 1, "only the ready event is visible");
+            assert_eq!(store.active(&cx).unwrap(), before);
+        });
+    }
+
+    #[test]
+    fn complete_serve_bad_utf8_and_json_do_not_poison_the_next_request() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut input = std::io::Cursor::new(b"\xff\n{invalid json\nsharedtoken\nquit\n");
+            let mut output = Vec::new();
+            runtime
+                .run_complete_generation_serve_with_io(&cx, &root, &mut input, &mut output, true)
+                .await
+                .unwrap();
+            let lines = serve_lines(&output);
+            assert_eq!(lines.len(), 4);
+            assert_eq!(lines[1]["ok"], false);
+            assert_eq!(lines[2]["ok"], false);
+            assert_eq!(lines[3]["ok"], true);
+            assert_eq!(lines[3]["cached"], false);
+        });
+    }
+
+    #[test]
+    fn complete_serve_oversized_response_exposes_no_partial_record() {
+        let oversized = "x".repeat(super::super::FSFS_DAEMON_RESPONSE_MAX_BYTES);
+        let mut output = Vec::new();
+        emit_complete_serve_line(&oversized, &mut output).unwrap_err();
+        assert!(output.is_empty());
     }
 
     #[test]
