@@ -222,12 +222,14 @@ impl FsfsRuntime {
         // Apply the same full-generation admission used by actual search, then
         // open its real lexical/vector/producer resources before sealing.
         Self::validate_search_generation_at_root(build.path(), SearchExecutionMode::Full)?;
-        let resources = Box::pin(candidate.prepare_search_execution_resources_at_root_with_modes(
-            cx,
-            build.path(),
-            SearchExecutionMode::Full,
-            SearchExecutionMode::Full,
-        ))
+        let resources = Box::pin(
+            candidate.prepare_search_execution_resources_at_root_with_modes(
+                cx,
+                build.path(),
+                SearchExecutionMode::Full,
+                SearchExecutionMode::Full,
+            ),
+        )
         .await?;
         drop(resources);
         build.publish(cx, |_, path| {

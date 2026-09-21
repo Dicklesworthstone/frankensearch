@@ -163,10 +163,8 @@ impl CompleteGenerationStore {
         require_directory(&parent)?;
         let path = parent.join(&id);
         require_directory(&path)?;
-        let bytes = read_bounded_regular(
-            &path.join(COMPLETE_GENERATION_MANIFEST),
-            MAX_MANIFEST_BYTES,
-        )?;
+        let bytes =
+            read_bounded_regular(&path.join(COMPLETE_GENERATION_MANIFEST), MAX_MANIFEST_BYTES)?;
         if digest(&bytes) != manifest_sha256 {
             return Err(invalid(
                 &path,
@@ -304,7 +302,8 @@ impl GenerationBuild {
         let temporary = self.store.root.join(format!(".FSFS-CURRENT-{}", self.id));
         write_new_synced(&temporary, &pointer)?;
         checkpoint(cx)?;
-        self.lease.fence("complete-generation pointer publication")?;
+        self.lease
+            .fence("complete-generation pointer publication")?;
         if read_pointer(&self.store.root)? != self.predecessor {
             return Err(invalid(
                 &self.store.root,
@@ -324,10 +323,9 @@ impl GenerationBuild {
         // cancel cannot turn an already visible commit into a claimed abort.
         match File::open(&self.store.root).and_then(|directory| directory.sync_all()) {
             Ok(()) => Ok(GenerationPublication::Durable(generation)),
-            Err(source) => Ok(GenerationPublication::VisibleButDurabilityUncertain {
-                generation,
-                source,
-            }),
+            Err(source) => {
+                Ok(GenerationPublication::VisibleButDurabilityUncertain { generation, source })
+            }
         }
     }
 }
@@ -486,14 +484,10 @@ fn read_pointer(root: &Path) -> SearchResult<Option<Vec<u8>>> {
 }
 
 fn decode_pointer(bytes: &[u8], root: &Path) -> SearchResult<(String, String)> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| invalid(root, "selection is not UTF-8"))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid(root, "selection is not UTF-8"))?;
     let fields = text.split('\n').collect::<Vec<_>>();
     if fields.len() != 4 || fields[0] != POINTER_MAGIC || !fields[3].is_empty() {
-        return Err(invalid(
-            root,
-            "invalid complete-generation pointer framing",
-        ));
+        return Err(invalid(root, "invalid complete-generation pointer framing"));
     }
     let id = fields[1];
     let parts = id.split('-').collect::<Vec<_>>();
@@ -522,27 +516,18 @@ fn hex(value: &str, length: usize) -> bool {
 fn read_bounded_regular(path: &Path, limit: u64) -> SearchResult<Vec<u8>> {
     let file = open_regular(path)?;
     if file.metadata()?.len() > limit {
-        return Err(invalid(
-            path,
-            "descriptor is not a bounded regular file",
-        ));
+        return Err(invalid(path, "descriptor is not a bounded regular file"));
     }
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
-        return Err(invalid(
-            path,
-            "descriptor grew beyond its size bound",
-        ));
+        return Err(invalid(path, "descriptor grew beyond its size bound"));
     }
     Ok(bytes)
 }
 
 fn write_new_synced(path: &Path, bytes: &[u8]) -> SearchResult<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -556,15 +541,14 @@ fn open_regular(path: &Path) -> SearchResult<File> {
     options.read(true);
     #[cfg(unix)]
     {
-        let flags = i32::try_from(
-            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits(),
-        )
-        .map_err(|_| {
-            std::io::Error::new(
-                ErrorKind::Unsupported,
-                "no-follow file flags do not fit this target's open flag word",
-            )
-        })?;
+        let flags =
+            i32::try_from((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits())
+                .map_err(|_| {
+                    std::io::Error::new(
+                        ErrorKind::Unsupported,
+                        "no-follow file flags do not fit this target's open flag word",
+                    )
+                })?;
         options.custom_flags(flags);
     }
     let file = options.open(path)?;
@@ -637,7 +621,12 @@ mod tests {
 
     fn write_bundle(path: &Path, value: &str) {
         fs::create_dir(path.join("lexical")).unwrap();
-        for relative in ["lexical/MANIFEST", "vector.idx", "catalog.db", "content.txt"] {
+        for relative in [
+            "lexical/MANIFEST",
+            "vector.idx",
+            "catalog.db",
+            "content.txt",
+        ] {
             fs::write(path.join(relative), value).unwrap();
         }
     }
@@ -664,7 +653,10 @@ mod tests {
             write_bundle(&abandoned, "partial");
             assert!(
                 failed
-                    .publish(&cx, |_, path| Err(invalid(path, "injected admission failure")))
+                    .publish(&cx, |_, path| Err(invalid(
+                        path,
+                        "injected admission failure"
+                    )))
                     .is_err()
             );
             assert_eq!(store.active(&cx).unwrap(), Some(first.clone()));
@@ -686,9 +678,20 @@ mod tests {
             let second = publish(&store, &cx, "new");
             assert_ne!(first.id(), second.id());
             assert_eq!(store.active(&cx).unwrap(), Some(second.clone()));
-            for relative in ["lexical/MANIFEST", "vector.idx", "catalog.db", "content.txt"] {
-                assert_eq!(fs::read_to_string(first.path().join(relative)).unwrap(), "old");
-                assert_eq!(fs::read_to_string(second.path().join(relative)).unwrap(), "new");
+            for relative in [
+                "lexical/MANIFEST",
+                "vector.idx",
+                "catalog.db",
+                "content.txt",
+            ] {
+                assert_eq!(
+                    fs::read_to_string(first.path().join(relative)).unwrap(),
+                    "old"
+                );
+                assert_eq!(
+                    fs::read_to_string(second.path().join(relative)).unwrap(),
+                    "new"
+                );
             }
         });
     }
@@ -837,7 +840,10 @@ mod tests {
             let temporary = root.path().join(format!(".FSFS-CURRENT-{}", build.id));
             fs::write(&temporary, "retain this evidence").unwrap();
             assert!(build.publish(&cx, |_, _| Ok(())).is_err());
-            assert_eq!(fs::read_to_string(temporary).unwrap(), "retain this evidence");
+            assert_eq!(
+                fs::read_to_string(temporary).unwrap(),
+                "retain this evidence"
+            );
             assert_eq!(store.active(&cx).unwrap(), Some(first));
         });
     }
@@ -861,7 +867,9 @@ mod tests {
             assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
             drop(future);
             assert_eq!(store.active(&cx).unwrap(), Some(first));
-            let retry = store.begin(&cx).expect("abandoned future released its lease");
+            let retry = store
+                .begin(&cx)
+                .expect("abandoned future released its lease");
             drop(retry);
         });
     }
