@@ -23264,7 +23264,8 @@ mod tests {
                 for metered in [false, true] {
                     let mut prepared = PreparedSnapshotDocFreqs::new();
                     if site == 3 {
-                        let seed = QueryCheckpoint::new(&cx, "seed_df", 2, 3);
+                        let seed: QueryCheckpointHandle<'_> =
+                            QueryCheckpoint::new(&cx, "seed_df", 2, 3);
                         assert_eq!(
                             prepared
                                 .get_or_compute(&seed, &snapshot, CONTENT_FIELD, b"beta")
@@ -23286,8 +23287,9 @@ mod tests {
                         QueryCheckpoint::new(&cx, "failed_df", 2, 2)
                     };
                     assert_eq!(checkpoint.metering(), metered);
+                    let checkpoint_handle: QueryCheckpointHandle<'_> = checkpoint.clone();
                     let error = prepared
-                        .get_or_compute(&checkpoint, &snapshot, CONTENT_FIELD, b"alpha")
+                        .get_or_compute(&checkpoint_handle, &snapshot, CONTENT_FIELD, b"alpha")
                         .expect_err("allocation failure must never fall back to an uncached scan");
                     let QuillIndexError::Argus(ArgusError::Allocation { resource, count }) = error
                     else {
@@ -23323,10 +23325,11 @@ mod tests {
                     }
                     prepared.reservation_overrides = SnapshotDocFreqReservationOverrides::default();
                     let retry = QueryCheckpoint::new(&cx, "retry_df", 2, 3);
+                    let retry_handle: QueryCheckpointHandle<'_> = retry.clone();
                     for _ in 0..2 {
                         assert_eq!(
                             prepared
-                                .get_or_compute(&retry, &snapshot, CONTENT_FIELD, b"alpha")
+                                .get_or_compute(&retry_handle, &snapshot, CONTENT_FIELD, b"alpha")
                                 .expect(
                                     "retry and cache hit retain the correct document frequency"
                                 ),
