@@ -19,8 +19,9 @@ A September 20 supplement below separates changes landed after the 0.6.1
 publication from that immutable crate release. Cross-platform binaries and
 complete release qualification remain pending.
 
-The September 21 supplement records executable complete-generation integration
-and reloadable default configuration files. These fixes remain unreleased.
+The September 21 supplement records executable complete-generation integration,
+live replacement-generation watching, Unix-socket serving, and reloadable default
+configuration files. These changes remain unreleased.
 
 ## Version Timeline
 
@@ -251,12 +252,33 @@ qualified; individual results below are narrower than release acceptance.
   with the current dependency API. Forty-two focused unit tests and five real
   executable tests pass, including a Potion-backed successor rebuild, retained
   predecessor, direct/streaming search, and malformed-request recovery followed
-  by a cached stdio result. This does not qualify watch/socket-daemon routing or
-  the full release matrix.
+  by a cached stdio result. Those checks cover the original stdio integration;
+  watcher/socket followthrough is recorded separately below.
   [Executable wiring](https://github.com/Dicklesworthstone/frankensearch/commit/a2bae41dffdf32e1efdf545fad05d2e2a93355e3);
   [warm serving](https://github.com/Dicklesworthstone/frankensearch/commit/a6992b70fa350fc49e1d5f7b8aeb0210311291b7);
   [digest repair](https://github.com/Dicklesworthstone/frankensearch/commit/4f30ffee34e9860e9a0b9a94b31d5e348be7d3cb);
   [executable validation and fixes](https://github.com/Dicklesworthstone/frankensearch/commit/e7808fe60eb20750430b05b8055a6a5d132ace74).
+
+- **Complete stores can publish replacement generations while searches continue.**
+  `watch` and `index --watch` coalesce filesystem changes, recheck source authority
+  before publication, and retain predecessor generations for existing readers.
+  Missing or replaced source roots fail without publishing mass deletions.
+  A real-Potion executable test searches through additions, renames, and deletions.
+  [Watcher implementation](https://github.com/Dicklesworthstone/frankensearch/commit/1e5aaec55b07535989697e4f023b0f8346a4dc00);
+  [integration evidence](CHANGELOG_RESEARCH.md).
+
+- **Complete-generation Unix daemons support buffered and progressive requests.**
+  The store owns its socket and singleton lock. Requests refresh the selected
+  generation before using cached results; shutdown remains available when the
+  selection pointer is damaged. Progressive requests reuse canonical stream
+  frames, bound pending output, and refuse unsupported per-request overrides.
+  Cooperative deadlines release stalled asynchronous requests without cancelling
+  the daemon. Ordinary CLI forwarding and legacy v4 overlays remain separate
+  integration work; complete release qualification is still pending.
+  [Socket ownership](https://github.com/Dicklesworthstone/frankensearch/commit/f07ab0251c5fc01d0632915890aba5dd69d319b1);
+  [shutdown](https://github.com/Dicklesworthstone/frankensearch/commit/07d90a88879129a7f4729b5ff663a4a90a0dde8e);
+  [execution deadlines](https://github.com/Dicklesworthstone/frankensearch/commit/1ea51073c59312f3dbac3936c3d4a7860652d4c6);
+  [progressive serving](https://github.com/Dicklesworthstone/frankensearch/commit/07e4838ad09a1dfbe01d9ee4326332776b0188cb).
 
 - **`config init` and `config reset` emit reloadable defaults.** On 64-bit hosts,
   directly serializing the unlimited-result sentinel produced an integer TOML
@@ -265,7 +287,6 @@ qualified; individual results below are narrower than release acceptance.
   bounded/unlimited configurations and files written by both command handlers.
   [Fix and tests](https://github.com/Dicklesworthstone/frankensearch/commit/e7808fe60eb20750430b05b8055a6a5d132ace74).
 
-- **Numeric filters compose with other Boolean clauses after a document is
 - **fsfs receipt hashes retain JSON insertion order in standalone builds.**
   The CLI now requests the JSON ordering feature directly, rather than relying
   on another workspace member to enable it. This restores the original receipt

@@ -1,15 +1,18 @@
-//! Owned, bounded Unix transport for complete-generation buffered search.
+//! Owned, bounded Unix transport for complete-generation search.
 //!
 //! Index admission/ranking remain in the existing serve handler. The listener
 //! and lock live at the store root, never inside a retained generation.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
@@ -18,10 +21,11 @@ use serde::Serialize;
 
 use super::super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_IDLE_TIMEOUT_MS, FSFS_DAEMON_REQUEST_MAX_BYTES,
-    SearchServeRequest,
+    SearchExecutionFlags, SearchServeRequest,
 };
 use super::{
-    FsfsRuntime, complete_cli_error, emit_complete_serve_line, retained_search_checkpoint,
+    FsfsRuntime, complete_cli_error, emit_complete_serve_line, pressure_timestamp_ms,
+    retained_search_checkpoint,
 };
 
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -31,6 +35,11 @@ const FSFS_DAEMON_SOCKET_FILE: &str = "fsfs-query.sock";
 
 #[path = "complete_daemon_control.rs"]
 mod control;
+
+#[path = "complete_daemon_stream.rs"]
+mod streaming;
+
+static STREAM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerOutcome {
@@ -111,7 +120,7 @@ impl Drop for BoundCompleteSocket {
 }
 
 impl FsfsRuntime {
-    /// Serve one buffered v3 request per connection until cancellation or idle
+    /// Serve one buffered or progressive request per connection until cancellation or idle
     /// expiry. No detached worker owns a reader, socket, or request after return.
     pub(super) async fn run_complete_generation_daemon(
         &self,
@@ -147,25 +156,68 @@ impl FsfsRuntime {
                     peer.set_nonblocking(true)?;
                     let session = &mut session;
                     let cache = &mut cache;
-                    let result = serve_peer(cx, &mut peer, peer_timeout, |request| async move {
-                        // A cached request must pass selection admission too.
-                        // Refresh never swaps on failure and we never consult
-                        // old cache/resources after a failed refresh.
-                        if session.refresh(cx).await? {
-                            cache.clear();
-                        }
-                        session
-                            .reader
-                            .runtime
-                            .execute_search_serve_request(
-                                cx,
-                                request,
-                                &mut session.reader.resources,
-                                cache,
-                                cache_enabled,
-                            )
-                            .await
-                    })
+                    let result = Box::pin(serve_peer(
+                        cx,
+                        &mut peer,
+                        peer_timeout,
+                        |request, output| async move {
+                            // A cached request must pass selection admission too.
+                            // Refresh never swaps on failure and we never consult
+                            // old cache/resources after a failed refresh.
+                            if session.refresh(cx).await? {
+                                cache.clear();
+                            }
+                            if let Some(mut output) = output {
+                                // Reuse direct streaming, including its producer
+                                // annotations, phase ordering and terminal frames.
+                                // Runtime paths and resources retain one generation.
+                                let mut runtime = session.reader.runtime.clone();
+                                runtime.cli_input.command = crate::CliCommand::Search;
+                                runtime.cli_input.format = crate::OutputFormat::Jsonl;
+                                runtime.cli_input.stream = true;
+                                runtime.cli_input.daemon = false;
+                                runtime.cli_input.daemon_socket = None;
+                                runtime.cli_input.query = Some(request.query.clone());
+                                let limit =
+                                    request.limit.unwrap_or(runtime.config.search.default_limit);
+                                let stream_id = format!(
+                                    "complete-{}-{}-{}",
+                                    pressure_timestamp_ms(),
+                                    std::process::id(),
+                                    STREAM_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                                );
+                                runtime
+                                    .run_search_stream_command_with_writer(
+                                        cx,
+                                        &request.query,
+                                        limit,
+                                        &stream_id,
+                                        &mut output,
+                                        Some((
+                                            &mut session.reader.resources,
+                                            SearchExecutionFlags {
+                                                include_snippets: true,
+                                                persist_explain_session: false,
+                                            },
+                                        )),
+                                    )
+                                    .await?;
+                                return Ok(None);
+                            }
+                            session
+                                .reader
+                                .runtime
+                                .execute_search_serve_request(
+                                    cx,
+                                    request,
+                                    &mut session.reader.resources,
+                                    cache,
+                                    cache_enabled,
+                                )
+                                .await
+                                .map(Some)
+                        },
+                    ))
                     .await;
                     match result {
                         Ok(PeerOutcome::Shutdown) => return Ok(()),
@@ -233,8 +285,8 @@ async fn serve_peer<T, F, Fut>(
 ) -> SearchResult<PeerOutcome>
 where
     T: Serialize,
-    F: FnOnce(SearchServeRequest) -> Fut,
-    Fut: Future<Output = SearchResult<T>>,
+    F: FnOnce(SearchServeRequest, Option<streaming::PhaseWriter>) -> Fut,
+    Fut: Future<Output = SearchResult<Option<T>>>,
 {
     let bytes = read_request(cx, peer, timeout).await?;
     match control::is_shutdown_request(&bytes) {
@@ -262,25 +314,65 @@ where
             "full",
             error.to_string(),
         ))?,
-        Ok(request) => {
+        Ok((request, stream)) => {
             let query = request.query.clone();
             let mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
-            retained_search_checkpoint(cx)?;
-            match execute(request).await {
-                Ok(response) => match encode_response(&response) {
-                    Ok(bytes) => bytes,
+            if stream {
+                if let Err(error) = streaming::validate_request(&bytes) {
+                    encode_response(&FsfsRuntime::search_serve_error_response(
+                        query,
+                        mode,
+                        error.to_string(),
+                    ))?
+                } else {
+                    let output = streaming::PhaseWriter::new(peer)?;
+                    let result = run_request(
+                        cx,
+                        timeout,
+                        streaming::drive(cx, &output, execute(request, Some(output.clone()))),
+                    )
+                    .await;
+                    match result {
+                        Ok(None) => return Ok(PeerOutcome::Search),
+                        Ok(Some(_)) => {
+                            return Err(complete_cli_error(
+                                "daemon_stream",
+                                "stream producer returned a buffered response",
+                            ));
+                        }
+                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                        Err(error) if output.emitted() => return Err(error),
+                        Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
+                            query,
+                            mode,
+                            error.to_string(),
+                        ))?,
+                    }
+                }
+            } else {
+                retained_search_checkpoint(cx)?;
+                match run_request(cx, timeout, execute(request, None)).await {
+                    Ok(Some(response)) => match encode_response(&response) {
+                        Ok(bytes) => bytes,
+                        Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
+                            query,
+                            mode,
+                            error.to_string(),
+                        ))?,
+                    },
+                    Ok(None) => {
+                        return Err(complete_cli_error(
+                            "daemon_response",
+                            "buffered request completed without a response",
+                        ));
+                    }
+                    Err(error @ SearchError::Cancelled { .. }) => return Err(error),
                     Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
                         query,
                         mode,
                         error.to_string(),
                     ))?,
-                },
-                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-                Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
-                    query,
-                    mode,
-                    error.to_string(),
-                ))?,
+                }
             }
         }
     };
@@ -288,23 +380,18 @@ where
     Ok(PeerOutcome::Search)
 }
 
-fn parse_request(bytes: &[u8]) -> SearchResult<SearchServeRequest> {
+fn parse_request(bytes: &[u8]) -> SearchResult<(SearchServeRequest, bool)> {
     let raw = std::str::from_utf8(bytes)
         .map_err(|_| complete_cli_error("daemon_request", "request is not UTF-8"))?
         .trim();
     // The established buffered request type intentionally has no stream field.
     // Inspect the transport selector before serde can ignore that extra field.
-    if raw.starts_with('{') {
+    let stream = if raw.starts_with('{') {
         let value: serde_json::Value = serde_json::from_str(raw)
             .map_err(|error| complete_cli_error("daemon_request", &error.to_string()))?;
         match value.get("stream") {
-            None | Some(serde_json::Value::Bool(false)) => {}
-            Some(serde_json::Value::Bool(true)) => {
-                return Err(complete_cli_error(
-                    "daemon_request",
-                    "complete-generation socket serving currently supports buffered requests; use direct search --no-daemon --stream for progressive phases",
-                ));
-            }
+            None => false,
+            Some(serde_json::Value::Bool(stream)) => *stream,
             Some(_) => {
                 return Err(complete_cli_error(
                     "daemon_request",
@@ -312,8 +399,53 @@ fn parse_request(bytes: &[u8]) -> SearchResult<SearchServeRequest> {
                 ));
             }
         }
+    } else {
+        false
+    };
+    FsfsRuntime::parse_search_serve_request(raw).map(|request| (request, stream))
+}
+
+/// Own the request future until completion, cancellation or its deadline.
+///
+/// Read/write timeouts alone do not bound an asynchronous admission or search
+/// that never completes. Periodic checkpoints also observe a shutdown even
+/// when that future never wakes itself. Dropping a timed-out future releases
+/// its borrows before the next peer; it must not cancel the shared daemon Cx.
+/// This is cooperative: a synchronous poll that blocks cannot be preempted.
+async fn run_request<T>(
+    cx: &Cx,
+    timeout: Duration,
+    request: impl Future<Output = SearchResult<T>>,
+) -> SearchResult<T> {
+    let mut request = pin!(request);
+    let mut deadline = pin!(asupersync::time::sleep(cx.now(), timeout));
+    loop {
+        let mut tick = pin!(asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL));
+        let result = poll_fn(|task| {
+            if let Err(error) = retained_search_checkpoint(cx) {
+                return Poll::Ready(Err(error));
+            }
+            if deadline.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "complete-generation daemon search deadline exceeded",
+                )
+                .into()));
+            }
+            if let Poll::Ready(result) = request.as_mut().poll(task) {
+                return Poll::Ready(retained_search_checkpoint(cx).and(result).map(Some));
+            }
+            if tick.as_mut().poll(task).is_ready() {
+                Poll::Ready(Ok(None))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await?;
+        if let Some(result) = result {
+            return Ok(result);
+        }
     }
-    FsfsRuntime::parse_search_serve_request(raw)
 }
 
 fn encode_response<T: Serialize>(response: &T) -> SearchResult<Vec<u8>> {
@@ -399,6 +531,118 @@ mod tests {
     use asupersync::test_utils::run_test_with_cx;
     use std::io::BufRead;
     use std::net::Shutdown;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct MarkReleased(Arc<AtomicBool>);
+
+    impl Drop for MarkReleased {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn request_deadline_releases_an_unresponsive_future_without_cancelling_daemon() {
+        run_test_with_cx(|cx| async move {
+            let released = Arc::new(AtomicBool::new(false));
+            let owned = MarkReleased(Arc::clone(&released));
+            let result: SearchResult<()> = run_request(&cx, Duration::from_millis(1), async move {
+                let _owned = owned;
+                std::future::pending().await
+            })
+            .await;
+            assert!(
+                matches!(result, Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut)
+            );
+            assert!(released.load(Ordering::SeqCst));
+            retained_search_checkpoint(&cx).expect("one timeout must not cancel the daemon");
+            assert_eq!(
+                run_request(&cx, Duration::from_secs(1), async { Ok(42) })
+                    .await
+                    .unwrap(),
+                42
+            );
+        });
+    }
+
+    #[test]
+    fn expired_request_is_dropped_without_polling_or_delivering_results() {
+        run_test_with_cx(|cx| async move {
+            let released = Arc::new(AtomicBool::new(false));
+            let owned = MarkReleased(Arc::clone(&released));
+            let mut polled = false;
+            let result = run_request(&cx, Duration::ZERO, async {
+                let _owned = owned;
+                polled = true;
+                Ok(())
+            })
+            .await;
+            assert!(
+                matches!(result, Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut)
+            );
+            assert!(!polled);
+            assert!(released.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn request_checkpoint_observes_cancellation_without_an_inner_wakeup() {
+        run_test_with_cx(|cx| async move {
+            let released = Arc::new(AtomicBool::new(false));
+            let owned = MarkReleased(Arc::clone(&released));
+            let result: SearchResult<()> = run_request(&cx, Duration::from_secs(1), async {
+                let _owned = owned;
+                cx.set_cancel_requested(true);
+                std::future::pending().await
+            })
+            .await;
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert!(released.load(Ordering::SeqCst));
+            cx.set_cancel_requested(false);
+        });
+    }
+
+    #[test]
+    fn request_execution_preserves_the_underlying_failure() {
+        run_test_with_cx(|cx| async move {
+            let result: SearchResult<()> = run_request(&cx, Duration::from_secs(1), async {
+                Err(complete_cli_error("test_admission", "original refusal"))
+            })
+            .await;
+            assert!(
+                matches!(result, Err(SearchError::InvalidConfig { field, reason, .. })
+                if field == "complete_generation.test_admission" && reason == "original refusal")
+            );
+        });
+    }
+
+    #[test]
+    fn socket_reports_search_deadline_and_accepts_a_subsequent_request() {
+        run_test_with_cx(|cx| async move {
+            let (client, mut server) = pair(b"{\"query\":\"stall\"}\n");
+            let result = serve_peer::<serde_json::Value, _, _>(
+                &cx,
+                &mut server,
+                Duration::from_millis(100),
+                |_, _| std::future::pending(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, PeerOutcome::Search);
+            let failure = response(client);
+            assert_eq!(failure["ok"], false);
+            assert!(failure.to_string().contains("search deadline exceeded"));
+
+            let (client, mut server) = pair(b"{\"query\":\"healthy\"}\n");
+            serve_peer(&cx, &mut server, Duration::from_secs(1), |_, _| async {
+                Ok(Some(serde_json::json!({"ok": true})))
+            })
+            .await
+            .unwrap();
+            assert_eq!(response(client)["ok"], true);
+        });
+    }
 
     fn pair(request: &[u8]) -> (UnixStream, UnixStream) {
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -490,10 +734,11 @@ mod tests {
                     &cx,
                     &mut server,
                     Duration::from_secs(2),
-                    |request| async move {
+                    |request, output| async move {
+                        assert!(output.is_none());
                         assert_eq!(request.query, "sharedtoken");
                         assert_eq!(request.limit, Some(3));
-                        Ok(serde_json::json!({"ok":true,"query":request.query}))
+                        Ok(Some(serde_json::json!({"ok":true,"query":request.query})))
                     },
                 )
                 .await
@@ -506,20 +751,98 @@ mod tests {
     }
 
     #[test]
-    fn socket_bad_input_and_progressive_requests_do_not_execute_search() {
+    fn socket_stream_forwards_producer_records_without_a_buffered_wrapper() {
+        run_test_with_cx(|cx| async move {
+            let (mut client, mut server) = pair(b"{\"query\":\"x\",\"stream\":true}\n");
+            serve_peer::<serde_json::Value, _, _>(
+                &cx,
+                &mut server,
+                Duration::from_secs(2),
+                |request, output| async move {
+                    assert_eq!(request.query, "x");
+                    let mut writer = output.expect("stream writer");
+                    writer.write_all(b"{\"phase\":\"initial\"}\n")?;
+                    writer.flush()?;
+                    writer.write_all(b"{\"phase\":\"refined\"}\n")?;
+                    writer.flush()?;
+                    Ok(None)
+                },
+            )
+            .await
+            .unwrap();
+            drop(server);
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"{\"phase\":\"initial\"}\n{\"phase\":\"refined\"}\n");
+        });
+    }
+
+    #[test]
+    fn socket_stream_failure_after_delivery_never_appends_a_buffered_error() {
+        run_test_with_cx(|cx| async move {
+            let (mut client, mut server) = pair(b"{\"query\":\"x\",\"stream\":true}\n");
+            let result = serve_peer::<serde_json::Value, _, _>(
+                &cx,
+                &mut server,
+                Duration::from_secs(2),
+                |_, output| async move {
+                    let mut writer = output.unwrap();
+                    writer.write_all(b"{\"phase\":\"initial\"}\n")?;
+                    writer.flush()?;
+                    Err(complete_cli_error("test_stream", "after Initial"))
+                },
+            )
+            .await;
+            assert!(
+                matches!(result, Err(SearchError::InvalidConfig { field, .. })
+                if field == "complete_generation.test_stream")
+            );
+            drop(server);
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"{\"phase\":\"initial\"}\n");
+        });
+    }
+
+    #[test]
+    fn socket_stream_admission_failure_is_reported_before_any_frames() {
+        run_test_with_cx(|cx| async move {
+            let (client, mut server) = pair(b"{\"query\":\"x\",\"stream\":true}\n");
+            serve_peer::<serde_json::Value, _, _>(
+                &cx,
+                &mut server,
+                Duration::from_secs(2),
+                |_, _| async {
+                    Err(complete_cli_error(
+                        "test_admission",
+                        "bad selected generation",
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+            let error = response(client);
+            assert_eq!(error["ok"], false);
+            assert!(error.to_string().contains("bad selected generation"));
+            assert!(error.get("event").is_none());
+        });
+    }
+
+    #[test]
+    fn socket_bad_input_and_unsupported_stream_options_do_not_execute_search() {
         run_test_with_cx(|cx| async move {
             for raw in [
                 b"\xff\n".as_slice(),
                 b"{invalid\n",
-                b"{\"query\":\"x\",\"stream\":true}\n",
+                b"{\"query\":\"x\",\"stream\":true,\"mode\":\"fast\"}\n",
                 b"{\"query\":\"x\",\"stream\":\"true\"}\n",
                 b"{\"query\":\"x\",\"stream\":null}\n",
             ] {
                 let (client, mut server) = pair(raw);
-                serve_peer(&cx, &mut server, Duration::from_secs(2), |_| async {
+                serve_peer(&cx, &mut server, Duration::from_secs(2), |_, _| async {
                     panic!("refused request must not execute"); // ubs:ignore — cfg(test) negative control fails if a refused request reaches execution.
                     #[allow(unreachable_code)]
-                    Ok(serde_json::Value::Null)
+                    Ok(Some(serde_json::Value::Null))
                 })
                 .await
                 .unwrap();
@@ -553,10 +876,10 @@ mod tests {
     fn explicit_shutdown_is_acknowledged_without_executing_search() {
         run_test_with_cx(|cx| async move {
             let (client, mut server) = pair(control::SHUTDOWN_REQUEST);
-            let outcome = serve_peer(&cx, &mut server, Duration::from_secs(2), |_| async {
+            let outcome = serve_peer(&cx, &mut server, Duration::from_secs(2), |_, _| async {
                 panic!("shutdown must not execute search"); // ubs:ignore — cfg(test) assertion.
                 #[allow(unreachable_code)]
-                Ok(serde_json::Value::Null)
+                Ok(Some(serde_json::Value::Null))
             })
             .await
             .unwrap();
@@ -572,10 +895,10 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let (client, mut server) =
                 pair(b"{\"fsfs_complete_daemon\":\"shutdown\",\"version\":2}\n");
-            let outcome = serve_peer(&cx, &mut server, Duration::from_secs(2), |_| async {
+            let outcome = serve_peer(&cx, &mut server, Duration::from_secs(2), |_, _| async {
                 panic!("malformed control must not execute search"); // ubs:ignore — cfg(test) assertion.
                 #[allow(unreachable_code)]
-                Ok(serde_json::Value::Null)
+                Ok(Some(serde_json::Value::Null))
             })
             .await
             .unwrap();
@@ -705,9 +1028,62 @@ mod generation_tests {
                         count
                     );
                 };
+                let streamed = || -> Vec<serde_json::Value> {
+                    let mut stream = UnixStream::connect(&client_endpoint).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    stream
+                        .write_all(b"{\"query\":\"sharedtoken\",\"limit\":10,\"stream\":true}\n")
+                        .unwrap();
+                    let mut reader = std::io::BufReader::new(stream);
+                    let mut frames = Vec::new();
+                    loop {
+                        assert!(frames.len() < 256, "missing stream terminal");
+                        let mut line = String::new();
+                        assert_ne!(
+                            reader.read_line(&mut line).unwrap(),
+                            0,
+                            "stream ended without terminal/refusal"
+                        );
+                        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let done = frame["event"] == "terminal" || frame["ok"] == false;
+                        frames.push(frame);
+                        if done {
+                            return frames;
+                        }
+                    }
+                };
+                let check_stream = |frames: Vec<serde_json::Value>, count| {
+                    assert_eq!(frames.first().unwrap()["event"], "started");
+                    assert_eq!(frames.last().unwrap()["event"], "terminal");
+                    assert_eq!(frames.last().unwrap()["payload"]["status"], "completed");
+                    assert_eq!(
+                        frames
+                            .iter()
+                            .filter(|frame| frame["event"] == "result")
+                            .count(),
+                        count
+                    );
+                    for pair in frames.windows(2) {
+                        assert_eq!(
+                            pair[1]["seq"].as_u64().unwrap(),
+                            pair[0]["seq"].as_u64().unwrap() + 1
+                        );
+                    }
+                    for frame in frames {
+                        let _: crate::stream_protocol::StreamFrame<
+                            crate::output_schema::SearchHitPayload,
+                        > = serde_json::from_value(frame).unwrap();
+                    }
+                };
                 let caching = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
                 check(request(), 1, false);
                 check(request(), 1, caching);
+                check_stream(streamed(), 1);
                 let temporary = client_root.join("test-pointer-switch");
                 fs::write(&temporary, b"invalid selection").unwrap();
                 fs::rename(&temporary, &pointer).unwrap();
@@ -715,10 +1091,14 @@ mod generation_tests {
                 assert_eq!(refused["ok"], false);
                 assert_eq!(refused["cached"], false);
                 assert!(refused["payloads"].as_array().unwrap().is_empty());
+                let stream_refused = streamed();
+                assert_eq!(stream_refused.len(), 1);
+                assert_eq!(stream_refused[0]["ok"], false);
                 fs::write(&temporary, successor).unwrap();
                 fs::rename(&temporary, &pointer).unwrap();
                 check(request(), 2, false);
                 check(request(), 2, caching);
+                check_stream(streamed(), 2);
             });
             let result = runtime
                 .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)

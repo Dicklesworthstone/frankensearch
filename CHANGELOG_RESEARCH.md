@@ -1051,3 +1051,36 @@ findings, 82 warnings, and nine informational findings. Earlier failed compile,
 lint, and fixture attempts remain recorded. These focused results do not replace
 clean-commit stock qualification, the still-running full Quill gate, the open R1
 comparison, or final platform release checks.
+
+Before the integration push, upstream advanced with execution deadlines
+(`1ea51073`) and progressive complete-generation socket serving (`07e4838a`).
+The push guard stopped on the unfetched upstream revision; it was not bypassed.
+The merge preserves those capabilities and the validated buffered fixes. A
+transport-local Boolean selector now chooses the stream path without inventing
+a member on the shared buffered request. Invalid selector types still fail
+before search. Boxing the owned peer future prevents stack-size propagation
+through daemon callers, and the stream writer releases its mutex after staging.
+No deadline, cancellation check, output bound, or runtime assertion was relaxed.
+
+The merged candidate passed remote all-target check, strict all-target Clippy,
+85 focused unit tests, the executable refusal test, and both real-Potion binary
+tests on `vmi1152480`. The daemon executable test now also decodes streamed
+frames, checks sequence order and one result, and requires a completed Terminal
+before exercising corrupt-selection shutdown. Retrieved receipt SHA-256 is
+`b2f15d12f12d8cfb717036f6025232821afd3c6c8ac5e1cefc464e76b3966b9d`;
+real-model log SHA-256 is
+`367e0451fa00fa78a79b954327d41c07e5cf6352a1b31689f20d4cab72cfa75a`.
+All stage log hashes and the three changed Rust source hashes match. The
+post-run production executable hash is
+`7f7a099ed58298fce261bcde96a7934f6574be8f59493cc7466035deb843515e`.
+The final three-file UBS scan reports zero critical findings, 380 warnings, and
+46 informational findings. The earlier large-future and mutex-lifetime Clippy
+failure is retained separately. Clean-commit stock qualification, full Quill,
+R1, and platform publication remain distinct obligations.
+
+The September 21 changelog supplement now records live replacement-generation
+watching and complete-generation socket ownership, shutdown, execution bounds,
+and progressive serving. All five added representative commit links resolve
+through the GitHub API. Structural validation passes with the existing possible
+bare-hash warning. The live release list still identifies `v1.10.0`, published
+2026-09-08, as the latest binary release; these changes remain unreleased.

@@ -242,6 +242,55 @@ fn complete_watch_binary_keeps_search_available() {
 }
 
 #[cfg(feature = "semantic-support")]
+fn assert_streamed_query(socket: &Path) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut peer = UnixStream::connect(socket).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    peer.set_write_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    peer.write_all(b"{\"query\":\"sharedtoken\",\"stream\":true}\n")
+        .unwrap();
+    let mut reader = BufReader::new(peer);
+    let mut frames = Vec::new();
+    loop {
+        assert!(frames.len() < 256, "missing stream terminal");
+        let mut line = String::new();
+        assert_ne!(
+            reader.read_line(&mut line).unwrap(),
+            0,
+            "premature stream EOF"
+        );
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        let _: frankensearch_fsfs::stream_protocol::StreamFrame<
+            frankensearch_fsfs::output_schema::SearchHitPayload,
+        > = serde_json::from_value(frame.clone()).unwrap();
+        let terminal = frame["event"] == "terminal";
+        frames.push(frame);
+        if terminal {
+            break;
+        }
+    }
+    assert_eq!(frames.first().unwrap()["event"], "started");
+    assert_eq!(frames.last().unwrap()["payload"]["status"], "completed");
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["event"] == "result")
+            .count(),
+        1
+    );
+    for pair in frames.windows(2) {
+        assert_eq!(
+            pair[1]["seq"].as_u64().unwrap(),
+            pair[0]["seq"].as_u64().unwrap() + 1
+        );
+    }
+}
+
+#[cfg(feature = "semantic-support")]
 #[test]
 #[ignore = "requires FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR with a verified Potion cache"]
 fn complete_daemon_binary_serves_and_stops_with_corrupt_selection() {
@@ -294,6 +343,7 @@ fn complete_daemon_binary_serves_and_stops_with_corrupt_selection() {
     let hits = phases.last().unwrap()["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0]["path"].as_str().unwrap().ends_with("alpha.md"));
+    assert_streamed_query(&socket);
 
     // Stop dispatch must not first admit the selected generation or its models.
     let pointer = fixture
