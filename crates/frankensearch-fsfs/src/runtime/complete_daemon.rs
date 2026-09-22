@@ -39,6 +39,9 @@ mod control;
 #[path = "complete_daemon_stream.rs"]
 mod streaming;
 
+#[path = "complete_daemon_forward.rs"]
+mod forwarding;
+
 static STREAM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,10 +159,38 @@ impl FsfsRuntime {
                     peer.set_nonblocking(true)?;
                     let session = &mut session;
                     let cache = &mut cache;
-                    let result = Box::pin(serve_peer(
+                    let bytes = match read_request(cx, &mut peer, peer_timeout).await {
+                        Ok(bytes) => bytes,
+                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                        Err(error) => {
+                            tracing::debug!(%error, "complete-generation daemon request ended");
+                            last_activity = Instant::now();
+                            continue;
+                        }
+                    };
+                    if forwarding::is_forwarded(&bytes) {
+                        // This lane has request-scoped filters and may refresh
+                        // selection. Never let an older v3 cache survive it.
+                        cache.clear();
+                        let result = Box::pin(forwarding::serve(
+                            cx, self, session, &mut peer, &bytes, peer_timeout,
+                        ))
+                        .await;
+                        match result {
+                            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                            Err(error) => {
+                                tracing::debug!(%error, "complete-generation forwarded client ended");
+                            }
+                            Ok(_) => {}
+                        }
+                        last_activity = Instant::now();
+                        continue;
+                    }
+                    let result = Box::pin(serve_peer_bytes(
                         cx,
                         &mut peer,
                         peer_timeout,
+                        &bytes,
                         |request, output| async move {
                             // A cached request must pass selection admission too.
                             // Refresh never swaps on failure and we never consult
@@ -277,6 +308,7 @@ impl FsfsRuntime {
 
 /// The execution closure is shared with the ordinary serve implementation;
 /// transport errors never trigger an in-process retry or a stale-reader query.
+#[cfg(test)]
 async fn serve_peer<T, F, Fut>(
     cx: &Cx,
     peer: &mut UnixStream,
@@ -289,7 +321,22 @@ where
     Fut: Future<Output = SearchResult<Option<T>>>,
 {
     let bytes = read_request(cx, peer, timeout).await?;
-    match control::is_shutdown_request(&bytes) {
+    serve_peer_bytes(cx, peer, timeout, &bytes, execute).await
+}
+
+async fn serve_peer_bytes<T, F, Fut>(
+    cx: &Cx,
+    peer: &mut UnixStream,
+    timeout: Duration,
+    bytes: &[u8],
+    execute: F,
+) -> SearchResult<PeerOutcome>
+where
+    T: Serialize,
+    F: FnOnce(SearchServeRequest, Option<streaming::PhaseWriter>) -> Fut,
+    Fut: Future<Output = SearchResult<Option<T>>>,
+{
+    match control::is_shutdown_request(bytes) {
         Ok(true) => {
             // No model/search work and no selection refresh for an explicit
             // control. A failed acknowledgment never claims a successful stop.
@@ -307,7 +354,7 @@ where
             return Ok(PeerOutcome::Search);
         }
     }
-    let request = parse_request(&bytes);
+    let request = parse_request(bytes);
     let response = match request {
         Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
             "",
@@ -318,7 +365,7 @@ where
             let query = request.query.clone();
             let mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
             if stream {
-                if let Err(error) = streaming::validate_request(&bytes) {
+                if let Err(error) = streaming::validate_request(bytes) {
                     encode_response(&FsfsRuntime::search_serve_error_response(
                         query,
                         mode,
