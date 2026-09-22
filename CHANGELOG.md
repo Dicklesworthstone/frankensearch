@@ -243,6 +243,21 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **Indexing with the quality tier uses a third of the memory, and default
+  `fsfs index` works again (GH #43).** The MiniLM quality embedder ran up to
+  64 texts through ONNX Runtime at once (256 in fsfs 1.10.0). Its scratch
+  memory grows with texts per run times padded length squared, and the
+  runtime keeps the peak. Indexing BEIR NFCorpus (3,633 abstracts) with
+  default models peaked at 18.1 GB RSS with fsfs 1.10.0 and 5.8 GB on `main`,
+  where the RSS check added for #43 then stopped default-config indexing at
+  the 2048 MiB `pressure.memory_ceiling_mb` on NFCorpus and SciFact. Runs of
+  four texts peak at 1.8 GB on both corpora, and those indexes complete under
+  the default setting. The stored vectors are byte-identical (a text's vector
+  does not depend on the texts sharing its run; real-model test
+  `minilm_vectors_do_not_depend_on_batch_neighbours`), and indexing is no
+  slower. The two models alone take 1.3 GB, so the default setting leaves
+  about 14% headroom on a 64-core host.
+
 - **Smaller opt-in fast models: `potion-base-8M` and `potion-base-32M` (GH #50).**
   `[indexing] fast_model` now selects the Model2Vec model that is actually
   loaded; before, it only fed `status`/`doctor` output and every load used

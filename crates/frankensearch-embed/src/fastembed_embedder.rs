@@ -45,6 +45,13 @@ pub const DEFAULT_HF_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 /// Expected `MiniLM` output dimension.
 pub const DEFAULT_DIMENSION: usize = 384;
 
+/// Texts per ONNX Runtime run. A run's scratch memory grows with its text
+/// count times its padded length squared, and the runtime's arena keeps the
+/// peak: indexing BEIR `NFCorpus` peaked at 5.8 GB RSS with 64 texts per run
+/// and 1.8 GB with 4, in the same time. A text's vector does not depend on
+/// the texts sharing its run (`minilm_vectors_do_not_depend_on_batch_neighbours`).
+const FASTEMBED_TEXTS_PER_RUN: usize = 4;
+
 /// Configuration for selecting a frozen, manifest-registered ONNX embedder.
 ///
 /// `model_id`, `dimension`, and `pooling` must agree with the registered
@@ -305,13 +312,12 @@ impl FastEmbedEmbedder {
         // Use the same ordered batch and adapter normalization as real calls,
         // before exposing this session's declared identity to any consumer.
         let texts = &crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
-        let mut probe =
-            text_embedding
-                .embed(texts, None)
-                .map_err(|e| SearchError::ModelLoadFailed {
-                    path: model_dir.clone(),
-                    source: format!("failed to run producer conformance probe: {e}").into(),
-                })?;
+        let mut probe = text_embedding
+            .embed(texts, Some(FASTEMBED_TEXTS_PER_RUN))
+            .map_err(|e| SearchError::ModelLoadFailed {
+                path: model_dir.clone(),
+                source: format!("failed to run producer conformance probe: {e}").into(),
+            })?;
         for vector in &mut probe {
             normalize_in_place(vector);
         }
@@ -418,7 +424,7 @@ impl FastEmbedEmbedder {
             .spawn_blocking(move |child| {
                 embed_checkpoint(&child, "fastembed.infer")?;
                 model
-                    .embed(texts, None)
+                    .embed(texts, Some(FASTEMBED_TEXTS_PER_RUN))
                     .map_err(|error| SearchError::EmbeddingFailed {
                         model: name,
                         source: format!("fastembed inference failed: {error}").into(),
@@ -1074,5 +1080,71 @@ mod tests {
                 "8b2d7421218d8ab9e6d0f9c3ea66b371be56324a5560c13e2b416c5064e51f05"
             },
         );
+    }
+
+    /// Each inference run pads its texts to the longest one. A text's vector
+    /// must not depend on which texts share its run, or the run size would be
+    /// part of the producer and changing it would silently re-key indexes.
+    #[test]
+    #[ignore = "requires verified MiniLM ONNX assets via FASTEMBED_MINILM_FIXTURE_DIR"]
+    fn minilm_vectors_do_not_depend_on_batch_neighbours() {
+        let dir = std::env::var("FASTEMBED_MINILM_FIXTURE_DIR")
+            .expect("FASTEMBED_MINILM_FIXTURE_DIR must name the verified model dir");
+        let embedder = FastEmbedEmbedder::load_with_config(
+            &dir,
+            OnnxEmbedderConfig::for_name("minilm").unwrap(),
+        )
+        .expect("load verified ONNX model");
+        let words = [
+            "retrieval",
+            "protein",
+            "folding",
+            "graph",
+            "cafe",
+            "fsvi_v2",
+            "Tokyo",
+            "dietary",
+            "fiber",
+            "argument",
+            "naive",
+            "semantic",
+        ];
+        // Word counts span one token to far past the 512-token truncation.
+        let texts = [1_usize, 7, 40, 130, 260, 511, 900, 3, 75, 2000, 18, 333]
+            .iter()
+            .enumerate()
+            .map(|(i, &count)| {
+                (0..count)
+                    .map(|j| words[(i * 7 + j * 3) % words.len()])
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>();
+        let texts = texts.iter().map(String::as_str).collect::<Vec<_>>();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .expect("build current-thread runtime");
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let together = runtime
+            .block_on(embedder.embed_batch(&cx, &texts))
+            .expect("embed the whole batch");
+        for (index, (text, vector)) in texts.iter().zip(&together).enumerate() {
+            let alone = runtime
+                .block_on(embedder.embed_batch(&cx, &[text]))
+                .expect("embed one text");
+            let max_difference = alone[0]
+                .iter()
+                .zip(vector)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                alone[0]
+                    .iter()
+                    .zip(vector)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "text {index} embeds differently alone than in a batch (max |diff| {max_difference:e})"
+            );
+        }
     }
 }
