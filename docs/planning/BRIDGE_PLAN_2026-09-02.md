@@ -9,6 +9,16 @@ two real-model watcher/daemon tests. Newer main `ad12acb9` compiles but fails
 strict Clippy in retained embedding reuse. Its subsequent tests did not run.
 There is no current-main release pass to infer from the older success.
 
+**Final source refresh:** main advanced concurrently to `fae763dc` during this
+review. It adds retained append/delete/compact/explain/expanded search,
+parent-store discovery, selective compound-filter gathering, bound embedding
+validation/cancellation, and opt-in native quality ANN. Read all 80 new README
+lines (now 1,255 total), the revised dispatcher, bound embedding contract and
+quality-ANN routing. These are real implementations, but no terminal
+qualification of this merged source was observed. The same 64 KiB stack buffer
+remains at `retained_reuse.rs:550`. Source findings below reflect this final
+snapshot; execution receipts keep their original revisions.
+
 This refresh is the owner's explicitly requested end-to-end reality check.
 Consumer: the owner and the existing release/migration assignees. It gates the
 assessment's completion, not a newly invented shipping requirement. Observed
@@ -20,7 +30,8 @@ with zero new runtime-capability credit.
 
 ### Source and evidence boundary
 
-Read all 958 project AGENTS lines, all 1,175 README lines and the suite rules.
+Read all 958 project AGENTS lines, all 1,175 initial README lines plus the 80
+concurrently added lines, and the suite rules.
 Read the architecture overview, Quill map and future distributed design;
 reviewed the existing bridge/bug plans, current feature manifests, production
 dispatch, generation store/reuse/watch code, live task graph and retained
@@ -29,9 +40,10 @@ selectively, not exhaustively; this is not a claim to have read every source
 line or every document. No new build was launched for this assessment.
 
 The release evidence root **W** remains
-`/data/release-work/frankensearch-release-20260912`. The evaluated source is
-`ad12acb9fa31529a1c1d73623629e3ef7ccdb45f`, with the two previously prepared
-rustfmt-only edits in `runtime/complete_watch.rs` and `runtime/retained_reuse.rs`.
+`/data/release-work/frankensearch-release-20260912`. Initial evaluation used
+`ad12acb9fa31529a1c1d73623629e3ef7ccdb45f` plus two rustfmt-only edits. Peers
+committed those as `5fa7d098` and merged further product work. Final source
+review: `fae763dcedac45df8f5e749b285da551156a6315`.
 
 | Evidence inspected | Verdict and boundary |
 |---|---|
@@ -57,15 +69,15 @@ some require empirical outcomes rather than code completion.
 | V3 Deliver Initial then Refined/RefinementFailed through CLI and daemon | WORKING at 7bc, including real executable and stream paths. Later source needs requalification. | closed progressive-daemon task; `bd-dsbym` |
 | V4 Apply configured quality blending in actual product ranking | WORKING implementation and prior tests; improved relevance is separately V17. | closed quality-weight task; E6.7 |
 | V5 Preserve Initial on timeout/cancellation and safely reuse warm models | WORKING in scoped stock/native tests at 7bc; not a global latency guarantee. | `bd-2ba5`, `bd-dsbym` |
-| V6 Machine output, snippets, explain and backend equivalence | PARTIAL: ordinary output works; complete-store explain/TUI/expand refuse, and total lexical result equivalence remains open. | `bd-qwkq`, `bd-xomn.3`, E6.4/E6.7 |
+| V6 Machine output, snippets, explain and backend equivalence | PARTIAL: ordinary output works; complete-store explain/expand now implemented, TUI still refuses. Latest routes and total lexical equivalence need qualification. | `bd-qwkq`, `bd-xomn.3`, E6.4/E6.7 |
 | V7 Independent searches while watcher stays alive | PARTIAL: opt-in complete-store CLI/watch/daemon now exist, with two real-model tests at 7bc. Default legacy lock limitation remains; latest reuse/catch-up changes unqualified. | `bd-z2nfa`, watch staging |
-| V8 Append/delete/compact/flush and daemon stay coherent | PARTIAL: legacy paths work; complete-store dispatcher refuses in-place mutations. Fragmented-session merge/fuel is a separate unresolved defect. | `bd-458gu`, immutable lifecycle, `bd-xomn.3` |
+| V8 Append/delete/compact/flush and daemon stay coherent | PARTIAL: complete-store append/delete/compact now publish successors; flush still refuses. Latest mutation routes are unqualified here; fragmented-session merge/fuel remains separate. | `bd-458gu`, immutable lifecycle, `bd-xomn.3` |
 | V9 Doctor/status report actual model and generation health | WORKING scoped checks, including complete-store selected-root routing; unified recovery remains incomplete. | `bd-p6z6.4`, `bd-3fy9` |
 | V10 Reusable published facade with registry-only consumers | WORKING published family; new source is ahead of public archives. Default hash remains explicitly control-only. | `bd-dsbym`, `bd-8nqz.6` |
 | V11 Full used-surface Quill conformance | PARTIAL: real default engine/bounded witness; original R1 fails and full all-feature verdict pending. | R1, E6/E7, `bd-q4rg` |
 | V12 One identity-bound retained generation across production | PARTIAL: cooperative FSFS-CURRENT bundle is wired, but not fixed AUTHORITY/antirollback/complete typed v2 migration. | `bd-xomn.1`–`.4`, publisher/snapshot/security owners |
 | V13 Repair/recover without mixing generations | PARTIAL: FEC, admission and retained predecessors exist; unified immutable repair/retry lifecycle remains. | `bd-p6z6.3/.4`, `bd-3fy9`, lifecycle |
-| V14 Bounded native ANN in actual serving routes | PARTIAL: optional production ANN still wraps registry frankenhnsw; native_hnsw connectivity fix does not switch serving adapters. | `bd-kcek` |
+| V14 Bounded native ANN in actual serving routes | PARTIAL: new opt-in admitted-v2 quality route uses native HNSW and bound query identity. No sidecar persistence; fresh reopen is exact. Fast/fsfs defaults still use existing routes. Recall/latency and migration need qualification. | `bd-kcek` |
 | V15 Real optional cross-encoder rerank | WORKING scoped native backend; not a missing feature. New artifact/profile qualification remains. | `bd-dsbym`, E6.7 |
 | V16 Pure-Rust quality replacement across promised platforms | PARTIAL: explicit semantic-native source profile works; default is ONNX. Original numerical, ranking, within-2x and no-C-toolchain obligations remain. | `bd-2ba5`, `bd-6kafg` |
 | V17 Demonstrably better held-out retrieval quality | UNPROVEN broadly. Delivering Refined or finding one known document is insufficient. | E6.6/E6.7, `bd-2g2l`, `bd-q4rg` |
@@ -74,7 +86,7 @@ some require empirical outcomes rather than code completion.
 | V20 Real CASS/xf/Mail adoption and lifecycle | PARTIAL: integration surfaces exist; downstream-owned semantic/recovery evidence remains. | `bd-cass-semantic-cross-repo-receipt-91k2`, total lexical contract |
 | V21 Privacy, bounded pressure, scope and replay | Implemented components; complete generation fault/rollback/retention matrix still incomplete. | `bd-pz8va`, cache/retention/recovery owners |
 | V22 Complete real-host release, installer and package qualification | NOT COMPLETE: current strict lint failure, R1 failure, full Quill pending, final platforms/publication not qualified. | `bd-dsbym`, R1, installer |
-| V23 Guidance describes actual shipped/source behavior | PARTIAL: release-version guidance now accurate; README omits opt-in complete-store path and active limitations. | `bd-dsbym`, migration documentation |
+| V23 Guidance describes actual shipped/source behavior | Updated README now distinguishes unreleased opt-in complete stores/native quality ANN and their limitations; release notes must follow final qualification. | `bd-dsbym`, migration documentation |
 | V24 Ops/distributed extension | Deliberately experimental/design-only, not part of the shipped local-search claim. | existing scope decision/deferred work |
 
 ### Bridge plan: dependency order and concrete completion
@@ -112,9 +124,10 @@ September 21 API-only finding, not the original v2 acceptance criteria.
 
 - [ ] Preserve opt-in and legacy behavior while qualifying current copy reuse,
   source-change catch-up and sustained-churn recovery against real executables.
-- [ ] Route remaining append/delete/compact/flush/explain/TUI/expand surfaces
-  through the existing immutable lifecycle design; do not enable mutation of
-  a sealed bundle just to remove refusals. Keep the legacy APIs until the
+- [ ] Qualify the newly landed append/delete/compact/explain/expand routes,
+  parent discovery, immutable stored-text reranking and bound output checks.
+  Finish flush/TUI through the existing immutable lifecycle design; do not
+  enable sealed-bundle mutation just to remove refusals. Keep legacy APIs until the
   migration's original platform/identity/retirement criteria are satisfied.
 - [ ] Complete fixed publisher, retained snapshot, independent tier identity,
   antirollback and retention-root prerequisites. Trusted-directory publication
@@ -180,8 +193,9 @@ and authorized GC remain under their existing owner, with no deletion implied.
 **Ambition round 2 — deliver one coherent user workflow across layouts.**
 The valuable finish line is index → watch → search/stream → explain → update
 or compact → restart/recover, retaining one documented feature contract.
-Today the opt-in root solves part of concurrency but rejects commands that
-ordinary users already have. Complete those existing migration subtasks before
+At the initial snapshot the opt-in root rejected several ordinary commands;
+the final merge implements most of them. Qualify those routes and complete
+flush/TUI before
 calling the new root a universal replacement; run the same genuine corpus and
 operations against both layouts during migration and retain intentional typed
 differences. This is existing lifecycle acceptance, not a new conformance
@@ -195,7 +209,111 @@ Phase 3a is reapplied verbatim after these rounds. Added copy-cost/session,
 catch-up, command-coverage and producer-selection obligations belong in the
 existing watch/migration/native beads; no new graph or split completion credit.
 
-Refinement results are recorded here as the review proceeds.
+Each pass below applies the exact frozen Phase 5 instruction reproduced in the
+historical September 21 section, including preservation of functionality,
+unit/E2E coverage, diagnostic logs and `br`-only tracker mutations.
+
+1. **Completeness:** rechecked all 24 goals against nonclosed task descriptions
+   and source. Kept fragmented-session merge/fuel separate from watch reuse,
+   native ANN separate from the production registry adapter, and Ops outside
+   the local-product release. No uncovered goal or duplicate epic is needed.
+2. **Ordering and ownership:** inspected publisher/snapshot/watch/migration
+   dependencies and active assignees. The lint repair and release qualification
+   can proceed in the owned release task; they need not wait for every future
+   performance win or universal v2 migration. R1's original requirement remains
+   a real blocker. No dependency, priority, acceptance or ownership was changed.
+3. **Positive/negative proof:** inspected the actual retained watch executable
+   fixture. Its two real-model tests use **Potion with quality disabled**;
+   they prove real semantic concurrency/daemon lifecycle, not two-tier watch
+   correctness. The existing watch/migration criteria still require both
+   independent tiers, quality-only/out-of-fast-pool behavior and restart.
+   Copy reuse must retain inode independence, same-metadata input changes,
+   missing/incompatible receipt cold fallback, malformed receipt refusal and
+   full-reindex bypass. Current-source lint failure prevents a new test claim.
+4. **Release/provenance:** compared actual current terminal failure with older
+   stock success and live GitHub/crates.io versions. Full Quill remains pending;
+   matched-layout R1 is diagnostic. No assembled pass from different sources,
+   public release, native replacement, numerical superiority or performance
+   win is claimed. The original failed receipts remain available.
+5. **Concurrent-source review:** main advanced to `fae763dc`. Re-read the README
+   additions and changed production dispatch. Corrected stale missing-feature
+   findings for append/delete/compact/explain/expand and native quality ANN;
+   these now need qualification, not duplicate implementation. Bound embedding
+   and compound-filter changes also need final-source tests. Preserved original
+   feature/identity goals and existing owners.
+6. **Final convergence:** compared this corrected snapshot with the revised
+   comments and original acceptance. No further planning change identified.
+   Stop refining and return to owned release repair/qualification; later commits
+   require a source refresh, not retroactive promotion of older receipts.
+
+### Audit disposition and handoff
+
+This session's assessment changes the existing plan and comments on existing
+beads only. It adds no test/gate, new framework, spec relaxation, duplicate task
+or closure. The two source-formatting edits predate this assessment. Review was
+performed locally against actual source and retained execution logs, not by an
+independent verifier. No extra builds were launched; the running all-feature
+job continues. The next concrete execution is the small Clippy repair, then
+existing retained tests and final-source gates; the original R1 resolution and
+artifact qualification remain open.
+
+**Bounded anti-ceremony worksheet (this assessment only).** Boundary: this
+document is process, not runtime state. Creation gate: explicit owner request;
+consumer, observed defects and retirement condition are stated above. The
+integrity-control exception is not used (all four exception questions are
+inapplicable because the explicit-request gate suffices). Opportunity cost:
+the owned release lint repair has greater immediate product value; the owner
+requested this assessment first. Verdict: legitimate requested assessment,
+finish it once rather than create more machinery.
+
+Real-work inventory for this assessment: one PROCESS unit (existing plan and
+Beads refresh), zero USER/ENABLER/UNKNOWN units credited. No product was shipped
+by this review, so no two-minute shipped-feature demo is claimed. Without it,
+code behavior would be identical but next-work guidance would remain stale.
+No new enabler was created. The old watch/search availability problem remains
+user-relevant; effort went to assessment because explicitly requested. No swarm
+was dispatched and close counts are not used to rank peers. Plan changes do not
+stand in for implementation and no follow-up was minted to close an original.
+Disposition: bounded requested process; next execution returns to release code.
+
+Honesty inventory, bounded to this assessment's own edits and claims:
+
+1. No test weakened (checked own diff: plan and Beads comments only).
+2. No mock or fixture introduced (same changed-path check).
+3. No golden regenerated (same changed-path check).
+4. No validator/config/suppression edit (same changed-path check).
+5. No success-path hardcoding or gate manipulation (same changed-path check).
+6. No zero-run result promoted: later ad12 stages did not run; existing ignores
+   and the fast-only scope are explicit.
+7. No unexecuted command claimed: retained logs are identified as earlier
+   executions; this pass launched no build.
+8. No lower proof class promoted: native ANN source, matched-layout R1 control
+   and older stock success each retain their limits.
+9. Stale missing-feature findings arose when peers merged during review;
+   corrected in this document and explicitly superseded in the same beads.
+10. No stderr suppressed on cited validation commands; one failed exploratory
+    filename glob was not evidence and was followed by actual source reads.
+11. No bead closed (checked statuses/counts and actual `br` mutations).
+12. No requirement rewritten to fit implementation: original acceptance and
+    failing R1 remain intact; current-state descriptions were corrected.
+13. No delegated closure accepted; no subagent dispatched in this assessment.
+14. No test-gaming delegation (no dispatch).
+15. No peer report accepted as terminal qualification: merged source was read,
+    and its unobserved test verdict remains unproven.
+16. No refusal-only closure credited (no closures; flush/TUI still incomplete).
+17. No agent agreement treated as independent evidence (source/logs cited).
+18. No post-hoc denominator: stated test inventories and 24-goal map retained;
+    no invented percentage complete or benchmark win.
+19. The misleading moment would have been reporting the pre-merge command
+    refusals as current. Final source refresh and corrective bead comments
+    prevent that; older snapshots remain explicitly historical.
+20. Strongest evidence: exact production dispatch plus source-bound terminal
+    gate logs/receipt hashes listed above; a skeptic can inspect and rerun them.
+
+Historical sessions were not newly audited in this bounded pass. No claim of
+independent review or clean audit of all earlier swarm work is made. Correction
+disposition: stale findings corrected in place, disclosed in commentary and
+Beads, and guarded by the final-source refresh (proof-class inflation boundary).
 
 ---
 
