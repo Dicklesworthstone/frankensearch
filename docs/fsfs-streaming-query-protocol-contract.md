@@ -37,6 +37,14 @@ A daemon-served stream that replays a cached answer emits a progress frame
 with `stage = cache` and `reason_code = daemon_cache_hit` before the replayed
 phases.
 
+When the caller requested reranking (`--rerank` or `search.rerank`), each phase
+that carries a rerank outcome emits one more progress frame after its phase
+frame and before its `result` frames: `stage = rerank`, `reason_code` from the
+stage (`query.stage.rerank.applied` or a `query.stage.rerank.disabled.*` /
+failure code), `completed_units` = hits the cross-encoder scored and
+`total_units` = the head budget. Streams without a rerank request carry no
+such frame.
+
 ## Frame Envelope
 
 Each frame MUST include:

@@ -2310,6 +2310,9 @@ struct ExplainSession {
     complete_generation: Option<CompleteExplainGeneration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unavailable: Option<ExplainUnavailableReason>,
+    /// Cross-encoder model identity when the rerank stage applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rerank_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2336,6 +2339,9 @@ struct ExplainSessionHit {
     /// Cross-encoder score when the rerank stage re-scored this hit.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     rerank_score: Option<f32>,
+    /// Raw cross-encoder logit behind `rerank_score`, when finite.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    rerank_logit: Option<f32>,
     /// This hit retained its raw BM25 score after the fused head.
     #[serde(default)]
     lexical_fallback_tail: bool,
@@ -2411,6 +2417,7 @@ impl ExplainSession {
                 hash_score: candidate.hash_score,
                 in_both_sources: candidate.in_both_sources,
                 rerank_score: None,
+                rerank_logit: None,
                 lexical_fallback_tail: false,
             })
             .collect();
@@ -2427,6 +2434,7 @@ impl ExplainSession {
             semantic_blend: None,
             complete_generation: None,
             unavailable: None,
+            rerank_model: None,
         }
     }
 
@@ -8186,6 +8194,36 @@ impl FsfsRuntime {
             *seq = seq.saturating_add(1);
         }
 
+        // A requested rerank stage reports its outcome before the results it
+        // ordered, so a stream consumer can tell a cross-encoder order from a
+        // fused one. Present only when the caller asked for reranking.
+        if let Some(rerank) = &payload.rerank {
+            let message = match rerank.status {
+                RerankStageStatus::Applied => format!(
+                    "cross-encoder {} re-scored {} hits",
+                    rerank.model.as_deref().unwrap_or("reranker"),
+                    rerank.reranked_hits
+                ),
+                RerankStageStatus::Skipped => "rerank stage skipped; fused order kept".to_owned(),
+                RerankStageStatus::Failed => "rerank stage failed; fused order kept".to_owned(),
+            };
+            let rerank_frame = StreamFrame::new(
+                stream_id.to_owned(),
+                *seq,
+                iso_timestamp_now(),
+                "search",
+                StreamEvent::<SearchHitPayload>::Progress(StreamProgressEvent {
+                    stage: "rerank".to_owned(),
+                    completed_units: u64::try_from(rerank.reranked_hits).unwrap_or(u64::MAX),
+                    total_units: Some(u64::try_from(rerank.candidate_budget).unwrap_or(u64::MAX)),
+                    reason_code: rerank.reason_code.clone(),
+                    message,
+                }),
+            );
+            emit_stream_frame(&rerank_frame, self.cli_input.format, writer)?;
+            *seq = seq.saturating_add(1);
+        }
+
         for hit in &payload.hits {
             let result_frame = StreamFrame::new(
                 stream_id.to_owned(),
@@ -8419,6 +8457,25 @@ impl FsfsRuntime {
                 weight: shared_weight,
             });
         }
+        if let (Some(sigmoid), Some(model)) = (hit.rerank_score, session.rerank_model.as_deref()) {
+            // The cross-encoder reorders the reranked head; it contributes no
+            // RRF term and leaves `final_score` (the fused score) unchanged.
+            // Weight 1.0 records that it alone decided this hit's position
+            // within the head.
+            components.push(ScoreComponent {
+                source: ExplainedSource::Rerank {
+                    model: model.to_owned(),
+                    logit: hit
+                        .rerank_logit
+                        .map_or_else(|| logit_from_sigmoid(sigmoid), f64::from),
+                    sigmoid: f64::from(sigmoid),
+                },
+                raw_score: f64::from(sigmoid),
+                normalized_score: f64::from(sigmoid),
+                rrf_contribution: 0.0,
+                weight: 1.0,
+            });
+        }
         if components.is_empty() {
             components.push(ScoreComponent {
                 source: ExplainedSource::LexicalBm25 {
@@ -8633,6 +8690,11 @@ impl FsfsRuntime {
         let mut session = ExplainSession::from_fused(query, phase, self.config.search.rrf_k, fused);
         if let Some(payload) = payload {
             session.semantic_blend.clone_from(&payload.semantic_blend);
+            session.rerank_model = payload
+                .rerank
+                .as_ref()
+                .filter(|stage| stage.status == RerankStageStatus::Applied)
+                .and_then(|stage| stage.model.clone());
             for (hit, source) in session.hits.iter_mut().zip(payload.hits.iter()) {
                 hit.semantic_rank = source.semantic_rank;
                 hit.hash_rank = source.hash_rank;
@@ -8648,13 +8710,11 @@ impl FsfsRuntime {
                 }) {
                     hit.semantic_score = Some(blend_hit.score);
                 }
-                hit.rerank_score = payload.rerank.as_ref().and_then(|stage| {
-                    stage
-                        .scores
-                        .iter()
-                        .find(|score| score.path == hit.path)
-                        .map(|score| score.score)
+                let rerank_hit = payload.rerank.as_ref().and_then(|stage| {
+                    stage.scores.iter().find(|score| score.path == hit.path)
                 });
+                hit.rerank_score = rerank_hit.map(|score| score.score);
+                hit.rerank_logit = rerank_hit.and_then(|score| score.logit);
             }
         }
         Self::attach_explain_session_generation(&mut session, index_root, payload);
@@ -16695,6 +16755,7 @@ impl FsfsRuntime {
                     .get(candidate.doc_id.as_str())
                     .copied()
                     .unwrap_or(0),
+                logit: score.raw_logit.filter(|logit| logit.is_finite()),
             });
             reordered.push(candidate);
         }
@@ -20029,6 +20090,14 @@ fn rrf_contribution_for_rank(k: f64, rank: Option<usize>) -> f64 {
     let safe_k = if k.is_finite() && k >= 0.0 { k } else { 60.0 };
     let rank_u32 = u32::try_from(rank).unwrap_or(u32::MAX);
     1.0 / (safe_k + f64::from(rank_u32) + 1.0)
+}
+
+/// Inverse of the cross-encoder sigmoid, for a session recorded without the
+/// raw logit (an older daemon's reply). The score is clamped away from 0 and 1
+/// so the result stays finite and JSON-representable.
+fn logit_from_sigmoid(sigmoid: f32) -> f64 {
+    let p = f64::from(sigmoid).clamp(1e-7, 1.0 - 1e-7);
+    (p / (1.0 - p)).ln()
 }
 
 fn render_explain_table(
@@ -24727,8 +24796,8 @@ mod tests {
         DiskBudgetAction, DiskBudgetStage, LifecycleTracker, ResourceLimits, WatchdogConfig,
     };
     use crate::output_schema::{
-        IndexFreshnessPayload, OutputWarningCode, SearchHitPayload, SearchOutputPhase,
-        SearchPayload,
+        IndexFreshnessPayload, OutputWarningCode, RerankHitScore, RerankStagePayload,
+        RerankStageStatus, SearchHitPayload, SearchOutputPhase, SearchPayload,
     };
     #[cfg(target_os = "linux")]
     use crate::pressure::HostPressureCollector;
@@ -24738,7 +24807,7 @@ mod tests {
     use crate::query_planning::QueryIntentClass;
     use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
     use crate::stream_protocol::{
-        StreamEvent, StreamEventKind, StreamFrame, StreamTerminalStatus,
+        StreamEvent, StreamEventKind, StreamFrame, StreamProgressEvent, StreamTerminalStatus,
         TOON_STREAM_RECORD_SEPARATOR_BYTE, decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
@@ -36868,6 +36937,86 @@ mod tests {
         assert_eq!(terminal.event.kind(), StreamEventKind::Terminal);
     }
 
+    /// A requested rerank stage announces its outcome as one `rerank` progress
+    /// frame before the results it ordered; a stream without a rerank request
+    /// carries no such frame.
+    #[test]
+    fn runtime_stream_reports_rerank_stage_before_its_results() {
+        fn rerank_progress_frames(payload: &SearchPayload) -> Vec<StreamProgressEvent> {
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                stream: true,
+                format: OutputFormat::Jsonl,
+                ..CliInput::default()
+            });
+            let mut bytes = Vec::new();
+            let mut seq = 0_u64;
+            runtime
+                .emit_search_stream_payload(payload, "stream-rerank", &mut seq, &mut bytes)
+                .expect("emit payload");
+            let text = String::from_utf8(bytes).expect("utf8");
+            let frames = text
+                .lines()
+                .map(|line| decode_stream_frame_ndjson::<SearchHitPayload>(line).expect("frame"))
+                .collect::<Vec<_>>();
+            let first_result = frames
+                .iter()
+                .position(|frame| frame.event.kind() == StreamEventKind::Result)
+                .expect("results follow");
+            frames
+                .iter()
+                .enumerate()
+                .filter_map(|(index, frame)| match &frame.event {
+                    StreamEvent::Progress(progress) if progress.stage == "rerank" => {
+                        assert!(index < first_result, "rerank frame precedes results");
+                        Some(progress.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        let hit = SearchHitPayload {
+            rank: 1,
+            path: "src/auth.rs".to_owned(),
+            score: 0.016,
+            snippet: None,
+            lexical_rank: Some(0),
+            semantic_rank: Some(0),
+            hash_rank: None,
+            in_both_sources: true,
+        };
+        let mut payload =
+            SearchPayload::new("auth", SearchOutputPhase::Refined, 1, vec![hit.clone()]);
+        assert!(
+            rerank_progress_frames(&payload).is_empty(),
+            "no rerank request, no rerank frame"
+        );
+
+        payload.rerank = Some(RerankStagePayload {
+            status: RerankStageStatus::Applied,
+            reason_code: "query.stage.rerank.applied".to_owned(),
+            candidate_budget: 4,
+            reranked_hits: 1,
+            elapsed_ms: 2,
+            model: Some("ms-marco-minilm-l-6-v2".to_owned()),
+            scores: Vec::new(),
+        });
+        let applied = rerank_progress_frames(&payload);
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].reason_code, "query.stage.rerank.applied");
+        assert_eq!((applied[0].completed_units, applied[0].total_units), (1, Some(4)));
+        assert!(applied[0].message.contains("ms-marco-minilm-l-6-v2"));
+
+        payload.rerank = Some(RerankStagePayload::skipped(
+            "query.stage.rerank.disabled.unavailable",
+            4,
+        ));
+        let skipped = rerank_progress_frames(&payload);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].reason_code, "query.stage.rerank.disabled.unavailable");
+        assert_eq!(skipped[0].completed_units, 0);
+    }
+
     #[test]
     fn runtime_stream_emitter_outputs_protocol_frames_toon_with_rs() {
         let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
@@ -38794,6 +38943,7 @@ mod tests {
                 hash_score: None,
                 in_both_sources: false,
                 rerank_score: None,
+                rerank_logit: None,
                 lexical_fallback_tail: false,
             },
             60.0,
@@ -38968,6 +39118,142 @@ mod tests {
         assert_eq!(session.hits[0].semantic_rank, None);
         assert_eq!(session.hits[0].hash_score, Some(0.4));
         assert_eq!(session.hits[0].semantic_score, None);
+    }
+
+    /// Explain JSON carries the cross-encoder component for a reranked hit,
+    /// with the model and the raw logit the stage reported — and nothing for
+    /// a hit the stage did not score, or when the stage did not apply.
+    #[test]
+    fn explain_json_reports_rerank_component_only_for_scored_hits() {
+        fn candidate(doc_id: &str, lexical_rank: usize) -> FusedCandidate {
+            FusedCandidate {
+                doc_id: doc_id.into(),
+                fused_score: 0.016,
+                prior_boost: 0.0,
+                lexical_rank: Some(lexical_rank),
+                semantic_rank: None,
+                hash_rank: None,
+                lexical_score: Some(2.5),
+                semantic_score: None,
+                hash_score: None,
+                in_both_sources: false,
+            }
+        }
+        fn hit(rank: usize, path: &str, lexical_rank: usize) -> SearchHitPayload {
+            SearchHitPayload {
+                rank,
+                path: path.to_owned(),
+                score: 0.016,
+                snippet: None,
+                lexical_rank: Some(lexical_rank),
+                semantic_rank: None,
+                hash_rank: None,
+                in_both_sources: false,
+            }
+        }
+        fn explain_json(runtime_root: &Path, result_id: &str) -> serde_json::Value {
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Explain,
+                result_id: Some(result_id.to_owned()),
+                index_dir: Some(runtime_root.to_path_buf()),
+                format: OutputFormat::Json,
+                ..CliInput::default()
+            });
+            let session = runtime
+                .load_explain_session()
+                .expect("load explain session")
+                .expect("session exists");
+            let mut out = Vec::new();
+            runtime
+                .emit_explain_session_with_writer(Some(&session), &mut out)
+                .expect("emit explain");
+            serde_json::from_slice(&out).expect("explain json")
+        }
+        fn rerank_components(value: &serde_json::Value) -> Vec<serde_json::Value> {
+            value["data"]["ranking"]["components"]
+                .as_array()
+                .expect("components array")
+                .iter()
+                .filter(|component| component["source"] == "rerank")
+                .cloned()
+                .collect()
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("index root");
+        let fused = [candidate("reranked.md", 1), candidate("unscored.md", 0)];
+        let mut payload = SearchPayload::new(
+            "cross encoder",
+            SearchOutputPhase::Refined,
+            2,
+            vec![hit(1, "reranked.md", 1), hit(2, "unscored.md", 0)],
+        );
+        payload.rerank = Some(RerankStagePayload {
+            status: RerankStageStatus::Applied,
+            reason_code: "query.stage.rerank.applied".to_owned(),
+            candidate_budget: 1,
+            reranked_hits: 1,
+            elapsed_ms: 3,
+            model: Some("ms-marco-minilm-l-6-v2".to_owned()),
+            scores: vec![RerankHitScore {
+                rank: 1,
+                path: "reranked.md".to_owned(),
+                score: 0.75,
+                original_rank: 2,
+                logit: Some(1.25),
+            }],
+        });
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            index_dir: Some(index_root.clone()),
+            ..CliInput::default()
+        });
+        runtime
+            .persist_explain_session_with_payload(
+                &index_root,
+                "cross encoder",
+                SearchOutputPhase::Refined,
+                &fused,
+                Some(&payload),
+            )
+            .expect("persist reranked session");
+
+        let reranked = rerank_components(&explain_json(&index_root, "R0"));
+        assert_eq!(reranked.len(), 1, "one rerank component: {reranked:?}");
+        let component = &reranked[0];
+        assert!(
+            (component["raw_score"].as_f64().expect("raw") - 0.75).abs() < 1e-6,
+            "rerank raw score is the stage sigmoid: {component}"
+        );
+        assert_eq!(component["rrf_contribution"].as_f64(), Some(0.0));
+        let summary = component["summary"].as_str().expect("summary");
+        assert!(
+            summary.contains("ms-marco-minilm-l-6-v2") && summary.contains("1.25"),
+            "summary names the model and the reported logit: {summary}"
+        );
+
+        assert!(
+            rerank_components(&explain_json(&index_root, "R1")).is_empty(),
+            "a hit outside the reranked head has no rerank component"
+        );
+
+        payload.rerank = Some(RerankStagePayload::skipped(
+            "query.stage.rerank.disabled.unavailable",
+            1,
+        ));
+        runtime
+            .persist_explain_session_with_payload(
+                &index_root,
+                "cross encoder",
+                SearchOutputPhase::Refined,
+                &fused,
+                Some(&payload),
+            )
+            .expect("persist skipped-rerank session");
+        assert!(
+            rerank_components(&explain_json(&index_root, "R0")).is_empty(),
+            "a skipped rerank stage yields no rerank component"
+        );
     }
 
     #[test]

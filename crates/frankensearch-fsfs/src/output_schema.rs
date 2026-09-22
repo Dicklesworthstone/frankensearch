@@ -535,6 +535,10 @@ pub struct RerankHitScore {
     pub score: f32,
     /// 1-based rank the hit held before reranking.
     pub original_rank: usize,
+    /// Raw pre-sigmoid cross-encoder logit, when the backend reported a
+    /// finite one. Absent for a non-finite logit (scored as `0.0`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub logit: Option<f32>,
 }
 
 /// Outcome of the cross-encoder rerank stage for one search phase.
