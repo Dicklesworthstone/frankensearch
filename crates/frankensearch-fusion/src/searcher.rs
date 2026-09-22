@@ -856,9 +856,10 @@ impl TwoTierSearcher {
     /// bd-9xuj admission law
     /// ([`EmbeddingIdentityBundleV1::verify_exact_producer_with`]) that
     /// [`TwoTierIndex::activate_owner_backed_search`] applies to the bound
-    /// query afterwards, so a query this method admits cannot be refused
-    /// later for an identity reason, and one it refuses never reaches an
-    /// embedder at all.
+    /// query afterwards. A refused configuration never reaches an embedder.
+    /// Native quality retrieval also checks the actual bound response after
+    /// inference, so a provider that contradicts its advertised identity is
+    /// refused before feedback-vector reads or graph traversal.
     ///
     /// # Errors
     ///
@@ -949,9 +950,10 @@ impl TwoTierSearcher {
 
     /// Wrap the fast (and quality, if set) embedders with a query embedding cache.
     ///
-    /// Repeated queries will return cached vectors instead of re-running inference.
-    /// `capacity` controls the maximum number of cached embeddings per embedder
-    /// (FIFO eviction when full).
+    /// Repeated raw embedding requests return cached vectors instead of
+    /// re-running inference. Native quality requests preserve the provider's
+    /// bound response and bypass this raw-vector cache. `capacity` controls the
+    /// maximum cached embeddings per embedder (FIFO eviction when full).
     ///
     /// Safe to call in any builder order: if `with_quality_embedder` is called
     /// later, the quality embedder is automatically wrapped at the same capacity.
@@ -2182,8 +2184,21 @@ impl TwoTierSearcher {
 
         // Quality embedding.
         let embed_start = Instant::now();
-        let mut quality_vec = match quality_embedder.embed(cx, query).await {
-            Ok(quality_vec) => {
+        let quality_output = if self.index.has_native_quality_hnsw() {
+            let response = quality_embedder.embed_bound(cx, query).await;
+            // Cancellation remains terminal even when the provider also refuses
+            // its bound response at this boundary.
+            cancellation_checkpoint(cx, "quality_embed_to_prf")
+                .and(response)
+                .map(|bound| (bound.values, Some(bound.identity)))
+        } else {
+            quality_embedder
+                .embed(cx, query)
+                .await
+                .map(|values| (values, None))
+        };
+        let (mut quality_vec, native_quality_identity) = match quality_output {
+            Ok(output) => {
                 let quality_embed_elapsed = embed_start.elapsed();
                 metrics.quality_embed_ms = quality_embed_elapsed.as_secs_f64() * 1000.0;
                 self.export_embedding_metrics(
@@ -2201,7 +2216,7 @@ impl TwoTierSearcher {
                         parent_event_id.clone(),
                     );
                 }
-                quality_vec
+                output
             }
             Err(err) => {
                 let quality_embed_elapsed = embed_start.elapsed();
@@ -2226,6 +2241,16 @@ impl TwoTierSearcher {
         };
 
         cancellation_checkpoint(cx, "quality_embed_to_prf")?;
+
+        if let Some(identity) = &native_quality_identity {
+            // Admit the identity that actually accompanied this response before
+            // reading feedback vectors or traversing the native graph. The
+            // provider's advertised identity cannot relabel a foreign response.
+            let bound = BoundQueryEmbedding::new(quality_vec.clone(), identity.clone())?;
+            let embeddings = TieredQueryEmbeddings::quality_only(bound);
+            self.index.activate_owner_backed_search(&embeddings)?;
+            cancellation_checkpoint(cx, "native_quality_activation_to_prf")?;
+        }
 
         if self.prf_config.should_expand(&query_class) {
             let mut feedback_embeddings = Vec::new();
@@ -2330,7 +2355,8 @@ impl TwoTierSearcher {
                 // construction: it is a convex mix of this query and vectors
                 // read out of this very index, so binding it to the quality
                 // embedder's identity states exactly what is true of it.
-                let quality_identity = quality_embedder.identity()?.clone();
+                let quality_identity = native_quality_identity
+                    .map_or_else(|| quality_embedder.identity().cloned(), Ok)?;
                 cancellation_checkpoint(cx, "quality_identity_to_activation")?;
                 let bound = BoundQueryEmbedding::new(quality_vec.clone(), quality_identity)?;
                 let embeddings = TieredQueryEmbeddings::quality_only(bound);
@@ -3950,7 +3976,9 @@ mod tests {
     use frankensearch_core::generation::{
         ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
     };
-    use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
+    use frankensearch_core::traits::{
+        IdentityBoundEmbedding, MetricsExporter, ModelCategory, SearchFuture,
+    };
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
     use frankensearch_core::{
         AdapterIdentity, AdapterLifecycleEvent, HostAdapter, TelemetryEnvelope, TelemetryEvent,
@@ -4674,6 +4702,9 @@ mod tests {
         identity: EmbeddingIdentityBundleV1,
         vector: Vec<f32>,
         embeds: Arc<AtomicU64>,
+        bound_embeds: AtomicU64,
+        bound_response_identity: Option<EmbeddingIdentityBundleV1>,
+        bound_response_values: Option<Vec<f32>>,
         identity_calls: Arc<AtomicU64>,
         cancel_on_identity_call: Option<(Cx, u64)>,
     }
@@ -4685,6 +4716,9 @@ mod tests {
                 identity,
                 vector,
                 embeds: Arc::new(AtomicU64::new(0)),
+                bound_embeds: AtomicU64::new(0),
+                bound_response_identity: None,
+                bound_response_values: None,
                 identity_calls: Arc::new(AtomicU64::new(0)),
                 cancel_on_identity_call: None,
             }
@@ -4692,6 +4726,16 @@ mod tests {
 
         fn embed_count(&self) -> u64 {
             self.embeds.load(Ordering::Relaxed)
+        }
+
+        fn with_bound_response_identity(mut self, identity: EmbeddingIdentityBundleV1) -> Self {
+            self.bound_response_identity = Some(identity);
+            self
+        }
+
+        fn with_bound_response_values(mut self, values: Vec<f32>) -> Self {
+            self.bound_response_values = Some(values);
+            self
         }
 
         fn cancel_on_identity_call(mut self, cx: Cx, call: u64) -> Self {
@@ -4709,6 +4753,25 @@ mod tests {
             self.embeds.fetch_add(1, Ordering::Relaxed);
             let vector = self.vector.clone();
             Box::pin(async move { Ok(vector) })
+        }
+
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+            self.bound_embeds.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                let values = self.embed(cx, text).await?;
+                let values = self.bound_response_values.clone().unwrap_or(values);
+                let identity = self
+                    .bound_response_identity
+                    .as_ref()
+                    .map_or_else(|| self.identity().cloned(), |identity| Ok(identity.clone()))?;
+                let bound = IdentityBoundEmbedding { values, identity };
+                bound.validate()?;
+                Ok(bound)
+            })
         }
 
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
@@ -5491,6 +5554,287 @@ mod tests {
             );
 
             let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn native_quality_retrieval_preserves_progressive_results_and_bound_identity_through_prf() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("native-quality-retrieval");
+            let fast_binding = artifact_binding("native-quality-fast", 4, 53);
+            let quality_binding = artifact_binding("native-quality-provider", 4, 53);
+            let mut index = owner_backed_two_tier_index(&dir, &fast_binding, &quality_binding);
+            let snapshot = |hits: &[ScoredResult]| {
+                hits.iter()
+                    .map(|hit| {
+                        (
+                            hit.doc_id.to_string(),
+                            hit.score.to_bits(),
+                            hit.source,
+                            hit.index,
+                            hit.fast_score.map(f32::to_bits),
+                            hit.quality_score.map(f32::to_bits),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut exact_results = None;
+            for native in [false, true] {
+                if native {
+                    Arc::get_mut(&mut index)
+                        .expect("previous searcher released its index")
+                        .enable_native_quality_hnsw(
+                            frankensearch_index::native_hnsw::HnswParams::default(),
+                            7,
+                        )
+                        .expect("enable native quality retrieval");
+                }
+                assert_eq!(index.has_native_quality_hnsw(), native);
+                let fast = Arc::new(IdentityCountingEmbedder::new(
+                    "fast",
+                    in_memory_identity("native-quality-fast", 4),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                ));
+                let identity = in_memory_identity("native-quality-provider", 4);
+                let quality = Arc::new(
+                    IdentityCountingEmbedder::new(
+                        "quality",
+                        identity.clone(),
+                        vec![0.0, 1.0, 0.0, 0.0],
+                    )
+                    .with_bound_response_identity(identity),
+                );
+                let searcher =
+                    TwoTierSearcher::new(Arc::clone(&index), fast, TwoTierConfig::default())
+                        .with_quality_embedder(quality.clone())
+                        .with_prf_config(PrfConfig {
+                            enabled: true,
+                            alpha: 0.5,
+                            top_k_feedback: 1,
+                            min_feedback_docs: 1,
+                            score_weighted: false,
+                        });
+
+                let mut phases = Vec::new();
+                let mut initial = Vec::new();
+                let mut refined = Vec::new();
+                let metrics = searcher
+                    .search(
+                        &cx,
+                        "find the quality document beyond the fast pool",
+                        3,
+                        |_| None,
+                        |phase| match phase {
+                            SearchPhase::Initial { results, .. } => {
+                                phases.push("initial");
+                                initial = results;
+                            }
+                            SearchPhase::Refined { results, .. } => {
+                                phases.push("refined");
+                                refined = results;
+                            }
+                            phase => panic!("unexpected progressive phase: {phase:?}"),
+                        },
+                    )
+                    .await
+                    .expect("retrieve from both admitted tiers");
+                assert_eq!(phases, ["initial", "refined"]);
+                assert!(initial.iter().all(|hit| hit.doc_id != "doc-quality-only"));
+                let quality_only = refined
+                    .iter()
+                    .find(|hit| hit.doc_id == "doc-quality-only")
+                    .expect("quality retrieval reaches outside the fast pool");
+                assert_eq!(quality_only.index, None);
+                let quality_score = quality_only.quality_score.expect("quality evidence");
+                assert!(
+                    quality_score > 0.0 && quality_score < 1.0,
+                    "feedback must rotate the query away from its original exact match"
+                );
+                assert_eq!(
+                    quality.bound_embeds.load(Ordering::Relaxed),
+                    u64::from(native)
+                );
+                assert_eq!(quality.embed_count(), 1);
+                assert_eq!(quality.identity_count(), if native { 1 } else { 2 });
+                let observed = (snapshot(&initial), snapshot(&refined), metrics.coverage);
+                if let Some(expected) = &exact_results {
+                    assert_eq!(
+                        &observed, expected,
+                        "full-width native retrieval matches exact"
+                    );
+                } else {
+                    exact_results = Some(observed);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_quality_refuses_foreign_bound_responses_with_prf_and_embedding_cache() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("native-quality-foreign-response");
+            let fast_binding = artifact_binding("native-response-fast", 4, 59);
+            let quality_binding = artifact_binding("native-response-quality", 4, 59);
+            let mut index = owner_backed_two_tier_index(&dir, &fast_binding, &quality_binding);
+            Arc::get_mut(&mut index)
+                .expect("the native fixture has one owner")
+                .enable_native_quality_hnsw(
+                    frankensearch_index::native_hnsw::HnswParams::default(),
+                    11,
+                )
+                .expect("enable native quality retrieval");
+            let advertised = in_memory_identity("native-response-quality", 4);
+            let mut foreign_producer = advertised.clone();
+            "foreign-bound-backend".clone_into(&mut foreign_producer.producer.backend);
+            for (response, expected_field) in [
+                (
+                    in_memory_identity("foreign-bound-space", 4),
+                    "query_embedding.quality.space_identity",
+                ),
+                (
+                    foreign_producer,
+                    "search_activation.quality.producer_conformance",
+                ),
+            ] {
+                for cached in [false, true] {
+                    let fast = Arc::new(IdentityCountingEmbedder::new(
+                        "fast",
+                        in_memory_identity("native-response-fast", 4),
+                        vec![1.0, 0.0, 0.0, 0.0],
+                    ));
+                    let quality = Arc::new(
+                        IdentityCountingEmbedder::new(
+                            "quality",
+                            advertised.clone(),
+                            vec![0.0, 1.0, 0.0, 0.0],
+                        )
+                        .with_bound_response_identity(response.clone()),
+                    );
+                    let mut searcher =
+                        TwoTierSearcher::new(Arc::clone(&index), fast, TwoTierConfig::default())
+                            .with_quality_embedder(quality.clone())
+                            .with_prf_config(PrfConfig {
+                                enabled: true,
+                                alpha: 0.5,
+                                top_k_feedback: 1,
+                                min_feedback_docs: 1,
+                                score_weighted: false,
+                            });
+                    if cached {
+                        searcher = searcher.with_embedding_cache(8);
+                    }
+                    let mut phases = Vec::new();
+                    let mut initial = Vec::new();
+                    let mut failure = None;
+                    let metrics = searcher
+                        .search(
+                            &cx,
+                            "find the quality document beyond the fast pool",
+                            3,
+                            |_| None,
+                            |phase| match phase {
+                                SearchPhase::Initial { results, .. } => {
+                                    phases.push("initial");
+                                    initial = results;
+                                }
+                                SearchPhase::RefinementFailed {
+                                    initial_results,
+                                    error,
+                                    ..
+                                } => {
+                                    phases.push("refinement_failed");
+                                    assert_eq!(
+                                        serde_json::to_value(initial_results).unwrap(),
+                                        serde_json::to_value(&initial).unwrap(),
+                                        "a refused response preserves every displayed Initial field"
+                                    );
+                                    failure = Some(error);
+                                }
+                                phase => panic!("foreign quality response escaped: {phase:?}"),
+                            },
+                        )
+                        .await
+                        .expect("identity refusal preserves the delivered Initial phase");
+                    assert_eq!(phases, ["initial", "refinement_failed"]);
+                    assert!(!initial.is_empty());
+                    assert!(
+                        matches!(failure, Some(SearchError::InvalidConfig { ref field, .. })
+                        if field == expected_field)
+                    );
+                    assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 1);
+                    assert_eq!(quality.embed_count(), 1);
+                    assert_eq!(quality.identity_count(), 1);
+                    assert_eq!(metrics.phase2_vectors_searched, 0);
+                    assert_eq!(metrics.quality_search_ms.to_bits(), 0.0_f64.to_bits());
+                    assert!(metrics.coverage.is_none());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_quality_cancellation_dominates_a_refused_bound_response() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("native-quality-bound-cancellation");
+            let fast_binding = artifact_binding("native-cancel-fast", 4, 61);
+            let quality_binding = artifact_binding("native-cancel-quality", 4, 61);
+            let mut index = owner_backed_two_tier_index(&dir, &fast_binding, &quality_binding);
+            Arc::get_mut(&mut index)
+                .expect("the native fixture has one owner")
+                .enable_native_quality_hnsw(
+                    frankensearch_index::native_hnsw::HnswParams::default(),
+                    13,
+                )
+                .expect("enable native quality retrieval");
+            let fast = Arc::new(IdentityCountingEmbedder::new(
+                "fast",
+                in_memory_identity("native-cancel-fast", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            // Preflight accepts the advertised identity. Binding the actual
+            // response cancels this invocation and then rejects its malformed
+            // vector length; cancellation must win over that coincident refusal.
+            let quality = Arc::new(
+                IdentityCountingEmbedder::new(
+                    "quality",
+                    in_memory_identity("native-cancel-quality", 4),
+                    vec![0.0, 1.0, 0.0, 0.0],
+                )
+                .with_bound_response_values(vec![0.0, 1.0, 0.0])
+                .cancel_on_identity_call(cx.clone(), 2),
+            );
+            let adapter = Arc::new(RecordingHostAdapter::new(
+                "native_quality_bound_cancellation",
+            ));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality.clone())
+                .with_embedding_cache(8)
+                .with_host_adapter(adapter.clone());
+            let mut phases = Vec::new();
+            let error = searcher
+                .search(
+                    &cx,
+                    "find the quality document beyond the fast pool",
+                    3,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => phases.push("initial"),
+                        phase => panic!("cancelled quality response published {phase:?}"),
+                    },
+                )
+                .await
+                .expect_err("cancellation must not become RefinementFailed");
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "quality_embed_to_prf"
+                        && reason == "user: cancel after quality identity"
+            ));
+            assert_eq!(phases, ["initial"]);
+            assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 1);
+            assert_eq!(quality.embed_count(), 1);
+            assert_eq!(quality.identity_count(), 2);
+            assert_single_cancelled_session_stop(&adapter, "quality_embed_to_prf");
         });
     }
 

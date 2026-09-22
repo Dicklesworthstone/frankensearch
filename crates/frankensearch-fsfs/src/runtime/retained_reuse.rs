@@ -10,14 +10,15 @@
 //! merely a package version that can stay unchanged across source edits. The
 //! final uncheckpointed batch has no retained input evidence and is recomputed.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{Canonicalizer, DefaultCanonicalizer, SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -26,7 +27,9 @@ use super::{
     INDEXING_CHECKPOINT_SCHEMA_VERSION, IndexingCheckpoint, IndexingProgressStage,
     SearchExecutionMode, content_sha256_hex, retained_search_checkpoint, write_indexing_checkpoint,
 };
-use crate::generation_store::{COMPLETE_GENERATION_MANIFEST, CompleteGenerationStore};
+use crate::generation_store::{
+    COMPLETE_GENERATION_MANIFEST, CompleteGenerationStore, PublishedGeneration,
+};
 
 const RECEIPT_FILE: &str = "FSFS-REUSE.json";
 const RECEIPT_VERSION: u16 = 1;
@@ -279,6 +282,132 @@ struct CopyStats {
     bytes: u64,
 }
 
+/// Read the same JSONL `id`/`text` input as the ordinary append command before
+/// acquiring publication ownership. Explicit batch text is the only content
+/// source: IDs never cause a source-file read. Resolve duplicate IDs first,
+/// then canonicalize their final bodies once for every component.
+pub(super) async fn read_append_documents(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+) -> SearchResult<BTreeMap<String, String>> {
+    retained_search_checkpoint(cx)?;
+    let lines = if let Some(path) = runtime.cli_input.input_file.as_ref() {
+        asupersync::fs::read_to_string(path)
+            .await?
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        BufReader::new(std::io::stdin().lock())
+            .lines()
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    #[derive(Deserialize)]
+    struct Document {
+        id: String,
+        text: String,
+    }
+    let mut documents = BTreeMap::new();
+    for (line_number, line) in lines.iter().enumerate() {
+        retained_search_checkpoint(cx)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let document: Document =
+            serde_json::from_str(line).map_err(|error| SearchError::InvalidConfig {
+                field: "append_batch.input".to_owned(),
+                value: format!("line {}", line_number + 1),
+                reason: format!("expected a JSON object with string id and text fields: {error}"),
+            })?;
+        if document.id.trim().is_empty() || document.id.len() > usize::from(u16::MAX) {
+            return Err(SearchError::InvalidConfig {
+                field: "append_batch.input".to_owned(),
+                value: format!("line {}", line_number + 1),
+                reason:
+                    "document IDs must be nonblank and fit the vector record's 65535-byte limit"
+                        .to_owned(),
+            });
+        }
+        documents.insert(document.id, document.text);
+    }
+    let canonicalizer = DefaultCanonicalizer::default();
+    for text in documents.values_mut() {
+        retained_search_checkpoint(cx)?;
+        *text = canonicalizer.canonicalize(text);
+        if text.trim().is_empty() {
+            return Err(SearchError::InvalidConfig {
+                field: "append_batch.input".to_owned(),
+                value: "empty_canonical_text".to_owned(),
+                reason: "every final document body must contain canonical text; the batch was not applied"
+                    .to_owned(),
+            });
+        }
+    }
+    retained_search_checkpoint(cx)?;
+    Ok(documents)
+}
+
+/// Copy a complete admitted predecessor for an explicit mutation, independently
+/// of indexing-reuse evidence. The caller must hold `store.begin()` throughout
+/// this operation and publish only through that build's predecessor check.
+///
+/// Unlike checkpoint reuse, deletion and compaction do not infer any new
+/// embedding from source text. They preserve the copied producers and discard
+/// the old indexing receipt, which cannot describe the changed membership.
+pub(super) fn copy_selected_generation(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    store: &CompleteGenerationStore,
+    destination: &Path,
+) -> SearchResult<PublishedGeneration> {
+    retained_search_checkpoint(cx)?;
+    let predecessor = store.active(cx)?.ok_or_else(|| {
+        reuse_error("no complete generation has been published; index the store first")
+    })?;
+    FsfsRuntime::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
+    if FsfsRuntime::resolve_lexical_engine(predecessor.path())?.engine()
+        == Some(frankensearch_quill::BlueGreenEngine::Tantivy)
+    {
+        // Ordinary search admission can migrate a legacy Tantivy root by
+        // rereading source files. An explicit membership mutation must never
+        // trigger that rebuild and silently reintroduce a deleted document.
+        return Err(reuse_error(
+            "complete-generation mutations require a Quill or vector-only bundle; rebuild the legacy lexical generation first",
+        ));
+    }
+    let mut sentinel = FsfsRuntime::read_index_sentinel(predecessor.path())?
+        .ok_or_else(|| reuse_error("selected generation has no sentinel"))?;
+    if FsfsRuntime::read_matching_manifest_generation(predecessor.path())?.is_none() {
+        return Err(reuse_error(
+            "selected generation has no matching membership manifests",
+        ));
+    }
+    if !fs::symlink_metadata(destination)?.file_type().is_dir()
+        || fs::read_dir(destination)?.next().transpose()?.is_some()
+    {
+        return Err(reuse_error(
+            "mutation requires an empty, non-symlink candidate directory",
+        ));
+    }
+    let mut stats = CopyStats::default();
+    copy_tree(cx, predecessor.path(), destination, 0, &mut stats)?;
+    if store.active(cx)?.as_ref() != Some(&predecessor) {
+        return Err(reuse_error(
+            "selected predecessor changed while copying the mutation candidate",
+        ));
+    }
+    sentinel.index_root = destination.display().to_string();
+    runtime.write_index_sentinel(destination, &sentinel)?;
+    retained_search_checkpoint(cx)?;
+    tracing::info!(
+        predecessor = predecessor.id(),
+        copied_files = stats.files,
+        copied_bytes = stats.bytes,
+        "copied complete generation for isolated mutation"
+    );
+    Ok(predecessor)
+}
+
 /// Must be called while the caller owns `store.begin()` and before opening any
 /// candidate resources. Missing/incompatible evidence starts cold; malformed
 /// evidence or damaged selection is an error, not permission to reuse data.
@@ -473,6 +602,33 @@ mod copy_tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn mutation_copy_refuses_legacy_lexical_migration_before_copying() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, parent.path()).unwrap();
+            let first = store.begin(&cx).unwrap();
+            fs::create_dir(first.path().join("lexical")).unwrap();
+            // The layout detector needs only this legacy marker. The refusal
+            // must happen before any loader, source rebuild or candidate copy.
+            fs::write(first.path().join("lexical/meta.json"), b"{}").unwrap();
+            let publication = first.publish(&cx, |_, _| Ok(())).unwrap();
+            let crate::generation_store::GenerationPublication::Durable(predecessor) = publication
+            else {
+                panic!("fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
+            };
+            let build = store.begin(&cx).unwrap();
+            let runtime = FsfsRuntime::new(crate::config::FsfsConfig::default());
+            let error = copy_selected_generation(&cx, &runtime, &store, build.path()).unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, reason, .. }
+                if field == "complete_generation.reuse" && reason.contains("legacy lexical generation"))
+            );
+            assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
+            assert_eq!(store.active(&cx).unwrap(), Some(predecessor));
+        });
+    }
 
     #[test]
     fn seed_copy_uses_independent_inodes_and_does_not_copy_control_artifacts() {

@@ -51,6 +51,18 @@ pub trait SearchFilter: Send + Sync {
         None
     }
 
+    /// An exact allow-set that can be safely compiled into a parent chain.
+    ///
+    /// This has the same membership contract as [`Self::candidate_hashes`],
+    /// plus a stability requirement: neither the set nor its membership
+    /// semantics may change through shared references or depend on metadata.
+    /// Changes through `&mut self` are allowed. This opt-in is separate so an
+    /// existing filter with interior-mutably selected candidate sets is never
+    /// silently frozen when added to a [`FilterChain`].
+    fn immutable_candidate_hashes(&self) -> Option<&DocIdHashSet> {
+        None
+    }
+
     /// A short, descriptive name for diagnostics and tracing.
     fn name(&self) -> &str;
 }
@@ -65,9 +77,15 @@ pub enum FilterMode {
 }
 
 /// Chains multiple [`SearchFilter`] implementations with configurable semantics.
+///
+/// Immutable hash allow-lists are intersected (`All`) or unioned (`Any`) when
+/// filters are added, preserving selective vector gathering through nested
+/// chains. Predicate and metadata filters retain the ordinary per-document
+/// path unless an empty AND operand proves that no document can match.
 pub struct FilterChain {
     filters: Vec<Box<dyn SearchFilter>>,
     mode: FilterMode,
+    compiled_hashes: Option<DocIdHashSet>,
 }
 
 impl FilterChain {
@@ -77,11 +95,34 @@ impl FilterChain {
         Self {
             filters: Vec::new(),
             mode,
+            compiled_hashes: None,
         }
     }
 
     /// Add a filter to the chain (mutating).
     pub fn add(&mut self, filter: Box<dyn SearchFilter>) -> &mut Self {
+        // A single-child chain delegates without copying its allow-list. Only
+        // the second and later operands need an owned, compiled result.
+        if !self.filters.is_empty() {
+            let current = if self.filters.len() == 1 {
+                self.filters[0].immutable_candidate_hashes().cloned()
+            } else {
+                self.compiled_hashes.take()
+            };
+            self.compiled_hashes = match (self.mode, current, filter.immutable_candidate_hashes()) {
+                (FilterMode::All, Some(mut current), Some(next)) => {
+                    current.retain(|hash| next.contains(hash));
+                    Some(current)
+                }
+                (FilterMode::All, Some(current), None) if current.is_empty() => Some(current),
+                (FilterMode::All, None, Some(next)) if next.is_empty() => Some(next.clone()),
+                (FilterMode::Any, Some(mut current), Some(next)) => {
+                    current.extend(next.iter().copied());
+                    Some(current)
+                }
+                _ => None,
+            };
+        }
         self.filters.push(filter);
         self
     }
@@ -89,7 +130,7 @@ impl FilterChain {
     /// Add a filter to the chain (builder pattern).
     #[must_use]
     pub fn with(mut self, filter: Box<dyn SearchFilter>) -> Self {
-        self.filters.push(filter);
+        self.add(filter);
         self
     }
 
@@ -122,6 +163,9 @@ impl SearchFilter for FilterChain {
         doc_id_hash: u64,
         metadata: Option<&serde_json::Value>,
     ) -> Option<bool> {
+        if let Some(hashes) = &self.compiled_hashes {
+            return Some(hashes.contains(&doc_id_hash));
+        }
         if self.filters.is_empty() {
             return Some(true);
         }
@@ -148,6 +192,20 @@ impl SearchFilter for FilterChain {
                 }
                 if has_unknown { None } else { Some(false) }
             }
+        }
+    }
+
+    fn candidate_hashes(&self) -> Option<&DocIdHashSet> {
+        match self.filters.as_slice() {
+            [filter] => filter.candidate_hashes(),
+            _ => self.compiled_hashes.as_ref(),
+        }
+    }
+
+    fn immutable_candidate_hashes(&self) -> Option<&DocIdHashSet> {
+        match self.filters.as_slice() {
+            [filter] => filter.immutable_candidate_hashes(),
+            _ => self.compiled_hashes.as_ref(),
         }
     }
 
@@ -202,6 +260,15 @@ impl SearchFilter for DocTypeFilter {
             return false;
         };
         self.allowed_types.contains(doc_type)
+    }
+
+    fn matches_doc_id_hash(
+        &self,
+        _doc_id_hash: u64,
+        metadata: Option<&serde_json::Value>,
+    ) -> Option<bool> {
+        // The decision depends only on metadata, never on the document ID.
+        Some(self.matches("", metadata))
     }
 
     #[allow(clippy::unnecessary_literal_bound)]
@@ -269,6 +336,15 @@ impl SearchFilter for DateRangeFilter {
             return false;
         }
         true
+    }
+
+    fn matches_doc_id_hash(
+        &self,
+        _doc_id_hash: u64,
+        metadata: Option<&serde_json::Value>,
+    ) -> Option<bool> {
+        // The decision depends only on metadata, never on the document ID.
+        Some(self.matches("", metadata))
     }
 
     #[allow(clippy::unnecessary_literal_bound)]
@@ -373,6 +449,10 @@ impl SearchFilter for BitsetFilter {
     }
 
     fn candidate_hashes(&self) -> Option<&DocIdHashSet> {
+        Some(&self.hashes)
+    }
+
+    fn immutable_candidate_hashes(&self) -> Option<&DocIdHashSet> {
         Some(&self.hashes)
     }
 
@@ -786,5 +866,258 @@ mod tests {
         let filter = PredicateFilter::new("test-filter", |_| true);
         let debug = format!("{filter:?}");
         assert!(debug.contains("test-filter"));
+    }
+
+    fn assert_candidates(filter: &dyn SearchFilter, ids: &[&str]) {
+        let expected = BitsetFilter::from_doc_ids(ids.iter().copied());
+        assert_eq!(filter.candidate_hashes(), Some(&expected.hashes));
+        assert_eq!(filter.immutable_candidate_hashes(), Some(&expected.hashes));
+    }
+
+    #[test]
+    fn compound_allow_lists_preserve_exhaustive_boolean_membership() {
+        let ids = ["doc-a", "doc-b", "doc-c", "doc-d", "outside"];
+        let metadata = json!({"doc_type": "tweet", "created_at": 1500});
+        for mode in [FilterMode::All, FilterMode::Any] {
+            for left in 0_u8..16 {
+                for right in 0_u8..16 {
+                    let subset = |mask: u8| {
+                        (0..4)
+                            .filter(move |&i| mask & (1_u8 << i) != 0)
+                            .map(|i| ids[i])
+                    };
+                    let chain = FilterChain::new(mode)
+                        .with(Box::new(BitsetFilter::from_doc_ids(subset(left))))
+                        .with(Box::new(BitsetFilter::from_doc_ids(subset(right))));
+                    let allowed = chain.candidate_hashes().expect("compiled allow-list");
+                    for (i, id) in ids.iter().enumerate() {
+                        let in_left = left & (1_u8 << i) != 0;
+                        let in_right = right & (1_u8 << i) != 0;
+                        let expected = match mode {
+                            FilterMode::All => in_left && in_right,
+                            FilterMode::Any => in_left || in_right,
+                        };
+                        let hash = fnv1a_hash(id.as_bytes());
+                        assert_eq!(allowed.contains(&hash), expected);
+                        for meta in [None, Some(&metadata)] {
+                            assert_eq!(chain.matches(id, meta), expected);
+                            assert_eq!(chain.matches_doc_id_hash(hash, meta), Some(expected));
+                        }
+                    }
+                    assert_eq!(chain.immutable_candidate_hashes(), Some(allowed));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_chains_compile_union_then_intersection() {
+        let left = FilterChain::new(FilterMode::Any)
+            .with(Box::new(BitsetFilter::from_doc_ids(["doc-a", "doc-b"])))
+            .with(Box::new(BitsetFilter::from_doc_ids(["doc-b", "doc-c"])));
+        let right = FilterChain::new(FilterMode::All)
+            .with(Box::new(BitsetFilter::from_doc_ids(["doc-b", "doc-c", "doc-d"])))
+            .with(Box::new(BitsetFilter::from_doc_ids(["doc-c", "doc-d"])));
+        let chain = FilterChain::new(FilterMode::All)
+            .with(Box::new(left))
+            .with(Box::new(right));
+        assert_candidates(&chain, &["doc-c"]);
+        assert!(chain.matches("doc-c", None));
+        assert!(!chain.matches("doc-b", None));
+        assert!(!chain.matches("doc-d", None));
+    }
+
+    #[test]
+    fn single_child_delegates_without_copying_candidates() {
+        let filter = Box::new(BitsetFilter::from_doc_ids(["doc-a", "doc-b"]));
+        let original = std::ptr::from_ref(filter.candidate_hashes().expect("allow-list"));
+        let chain = FilterChain::new(FilterMode::All).with(filter);
+        let delegated = std::ptr::from_ref(chain.candidate_hashes().expect("allow-list"));
+        assert!(std::ptr::eq(original, delegated));
+        assert_candidates(&chain, &["doc-a", "doc-b"]);
+    }
+
+    #[test]
+    fn adding_filters_rebuilds_or_invalidates_compiled_candidates() {
+        let mut all = FilterChain::new(FilterMode::All)
+            .with(Box::new(BitsetFilter::from_doc_ids(["doc-a", "doc-b"])));
+        assert_candidates(&all, &["doc-a", "doc-b"]);
+        all.add(Box::new(BitsetFilter::from_doc_ids(["doc-b", "doc-c"])));
+        assert_candidates(&all, &["doc-b"]);
+        all.add(Box::new(BitsetFilter::from_doc_ids(["doc-c"])));
+        assert_candidates(&all, &[]);
+
+        let mut any = FilterChain::new(FilterMode::Any)
+            .with(Box::new(BitsetFilter::from_doc_ids(["doc-a"])));
+        any.add(Box::new(BitsetFilter::from_doc_ids(["doc-b"])));
+        assert_candidates(&any, &["doc-a", "doc-b"]);
+        any.add(Box::new(PredicateFilter::new("outside", |id| id == "outside")));
+        assert!(any.candidate_hashes().is_none());
+        assert!(any.immutable_candidate_hashes().is_none());
+        assert!(any.matches("outside", None));
+        any.add(Box::new(BitsetFilter::from_doc_ids(["doc-c"])));
+        assert!(any.candidate_hashes().is_none());
+        assert!(any.matches("outside", None));
+    }
+
+    #[test]
+    fn empty_chain_is_not_an_empty_allow_list() {
+        for mode in [FilterMode::All, FilterMode::Any] {
+            let chain = FilterChain::new(mode);
+            assert!(chain.candidate_hashes().is_none());
+            assert!(chain.immutable_candidate_hashes().is_none());
+            assert!(chain.matches("outside", None));
+            assert_eq!(chain.matches_doc_id_hash(0, None), Some(true));
+        }
+    }
+
+    #[test]
+    fn empty_and_operand_annihilates_unknown_filters_in_either_order() {
+        for empty_first in [false, true] {
+            let empty = Box::new(BitsetFilter::from_doc_ids(std::iter::empty::<&str>()));
+            let unknown = Box::new(PredicateFilter::new("unknown", |_| true));
+            let mut chain = FilterChain::new(FilterMode::All);
+            if empty_first {
+                chain.add(empty).add(unknown);
+            } else {
+                chain.add(unknown).add(empty);
+            }
+            assert_candidates(&chain, &[]);
+            chain.add(Box::new(DocTypeFilter::new(["tweet"])));
+            assert_candidates(&chain, &[]);
+            assert!(!chain.matches("doc-a", None));
+            assert_eq!(
+                chain.matches_doc_id_hash(fnv1a_hash(b"doc-a"), None),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_and_predicates_do_not_masquerade_as_exact_allow_lists() {
+        let accepted = json!({"doc_type": "tweet", "created_at": 1500});
+        let rejected = json!({"doc_type": "reply", "created_at": 3000});
+        for mode in [FilterMode::All, FilterMode::Any] {
+            let chain = FilterChain::new(mode)
+                .with(Box::new(BitsetFilter::from_doc_ids(["doc-a"])))
+                .with(Box::new(DocTypeFilter::new(["tweet"])))
+                .with(Box::new(DateRangeFilter::between(1000, 2000)));
+            assert!(chain.candidate_hashes().is_none());
+            assert!(chain.immutable_candidate_hashes().is_none());
+            for meta in [None, Some(&accepted), Some(&rejected)] {
+                for id in ["doc-a", "outside"] {
+                    assert_eq!(
+                        chain.matches_doc_id_hash(fnv1a_hash(id.as_bytes()), meta),
+                        Some(chain.matches(id, meta))
+                    );
+                }
+            }
+            let with_predicate = FilterChain::new(mode)
+                .with(Box::new(BitsetFilter::from_doc_ids(["doc-a"])))
+                .with(Box::new(PredicateFilter::new("outside", |id| id == "outside")));
+            assert!(with_predicate.candidate_hashes().is_none());
+        }
+    }
+
+    #[test]
+    fn metadata_hash_decisions_equal_document_decisions() {
+        let filters: Vec<Box<dyn SearchFilter>> = vec![
+            Box::new(DocTypeFilter::new(["tweet"])),
+            Box::new(DocTypeFilter::new(std::iter::empty::<&str>())),
+            Box::new(DateRangeFilter::between(1000, 2000)),
+            Box::new(DateRangeFilter::new(None, None)),
+            Box::new(DateRangeFilter::between(i64::MAX, i64::MIN)),
+        ];
+        let metadata = [
+            json!({"doc_type": "tweet", "created_at": 1500}),
+            json!({"doc_type": "reply", "created_at": 1000}),
+            json!({"doc_type": "tweet", "created_at": 2000}),
+            json!({"doc_type": 1, "created_at": "1500"}),
+            json!({"created_at": i64::MIN}),
+            json!({"created_at": i64::MAX}),
+            json!({}),
+            json!(null),
+            json!([]),
+        ];
+        for filter in filters {
+            for meta in std::iter::once(None).chain(metadata.iter().map(Some)) {
+                assert_eq!(
+                    filter.matches_doc_id_hash(u64::MAX, meta),
+                    Some(filter.matches("any-document", meta))
+                );
+            }
+        }
+    }
+
+    struct SwitchingCandidates {
+        switched: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        first: BitsetFilter,
+        second: BitsetFilter,
+    }
+
+    impl SwitchingCandidates {
+        fn current(&self) -> &BitsetFilter {
+            if self.switched.load(std::sync::atomic::Ordering::Relaxed) {
+                &self.second
+            } else {
+                &self.first
+            }
+        }
+    }
+
+    impl SearchFilter for SwitchingCandidates {
+        fn matches(&self, id: &str, metadata: Option<&serde_json::Value>) -> bool {
+            self.current().matches(id, metadata)
+        }
+
+        fn matches_doc_id_hash(
+            &self,
+            hash: u64,
+            metadata: Option<&serde_json::Value>,
+        ) -> Option<bool> {
+            self.current().matches_doc_id_hash(hash, metadata)
+        }
+
+        fn candidate_hashes(&self) -> Option<&DocIdHashSet> {
+            self.current().candidate_hashes()
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn name(&self) -> &str {
+            "switching-candidates"
+        }
+    }
+
+    #[test]
+    fn dynamic_candidate_sets_are_not_frozen_by_compilation() {
+        let switched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dynamic = SwitchingCandidates {
+            switched: std::sync::Arc::clone(&switched),
+            first: BitsetFilter::from_doc_ids(["doc-a"]),
+            second: BitsetFilter::from_doc_ids(["doc-b"]),
+        };
+        let mut chain = FilterChain::new(FilterMode::All).with(Box::new(dynamic));
+        assert!(
+            chain
+                .candidate_hashes()
+                .expect("delegated")
+                .contains(&fnv1a_hash(b"doc-a"))
+        );
+        assert!(chain.immutable_candidate_hashes().is_none());
+        chain.add(Box::new(BitsetFilter::from_doc_ids(["doc-a", "doc-b"])));
+        assert!(chain.candidate_hashes().is_none());
+        assert!(chain.matches("doc-a", None));
+        assert!(!chain.matches("doc-b", None));
+        switched.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!chain.matches("doc-a", None));
+        assert!(chain.matches("doc-b", None));
+        assert_eq!(
+            chain.matches_doc_id_hash(fnv1a_hash(b"doc-a"), None),
+            Some(false)
+        );
+        assert_eq!(
+            chain.matches_doc_id_hash(fnv1a_hash(b"doc-b"), None),
+            Some(true)
+        );
     }
 }

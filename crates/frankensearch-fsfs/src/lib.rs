@@ -31,6 +31,7 @@ pub mod file_classification;
 pub mod generation_store;
 pub mod high_cost_artifact;
 pub mod incremental_change;
+mod index_root_discovery;
 pub mod interaction_matrix;
 pub mod interaction_primitives;
 pub mod lexical_pipeline;
