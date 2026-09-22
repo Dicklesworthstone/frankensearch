@@ -58,6 +58,9 @@ const DEFAULT_MODEL_NAME: &str = "potion-multilingual-128M";
 /// Default `HuggingFace` model ID for the primary fast-tier model.
 const DEFAULT_HF_ID: &str = "minishlab/potion-multilingual-128M";
 
+mod registered;
+pub use registered::RegisteredModel2Vec;
+
 /// Static token embedding model (`Model2Vec` / potion).
 ///
 /// After construction, all fields are immutable — no `Mutex` needed.
@@ -368,7 +371,7 @@ impl Model2VecEmbedder {
         );
 
         tracing::info!(
-            model = DEFAULT_MODEL_NAME,
+            model = %identity.space.logical_model_id,
             vocab_size,
             dimensions,
             manifest = %identity.producer.provenance_manifest_fingerprint,

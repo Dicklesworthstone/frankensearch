@@ -108,7 +108,7 @@ pub use hash_embedder::{
 pub mod model2vec_embedder;
 
 #[cfg(feature = "model2vec")]
-pub use model2vec_embedder::{Model2VecEmbedder, find_model_dir};
+pub use model2vec_embedder::{Model2VecEmbedder, RegisteredModel2Vec, find_model_dir};
 
 #[cfg(feature = "fastembed")]
 pub mod fastembed_embedder;
