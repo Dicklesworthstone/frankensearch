@@ -290,6 +290,7 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     let run_with_shutdown = matches!(interface_mode, InterfaceMode::Tui)
         || app_runtime.config().indexing.watch_mode
         || command == CliCommand::Index
+        || command == CliCommand::Search
         || command == CliCommand::Watch
         || command == CliCommand::Daemon
         || command == CliCommand::Serve;
@@ -1045,9 +1046,17 @@ where
     WOut: Write,
     WErr: Write,
 {
-    let code = exit_code_for(error);
+    #[cfg(unix)]
+    let remote = FsfsRuntime::forwarded_search_error(error);
+    #[cfg(not(unix))]
+    let remote: Option<&frankensearch_fsfs::output_schema::OutputError> = None;
+    let code = remote.map_or_else(|| exit_code_for(error), |remote| remote.exit_code);
+    #[cfg(unix)]
+    if FsfsRuntime::forwarded_search_error_was_emitted(error) {
+        return code;
+    }
     let envelope: OutputEnvelope<()> = OutputEnvelope::error(
-        output_error_from(error),
+        remote.cloned().unwrap_or_else(|| output_error_from(error)),
         meta_for_format(&context.command, context.format),
         timestamp,
     );

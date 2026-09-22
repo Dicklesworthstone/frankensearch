@@ -33,6 +33,9 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 const VERSION: u32 = 1;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[path = "complete_daemon_forward_stream.rs"]
+mod progressive;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ForwardedSearch {
@@ -96,8 +99,9 @@ fn configuration_contract(config: &FsfsConfig) -> SearchResult<serde_json::Value
 }
 
 pub(super) fn is_forwarded(bytes: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .is_ok_and(|value| value.get("fsfs_complete_cli").is_some())
+    progressive::is_streamed(bytes)
+        || serde_json::from_slice::<serde_json::Value>(bytes)
+            .is_ok_and(|value| value.get("fsfs_complete_cli").is_some())
 }
 
 fn decode_request(bytes: &[u8]) -> SearchResult<ForwardedSearch> {
@@ -202,10 +206,12 @@ fn decode_reply(bytes: &[u8], request: &ForwardedSearch) -> SearchResult<SearchP
     }
     match (reply.result.ok, reply.result.data, reply.result.error) {
         (true, Some(payload), None) => Ok(payload),
-        (false, None, Some(error)) => Err(SearchError::SubsystemError {
-            subsystem: "fsfs.complete_generation.remote_search",
-            source: Box::new(RemoteSearchFailure(error)),
-        }),
+        (false, None, Some(error)) if (1..=255).contains(&error.exit_code) => {
+            Err(SearchError::SubsystemError {
+                subsystem: "fsfs.complete_generation.remote_search",
+                source: Box::new(RemoteSearchFailure(error)),
+            })
+        }
         _ => Err(complete_cli_error(
             "daemon_response",
             "inconsistent search response envelope or query",
@@ -214,6 +220,33 @@ fn decode_reply(bytes: &[u8], request: &ForwardedSearch) -> SearchResult<SearchP
 }
 
 impl FsfsRuntime {
+    /// Recover a validated forwarding reply's structured error so callers
+    /// can preserve its exit status, error code and recovery guidance.
+    /// Transport failures and unrelated subsystem errors return `None`.
+    #[must_use]
+    pub fn forwarded_search_error(error: &SearchError) -> Option<&OutputError> {
+        if let Some(error) = progressive::reported_error(error) {
+            return Some(error);
+        }
+        match error {
+            SearchError::SubsystemError { subsystem, source }
+                if *subsystem == "fsfs.complete_generation.remote_search" =>
+            {
+                source
+                    .downcast_ref::<RemoteSearchFailure>()
+                    .map(|failure| &failure.0)
+            }
+            _ => None,
+        }
+    }
+
+    /// True when a forwarded stream already emitted its terminal record, or
+    /// its output writer failed after possibly exposing part of a record.
+    #[must_use]
+    pub fn forwarded_search_error_was_emitted(error: &SearchError) -> bool {
+        progressive::reported_error(error).is_some()
+    }
+
     /// Query an already-running complete-generation daemon without opening the
     /// catalog, vectors or models in this client. Failure is final for this
     /// request, including malformed replies and an absent socket.
@@ -308,6 +341,9 @@ pub(super) async fn serve(
     bytes: &[u8],
     timeout: Duration,
 ) -> SearchResult<PeerOutcome> {
+    if progressive::is_streamed(bytes) {
+        return progressive::serve(cx, runtime, session, peer, bytes, timeout).await;
+    }
     let request = decode_request(bytes);
     let request_id = request
         .as_ref()
@@ -357,6 +393,58 @@ fn error_envelope(error: &SearchError) -> OutputEnvelope<SearchPayload> {
         meta_for_format("search", OutputFormat::Json),
         super::super::iso_timestamp_now(),
     )
+}
+
+#[cfg(test)]
+mod remote_error_tests {
+    use super::*;
+
+    fn error_reply(exit_code: Option<i32>) -> (Reply, ForwardedSearch) {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let request = make_request(&runtime, root.path(), "query", 10).unwrap();
+        let original = complete_cli_error("test_remote", "original remote diagnosis");
+        let mut envelope = error_envelope(&original);
+        if let Some(exit_code) = exit_code {
+            envelope.error.as_mut().unwrap().exit_code = exit_code;
+        }
+        let reply = Reply {
+            fsfs_complete_cli: VERSION,
+            request_id: request.request_id.clone(),
+            query: request.search.query.clone(),
+            result: envelope,
+        };
+        (reply, request)
+    }
+
+    #[test]
+    fn forwarded_error_preserves_the_complete_canonical_error() {
+        let (reply, request) = error_reply(None);
+        let expected = serde_json::to_value(reply.result.error.as_ref().unwrap()).unwrap();
+        let error = decode_reply(&serde_json::to_vec(&reply).unwrap(), &request).unwrap_err();
+        let original = FsfsRuntime::forwarded_search_error(&error).unwrap();
+        assert_eq!(serde_json::to_value(original).unwrap(), expected);
+        assert!(error.to_string().contains("original remote diagnosis"));
+    }
+
+    #[test]
+    fn failed_remote_reply_cannot_claim_success_or_out_of_range_exit_status() {
+        for exit_code in [0, -1, 256] {
+            let (reply, request) = error_reply(Some(exit_code));
+            let error = decode_reply(&serde_json::to_vec(&reply).unwrap(), &request).unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { .. }));
+            assert!(FsfsRuntime::forwarded_search_error(&error).is_none());
+        }
+    }
+
+    #[test]
+    fn subsystem_name_alone_does_not_authorize_a_remote_error() {
+        let error = SearchError::SubsystemError {
+            subsystem: "fsfs.complete_generation.remote_search",
+            source: Box::new(std::io::Error::other("not a decoded forwarding reply")),
+        };
+        assert!(FsfsRuntime::forwarded_search_error(&error).is_none());
+    }
 }
 
 #[cfg(test)]

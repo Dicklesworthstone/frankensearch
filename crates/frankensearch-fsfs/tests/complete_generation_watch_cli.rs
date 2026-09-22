@@ -368,6 +368,48 @@ fn complete_daemon_binary_serves_and_stops_with_corrupt_selection() {
             .ends_with("alpha.md")
     );
 
+    let streamed = Process::start(fixture.command("search", "jsonl").args([
+        "sharedtoken",
+        "--daemon",
+        "--stream",
+        "--limit",
+        "1",
+    ]))
+    .finish(Duration::from_secs(60));
+    assert!(
+        streamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&streamed.stderr)
+    );
+    let frames: Vec<Value> = streamed
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let frame: Value = serde_json::from_slice(line).unwrap();
+            let _: frankensearch_fsfs::stream_protocol::StreamFrame<
+                frankensearch_fsfs::output_schema::SearchHitPayload,
+            > = serde_json::from_value(frame.clone()).unwrap();
+            frame
+        })
+        .collect();
+    assert_eq!(frames.first().unwrap()["event"], "started");
+    assert_eq!(frames.last().unwrap()["payload"]["status"], "completed");
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["event"] == "result")
+            .count(),
+        1
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["event"] == "terminal")
+            .count(),
+        1
+    );
+
     // Stop dispatch must not first admit the selected generation or its models.
     let pointer = fixture
         .store

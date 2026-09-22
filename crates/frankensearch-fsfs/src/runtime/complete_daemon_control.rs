@@ -143,7 +143,7 @@ pub(super) async fn exchange(
     Ok(bytes)
 }
 
-async fn connect(
+pub(super) async fn connect(
     cx: &Cx,
     path: &Path,
     started: Instant,
@@ -187,7 +187,7 @@ async fn connect(
     }
 }
 
-fn remaining(started: Instant, timeout: Duration) -> SearchResult<Duration> {
+pub(super) fn remaining(started: Instant, timeout: Duration) -> SearchResult<Duration> {
     timeout
         .checked_sub(started.elapsed())
         .filter(|left| !left.is_zero())
