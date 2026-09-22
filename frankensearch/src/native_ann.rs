@@ -601,6 +601,64 @@ mod tests {
     }
 
     #[test]
+    fn repeated_embeddings_build_reopen_and_find_live_rows_at_high_tombstone_density() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let ids: Vec<_> = (0..96).map(|row| format!("duplicate-{row:04}")).collect();
+            for format in [QuantizationFormat::F16, QuantizationFormat::F32] {
+                for live_stride in [1, 2, 10] {
+                    let rows: Vec<_> = ids
+                        .iter()
+                        .enumerate()
+                        .map(|(row, id)| {
+                            (id.as_str(), [1.0, 0.0, 0.0, 0.0], row % live_stride == 0)
+                        })
+                        .collect();
+                    let owner = owner(&rows, 1, format);
+                    let index =
+                        NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 42)
+                            .expect(
+                                "valid repeated embeddings must build a connected native graph",
+                            );
+                    let query = query([1.0, 0.0, 0.0, 0.0]);
+                    let mut exact = owner
+                        .search_top_k(query.vector(), owner.live_count(), None)
+                        .expect("exact owner oracle");
+                    exact.sort_unstable_by(VectorHit::cmp_rank);
+                    assert_eq!(
+                        index
+                            .search(&cx, &query, usize::MAX, Some(1))
+                            .expect("tombstones must remain traversable"),
+                        exact,
+                    );
+
+                    let dir = tempfile::tempdir().expect("native persistence directory");
+                    let path = dir.path().join("duplicates.fshnsw");
+                    index.save(&cx, &path).expect("save repeated-vector graph");
+                    drop(index);
+                    let reopened = NativeAnnIndex::load(&cx, Arc::clone(&owner), &path)
+                        .expect("reopen the exact repeated-vector owner");
+                    assert_eq!(reopened.owner_witness(), owner.witness());
+                    assert_eq!(
+                        reopened
+                            .search(&cx, &query, usize::MAX, Some(1))
+                            .expect("reopened tombstone search"),
+                        exact,
+                    );
+                    let selected = exact.last().expect("a live row remains");
+                    assert_eq!(
+                        reopened
+                            .search_filtered(&cx, &query, 1, Some(1), |id| {
+                                id == selected.doc_id
+                            })
+                            .expect("filter expansion must reach the requested live row"),
+                        vec![selected.clone()],
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
     fn filtered_search_expands_past_rejected_nearest_neighbors() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let owner = owner(&rows(), 1, QuantizationFormat::F32);
