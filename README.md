@@ -411,6 +411,7 @@ recognize the store automatically:
 ```bash
 FSFS_COMPLETE_GENERATIONS=1 fsfs index ~/projects --index-dir ./search-store
 fsfs search "structured concurrency" --index-dir ./search-store --no-daemon
+fsfs tui --index-dir ./search-store
 fsfs explain 1 --index-dir ./search-store
 fsfs append-batch --file updates.jsonl --index-dir ./search-store
 fsfs delete src/obsolete.rs --index-dir ./search-store
@@ -452,10 +453,16 @@ fusion whose component explanations are unavailable.
 Reranking reads the generation's stored document text, so edits or removals in
 the source tree cannot silently change the content scored for retained results.
 
+`tui` opens the search dashboard against one admitted generation for the entire
+session. Lexical, fast, and quality stages, snippets, and status refreshes keep
+using that generation while a watcher or another command publishes successors.
+Reopen the dashboard to select the latest generation. Without an interactive
+terminal, the command reports the selected generation's status.
+
 This is the cooperative local store. The complete FSVI v2 authority migration
 and automatic reclamation of retained generations remain unfinished. Commands
-refuse to create a nested index inside a sealed generation. Direct `flush` and
-TUI routing are still unavailable for these stores.
+refuse to create a nested index inside a sealed generation. Direct `flush` is
+still unavailable for these stores.
 
 ## Reproducible Showcase Suite
 

@@ -2,7 +2,7 @@
 //! to the legacy mutable layout, including when its selection is corrupt.
 
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -12,8 +12,9 @@ use frankensearch_core::{SearchError, SearchResult};
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
 use super::{
-    FsfsRuntime, InterfaceMode, SearchExecutionFlags, iso_timestamp_now, pressure_timestamp_ms,
-    retained_search_checkpoint, validate_retained_catalog_path,
+    FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsRuntime,
+    FtuiSession, InterfaceMode, SearchDashboardState, SearchExecutionFlags, iso_timestamp_now,
+    pressure_timestamp_ms, retained_search_checkpoint, validate_retained_catalog_path,
 };
 use crate::adapters::format_emitter::{emit_envelope, meta_for_format};
 use crate::generation_store::{
@@ -70,16 +71,18 @@ impl FsfsRuntime {
                 None => self.run_mode(cx, mode).await,
             };
         };
-        if mode != InterfaceMode::Cli {
-            return Err(complete_cli_error(
-                "interface",
-                "complete-generation stores require a CLI command; TUI routing is not yet supported",
-            ));
-        }
-        self.validate_command_inputs(self.cli_input.command)?;
+        let dashboard = mode == InterfaceMode::Tui || self.cli_input.command == CliCommand::Tui;
+        self.validate_command_inputs(if dashboard {
+            CliCommand::Tui
+        } else {
+            self.cli_input.command
+        })?;
         let _cancellation_scope = shutdown.map(|shutdown| shutdown.cancellation_scope(cx));
         retained_search_checkpoint(cx)?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
+        if dashboard {
+            return self.run_complete_generation_tui(cx, &root).await;
+        }
         let mut stdout = std::io::stdout();
         match self.cli_input.command {
             CliCommand::Index if !self.cli_input.watch && !self.config.indexing.watch_mode => {
@@ -130,9 +133,94 @@ impl FsfsRuntime {
             }
             _ => Err(complete_cli_error(
                 "command",
-                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, append-batch, delete, compact, search, explain, serve, daemon, status, or doctor",
+                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, append-batch, delete, compact, search, explain, tui, serve, daemon, status, or doctor",
             )),
         }
+    }
+
+    /// Retain one complete generation for the dashboard's entire session, just
+    /// as the ordinary dashboard retains its initially opened search resources.
+    /// Reopening the dashboard observes a successor; editing a query does not
+    /// mix a new catalog or lexical snapshot into an earlier vector generation.
+    async fn run_complete_generation_tui(&self, cx: &Cx, root: &Path) -> SearchResult<()> {
+        retained_search_checkpoint(cx)?;
+        if self.config.search.shadow_mode {
+            return Err(SearchError::InvalidConfig {
+                field: "search.shadow_mode".to_owned(),
+                value: "true".to_owned(),
+                reason: "shadow mode writes observation artifacts and cannot run against a sealed complete generation"
+                    .to_owned(),
+            });
+        }
+        if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            return self.run_complete_generation_tui_status(cx, root);
+        }
+        let mut reader = Box::pin(self.open_retained_search(cx, root)).await?;
+        retained_search_checkpoint(cx)?;
+        eprintln!(
+            "fsfs: dashboard is pinned to complete generation {}; reopen it to see a newer generation ('/' to search, 'q' to quit)",
+            reader.generation().id(),
+        );
+        // Do not enter generic first-run onboarding: this runtime names a sealed
+        // generation, whose catalog and search resources are already admitted.
+        // Initialize the dashboard from that runtime, then keep the retained
+        // resources in the existing render loops for the entire session.
+        let no_color = reader.runtime.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
+        let status_payload = reader.runtime.collect_status_payload()?;
+        let mode_hint = reader.runtime.search_mode_hint()?;
+        let configured_limit = reader
+            .runtime
+            .cli_input
+            .overrides
+            .limit
+            .unwrap_or(reader.runtime.config.search.default_limit);
+        let result_limit = if configured_limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
+            FSFS_TUI_INTERACTIVE_RESULT_LIMIT
+        } else {
+            configured_limit.max(1)
+        };
+        let mut state =
+            SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color);
+        match FtuiSession::enter() {
+            Ok(mut session) => {
+                reader
+                    .runtime
+                    .run_search_dashboard_ftui(
+                        cx,
+                        &mut session,
+                        &mut state,
+                        &mut reader.resources,
+                        no_color,
+                    )
+                    .await
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "interactive fsfs search cockpit unavailable; falling back to ansi interaction"
+                );
+                reader
+                    .runtime
+                    .run_search_dashboard_ansi(cx, &mut state, &mut reader.resources, no_color)
+                    .await
+            }
+        }
+    }
+
+    fn run_complete_generation_tui_status(&self, cx: &Cx, root: &Path) -> SearchResult<()> {
+        retained_search_checkpoint(cx)?;
+        // Status needs the authenticated inventory, not semantic resource
+        // admission or model loading. A missing model must remain visible
+        // as status rather than prevent noninteractive TUI fallback.
+        let store = CompleteGenerationStore::open(cx, root)?;
+        let selected = store.active(cx)?.ok_or_else(|| {
+            complete_cli_error("selection", "no complete generation has been published")
+        })?;
+        let mut input = self.cli_input.clone();
+        input.index_dir = Some(selected.path().to_path_buf());
+        input.daemon = false;
+        retained_search_checkpoint(cx)?;
+        self.clone().with_cli_input(input).run_status_command()
     }
 
     fn complete_generation_command_root(
@@ -817,12 +905,19 @@ pub(super) fn complete_cli_error(field: &str, reason: &str) -> SearchError {
 
 #[cfg(all(test, unix, not(feature = "embedded-models")))]
 mod tests {
-    use super::super::FSFS_EXPLAIN_SESSION_FILE;
+    use super::super::{
+        DashboardSearchStage, FSFS_EXPLAIN_SESSION_FILE, SearchDashboardState, SearchExecutionMode,
+        set_test_fast_embedder, set_test_quality_embedder, test_fast_embedder_override,
+        test_quality_embedder_override,
+    };
     use super::*;
-    use crate::output_schema::SearchHitPayload;
+    use crate::output_schema::{SearchHitPayload, SearchOutputPhase};
     use crate::stream_protocol::StreamFrame;
     use crate::{CliInput, FsfsConfig};
     use asupersync::test_utils::run_test_with_cx;
+    use frankensearch_core::{Embedder, EmbeddingIdentityBundleV1, ModelCategory, SearchFuture};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn fixture(parent: &Path) -> (FsfsRuntime, PathBuf, PathBuf) {
         let source = parent.join("source");
@@ -864,6 +959,288 @@ mod tests {
         assert_eq!(receipt["ok"], true);
         assert_eq!(receipt["data"]["publication"], "durable");
         receipt
+    }
+
+    fn sealed_inventory(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut entries = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if entry.file_type().unwrap().is_dir() {
+                    entries.insert(relative, None);
+                    pending.push(path);
+                } else {
+                    entries.insert(relative, Some(fs::read(path).unwrap()));
+                }
+            }
+        }
+        entries
+    }
+
+    // Deterministic, independently identified semantic fixtures exercise the
+    // real dashboard's stage routing; they make no model-quality claim.
+    struct DashboardEmbedder {
+        identity: EmbeddingIdentityBundleV1,
+        category: ModelCategory,
+    }
+
+    impl Embedder for DashboardEmbedder {
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async { Ok(vec![1.0, 0.0, 0.0]) })
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+
+        fn id(&self) -> &str {
+            &self.identity.space.logical_model_id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            self.category
+        }
+    }
+
+    struct RestoreDashboardEmbedders {
+        fast: Option<Arc<dyn Embedder>>,
+        quality: Option<Arc<dyn Embedder>>,
+    }
+
+    impl RestoreDashboardEmbedders {
+        fn install() -> Self {
+            let previous = Self {
+                fast: test_fast_embedder_override(),
+                quality: test_quality_embedder_override(),
+            };
+            set_test_fast_embedder(Some(Arc::new(DashboardEmbedder {
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("dashboard-fast", 3),
+                category: ModelCategory::StaticEmbedder,
+            })));
+            set_test_quality_embedder(Some(Arc::new(DashboardEmbedder {
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("dashboard-quality", 3),
+                category: ModelCategory::TransformerEmbedder,
+            })));
+            previous
+        }
+    }
+
+    impl Drop for RestoreDashboardEmbedders {
+        fn drop(&mut self) {
+            set_test_fast_embedder(self.fast.take());
+            set_test_quality_embedder(self.quality.take());
+        }
+    }
+
+    #[test]
+    fn complete_tui_stages_pin_vectors_lexical_and_snippets_across_publication() {
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        scheduler.block_on(async move {
+            let cx = Cx::current().expect("current-thread root installs a spawn-capable context");
+            let _embedders = RestoreDashboardEmbedders::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.search.fast_only = false;
+            runtime.config.search.quality_timeout_ms = 5_000;
+            "dashboard-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            fs::write(
+                source.join("alpha.md"),
+                "sharedtoken original document body",
+            )
+            .unwrap();
+            publish(&runtime, &cx, &root).await;
+            let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let predecessor = reader.generation().clone();
+            let before = sealed_inventory(predecessor.path());
+            let status = reader.runtime.collect_status_payload().unwrap();
+            assert_eq!(status.index.path, predecessor.path().display().to_string());
+            let mut state = SearchDashboardState::new(status, None, 10, true);
+            state
+                .query_input
+                .set_value("how to find sharedtoken document content");
+            reader
+                .runtime
+                .refresh_search_dashboard_lexical(&cx, &mut state, &mut reader.resources)
+                .await;
+            assert_eq!(state.stage_chain, vec![DashboardSearchStage::Lexical]);
+            assert_eq!(state.latest_hits().len(), 1);
+            assert_eq!(state.latest_hits()[0].path, "alpha.md");
+            assert!(state.latest_hits()[0].semantic_rank.is_none());
+
+            fs::write(
+                source.join("alpha.md"),
+                "sharedtoken rewritten successor body",
+            )
+            .unwrap();
+            fs::write(source.join("beta.md"), "sharedtoken new successor document").unwrap();
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let successor = store.active(&cx).unwrap().unwrap();
+            let successor_before = sealed_inventory(successor.path());
+            assert_ne!(predecessor, successor);
+
+            reader
+                .runtime
+                .refresh_search_dashboard_semantic_fast(&cx, &mut state, &mut reader.resources)
+                .await;
+            assert!(state.last_error.is_none(), "{:?}", state.last_error);
+            assert_eq!(state.latest_hits().len(), 1);
+            assert!(state.latest_hits()[0].semantic_rank.is_some());
+            reader
+                .runtime
+                .refresh_search_dashboard_quality(&cx, &mut state, &mut reader.resources)
+                .await;
+            assert!(state.last_error.is_none(), "{:?}", state.last_error);
+            let refined = state.latest_payload().unwrap();
+            assert_eq!(refined.phase, SearchOutputPhase::Refined);
+            assert_eq!(refined.hits.len(), 1);
+            assert_eq!(refined.hits[0].path, "alpha.md");
+            assert!(
+                refined.hits[0]
+                    .snippet
+                    .as_ref()
+                    .unwrap()
+                    .contains("original")
+            );
+            let blend = refined.semantic_blend.as_ref().unwrap();
+            assert_eq!(blend.fast_embedder, "dashboard-fast");
+            assert_eq!(blend.quality_embedder, "dashboard-quality");
+            assert_eq!(reader.generation(), &predecessor);
+
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let mut fresh_state = SearchDashboardState::new(
+                fresh.runtime.collect_status_payload().unwrap(),
+                None,
+                10,
+                true,
+            );
+            fresh_state.query_input.set_value(state.query_input.value());
+            fresh
+                .runtime
+                .refresh_search_dashboard_full(&cx, &mut fresh_state, &mut fresh.resources)
+                .await;
+            assert!(
+                fresh_state.last_error.is_none(),
+                "{:?}",
+                fresh_state.last_error
+            );
+            assert_eq!(fresh_state.latest_hits().len(), 2);
+            assert_eq!(
+                fresh_state.latest_payload().unwrap().phase,
+                SearchOutputPhase::Refined
+            );
+            assert!(
+                fresh_state
+                    .latest_hits()
+                    .iter()
+                    .find(|hit| hit.path == "alpha.md")
+                    .unwrap()
+                    .snippet
+                    .as_ref()
+                    .unwrap()
+                    .contains("rewritten")
+            );
+            cx.set_cancel_requested(true);
+            let error = reader
+                .runtime
+                .refresh_search_dashboard_mode_with_limit(
+                    &cx,
+                    &mut state,
+                    SearchExecutionMode::Full,
+                    &mut reader.resources,
+                    10,
+                    true,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert_eq!(reader.generation(), &predecessor);
+            assert_eq!(sealed_inventory(predecessor.path()), before);
+            assert_eq!(sealed_inventory(successor.path()), successor_before);
+            assert!(!root.join(FSFS_EXPLAIN_SESSION_FILE).exists());
+        });
+    }
+
+    #[test]
+    fn complete_tui_noninteractive_status_preserves_the_selected_bundle() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let before = sealed_inventory(&root);
+            let mut tui = search_runtime(&runtime);
+            tui.cli_input.query = None;
+            tui.config.indexing.model_dir = directory
+                .path()
+                .join("missing-models")
+                .display()
+                .to_string();
+            // A native quality loader would require both model artifacts and
+            // a caller-owned blocking pool; status needs neither.
+            super::super::FSFS_NATIVE_QUALITY_MODEL_ID
+                .clone_into(&mut tui.config.indexing.quality_model);
+            tui.run_complete_generation_tui_status(&cx, &root).unwrap();
+            assert_eq!(sealed_inventory(&root), before);
+            assert!(!directory.path().join("missing-models").exists());
+        });
+    }
+
+    #[test]
+    fn complete_tui_refuses_corrupt_selection_shadow_and_cancellation_before_onboarding() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let before = sealed_inventory(&root);
+            let mut tui = search_runtime(&runtime);
+            // Auto TUI mode can originate from a Search command without a
+            // query. It must reach TUI admission, not CLI query validation.
+            tui.cli_input.query = None;
+            tui.config.search.shadow_mode = true;
+            let error = tui
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Tui, None, false)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "search.shadow_mode")
+            );
+            tui.config.search.shadow_mode = false;
+            tui.cli_input.command = CliCommand::Tui;
+            cx.set_cancel_requested(true);
+            let error = tui
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert_eq!(sealed_inventory(&root), before);
+
+            fs::write(root.join(COMPLETE_GENERATION_POINTER), "corrupt").unwrap();
+            let corrupt_before = sealed_inventory(&root);
+            tui.run_mode_with_complete_generations(&cx, InterfaceMode::Tui, None, false)
+                .await
+                .unwrap_err();
+            assert_eq!(sealed_inventory(&root), corrupt_before);
+        });
     }
 
     #[test]
