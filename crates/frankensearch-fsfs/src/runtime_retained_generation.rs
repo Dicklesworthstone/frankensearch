@@ -265,6 +265,16 @@ impl FsfsRuntime {
         use crate::generation_store::CompleteGenerationStore;
 
         retained_search_checkpoint(cx)?;
+        // Shadow observation persists artifacts beneath the opened index.
+        // A retained reader must never create them inside its sealed bundle.
+        if self.config.search.shadow_mode {
+            return Err(SearchError::InvalidConfig {
+                field: "search.shadow_mode".to_owned(),
+                value: "true".to_owned(),
+                reason: "shadow mode writes observation artifacts and cannot run against a sealed complete generation"
+                    .to_owned(),
+            });
+        }
         validate_retained_catalog_path(&self.config.storage.db_path)?;
         let store = CompleteGenerationStore::open(cx, store_root)?;
         let generation = store
@@ -863,8 +873,23 @@ mod retained_delete_tests {
                 .hits;
             assert_eq!(hits.len(), 2);
             assert!(!hits.iter().any(|hit| hit.path == "beta.md"));
+            // Storage::open bootstraps writable connections. Inspect an
+            // independent catalog copy, including any WAL sidecars, so the
+            // test never opens the selected generation with a database writer.
+            let catalog_copy_root = parent.path().join("verify-catalog");
+            fs::create_dir(&catalog_copy_root).unwrap();
+            for entry in fs::read_dir(next.path()).unwrap() {
+                let entry = entry.unwrap();
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("catalog.sqlite")
+                {
+                    fs::copy(entry.path(), catalog_copy_root.join(entry.file_name())).unwrap();
+                }
+            }
             let storage = Storage::open(PipelineStorageConfig {
-                db_path: next.path().join("catalog.sqlite"),
+                db_path: catalog_copy_root.join("catalog.sqlite"),
                 ..PipelineStorageConfig::default()
             })
             .unwrap();
@@ -1378,6 +1403,32 @@ mod retained_search_tests {
             assert_eq!(
                 fs::read(external).expect("external data"),
                 b"unrelated catalog sentinel"
+            );
+        });
+    }
+
+    #[test]
+    fn retained_reader_refuses_shadow_artifact_writes_without_changing_publication() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+            let selected = store.active(&cx).expect("published generation");
+            let mut config = runtime.config().clone();
+            config.search.shadow_mode = true;
+            let invalid = FsfsRuntime::new(config).with_cli_input(runtime.cli_input.clone());
+
+            let error = invalid
+                .open_retained_search(&cx, &root)
+                .await
+                .expect_err("shadow observation must not write into a retained generation");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "search.shadow_mode")
+            );
+            assert_eq!(
+                store.active(&cx).expect("sealed inventory remains valid"),
+                selected
             );
         });
     }
