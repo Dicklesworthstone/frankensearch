@@ -521,9 +521,10 @@ pub struct TwoTierMetrics {
     /// Per-tier coverage reconstructed from the retained owner witnesses and
     /// the candidates actually returned (bd-ctzo C4).
     ///
-    /// `None` means this search had no owner-backed activation to witness —
-    /// a legacy artifact, or a lane that never reached the quality tier. That
-    /// absence is deliberately NOT a zero-coverage receipt: an unwitnessed
+    /// `None` means this path emitted no owner-backed candidate receipt, as with
+    /// legacy retrieval, explicit exact overrides, or a zero-signal short circuit.
+    /// Native fast retrieval can report coverage without running quality. An
+    /// absent receipt is deliberately NOT a zero-coverage receipt: an unwitnessed
     /// search and a search that covered nothing are different facts, and
     /// [`crate::TierQueryCoverageV1`] has no variant that conflates them.
     /// `serde(default)` keeps older payloads readable.

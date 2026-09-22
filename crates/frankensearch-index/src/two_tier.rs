@@ -501,10 +501,10 @@ impl TierSource {
     }
 }
 
-/// Explicit in-memory quality retrieval policy and its current owner's graph.
+/// Explicit in-memory tier retrieval policy and its current owner's graph.
 /// A fast-only successor retains the policy with no graph until quality returns.
 #[derive(Debug)]
-struct NativeQualityHnsw {
+struct NativeTierHnsw {
     params: HnswParams,
     seed: u64,
     graph: Option<ValidatedNativeHnsw>,
@@ -515,7 +515,8 @@ struct NativeQualityHnsw {
 pub struct TwoTierIndex {
     fast_source: TierSource,
     quality_source: Option<TierSource>,
-    native_quality_hnsw: Option<NativeQualityHnsw>,
+    native_fast_hnsw: Option<NativeTierHnsw>,
+    native_quality_hnsw: Option<NativeTierHnsw>,
     #[cfg(feature = "ann")]
     fast_ann: Option<HnswIndex>,
     #[cfg(feature = "ann")]
@@ -994,6 +995,7 @@ impl TwoTierIndex {
         Ok(Self {
             fast_source,
             quality_source,
+            native_fast_hnsw: None,
             native_quality_hnsw: None,
             #[cfg(feature = "ann")]
             fast_ann,
@@ -1111,6 +1113,53 @@ impl TwoTierIndex {
             .and_then(TierSource::admitted_binding)
     }
 
+    /// Opt into native HNSW candidate retrieval for the admitted fast tier.
+    ///
+    /// This routes [`ActivatedTierSearch::search_fast`] and the fast arm of
+    /// [`ActivatedTierSearch::search_union`] through the native graph. The
+    /// progressive searcher binds the actual fast embedding response before
+    /// traversal. Quality retrieval remains independently configured, and
+    /// [`ActivatedTier::search_top_k`] remains an explicit exact scan.
+    ///
+    /// Construction is synchronous CPU work on the caller's lane and shares
+    /// the exact admitted owner. No sidecar is read or written. Graph memory
+    /// scales with physical rows and degree; tombstone routing can widen query
+    /// candidates to the full physical row count. Smaller beams are approximate
+    /// without a certified recall claim. Build and query errors propagate
+    /// without an exact retry. A failed build preserves the previous policy.
+    ///
+    /// [`Self::try_replace_admitted_v2`] builds the successor's graph before
+    /// swapping either tier. Fresh pathname opens require explicit opt-in again.
+    ///
+    /// # Errors
+    /// Rejects invalid graph parameters, legacy tiers, or disagreement between
+    /// the complete generation, document-ID contract or semantic/control kind
+    /// of admitted tiers, before graph construction.
+    pub fn enable_native_fast_hnsw(&mut self, params: HnswParams, seed: u64) -> SearchResult<()> {
+        params.validate()?;
+        self.validate_native_hnsw_tiers("fast")?;
+        let TierSource::AdmittedV2 { owner, .. } = &self.fast_source else {
+            unreachable!("native tier validation requires an admitted fast owner");
+        };
+        let graph = ValidatedNativeHnsw::build(Arc::clone(owner), params, seed)?;
+        self.native_fast_hnsw = Some(NativeTierHnsw {
+            params,
+            seed,
+            graph: Some(graph),
+        });
+        Ok(())
+    }
+
+    /// Whether admitted fast retrieval currently uses a native graph.
+    ///
+    /// This is independent of quality retrieval and the legacy `ann` feature.
+    #[must_use]
+    pub fn has_native_fast_hnsw(&self) -> bool {
+        self.native_fast_hnsw
+            .as_ref()
+            .is_some_and(|policy| policy.graph.is_some())
+    }
+
     /// Opt into native HNSW candidate retrieval for the admitted quality tier.
     ///
     /// This routes [`ActivatedTierSearch::search_quality`] and its quality
@@ -1118,7 +1167,8 @@ impl TwoTierIndex {
     /// graph. The progressive searcher therefore retrieves quality candidates
     /// independently of its fast pool. Query producer admission still precedes
     /// traversal; [`ActivatedTier::search_top_k`] remains an explicit exact scan.
-    /// Fast retrieval and the legacy ANN adapter are unaffected.
+    /// Fast retrieval is independently configured; the legacy ANN adapter is
+    /// unaffected.
     ///
     /// Construction is synchronous CPU work on the caller's lane. It retains
     /// the quality tier's exact admitted owner without copying its vector slab,
@@ -1144,22 +1194,42 @@ impl TwoTierIndex {
         seed: u64,
     ) -> SearchResult<()> {
         params.validate()?;
+        self.validate_native_hnsw_tiers("quality")?;
+        let graph = match self.quality_source.as_ref() {
+            Some(TierSource::AdmittedV2 { owner, .. }) => {
+                Some(ValidatedNativeHnsw::build(Arc::clone(owner), params, seed)?)
+            }
+            Some(TierSource::PathOpened(_)) => {
+                unreachable!("native tier validation refuses an unadmitted quality owner");
+            }
+            None => None,
+        };
+        self.native_quality_hnsw = Some(NativeTierHnsw {
+            params,
+            seed,
+            graph,
+        });
+        Ok(())
+    }
+
+    /// Join the complete retained generation and cross-tier contracts before
+    /// any graph reads vectors. Legacy publication nonces are insufficient.
+    fn validate_native_hnsw_tiers(&self, requested_tier: &str) -> SearchResult<()> {
         let (fast_owner, fast_binding) =
             self.fast_source
                 .admitted_pair()
                 .ok_or_else(|| SearchError::InvalidConfig {
-                    field: "two_tier.native_quality_hnsw.owner".to_owned(),
+                    field: format!("two_tier.native_{requested_tier}_hnsw.owner"),
                     value: "legacy-fast".to_owned(),
-                    reason: "native quality retrieval requires an admitted FSVI v2 index"
-                        .to_owned(),
+                    reason: "native retrieval requires an admitted FSVI v2 index".to_owned(),
                 })?;
-        let graph = match self.quality_source.as_ref() {
+        match self.quality_source.as_ref() {
             Some(TierSource::AdmittedV2 { owner, binding }) => {
                 // Legacy publication nonces are not the full v2 generation.
                 // Join the exact retained witnesses before graph construction.
                 if fast_owner.witness().generation != owner.witness().generation {
                     return Err(SearchError::InvalidConfig {
-                        field: "two_tier.native_quality_hnsw.generation".to_owned(),
+                        field: format!("two_tier.native_{requested_tier}_hnsw.generation"),
                         value: "mismatch".to_owned(),
                         reason:
                             "native retrieval tiers must share one complete artifact generation"
@@ -1172,29 +1242,22 @@ impl TwoTierIndex {
                     || fast_identity.space.kind != quality_identity.space.kind
                 {
                     return Err(SearchError::InvalidConfig {
-                        field: "two_tier.native_quality_hnsw.tier_contract".to_owned(),
+                        field: format!("two_tier.native_{requested_tier}_hnsw.tier_contract"),
                         value: "mismatch".to_owned(),
                         reason: "native retrieval tiers require one document-ID contract and semantic/control kind"
                             .to_owned(),
                     });
                 }
-                Some(ValidatedNativeHnsw::build(Arc::clone(owner), params, seed)?)
             }
             Some(TierSource::PathOpened(_)) => {
                 return Err(SearchError::InvalidConfig {
-                    field: "two_tier.native_quality_hnsw.owner".to_owned(),
+                    field: format!("two_tier.native_{requested_tier}_hnsw.owner"),
                     value: "legacy-quality".to_owned(),
-                    reason: "native quality retrieval cannot adopt an unadmitted quality tier"
-                        .to_owned(),
+                    reason: "native retrieval cannot adopt an unadmitted quality tier".to_owned(),
                 });
             }
-            None => None,
-        };
-        self.native_quality_hnsw = Some(NativeQualityHnsw {
-            params,
-            seed,
-            graph,
-        });
+            None => {}
+        }
         Ok(())
     }
 
@@ -1227,7 +1290,7 @@ impl TwoTierIndex {
     /// # Errors
     ///
     /// Returns the errors of [`Self::open_admitted_v2_with_paths`] and of any
-    /// requested native quality graph build, before any state change.
+    /// requested native graph build, before any state change.
     pub fn try_replace_admitted_v2(
         &mut self,
         paths: &TwoTierIndexPaths,
@@ -1254,6 +1317,9 @@ impl TwoTierIndex {
                 return Err(error);
             }
         };
+        if let Some(policy) = &self.native_fast_hnsw {
+            candidate.enable_native_fast_hnsw(policy.params, policy.seed)?;
+        }
         if let Some(policy) = &self.native_quality_hnsw {
             // Build against the candidate's own retained allocation before
             // replacing any part of the incumbent. A failure leaves both its
@@ -1329,7 +1395,12 @@ impl TwoTierIndex {
                 self.fast_source.admitted_pair(),
                 query,
                 "fast",
-                None,
+                self.native_fast_hnsw.as_ref().and_then(|policy| {
+                    policy
+                        .graph
+                        .as_ref()
+                        .map(|graph| (graph, policy.params.ef_search))
+                }),
             )?),
             None => None,
         };
@@ -2598,6 +2669,7 @@ fn ensure_identity_describes_tier(
 pub struct ActivatedTier<'index, 'query> {
     owner: &'index ValidatedFsviBytes,
     query: &'query BoundQueryEmbedding,
+    tier: &'static str,
     native_hnsw: Option<(&'index ValidatedNativeHnsw, usize)>,
 }
 
@@ -2609,6 +2681,23 @@ impl ActivatedTier<'_, '_> {
     /// Propagates typed row/vector decode failures from the owner.
     pub fn search_top_k(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
         self.owner.search_top_k(self.query.vector(), k, None)
+    }
+
+    /// Exact top-k with explicit parallelism settings over the retained owner.
+    ///
+    /// This bypasses all candidate generators, including native and legacy
+    /// ANN and dimension truncation, while retaining the query's admission.
+    ///
+    /// # Errors
+    /// Propagates typed row/vector decode failures from the owner.
+    pub fn search_top_k_with_params(
+        &self,
+        k: usize,
+        params: SearchParams,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.owner
+            .index
+            .search_top_k_with_params(self.query.vector(), k, None, params)
     }
 
     /// Retrieve with this activation's configured backend. Exact rescoring
@@ -2627,14 +2716,14 @@ impl ActivatedTier<'_, '_> {
         for candidate in candidates {
             let index = candidate.physical_row();
             let row = usize::try_from(index).map_err(|_| SearchError::InvalidConfig {
-                field: "search_activation.quality.physical_row".to_owned(),
+                field: format!("search_activation.{}.physical_row", self.tier),
                 value: index.to_string(),
                 reason: "native graph row does not fit usize".to_owned(),
             })?;
             let score = self.owner.index.dot_query_at(row, self.query.vector())?;
             if !score.is_finite() {
                 return Err(SearchError::InvalidConfig {
-                    field: "search_activation.quality.score".to_owned(),
+                    field: format!("search_activation.{}.score", self.tier),
                     value: "non-finite".to_owned(),
                     reason: "native candidate rescoring must produce a finite score".to_owned(),
                 });
@@ -2851,7 +2940,7 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
 fn activate_tier<'index, 'query>(
     admitted: Option<(&'index ValidatedFsviBytes, &FsviV2IdentityBinding)>,
     query: &'query BoundQueryEmbedding,
-    tier: &str,
+    tier: &'static str,
     native_hnsw: Option<(&'index ValidatedNativeHnsw, usize)>,
 ) -> SearchResult<ActivatedTier<'index, 'query>> {
     let (owner, binding) = admitted.ok_or_else(|| SearchError::InvalidConfig {
@@ -2917,6 +3006,7 @@ fn activate_tier<'index, 'query>(
     Ok(ActivatedTier {
         owner,
         query,
+        tier,
         native_hnsw,
     })
 }
@@ -7644,6 +7734,12 @@ mod tests {
                 if field == "two_tier.native_quality_hnsw.owner"
         ));
         assert!(!opened.has_native_quality_hnsw());
+        assert!(matches!(
+            opened.enable_native_fast_hnsw(HnswParams::default(), 7),
+            Err(SearchError::InvalidConfig { field, .. })
+                if field == "two_tier.native_fast_hnsw.owner"
+        ));
+        assert!(!opened.has_native_fast_hnsw());
 
         let by_paths = TwoTierIndex::open_with_paths(
             &TwoTierIndexPaths::new(&fast_path),
@@ -7687,6 +7783,240 @@ mod tests {
         "native-f32-values".clone_into(&mut query_identity.storage.endianness);
         BoundQueryEmbedding::new(vector.to_vec(), query_identity)
             .expect("bind a query embedding in the fixture's space")
+    }
+
+    #[test]
+    fn native_fast_full_beam_matches_exact_with_tombstones_and_independent_quality() {
+        for precision in [QuantizationFormat::F16, QuantizationFormat::F32] {
+            let directory = tempfile::tempdir().unwrap();
+            let fast_path = directory.path().join("fast.fsvi");
+            let quality_path = directory.path().join("quality.fsvi");
+            let (binding, mut identity) = fsvi_v2_binding("native-fast-model", 4, 70);
+            identity.storage.quantization = precision;
+            let fast_binding =
+                FsviV2IdentityBinding::new(binding.generation(), identity.freeze().unwrap())
+                    .unwrap();
+            let (quality_binding, quality_identity) =
+                fsvi_v2_binding("native-fast-independent-quality", 4, 70);
+            let mut writer = VectorIndex::create_v2(&fast_path, fast_binding.clone()).unwrap();
+            for row in 0..96 {
+                let id = format!("fast-{row:03}");
+                if row % 10 == 0 {
+                    writer.write_record(&id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+                } else {
+                    writer
+                        .write_tombstone_record(&id, &[1.0, 0.0, 0.0, 0.0])
+                        .unwrap();
+                }
+            }
+            writer.finish().unwrap();
+            write_v2_tier(
+                &quality_path,
+                &quality_binding,
+                &[("quality-only", &[0.0, 1.0, 0.0, 0.0])],
+            );
+            let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                &TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path),
+                TwoTierConfig::default(),
+                &fast_binding,
+                Some(&quality_binding),
+            )
+            .unwrap();
+            assert!(!index.has_native_fast_hnsw());
+            let before = index.fast_admitted_owner().unwrap().witness().clone();
+            index
+                .enable_native_fast_hnsw(
+                    HnswParams {
+                        ef_search: 96,
+                        ..HnswParams::default()
+                    },
+                    3,
+                )
+                .unwrap();
+            assert!(index.has_native_fast_hnsw());
+            assert!(!index.has_native_quality_hnsw());
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+            let TierSource::AdmittedV2 { owner, .. } = &index.fast_source else {
+                panic!("fast tier must retain its admitted owner");
+            };
+            assert_eq!(Arc::strong_count(owner), 2);
+            fs::rename(&fast_path, directory.path().join("moved-fast.fsvi")).unwrap();
+
+            let fast_query = bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]);
+            let fast_embeddings = TieredQueryEmbeddings::fast_only(fast_query);
+            for k in [0, 1, 7, 96] {
+                let activated = index
+                    .activate_owner_backed_search(&fast_embeddings)
+                    .unwrap();
+                let hits = activated.search_fast(k).unwrap();
+                assert_eq!(
+                    hits,
+                    activated.fast().unwrap().search_top_k(k).unwrap(),
+                    "precision={precision:?}, k={k}"
+                );
+                assert!(hits.iter().all(|hit| {
+                    index
+                        .fast_admitted_owner()
+                        .unwrap()
+                        .row(hit.index as usize)
+                        .unwrap()
+                        .flags()
+                        .is_live()
+                }));
+                let coverage = activated.coverage(&hits, k).unwrap();
+                assert_eq!(coverage.quality, TierQueryCoverageV1::NotRequested);
+                assert_eq!(
+                    coverage.fast,
+                    TierQueryCoverageV1::Witnessed {
+                        generation_sequence: 70,
+                        live_count: 10,
+                        contributed_candidates: hits.len() as u64,
+                    }
+                );
+            }
+            let foreign = TieredQueryEmbeddings::fast_only(bound_query(
+                &quality_identity,
+                &[1.0, 0.0, 0.0, 0.0],
+            ));
+            assert!(index.activate_owner_backed_search(&foreign).is_err());
+            let quality_embeddings = TieredQueryEmbeddings::quality_only(bound_query(
+                &quality_identity,
+                &[0.0, 1.0, 0.0, 0.0],
+            ));
+            let quality_exact = index
+                .activate_owner_backed_search(&quality_embeddings)
+                .unwrap()
+                .search_quality(1)
+                .unwrap();
+            let progressive_embeddings = TieredQueryEmbeddings::progressive(
+                bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]),
+                bound_query(&quality_identity, &[0.0, 1.0, 0.0, 0.0]),
+            );
+            let union_before = index
+                .activate_owner_backed_search(&progressive_embeddings)
+                .unwrap()
+                .search_union(11)
+                .unwrap();
+            index
+                .enable_native_quality_hnsw(HnswParams::default(), 5)
+                .unwrap();
+            assert!(index.has_native_fast_hnsw());
+            assert!(index.has_native_quality_hnsw());
+            assert_eq!(
+                index
+                    .activate_owner_backed_search(&quality_embeddings)
+                    .unwrap()
+                    .search_quality(1)
+                    .unwrap(),
+                quality_exact
+            );
+            let both = index
+                .activate_owner_backed_search(&progressive_embeddings)
+                .unwrap();
+            let union = both.search_union(11).unwrap();
+            assert_eq!(union, union_before);
+            assert!(union.iter().any(|hit| hit.doc_id == "quality-only"));
+            let coverage = both.coverage(&union, 11).unwrap();
+            assert_eq!(
+                coverage.fast,
+                TierQueryCoverageV1::Witnessed {
+                    generation_sequence: 70,
+                    live_count: 10,
+                    contributed_candidates: 10,
+                }
+            );
+            assert_eq!(
+                coverage.quality,
+                TierQueryCoverageV1::Witnessed {
+                    generation_sequence: 70,
+                    live_count: 1,
+                    contributed_candidates: 1,
+                }
+            );
+            assert_eq!(index.fast_admitted_owner().unwrap().witness(), &before);
+            let before_hits = index
+                .activate_owner_backed_search(&fast_embeddings)
+                .unwrap()
+                .search_fast(3)
+                .unwrap();
+            assert!(
+                index
+                    .enable_native_fast_hnsw(
+                        HnswParams {
+                            m0: 1,
+                            ..HnswParams::default()
+                        },
+                        8
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                index
+                    .activate_owner_backed_search(&fast_embeddings)
+                    .unwrap()
+                    .search_fast(3)
+                    .unwrap(),
+                before_hits
+            );
+            assert!(index.has_native_quality_hnsw());
+        }
+    }
+
+    #[test]
+    fn native_fast_coverage_counts_approximate_candidates_not_the_exact_oracle() {
+        let directory = tempfile::tempdir().unwrap();
+        let fast_path = directory.path().join("fast.fsvi");
+        let (binding, identity) = fsvi_v2_binding("native-fast-coverage", 4, 73);
+        let mut ids = ["a", "b", "c", "d"];
+        ids.sort_by_key(|id| crate::fnv1a_hash(id.as_bytes()));
+        write_v2_tier(
+            &fast_path,
+            &binding,
+            &[
+                (ids[0], &[1.0, 0.0, 0.0, 0.0]),
+                (ids[1], &[0.0, 0.0, 1.0, 0.0]),
+                (ids[2], &[0.0, -1.0, 0.0, 0.0]),
+                (ids[3], &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &TwoTierIndexPaths::new(&fast_path),
+            TwoTierConfig::default(),
+            &binding,
+            None,
+        )
+        .unwrap();
+        // Deliberately narrow beam: the exact winner is beyond an intervening
+        // valley on the physical 0-1-2-3 path, distinguishing routed retrieval.
+        index
+            .enable_native_fast_hnsw(
+                HnswParams {
+                    m0: 2,
+                    ef_search: 1,
+                    ..HnswParams::default()
+                },
+                3,
+            )
+            .unwrap();
+        let embeddings =
+            TieredQueryEmbeddings::fast_only(bound_query(&identity, &[0.0, 1.0, 0.0, 0.0]));
+        let activated = index.activate_owner_backed_search(&embeddings).unwrap();
+        let exact = activated.fast().unwrap().search_top_k(1).unwrap();
+        let approximate = activated.search_fast(1).unwrap();
+        assert_eq!(exact[0].doc_id, ids[3]);
+        assert_eq!(approximate[0].doc_id, ids[0]);
+        for (returned, expected_contribution) in [(&approximate, 1), (&exact, 0)] {
+            let coverage = activated.coverage(returned, 1).unwrap();
+            assert_eq!(
+                coverage.fast,
+                TierQueryCoverageV1::Witnessed {
+                    generation_sequence: 73,
+                    live_count: 4,
+                    contributed_candidates: expected_contribution,
+                }
+            );
+            assert_eq!(coverage.quality, TierQueryCoverageV1::NotRequested);
+        }
     }
 
     #[test]
@@ -7874,138 +8204,196 @@ mod tests {
     }
 
     #[test]
-    fn native_quality_policy_survives_transactional_replacement_and_missing_quality() {
-        let directory = tempfile::tempdir().unwrap();
-        let make_generation = |sequence, quality_doc: Option<&str>| {
-            let generation_dir = directory.path().join(format!("generation-{sequence}"));
-            fs::create_dir(&generation_dir).unwrap();
-            let fast_path = generation_dir.join("fast.fsvi");
-            let (fast_binding, _) = fsvi_v2_binding("native-refresh-fast", 4, sequence);
-            write_v2_tier(
-                &fast_path,
-                &fast_binding,
-                &[("fast", &[1.0, 0.0, 0.0, 0.0])],
-            );
-            let mut paths = TwoTierIndexPaths::new(fast_path);
-            let quality_binding = quality_doc.map(|doc| {
-                let quality_path = generation_dir.join("quality.fsvi");
-                let (binding, _) = fsvi_v2_binding("native-refresh-quality", 4, sequence);
-                write_v2_tier(&quality_path, &binding, &[(doc, &[0.0, 1.0, 0.0, 0.0])]);
-                paths = paths.clone().with_quality_index(quality_path);
-                binding
-            });
-            (paths, fast_binding, quality_binding)
-        };
-        let (paths, fast, quality) = make_generation(1, Some("old-quality"));
-        let open = || {
-            TwoTierIndex::open_admitted_v2_with_paths(
-                &paths,
-                TwoTierConfig::default(),
-                &fast,
-                quality.as_ref(),
-            )
-            .unwrap()
-        };
-        let mut index = open();
-        let mut retained_reader = open();
-        index
-            .enable_native_quality_hnsw(HnswParams::default(), 7)
-            .unwrap();
-        retained_reader
-            .enable_native_quality_hnsw(HnswParams::default(), 7)
-            .unwrap();
-        let (_, identity) = fsvi_v2_binding("native-refresh-quality", 4, 1);
-        let embeddings =
-            TieredQueryEmbeddings::quality_only(bound_query(&identity, &[0.0, 1.0, 0.0, 0.0]));
-        let before = index.quality_admitted_owner().unwrap().witness().clone();
-        let (bad_paths, bad_fast, bad_quality) = make_generation(4, Some("bad-quality"));
-        fs::write(bad_paths.quality_index().unwrap(), b"invalid fsvi").unwrap();
-        assert!(
-            index
-                .try_replace_admitted_v2(&bad_paths, &bad_fast, bad_quality.as_ref())
-                .is_err()
-        );
-        assert!(index.has_native_quality_hnsw());
-        assert_eq!(index.quality_admitted_owner().unwrap().witness(), &before);
-        assert_eq!(
-            index
-                .activate_owner_backed_search(&embeddings)
+    fn native_policies_survive_transactional_replacement_and_missing_quality() {
+        for enable_fast in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let make_generation = |sequence, quality_doc: Option<&str>| {
+                let generation_dir = directory.path().join(format!("generation-{sequence}"));
+                fs::create_dir(&generation_dir).unwrap();
+                let fast_path = generation_dir.join("fast.fsvi");
+                let (fast_binding, _) = fsvi_v2_binding("native-refresh-fast", 4, sequence);
+                write_v2_tier(
+                    &fast_path,
+                    &fast_binding,
+                    &[(&format!("fast-{sequence}"), &[1.0, 0.0, 0.0, 0.0])],
+                );
+                let mut paths = TwoTierIndexPaths::new(fast_path);
+                let quality_binding = quality_doc.map(|doc| {
+                    let quality_path = generation_dir.join("quality.fsvi");
+                    let (binding, _) = fsvi_v2_binding("native-refresh-quality", 4, sequence);
+                    write_v2_tier(&quality_path, &binding, &[(doc, &[0.0, 1.0, 0.0, 0.0])]);
+                    paths = paths.clone().with_quality_index(quality_path);
+                    binding
+                });
+                (paths, fast_binding, quality_binding)
+            };
+            let (paths, fast, quality) = make_generation(1, Some("old-quality"));
+            let open = || {
+                TwoTierIndex::open_admitted_v2_with_paths(
+                    &paths,
+                    TwoTierConfig::default(),
+                    &fast,
+                    quality.as_ref(),
+                )
                 .unwrap()
-                .search_quality(1)
-                .unwrap()[0]
-                .doc_id,
-            "old-quality"
-        );
-
-        let (mixed_paths, mixed_fast, _) = make_generation(5, Some("mixed-quality"));
-        let (foreign_quality, _) = fsvi_v2_binding("native-refresh-quality", 4, 6);
-        write_v2_tier(
-            mixed_paths.quality_index().unwrap(),
-            &foreign_quality,
-            &[("mixed-quality", &[0.0, 1.0, 0.0, 0.0])],
-        );
-        // Both files are independently admissible and their legacy nonces
-        // agree. Native activation must still join their full v2 generations.
-        let ordinary = TwoTierIndex::open_admitted_v2_with_paths(
-            &mixed_paths,
-            TwoTierConfig::default(),
-            &mixed_fast,
-            Some(&foreign_quality),
-        )
-        .unwrap();
-        assert!(ordinary.quality_admitted_owner().is_some());
-        assert!(matches!(
-            index.try_replace_admitted_v2(&mixed_paths, &mixed_fast, Some(&foreign_quality)),
-            Err(SearchError::InvalidConfig { field, .. })
-                if field == "two_tier.native_quality_hnsw.generation"
-        ));
-        assert!(index.has_native_quality_hnsw());
-        assert_eq!(index.quality_admitted_owner().unwrap().witness(), &before);
-
-        let (fast_only_paths, fast_only_binding, _) = make_generation(2, None);
-        index
-            .try_replace_admitted_v2(&fast_only_paths, &fast_only_binding, None)
-            .unwrap();
-        assert!(!index.has_native_quality_hnsw());
-        assert!(index.quality_admitted_owner().is_none());
-        assert!(index.activate_owner_backed_search(&embeddings).is_err());
-
-        let (successor_paths, successor_fast, successor_quality) =
-            make_generation(3, Some("new-quality"));
-        index
-            .try_replace_admitted_v2(
-                &successor_paths,
-                &successor_fast,
-                successor_quality.as_ref(),
-            )
-            .unwrap();
-        assert!(index.has_native_quality_hnsw());
-        assert_eq!(
+            };
+            let mut index = open();
+            let mut retained_reader = open();
+            if enable_fast {
+                index
+                    .enable_native_fast_hnsw(HnswParams::default(), 3)
+                    .unwrap();
+                retained_reader
+                    .enable_native_fast_hnsw(HnswParams::default(), 3)
+                    .unwrap();
+            }
             index
-                .activate_owner_backed_search(&embeddings)
-                .unwrap()
-                .search_quality(1)
-                .unwrap()[0]
-                .doc_id,
-            "new-quality"
-        );
-        assert_eq!(
+                .enable_native_quality_hnsw(HnswParams::default(), 7)
+                .unwrap();
             retained_reader
-                .activate_owner_backed_search(&embeddings)
-                .unwrap()
-                .search_quality(1)
-                .unwrap()[0]
-                .doc_id,
-            "old-quality"
-        );
-        assert_eq!(
-            retained_reader.quality_admitted_owner().unwrap().witness(),
-            &before
-        );
-        assert!(
-            !open().has_native_quality_hnsw(),
-            "a fresh open starts exact"
-        );
+                .enable_native_quality_hnsw(HnswParams::default(), 7)
+                .unwrap();
+            let (_, identity) = fsvi_v2_binding("native-refresh-quality", 4, 1);
+            let embeddings =
+                TieredQueryEmbeddings::quality_only(bound_query(&identity, &[0.0, 1.0, 0.0, 0.0]));
+            let before = index.quality_admitted_owner().unwrap().witness().clone();
+            let before_fast = index.fast_admitted_owner().unwrap().witness().clone();
+            let (bad_paths, bad_fast, bad_quality) = make_generation(4, Some("bad-quality"));
+            fs::write(bad_paths.quality_index().unwrap(), b"invalid fsvi").unwrap();
+            assert!(
+                index
+                    .try_replace_admitted_v2(&bad_paths, &bad_fast, bad_quality.as_ref())
+                    .is_err()
+            );
+            assert!(index.has_native_quality_hnsw());
+            assert_eq!(index.has_native_fast_hnsw(), enable_fast);
+            assert_eq!(index.fast_admitted_owner().unwrap().witness(), &before_fast);
+            assert_eq!(index.quality_admitted_owner().unwrap().witness(), &before);
+            assert_eq!(
+                index
+                    .activate_owner_backed_search(&embeddings)
+                    .unwrap()
+                    .search_quality(1)
+                    .unwrap()[0]
+                    .doc_id,
+                "old-quality"
+            );
+
+            let (mixed_paths, mixed_fast, _) = make_generation(5, Some("mixed-quality"));
+            let (foreign_quality, _) = fsvi_v2_binding("native-refresh-quality", 4, 6);
+            write_v2_tier(
+                mixed_paths.quality_index().unwrap(),
+                &foreign_quality,
+                &[("mixed-quality", &[0.0, 1.0, 0.0, 0.0])],
+            );
+            // Both files are independently admissible and their legacy nonces
+            // agree. Native activation must still join their full v2 generations.
+            let ordinary = TwoTierIndex::open_admitted_v2_with_paths(
+                &mixed_paths,
+                TwoTierConfig::default(),
+                &mixed_fast,
+                Some(&foreign_quality),
+            )
+            .unwrap();
+            assert!(ordinary.quality_admitted_owner().is_some());
+            assert!(matches!(
+                index.try_replace_admitted_v2(&mixed_paths, &mixed_fast, Some(&foreign_quality)),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == if enable_fast {
+                        "two_tier.native_fast_hnsw.generation"
+                    } else {
+                        "two_tier.native_quality_hnsw.generation"
+                    }
+            ));
+            assert!(index.has_native_quality_hnsw());
+            assert_eq!(index.has_native_fast_hnsw(), enable_fast);
+            assert_eq!(index.fast_admitted_owner().unwrap().witness(), &before_fast);
+            assert_eq!(index.quality_admitted_owner().unwrap().witness(), &before);
+
+            let (fast_only_paths, fast_only_binding, _) = make_generation(2, None);
+            index
+                .try_replace_admitted_v2(&fast_only_paths, &fast_only_binding, None)
+                .unwrap();
+            assert!(!index.has_native_quality_hnsw());
+            assert_eq!(index.has_native_fast_hnsw(), enable_fast);
+            let (_, fast_identity) = fsvi_v2_binding("native-refresh-fast", 4, 1);
+            let fast_embeddings = TieredQueryEmbeddings::fast_only(bound_query(
+                &fast_identity,
+                &[1.0, 0.0, 0.0, 0.0],
+            ));
+            assert_eq!(
+                index
+                    .activate_owner_backed_search(&fast_embeddings)
+                    .unwrap()
+                    .search_fast(1)
+                    .unwrap()[0]
+                    .doc_id,
+                "fast-2"
+            );
+            assert!(index.quality_admitted_owner().is_none());
+            assert!(index.activate_owner_backed_search(&embeddings).is_err());
+
+            let (successor_paths, successor_fast, successor_quality) =
+                make_generation(3, Some("new-quality"));
+            index
+                .try_replace_admitted_v2(
+                    &successor_paths,
+                    &successor_fast,
+                    successor_quality.as_ref(),
+                )
+                .unwrap();
+            assert!(index.has_native_quality_hnsw());
+            assert_eq!(index.has_native_fast_hnsw(), enable_fast);
+            assert_eq!(
+                index
+                    .activate_owner_backed_search(&fast_embeddings)
+                    .unwrap()
+                    .search_fast(1)
+                    .unwrap()[0]
+                    .doc_id,
+                "fast-3"
+            );
+            assert_eq!(
+                retained_reader
+                    .activate_owner_backed_search(&fast_embeddings)
+                    .unwrap()
+                    .search_fast(1)
+                    .unwrap()[0]
+                    .doc_id,
+                "fast-1"
+            );
+            assert_eq!(
+                retained_reader.fast_admitted_owner().unwrap().witness(),
+                &before_fast
+            );
+            assert_eq!(
+                index
+                    .activate_owner_backed_search(&embeddings)
+                    .unwrap()
+                    .search_quality(1)
+                    .unwrap()[0]
+                    .doc_id,
+                "new-quality"
+            );
+            assert_eq!(
+                retained_reader
+                    .activate_owner_backed_search(&embeddings)
+                    .unwrap()
+                    .search_quality(1)
+                    .unwrap()[0]
+                    .doc_id,
+                "old-quality"
+            );
+            assert_eq!(
+                retained_reader.quality_admitted_owner().unwrap().witness(),
+                &before
+            );
+            assert!(
+                !open().has_native_quality_hnsw(),
+                "a fresh open starts exact"
+            );
+            assert!(!open().has_native_fast_hnsw());
+        }
     }
 
     /// bd-ctzo C2: the document that matters is ABSENT from the fast tier's

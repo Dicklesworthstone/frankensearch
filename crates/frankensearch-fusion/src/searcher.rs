@@ -700,8 +700,9 @@ impl TwoTierSearcher {
 
     /// Override brute-force vector-search parallelism parameters for Phase 1.
     ///
-    /// ANN retrieval remains unchanged; overrides are applied when the fast tier
-    /// uses brute-force scanning.
+    /// An explicit override selects exact owner-backed scanning instead of an
+    /// opted-in native fast graph; the actual bound query is still admitted.
+    /// Legacy ANN dispatch retains its existing parameter behavior.
     #[must_use]
     pub const fn with_search_params(mut self, params: SearchParams) -> Self {
         self.search_params = Some(params);
@@ -857,7 +858,7 @@ impl TwoTierSearcher {
     /// ([`EmbeddingIdentityBundleV1::verify_exact_producer_with`]) that
     /// [`TwoTierIndex::activate_owner_backed_search`] applies to the bound
     /// query afterwards. A refused configuration never reaches an embedder.
-    /// Native quality retrieval also checks the actual bound response after
+    /// Native retrieval also checks the actual bound response after
     /// inference, so a provider that contradicts its advertised identity is
     /// refused before feedback-vector reads or graph traversal.
     ///
@@ -951,7 +952,7 @@ impl TwoTierSearcher {
     /// Wrap the fast (and quality, if set) embedders with a query embedding cache.
     ///
     /// Repeated raw embedding requests return cached vectors instead of
-    /// re-running inference. Native quality requests preserve the provider's
+    /// re-running inference. Native tier requests preserve the provider's
     /// bound response and bypass this raw-vector cache. `capacity` controls the
     /// maximum cached embeddings per embedder (FIFO eviction when full).
     ///
@@ -1109,7 +1110,13 @@ impl TwoTierSearcher {
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
             )
-            .await;
+            .await
+            .and_then(|outcome| {
+                if self.index.has_native_fast_hnsw() {
+                    cancellation_checkpoint(cx, "native_fast_result_to_publish")?;
+                }
+                Ok(outcome)
+            });
         metrics.phase1_total_ms = phase1_start.elapsed().as_secs_f64() * 1000.0;
 
         let (initial_hits, refinement_pools) = match initial {
@@ -1714,13 +1721,30 @@ impl TwoTierSearcher {
         // `poll_immediate` from aborting the Pending futures.
         let is_async_embedder =
             self.fast_embedder.category() == frankensearch_core::traits::ModelCategory::ApiEmbedder;
+        let native_fast = self.index.has_native_fast_hnsw();
+        let embed_fast = || async {
+            if native_fast {
+                let response = self.fast_embedder.embed_bound(cx, semantic_query).await;
+                cancellation_checkpoint(cx, "fast_embed_to_activation")
+                    .and(response)
+                    .map(|bound| (bound.values, Some(bound.identity)))
+            } else {
+                self.fast_embedder
+                    .embed(cx, semantic_query)
+                    .await
+                    .map(|values| (values, None))
+            }
+        };
 
         let (embed_timed, lexical_timed) = if is_async_embedder {
             let start_embed = Instant::now();
-            let embed_res = self.fast_embedder.embed(cx, semantic_query).await;
+            let embed_res = embed_fast().await;
             let embed_elapsed = start_embed.elapsed();
 
-            let lex_res = if let Some(lex) = self.lexical.as_ref() {
+            let lex_res = if native_fast && matches!(&embed_res, Err(SearchError::Cancelled { .. }))
+            {
+                (None, Duration::ZERO)
+            } else if let Some(lex) = self.lexical.as_ref() {
                 let start_lex = Instant::now();
                 let res = lex
                     .search_candidates(cx, semantic_query, lexical_budget)
@@ -1738,7 +1762,7 @@ impl TwoTierSearcher {
             rayon::join(
                 || {
                     let start = Instant::now();
-                    let result = poll_immediate(self.fast_embedder.embed(cx, semantic_query))
+                    let result = poll_immediate(embed_fast())
                         .unwrap_or_else(|| {
                             Err(SearchError::EmbeddingFailed {
                                 model: self.fast_embedder.id().to_owned(),
@@ -1772,6 +1796,23 @@ impl TwoTierSearcher {
 
         let (fast_embed_result, fast_embed_elapsed) = embed_timed;
         metrics.fast_embed_ms = fast_embed_elapsed.as_secs_f64() * 1000.0;
+        if native_fast {
+            // Observe cancellation before lexical hydration/filter callbacks or
+            // a lexical-only fallback can publish an Initial response.
+            cancellation_checkpoint(cx, "fast_embed_to_activation")?;
+        }
+        let native_embeddings = match &fast_embed_result {
+            Ok((values, Some(identity))) => {
+                let bound = BoundQueryEmbedding::new(values.clone(), identity.clone())?;
+                let embeddings = TieredQueryEmbeddings::fast_only(bound);
+                // Even an explicit exact-scan override must admit the actual
+                // native provider response before touching the retained vectors.
+                self.index.activate_owner_backed_search(&embeddings)?;
+                cancellation_checkpoint(cx, "native_fast_activation_to_search")?;
+                Some(embeddings)
+            }
+            _ => None,
+        };
 
         // bd-8nqz.1: the candidate batch's hydration context pins the exact
         // snapshot that scored these candidates; it travels alongside the
@@ -1824,7 +1865,7 @@ impl TwoTierSearcher {
         }
 
         match fast_embed_result {
-            Ok(query_vec) => {
+            Ok((query_vec, _)) => {
                 self.export_embedding_metrics(
                     self.fast_embedder.as_ref(),
                     1,
@@ -1884,27 +1925,61 @@ impl TwoTierSearcher {
                 // configuration and classifies lazily, only when the result
                 // comes back empty.
                 let search_start = Instant::now();
-                let (mut fast_hits, index_zero_signal) = match self.search_params {
-                    None => {
-                        let classified = self
-                            .index
-                            .search_fast_classified(&query_vec, semantic_budget)?;
-                        (classified.hits, classified.zero_signal)
-                    }
-                    Some(params) => {
-                        let hits = self.index.search_fast_with_params(
-                            &query_vec,
-                            semantic_budget,
-                            Some(params),
-                        )?;
-                        let zero_signal = if hits.is_empty() {
-                            self.classify_fast_empty(&query_vec, semantic_budget)
-                        } else {
-                            None
-                        };
-                        (hits, zero_signal)
-                    }
-                };
+                let (mut fast_hits, index_zero_signal) =
+                    match (self.search_params, native_embeddings.as_ref()) {
+                        (None, Some(_)) if query_vec.iter().all(|&value| value == 0.0) => {
+                            (Vec::new(), Some(ZeroSignalReason::ZeroNormQuery))
+                        }
+                        (None, Some(embeddings)) => {
+                            let hits = self
+                                .index
+                                .activate_owner_backed_search(embeddings)?
+                                .search_fast(semantic_budget)?;
+                            cancellation_checkpoint(cx, "native_fast_search_to_filter")?;
+                            let zero_signal = if hits.is_empty() {
+                                self.classify_fast_empty(&query_vec, semantic_budget)
+                            } else {
+                                None
+                            };
+                            (hits, zero_signal)
+                        }
+                        (None, None) => {
+                            let classified = self
+                                .index
+                                .search_fast_classified(&query_vec, semantic_budget)?;
+                            (classified.hits, classified.zero_signal)
+                        }
+                        (Some(params), embeddings) => {
+                            let hits = if let Some(embeddings) = embeddings {
+                                let activated =
+                                    self.index.activate_owner_backed_search(embeddings)?;
+                                let fast =
+                                    activated.fast().ok_or_else(|| SearchError::InvalidConfig {
+                                        field: "search_activation.fast".to_owned(),
+                                        value: "missing".to_owned(),
+                                        reason:
+                                            "exact native override requires the admitted fast tier"
+                                                .to_owned(),
+                                    })?;
+                                let hits =
+                                    fast.search_top_k_with_params(semantic_budget, params)?;
+                                cancellation_checkpoint(cx, "native_fast_search_to_filter")?;
+                                hits
+                            } else {
+                                self.index.search_fast_with_params(
+                                    &query_vec,
+                                    semantic_budget,
+                                    Some(params),
+                                )?
+                            };
+                            let zero_signal = if hits.is_empty() {
+                                self.classify_fast_empty(&query_vec, semantic_budget)
+                            } else {
+                                None
+                            };
+                            (hits, zero_signal)
+                        }
+                    };
                 let prefilter_empty = fast_hits.is_empty();
                 self.apply_score_calibration_to_hits(&mut fast_hits);
                 let fast_hits = if let Some(exclusions) = normalized_exclusions {
@@ -1922,6 +1997,15 @@ impl TwoTierSearcher {
                 // costs nothing. Timed inside `vector_search_ms` — they are part of producing the
                 // semantic candidate list, and leaving them unaccounted would understate Phase-1.
                 let fast_hits = self.correct_phase1_pool(fast_hits);
+                if self.search_params.is_none()
+                    && index_zero_signal != Some(ZeroSignalReason::ZeroNormQuery)
+                    && let Some(embeddings) = native_embeddings.as_ref()
+                {
+                    cancellation_checkpoint(cx, "native_fast_filter_to_coverage")?;
+                    let activated = self.index.activate_owner_backed_search(embeddings)?;
+                    metrics.coverage = Some(activated.coverage(&fast_hits, semantic_budget)?);
+                    cancellation_checkpoint(cx, "native_fast_coverage_to_fusion")?;
+                }
 
                 metrics.vector_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
                 metrics.publish_vector_candidates(
@@ -2349,6 +2433,7 @@ impl TwoTierSearcher {
         // own top-k", which is strictly more than either arm alone.
         let quality_budget = fast_hits.len().max(k);
         cancellation_checkpoint(cx, "fast_pool_to_quality_search")?;
+        let mut quality_coverage = None;
         let quality_pool = match admission {
             SemanticAdmission::OwnerBacked { quality: true } => {
                 // The PRF-expanded vector stays inside this space by
@@ -2375,7 +2460,7 @@ impl TwoTierSearcher {
                     coverage = %coverage.redacted_summary(),
                     "quality tier served under owner-backed activation"
                 );
-                metrics.coverage = Some(coverage);
+                quality_coverage = Some(coverage);
                 QualityPool::Retrieved(hits)
             }
             SemanticAdmission::LegacyUnidentified
@@ -2414,6 +2499,33 @@ impl TwoTierSearcher {
             ),
             (pool, _) => pool,
         };
+        let completed_coverage = quality_coverage.map(|mut coverage| {
+            if let QualityPool::Retrieved(hits) = &quality_pool
+                && let frankensearch_core::TierQueryCoverageV1::Witnessed {
+                    contributed_candidates,
+                    ..
+                } = &mut coverage.quality
+            {
+                // Excluded candidates did not participate in refinement. The
+                // retained pool is the measured contribution; it must not be
+                // reconstructed by another search with different filters.
+                *contributed_candidates = hits.len() as u64;
+            }
+            if let Some(previous) = metrics.coverage.as_ref()
+                && matches!(
+                    previous.fast,
+                    frankensearch_core::TierQueryCoverageV1::Witnessed { .. }
+                )
+            {
+                coverage.topology = if previous.is_hash_control() || coverage.is_hash_control() {
+                    frankensearch_core::RetrievalTopology::HashControl
+                } else {
+                    frankensearch_core::RetrievalTopology::FullProgressive
+                };
+                coverage.fast = previous.fast.clone();
+            }
+            coverage
+        });
 
         // Calibration is a pure per-element score transform, so it is applied
         // in whichever shape the pool arrived in — never by converting between
@@ -2722,6 +2834,9 @@ impl TwoTierSearcher {
                 );
             }
             cancellation_checkpoint(cx, "quality_result_construction_to_publish")?;
+            if let Some(coverage) = completed_coverage {
+                metrics.coverage = Some(coverage);
+            }
             return Ok(results);
         }
 
@@ -2769,6 +2884,9 @@ impl TwoTierSearcher {
             .collect();
 
         cancellation_checkpoint(cx, "quality_result_construction_to_publish")?;
+        if let Some(coverage) = completed_coverage {
+            metrics.coverage = Some(coverage);
+        }
         Ok(results)
     }
 
@@ -4705,6 +4823,7 @@ mod tests {
         bound_embeds: AtomicU64,
         bound_response_identity: Option<EmbeddingIdentityBundleV1>,
         bound_response_values: Option<Vec<f32>>,
+        async_bound_response: bool,
         identity_calls: Arc<AtomicU64>,
         cancel_on_identity_call: Option<(Cx, u64)>,
     }
@@ -4719,6 +4838,7 @@ mod tests {
                 bound_embeds: AtomicU64::new(0),
                 bound_response_identity: None,
                 bound_response_values: None,
+                async_bound_response: false,
                 identity_calls: Arc::new(AtomicU64::new(0)),
                 cancel_on_identity_call: None,
             }
@@ -4735,6 +4855,11 @@ mod tests {
 
         fn with_bound_response_values(mut self, values: Vec<f32>) -> Self {
             self.bound_response_values = Some(values);
+            self
+        }
+
+        fn with_async_bound_response(mut self) -> Self {
+            self.async_bound_response = true;
             self
         }
 
@@ -4762,6 +4887,19 @@ mod tests {
         ) -> SearchFuture<'a, IdentityBoundEmbedding> {
             self.bound_embeds.fetch_add(1, Ordering::Relaxed);
             Box::pin(async move {
+                if self.async_bound_response {
+                    let mut yielded = false;
+                    std::future::poll_fn(|task| {
+                        if yielded {
+                            std::task::Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            task.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
                 let values = self.embed(cx, text).await?;
                 let values = self.bound_response_values.clone().unwrap_or(values);
                 let identity = self
@@ -4804,7 +4942,11 @@ mod tests {
         }
 
         fn category(&self) -> ModelCategory {
-            ModelCategory::StaticEmbedder
+            if self.async_bound_response {
+                ModelCategory::ApiEmbedder
+            } else {
+                ModelCategory::StaticEmbedder
+            }
         }
     }
 
@@ -5554,6 +5696,442 @@ mod tests {
             );
 
             let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn native_fast_and_both_tiers_preserve_progressive_hybrid_results() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for with_quality in [false, true] {
+                let dir = owner_backed_dir("native-fast-progressive");
+                let fast_binding = artifact_binding("native-progressive-fast", 4, 67);
+                let quality_binding = artifact_binding("native-progressive-quality", 4, 67);
+                let mut index = if with_quality {
+                    owner_backed_two_tier_index(&dir, &fast_binding, &quality_binding)
+                } else {
+                    let path = dir.join("fast.fsvi");
+                    let mut writer =
+                        frankensearch_index::VectorIndex::create_v2(&path, fast_binding.clone())
+                            .unwrap();
+                    writer.write_record("doc-a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+                    writer.write_record("doc-b", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+                    writer
+                        .write_tombstone_record("doc-dead", &[1.0, 0.0, 0.0, 0.0])
+                        .unwrap();
+                    writer.finish().unwrap();
+                    Arc::new(
+                        TwoTierIndex::open_admitted_v2_with_paths(
+                            &frankensearch_index::TwoTierIndexPaths::new(path),
+                            TwoTierConfig::default(),
+                            &fast_binding,
+                            None,
+                        )
+                        .unwrap(),
+                    )
+                };
+                let mut exact = None;
+                for (native, native_quality, asynchronous) in [
+                    (false, false, false),
+                    (true, false, false),
+                    (true, true, false),
+                    (true, true, true),
+                ] {
+                    if native && !index.has_native_fast_hnsw() {
+                        let index = Arc::get_mut(&mut index).expect("previous searcher dropped");
+                        index
+                            .enable_native_fast_hnsw(
+                                frankensearch_index::native_hnsw::HnswParams::default(),
+                                17,
+                            )
+                            .unwrap();
+                    }
+                    if native_quality && with_quality && !index.has_native_quality_hnsw() {
+                        Arc::get_mut(&mut index)
+                            .expect("previous searcher dropped")
+                            .enable_native_quality_hnsw(
+                                frankensearch_index::native_hnsw::HnswParams::default(),
+                                19,
+                            )
+                            .unwrap();
+                    }
+                    let identity = in_memory_identity("native-progressive-fast", 4);
+                    let mut fast = IdentityCountingEmbedder::new(
+                        "fast",
+                        identity.clone(),
+                        vec![1.0, 0.0, 0.0, 0.0],
+                    )
+                    .with_bound_response_identity(identity);
+                    if asynchronous {
+                        fast = fast.with_async_bound_response();
+                    }
+                    let fast = Arc::new(fast);
+                    let mut searcher = TwoTierSearcher::new(
+                        Arc::clone(&index),
+                        fast.clone(),
+                        TwoTierConfig::default(),
+                    )
+                    .with_lexical(Arc::new(StubLexical))
+                    .with_embedding_cache(8);
+                    if with_quality {
+                        searcher = searcher.with_quality_embedder(Arc::new(
+                            IdentityCountingEmbedder::new(
+                                "quality",
+                                in_memory_identity("native-progressive-quality", 4),
+                                vec![0.0, 1.0, 0.0, 0.0],
+                            ),
+                        ));
+                    }
+                    let mut phases = Vec::new();
+                    let mut snapshots = Vec::new();
+                    let metrics = searcher
+                        .search(
+                            &cx,
+                            "find the best matching document -excluded",
+                            8,
+                            |doc| {
+                                Some(if matches!(doc, "doc-b" | "doc-far" | "lex-doc-1") {
+                                    "excluded document".to_owned()
+                                } else {
+                                    "retained document".to_owned()
+                                })
+                            },
+                            |phase| {
+                                let (name, results) = match phase {
+                                    SearchPhase::Initial { results, .. } => ("initial", results),
+                                    SearchPhase::Refined { results, .. } => ("refined", results),
+                                    phase => panic!("unexpected native phase: {phase:?}"),
+                                };
+                                assert!(results.iter().all(|hit| !matches!(
+                                    hit.doc_id.as_str(),
+                                    "doc-dead" | "doc-b" | "doc-far" | "lex-doc-1"
+                                )));
+                                assert!(results.iter().any(|hit| hit.doc_id == "lex-doc-0"));
+                                if with_quality && name == "refined" {
+                                    assert!(
+                                        results.iter().any(|hit| hit.doc_id == "doc-quality-only")
+                                    );
+                                }
+                                phases.push(name);
+                                snapshots.push(serde_json::to_value(results).unwrap());
+                            },
+                        )
+                        .await
+                        .expect("serve the admitted native tiers");
+                    assert_eq!(
+                        phases,
+                        if with_quality {
+                            vec!["initial", "refined"]
+                        } else {
+                            vec!["initial"]
+                        }
+                    );
+                    assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), u64::from(native));
+                    assert_eq!(fast.embed_count(), 1);
+                    assert_eq!(fast.identity_count(), 1);
+                    if let Some(expected) = &exact {
+                        assert_eq!(
+                            &snapshots, expected,
+                            "native and exact public results agree"
+                        );
+                    } else {
+                        exact = Some(snapshots);
+                    }
+                    if native {
+                        let coverage = metrics.coverage.expect("native fast coverage");
+                        assert_eq!(
+                            coverage.fast,
+                            frankensearch_core::TierQueryCoverageV1::Witnessed {
+                                generation_sequence: 67,
+                                live_count: 2,
+                                contributed_candidates: 1,
+                            }
+                        );
+                        assert_eq!(
+                            coverage.quality,
+                            if with_quality {
+                                frankensearch_core::TierQueryCoverageV1::Witnessed {
+                                    generation_sequence: 67,
+                                    live_count: 3,
+                                    contributed_candidates: 2,
+                                }
+                            } else {
+                                frankensearch_core::TierQueryCoverageV1::NotRequested
+                            }
+                        );
+                        assert_eq!(
+                            coverage.topology,
+                            if with_quality {
+                                frankensearch_core::RetrievalTopology::FullProgressive
+                            } else {
+                                frankensearch_core::RetrievalTopology::FastOnly
+                            }
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_fast_refuses_foreign_bound_responses_before_lexical_filtering() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("native-fast-foreign-response");
+            let binding = artifact_binding("native-fast-response", 4, 68);
+            let mut index = owner_backed_index(&dir, &binding);
+            Arc::get_mut(&mut index)
+                .unwrap()
+                .enable_native_fast_hnsw(
+                    frankensearch_index::native_hnsw::HnswParams::default(),
+                    23,
+                )
+                .unwrap();
+            let advertised = in_memory_identity("native-fast-response", 4);
+            let mut foreign_producer = advertised.clone();
+            "foreign-bound-backend".clone_into(&mut foreign_producer.producer.backend);
+            for (response, field) in [
+                (
+                    in_memory_identity("foreign-fast-space", 4),
+                    "query_embedding.fast.space_identity",
+                ),
+                (
+                    foreign_producer,
+                    "search_activation.fast.producer_conformance",
+                ),
+            ] {
+                for cached in [false, true] {
+                    for exact_override in [false, true] {
+                        let fast = Arc::new(
+                            IdentityCountingEmbedder::new(
+                                "fast",
+                                advertised.clone(),
+                                vec![1.0, 0.0, 0.0, 0.0],
+                            )
+                            .with_bound_response_identity(response.clone()),
+                        );
+                        let mut searcher = TwoTierSearcher::new(
+                            Arc::clone(&index),
+                            fast.clone(),
+                            TwoTierConfig::default(),
+                        )
+                        .with_lexical(Arc::new(StubLexical));
+                        if cached {
+                            searcher = searcher.with_embedding_cache(8);
+                        }
+                        if exact_override {
+                            searcher = searcher.with_search_params(SearchParams {
+                                parallel_enabled: false,
+                                parallel_threshold: usize::MAX,
+                                parallel_chunk_size: 1,
+                            });
+                        }
+                        let text_reads = AtomicU64::new(0);
+                        let error = searcher
+                            .search(
+                                &cx,
+                                "find a matching document -excluded",
+                                3,
+                                |_| {
+                                    text_reads.fetch_add(1, Ordering::Relaxed);
+                                    Some("retained document".to_owned())
+                                },
+                                |phase| panic!("foreign fast response published {phase:?}"),
+                            )
+                            .await
+                            .expect_err("the actual response must be admitted");
+                        assert!(
+                            matches!(error, SearchError::InvalidConfig { field: actual, .. } if actual == field)
+                        );
+                        assert_eq!(text_reads.load(Ordering::Relaxed), 0);
+                        assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), 1);
+                        assert_eq!(fast.embed_count(), 1);
+                        assert_eq!(fast.identity_count(), 1);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_fast_cancellation_dominates_refusal_and_lexical_fallback() {
+        for asynchronous in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = owner_backed_dir("native-fast-cancel");
+                let binding = artifact_binding("native-fast-cancel", 4, 69);
+                let mut index = owner_backed_index(&dir, &binding);
+                Arc::get_mut(&mut index)
+                    .unwrap()
+                    .enable_native_fast_hnsw(
+                        frankensearch_index::native_hnsw::HnswParams::default(),
+                        29,
+                    )
+                    .unwrap();
+                let mut fast = IdentityCountingEmbedder::new(
+                    "fast",
+                    in_memory_identity("native-fast-cancel", 4),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )
+                .with_bound_response_values(vec![1.0, 0.0, 0.0])
+                .cancel_on_identity_call(cx.clone(), 2);
+                if asynchronous {
+                    fast = fast.with_async_bound_response();
+                }
+                let fast = Arc::new(fast);
+                let adapter = Arc::new(RecordingHostAdapter::new("native_fast_cancellation"));
+                let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                    .with_lexical(Arc::new(StubLexical))
+                    .with_embedding_cache(8)
+                    .with_host_adapter(adapter.clone());
+                let text_reads = AtomicU64::new(0);
+                let error = searcher
+                    .search(
+                        &cx,
+                        "find a matching document -excluded",
+                        3,
+                        |_| {
+                            text_reads.fetch_add(1, Ordering::Relaxed);
+                            Some("retained document".to_owned())
+                        },
+                        |phase| panic!("cancelled fast response published {phase:?}"),
+                    )
+                    .await
+                    .expect_err("native cancellation remains terminal");
+                assert!(
+                    matches!(error, SearchError::Cancelled { phase, .. } if phase == "fast_embed_to_activation")
+                );
+                assert_eq!(text_reads.load(Ordering::Relaxed), 0);
+                assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), 1);
+                assert_eq!(fast.embed_count(), 1);
+                assert_eq!(fast.identity_count(), 2);
+                assert_single_cancelled_session_stop(&adapter, "fast_embed_to_activation");
+            });
+        }
+    }
+
+    #[test]
+    fn native_fast_exact_override_observes_filter_cancellation_before_initial() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("native-fast-filter-cancel");
+            let binding = artifact_binding("native-fast-filter-cancel", 4, 71);
+            let mut index = owner_backed_index(&dir, &binding);
+            Arc::get_mut(&mut index)
+                .unwrap()
+                .enable_native_fast_hnsw(
+                    frankensearch_index::native_hnsw::HnswParams::default(),
+                    31,
+                )
+                .unwrap();
+            let adapter = Arc::new(RecordingHostAdapter::new("native_fast_filter_cancellation"));
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(IdentityCountingEmbedder::new(
+                    "fast",
+                    in_memory_identity("native-fast-filter-cancel", 4),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )),
+                TwoTierConfig::default(),
+            )
+            .with_search_params(SearchParams {
+                parallel_enabled: false,
+                parallel_threshold: usize::MAX,
+                parallel_chunk_size: 1,
+            })
+            .with_host_adapter(adapter.clone());
+            let text_reads = AtomicU64::new(0);
+            let error = searcher
+                .search(
+                    &cx,
+                    "find a matching document -excluded",
+                    3,
+                    |_| {
+                        text_reads.fetch_add(1, Ordering::Relaxed);
+                        cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("cancel during exclusion filtering"),
+                        );
+                        Some("retained document".to_owned())
+                    },
+                    |phase| panic!("filter cancellation published {phase:?}"),
+                )
+                .await
+                .expect_err("native exact override must not publish after cancellation");
+            assert!(text_reads.load(Ordering::Relaxed) > 0);
+            assert!(matches!(error, SearchError::Cancelled { phase, .. }
+                if phase == "native_fast_result_to_publish"));
+            assert_single_cancelled_session_stop(&adapter, "native_fast_result_to_publish");
+        });
+    }
+
+    #[test]
+    fn native_fast_exact_override_and_zero_signal_keep_their_contracts() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("native-fast-exact-override");
+            let path = dir.join("fast.fsvi");
+            let binding = artifact_binding("native-fast-override", 4, 70);
+            let mut ids = ["a", "b", "c", "d"];
+            ids.sort_by_key(|id| frankensearch_index::fnv1a_hash(id.as_bytes()));
+            write_v2_tier(
+                &path,
+                &binding,
+                &[
+                    (ids[0], &[1.0, 0.0, 0.0, 0.0]),
+                    (ids[1], &[0.0, 0.0, 1.0, 0.0]),
+                    (ids[2], &[0.0, -1.0, 0.0, 0.0]),
+                    (ids[3], &[0.0, 1.0, 0.0, 0.0]),
+                ],
+            );
+            let config = TwoTierConfig {
+                candidate_multiplier: 1,
+                mrl_search_dims: 1,
+                ..TwoTierConfig::default()
+            };
+            let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                &frankensearch_index::TwoTierIndexPaths::new(path),
+                config.clone(),
+                &binding,
+                None,
+            )
+            .unwrap();
+            index
+                .enable_native_fast_hnsw(
+                    frankensearch_index::native_hnsw::HnswParams {
+                        m0: 2,
+                        ef_search: 1,
+                        ..frankensearch_index::native_hnsw::HnswParams::default()
+                    },
+                    3,
+                )
+                .unwrap();
+            let index = Arc::new(index);
+            for (exact_override, zero_query) in [(false, false), (true, false), (false, true)] {
+                let fast = Arc::new(IdentityCountingEmbedder::new(
+                    "fast",
+                    in_memory_identity("native-fast-override", 4),
+                    if zero_query {
+                        vec![0.0; 4]
+                    } else {
+                        vec![0.0, 1.0, 0.0, 0.0]
+                    },
+                ));
+                let mut searcher =
+                    TwoTierSearcher::new(Arc::clone(&index), fast.clone(), config.clone());
+                if exact_override {
+                    searcher = searcher.with_search_params(SearchParams {
+                        parallel_enabled: false,
+                        parallel_threshold: usize::MAX,
+                        parallel_chunk_size: 1,
+                    });
+                }
+                let (hits, metrics) = searcher.search_collect(&cx, "query", 1).await.unwrap();
+                if zero_query {
+                    assert!(hits.is_empty());
+                    assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::ZeroNormQuery));
+                    assert!(metrics.coverage.is_none());
+                } else {
+                    assert_eq!(hits[0].doc_id, ids[if exact_override { 3 } else { 0 }]);
+                    assert_eq!(metrics.coverage.is_some(), !exact_override);
+                }
+                assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), 1);
+            }
         });
     }
 
