@@ -30,6 +30,9 @@ use crate::generation_store::{
     COMPLETE_GENERATION_MANIFEST, CompleteGenerationStore, PublishedGeneration,
 };
 
+// This file is itself loaded through `#[path]`, so an unannotated child
+// module would resolve beside it in `runtime/`, not in `runtime/retained_reuse/`.
+#[path = "retained_reuse/append_input.rs"]
 mod append_input;
 pub(super) use append_input::read_append_documents;
 
