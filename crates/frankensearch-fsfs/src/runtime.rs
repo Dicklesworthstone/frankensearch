@@ -34807,7 +34807,7 @@ mod tests {
             let build = store.begin(&cx).unwrap();
             fs::write(build.path().join("artifact"), b"immutable bytes").unwrap();
             let generation = super::complete_cli::require_durable_publication(
-                build.publish(&cx, |_| Ok(())).unwrap(),
+                build.publish(&cx, |_, _| Ok(())).unwrap(),
             )
             .unwrap();
             let mut runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
@@ -34896,7 +34896,7 @@ mod tests {
             let build = store.begin(&cx).unwrap();
             fs::write(build.path().join("artifact"), b"immutable bytes").unwrap();
             let generation = super::complete_cli::require_durable_publication(
-                build.publish(&cx, |_| Ok(())).unwrap(),
+                build.publish(&cx, |_, _| Ok(())).unwrap(),
             )
             .unwrap();
             symlink(generation.path(), store.root().join("explain")).unwrap();
