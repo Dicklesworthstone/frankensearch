@@ -76,19 +76,17 @@ impl IdentityBoundEmbedding {
 // immutable identity, which must be admitted even when the batch is empty.
 fn validate_embedding_identity(identity: &EmbeddingIdentityBundleV1) -> SearchResult<usize> {
     identity.validate()?;
-    let dimension = usize::try_from(identity.space.dimension).map_err(|_| {
-        SearchError::InvalidConfig {
+    let dimension =
+        usize::try_from(identity.space.dimension).map_err(|_| SearchError::InvalidConfig {
             field: "identity_bound_embedding.dimension".to_owned(),
             value: identity.space.dimension.to_string(),
             reason: "dimension does not fit usize".to_owned(),
-        }
-    })?;
+        })?;
     if identity.storage.quantization != QuantizationFormat::F32 {
         return Err(SearchError::InvalidConfig {
             field: "identity_bound_embedding.storage.quantization".to_owned(),
             value: format!("{:?}", identity.storage.quantization),
-            reason: "an in-process Vec<f32> output must carry an f32 storage identity"
-                .to_owned(),
+            reason: "an in-process Vec<f32> output must carry an f32 storage identity".to_owned(),
         });
     }
     if !identity.storage.format.starts_with("in-memory-") {
@@ -106,8 +104,7 @@ fn validate_embedding_identity(identity: &EmbeddingIdentityBundleV1) -> SearchRe
         return Err(SearchError::InvalidConfig {
             field: "identity_bound_embedding.storage.endianness".to_owned(),
             value: identity.storage.endianness.clone(),
-            reason: "an in-process Vec<f32> output must carry a native-value contract"
-                .to_owned(),
+            reason: "an in-process Vec<f32> output must carry a native-value contract".to_owned(),
         });
     }
     Ok(dimension)
@@ -1805,12 +1802,14 @@ mod tests {
 
     impl SyncEmbed for BatchContractSyncEmbedder {
         fn embed_sync(&self, _text: &str) -> SearchResult<Vec<f32>> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.outputs.first().cloned().unwrap_or_default())
         }
 
         fn embed_batch_sync(&self, _texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.outputs.clone())
         }
 
@@ -1844,12 +1843,20 @@ mod tests {
 
     #[test]
     fn identity_bound_rejects_non_finite_values_without_repair_or_disclosure() {
-        for bits in [0x7fc0_0000, 0xffc0_0042, 0x7f80_0001, 0x7f80_0000, 0xff80_0000] {
+        for bits in [
+            0x7fc0_0000,
+            0xffc0_0042,
+            0x7f80_0001,
+            0x7f80_0000,
+            0xff80_0000,
+        ] {
             let bound = IdentityBoundEmbedding {
                 values: vec![12_345.5, f32::from_bits(bits), -9_876.25],
                 identity: EmbeddingIdentityBundleV1::explicit_test_model("finite-contract", 3),
             };
-            let error = bound.validate().expect_err("non-finite output must fail closed");
+            let error = bound
+                .validate()
+                .expect_err("non-finite output must fail closed");
             let message = error.to_string();
             assert!(message.contains("index 1"));
             assert!(!message.contains("12345"));
@@ -1917,7 +1924,9 @@ mod tests {
             // a partially accepted batch.
             let batch = BatchContractSyncEmbedder::new(vec![vec![1.0; 3], output]);
             assert_contract_error(
-                batch.embed_batch_bound_sync(&["first", "second"]).unwrap_err(),
+                batch
+                    .embed_batch_bound_sync(&["first", "second"])
+                    .unwrap_err(),
                 "identity_bound_embedding.values",
             );
         }
@@ -1934,17 +1943,14 @@ mod tests {
                 vec![1.0, f32::INFINITY, 0.0],
                 vec![1.0, f32::NEG_INFINITY, 0.0],
             ] {
-                let single = SyncEmbedderAdapter(BatchContractSyncEmbedder::new(vec![
-                    output.clone(),
-                ]));
+                let single =
+                    SyncEmbedderAdapter(BatchContractSyncEmbedder::new(vec![output.clone()]));
                 assert_contract_error(
                     single.embed_bound(&cx, "private-input").await.unwrap_err(),
                     "identity_bound_embedding.values",
                 );
-                let batch = SyncEmbedderAdapter(BatchContractSyncEmbedder::new(vec![
-                    vec![1.0; 3],
-                    output,
-                ]));
+                let batch =
+                    SyncEmbedderAdapter(BatchContractSyncEmbedder::new(vec![vec![1.0; 3], output]));
                 assert_contract_error(
                     batch
                         .embed_batch_bound(&cx, &["first", "second"])
@@ -2001,7 +2007,10 @@ mod tests {
                 vec![0.0, -0.0, f32::from_bits(1)],
                 vec![1.0, -7.25, f32::MAX],
             ]));
-            let sync = adapter.0.embed_batch_bound_sync(&["first", "second"]).unwrap();
+            let sync = adapter
+                .0
+                .embed_batch_bound_sync(&["first", "second"])
+                .unwrap();
             assert_bound_rows_unchanged(&sync, &adapter.0);
             let asynchronous = adapter
                 .embed_batch_bound(&cx, &["first", "second"])
@@ -2050,7 +2059,8 @@ mod tests {
     impl Embedder for CancelDuringInference {
         fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             Box::pin(async move {
-                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 cx.cancel_fast(asupersync::CancelKind::User);
                 // Deliberately return success after cancellation, modeling a
                 // backend that checks only before its blocking inference.
@@ -2088,7 +2098,9 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let embedder = CancelDuringInference::new();
             assert!(matches!(
-                embedder.embed_batch(&cx, &["first", "second", "third"]).await,
+                embedder
+                    .embed_batch(&cx, &["first", "second", "third"])
+                    .await,
                 Err(SearchError::Cancelled { .. })
             ));
             assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::Relaxed), 1);

@@ -547,7 +547,7 @@ fn copy_tree(
                 .open(&target)?;
             // No hard links: tombstones, mmap writes, catalogs and lexical
             // commits in the candidate must never reach a retained reader.
-            let mut buffer = [0_u8; 64 * 1024];
+            let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
             let mut copied = 0_u64;
             let mut digest = Sha256::new();
             loop {

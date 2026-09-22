@@ -916,7 +916,9 @@ mod tests {
             .with(Box::new(BitsetFilter::from_doc_ids(["doc-a", "doc-b"])))
             .with(Box::new(BitsetFilter::from_doc_ids(["doc-b", "doc-c"])));
         let right = FilterChain::new(FilterMode::All)
-            .with(Box::new(BitsetFilter::from_doc_ids(["doc-b", "doc-c", "doc-d"])))
+            .with(Box::new(BitsetFilter::from_doc_ids([
+                "doc-b", "doc-c", "doc-d",
+            ])))
             .with(Box::new(BitsetFilter::from_doc_ids(["doc-c", "doc-d"])));
         let chain = FilterChain::new(FilterMode::All)
             .with(Box::new(left))
@@ -947,11 +949,13 @@ mod tests {
         all.add(Box::new(BitsetFilter::from_doc_ids(["doc-c"])));
         assert_candidates(&all, &[]);
 
-        let mut any = FilterChain::new(FilterMode::Any)
-            .with(Box::new(BitsetFilter::from_doc_ids(["doc-a"])));
+        let mut any =
+            FilterChain::new(FilterMode::Any).with(Box::new(BitsetFilter::from_doc_ids(["doc-a"])));
         any.add(Box::new(BitsetFilter::from_doc_ids(["doc-b"])));
         assert_candidates(&any, &["doc-a", "doc-b"]);
-        any.add(Box::new(PredicateFilter::new("outside", |id| id == "outside")));
+        any.add(Box::new(PredicateFilter::new("outside", |id| {
+            id == "outside"
+        })));
         assert!(any.candidate_hashes().is_none());
         assert!(any.immutable_candidate_hashes().is_none());
         assert!(any.matches("outside", None));
@@ -1014,7 +1018,9 @@ mod tests {
             }
             let with_predicate = FilterChain::new(mode)
                 .with(Box::new(BitsetFilter::from_doc_ids(["doc-a"])))
-                .with(Box::new(PredicateFilter::new("outside", |id| id == "outside")));
+                .with(Box::new(PredicateFilter::new("outside", |id| {
+                    id == "outside"
+                })));
             assert!(with_predicate.candidate_hashes().is_none());
         }
     }
