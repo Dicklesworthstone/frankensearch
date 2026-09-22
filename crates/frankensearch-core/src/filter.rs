@@ -222,6 +222,7 @@ impl fmt::Debug for FilterChain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FilterChain")
             .field("mode", &self.mode)
+            .field("compiled_hashes", &self.compiled_hashes)
             .field(
                 "filters",
                 &self.filters.iter().map(|f| f.name()).collect::<Vec<_>>(),
