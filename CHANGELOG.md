@@ -269,9 +269,10 @@ qualified; individual results below are narrower than release acceptance.
   pooling, as reference `model2vec` does; on eight reference texts (three with
   `[UNK]`) both match `model2vec` 0.9.0 within 1e-5 per component. The default
   model's manifest, certificate and fingerprint are unchanged. On a 56-file
-  corpus a cold `fsfs search --no-daemon` delivering REFINED took 3.1 s and
-  1.41 GB peak RSS with the default, 0.64 s and 0.41 GB with 32M, and 0.55 s
-  and 0.31 GB with 8M (release build, median of seven runs). Retrieval quality
+  corpus a cold `fsfs search --no-daemon` delivering REFINED took 2.3 s and
+  1.40 GB peak RSS with the default, 0.53 s and 0.41 GB with 32M, and 0.44 s
+  and 0.31 GB with 8M (release build, models with verification receipts,
+  median of seven runs). Retrieval quality
   of the English models relative to the default is not measured.
   [Selection and models](https://github.com/Dicklesworthstone/frankensearch/commit/6a717c64c94da0f61e3fd31a69ecaea92c4da21c);
   [registration API](https://github.com/Dicklesworthstone/frankensearch/commit/e438f0d04f7abb99162dd60e58f7657f66029d8c).

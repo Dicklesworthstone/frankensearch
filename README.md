@@ -238,14 +238,15 @@ than a fallback. Both apply the reference `model2vec` rule of dropping the
 WordPiece `[UNK]` token before pooling.
 
 Cold `fsfs search --no-daemon` on a 56-file corpus, release build, both tiers
-delivering REFINED, median of seven interleaved runs with distinct queries
-(2026-09-22, Threadripper PRO 5975WX):
+delivering REFINED, models installed with verification receipts (as
+`fsfs download-models` leaves them), median of seven interleaved runs with
+distinct queries (2026-09-22, Threadripper PRO 5975WX):
 
 | Fast model | Cold search | Peak RSS |
 |---|---|---|
-| potion-multilingual-128M | 3.1 s | 1.41 GB |
-| potion-base-32M | 0.64 s | 0.41 GB |
-| potion-base-8M | 0.55 s | 0.31 GB |
+| potion-multilingual-128M | 2.3 s | 1.40 GB |
+| potion-base-32M | 0.53 s | 0.41 GB |
+| potion-base-8M | 0.44 s | 0.31 GB |
 
 These are English models, and their retrieval quality relative to the
 multilingual default has not been measured. Library callers select one with
