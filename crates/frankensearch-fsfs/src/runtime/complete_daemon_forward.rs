@@ -342,7 +342,10 @@ pub(super) async fn serve(
     timeout: Duration,
 ) -> SearchResult<PeerOutcome> {
     if progressive::is_streamed(bytes) {
-        return progressive::serve(cx, runtime, session, peer, bytes, timeout).await;
+        return Box::pin(progressive::serve(
+            cx, runtime, session, peer, bytes, timeout,
+        ))
+        .await;
     }
     let request = decode_request(bytes);
     let request_id = request

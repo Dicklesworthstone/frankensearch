@@ -137,7 +137,12 @@ pub(super) async fn serve(
             )
             .await
     };
-    let result = run_request(cx, timeout, streaming::drive(cx, &output, producer)).await;
+    let result = Box::pin(run_request(
+        cx,
+        timeout,
+        streaming::drive(cx, &output, producer),
+    ))
+    .await;
     match result {
         Ok(()) => Ok(PeerOutcome::Search),
         Err(error @ SearchError::Cancelled { .. }) => Err(error),
@@ -569,8 +574,9 @@ mod tests {
             assert_eq!(json, bytes);
             let (toon, result) = read(&cx, &request, &bytes, OutputFormat::Toon).await;
             result.unwrap();
-            assert_eq!(toon.iter().filter(|byte| **byte == 0x1e).count(), 2);
-            assert!(String::from_utf8(toon).unwrap().contains("toon"));
+            let toon = String::from_utf8(toon).unwrap();
+            assert_eq!(toon.matches('\u{001e}').count(), 2);
+            assert!(toon.contains("toon"));
         });
     }
 
@@ -892,7 +898,8 @@ mod tests {
                 .await;
             server.join().unwrap();
             result.unwrap();
-            assert_eq!(output.iter().filter(|byte| **byte == 0x1e).count(), 2);
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(output.matches('\u{001e}').count(), 2);
             assert!(!root.join("generations").exists());
         });
     }

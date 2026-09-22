@@ -1153,3 +1153,27 @@ bare-hash warnings, and the new upstream commit link resolves through GitHub.
 This is focused forwarding qualification. The stock receipt above predates
 forwarding; the combined source still needs its own stock gate. The separate
 full Quill rerun and exact R1 boundary remain unresolved, with no release claim.
+
+### September 22: progressive CLI forwarding qualification
+
+The subsequent upstream streaming integration (`ff73d325`) is now covered by
+the actual executable fixture: `search --daemon --stream` produces valid JSONL
+frames, exactly one result, and exactly one completed terminal before the fixture
+checks corrupt-selection refusal and daemon shutdown. Two owning futures needed
+boxing to satisfy strict Clippy without spawning tasks or changing cancellation.
+The TOON assertions now validate UTF-8 and count text record separators.
+
+RCH worker `vmi1264463` passed all-target fsfs check, strict all-target Clippy,
+56 daemon unit tests, and the explicitly enabled real-Potion executable test
+(one pass, zero failures or ignores). Retrieved receipt SHA-256 is
+`254f97c5eb013e8f42283426c501faf35902393c0c3901733fee8e9a18cff414`.
+Every stage log and 710 crate/toolchain source files match the frozen candidate.
+The executable-test log hashes to
+`64f08153972dea335ccd11418d4adae570ed9cd0ddd7899cb582e9a4333f464a`;
+the executed test ELF hashes to
+`a2e892593484755951a931d2e468d4b66bbfca8475f54a167d4ab5d14a9455f9`.
+Earlier large-future and test-bytecount lint failures remain retained separately.
+The six-file UBS scan reports zero critical findings, 655 warnings, and 190
+informational findings. This focused pass does not qualify the full release:
+the combined stock gate, full Quill run, exact R1 acceptance, and platform
+publication remain outstanding.
