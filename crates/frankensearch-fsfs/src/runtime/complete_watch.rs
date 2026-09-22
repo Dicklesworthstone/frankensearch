@@ -1225,12 +1225,12 @@ mod lifecycle_tests {
 
             for revision in 0..5 {
                 let now = session.settling.as_ref().unwrap().next_probe;
-                let changed = session.source.path.join("beta.md");
-                fs::write(&changed, format!("sharedtoken beta revision {revision}")).unwrap();
+                let beta_path = session.source.path.join("beta.md");
+                fs::write(&beta_path, format!("sharedtoken beta revision {revision}")).unwrap();
                 {
                     let mut changes = lock_changes(&session.changes).unwrap();
                     changes.record(now, false);
-                    changes.record_path(&changed);
+                    changes.record_path(&beta_path);
                 }
                 assert!(session.advance(&cx, now).await.unwrap().is_none());
                 assert!(session.settling.as_ref().unwrap().observation.is_none());
