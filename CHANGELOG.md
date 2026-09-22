@@ -243,6 +243,31 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **Smaller opt-in fast models: `potion-base-8M` and `potion-base-32M` (GH #50).**
+  `[indexing] fast_model` now selects the Model2Vec model that is actually
+  loaded; before, it only fed `status`/`doctor` output and every load used
+  `potion-multilingual-128M`. Both English models are pinned (revision, size
+  and SHA-256 per file), listed by `fsfs download-models --list`, acquired only
+  explicitly and loaded only when selected. Each is a distinct vector space: an
+  index built with one is refused by another, and an unrecognized `fast_model`
+  is a configuration error. They drop the WordPiece `[UNK]` token before
+  pooling, as reference `model2vec` does; on eight reference texts (three with
+  `[UNK]`) both match `model2vec` 0.9.0 within 1e-5 per component. The default
+  model's manifest, certificate and fingerprint are unchanged. On a 56-file
+  corpus a cold `fsfs search --no-daemon` delivering REFINED took 3.1 s and
+  1.41 GB peak RSS with the default, 0.64 s and 0.41 GB with 32M, and 0.55 s
+  and 0.31 GB with 8M (release build, median of seven runs). Retrieval quality
+  of the English models relative to the default is not measured.
+  [Selection and models](https://github.com/Dicklesworthstone/frankensearch/commit/6a717c64c94da0f61e3fd31a69ecaea92c4da21c);
+  [registration API](https://github.com/Dicklesworthstone/frankensearch/commit/e438f0d04f7abb99162dd60e58f7657f66029d8c).
+
+- **Explain and streams report the cross-encoder.** `fsfs explain` JSON now
+  includes the `rerank` component (model, raw logit, sigmoid) for hits the
+  cross-encoder scored, and `--stream` emits a `stage = rerank` progress frame
+  with the stage's reason code before the results it ordered. Per-hit rerank
+  scores in `data.rerank.scores` gain the raw `logit`.
+  [Change](https://github.com/Dicklesworthstone/frankensearch/commit/5ccdcbd071e6161f0657a7ac50d982e9761c8fd6).
+
 - **Complete-generation rebuilds and searches reach the executable.** Opting in
   with `FSFS_COMPLETE_GENERATIONS=1` publishes a complete bundle; subsequent
   index/search commands recognize that store. Warm stdio serving admits a

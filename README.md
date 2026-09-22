@@ -213,6 +213,44 @@ re-embed the complete corpus, and atomically publish that backfilled generation
 before serving queries from it. Identity checks fail closed if vectors from the
 two spaces are combined.
 
+### Opt-in smaller fast models
+
+The fast tier defaults to `potion-multilingual-128M` (256 dimensions, 512 MB of
+weights, a 500k-piece tokenizer). Two English-only Model2Vec models are
+registered as smaller, explicitly selected alternatives: `potion-base-8M`
+(256 dimensions, 30 MB) and `potion-base-32M` (512 dimensions, 129 MB). Like
+the opt-in quality models, they are never downloaded or selected implicitly:
+
+```bash
+fsfs download-models potion-base-8m
+fsfs download-models potion-base-8m --verify
+```
+
+```toml
+[indexing]
+fast_model = "potion-base-8M"
+```
+
+Then rebuild the index with that configuration. Each model is a distinct
+vector space with its own producer identity: an index built with one is refused
+by another, and an unrecognized `fast_model` is a configuration error rather
+than a fallback. Both apply the reference `model2vec` rule of dropping the
+WordPiece `[UNK]` token before pooling.
+
+Cold `fsfs search --no-daemon` on a 56-file corpus, release build, both tiers
+delivering REFINED, median of seven interleaved runs with distinct queries
+(2026-09-22, Threadripper PRO 5975WX):
+
+| Fast model | Cold search | Peak RSS |
+|---|---|---|
+| potion-multilingual-128M | 3.1 s | 1.41 GB |
+| potion-base-32M | 0.64 s | 0.41 GB |
+| potion-base-8M | 0.55 s | 0.31 GB |
+
+These are English models, and their retrieval quality relative to the
+multilingual default has not been measured. Library callers select one with
+`Model2VecEmbedder::load_registered(dir, &RegisteredModel2Vec::potion_base_8m()?)`.
+
 To build the full binary profile with Potion and MiniLM embedded, provision the
 revision-pinned inputs and select the feature explicitly:
 
