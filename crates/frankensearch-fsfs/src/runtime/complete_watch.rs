@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use super::complete_cli::{complete_cli_error, require_durable_publication};
 use super::{FsfsRuntime, retained_search_checkpoint, validate_retained_catalog_path};
 use crate::OutputFormat;
 use crate::config::{DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision};
-use crate::generation_store::{GenerationPublication, PublishedGeneration};
+use crate::generation_store::{CompleteGenerationStore, GenerationPublication, PublishedGeneration};
 use crate::mount_info::{MountTable, read_system_mounts};
 use crate::watcher::DEFAULT_DEBOUNCE_MS;
 
@@ -29,8 +29,9 @@ const DEBOUNCE: Duration = Duration::from_millis(DEFAULT_DEBOUNCE_MS);
 const MAX_DEBOUNCE: Duration = Duration::from_secs(5);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_POLL: Duration = Duration::from_millis(50);
-// A continuously changing corpus must not allocate abandoned bundles forever.
+// Pause candidate allocation under sustained churn, not the watch registration.
 const MAX_UNSTABLE_BUILDS: usize = 3;
+const SETTLE_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_HINT_PATHS: usize = 128;
 const MAX_HINT_PATH_BYTES: usize = 4096;
 
@@ -52,6 +53,16 @@ struct Changes {
 }
 
 impl Changes {
+    fn check_backend(&self) -> SearchResult<()> {
+        if let Some(failure) = &self.failure {
+            return Err(SearchError::SubsystemError {
+                subsystem: "fsfs.complete_generation.watch",
+                source: Box::new(BackendFailure(Arc::clone(failure))),
+            });
+        }
+        Ok(())
+    }
+
     fn record(&mut self, now: Instant, force_rebuild: bool) {
         if let Some(window) = &mut self.dirty {
             window.last = now;
@@ -74,6 +85,7 @@ impl Changes {
             return;
         }
         if !path.is_absolute()
+            || path.components().any(|part| matches!(part, Component::ParentDir))
             || path.as_os_str().len() > MAX_HINT_PATH_BYTES
             || (!window.paths.contains(path) && window.paths.len() == MAX_HINT_PATHS)
         {
@@ -156,14 +168,7 @@ fn lock_changes(changes: &Mutex<Changes>) -> SearchResult<MutexGuard<'_, Changes
 }
 
 fn check_backend(changes: &Mutex<Changes>) -> SearchResult<()> {
-    let failure = lock_changes(changes)?.failure.clone();
-    if let Some(failure) = failure {
-        return Err(SearchError::SubsystemError {
-            subsystem: "fsfs.complete_generation.watch",
-            source: Box::new(BackendFailure(failure)),
-        });
-    }
-    Ok(())
+    lock_changes(changes)?.check_backend()
 }
 
 fn record_notification(changes: &Mutex<Changes>, result: notify::Result<Event>, now: Instant) {
@@ -364,8 +369,33 @@ fn touches_observed_files(
     hint.force_rebuild
         || hint.paths.iter().any(|path| {
             current.stamps.contains_key(path)
-                || previous.is_some_and(|observation| observation.stamps.contains_key(path))
+                || current.directories.contains_key(path)
+                || previous.is_some_and(|observation| {
+                    observation.stamps.contains_key(path)
+                        || observation.directories.contains_key(path)
+                })
         })
+}
+
+/// The source baseline belongs to one publication, not just a store path.
+/// Reading only the bounded descriptor here avoids rehashing every sealed
+/// artifact on an idle poll. The store's ordinary admission still verifies it.
+fn check_watch_publication(
+    cx: &Cx,
+    root: &Path,
+    expected: Option<&PublishedGeneration>,
+) -> SearchResult<()> {
+    retained_search_checkpoint(cx)?;
+    if let Some(expected) = expected {
+        let store = CompleteGenerationStore::open(cx, root)?;
+        if !store.is_selected(cx, expected)? {
+            return Err(complete_cli_error(
+                "watch_selection_changed",
+                "selection changed outside this watch session; refusing to reuse its source baseline or overwrite another publisher's generation",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A read-only preflight: do not create a staging tree inside the source even
@@ -394,6 +424,13 @@ fn resolve_watch_store(source: &Path, root: &Path) -> SearchResult<PathBuf> {
     Ok(root)
 }
 
+/// Quiet-source observations are not published baselines. They only authorize
+/// a fresh catch-up attempt through the ordinary builder and its precommit.
+struct SettleWindow {
+    next_probe: Instant,
+    observation: Option<SourceObservation>,
+}
+
 struct CompleteWatchSession {
     runtime: FsfsRuntime,
     store_root: PathBuf,
@@ -403,6 +440,8 @@ struct CompleteWatchSession {
     // query/publication. The callback owns only coalescing state, not a writer.
     _watcher: RecommendedWatcher,
     baseline: Option<SourceObservation>,
+    publication: Option<PublishedGeneration>,
+    settling: Option<SettleWindow>,
     last_reconcile: Instant,
     unstable_builds: usize,
 }
@@ -447,9 +486,114 @@ impl CompleteWatchSession {
             changes,
             _watcher: watcher,
             baseline: None,
+            publication: None,
+            settling: None,
             last_reconcile: Instant::now(),
             unstable_builds: 0,
         })
+    }
+
+    fn record_unstable_source(&mut self, now: Instant) -> SearchResult<()> {
+        self.unstable_builds += 1;
+        if self.unstable_builds >= MAX_UNSTABLE_BUILDS {
+            self.settling = Some(SettleWindow {
+                next_probe: now + SETTLE_INTERVAL,
+                observation: None,
+            });
+            tracing::warn!(
+                reason_code = "watch.source_settling",
+                attempts = self.unstable_builds,
+                "paused candidate allocation until two quiet source observations agree"
+            );
+        } else {
+            // The catch-up obligation survives even without another event.
+            // Hints received during the failed attempt are never erased.
+            let mut changes = lock_changes(&self.changes)?;
+            changes.record(now, true);
+            if let Some(window) = &mut changes.dirty {
+                window.first = now;
+                window.paths.clear();
+            }
+        }
+        Ok(())
+    }
+
+    fn probe_settling_source(&mut self, cx: &Cx, now: Instant) -> SearchResult<()> {
+        self.probe_settling_source_with_entry_check(cx, now, |_| Ok(()))
+    }
+
+    fn probe_settling_source_with_entry_check<F>(
+        &mut self,
+        cx: &Cx,
+        now: Instant,
+        before_entry: F,
+    ) -> SearchResult<()>
+    where
+        F: FnMut(&Path) -> SearchResult<()>,
+    {
+        retained_search_checkpoint(cx)?;
+        let Some(gate) = self.settling.as_ref() else {
+            return Ok(());
+        };
+        if now < gate.next_probe {
+            return Ok(());
+        }
+        // Consume BEFORE observing. Events delivered during the scan remain
+        // pending and veto recovery, including edits with identical metadata.
+        let pending = {
+            let mut changes = lock_changes(&self.changes)?;
+            changes.check_backend()?;
+            changes.dirty.take()
+        };
+        let observed = match self.source.observe_with_entry_check(
+            cx,
+            &self.runtime.config.discovery,
+            before_entry,
+        ) {
+            Ok(observed) => observed,
+            Err(error) if is_source_changed(&error) => {
+                self.settling = Some(SettleWindow {
+                    next_probe: now.max(Instant::now()) + SETTLE_INTERVAL,
+                    observation: None,
+                });
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        check_watch_publication(cx, &self.store_root, self.publication.as_ref())?;
+        let previous = self.settling.as_ref().and_then(|gate| gate.observation.as_ref());
+        let touched = {
+            let changes = lock_changes(&self.changes)?;
+            // Check backend failure at the same boundary as hints, not only
+            // before traversal. A failed backend cannot certify a quiet source.
+            changes.check_backend()?;
+            pending.as_ref().is_some_and(|hint| {
+                touches_observed_files(hint, &observed, previous)
+            }) || changes.dirty.as_ref().is_some_and(|hint| {
+                touches_observed_files(hint, &observed, previous)
+            })
+        };
+        let completed = now.max(Instant::now());
+        if !touched && previous == Some(&observed) {
+            // Even a source equal to the old baseline needs this catch-up:
+            // metadata equality cannot cancel an earlier content-change hint.
+            self.settling = None;
+            self.unstable_builds = 0;
+            lock_changes(&self.changes)?.record(completed, true);
+            tracing::info!(
+                reason_code = "watch.source_settled",
+                "source observations agree; queued retained-generation catch-up"
+            );
+        } else {
+            self.settling = Some(SettleWindow {
+                next_probe: completed + SETTLE_INTERVAL,
+                // A hint-contaminated scan must not count as the first of the
+                // two quiet observations. No candidate is allocated here.
+                observation: (!touched).then_some(observed),
+            });
+        }
+        self.last_reconcile = completed;
+        Ok(())
     }
 
     #[allow(clippy::future_not_send)]
@@ -472,6 +616,8 @@ impl CompleteWatchSession {
         let discovery = &self.runtime.config.discovery;
         let changes = &self.changes;
         let expected = &observed;
+        let selected = self.publication.as_ref();
+        let store_root = &self.store_root;
         let publication = self
             .runtime
             .rebuild_retained_generation_with_precommit(cx, &self.store_root, move |cx| {
@@ -480,10 +626,14 @@ impl CompleteWatchSession {
                 if &current != expected {
                     return Err(source_changed());
                 }
+                // A different publisher can win between the last poll and
+                // this build's begin(). Its receipt cannot retarget our baseline.
+                check_watch_publication(cx, store_root, selected)?;
                 // On a coarse-timestamp filesystem even ctime can match. A
                 // queued in-scope content hint is still evidence of a raced
                 // build, and must not be acknowledged by this publication.
                 let changes = lock_changes(changes)?;
+                changes.check_backend()?;
                 if changes
                     .dirty
                     .as_ref()
@@ -507,6 +657,11 @@ impl CompleteWatchSession {
         retained_search_checkpoint(cx)?;
         check_backend(&self.changes)?;
         self.source.check()?;
+        check_watch_publication(cx, &self.store_root, self.publication.as_ref())?;
+        if self.settling.is_some() {
+            self.probe_settling_source(cx, now)?;
+            return Ok(None);
+        }
         let initial = self.baseline.is_none() && self.unstable_builds == 0;
         let periodic = now.saturating_duration_since(self.last_reconcile) >= RECONCILE_INTERVAL;
         let pending = {
@@ -525,6 +680,12 @@ impl CompleteWatchSession {
         match self.attempt(cx, force_rebuild, pending.as_ref()).await {
             Ok(Some((observation, publication))) => {
                 self.baseline = Some(observation);
+                self.publication = Some(match &publication {
+                    GenerationPublication::Durable(generation)
+                    | GenerationPublication::VisibleButDurabilityUncertain { generation, .. } => {
+                        generation.clone()
+                    }
+                });
                 self.unstable_builds = 0;
                 Ok(Some(publication))
             }
@@ -533,23 +694,7 @@ impl CompleteWatchSession {
                 Ok(None)
             }
             Err(error) if is_source_changed(&error) => {
-                self.unstable_builds += 1;
-                if self.unstable_builds >= MAX_UNSTABLE_BUILDS {
-                    return Err(complete_cli_error(
-                        "watch_source_unstable",
-                        "source changed during three consecutive attempts; predecessor and abandoned bundles were retained; restart after the source settles",
-                    ));
-                }
-                // Retry a raced scan/build after a fresh quiet window. Never
-                // erase hints that arrived while this attempt was suspended.
-                let retry_at = Instant::now();
-                let mut changes = lock_changes(&self.changes)?;
-                changes.record(retry_at, true);
-                if let Some(window) = &mut changes.dirty {
-                    window.first = retry_at;
-                    window.paths.clear();
-                }
-                drop(changes);
+                self.record_unstable_source(Instant::now())?;
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -568,16 +713,21 @@ impl FsfsRuntime {
     /// must be disjoint; an incomplete scan is never an authoritative deletion.
     ///
     /// Existing retained readers remain usable throughout this future. This is
-    /// a full-rebuild route, not incremental embedding or legacy-watch migration.
+    /// a replacement-build route using eligible checkpoint-proven embedding
+    /// reuse, not delta-only discovery or legacy-watch migration.
     /// The sink runs only after durable publication; its error cannot roll that
     /// publication back. Visibility with uncertain durability returns an explicit
     /// error and stops instead of emitting a false durable receipt.
     ///
     /// # Errors
     /// Returns admission, discovery, backend, output, cancellation or publication
-    /// errors. Three consecutive unstable-source attempts stop boundedly without
-    /// deleting their staged bundles. Dropping the future drops its owned native
-    /// watch registration; no independent indexing task or runtime is spawned.
+    /// errors. Three consecutive source races pause candidate allocation. Two
+    /// quiet observations five seconds apart queue catch-up without requiring a
+    /// new notification. Paused probes neither allocate nor delete generations.
+    /// External publication changes stop this session rather than silently
+    /// associating its source baseline with someone else's selected bundle.
+    /// Dropping the future drops its owned native watch registration; no
+    /// independent indexing task or runtime is spawned.
     #[allow(clippy::future_not_send)]
     pub async fn watch_retained_generations<F>(
         &self,
@@ -747,6 +897,7 @@ mod tests {
     fn complete_watch_relative_or_oversized_hint_cannot_be_silently_missed() {
         for path in [
             PathBuf::from("relative.md"),
+            PathBuf::from("/source/nested/../alpha.md"),
             PathBuf::from(format!("/{}", "x".repeat(MAX_HINT_PATH_BYTES))),
         ] {
             let mut changes = Changes::default();
@@ -793,6 +944,31 @@ mod tests {
         fs::rename(&path, directory.path().join("old-source")).unwrap();
         fs::create_dir(&path).unwrap();
         assert!(source.check().is_err());
+    }
+
+    #[test]
+    fn complete_watch_directory_hint_covers_current_and_renamed_subtrees_not_siblings() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let source = SourceRoot::open(fs::canonicalize(directory.path()).unwrap()).unwrap();
+            let nested = source.path.join("nested");
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("alpha.md"), "sharedtoken directory fixture").unwrap();
+            let before = source.observe(&cx, &DiscoveryConfig::default()).unwrap();
+            let mut changes = Changes::default();
+            changes.record(Instant::now(), false);
+            changes.record_path(&nested);
+            let hint = changes.dirty.as_ref().unwrap();
+            assert!(touches_observed_files(hint, &before, None));
+            fs::rename(&nested, source.path.join("renamed")).unwrap();
+            let after = source.observe(&cx, &DiscoveryConfig::default()).unwrap();
+            assert!(touches_observed_files(hint, &after, Some(&before)));
+            assert!(!touches_observed_files(hint, &after, None));
+            let mut sibling = Changes::default();
+            sibling.record(Instant::now(), false);
+            sibling.record_path(&source.path.join("nested-sibling"));
+            assert!(!touches_observed_files(sibling.dirty.as_ref().unwrap(), &after, Some(&before)));
+        });
     }
 
     #[test]
@@ -997,6 +1173,301 @@ mod lifecycle_tests {
             }
         }
         panic!("no publication after bounded settling attempts") // ubs:ignore — cfg(test) bounded wait must fail when publication never occurs.
+    }
+
+    fn controlled_notifications(session: &mut CompleteWatchSession) {
+        let CompleteWatchSession {
+            _watcher: watcher,
+            source,
+            ..
+        } = &mut *session;
+        watcher.unwatch(&source.path).unwrap();
+        // The old callback retains its old state until it is dropped. Tests
+        // inject hints into the same owning-lane state without backend timing.
+        session.changes = Arc::new(Mutex::new(Changes::default()));
+    }
+
+    fn pause_after_races(session: &mut CompleteWatchSession, now: Instant) {
+        for attempt in 1..=MAX_UNSTABLE_BUILDS {
+            session.record_unstable_source(now).unwrap();
+            assert_eq!(session.settling.is_some(), attempt == MAX_UNSTABLE_BUILDS);
+        }
+    }
+
+    fn candidate_count(root: &Path) -> usize {
+        fs::read_dir(root.join("generations")).unwrap().count()
+    }
+
+    #[test]
+    fn complete_watch_hot_source_pauses_allocations_then_catches_up_without_an_event() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let before = publish_tick(&mut session, &cx).await;
+            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let allocated = candidate_count(&root);
+            pause_after_races(&mut session, Instant::now());
+
+            for revision in 0..5 {
+                let now = session.settling.as_ref().unwrap().next_probe;
+                let changed = session.source.path.join("beta.md");
+                fs::write(&changed, format!("sharedtoken beta revision {revision}")).unwrap();
+                {
+                    let mut changes = lock_changes(&session.changes).unwrap();
+                    changes.record(now, false);
+                    changes.record_path(&changed);
+                }
+                assert!(session.advance(&cx, now).await.unwrap().is_none());
+                assert!(session.settling.as_ref().unwrap().observation.is_none());
+                assert_eq!(candidate_count(&root), allocated);
+                assert_eq!(
+                    CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(),
+                    Some(before.clone())
+                );
+            }
+            // No event after the source settles. The paused state itself owes
+            // a catch-up publication, and still uses the real retained builder.
+            let now = session.settling.as_ref().unwrap().next_probe;
+            assert!(session.advance(&cx, now).await.unwrap().is_none());
+            assert!(session.settling.as_ref().unwrap().observation.is_some());
+            let now = session.settling.as_ref().unwrap().next_probe;
+            assert!(session.advance(&cx, now).await.unwrap().is_none());
+            assert!(session.settling.is_none());
+            assert_eq!(candidate_count(&root), allocated);
+            let due = session.last_reconcile + DEBOUNCE;
+            let publication = session.advance(&cx, due).await.unwrap().unwrap();
+            let current = require_durable_publication(publication).unwrap();
+            assert_ne!(before, current);
+            let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert_eq!(reader.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 2);
+            assert_eq!(pinned.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 1);
+            assert_eq!(pinned.generation(), &before);
+        });
+    }
+
+    #[test]
+    fn complete_watch_quiet_recovery_forces_catch_up_even_when_baseline_matches() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let before = publish_tick(&mut session, &cx).await;
+            pause_after_races(&mut session, Instant::now());
+            // First probe consumes the outstanding forced retry. It cannot be
+            // used as one of the subsequent two quiet observations.
+            for step in 0..3 {
+                let now = session.settling.as_ref().unwrap().next_probe;
+                assert!(session.advance(&cx, now).await.unwrap().is_none());
+                assert_eq!(session.settling.is_none(), step == 2);
+            }
+            assert_eq!(
+                session.baseline.as_ref(),
+                Some(&session.source.observe(&cx, &runtime.config.discovery).unwrap())
+            );
+            assert!(lock_changes(&session.changes).unwrap().dirty.as_ref().unwrap().force_rebuild);
+            let due = session.last_reconcile + DEBOUNCE;
+            let next = require_durable_publication(session.advance(&cx, due).await.unwrap().unwrap()).unwrap();
+            assert_ne!(next, before, "metadata equality must not erase the catch-up obligation");
+        });
+    }
+
+    #[test]
+    fn complete_watch_initial_settling_observations_do_not_create_a_store() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            pause_after_races(&mut session, Instant::now());
+            for step in 0..3 {
+                let now = session.settling.as_ref().unwrap().next_probe;
+                assert!(session.advance(&cx, now).await.unwrap().is_none());
+                assert!(!root.exists(), "a quiet probe cannot allocate a candidate");
+                assert_eq!(session.settling.is_none(), step == 2);
+            }
+            let due = session.last_reconcile + DEBOUNCE;
+            let first = session.advance(&cx, due).await.unwrap().unwrap();
+            assert!(require_durable_publication(first).unwrap().path().is_dir());
+        });
+    }
+
+    #[test]
+    fn complete_watch_hint_during_settling_probe_vetoes_quiet_proof_without_losing_hint() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let now = Instant::now();
+            session.settling = Some(SettleWindow {
+                next_probe: now,
+                observation: Some(session.source.observe(&cx, &runtime.config.discovery).unwrap()),
+            });
+            let changes = Arc::clone(&session.changes);
+            session.probe_settling_source_with_entry_check(&cx, now, |path| {
+                let mut changes = lock_changes(&changes)?;
+                changes.record(now, false);
+                changes.record_path(path);
+                Ok(())
+            }).unwrap();
+            assert!(session.settling.as_ref().unwrap().observation.is_none());
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_some());
+            assert!(!root.exists());
+        });
+    }
+
+    #[test]
+    fn complete_watch_backend_failure_during_settling_probe_cannot_queue_a_build() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let now = Instant::now();
+            session.settling = Some(SettleWindow {
+                next_probe: now,
+                observation: Some(session.source.observe(&cx, &runtime.config.discovery).unwrap()),
+            });
+            let changes = Arc::clone(&session.changes);
+            let error = session.probe_settling_source_with_entry_check(&cx, now, |_| {
+                record_notification(&changes, Err(notify::Error::generic("probe backend failed")), now);
+                Ok(())
+            }).unwrap_err();
+            assert!(error.to_string().contains("probe backend failed"));
+            assert!(session.settling.is_some());
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_none());
+            assert!(!root.exists());
+        });
+    }
+
+    #[test]
+    fn complete_watch_cancelled_settling_preserves_selection_without_allocation() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let before = publish_tick(&mut session, &cx).await;
+            let allocated = candidate_count(&root);
+            pause_after_races(&mut session, Instant::now());
+            cx.set_cancel_requested(true);
+            let due = session.settling.as_ref().unwrap().next_probe;
+            let error = session.advance(&cx, due).await.unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert!(session.settling.is_some());
+            assert_eq!(candidate_count(&root), allocated);
+            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(before));
+        });
+    }
+
+    #[test]
+    fn complete_watch_external_publication_cannot_retarget_an_idle_source_baseline() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let first = publish_tick(&mut session, &cx).await;
+            let outside = require_durable_publication(
+                runtime.rebuild_retained_generation(&cx, &root).await.unwrap(),
+            ).unwrap();
+            let count = candidate_count(&root);
+            let error = session.advance(&cx, Instant::now()).await.unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "complete_generation.watch_selection_changed"));
+            assert_eq!(candidate_count(&root), count);
+            assert_eq!(session.publication.as_ref(), Some(&first));
+            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(outside));
+        });
+    }
+
+    #[test]
+    fn complete_watch_candidate_refuses_a_publication_won_since_its_last_poll() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let first = publish_tick(&mut session, &cx).await;
+            let outside = require_durable_publication(
+                runtime.rebuild_retained_generation(&cx, &root).await.unwrap(),
+            ).unwrap();
+            let before = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            // Call the actual attempt after the external publication, as when
+            // a writer wins after advance's check but before store.begin().
+            let error = session.attempt(&cx, true, None).await.unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "complete_generation.watch_selection_changed"));
+            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), before);
+            assert_eq!(session.publication.as_ref(), Some(&first));
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            assert_eq!(store.active(&cx).unwrap(), Some(outside));
+            drop(store.begin(&cx).unwrap());
+        });
+    }
+
+    #[test]
+    fn complete_watch_missing_selection_while_settling_is_not_recreated() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let first = publish_tick(&mut session, &cx).await;
+            pause_after_races(&mut session, Instant::now());
+            let pointer = root.join(COMPLETE_GENERATION_POINTER);
+            let preserved = root.join("test-preserved-selection");
+            fs::rename(&pointer, &preserved).unwrap();
+            let count = candidate_count(&root);
+            let due = session.settling.as_ref().unwrap().next_probe;
+            assert!(session.advance(&cx, due).await.is_err());
+            assert!(!pointer.exists());
+            assert!(preserved.is_file());
+            assert_eq!(session.publication.as_ref(), Some(&first));
+            assert_eq!(candidate_count(&root), count);
+        });
+    }
+
+    #[test]
+    fn complete_watch_selection_change_during_quiet_probe_cannot_queue_catch_up() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let first = publish_tick(&mut session, &cx).await;
+            let pointer = root.join(COMPLETE_GENERATION_POINTER);
+            let first_pointer = fs::read(&pointer).unwrap();
+            let outside = require_durable_publication(
+                runtime.rebuild_retained_generation(&cx, &root).await.unwrap(),
+            ).unwrap();
+            let outside_pointer = fs::read(&pointer).unwrap();
+            // Both descriptors select real, admitted bundles. Replay them at
+            // a deterministic point inside the production discovery traversal.
+            let staged = root.join("test-selection-switch");
+            fs::write(&staged, first_pointer).unwrap();
+            fs::rename(&staged, &pointer).unwrap();
+            let now = Instant::now();
+            session.settling = Some(SettleWindow {
+                next_probe: now,
+                observation: Some(session.source.observe(&cx, &runtime.config.discovery).unwrap()),
+            });
+            let error = session.probe_settling_source_with_entry_check(&cx, now, |_| {
+                fs::write(&staged, &outside_pointer)?;
+                fs::rename(&staged, &pointer)?;
+                Ok(())
+            }).unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "complete_generation.watch_selection_changed"));
+            assert!(session.settling.is_some());
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_none());
+            assert_eq!(session.publication.as_ref(), Some(&first));
+            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(outside));
+        });
     }
 
     #[test]

@@ -374,6 +374,8 @@ pub struct HnswParams {
     ///
     /// Layer 0 holds every point and carries the final hop of every query,
     /// so it is conventionally given twice the degree of upper layers.
+    /// Must be at least two. Up to two slots preserve links to consecutive
+    /// physical rows, keeping reciprocal pruning connected even for equal vectors.
     pub m0: usize,
     /// Beam width during construction.
     pub ef_construction: usize,
@@ -1667,8 +1669,12 @@ impl HnswParams {
         if self.m == 0 {
             return Err(invalid("m", self.m, "must be >= 1"));
         }
-        if self.m0 == 0 {
-            return Err(invalid("m0", self.m0, "must be >= 1"));
+        if self.m0 < 2 {
+            return Err(invalid(
+                "m0",
+                self.m0,
+                "must be >= 2 to preserve connected layer-zero routing",
+            ));
         }
         if self.ef_construction == 0 {
             return Err(invalid(
@@ -2731,8 +2737,30 @@ impl NativeHnsw {
                     store,
                     visited,
                 )?;
-                let selected =
+                let mut selected =
                     Self::select_neighbours(id, &candidates, self.params.degree_at(layer), store)?;
+
+                // A reciprocal degree-bounded graph needs a spanning path
+                // that pruning cannot remove. Equal vectors otherwise make
+                // every neighbor evict the same older row when the newest
+                // row arrives, disconnecting valid data. Spend an existing
+                // layer-zero slot on the physical predecessor; no additional
+                // edges or vector storage are allocated beyond the budget.
+                if layer == 0 {
+                    let predecessor = id - 1; // The first row returned above.
+                    if !selected.contains(&predecessor) {
+                        if selected.len() == self.params.m0
+                            && let Some(farthest) = candidates
+                                .iter()
+                                .rev()
+                                .find(|candidate| selected.contains(&candidate.id))
+                                .map(|candidate| candidate.id)
+                        {
+                            selected.retain(|&neighbor| neighbor != farthest);
+                        }
+                        selected.push(predecessor);
+                    }
+                }
 
                 self.link(id, &selected, layer, store, &mut journal)?;
 
@@ -2989,9 +3017,9 @@ impl NativeHnsw {
             }
 
             // The reverse edge may have pushed the neighbour over budget.
-            // `id` is protected: pruning the edge that was just created
-            // would orphan the new point, since nothing else links to it
-            // yet. Measured before this guard: 33 of 5000 points reachable.
+            // Retain the newly inserted edge wherever the budget allows,
+            // alongside layer zero's permanent spanning path. A degree-two
+            // base layer has room only for that path.
             self.prune(neighbour, layer, Some(id), store, journal)?;
         }
         Ok(())
@@ -3020,27 +3048,36 @@ impl NativeHnsw {
         }
         scored.sort_unstable();
         let mut kept = Self::select_neighbours(id, &scored, budget, store)?;
-        // Reinstate the protected edge if the heuristic dropped it, evicting
-        // the farthest kept neighbour to stay inside the budget.
+        // Reinstate routing edges if the heuristic dropped them, evicting
+        // the farthest unprotected neighbour to stay inside the budget.
+        // Consecutive physical rows form a permanent layer-zero path. Both
+        // incident path edges must survive, including one restored earlier
+        // in this loop. With a third slot available, preserve the incoming
+        // geometric edge too, as the original builder did. A new outlier
+        // should retain its chosen neighbors, not only an arbitrary path link.
         //
         // The eviction must find the genuinely farthest entry rather than
         // popping the last one: `select_neighbours` appends its top-up fill
         // after the heuristic's picks, so the list is not in distance order
         // and popping would usually evict a NEAR neighbour. `scored` is
-        // sorted ascending, so the last kept entry it mentions is the
-        // farthest.
-        if let Some(protected) = protected
-            && !kept.contains(&protected)
-        {
-            if let Some(farthest) = scored
-                .iter()
-                .rev()
-                .find(|candidate| kept.contains(&candidate.id))
-                .map(|candidate| candidate.id)
-            {
-                kept.retain(|&neighbour| neighbour != farthest);
+        // sorted ascending, so the last unprotected kept entry it mentions
+        // is the farthest eligible eviction.
+        let is_protected = |neighbour: u32| {
+            (layer == 0 && id.abs_diff(neighbour) == 1)
+                || ((layer > 0 || budget >= 3) && protected == Some(neighbour))
+        };
+        for candidate in &scored {
+            if is_protected(candidate.id) && !kept.contains(&candidate.id) {
+                if let Some(farthest) = scored
+                    .iter()
+                    .rev()
+                    .find(|candidate| kept.contains(&candidate.id) && !is_protected(candidate.id))
+                    .map(|candidate| candidate.id)
+                {
+                    kept.retain(|&neighbour| neighbour != farthest);
+                }
+                kept.push(candidate.id);
             }
-            kept.push(protected);
         }
 
         // Dropping an edge must drop BOTH directions. Trimming only this
@@ -3879,14 +3916,10 @@ mod tests {
         /// reproduces from the test name alone while the data still behaves
         /// like real embeddings.
         ///
-        /// ★ Do NOT replace this with a closed-form lattice such as
-        /// `(i * 31 + d * 17) % 101`. That looks like a reasonable
-        /// deterministic corpus and is a trap: the modular structure makes
-        /// vast numbers of points equidistant, which both depresses measured
-        /// recall (ties make "the" exact top-k arbitrary) and genuinely
-        /// fragments the graph — it measured 0.64 recall and 33-of-5000
-        /// reachability on data that is pathological rather than
-        /// representative. The same build scores recall 1.0 here.
+        /// Keep this recall corpus varied: a modular lattice produces many
+        /// equal distances, making a narrow beam's tied top-k ambiguous.
+        /// Separate repeated-vector and lattice fixtures below enforce
+        /// connectivity and exact full-width retrieval for those valid inputs.
         fn synthetic(count: usize, dim: usize) -> Self {
             let vectors = (0..count)
                 .map(|i| {
@@ -6922,6 +6955,65 @@ mod tests {
     }
 
     #[test]
+    fn repeated_vectors_remain_connected_beyond_the_layer_zero_budget() {
+        let config = HnswParams::default();
+        let count = config.m0 + 2;
+        let store = TestStore::new(vec![vec![1.0, 0.0]; count]);
+        let graph = NativeHnsw::build(config, 42, &store).expect("build repeated vectors");
+        graph
+            .verify()
+            .expect("equal embeddings must not disconnect a previously inserted row");
+        let actual: Vec<_> = graph
+            .search(&[1.0, 0.0], count, Some(count), &store)
+            .expect("full-width repeated-vector search")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(actual, store.exact_top_k(&[1.0, 0.0], count));
+    }
+
+    #[test]
+    fn tied_vectors_keep_every_insert_reachable_with_small_degree_and_beam_budgets() {
+        let count = 65usize;
+        let store = TestStore::new(
+            (0..count)
+                .map(|row| {
+                    (0..8)
+                        .map(|axis| ((row * 7 + axis * 5) % 17) as f32)
+                        .collect()
+                })
+                .collect(),
+        );
+        for m0 in [2, 3, 16] {
+            let config = HnswParams {
+                m: 2,
+                m0,
+                ef_construction: 1,
+                ef_search: 1,
+            };
+            let mut graph = NativeHnsw::new(config, 17).expect("bounded-degree graph");
+            for row in 0..u32::try_from(count).unwrap() {
+                graph.insert(row, &store).expect("insert tied vector");
+                graph.verify().unwrap_or_else(|error| {
+                    panic!(
+                        "row {row}, m0={m0}: insertion lost connectivity or degree bound: {error}"
+                    )
+                });
+            }
+            for seed in 0..4 {
+                let query = TestStore::query(seed, 8);
+                let actual: Vec<_> = graph
+                    .search(&query, 7, Some(count), &store)
+                    .expect("full-width tied-vector search")
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                assert_eq!(actual, store.exact_top_k(&query, 7));
+            }
+        }
+    }
+
+    #[test]
     fn empty_graph_and_zero_k_are_benign() {
         let store = TestStore::synthetic(0, 4);
         let graph = NativeHnsw::build(params(), 1, &store).expect("build empty");
@@ -7040,6 +7132,7 @@ mod tests {
         for (m, m0, efc, efs) in [
             (0, 16, 64, 64),
             (8, 0, 64, 64),
+            (8, 1, 64, 64),
             (8, 16, 0, 64),
             (8, 16, 64, 0),
         ] {
