@@ -427,6 +427,46 @@ fn seed_candidate(
     Ok(eligible)
 }
 
+/// Charge entries while enumerating, including siblings awaiting recursion.
+/// Collecting an unbounded directory before checking this budget would defeat
+/// both the memory bound and cooperative cancellation. The iterator may read
+/// one over-budget entry to distinguish an exact fit from overflow, but that
+/// entry is never retained and no subsequent entry is requested.
+fn collect_copy_entries<T, I>(
+    cx: &Cx,
+    mut source: I,
+    stats: &mut CopyStats,
+) -> SearchResult<Vec<T>>
+where
+    I: Iterator<Item = std::io::Result<T>>,
+{
+    let mut entries = Vec::new();
+    loop {
+        retained_search_checkpoint(cx)?;
+        let next = source.next();
+        // EOF and an iterator that returns data after cancellation are not
+        // permission to return a successfully admitted inventory.
+        retained_search_checkpoint(cx)?;
+        let Some(entry) = next else { break };
+        let entry = entry?;
+        let charged = stats
+            .entries
+            .checked_add(1)
+            .filter(|&count| count <= MAX_COPY_ENTRIES)
+            .ok_or_else(|| reuse_error("predecessor copy exceeds its entry limit"))?;
+        if entries.len() == entries.capacity() {
+            let remaining = MAX_COPY_ENTRIES - stats.entries;
+            let growth = entries.capacity().max(16).min(remaining);
+            entries
+                .try_reserve_exact(growth)
+                .map_err(|_| reuse_error("cannot reserve bounded predecessor inventory"))?;
+        }
+        stats.entries = charged;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
 fn copy_tree(
     cx: &Cx,
     source: &Path,
@@ -440,14 +480,10 @@ fn copy_tree(
             "invalid or excessively deep predecessor directory",
         ));
     }
-    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+    let mut entries = collect_copy_entries(cx, fs::read_dir(source)?, stats)?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         retained_search_checkpoint(cx)?;
-        stats.entries += 1;
-        if stats.entries > MAX_COPY_ENTRIES {
-            return Err(reuse_error("predecessor copy exceeds its entry limit"));
-        }
         let name = entry.file_name();
         let file_type = entry.file_type()?;
         if !file_type.is_dir() && !file_type.is_file() {
@@ -539,6 +575,211 @@ mod copy_tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
     use std::os::unix::fs::MetadataExt;
+
+    fn inventory_fixture(
+        parent: &Path,
+        names: &[&str],
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let source = parent.join("source");
+        let destination = parent.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        for name in names {
+            let path = source.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, name.as_bytes()).unwrap();
+        }
+        (source, destination)
+    }
+
+    fn assert_entry_limit(result: SearchResult<()>) {
+        assert!(
+            matches!(result, Err(SearchError::InvalidConfig { field, reason, .. })
+                if field == "complete_generation.reuse" && reason.contains("entry limit"))
+        );
+    }
+
+    #[test]
+    fn copy_inventory_accepts_exact_budget_without_double_charging() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (source, destination) = inventory_fixture(parent.path(), &["b", "a"]);
+            let mut stats = CopyStats {
+                entries: MAX_COPY_ENTRIES - 2,
+                ..CopyStats::default()
+            };
+            copy_tree(&cx, &source, &destination, 0, &mut stats).unwrap();
+            assert_eq!(stats.entries, MAX_COPY_ENTRIES);
+            assert_eq!(stats.files, 2);
+            assert_eq!(stats.bytes, 2);
+            for name in ["a", "b"] {
+                assert_eq!(fs::read(destination.join(name)).unwrap(), name.as_bytes());
+                assert_eq!(fs::read(source.join(name)).unwrap(), name.as_bytes());
+            }
+            // An empty directory remains legal when the global budget is full.
+            let empty = parent.path().join("empty");
+            fs::create_dir(&empty).unwrap();
+            assert!(
+                collect_copy_entries(&cx, fs::read_dir(empty).unwrap(), &mut stats)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn copy_inventory_rejects_oversized_directory_before_creating_files() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (source, destination) = inventory_fixture(parent.path(), &["a", "b", "c"]);
+            let mut stats = CopyStats {
+                entries: MAX_COPY_ENTRIES - 2,
+                ..CopyStats::default()
+            };
+            assert_entry_limit(copy_tree(&cx, &source, &destination, 0, &mut stats));
+            assert_eq!(stats.entries, MAX_COPY_ENTRIES);
+            assert_eq!(stats.files, 0);
+            assert_eq!(stats.bytes, 0);
+            assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+            for name in ["a", "b", "c"] {
+                assert_eq!(fs::read(source.join(name)).unwrap(), name.as_bytes());
+            }
+        });
+    }
+
+    #[test]
+    fn copy_inventory_charges_pending_siblings_before_recursing() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (source, destination) = inventory_fixture(parent.path(), &["a/data"]);
+            fs::create_dir(source.join("b")).unwrap();
+            let mut stats = CopyStats {
+                entries: MAX_COPY_ENTRIES - 2,
+                ..CopyStats::default()
+            };
+            assert_entry_limit(copy_tree(&cx, &source, &destination, 0, &mut stats));
+            // Both root directories have been charged before descending into
+            // a. The child cannot steal the pending sibling's inventory slot.
+            assert_eq!(stats.entries, MAX_COPY_ENTRIES);
+            assert_eq!(stats.files, 0);
+            assert_eq!(stats.bytes, 0);
+            assert!(destination.join("a").is_dir());
+            assert!(!destination.join("a/data").exists());
+            assert!(!destination.join("b").exists());
+            assert_eq!(fs::read(source.join("a/data")).unwrap(), b"a/data");
+        });
+    }
+
+    #[test]
+    fn copy_inventory_counts_excluded_generation_control_artifacts() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (source, destination) =
+                inventory_fixture(parent.path(), &[COMPLETE_GENERATION_MANIFEST, "data"]);
+            let mut stats = CopyStats {
+                entries: MAX_COPY_ENTRIES - 1,
+                ..CopyStats::default()
+            };
+            assert_entry_limit(copy_tree(&cx, &source, &destination, 0, &mut stats));
+            assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+            assert_eq!(stats.entries, MAX_COPY_ENTRIES);
+            assert_eq!(stats.files, 0);
+            assert!(source.join(COMPLETE_GENERATION_MANIFEST).is_file());
+        });
+    }
+
+    #[test]
+    fn copy_inventory_stops_unbounded_iterators_at_first_over_budget_entry() {
+        run_test_with_cx(|cx| async move {
+            let calls = std::cell::Cell::new(0_usize);
+            let source = std::iter::from_fn(|| {
+                calls.set(calls.get() + 1);
+                Some(Ok(calls.get()))
+            });
+            let mut stats = CopyStats {
+                entries: MAX_COPY_ENTRIES - 3,
+                ..CopyStats::default()
+            };
+            assert_entry_limit(collect_copy_entries(&cx, source, &mut stats).map(|_| ()));
+            assert_eq!(calls.get(), 4);
+            assert_eq!(stats.entries, MAX_COPY_ENTRIES);
+        });
+    }
+
+    #[test]
+    fn copy_inventory_observes_cancellation_before_data_after_data_and_at_eof() {
+        run_test_with_cx(|cx| async move {
+            let calls = std::cell::Cell::new(0_usize);
+            let source = std::iter::once_with(|| {
+                calls.set(calls.get() + 1);
+                Ok(7_u8)
+            });
+            cx.set_cancel_requested(true);
+            let result = collect_copy_entries(&cx, source, &mut CopyStats::default());
+            cx.set_cancel_requested(false);
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert_eq!(calls.get(), 0);
+
+            let mut stats = CopyStats::default();
+            let source = std::iter::once_with(|| {
+                cx.set_cancel_requested(true);
+                Ok(7_u8)
+            });
+            let result = collect_copy_entries(&cx, source, &mut stats);
+            cx.set_cancel_requested(false);
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert_eq!(stats.entries, 0);
+
+            let mut calls = 0;
+            let source = std::iter::from_fn(|| {
+                calls += 1;
+                if calls == 1 {
+                    Some(Ok(7_u8))
+                } else {
+                    cx.set_cancel_requested(true);
+                    None
+                }
+            });
+            let result = collect_copy_entries(&cx, source, &mut stats);
+            cx.set_cancel_requested(false);
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert_eq!(stats.entries, 1);
+            assert_eq!(calls, 2);
+        });
+    }
+
+    #[test]
+    fn copy_inventory_propagates_listing_errors_without_reading_further() {
+        run_test_with_cx(|cx| async move {
+            let mut source = [
+                Ok(1_u8),
+                Err(std::io::Error::from(ErrorKind::PermissionDenied)),
+                Ok(2),
+            ]
+            .into_iter();
+            let mut stats = CopyStats::default();
+            assert!(
+                matches!(collect_copy_entries(&cx, &mut source, &mut stats),
+                    Err(SearchError::Io(error)) if error.kind() == ErrorKind::PermissionDenied)
+            );
+            assert_eq!(stats.entries, 1);
+            assert_eq!(source.next().unwrap().unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn copy_inventory_counter_cannot_wrap_back_under_the_limit() {
+        run_test_with_cx(|cx| async move {
+            let mut stats = CopyStats {
+                entries: usize::MAX,
+                ..CopyStats::default()
+            };
+            assert_entry_limit(
+                collect_copy_entries(&cx, std::iter::once(Ok(1_u8)), &mut stats).map(|_| ()),
+            );
+            assert_eq!(stats.entries, usize::MAX);
+        });
+    }
 
     #[test]
     fn mutation_copy_refuses_legacy_lexical_migration_before_copying() {
