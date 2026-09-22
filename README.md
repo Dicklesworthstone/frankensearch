@@ -499,6 +499,7 @@ Common environment variables:
 | `FRANKENSEARCH_INDEX_DIR` | Override index/data directory | `~/.local/share/frankensearch` |
 | `FRANKENSEARCH_MODEL_DIR` | Override model location | `~/.cache/frankensearch/models` |
 | `FRANKENSEARCH_RERANK` | Re-score the refined head with the cross-encoder (same as `--rerank`); needs `fsfs download-models ms-marco-minilm-l-6-v2` once | `1` |
+| `FRANKENSEARCH_RERANK_TIMEOUT_MS` | Rerank-stage deadline (`search.rerank_timeout_ms`, default 300). The head is up to 30 documents, so abstract-length documents need about a second; at 300 ms the stage times out and the fused order stands | `1000` |
 | `FRANKENSEARCH_FAST_ONLY` | Disable quality work; follows CLI > environment > config precedence. `false` requires a profile that permits quality | `true` |
 | `FRANKENSEARCH_QUALITY_WEIGHT` | Blend quality vs fast tier | `0.7` |
 | `FRANKENSEARCH_RRF_K` | RRF constant | `60` |
@@ -711,6 +712,22 @@ The repository includes explicit quality harnesses and statistical checks:
 
 This keeps tuning decisions evidence-driven rather than anecdotal.
 
+Measured through the `fsfs` product (release build, `fsfs serve` modes) on BEIR
+SciFact, 5,183 abstracts and 300 held-out queries, default settings,
+2026-09-22 (`docs/quality_harness/fsfs_beir_product_eval.py`):
+
+| Stage | nDCG@10 | Recall@100 |
+|---|---|---|
+| Lexical only (Quill BM25) | 0.654 | 0.867 |
+| Initial (BM25 + potion-128M, RRF) | 0.588 | 0.910 |
+| Refined (+ MiniLM quality tier) | 0.688 | 0.952 |
+
+Refinement is a significant gain over both Initial and lexical-only search.
+Initial is significantly worse than BM25 alone on this corpus: the first
+results and `fast_only` search rank below plain lexical search here (tracked as
+`bd-zown6`; one corpus so far). The cross-encoder applied only once its
+deadline was raised, and then added +0.019 nDCG@10, which is not significant.
+
 ## Limits and Tradeoffs
 
 Being explicit about scope helps set expectations:
@@ -869,7 +886,7 @@ and are design budgets:
 | Index build, both vector tiers + Quill (1,000 docs, 659 KB) | ~17 s | receipt, 2026-09-03 (17.2 s wall: 15.8 s embedding both tiers, 1.3 s Quill; artifacts 536 KB fast, 792 KB quality, 74 MB lexical; 1.29 GB RSS at the end) |
 | `fsfs index` (1,000 files / 660 KB, both vector tiers + Quill + catalog) | ~14 s | product receipt, 2026-09-03 (14.1 s wall, 26.9 MB on disk) |
 | Daemon-served `fsfs search` (warm query daemon, one request per connection, INITIAL + REFINED) | ~13 ms | product receipt, 2026-09-03 (p50 12.7 ms, p95 13.9 ms, p99 14.8 ms over 50 queries, 0 cache hits; `:ready` round trip 1.1 ms). Before the adaptive accept poll landed the same run measured p50 50 ms: the daemon slept 50 ms between empty accept polls |
-| Daemon-served `fsfs search --rerank` (cross-encoder over the refined head) | ~250–400 ms | product receipt, 2026-09-03 (p50 412 ms over 20 queries, all applied, with the host at a 15-minute load of 63; an earlier run of the same lane at load 9 measured p50 233 ms, p95 320 ms: the int8 cross-encoder is CPU-bound and shares the box) |
+| Daemon-served `fsfs search --rerank` (cross-encoder over the refined head) | ~250–400 ms | product receipt, 2026-09-03 (p50 412 ms over 20 queries, all applied, with the host at a 15-minute load of 63; an earlier run of the same lane at load 9 measured p50 233 ms, p95 320 ms: the int8 cross-encoder is CPU-bound and shares the box). Those documents were short synthetic prose: on BEIR SciFact abstracts (2026-09-22, limit 10) the default 300 ms deadline expired on every query, and with `rerank_timeout_ms = 60000` a served request took p50 554 ms, p95 722 ms |
 | Watch mode: file written → ingested into both tiers (`fsfs index --watch`) | ~0.7 s | product receipt, 2026-09-03 (20 files written one at a time: event-to-applied p50 725 ms, p95 848 ms, max 886 ms = the 500 ms debounce plus p50 224 ms ingest; all 20 searchable from a fresh process after the watcher's graceful exit; host-pressure sampling pinned for the measurement, since a saturated host pauses the watcher by design) |
 | Cold process start (`fsfs search` without a running daemon, INITIAL + REFINED) | ~3.3–3.6 s | product receipt, 2026-09-03 (3.55 s median of 3 runs at load 63; 3.32–3.34 s at load 9): potion vocabulary load dominates |
 

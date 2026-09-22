@@ -261,6 +261,21 @@ qualified; individual results below are narrower than release acceptance.
   [Selection and models](https://github.com/Dicklesworthstone/frankensearch/commit/6a717c64c94da0f61e3fd31a69ecaea92c4da21c);
   [registration API](https://github.com/Dicklesworthstone/frankensearch/commit/e438f0d04f7abb99162dd60e58f7657f66029d8c).
 
+- **`--rerank` can apply on real documents.** The rerank stage deadline was
+  hard-capped at 300 ms, so on BEIR SciFact abstracts it timed out on every
+  query. `[search] rerank_timeout_ms` (env `FRANKENSEARCH_RERANK_TIMEOUT_MS`,
+  default 300) now sets it. With a generous deadline the cross-encoder applied
+  on all 300 queries at limit 10, p50 554 ms per served request, and changed
+  nDCG@10 by +0.019 (95% interval −0.006 to +0.044, not significant). The config
+  schema now also declares the `rerank` key it had been rejecting.
+  [Change](https://github.com/Dicklesworthstone/frankensearch/commit/550915737bf27809af6b1aa670ced03ad7f268eb).
+
+- **First product-path retrieval-quality measurement.** On BEIR SciFact through
+  `fsfs serve`, nDCG@10 is 0.654 lexical-only, 0.588 Initial and 0.688 Refined:
+  refinement is a significant gain, while Initial ranks significantly below
+  BM25 alone on this corpus (tracked as `bd-zown6`). Reproduce with
+  `docs/quality_harness/fsfs_beir_product_eval.py`.
+
 - **Explain and streams report the cross-encoder.** `fsfs explain` JSON now
   includes the `rerank` component (model, raw logit, sigmoid) for hits the
   cross-encoder scored, and `--stream` emits a `stage = rerank` progress frame
