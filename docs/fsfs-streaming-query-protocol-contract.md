@@ -11,6 +11,9 @@ Define deterministic machine protocol semantics for `fsfs search --stream` in bo
 
 Every stream frame MUST be one of:
 
+- `started`: first frame of a stream (`seq = 0`), carrying `stream_id`, `query`,
+  `format`, and, when a readable vector generation exists,
+  `vector_generation_id`, `vector_generation_is_hash` and `semantic_admitted`
 - `progress`: pipeline progress update
 - `result`: ranked search result item
 - `explain`: explainability payload for a result
@@ -18,6 +21,21 @@ Every stream frame MUST be one of:
 - `terminal`: final stream outcome + retry/exit policy
 
 These names are stable and versioned by `schema_version = "fsfs.stream.query.v1"`.
+
+### Phase progress reason codes
+
+Each delivered result phase is announced by one `progress` frame before its
+`result` frames. Its `payload.reason_code` identifies the phase:
+
+| `reason_code` | `payload.stage` | Meaning |
+|---|---|---|
+| `query.stream.initial_ready` | `retrieve.fast` (`retrieve.hash_control` for a hash control generation) | Initial results follow |
+| `query.stream.refined_ready` | `retrieve.quality` | Quality-refined results follow |
+| `query.stream.refinement_failed` | `retrieve.refinement_failed` | Refinement failed or timed out; the Initial results stand |
+
+A daemon-served stream that replays a cached answer emits a progress frame
+with `stage = cache` and `reason_code = daemon_cache_hit` before the replayed
+phases.
 
 ## Frame Envelope
 
@@ -29,7 +47,7 @@ Each frame MUST include:
 - `seq` (monotonic per-stream sequence)
 - `ts` (RFC3339 UTC)
 - `command` (`search`)
-- event payload (`progress|result|explain|warning|terminal`)
+- event payload (`started|progress|result|explain|warning|terminal`)
 
 ## Transport Semantics
 

@@ -72,7 +72,9 @@ Installer goals:
 - auto-configured model cache path
 - sane defaults for interactive usage
 
-The Windows x86-64 full archive requires the
+No Windows archive has been published yet: every release through v1.10.0
+ships Linux and macOS assets only. When the Windows x86-64 full archive
+ships, it will require the
 [Microsoft Visual C++ v14 x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
 Install the current supported x64 package if the required `MSVCP140` or
 `VCRUNTIME140` DLLs are missing. Keep the archive's `DirectML.dll` beside
@@ -321,8 +323,8 @@ Result: responsive first answers plus better final ranking without blocking the 
 
 ## Core Features
 
-- Release binaries ship the Model2Vec/FastEmbed loaders; the installer downloads and verifies the two default models (`potion-multilingual-128M` + `all-MiniLM-L6-v2`) on first run. The `embedded-models` build profile additionally embeds those bytes for a zero-download first run (macOS/Windows full assets); the Linux full asset uses the loader + verified-download path
-- Progressive search phases (`Initial`, `Refined`, `RefinementFailed`)
+- Release binaries ship the Model2Vec/FastEmbed loaders; the installer downloads and verifies the two default models (`potion-multilingual-128M` + `all-MiniLM-L6-v2`) on first run. The `embedded-models` build profile additionally embeds those bytes for a zero-download first run; it is a source-build option, and every published full asset uses the loader + verified-download path
+- Progressive search phases (`Initial`, `Refined`, `RefinementFailed`; library searchers with a reranker also emit `Reranked`)
 - Agent-friendly streaming (`--stream`) with machine-readable output
 - Result explanation surfaces (`fsfs explain <rank|R-id|path>` against the last search)
 - Multiple output formats: `table`, `json`, `jsonl`, `toon`, `csv`
@@ -403,7 +405,9 @@ operation. A delete with no matches leaves the selected generation unchanged.
 `search --expand` pins one generation across all variants and counts each
 variant's final ranking once. Expansion executes directly even when `--daemon`
 is set; streamed searches deliver Initial before waiting for optional expansion.
-Without an expansion provider, the original query's normal phases are retained.
+The expansion provider is a remote LLM API: the query text goes to Anthropic
+or OpenAI when the matching API key is set (see the FAQ). Without a key, the
+original query's normal phases are retained.
 Ordinary direct and forwarded searches save explanation context beside the
 store; `explain` refuses context from a different generation or from a multi-query
 fusion whose component explanations are unavailable.
@@ -905,8 +909,9 @@ because the installer and updater use that endpoint.
 
 ## Quality Gate (dsr, not GitHub Actions)
 
-GitHub Actions is not used for this repository: every workflow under
-`.github/workflows/` is disabled (owner decision 2026-09-01). The gate that must pass
+GitHub Actions is not used as a gate for this repository: every CI workflow under
+`.github/workflows/` is disabled (owner decision 2026-09-01). The one active workflow,
+`quill-gh51-landing.yml`, runs only on manual dispatch and gates nothing. The gate that must pass
 before any release lives in the repository and runs on a real host:
 
 ```bash
@@ -1203,7 +1208,7 @@ Use both: keep `rg` for exact matches and use `fsfs` for intent-level retrieval.
 ## FAQ
 
 ### Does it run fully local?
-Yes. Search/indexing runs on your machine. Network access is only needed for optional alternate-model downloads and update checks.
+Yes. Search/indexing runs on your machine. Network access is only needed for model downloads, update checks, and `fsfs search --expand`. Expansion sends the query text to `api.anthropic.com` when `ANTHROPIC_API_KEY` is set, otherwise to `api.openai.com` when `OPENAI_API_KEY` is set; with neither key it warns and searches the original query only. Documents and index contents are never sent.
 
 ### Can I use only the library and skip `fsfs`?
 Yes. Add `frankensearch` as a dependency and wire your own app/runtime.
