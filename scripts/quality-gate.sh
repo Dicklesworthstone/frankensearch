@@ -26,7 +26,8 @@
 #   facade     the library crate's integration tests on the product feature set (`hybrid`:
 #              potion + MiniLM loaders + Quill), including the real-model two-tier lane
 #              (IndexBuilder + TwoTierSearcher yield INITIAL then REFINED through the public
-#              API) which is hard-required when the registered models are present
+#              API) which is hard-required when the registered models are present, plus
+#              the facade doctests, which compile the README's Rust blocks
 #   examples   frankensearch/examples/run_all.sh (the validate_* e2e scripts + bench_quick);
 #              opt-in via QUALITY_GATE_STAGES because it compiles and runs four examples
 #              (~2.5 min debug)
@@ -147,6 +148,11 @@ if want facade; then
   else
     fail facade "registered models absent under $MODEL_DIR; run scripts/rch-ensure-deps.sh --models-only or set QUALITY_GATE_ALLOW_MODEL_SKIP=1"
   fi
+  # The crate docs and README Rust blocks compile as doctests (README via a cfg(doctest)
+  # include in frankensearch/src/lib.rs). The 2026-09-01 reality check found the README
+  # quickstart importing a removed trait unnoticed because nothing compiled it. `no_run`
+  # blocks compile only, so this needs no models.
+  run_stage facade-doc cargo test --locked -p frankensearch --features hybrid --doc
 fi
 
 if want examples; then

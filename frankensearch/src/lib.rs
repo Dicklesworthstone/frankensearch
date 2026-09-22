@@ -195,6 +195,15 @@ compile_error!("feature `durable` requires both `persistent` and `durability`");
 #[cfg(all(feature = "full-fts5", not(all(feature = "full", feature = "fts5"))))]
 compile_error!("feature `full-fts5` requires both `full` and `fts5`");
 
+/// Compiles the repository README's Rust blocks as doctests of this crate.
+///
+/// The 2026-09-01 reality check found the README quickstart importing a
+/// removed trait with nothing noticing, because no gate compiled it. Exists
+/// only under `cfg(doctest)`, so it adds nothing to any build or package.
+#[cfg(doctest)]
+#[doc = include_str!("../../README.md")]
+pub struct ReadmeDoctests;
+
 // ─── Sub-crate module aliases (advanced access) ─────────────────────────────
 
 /// Core types, traits, and error definitions.
