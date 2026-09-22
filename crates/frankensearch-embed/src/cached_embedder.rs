@@ -1,7 +1,9 @@
 //! Caching wrapper for any [`Embedder`] implementation.
 //!
 //! `CachedEmbedder` sits between the search pipeline and an inner embedder,
-//! caching query embeddings so that repeated queries skip inference entirely.
+//! caching raw query embeddings so that repeated raw queries skip inference.
+//! [`Embedder::embed_bound`] calls bypass this raw-vector cache and preserve
+//! the inner provider's complete response, including its producing identity.
 //!
 //! The cache uses FIFO eviction with a bounded capacity (default 128 entries).
 //! Cache hits return a cloned `Vec<f32>`, which is cheap (~1.5 KiB for 384-dim).
@@ -18,7 +20,9 @@ use std::sync::{Arc, Mutex};
 use asupersync::Cx;
 use frankensearch_core::SearchResult;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
-use frankensearch_core::traits::{Embedder, ModelCategory, ModelTier, SearchFuture};
+use frankensearch_core::traits::{
+    Embedder, IdentityBoundEmbedding, ModelCategory, ModelTier, SearchFuture,
+};
 
 /// Default maximum number of cached query embeddings.
 const DEFAULT_CAPACITY: usize = 128;
@@ -198,8 +202,9 @@ impl CacheState {
 
 /// Caching wrapper around any [`Embedder`].
 ///
-/// Intercepts `embed()` calls and returns cached vectors for previously-seen
-/// query strings. All other trait methods delegate directly to the inner embedder.
+/// Caches raw `embed()` and `embed_batch()` results for previously seen queries.
+/// `embed_bound()` deliberately bypasses the raw-vector cache: an identity from
+/// `identity()` cannot replace the identity accompanying the provider's response.
 ///
 /// # Construction
 ///
@@ -286,6 +291,14 @@ impl Embedder for CachedEmbedder {
             self.state_lock().insert(key, vec.clone());
             Ok(vec)
         })
+    }
+
+    fn embed_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+    ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+        self.inner.embed_bound(cx, text)
     }
 
     fn embed_batch<'a>(
@@ -428,6 +441,8 @@ mod tests {
         dim: usize,
         calls: AtomicUsize,
         identity: EmbeddingIdentityBundleV1,
+        bound_calls: AtomicUsize,
+        bound_response_identity: Option<EmbeddingIdentityBundleV1>,
     }
 
     impl CountingEmbedder {
@@ -439,6 +454,8 @@ mod tests {
                     "counting-test",
                     u32::try_from(dim).unwrap_or(u32::MAX),
                 ),
+                bound_calls: AtomicUsize::new(0),
+                bound_response_identity: None,
             }
         }
 
@@ -457,6 +474,26 @@ mod tests {
             }
             let normalized = l2_normalize(&vec);
             Box::pin(async move { Ok(normalized) })
+        }
+
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+            self.bound_calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                let bound = IdentityBoundEmbedding {
+                    values: self.embed(cx, text).await?,
+                    identity: self
+                        .bound_response_identity
+                        .as_ref()
+                        .unwrap_or(&self.identity)
+                        .clone(),
+                };
+                bound.validate()?;
+                Ok(bound)
+            })
         }
 
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
@@ -586,6 +623,37 @@ mod tests {
     fn cache_wrapper_forwards_complete_identity_exactly() {
         let (cached, inner) = make_cached(16);
         assert_eq!(cached.identity().unwrap(), inner.identity().unwrap());
+    }
+
+    #[test]
+    fn bound_embedding_bypasses_warm_raw_cache_and_preserves_response_identity() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let response_identity =
+                EmbeddingIdentityBundleV1::explicit_test_model("foreign-response", 64);
+            let mut inner = CountingEmbedder::new(64);
+            inner.bound_response_identity = Some(response_identity.clone());
+            let inner = Arc::new(inner);
+            let cached = CachedEmbedder::new(inner.clone(), 16);
+            assert_ne!(cached.identity().unwrap(), &response_identity);
+
+            let raw = cached.embed(&cx, "query").await.unwrap();
+            assert_eq!(cached.embed(&cx, "query").await.unwrap(), raw);
+            assert_eq!(inner.call_count(), 1);
+            let warmed_stats = cached.cache_stats();
+
+            for _ in 0..2 {
+                let bound = cached.embed_bound(&cx, "query").await.unwrap();
+                assert_eq!(bound.values, raw);
+                assert_eq!(bound.identity, response_identity);
+            }
+            assert_eq!(inner.bound_calls.load(Ordering::Relaxed), 2);
+            assert_eq!(inner.call_count(), 3);
+            assert_eq!(cached.cache_stats(), warmed_stats);
+
+            assert_eq!(cached.embed(&cx, "query").await.unwrap(), raw);
+            assert_eq!(inner.call_count(), 3);
+            assert_eq!(cached.cache_stats().hits, warmed_stats.hits + 1);
+        });
     }
 
     #[test]

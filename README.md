@@ -748,6 +748,33 @@ Notes:
 - Keep `TwoTierConfig` explicit in code for reproducible behavior across environments.
 - This path is proven with the real models, not doubles: the gate's `facade` stage runs `integration.rs::real_models_two_tier_search_yields_refined_through_the_public_api` (potion fast tier + MiniLM quality tier from the registered cache; INITIAL then REFINED with the quality tier searched). Reproduce locally with `FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 cargo test -p frankensearch --features hybrid --test integration -- real_models`.
 
+### Native quality ANN on admitted v2 indexes (unreleased, opt-in)
+
+An index opened through `TwoTierIndex::open_admitted_v2_with_paths` can use the
+native HNSW graph for quality retrieval. Enable it before sharing the index with
+a `TwoTierSearcher`:
+
+```rust,ignore
+use frankensearch_index::native_hnsw::HnswParams;
+
+// `index` is an already admitted FSVI v2 TwoTierIndex.
+index.enable_native_quality_hnsw(HnswParams::default(), 42)?;
+```
+
+The graph shares the retained quality vector owner. Quality retrieval searches
+independently of the fast candidate pool, then exactly rescores its ANN
+candidates before progressive fusion. Query admission checks the identity that
+actually accompanies the provider's bound embedding, including when query
+caching or pseudo-relevance feedback is enabled. Bound requests bypass the
+raw-vector cache because that cache does not retain response identities.
+
+Graph construction is synchronous. Generation replacement rebuilds the requested
+graph before installing the successor; failure leaves the current index intact.
+The policy survives a successor that temporarily has no quality tier. This route
+does not persist graph sidecars, and a fresh open starts with exact retrieval.
+Legacy v1 opens are ineligible. Fast-tier and `fsfs` defaults remain unchanged;
+ANN recall and latency still need qualification at representative corpus sizes.
+
 ## Baseline Performance Envelope (Reference)
 
 These are practical CPU-only reference numbers for a healthy local setup.
