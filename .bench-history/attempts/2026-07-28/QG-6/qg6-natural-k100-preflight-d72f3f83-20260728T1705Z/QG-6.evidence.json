@@ -22,7 +22,10 @@
       "rustc_version": "rustc 1.99.0-nightly (09ee43b2d 2026-07-27)",
       "target_triple": "x86_64-unknown-linux-gnu",
       "build_profile": "release-perf",
-      "cargo_features": ["perf-harness", "tantivy-oracle"]
+      "cargo_features": [
+        "perf-harness",
+        "tantivy-oracle"
+      ]
     },
     "machine": {
       "fingerprint": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
@@ -61,7 +64,12 @@
           "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
           "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
           "query_group_count": 4,
-          "query_group_ids": [0, 1, 2, 3]
+          "query_group_ids": [
+            0,
+            1,
+            2,
+            3
+          ]
         },
         "cold_cache": null
       },
@@ -85,7 +93,12 @@
               "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
               "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
               "query_group_count": 4,
-              "query_group_ids": [0, 1, 2, 3]
+              "query_group_ids": [
+                0,
+                1,
+                2,
+                3
+              ]
             },
             "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
             "build_profile": "release-perf"
@@ -206,7 +219,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -239,7 +257,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -272,7 +295,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -305,7 +333,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -338,7 +371,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -371,7 +409,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -404,7 +447,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -437,7 +485,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -470,7 +523,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -503,7 +561,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -536,7 +599,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -569,7 +637,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -602,7 +675,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -635,7 +713,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -668,7 +751,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -701,7 +789,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -734,7 +827,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -767,7 +865,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -800,7 +903,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -833,7 +941,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -866,7 +979,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -899,7 +1017,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -932,7 +1055,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -965,7 +1093,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1000,7 +1133,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1033,7 +1171,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1066,7 +1209,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1099,7 +1247,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1132,7 +1285,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1165,7 +1323,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1198,7 +1361,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1231,7 +1399,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1264,7 +1437,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1297,7 +1475,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1330,7 +1513,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1363,7 +1551,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1396,7 +1589,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1429,7 +1627,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1462,7 +1665,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1495,7 +1703,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1528,7 +1741,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1561,7 +1779,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1594,7 +1817,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1627,7 +1855,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1660,7 +1893,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1693,7 +1931,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1726,7 +1969,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"
@@ -1759,7 +2007,12 @@
                   "query_manifest_sha256": "ba9c828cceb01d80da8ad734a2d3e9a0ff44796883ddb821a998026a84ce960e",
                   "config_contract_sha256": "4e560c013f0074bfc20fcc62c57ca846bda0da60b094cb4b2ed7957f9a88e330",
                   "query_group_count": 4,
-                  "query_group_ids": [0, 1, 2, 3]
+                  "query_group_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
                 },
                 "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
                 "build_profile": "release-perf"

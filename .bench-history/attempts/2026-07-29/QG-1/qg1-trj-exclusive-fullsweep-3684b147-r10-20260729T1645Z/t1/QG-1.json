@@ -11,7 +11,9 @@
     "ram_bytes": 536069869568,
     "numa_nodes": 1,
     "process_available_threads": 128,
-    "thread_counts_requested": [1],
+    "thread_counts_requested": [
+      1
+    ],
     "thread_observations": [
       {
         "fixture": "bulk/xlarge/1/positions_on",
@@ -57,7 +59,13 @@
         "identity_scheme": "same-static-elf-v1"
       }
     ],
-    "runtime_detected_isa": ["avx2", "fma", "bmi2", "aes", "vaes"],
+    "runtime_detected_isa": [
+      "avx2",
+      "fma",
+      "bmi2",
+      "aes",
+      "vaes"
+    ],
     "cpu_affinity_allowed_list": "0-127",
     "affinity_or_cpuset_cap": null
   },

@@ -22,7 +22,10 @@
       "rustc_version": "rustc 1.99.0-nightly (9f36de775 2026-07-19)",
       "target_triple": "aarch64-apple-darwin",
       "build_profile": "release-perf",
-      "cargo_features": ["perf-harness", "tantivy-oracle"]
+      "cargo_features": [
+        "perf-harness",
+        "tantivy-oracle"
+      ]
     },
     "machine": {
       "fingerprint": "macos-aarch64-14cpu-unknown-cpu",

@@ -9,8 +9,16 @@
     "physical_cores": 64,
     "logical_threads": 128,
     "process_available_threads": 128,
-    "configured_engine_thread_widths": [2],
-    "runtime_detected_isa": ["aes", "avx2", "bmi2", "fma", "vaes"],
+    "configured_engine_thread_widths": [
+      2
+    ],
+    "runtime_detected_isa": [
+      "aes",
+      "avx2",
+      "bmi2",
+      "fma",
+      "vaes"
+    ],
     "cpu_affinity_allowed_list": "0-127",
     "affinity_or_cpuset_cap": null
   },

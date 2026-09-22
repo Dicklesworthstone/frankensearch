@@ -1084,3 +1084,39 @@ and progressive serving. All five added representative commit links resolve
 through the GitHub API. Structural validation passes with the existing possible
 bare-hash warning. The live release list still identifies `v1.10.0`, published
 2026-09-08, as the latest binary release; these changes remain unreleased.
+
+### September 22: stock gate completion and historical artifact repair
+
+The unchanged stock gate on clean `cedcbf6d8f492dc1719add03620900c6feed5aa8`
+completed through admitted RCH worker `vmi1152480`: all eleven stage rows pass,
+including real-model E2E and executable quickstart. The additional benchmark
+matrix passes 24 tests, and the explicitly enabled real-model watcher/daemon
+binary passes both tests with zero failures or ignores. Retrieved receipt
+SHA-256 is `dd1b3f1d15f0cbf357063e6316a1271ef4cf94b36628781bfc2ba4a0db39fb3f`;
+every stage log matches its receipt hash. Quickstart receipt SHA-256 is
+`9c9e09baeb19b75cfe2f83b4df660b3130ddfe23fd716becd7eb38c860b5ac89`, binding
+the actually executed binary
+`85ffde7d3101c40a5e2395dc8730136363630d8a8c47a3272f1510ba1a6f2db9`.
+
+The separate full Quill run on `e3f7bb61` ended with SIGKILL/exit 137, without
+a terminal suite verdict. Its retained default-library output records 623
+passes, one failure, and four ignores before interruption. The recorded failure
+is `preserved_v6_placeholders_are_canonical_but_not_current_v7_sentinels`:
+formatting-only commit `405c442a` added terminal newlines contrary to the
+historical byte contract in `.bench-history/README.md`. That same commit
+reformatted 164 archived JSON artifacts. All 164 still matched its output and
+parsed identically to their parent versions before repair.
+
+Restore those exact parent-commit bytes; do not regenerate evidence, change
+assertions, reseal measurements, or relax the historical/current schema boundary.
+The reformatted copies and before/after hash inventory are retained under
+`/data/release-work/frankensearch-release-20260912/dependencies/bench-history-format-before-repair`
+and `bench-history-format-audit.json`. Both unchanged all-feature tests now pass
+through RCH `vmi1152480` (historical fixtures and current sentinels, one test each,
+zero failures/ignores). Retrieved receipt SHA-256 is
+`ca01528dd6e5dd84809c74170bf84ff0051b8d4b27a68e57555e768248a68d89`;
+both logs match their hashes, and both invocations executed ELF
+`321b26c7ebbf7e43f84d30cf8b03a7ae1eec2d7de52a980159238a428732327d`.
+This restoration admits no measured performance rows and changes no WIN/LOSE
+classification. The SIGKILL cause is unproven; no surviving job process or kernel
+OOM record was found. Full Quill, R1, and final release publication remain open.

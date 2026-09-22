@@ -24,7 +24,10 @@
       "rustc_version": "unavailable",
       "target_triple": "x86_64-linux",
       "build_profile": "release-perf",
-      "cargo_features": ["perf-harness", "tantivy-oracle"]
+      "cargo_features": [
+        "perf-harness",
+        "tantivy-oracle"
+      ]
     },
     "machine": {
       "fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
@@ -37,8 +40,16 @@
         "physical_cores": 64,
         "logical_threads": 128,
         "process_available_threads": 128,
-        "configured_engine_thread_widths": [64],
-        "runtime_detected_isa": ["aes", "avx2", "bmi2", "fma", "vaes"],
+        "configured_engine_thread_widths": [
+          64
+        ],
+        "runtime_detected_isa": [
+          "aes",
+          "avx2",
+          "bmi2",
+          "fma",
+          "vaes"
+        ],
         "cpu_affinity_allowed_list": "0-127",
         "affinity_or_cpuset_cap": null
       },
