@@ -316,8 +316,25 @@ impl FsfsRuntime {
         cx: &Cx,
         store_root: &Path,
     ) -> SearchResult<crate::generation_store::GenerationPublication> {
+        self.rebuild_retained_generation_with_precommit(cx, store_root, |_| Ok(()))
+            .await
+    }
+
+    // Source authority is checked after sealing, without replacing the real
+    // indexing, producer admission, lease or predecessor checks below.
+    #[allow(clippy::future_not_send)]
+    async fn rebuild_retained_generation_with_precommit<F>(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        precommit: F,
+    ) -> SearchResult<crate::generation_store::GenerationPublication>
+    where
+        F: FnOnce(&Cx) -> SearchResult<()> + Send,
+    {
         use crate::generation_store::CompleteGenerationStore;
 
+        retained_search_checkpoint(cx)?;
         let target_root = fs::canonicalize(self.resolve_target_root()?)?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
         let store = CompleteGenerationStore::create(cx, store_root)?;
@@ -338,7 +355,8 @@ impl FsfsRuntime {
         // Preserve caller-owned native capacity, bundled-model materialization
         // and already initialized model slots rather than constructing an
         // unrelated runtime with no blocking pool.
-        let candidate = self.clone().with_cli_input(input);
+        let mut candidate = self.clone().with_cli_input(input);
+        candidate.config.indexing.watch_mode = false;
         Box::pin(candidate.run_one_shot_index_scaffold_internal(
             cx,
             CliCommand::Index,
@@ -361,9 +379,11 @@ impl FsfsRuntime {
         )
         .await?;
         drop(resources);
-        build.publish(cx, |_, path| {
-            Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)
-        })
+        build.publish_with_precommit(
+            cx,
+            |_, path| Self::validate_search_generation_at_root(path, SearchExecutionMode::Full),
+            precommit,
+        )
     }
 }
 
@@ -885,3 +905,7 @@ mod retained_search_tests {
 
 #[path = "runtime/complete_cli.rs"]
 mod complete_cli;
+
+#[cfg(unix)]
+#[path = "runtime/complete_watch.rs"]
+mod complete_watch;

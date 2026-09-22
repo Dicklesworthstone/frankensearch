@@ -23,6 +23,26 @@ use crate::generation_store::{
 use crate::output_schema::OutputEnvelope;
 use crate::{CliCommand, OutputFormat, ShutdownCoordinator};
 
+pub(super) fn require_durable_publication(
+    publication: GenerationPublication,
+) -> SearchResult<crate::generation_store::PublishedGeneration> {
+    match publication {
+        GenerationPublication::Durable(generation) => Ok(generation),
+        GenerationPublication::VisibleButDurabilityUncertain { generation, source } => {
+            // The rename is already visible. Never describe this as an aborted
+            // rebuild or restore the predecessor after a directory-sync failure.
+            Err(SearchError::SubsystemError {
+                subsystem: "fsfs.complete_generation.durability",
+                source: Box::new(std::io::Error::other(format!(
+                    "generation {} is already visible at {}, but directory synchronization failed: {source}",
+                    generation.id(),
+                    generation.path().display(),
+                ))),
+            })
+        }
+    }
+}
+
 impl FsfsRuntime {
     /// Run a command with complete-generation publication and reader admission.
     ///
@@ -66,6 +86,11 @@ impl FsfsRuntime {
                 self.run_complete_generation_index_with_writer(cx, &root, &mut stdout)
                     .await
             }
+            #[cfg(unix)]
+            CliCommand::Watch | CliCommand::Index => {
+                self.run_complete_generation_watch_with_writer(cx, &root, &mut stdout)
+                    .await
+            }
             CliCommand::Search => {
                 self.run_complete_generation_search_with_writer(cx, &root, &mut stdout)
                     .await
@@ -90,7 +115,7 @@ impl FsfsRuntime {
             }
             _ => Err(complete_cli_error(
                 "command",
-                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, direct search, serve, daemon, status, or doctor",
+                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, direct search, serve, daemon, status, or doctor",
             )),
         }
     }
@@ -147,21 +172,18 @@ impl FsfsRuntime {
         root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
-        let generation = match self.rebuild_retained_generation(cx, root).await? {
-            GenerationPublication::Durable(generation) => generation,
-            GenerationPublication::VisibleButDurabilityUncertain { generation, source } => {
-                // The rename already happened. In particular, do not label this
-                // an aborted rebuild or try to restore the predecessor pointer.
-                return Err(SearchError::SubsystemError {
-                    subsystem: "fsfs.complete_generation.durability",
-                    source: Box::new(std::io::Error::other(format!(
-                        "generation {} is already visible at {}, but directory synchronization failed: {source}",
-                        generation.id(),
-                        generation.path().display(),
-                    ))),
-                });
-            }
-        };
+        let generation =
+            require_durable_publication(self.rebuild_retained_generation(cx, root).await?)?;
+        self.emit_complete_generation_receipt(root, &generation, "index", writer)
+    }
+
+    pub(super) fn emit_complete_generation_receipt<W: Write>(
+        &self,
+        root: &Path,
+        generation: &crate::generation_store::PublishedGeneration,
+        command: &str,
+        writer: &mut W,
+    ) -> SearchResult<()> {
         if self.cli_input.format == OutputFormat::Table {
             writeln!(
                 writer,
@@ -180,7 +202,7 @@ impl FsfsRuntime {
             });
             let envelope = OutputEnvelope::success(
                 payload,
-                meta_for_format("index", self.cli_input.format),
+                meta_for_format(command, self.cli_input.format),
                 iso_timestamp_now(),
             );
             emit_envelope(&envelope, self.cli_input.format, writer)?;
@@ -200,11 +222,10 @@ impl FsfsRuntime {
         root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
-        if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() || self.cli_input.expand
-        {
+        if self.cli_input.expand {
             return Err(complete_cli_error(
                 "search_options",
-                "complete-generation CLI search currently requires --no-daemon and does not support --expand; no fallback was attempted",
+                "complete-generation search does not support --expand; no fallback was attempted",
             ));
         }
         let query = self
@@ -229,6 +250,20 @@ impl FsfsRuntime {
             ));
         }
         let started = Instant::now();
+        if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
+            #[cfg(unix)]
+            {
+                let payload = self
+                    .query_complete_generation_daemon(cx, root, query, limit)
+                    .await?;
+                return self.emit_complete_search_payload(payload, started, writer);
+            }
+            #[cfg(not(unix))]
+            return Err(complete_cli_error(
+                "daemon_transport",
+                "complete-generation daemon forwarding requires Unix sockets",
+            ));
+        }
         let mut reader = self.open_retained_search(cx, root).await?;
         if self.cli_input.stream {
             let stream_id = format!("search-{}-{}", pressure_timestamp_ms(), std::process::id());
@@ -254,6 +289,15 @@ impl FsfsRuntime {
         let payload = payloads.last().cloned().ok_or_else(|| {
             complete_cli_error("search", "search completed without an Initial phase")
         })?;
+        self.emit_complete_search_payload(payload, started, writer)
+    }
+
+    fn emit_complete_search_payload<W: Write>(
+        &self,
+        payload: crate::output_schema::SearchPayload,
+        started: Instant,
+        writer: &mut W,
+    ) -> SearchResult<()> {
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if self.cli_input.format == OutputFormat::Table {
             let table = crate::adapters::format_emitter::render_search_table_for_cli(
@@ -422,7 +466,7 @@ fn complete_entry_exists(path: &Path) -> SearchResult<bool> {
     }
 }
 
-fn complete_cli_error(field: &str, reason: &str) -> SearchError {
+pub(super) fn complete_cli_error(field: &str, reason: &str) -> SearchError {
     SearchError::InvalidConfig {
         field: format!("complete_generation.{field}"),
         value: String::new(),
@@ -825,9 +869,12 @@ mod tests {
             publish(&runtime, &cx, &root).await;
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
             let before = store.active(&cx).unwrap();
-            for command in [CliCommand::Compact, CliCommand::Flush, CliCommand::Watch] {
+            for command in [CliCommand::Compact, CliCommand::Flush, CliCommand::Delete] {
                 let mut input = runtime.cli_input.clone();
                 input.command = command;
+                if command == CliCommand::Delete {
+                    input.query = Some("alpha.md".to_owned());
+                }
                 runtime
                     .clone()
                     .with_cli_input(input)

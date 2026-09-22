@@ -86,15 +86,71 @@ reads block on the command's owning lane: cancellation is observed between
 reads and requests, not promised to interrupt an idle blocked read. No detached
 input worker is introduced.
 
-## Current boundaries
+On Unix, the daemon uses a socket owned by the complete store:
 
-Complete-store CLI routing supports one-shot `index`, direct `search` (including
-JSONL/TOON streaming), stdio `serve`, `status`, and `doctor`. It refuses watch
-mode, TUI, daemon/socket serving, direct query expansion and in-place mutators
-rather than pretending that those paths have been migrated. Existing legacy
-roots without a complete-generation selection or staging tree retain their
-ordinary behavior when the new layout is not explicitly selected. The legacy
-watch/search exclusion issue is not resolved by this opt-in route.
+```sh
+fsfs daemon --index-dir /work/search-store --config /work/fsfs.toml --idle-timeout-ms 0
+fsfs daemon --index-dir /work/search-store --config /work/fsfs.toml --stop
+```
+
+The first command stays in the foreground and listens at
+`/work/search-store/fsfs-query.sock`; zero disables idle expiry. Each connection
+accepts one newline-terminated query; plain queries return a buffered response. The stop
+command addresses that socket and remains usable if the generation selection is
+damaged. It does not start a replacement daemon or repair the selection.
+## Progressive Unix-socket requests
+
+The complete-generation socket daemon also accepts progressive requests:
+
+```sh
+fsfs daemon --index-dir /work/search-store --config /work/fsfs.toml
+```
+
+Send one newline-terminated JSON request on a socket connection:
+
+```json
+{"query":"connection pooling","limit":10,"stream":true,"mode":"full"}
+```
+
+The response reuses the direct search `fsfs.stream.query.v1` JSONL frames,
+including Started, ordered phase output, generation/producer annotations and
+Terminal. A request pins one admitted generation for every phase and bypasses
+the result cache and persistent explanation writes. The next request refreshes
+selection before using either the cache or the search resources.
+
+Streaming currently accepts only `query`, `limit`, `stream`, and optional
+`mode: "full"`, under the daemon startup configuration. Extra filter, model,
+format and protocol options are refused, not silently ignored. This endpoint
+does not yet wire ordinary `fsfs search --daemon` forwarding or the legacy
+v4 request-overlay protocol into complete-generation serving.
+
+A refusal before any stream bytes are emitted uses the existing buffered
+`ok: false` error response. Once streaming starts, an output failure or outer
+deadline closes the connection; it never appends a buffered envelope or retries
+the query. Clients must treat EOF without Terminal as failure, retaining any
+already received Initial as partial results rather than declaring completion.
+
+Flush attempts nonblocking delivery immediately. Backpressure retains at most
+4 MiB of pending/staged bytes; exhaustion fails the request instead of allowing
+unbounded queue growth. Socket reads, asynchronous admission/search, and output
+delivery have deadlines. Shutdown is checked even when an asynchronous search
+never wakes itself. These are cooperative bounds, not preemption of a blocking
+synchronous poll. No detached worker is added and one request timing out does
+not cancel the shared daemon context.
+
+## Watching and current boundaries
+
+Complete-store routing also supports `watch` and `index --watch`, using full
+replacement builds without holding a serving-index writer between publications.
+See [complete-generation watch](complete-generation-watch.md) for the bounded
+notification queue, source recheck, framed receipts and remaining update costs.
+Buffered and progressive Unix-socket serving preserve the daemon shutdown path.
+
+TUI, direct query expansion, automatic search-to-daemon forwarding and in-place
+mutators remain outside this route. Legacy roots without a complete-generation
+selection or staging tree retain their ordinary behavior when the new layout is
+not explicitly selected. The legacy mutable watch/search exclusion issue is not
+resolved by this opt-in route, nor is incremental artifact/embedding reuse.
 
 There is no automatic garbage collection. Retained predecessors and failed
 builds consume disk space. The store assumes cooperating writers and a trusted
@@ -111,6 +167,7 @@ explicitly; it covers the fast semantic tier, not quality-tier acceptance:
 
 ```sh
 cargo test -p frankensearch-fsfs --no-default-features --lib complete_cli
+cargo test -p frankensearch-fsfs --no-default-features --lib complete_daemon
 cargo test -p frankensearch-fsfs --no-default-features --test complete_generations_cli
 FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR=/verified/model-cache \
   cargo test -p frankensearch-fsfs --no-default-features --features semantic-support \
@@ -123,3 +180,9 @@ no compile, formatting, test, performance or full-release qualification is
 asserted by this document. Warm-server tests replay genuine published bundle
 selections at controlled output boundaries; they do not certify a real-model
 cross-process watcher lifecycle.
+
+Socket tests additionally exercise early delivery while the producer is still
+running, bounded backpressure, deadline/drop behavior, pre-admission refusal,
+no buffered fallback after streaming starts, and canonical frame decoding while
+published generations change or selection is repaired. These remain unexecuted
+in the editing environment and do not establish real-model quality-tier timing.

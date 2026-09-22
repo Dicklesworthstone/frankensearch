@@ -5412,12 +5412,24 @@ impl Qg1SampleBinding {
         scope: &PerfOperationScope,
         provenance: &PerfSampleProvenance,
     ) -> bool {
+        authority.validate().is_ok()
+            && self.matches_validated_authority(authority, scope, provenance)
+    }
+
+    /// Match a binding after the caller has validated this immutable authority.
+    /// Stream validation uses this only after its authority check, so the full
+    /// issued-row plan is not rehashed and revalidated for every sample.
+    fn matches_validated_authority(
+        &self,
+        authority: &Qg1LifecycleAuthority,
+        scope: &PerfOperationScope,
+        provenance: &PerfSampleProvenance,
+    ) -> bool {
         let prepared_corpus_matches_provenance =
             self.prepared_corpus_sha256 == provenance.corpus_sha256;
         let recorded_batch_count_is_complete =
             self.recorded_batch_count == authority.prepared_batch_count;
-        authority.validate().is_ok()
-            && authority.scope == *scope
+        authority.scope == *scope
             && authority.provenance_corpus_sha256 == provenance.corpus_sha256
             && self.lifecycle_authority_sha256 == authority.authority_sha256
             && authority.stream_role_identity_sha256(&self.stream_role)
@@ -6403,7 +6415,7 @@ fn qg1_validate_stream(
             || binding.stream_id_sha256 != expected_stream_id
             || binding.lifecycle_authority_sha256 != first.lifecycle_authority_sha256
             || !binding.same_prepared_input(first)
-            || !binding.matches_authority(authority, scope, provenance)
+            || !binding.matches_validated_authority(authority, scope, provenance)
             || binding.engine_id() != expected_engine
         {
             return Err(PairedEstimatorError::InvalidProvenance {
@@ -9119,6 +9131,7 @@ mod tests {
                 join_elapsed_ns: 1,
                 writer_rearmed: false,
             },
+            // ubs:ignore -- Unknown engine IDs must fail this test fixture constructor.
             _ => panic!("QG-1 test binding requires a known engine ID"),
         };
         let mut binding = Qg1SampleBinding {
@@ -9665,6 +9678,47 @@ mod tests {
             QG1_STREAM_ROLE_TANTIVY_NULL,
         );
         let expected_authority = qg1_test_expected_authority(&authority);
+        // Exercise the stream boundary directly: the public estimator also
+        // validates its configuration, which could otherwise hide a missing
+        // authority check here when binding checks reuse a validated authority.
+        qg1_validate_stream(
+            &effect,
+            &scope,
+            &provenance,
+            PERF_MIN_RUNS,
+            Some(&authority),
+        )
+        .expect("the intact lifecycle stream is admitted");
+        let mut substituted_binding = effect.clone();
+        substituted_binding[0]
+            .qg1_sample_binding
+            .as_mut()
+            .expect("binding")
+            .producer_capability_sha256 = "0".repeat(64);
+        assert!(matches!(
+            qg1_validate_stream(
+                &substituted_binding,
+                &scope,
+                &provenance,
+                PERF_MIN_RUNS,
+                Some(&authority),
+            ),
+            Err(PairedEstimatorError::InvalidProvenance { reason })
+                if reason == "QG-1 stream mixes prepared input, stream identity, or engine role"
+        ));
+        let mut invalid_authority = authority.clone();
+        invalid_authority.authority_sha256 = "0".repeat(64);
+        assert!(matches!(
+            qg1_validate_stream(
+                &substituted_binding,
+                &scope,
+                &provenance,
+                PERF_MIN_RUNS,
+                Some(&invalid_authority),
+            ),
+            Err(PairedEstimatorError::InvalidProvenance { reason })
+                if reason == "QG-1 lifecycle authority does not match the estimator scope and provenance"
+        ));
         // The public authority-free estimator refuses canonical QG-1 scopes
         // outright, so every hostile case below is exercised through the
         // authority-bearing entry and cannot pass for the trivial reason.
@@ -12718,6 +12772,7 @@ mod tests {
             .into_iter()
             .find(|cell| cell.metric == metric && cell.topology == Some(PerfTopology::InProcess))
             .cloned()
+            // ubs:ignore -- A missing required QG-3 fixture cell must fail the test.
             .unwrap_or_else(|| panic!("the frozen matrix ships an in-process QG-3 {metric} cell"));
         let started_ns = 4_000;
         // The producer's exact expressions, mirrored here on purpose: this
@@ -12767,6 +12822,7 @@ mod tests {
             );
             let value = honest
                 .validate_and_value()
+                // ubs:ignore -- Rejecting the positive control must fail this validation test.
                 .unwrap_or_else(|error| panic!("honest QG-3 {metric} sample rejected: {error}"));
             assert!(value.is_finite() && value > 0.0);
 

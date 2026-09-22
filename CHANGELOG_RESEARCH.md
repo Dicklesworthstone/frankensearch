@@ -968,3 +968,119 @@ the additional fixed-hash consumers. UBS returned exit 3 for JSON alone because
 it has no JSON scanner; this is not a pass. A cumulative scan including the two
 actual Rust files repaired in this work block exited zero, but does not validate
 JSON. Historical-byte comparisons and the consumer tests provide that evidence.
+
+The clean committed source `af1d6db2b8484ca465fcb1f6ceda1a9024522af9`
+subsequently passed the unchanged full stock quality gate on RCH worker
+`vmi1152480`, finishing on 2026-09-21 at 19:39 UTC. All eleven stage rows passed:
+formatting, workspace check, workspace and hybrid Clippy, Windows compile guard,
+workspace library tests, bounded Quill, fsfs, facade, real-model E2E, and executable
+quickstart. Workspace test summaries reported 8,255 passes and 59 existing ignores;
+fsfs reported 2,478 passes and 21 ignores; facade reported 395 passes; all nine
+real-model E2E tests passed. Bounded Quill executed 59 tests without failures or
+ignores. Counts are scoped to their stages and include repeated tests across
+stages; they are not a unique-test total.
+
+The retrieved terminal receipt is SHA-256
+`f3ebfe6c462a945a4e1fa67d3f6847eed9cc008dc2216883a5f4822422852167`;
+the complete quality log is
+`ccaac760d5781ad6f8f2165331bf26a411a1f7e11877c66ea017d4b722405d0c`.
+All stage log hashes were checked after retrieval. Quickstart receipt
+`a83a3d3a9fc5b0a5177df9c245f63d45332f2e479d3ccb840e21a162cd440bd4`
+binds the invocation-built and installed executable to that same source and
+binary SHA-256 `24ffeb93d506adb0d6f3e75a83ebeadf524b2db32076501527b5fd07d6ca932b`,
+independently checked against the retrieved executable. Its 18 negative controls
+passed, its warm query recorded zero Internet operations, and no owned process
+remained. The separate benchmark baseline matrix also passed all 24 tests.
+
+This is a stock quality-gate pass, not a release completion claim. The full
+default/all-feature Quill run is separate and still in progress; the unchanged
+339-passage, six-query R1 acceptance test still fails three queries. No exact
+repair or controlled residual has been established. The later candidate that
+avoids repeated immutable authority validation is not covered by this receipt.
+Final platform artifacts, release publication, and any changed final source
+retain their own qualification obligations.
+
+During that full Quill run, a bounded live backtrace located repeated whole-plan
+authority validation inside the per-sample stream loop. The maintenance candidate
+keeps the existing immutable authority validation at stream entry and reuses its
+result only within that call. The standalone binding entry points still validate
+their authorities; every per-binding predicate and error reason is retained.
+The existing hostile-mutation test gained direct stream checks for a forged row
+capability and invalid-authority error precedence.
+
+RCH worker `vmi1152480` passed strict all-target/all-feature Clippy, the hostile
+test, all 26 QG-1 tests in each of the default and all-feature configurations,
+and the unchanged `arbitrary_partial_source_no_claim_cannot_be_laundered_into_readiness`
+assembly test. Retrieved receipt SHA-256:
+`779a85b247b6457773ea3e4d1958039883474d72b59b4bf0b8cb63de202a7c12`.
+Every stage log hash was checked. The final Rust source differs from that tested
+snapshot only by three reviewed UBS comments on existing intentional test panics;
+no panic was removed. The changed-file static scan exits zero with zero critical
+findings, 985 warnings, and 494 informational findings. These are targeted
+maintenance checks and self-verification, not independent review, a full-suite
+pass on the candidate, or an incumbent-relative performance result.
+
+The subsequent combined source `e3f7bb61` exposed uncompiled daemon integration:
+two imported constants did not exist, and the buffered request type had no
+`stream` member. The repair uses the existing client I/O timeout, defines the
+complete-store socket beside its selection pointer, and validates the JSON
+transport selector before buffered deserialization can ignore it. Streamed or
+non-boolean selectors are rejected without executing a search. The new watcher
+files also needed formatting and strict Clippy repairs. The executable fixture
+needed the documented command/source/flags argument order; its acceptance
+assertions were retained.
+
+RCH worker `vmi1152480` passed all-target check, strict all-target Clippy, 71
+complete-generation unit tests, the executable output-format refusal test, and
+both explicitly invoked real-Potion integration tests. The watcher test searches
+through file additions, renames, and deletions while retaining predecessor
+generations. The new daemon test serves a real query, damages only its fixture's
+selection pointer, then proves the executable's stop command terminates the
+daemon and removes its owned socket without rewriting that pointer.
+
+Retrieved terminal receipt SHA-256 is
+`8c3546713374ba320daa1582d28fce85200711d5bc191851555d61ab4f662819`;
+the real-model test log is
+`2464ae07da14a0457016bd3dbae0662eed190ec7deb915eebed20d8666576fe1`.
+All retrieved stage hashes and all five tested Rust source hashes were checked.
+The post-run production executable hash is
+`b26422d6169bf234b7f129d9344c19dae5d9e601d0f72807c707bf9dc2a86d10`.
+The five-file UBS scan reported zero critical findings, 604 warnings, and 115
+informational findings; the final fixture-only rescan reported zero critical
+findings, 82 warnings, and nine informational findings. Earlier failed compile,
+lint, and fixture attempts remain recorded. These focused results do not replace
+clean-commit stock qualification, the still-running full Quill gate, the open R1
+comparison, or final platform release checks.
+
+Before the integration push, upstream advanced with execution deadlines
+(`1ea51073`) and progressive complete-generation socket serving (`07e4838a`).
+The push guard stopped on the unfetched upstream revision; it was not bypassed.
+The merge preserves those capabilities and the validated buffered fixes. A
+transport-local Boolean selector now chooses the stream path without inventing
+a member on the shared buffered request. Invalid selector types still fail
+before search. Boxing the owned peer future prevents stack-size propagation
+through daemon callers, and the stream writer releases its mutex after staging.
+No deadline, cancellation check, output bound, or runtime assertion was relaxed.
+
+The merged candidate passed remote all-target check, strict all-target Clippy,
+85 focused unit tests, the executable refusal test, and both real-Potion binary
+tests on `vmi1152480`. The daemon executable test now also decodes streamed
+frames, checks sequence order and one result, and requires a completed Terminal
+before exercising corrupt-selection shutdown. Retrieved receipt SHA-256 is
+`b2f15d12f12d8cfb717036f6025232821afd3c6c8ac5e1cefc464e76b3966b9d`;
+real-model log SHA-256 is
+`367e0451fa00fa78a79b954327d41c07e5cf6352a1b31689f20d4cab72cfa75a`.
+All stage log hashes and the three changed Rust source hashes match. The
+post-run production executable hash is
+`7f7a099ed58298fce261bcde96a7934f6574be8f59493cc7466035deb843515e`.
+The final three-file UBS scan reports zero critical findings, 380 warnings, and
+46 informational findings. The earlier large-future and mutex-lifetime Clippy
+failure is retained separately. Clean-commit stock qualification, full Quill,
+R1, and platform publication remain distinct obligations.
+
+The September 21 changelog supplement now records live replacement-generation
+watching and complete-generation socket ownership, shutdown, execution bounds,
+and progressive serving. All five added representative commit links resolve
+through the GitHub API. Structural validation passes with the existing possible
+bare-hash warning. The live release list still identifies `v1.10.0`, published
+2026-09-08, as the latest binary release; these changes remain unreleased.
