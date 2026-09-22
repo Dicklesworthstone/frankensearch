@@ -163,19 +163,18 @@ pub fn plan_session_merge(
     policy.validate()?;
     for (index, segment) in segments.iter().enumerate() {
         checkpoint(cx)?;
-        let reason = if segment.docid_lo >= segment.docid_hi
-            || segment.docid_hi > u64::from(u32::MAX) + 1
-        {
-            Some("range must be nonempty and fit the global u32 document space")
-        } else if u64::from(segment.doc_count) > segment.docid_hi - segment.docid_lo {
-            Some("physical row count exceeds the covering interval")
-        } else if segment.tombstones.cardinality() > u64::from(segment.doc_count) {
-            Some("tombstone count exceeds physical row count")
-        } else if index > 0 && segments[index - 1].docid_hi > segment.docid_lo {
-            Some("manifest ranges overlap or are out of order")
-        } else {
-            None
-        };
+        let reason =
+            if segment.docid_lo >= segment.docid_hi || segment.docid_hi > u64::from(u32::MAX) + 1 {
+                Some("range must be nonempty and fit the global u32 document space")
+            } else if u64::from(segment.doc_count) > segment.docid_hi - segment.docid_lo {
+                Some("physical row count exceeds the covering interval")
+            } else if segment.tombstones.cardinality() > u64::from(segment.doc_count) {
+                Some("tombstone count exceeds physical row count")
+            } else if index > 0 && segments[index - 1].docid_hi > segment.docid_lo {
+                Some("manifest ranges overlap or are out of order")
+            } else {
+                None
+            };
         if let Some(reason) = reason {
             return Err(SessionMergeError::InvalidSegment {
                 segment_id: segment.segment_id,
@@ -306,9 +305,7 @@ mod tests {
     #[test]
     fn short_sessions_merge_without_relaxing_the_existing_tier_policy() {
         run_test_with_cx(|cx| async move {
-            let segments: Vec<_> = (0..8)
-                .map(|id| segment(id, id * 65_536, 3, 4096))
-                .collect();
+            let segments: Vec<_> = (0..8).map(|id| segment(id, id * 65_536, 3, 4096)).collect();
             let ordinary = TierMergePolicy::from_config(&QuillConfig::default());
             assert!(plan_tier_merge(&segments, ordinary).unwrap().is_none());
             let plan = plan_session_merge(&cx, &segments, SessionMergePolicy::default())
@@ -354,9 +351,7 @@ mod tests {
                 segment(2, 65_536, 3, 1024),
                 segment(3, 131_072, 3, 1024),
             ];
-            let plan = plan_session_merge(&cx, &segments, policy)
-                .unwrap()
-                .unwrap();
+            let plan = plan_session_merge(&cx, &segments, policy).unwrap().unwrap();
             assert_eq!(plan.source_segment_ids, vec![2, 3]);
             assert_eq!(plan.input_bytes, policy.max_input_bytes);
             assert_eq!(plan.input_docs, policy.max_input_docs);
@@ -406,9 +401,7 @@ mod tests {
                 segment(4, 196_608, 3, 1024),
                 segment(5, 262_144, 3, 1024),
             ];
-            let plan = plan_session_merge(&cx, &segments, policy)
-                .unwrap()
-                .unwrap();
+            let plan = plan_session_merge(&cx, &segments, policy).unwrap().unwrap();
             assert_eq!(plan.source_segment_ids, vec![3, 4]);
         });
     }
@@ -426,9 +419,7 @@ mod tests {
                 segment(2, 65_536, 1, 1),
                 segment(3, 131_072, 1, 1),
             ];
-            let plan = plan_session_merge(&cx, &segments, policy)
-                .unwrap()
-                .unwrap();
+            let plan = plan_session_merge(&cx, &segments, policy).unwrap().unwrap();
             assert_eq!(plan.source_segment_ids, vec![2, 3]);
         });
     }
