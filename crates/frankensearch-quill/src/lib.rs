@@ -33,6 +33,7 @@ pub mod quiver;
 pub mod schema;
 pub mod scribe;
 pub mod segment;
+pub mod session_merge;
 pub mod snippet;
 pub mod stats;
 pub mod tracing_conventions;
@@ -97,6 +98,10 @@ pub use segment::{
     EncodedSegment, FSLX_FORMAT_VERSION, FSLX_SECTION_ALIGNMENT, FSLX_SEGMENT_MAGIC,
     PendingSegmentFile, SectionEntry, SectionInput, SectionKind, SegmentHeader, SegmentHeaderInput,
     SegmentLimits, SegmentReader,
+};
+pub use session_merge::{
+    MAX_SESSION_MERGE_FANOUT, SessionMergeError, SessionMergePlan, SessionMergePolicy,
+    plan_session_merge,
 };
 pub use snippet::{DEFAULT_SNIPPET_MAX_CHARS, SnippetConfig, SnippetGenerator, SnippetTerm};
 pub use stats::{SegmentStats, SegmentStatsProvider};
