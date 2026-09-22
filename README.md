@@ -377,6 +377,11 @@ fsfs compact --index-dir ./search-store
 fsfs search "ownership rules" --expand --index-dir ./search-store --format json
 ```
 
+For a relative configured index directory, commands also find the nearest
+existing store in a parent directory when run from a project subdirectory.
+Corrupt selections and interrupted first publications produce errors at that
+store instead of redirecting the command to a different legacy index.
+
 `delete` supports exact IDs and `--prefix`; it updates lexical membership, every
 present vector tier, and the catalog in a new generation. Source files remain
 on disk and can be indexed again by a later rebuild. `compact` also publishes a

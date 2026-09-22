@@ -9124,20 +9124,17 @@ impl FsfsRuntime {
         // doc in ≥2 variants) is exactly when `.entry(path.clone())` would re-clone an
         // already-present key. `ahash` (not SipHash) matches the sibling RRF paths.
         // Owned strings are materialized only for the top-`limit` output rows.
-        // Bit-identical to the prior owned-key form (`expand_fuse_ab` bench: ~2.8–3.2×).
         let mut scores: ahash::AHashMap<&str, f64> = ahash::AHashMap::new();
         let mut snippets: ahash::AHashMap<&str, &str> = ahash::AHashMap::new();
         let mut best_lexical_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
         let mut best_semantic_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
         let mut best_hash_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
-        let mut appeared_in_count: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
 
         for payload in payloads {
             for hit in &payload.hits {
                 let key = hit.path.as_str();
                 let contribution = 1.0 / (k + hit.rank as f64);
                 *scores.entry(key).or_default() += contribution;
-                *appeared_in_count.entry(key).or_default() += 1;
 
                 // Keep the first non-empty snippet.
                 if let Some(snippet) = &hit.snippet {
@@ -9183,7 +9180,10 @@ impl FsfsRuntime {
                 let lexical_rank = best_lexical_rank.get(path).copied();
                 let semantic_rank = best_semantic_rank.get(path).copied();
                 let hash_rank = best_hash_rank.get(path).copied();
-                let in_multiple = appeared_in_count.get(path).copied().unwrap_or(0) > 1;
+                // Query variants contribute votes, while source overlap still
+                // means lexical and vector retrieval found this document.
+                let in_both_sources =
+                    lexical_rank.is_some() && (semantic_rank.is_some() || hash_rank.is_some());
                 SearchHitPayload {
                     rank: idx.saturating_add(1),
                     path: path.to_owned(),
@@ -9192,7 +9192,7 @@ impl FsfsRuntime {
                     lexical_rank,
                     semantic_rank,
                     hash_rank,
-                    in_both_sources: in_multiple,
+                    in_both_sources,
                 }
             })
             .collect();
@@ -13787,20 +13787,20 @@ impl FsfsRuntime {
         }
 
         let cwd = std::env::current_dir().map_err(SearchError::Io)?;
-        let mut probe = Some(cwd.as_path());
-        while let Some(path) = probe {
-            let candidate = path.join(&configured);
-            if candidate.join(FSFS_SENTINEL_FILE).exists()
-                || candidate.join(FSFS_VECTOR_MANIFEST_FILE).exists()
-                || candidate.join(FSFS_LEXICAL_MANIFEST_FILE).exists()
-                || candidate.join(FSFS_VECTOR_INDEX_FILE).exists()
-            {
-                return Ok(candidate);
-            }
-            probe = path.parent();
-        }
-
-        Ok(cwd.join(configured))
+        crate::index_root_discovery::find_ancestor_index(
+            &cwd,
+            &configured,
+            &[
+                crate::generation_store::COMPLETE_GENERATION_POINTER,
+                crate::generation_store::COMPLETE_GENERATION_MANIFEST,
+                "generations",
+                FSFS_SENTINEL_FILE,
+                FSFS_VECTOR_MANIFEST_FILE,
+                FSFS_LEXICAL_MANIFEST_FILE,
+                FSFS_VECTOR_INDEX_FILE,
+            ],
+        )
+        .map_err(SearchError::Io)
     }
 
     fn read_index_sentinel(index_root: &Path) -> SearchResult<Option<IndexSentinel>> {
@@ -38968,6 +38968,91 @@ mod tests {
         assert_eq!(session.hits[0].semantic_rank, None);
         assert_eq!(session.hits[0].hash_score, Some(0.4));
         assert_eq!(session.hits[0].semantic_score, None);
+    }
+
+    #[test]
+    fn fuse_expanded_payloads_reports_sources_independently_of_query_votes() {
+        for hash_control in [false, true] {
+            let hit = |rank, path: &str, lexical_rank, vector_rank| SearchHitPayload {
+                rank,
+                path: path.to_owned(),
+                score: 0.2,
+                snippet: None,
+                lexical_rank,
+                semantic_rank: if hash_control { None } else { vector_rank },
+                hash_rank: if hash_control { vector_rank } else { None },
+                in_both_sources: lexical_rank.is_some() && vector_rank.is_some(),
+            };
+            let generation = if hash_control {
+                "fnv1a-256"
+            } else {
+                "fixture-semantic-384"
+            };
+            let original = SearchPayload::new(
+                "original",
+                SearchOutputPhase::Initial,
+                4,
+                vec![
+                    hit(1, "lexical.md", Some(4), None),
+                    hit(2, "hybrid.md", Some(5), Some(2)),
+                    hit(3, "split.md", Some(3), None),
+                    hit(4, "vector.md", None, Some(1)),
+                ],
+            )
+            .with_vector_generation(generation, hash_control);
+            let synonym = SearchPayload::new(
+                "synonym",
+                SearchOutputPhase::Initial,
+                3,
+                vec![
+                    hit(1, "lexical.md", Some(0), None),
+                    hit(2, "split.md", None, Some(0)),
+                    hit(3, "vector.md", None, Some(2)),
+                ],
+            )
+            .with_vector_generation(generation, hash_control);
+
+            let fused =
+                FsfsRuntime::fuse_expanded_payloads("original", &[original, synonym], 10, 60.0);
+            let by_path = |path: &str| {
+                fused
+                    .hits
+                    .iter()
+                    .find(|hit| hit.path == path)
+                    .expect("every distinct candidate survives fusion")
+            };
+            assert_eq!(fused.hits.len(), 4);
+            assert!(
+                !by_path("lexical.md").in_both_sources,
+                "two lexical query votes still have only one retrieval source"
+            );
+            assert!(
+                !by_path("vector.md").in_both_sources,
+                "two vector query votes still have only one retrieval source"
+            );
+            assert!(
+                by_path("hybrid.md").in_both_sources,
+                "one query can find a document in both retrieval sources"
+            );
+            assert!(
+                by_path("split.md").in_both_sources,
+                "lexical and vector evidence can arrive from different variants"
+            );
+            assert_eq!(by_path("lexical.md").lexical_rank, Some(0));
+            let split = by_path("split.md");
+            assert_eq!(split.lexical_rank, Some(3));
+            assert_eq!(split.semantic_rank, (!hash_control).then_some(0));
+            assert_eq!(split.hash_rank, hash_control.then_some(0));
+            assert_eq!(
+                by_path("lexical.md").score.to_bits(),
+                (2.0_f64 / 61.0).to_bits(),
+                "source reporting must preserve independent query votes"
+            );
+            assert_eq!(
+                by_path("hybrid.md").score.to_bits(),
+                (1.0_f64 / 62.0).to_bits()
+            );
+        }
     }
 
     #[test]
