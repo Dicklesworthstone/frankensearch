@@ -305,6 +305,9 @@ impl FsfsRuntime {
     /// existing readers and directories survive subsequent publications.
     /// The store must be outside the source tree, and the catalog must use the
     /// `{index_dir}` layout so no old-generation database is modified.
+    /// Same-process successors can reuse checkpoint-proven embeddings in an
+    /// independent copy. `full_reindex` disables reuse; unproven inputs are
+    /// recomputed through the ordinary indexer and its producer checks.
     ///
     /// # Errors
     /// Returns the original indexing/admission error without changing the
@@ -357,13 +360,7 @@ impl FsfsRuntime {
         // unrelated runtime with no blocking pool.
         let mut candidate = self.clone().with_cli_input(input);
         candidate.config.indexing.watch_mode = false;
-        Box::pin(candidate.run_one_shot_index_scaffold_internal(
-            cx,
-            CliCommand::Index,
-            |_| Ok(()),
-            false,
-        ))
-        .await?;
+        Box::pin(candidate.run_retained_index_with_reuse(cx, &store, build.path())).await?;
 
         // An indexing command can return success with deferred semantic rows.
         // Apply the same full-generation admission used by actual search, then
@@ -909,3 +906,6 @@ mod complete_cli;
 #[cfg(unix)]
 #[path = "runtime/complete_watch.rs"]
 mod complete_watch;
+
+#[path = "runtime/retained_reuse.rs"]
+mod retained_reuse;
