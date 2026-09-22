@@ -230,7 +230,11 @@ impl AppendInput {
         // Replacement releases the superseded body, rather than charging its
         // size forever. Encoded-byte accounting still bounds repeated updates.
         let old_bytes = previous.map_or(0, String::len);
-        let new_key_bytes = if previous.is_none() { document.id.len() } else { 0 };
+        let new_key_bytes = if previous.is_none() {
+            document.id.len()
+        } else {
+            0
+        };
         let retained_bytes = self
             .retained_bytes
             .checked_sub(old_bytes)
@@ -366,7 +370,10 @@ mod tests {
                     &cx,
                     &bytes,
                     1,
-                    InputLimits { wire_bytes: bytes.len() - 1, ..exact },
+                    InputLimits {
+                        wire_bytes: bytes.len() - 1,
+                        ..exact
+                    },
                 )
                 .unwrap_err(),
                 "encoded-byte",
@@ -376,7 +383,10 @@ mod tests {
                     &cx,
                     &bytes,
                     1,
-                    InputLimits { record_bytes: bytes.len() - 2, ..exact },
+                    InputLimits {
+                        record_bytes: bytes.len() - 2,
+                        ..exact
+                    },
                 )
                 .unwrap_err(),
                 "record-byte",
@@ -443,7 +453,10 @@ mod tests {
                     &cx,
                     &bytes,
                     2,
-                    InputLimits { retained_bytes: 3, ..limits },
+                    InputLimits {
+                        retained_bytes: 3,
+                        ..limits
+                    },
                 )
                 .unwrap_err(),
                 "retained-payload-byte",
@@ -464,10 +477,8 @@ mod tests {
             bytes.extend(record("x", "hello"));
             assert_eq!(parse(&cx, &bytes, 3, INPUT_LIMITS).unwrap()["x"], "hello");
             bytes.extend(record("x", "  "));
-            assert!(
-                matches!(parse(&cx, &bytes, 3, INPUT_LIMITS),
-                    Err(SearchError::InvalidConfig { value, .. }) if value == "empty_canonical_text")
-            );
+            assert!(matches!(parse(&cx, &bytes, 3, INPUT_LIMITS),
+                    Err(SearchError::InvalidConfig { value, .. }) if value == "empty_canonical_text"));
         });
     }
 
@@ -480,9 +491,7 @@ mod tests {
             let display = error.to_string();
             assert!(!display.contains("private-id"));
             assert!(!display.contains("private-body"));
-            assert!(
-                matches!(error, SearchError::InvalidConfig { value, .. } if value == "line 2")
-            );
+            assert!(matches!(error, SearchError::InvalidConfig { value, .. } if value == "line 2"));
             for invalid in [
                 b"\xff\n".as_slice(),
                 b"{\"id\":\"\",\"text\":\"hello\"}\n",
@@ -621,10 +630,8 @@ mod tests {
     fn io_failure_after_valid_records_returns_no_partial_batch() {
         run_test_with_cx(|cx| async move {
             let mut reader = FailingReader { reads: 0 };
-            assert!(
-                matches!(read_sync(&cx, &mut reader, INPUT_LIMITS),
-                    Err(SearchError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied)
-            );
+            assert!(matches!(read_sync(&cx, &mut reader, INPUT_LIMITS),
+                    Err(SearchError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied));
             assert_eq!(reader.reads, 3);
         });
     }
@@ -641,7 +648,9 @@ mod tests {
                 expected,
             );
             assert_eq!(
-                read_async(&cx, &mut bytes.as_slice(), INPUT_LIMITS).await.unwrap(),
+                read_async(&cx, &mut bytes.as_slice(), INPUT_LIMITS)
+                    .await
+                    .unwrap(),
                 expected,
             );
         });
@@ -655,8 +664,8 @@ mod tests {
             let root = parent.path().join("store");
             let bytes = record("not-a-source-path", "hello");
             std::fs::write(&path, &bytes).unwrap();
-            let runtime = FsfsRuntime::new(crate::FsfsConfig::default())
-                .with_cli_input(crate::CliInput {
+            let runtime =
+                FsfsRuntime::new(crate::FsfsConfig::default()).with_cli_input(crate::CliInput {
                     command: crate::CliCommand::AppendBatch,
                     input_file: Some(path.clone()),
                     index_dir: Some(root.clone()),

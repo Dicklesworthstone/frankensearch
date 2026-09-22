@@ -435,11 +435,7 @@ fn seed_candidate(
 /// both the memory bound and cooperative cancellation. The iterator may read
 /// one over-budget entry to distinguish an exact fit from overflow, but that
 /// entry is never retained and no subsequent entry is requested.
-fn collect_copy_entries<T, I>(
-    cx: &Cx,
-    mut source: I,
-    stats: &mut CopyStats,
-) -> SearchResult<Vec<T>>
+fn collect_copy_entries<T, I>(cx: &Cx, mut source: I, stats: &mut CopyStats) -> SearchResult<Vec<T>>
 where
     I: Iterator<Item = std::io::Result<T>>,
 {
@@ -761,10 +757,8 @@ mod copy_tests {
             ]
             .into_iter();
             let mut stats = CopyStats::default();
-            assert!(
-                matches!(collect_copy_entries(&cx, &mut source, &mut stats),
-                    Err(SearchError::Io(error)) if error.kind() == ErrorKind::PermissionDenied)
-            );
+            assert!(matches!(collect_copy_entries(&cx, &mut source, &mut stats),
+                    Err(SearchError::Io(error)) if error.kind() == ErrorKind::PermissionDenied));
             assert_eq!(stats.entries, 1);
             assert_eq!(source.next().unwrap().unwrap(), 2);
         });
