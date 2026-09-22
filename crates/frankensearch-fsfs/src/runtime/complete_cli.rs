@@ -56,7 +56,7 @@ impl FsfsRuntime {
     ///
     /// # Errors
     /// Returns command, selection, indexing, search, output or cancellation errors.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn run_mode_with_complete_generations(
         &self,
         cx: &Cx,
@@ -95,6 +95,17 @@ impl FsfsRuntime {
                 self.run_complete_generation_search_with_writer(cx, &root, &mut stdout)
                     .await
             }
+            CliCommand::Explain => {
+                self.run_complete_generation_explain_with_writer(cx, &root, &mut stdout)
+            }
+            CliCommand::Delete => {
+                self.run_complete_generation_delete_with_writer(cx, &root, &mut stdout)
+                    .await
+            }
+            CliCommand::Compact => {
+                self.run_complete_generation_compact_with_writer(cx, &root, &mut stdout)
+                    .await
+            }
             #[cfg(unix)]
             CliCommand::Serve => self.run_complete_generation_serve(cx, &root).await,
             #[cfg(unix)]
@@ -115,7 +126,7 @@ impl FsfsRuntime {
             }
             _ => Err(complete_cli_error(
                 "command",
-                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, direct search, serve, daemon, status, or doctor",
+                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, delete, compact, search, explain, serve, daemon, status, or doctor",
             )),
         }
     }
@@ -216,18 +227,93 @@ impl FsfsRuntime {
         writer.flush().map_err(SearchError::Io)
     }
 
+    async fn run_complete_generation_delete_with_writer<W: Write>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let (publication, deleted) = self.delete_retained_generation(cx, root).await?;
+        let generation = publication.map(require_durable_publication).transpose()?;
+        if self.cli_input.format == OutputFormat::Table {
+            writeln!(writer, "{deleted} documents deleted")?;
+            if let Some(generation) = &generation {
+                writeln!(
+                    writer,
+                    "Published complete generation {} (durable; predecessors retained)",
+                    generation.id(),
+                )?;
+            }
+        } else {
+            let mut payload = serde_json::json!({
+                "deleted": deleted,
+                "generation_changed": generation.is_some(),
+            });
+            if let Some(generation) = &generation {
+                payload["generation_id"] = serde_json::json!(generation.id());
+                payload["generation_path"] = serde_json::json!(generation.path());
+                payload["manifest_sha256"] = serde_json::json!(generation.manifest_sha256());
+                payload["publication"] = serde_json::json!("durable");
+                payload["generation_complete"] = serde_json::json!(true);
+            }
+            let envelope = OutputEnvelope::success(
+                payload,
+                meta_for_format("delete", self.cli_input.format),
+                iso_timestamp_now(),
+            );
+            emit_envelope(&envelope, self.cli_input.format, writer)?;
+            if !matches!(
+                self.cli_input.format,
+                OutputFormat::Jsonl | OutputFormat::Csv
+            ) {
+                writer.write_all(b"\n")?;
+            }
+        }
+        writer.flush().map_err(SearchError::Io)
+    }
+
+    async fn run_complete_generation_compact_with_writer<W: Write>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let (publication, mut payload) = self.compact_retained_generation(cx, root).await?;
+        let generation = require_durable_publication(publication)?;
+        if self.cli_input.format == OutputFormat::Table {
+            writeln!(
+                writer,
+                "Compacted all present vector tiers into an isolated successor"
+            )?;
+            return self.emit_complete_generation_receipt(root, &generation, "compact", writer);
+        }
+        payload["generation_id"] = serde_json::json!(generation.id());
+        payload["generation_path"] = serde_json::json!(generation.path());
+        payload["store_root"] = serde_json::json!(root);
+        payload["manifest_sha256"] = serde_json::json!(generation.manifest_sha256());
+        payload["publication"] = serde_json::json!("durable");
+        payload["generation_complete"] = serde_json::json!(true);
+        let envelope = OutputEnvelope::success(
+            payload,
+            meta_for_format("compact", self.cli_input.format),
+            iso_timestamp_now(),
+        );
+        emit_envelope(&envelope, self.cli_input.format, writer)?;
+        if !matches!(
+            self.cli_input.format,
+            OutputFormat::Jsonl | OutputFormat::Csv
+        ) {
+            writer.write_all(b"\n")?;
+        }
+        writer.flush().map_err(SearchError::Io)
+    }
+
     async fn run_complete_generation_search_with_writer<W: Write + Send>(
         &self,
         cx: &Cx,
         root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
-        if self.cli_input.expand {
-            return Err(complete_cli_error(
-                "search_options",
-                "complete-generation search does not support --expand; no fallback was attempted",
-            ));
-        }
         let query = self
             .cli_input
             .query
@@ -250,6 +336,11 @@ impl FsfsRuntime {
             ));
         }
         let started = Instant::now();
+        if self.cli_input.expand {
+            return self
+                .run_complete_expanded_search(cx, root, query, limit, started, writer)
+                .await;
+        }
         if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
             #[cfg(unix)]
             {
@@ -270,6 +361,9 @@ impl FsfsRuntime {
             ));
         }
         let mut reader = self.open_retained_search(cx, root).await?;
+        reader
+            .runtime
+            .enable_complete_generation_explanations(root, &reader.generation)?;
         if self.cli_input.stream {
             let stream_id = format!("search-{}-{}", pressure_timestamp_ms(), std::process::id());
             return reader
@@ -284,17 +378,204 @@ impl FsfsRuntime {
                         &mut reader.resources,
                         SearchExecutionFlags {
                             include_snippets: true,
-                            persist_explain_session: false,
+                            persist_explain_session: true,
                         },
                     )),
                 )
                 .await;
         }
-        let payloads = reader.search(cx, query, limit).await?;
+        let payloads = reader
+            .runtime
+            .execute_search_payloads_with_mode_using_resources(
+                cx,
+                query,
+                limit,
+                super::SearchExecutionMode::Full,
+                &mut reader.resources,
+                SearchExecutionFlags {
+                    include_snippets: true,
+                    persist_explain_session: true,
+                },
+            )
+            .await?;
         let payload = payloads.last().cloned().ok_or_else(|| {
             complete_cli_error("search", "search completed without an Initial phase")
         })?;
         self.emit_complete_search_payload(payload, started, writer)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_complete_expanded_search<W: Write + Send>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        query: &str,
+        limit: usize,
+        started: Instant,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        // Pin before the expansion request. A publication during the LLM call
+        // or between variants must not mix lexical, vector or catalog inputs.
+        let mut reader = self.open_retained_search(cx, root).await?;
+        reader
+            .runtime
+            .enable_complete_generation_explanations(root, &reader.generation)?;
+        if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
+            tracing::warn!(
+                "--expand executes directly against one retained generation; daemon forwarding is ignored"
+            );
+        }
+        if !self.cli_input.stream {
+            let expansion = Self::expand_search_query(cx, query).await?;
+            let payload = Self::execute_retained_expanded_queries(
+                cx,
+                &mut reader,
+                query,
+                limit,
+                &expansion.queries,
+            )
+            .await?;
+            if expansion.queries.len() > 1 {
+                reader
+                    .runtime
+                    .invalidate_complete_generation_explanation(query)?;
+            }
+            return self.emit_complete_search_payload(payload, started, writer);
+        }
+
+        let stream_id = format!("search-{}-{}", pressure_timestamp_ms(), std::process::id());
+        let mut seq = 0;
+        reader
+            .runtime
+            .emit_search_stream_started(query, &stream_id, &mut seq, writer)?;
+        let result = async {
+            // Deliver Initial immediately. Retain the ordinary terminal phase
+            // until expansion chooses the single final ranking for this stream.
+            let mut sink = |payload: &crate::output_schema::SearchPayload| {
+                if payload.phase == crate::output_schema::SearchOutputPhase::Initial {
+                    self.emit_search_stream_payload(payload, &stream_id, &mut seq, writer)?;
+                }
+                Ok(())
+            };
+            let original = reader
+                .runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    cx,
+                    query,
+                    limit,
+                    super::SearchExecutionMode::Full,
+                    &mut reader.resources,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: false,
+                    },
+                    Some(&mut sink),
+                )
+                .await?;
+            let expansion = Self::expand_search_query(cx, query).await?;
+            if expansion.queries.len() > 1 {
+                let payload = Self::execute_retained_expanded_queries(
+                    cx,
+                    &mut reader,
+                    query,
+                    limit,
+                    &expansion.queries,
+                )
+                .await?;
+                self.emit_search_stream_payload_with_stage(
+                    &payload,
+                    &stream_id,
+                    &mut seq,
+                    writer,
+                    Some((
+                        "retrieve.expansion",
+                        "query.stream.expanded_ready",
+                        "expanded query rankings fused",
+                    )),
+                )?;
+                retained_search_checkpoint(cx)?;
+                reader
+                    .runtime
+                    .invalidate_complete_generation_explanation(query)?;
+            } else {
+                let last = original
+                    .last()
+                    .ok_or_else(|| complete_cli_error("search", "search returned no phase"))?;
+                if last.phase != crate::output_schema::SearchOutputPhase::Initial {
+                    self.emit_search_stream_payload(&last.payload, &stream_id, &mut seq, writer)?;
+                }
+                retained_search_checkpoint(cx)?;
+                reader.runtime.persist_search_artifact_explanation(
+                    &reader.resources.index_root,
+                    query,
+                    last,
+                );
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => self.emit_search_stream_terminal_completed(&stream_id, &mut seq, writer),
+            Err(error) => {
+                self.emit_search_stream_terminal_error(&stream_id, &error, &mut seq, writer)?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn execute_retained_expanded_queries(
+        cx: &Cx,
+        reader: &mut super::RetainedSearchReader,
+        query: &str,
+        limit: usize,
+        queries: &[crate::query_expansion::ExpandedQuery],
+    ) -> SearchResult<crate::output_schema::SearchPayload> {
+        retained_search_checkpoint(cx)?;
+        if queries.len() <= 1 {
+            return reader
+                .runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    cx,
+                    query,
+                    limit,
+                    super::SearchExecutionMode::Full,
+                    &mut reader.resources,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: reader.runtime.complete_explain_target.is_some(),
+                    },
+                )
+                .await?
+                .pop()
+                .ok_or_else(|| complete_cli_error("search", "search returned no phase"));
+        }
+        let fingerprint = reader.resources.generation_fingerprint.clone();
+        let payloads = reader
+            .runtime
+            .execute_expanded_query_variants(
+                cx,
+                queries,
+                limit.saturating_mul(2).max(20),
+                &mut reader.resources,
+                &fingerprint,
+                SearchExecutionFlags {
+                    include_snippets: true,
+                    persist_explain_session: false,
+                },
+            )
+            .await?;
+        retained_search_checkpoint(cx)?;
+        Self::validate_search_generation_fingerprint(
+            &reader.resources.index_root,
+            &fingerprint,
+            super::SearchExecutionMode::Full,
+        )?;
+        Ok(Self::fuse_expanded_payloads(
+            query,
+            &payloads,
+            limit,
+            reader.runtime.config.search.rrf_k,
+        ))
     }
 
     fn emit_complete_search_payload<W: Write>(
@@ -528,6 +809,122 @@ mod tests {
         assert_eq!(receipt["ok"], true);
         assert_eq!(receipt["data"]["publication"], "durable");
         receipt
+    }
+
+    #[test]
+    fn complete_expansion_pins_all_variants_and_preserves_sealed_inventories() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let predecessor = reader.generation().clone();
+            let before = fs::read(predecessor.path().join(COMPLETE_GENERATION_MANIFEST)).unwrap();
+            fs::write(source.join("beta.md"), "sharedtoken beta successor").unwrap();
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let selected = store.active(&cx).unwrap().unwrap();
+            let queries = [
+                crate::query_expansion::ExpandedQuery {
+                    text: "sharedtoken".to_owned(),
+                    strategy: crate::query_expansion::ExpansionStrategy::Original,
+                },
+                crate::query_expansion::ExpandedQuery {
+                    text: "alpha beta".to_owned(),
+                    strategy: crate::query_expansion::ExpansionStrategy::Keyword,
+                },
+            ];
+            let old = FsfsRuntime::execute_retained_expanded_queries(
+                &cx,
+                &mut reader,
+                "sharedtoken",
+                10,
+                &queries,
+            )
+            .await
+            .unwrap();
+            assert_eq!(old.hits.len(), 1);
+            assert_eq!(old.hits[0].path, "alpha.md");
+            assert_eq!(reader.generation(), &predecessor);
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let new = FsfsRuntime::execute_retained_expanded_queries(
+                &cx,
+                &mut fresh,
+                "sharedtoken",
+                10,
+                &queries,
+            )
+            .await
+            .unwrap();
+            assert_eq!(new.hits.len(), 2);
+            assert_eq!(new.query, "sharedtoken");
+            assert_eq!(store.active(&cx).unwrap(), Some(selected));
+            assert_eq!(
+                fs::read(predecessor.path().join(COMPLETE_GENERATION_MANIFEST)).unwrap(),
+                before,
+            );
+            for generation in [reader.generation(), fresh.generation()] {
+                assert!(
+                    !generation
+                        .path()
+                        .join(super::super::FSFS_EXPLAIN_SESSION_FILE)
+                        .exists()
+                );
+                assert!(!generation.path().join("query_cache").exists());
+            }
+        });
+    }
+
+    #[test]
+    fn complete_expansion_without_provider_preserves_original_phase_and_cancellation() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let original = reader
+                .search(&cx, "sharedtoken", 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let expansion = crate::query_expansion::expand_query(
+                "sharedtoken",
+                &std::collections::HashMap::new(),
+            );
+            assert_eq!(expansion.queries.len(), 1);
+            let fallback = FsfsRuntime::execute_retained_expanded_queries(
+                &cx,
+                &mut reader,
+                "sharedtoken",
+                1,
+                &expansion.queries,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fallback.phase, original.phase);
+            assert_eq!(fallback.hits, original.hits);
+            let selected = reader.generation().clone();
+            cx.set_cancel_requested(true);
+            let error = FsfsRuntime::execute_retained_expanded_queries(
+                &cx,
+                &mut reader,
+                "sharedtoken",
+                1,
+                &expansion.queries,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(selected),
+            );
+        });
     }
 
     struct PublicationWriter {
@@ -867,27 +1264,103 @@ mod tests {
     }
 
     #[test]
-    fn complete_cli_refuses_legacy_mutators_without_touching_the_selected_bundle() {
+    fn complete_cli_refuses_legacy_flush_without_touching_the_selected_bundle() {
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(directory.path());
             publish(&runtime, &cx, &root).await;
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
             let before = store.active(&cx).unwrap();
-            for command in [CliCommand::Compact, CliCommand::Flush, CliCommand::Delete] {
-                let mut input = runtime.cli_input.clone();
-                input.command = command;
-                if command == CliCommand::Delete {
-                    input.query = Some("alpha.md".to_owned());
-                }
-                runtime
-                    .clone()
-                    .with_cli_input(input)
-                    .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+            let mut input = runtime.cli_input.clone();
+            input.command = CliCommand::Flush;
+            runtime
+                .clone()
+                .with_cli_input(input)
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await
+                .unwrap_err();
+            assert_eq!(store.active(&cx).unwrap(), before);
+        });
+    }
+
+    #[test]
+    fn complete_cli_mutation_receipts_match_selection_and_preserve_old_readers() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let predecessor = store.active(&cx).unwrap().unwrap();
+            let inventory =
+                fs::read(predecessor.path().join(COMPLETE_GENERATION_MANIFEST)).unwrap();
+            let mut old_reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let mut input = runtime.cli_input.clone();
+            input.command = CliCommand::Delete;
+            input.delete_ids = vec!["missing.md".to_owned()];
+            let mut delete = runtime.clone().with_cli_input(input);
+            let mut output = Vec::new();
+            delete
+                .run_complete_generation_delete_with_writer(&cx, &root, &mut output)
+                .await
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(receipt["ok"], true);
+            assert_eq!(receipt["data"]["deleted"], 0);
+            assert_eq!(receipt["data"]["generation_changed"], false);
+            assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
+
+            delete.cli_input.delete_ids = vec!["alpha.md".to_owned()];
+            output.clear();
+            delete
+                .run_complete_generation_delete_with_writer(&cx, &root, &mut output)
+                .await
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            let deleted = store.active(&cx).unwrap().unwrap();
+            assert_eq!(receipt["data"]["deleted"], 1);
+            assert_eq!(receipt["data"]["generation_changed"], true);
+            assert_eq!(receipt["data"]["publication"], "durable");
+            assert_eq!(receipt["data"]["generation_id"], deleted.id());
+            assert_ne!(deleted.id(), predecessor.id());
+            assert!(source.join("alpha.md").is_file());
+
+            output.clear();
+            runtime
+                .run_complete_generation_compact_with_writer(&cx, &root, &mut output)
+                .await
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            let compacted = store.active(&cx).unwrap().unwrap();
+            assert_eq!(receipt["ok"], true);
+            assert_eq!(receipt["data"]["publication"], "durable");
+            assert_eq!(receipt["data"]["generation_id"], compacted.id());
+            assert_ne!(compacted.id(), deleted.id());
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert!(
+                fresh
+                    .search(&cx, "sharedtoken", 10)
                     .await
-                    .unwrap_err();
-                assert_eq!(store.active(&cx).unwrap(), before);
-            }
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .is_empty()
+            );
+            assert_eq!(
+                old_reader
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert_eq!(
+                fs::read(predecessor.path().join(COMPLETE_GENERATION_MANIFEST)).unwrap(),
+                inventory
+            );
         });
     }
 }

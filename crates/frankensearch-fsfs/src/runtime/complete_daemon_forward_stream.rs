@@ -105,6 +105,10 @@ pub(super) async fn serve(
         validate_request(runtime, session.store.root(), &request.request)?;
         session.refresh(cx).await?;
         let mut query_runtime = session.reader.runtime.clone();
+        query_runtime.enable_complete_generation_explanations(
+            session.store.root(),
+            session.reader.generation(),
+        )?;
         query_runtime.cli_input.command = CliCommand::Search;
         query_runtime.cli_input.query = Some(request.request.search.query.clone());
         query_runtime
@@ -131,7 +135,7 @@ pub(super) async fn serve(
                     &mut session.reader.resources,
                     SearchExecutionFlags {
                         include_snippets: true,
-                        persist_explain_session: false,
+                        persist_explain_session: true,
                     },
                 )),
             )
@@ -1035,6 +1039,23 @@ mod generation_tests {
                 if terminal.status == StreamTerminalStatus::Completed)
             );
             assert_eq!(store.active(&cx).unwrap(), selected);
+            let context = FsfsRuntime::load_explain_session_at_root(&root)
+                .unwrap()
+                .unwrap();
+            assert_eq!(context.query, "sharedtoken");
+            assert_eq!(context.hits.len(), 1);
+            assert_eq!(
+                context.complete_generation.as_ref().unwrap().id,
+                selected.as_ref().unwrap().id()
+            );
+            assert!(
+                !selected
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .join("explain/last_search_session.json")
+                    .exists()
+            );
         });
     }
 }

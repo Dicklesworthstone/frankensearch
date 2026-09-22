@@ -362,6 +362,41 @@ fsfs index ~/projects --watch
 fsfs doctor
 ```
 
+### Complete generations (unreleased, opt-in)
+
+The complete-generation store publishes lexical data, vector tiers, and the
+catalog as one retained bundle. Opt in on the initial build; later commands
+recognize the store automatically:
+
+```bash
+FSFS_COMPLETE_GENERATIONS=1 fsfs index ~/projects --index-dir ./search-store
+fsfs search "structured concurrency" --index-dir ./search-store --no-daemon
+fsfs explain 1 --index-dir ./search-store
+fsfs delete src/obsolete.rs --index-dir ./search-store
+fsfs compact --index-dir ./search-store
+fsfs search "ownership rules" --expand --index-dir ./search-store --format json
+```
+
+`delete` supports exact IDs and `--prefix`; it updates lexical membership, every
+present vector tier, and the catalog in a new generation. Source files remain
+on disk and can be indexed again by a later rebuild. `compact` also publishes a
+successor. Existing readers keep their original bundle throughout either
+operation. A delete with no matches leaves the selected generation unchanged.
+
+`search --expand` pins one generation across all variants and counts each
+variant's final ranking once. Expansion executes directly even when `--daemon`
+is set; streamed searches deliver Initial before waiting for optional expansion.
+Without an expansion provider, the original query's normal phases are retained.
+Ordinary direct and forwarded searches save explanation context beside the
+store; `explain` refuses context from a different generation or from a multi-query
+fusion whose component explanations are unavailable.
+Reranking reads the generation's stored document text, so edits or removals in
+the source tree cannot silently change the content scored for retained results.
+
+This is the cooperative local store. The complete FSVI v2 authority migration
+and automatic reclamation of retained generations remain unfinished. Direct
+`append-batch`, `flush`, and TUI routing are still unavailable for these stores.
+
 ## Reproducible Showcase Suite
 
 Use this sequence to reproduce the core demo + benchmark evidence bundle:

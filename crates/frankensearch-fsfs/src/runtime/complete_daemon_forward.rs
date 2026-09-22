@@ -297,6 +297,10 @@ async fn execute(
     // retrieval must point at the same pinned bundle. The filter is request
     // scoped; None explicitly clears any filter from daemon startup.
     let mut query_runtime = session.reader.runtime.clone();
+    query_runtime.enable_complete_generation_explanations(
+        session.store.root(),
+        session.reader.generation(),
+    )?;
     query_runtime.cli_input.command = CliCommand::Search;
     query_runtime.cli_input.query = Some(request.search.query.clone());
     query_runtime
@@ -319,7 +323,7 @@ async fn execute(
             &mut session.reader.resources,
             SearchExecutionFlags {
                 include_snippets: true,
-                persist_explain_session: false,
+                persist_explain_session: true,
             },
             None,
         ),
@@ -754,6 +758,25 @@ mod generation_tests {
                     .query_complete_generation_daemon(&cx, &root, "sharedtoken", 1)
                     .await?;
                 assert_eq!(limited.hits.len(), 1);
+                let context = FsfsRuntime::load_explain_session_at_root(&root)?.unwrap();
+                assert_eq!(context.query, limited.query);
+                assert_eq!(context.hits.len(), 1);
+                assert_eq!(context.hits[0].path, limited.hits[0].path);
+                assert!(context.complete_generation.is_some());
+                let mut explain = client.clone();
+                explain.cli_input.command = CliCommand::Explain;
+                explain.cli_input.result_id = Some("R0".to_owned());
+                let mut explanation = Vec::new();
+                explain.run_complete_generation_explain_with_writer(
+                    &cx,
+                    &root,
+                    &mut explanation,
+                )?;
+                let explanation: serde_json::Value = serde_json::from_slice(&explanation).unwrap();
+                assert_eq!(
+                    explanation["data"]["ranking"]["doc_id"],
+                    limited.hits[0].path
+                );
 
                 let mut different = runtime.config().clone();
                 different.search.fast_only = false;

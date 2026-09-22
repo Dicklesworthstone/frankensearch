@@ -382,6 +382,737 @@ impl FsfsRuntime {
             precommit,
         )
     }
+
+    /// Delete exact IDs or prefixes from an isolated complete successor.
+    ///
+    /// The selected bundle stays immutable and searchable for the entire
+    /// operation. Both vector tiers, lexical membership, the local storage
+    /// catalog and paired manifests change before publication. No source file
+    /// is removed; a later source rebuild can index it again.
+    ///
+    /// A missing match returns no publication. Otherwise the caller must inspect
+    /// the publication outcome before reporting confirmed durability.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn delete_retained_generation(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+    ) -> SearchResult<(
+        Option<crate::generation_store::GenerationPublication>,
+        usize,
+    )> {
+        self.delete_retained_generation_with_precommit(cx, store_root, |_| Ok(()))
+            .await
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn delete_retained_generation_with_precommit<F>(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        precommit: F,
+    ) -> SearchResult<(
+        Option<crate::generation_store::GenerationPublication>,
+        usize,
+    )>
+    where
+        F: FnOnce(&Cx) -> SearchResult<()> + Send,
+    {
+        use crate::generation_store::CompleteGenerationStore;
+
+        retained_search_checkpoint(cx)?;
+        validate_retained_catalog_path(&self.config.storage.db_path)?;
+        if self.cli_input.delete_ids.is_empty() {
+            return Err(complete_cli::complete_cli_error(
+                "delete_ids",
+                "provide at least one document ID or prefix to delete",
+            ));
+        }
+        let store = CompleteGenerationStore::open(cx, store_root)?;
+        let build = store.begin(cx)?;
+        let predecessor = store.active(cx)?.ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "selection",
+                "no complete generation has been published",
+            )
+        })?;
+        Self::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
+        let mut manifests = Self::read_matching_manifest_generation(predecessor.path())?
+            .ok_or_else(|| {
+                complete_cli::complete_cli_error(
+                    "delete_membership",
+                    "selected membership manifests disagree",
+                )
+            })?;
+        // Use the union, not just the fast vector tier: lexical-only documents
+        // and partial quality coverage still belong to the same command.
+        let mut live_ids = manifests.keys().cloned().collect::<BTreeSet<_>>();
+        for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
+            let path = predecessor.path().join(relative);
+            if path.exists() {
+                let index = VectorIndex::open_read_only(&path)?;
+                live_ids.extend(index.live_doc_ids()?);
+            }
+        }
+        let targets = live_ids
+            .into_iter()
+            .filter(|id| {
+                self.cli_input.delete_ids.iter().any(|requested| {
+                    if self.cli_input.delete_prefix {
+                        id.starts_with(requested.as_str())
+                    } else {
+                        id == requested
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Ok((None, 0));
+        }
+        retained_search_checkpoint(cx)?;
+        let mut input = self.cli_input.clone();
+        input.index_dir = Some(build.path().to_path_buf());
+        input.daemon = false;
+        input.daemon_socket = None;
+        let candidate = self.clone().with_cli_input(input);
+        if retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?
+            != predecessor
+        {
+            return Err(complete_cli::complete_cli_error(
+                "delete_selection",
+                "selected predecessor changed while preparing deletion",
+            ));
+        }
+        let candidate_lease = crate::lifecycle::PublicationLease::acquire(build.path())?;
+        candidate_lease.fence("complete-generation delete lexical mutation")?;
+        let lexical_mutations = targets
+            .iter()
+            .map(|id| {
+                LexicalMutation::delete(id.clone(), 0, IngestionClass::Skip, "delete_command")
+            })
+            .collect::<Vec<_>>();
+        candidate
+            .apply_one_shot_lexical_mutations(cx, build.path(), &lexical_mutations)
+            .await?;
+        let refs = targets.iter().map(String::as_str).collect::<Vec<_>>();
+        for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
+            retained_search_checkpoint(cx)?;
+            candidate_lease.fence("complete-generation delete vector mutation")?;
+            let path = build.path().join(relative);
+            if path.exists() {
+                let mut index = Self::open_vector_index_for_mutation(&path)?;
+                index.soft_delete_batch(&refs)?;
+                // Freeze the candidate without a pending WAL. These ordinary
+                // rewrites also invalidate old repair symbols before fresh
+                // protection, so repair cannot resurrect a deleted document.
+                index.compact()?;
+                index.vacuum()?;
+            }
+        }
+        retained_search_checkpoint(cx)?;
+        candidate_lease.fence("complete-generation delete metadata mutation")?;
+        let catalog_path = candidate.resolve_storage_db_path()?;
+        if catalog_path.exists() {
+            let storage = Storage::open(PipelineStorageConfig {
+                db_path: catalog_path,
+                ..PipelineStorageConfig::default()
+            })?;
+            for id in &targets {
+                retained_search_checkpoint(cx)?;
+                storage.delete_document(id)?;
+            }
+        }
+        for id in &targets {
+            manifests.remove(id);
+        }
+        let manifests = manifests.into_values().collect::<Vec<_>>();
+        let layout = Self::resolve_lexical_engine(build.path())?;
+        let lexical_manifest_path = if layout.lexical_root() == build.path() {
+            layout
+                .engine_dir()
+                .map(|path| path.join(FSFS_INDEX_MANIFEST_FILE_NAME))
+                .unwrap_or_else(|| build.path().join(FSFS_LEXICAL_MANIFEST_FILE))
+        } else {
+            build.path().join(FSFS_LEXICAL_MANIFEST_FILE)
+        };
+        candidate.write_index_artifacts(build.path(), &lexical_manifest_path, &manifests)?;
+        let mut sentinel = Self::read_index_sentinel(build.path())?.ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "delete_membership",
+                "candidate has no completion sentinel",
+            )
+        })?;
+        sentinel.command = "delete".to_owned();
+        sentinel.generated_at_ms = pressure_timestamp_ms();
+        sentinel.indexed_files = manifests.len();
+        sentinel.skipped_files = sentinel.discovered_files.saturating_sub(manifests.len());
+        sentinel.total_canonical_bytes = manifests.iter().fold(0_u64, |total, entry| {
+            total.saturating_add(entry.canonical_bytes)
+        });
+        sentinel.source_hash_hex = index_source_hash_hex(&manifests);
+        for reason in protect_vector_generations(build.path(), "complete-generation delete") {
+            if !sentinel.reason_codes.contains(&reason) {
+                sentinel.reason_codes.push(reason);
+            }
+        }
+        candidate.write_index_sentinel(build.path(), &sentinel)?;
+        candidate_lease.fence("complete-generation delete candidate complete")?;
+        // Drop clears the lease's owner record. It must precede sealing so no
+        // destructor writes through the completed bundle's inventory.
+        drop(candidate_lease);
+        retained_search_checkpoint(cx)?;
+        let resources = Box::pin(
+            candidate.prepare_search_execution_resources_at_root_with_modes(
+                cx,
+                build.path(),
+                SearchExecutionMode::Full,
+                SearchExecutionMode::Full,
+            ),
+        )
+        .await?;
+        drop(resources);
+        let publication = build.publish_with_precommit(
+            cx,
+            |_, path| Self::validate_search_generation_at_root(path, SearchExecutionMode::Full),
+            precommit,
+        )?;
+        Ok((Some(publication), targets.len()))
+    }
+
+    /// Compact both vector tiers into a complete successor while old readers
+    /// keep their original files. Counts and timings use the ordinary compact
+    /// command's payload fields; the caller reports success only after checking
+    /// the returned publication outcome.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn compact_retained_generation(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+    ) -> SearchResult<(
+        crate::generation_store::GenerationPublication,
+        serde_json::Value,
+    )> {
+        use crate::generation_store::CompleteGenerationStore;
+
+        retained_search_checkpoint(cx)?;
+        validate_retained_catalog_path(&self.config.storage.db_path)?;
+        let store = CompleteGenerationStore::open(cx, store_root)?;
+        let build = store.begin(cx)?;
+        let mut input = self.cli_input.clone();
+        input.index_dir = Some(build.path().to_path_buf());
+        input.daemon = false;
+        input.daemon_socket = None;
+        let candidate = self.clone().with_cli_input(input);
+        retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?;
+        let candidate_lease = crate::lifecycle::PublicationLease::acquire(build.path())?;
+        let mut payload = serde_json::Value::Null;
+        for (tier, relative) in FSFS_VECTOR_GENERATION_FILES {
+            retained_search_checkpoint(cx)?;
+            candidate_lease.fence("complete-generation vector compaction")?;
+            let path = build.path().join(relative);
+            if tier == "quality" && !path.exists() {
+                continue;
+            }
+            let mut index = Self::open_vector_index_for_mutation(&path)?;
+            let compact = index.compact()?;
+            let vacuum = index.vacuum()?;
+            let stats = serde_json::json!({
+                "main_records_before": compact.main_records_before,
+                "wal_records_merged": compact.wal_records,
+                "total_records_after": vacuum.records_after,
+                "tombstones_removed": vacuum.tombstones_removed,
+                "compaction_elapsed_ms": compact.elapsed_ms,
+                "vacuum_elapsed_ms": vacuum.duration.as_secs_f64() * 1000.0,
+            });
+            if tier == "fast" {
+                payload = stats;
+            } else if let Some(object) = payload.as_object_mut() {
+                object.insert("quality".to_owned(), stats);
+            }
+        }
+        retained_search_checkpoint(cx)?;
+        let mut sentinel = Self::read_index_sentinel(build.path())?.ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "compact_membership",
+                "candidate has no completion sentinel",
+            )
+        })?;
+        sentinel.command = "compact".to_owned();
+        sentinel.generated_at_ms = pressure_timestamp_ms();
+        for reason in protect_vector_generations(build.path(), "complete-generation compact") {
+            if !sentinel.reason_codes.contains(&reason) {
+                sentinel.reason_codes.push(reason);
+            }
+        }
+        candidate.write_index_sentinel(build.path(), &sentinel)?;
+        candidate_lease.fence("complete-generation compact candidate complete")?;
+        drop(candidate_lease);
+        let resources = Box::pin(
+            candidate.prepare_search_execution_resources_at_root_with_modes(
+                cx,
+                build.path(),
+                SearchExecutionMode::Full,
+                SearchExecutionMode::Full,
+            ),
+        )
+        .await?;
+        drop(resources);
+        let publication = build.publish(cx, |_, path| {
+            Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)
+        })?;
+        Ok((publication, payload))
+    }
+}
+
+#[cfg(all(test, unix, not(feature = "embedded-models")))]
+mod retained_delete_tests {
+    use super::*;
+    use crate::generation_store::{
+        CompleteGenerationStore, GenerationPublication, PublishedGeneration,
+    };
+    use asupersync::test_utils::run_test_with_cx;
+
+    async fn fixture(
+        cx: &Cx,
+        parent: &Path,
+        with_wal: bool,
+    ) -> (FsfsRuntime, PathBuf, PathBuf, PublishedGeneration) {
+        let source = parent.join("source");
+        let root = parent.join("store");
+        fs::create_dir(&source).unwrap();
+        for name in ["alpha.md", "beta.md", "beta-notes.md"] {
+            fs::write(source.join(name), format!("sharedtoken document {name}")).unwrap();
+        }
+        let mut config = FsfsConfig::default();
+        config.indexing.offline = true;
+        config.indexing.quality_model.clear();
+        config.search.fast_only = true;
+        config.search.rerank = false;
+        "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Index,
+            target_path: Some(source.clone()),
+            index_dir: Some(root.clone()),
+            quiet: true,
+            ..CliInput::default()
+        });
+        let store = CompleteGenerationStore::create(cx, &root).unwrap();
+        let build = store.begin(cx).unwrap();
+        let mut input = runtime.cli_input.clone();
+        input.index_dir = Some(build.path().to_path_buf());
+        let candidate = runtime.clone().with_cli_input(input);
+        candidate
+            .run_retained_index_with_reuse(cx, &store, build.path())
+            .await
+            .unwrap();
+        // An explicitly synthetic independent quality space checks that the
+        // mutation reaches both physical tiers, without claiming model parity.
+        let mut quality = VectorIndex::create(
+            &build.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE),
+            "test-delete-quality",
+            3,
+        )
+        .unwrap();
+        for name in ["alpha.md", "beta.md", "beta-notes.md"] {
+            quality.write_record(name, &[1.0, 0.0, 0.0]).unwrap();
+        }
+        quality.finish().unwrap();
+        if with_wal {
+            for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
+                let mut index =
+                    FsfsRuntime::open_vector_index_for_mutation(&build.path().join(relative))
+                        .unwrap();
+                let id = index.doc_id_at(0).unwrap().to_owned();
+                let vector = index.vector_at_f32(0).unwrap();
+                index.append(&id, &vector).unwrap();
+                assert_eq!(index.wal_record_count(), 1);
+            }
+        }
+        let storage = Storage::open(PipelineStorageConfig {
+            db_path: candidate.resolve_storage_db_path().unwrap(),
+            ..PipelineStorageConfig::default()
+        })
+        .unwrap();
+        for name in ["alpha.md", "beta.md", "beta-notes.md"] {
+            storage
+                .upsert_document(&frankensearch_storage::DocumentRecord::new(
+                    name,
+                    "sharedtoken catalog row",
+                    [7; 32],
+                    23,
+                    1,
+                    1,
+                ))
+                .unwrap();
+        }
+        drop(storage);
+        assert!(protect_vector_generations(build.path(), "delete test fixture").is_empty());
+        let publication = build
+            .publish(cx, |_, path| {
+                FsfsRuntime::validate_search_generation_at_root(path, SearchExecutionMode::Full)
+            })
+            .unwrap();
+        let GenerationPublication::Durable(generation) = publication else {
+            panic!("test fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
+        };
+        (runtime, source, root, generation)
+    }
+
+    fn deletion(runtime: &FsfsRuntime, ids: &[&str], prefix: bool) -> FsfsRuntime {
+        let mut input = runtime.cli_input.clone();
+        input.command = CliCommand::Delete;
+        input.delete_ids = ids.iter().map(|id| (*id).to_owned()).collect();
+        input.delete_prefix = prefix;
+        runtime.clone().with_cli_input(input)
+    }
+
+    fn live_ids(root: &Path, relative: &str) -> BTreeSet<String> {
+        VectorIndex::open_read_only(&root.join(relative))
+            .unwrap()
+            .live_doc_ids()
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    fn file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files.insert(
+                        entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn retained_delete_updates_both_tiers_catalog_and_manifests_without_retargeting_old_reader() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (runtime, source, root, predecessor) = fixture(&cx, parent.path(), false).await;
+            let before = file_bytes(predecessor.path());
+            let mut old = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let command = deletion(&runtime, &["beta.md", "beta.md", "absent.md"], false);
+            let (publication, deleted) = command
+                .delete_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(deleted, 1);
+            let Some(GenerationPublication::Durable(next)) = publication else {
+                panic!("delete must publish one durable successor"); // ubs:ignore — cfg(test) assertion.
+            };
+            assert_ne!(next.id(), predecessor.id());
+            let expected = BTreeSet::from(["alpha.md".to_owned(), "beta-notes.md".to_owned()]);
+            for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
+                assert_eq!(live_ids(next.path(), relative), expected);
+                assert_eq!(live_ids(predecessor.path(), relative).len(), 3);
+                assert_eq!(
+                    VectorIndex::open_read_only(&next.path().join(relative))
+                        .unwrap()
+                        .wal_record_count(),
+                    0
+                );
+                assert_eq!(
+                    fsfs_fsvi_protector()
+                        .unwrap()
+                        .verify(&next.path().join(relative))
+                        .unwrap(),
+                    FsviVerifyResult::Intact
+                );
+            }
+            let manifests = FsfsRuntime::read_matching_manifest_generation(next.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(manifests.keys().cloned().collect::<BTreeSet<_>>(), expected);
+            let sentinel = FsfsRuntime::read_index_sentinel(next.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(sentinel.indexed_files, 2);
+            assert_eq!(sentinel.index_root, next.path().display().to_string());
+            assert_eq!(
+                sentinel.source_hash_hex,
+                index_source_hash_hex(&manifests.into_values().collect::<Vec<_>>())
+            );
+            assert!(!next.path().join("FSFS-REUSE.json").exists());
+            assert_eq!(
+                old.search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                3
+            );
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let hits = fresh
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .hits;
+            assert_eq!(hits.len(), 2);
+            assert!(!hits.iter().any(|hit| hit.path == "beta.md"));
+            let storage = Storage::open(PipelineStorageConfig {
+                db_path: next.path().join("catalog.sqlite"),
+                ..PipelineStorageConfig::default()
+            })
+            .unwrap();
+            assert!(storage.get_document("beta.md").unwrap().is_none());
+            assert!(storage.get_document("alpha.md").unwrap().is_some());
+            drop(storage);
+            assert!(
+                source.join("beta.md").exists(),
+                "index deletion must retain source files"
+            );
+            assert_eq!(file_bytes(predecessor.path()), before);
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(next)
+            );
+            let (publication, deleted) = deletion(&runtime, &[""], true)
+                .delete_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(deleted, 2);
+            let Some(GenerationPublication::Durable(empty)) = publication else {
+                panic!("deleting every remaining document must publish"); // ubs:ignore — cfg(test) assertion.
+            };
+            for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
+                assert!(live_ids(empty.path(), relative).is_empty());
+            }
+            let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert!(
+                reader
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn retained_delete_prefix_and_no_match_are_truthful() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (runtime, _, root, _) = fixture(&cx, parent.path(), false).await;
+            let command = deletion(&runtime, &["beta"], true);
+            let (publication, deleted) = command
+                .delete_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(deleted, 2);
+            let Some(GenerationPublication::Durable(next)) = publication else {
+                panic!("prefix delete must publish"); // ubs:ignore — cfg(test) assertion.
+            };
+            let (noop, deleted) = command
+                .delete_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert!(noop.is_none());
+            assert_eq!(deleted, 0);
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(next)
+            );
+        });
+    }
+
+    #[test]
+    fn retained_delete_prefix_includes_lexical_only_documents_without_vector_rows() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (runtime, source, root, _) = fixture(&cx, parent.path(), false).await;
+            fs::write(
+                source.join("lexical-data.csv"),
+                "sharedtoken,csv document\n",
+            )
+            .unwrap();
+            let publication = runtime
+                .rebuild_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            let GenerationPublication::Durable(predecessor) = publication else {
+                panic!("lexical-only fixture must publish"); // ubs:ignore — cfg(test) assertion.
+            };
+            let manifest = FsfsRuntime::read_matching_manifest_generation(predecessor.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(manifest["lexical-data.csv"].ingestion_class, "lexical_only");
+            assert!(
+                !live_ids(predecessor.path(), FSFS_VECTOR_INDEX_FILE).contains("lexical-data.csv")
+            );
+            let mut old = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let command = deletion(&runtime, &["lexical-"], true);
+            let (publication, deleted) = command
+                .delete_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(deleted, 1);
+            assert!(matches!(
+                publication,
+                Some(GenerationPublication::Durable(_))
+            ));
+            assert!(
+                old.search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .iter()
+                    .any(|hit| hit.path == "lexical-data.csv")
+            );
+            let mut current = runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert!(
+                !current
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .iter()
+                    .any(|hit| hit.path == "lexical-data.csv")
+            );
+        });
+    }
+
+    #[test]
+    fn retained_delete_cancelled_after_sealing_preserves_predecessor_and_retries() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (runtime, _, root, predecessor) = fixture(&cx, parent.path(), false).await;
+            let before = file_bytes(predecessor.path());
+            let mut old = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let command = deletion(&runtime, &["beta.md"], false);
+            let error = command
+                .delete_retained_generation_with_precommit(&cx, &root, |cx| {
+                    cx.set_cancel_requested(true);
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(predecessor.clone())
+            );
+            assert_eq!(file_bytes(predecessor.path()), before);
+            assert_eq!(
+                old.search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                3
+            );
+            let (publication, deleted) = command
+                .delete_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert!(matches!(
+                publication,
+                Some(GenerationPublication::Durable(_))
+            ));
+            assert_eq!(deleted, 1);
+        });
+    }
+
+    #[test]
+    fn retained_compact_merges_both_wals_while_retaining_readers_and_membership() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (runtime, _, root, predecessor) = fixture(&cx, parent.path(), true).await;
+            let before = file_bytes(predecessor.path());
+            let mut old = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let (publication, stats) = runtime
+                .compact_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            let GenerationPublication::Durable(next) = publication else {
+                panic!("compaction must publish durably"); // ubs:ignore — cfg(test) assertion.
+            };
+            assert_ne!(next.id(), predecessor.id());
+            assert_eq!(stats["wal_records_merged"], 1);
+            assert_eq!(stats["quality"]["wal_records_merged"], 1);
+            assert_eq!(stats["total_records_after"], 3);
+            assert_eq!(stats["quality"]["total_records_after"], 3);
+            for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
+                assert_eq!(
+                    live_ids(next.path(), relative),
+                    live_ids(predecessor.path(), relative)
+                );
+                let index = VectorIndex::open_read_only(&next.path().join(relative)).unwrap();
+                assert_eq!(index.wal_record_count(), 0);
+                assert_eq!(index.tombstone_count(), 0);
+                assert_eq!(
+                    fsfs_fsvi_protector()
+                        .unwrap()
+                        .verify(&next.path().join(relative))
+                        .unwrap(),
+                    FsviVerifyResult::Intact
+                );
+            }
+            assert_eq!(
+                FsfsRuntime::read_matching_manifest_generation(next.path()).unwrap(),
+                FsfsRuntime::read_matching_manifest_generation(predecessor.path()).unwrap()
+            );
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let old_hits = old
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .hits;
+            let fresh_hits = fresh
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .hits;
+            assert_eq!(
+                old_hits.iter().map(|hit| &hit.path).collect::<Vec<_>>(),
+                fresh_hits.iter().map(|hit| &hit.path).collect::<Vec<_>>()
+            );
+            assert_eq!(file_bytes(predecessor.path()), before);
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(next)
+            );
+        });
+    }
 }
 
 #[cfg(test)]

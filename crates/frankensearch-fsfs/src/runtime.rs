@@ -2264,6 +2264,34 @@ fn ema(previous: f64, sample: f64, alpha: f64) -> f64 {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompleteExplainGeneration {
+    id: String,
+    manifest_sha256: String,
+}
+
+impl CompleteExplainGeneration {
+    fn from_generation(generation: &crate::generation_store::PublishedGeneration) -> Self {
+        Self {
+            id: generation.id().to_owned(),
+            manifest_sha256: generation.manifest_sha256().to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompleteExplainTarget {
+    store_root: PathBuf,
+    generation: crate::generation_store::PublishedGeneration,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExplainUnavailableReason {
+    ExpandedQueryFusion,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct ExplainSession {
     schema_version: String,
@@ -2278,6 +2306,10 @@ struct ExplainSession {
     vector_generation_is_hash: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     semantic_blend: Option<SemanticBlendPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    complete_generation: Option<CompleteExplainGeneration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unavailable: Option<ExplainUnavailableReason>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2393,6 +2425,8 @@ impl ExplainSession {
             vector_generation_id: None,
             vector_generation_is_hash: false,
             semantic_blend: None,
+            complete_generation: None,
+            unavailable: None,
         }
     }
 
@@ -4686,6 +4720,9 @@ impl Drop for SearchBlockingPool {
 pub struct FsfsRuntime {
     config: FsfsConfig,
     cli_input: CliInput,
+    /// CLI follow-up state lives beside the selected immutable generation.
+    /// Retained library readers still disable persistence explicitly.
+    complete_explain_target: Option<CompleteExplainTarget>,
     reranker: Arc<std::sync::OnceLock<RerankerSlot>>,
     /// A running worker retains this permit after its caller times out;
     /// a cancelled queued job releases it when the pool discards that job.
@@ -4710,6 +4747,7 @@ impl FsfsRuntime {
         Self {
             config,
             cli_input: CliInput::default(),
+            complete_explain_target: None,
             reranker: Arc::new(std::sync::OnceLock::new()),
             reranker_load_gate: Arc::new(asupersync::sync::Mutex::new(())),
             quality_load_gate: Arc::new(asupersync::sync::Mutex::new(
@@ -7710,6 +7748,7 @@ impl FsfsRuntime {
                 &fingerprint,
                 SearchExecutionMode::Full,
             )?;
+            Self::semantic_retry_checkpoint(cx, "fsfs.search.finalize")?;
             if let Err(error) = self.persist_explain_session_for_cached_payloads(query, &payloads) {
                 warn!(
                     error = %error,
@@ -8082,7 +8121,18 @@ impl FsfsRuntime {
         seq: &mut u64,
         writer: &mut W,
     ) -> SearchResult<()> {
-        let (stage, reason_code, message) = match payload.phase {
+        self.emit_search_stream_payload_with_stage(payload, stream_id, seq, writer, None)
+    }
+
+    fn emit_search_stream_payload_with_stage<W: Write>(
+        &self,
+        payload: &SearchPayload,
+        stream_id: &str,
+        seq: &mut u64,
+        writer: &mut W,
+        stage_override: Option<(&str, &str, &str)>,
+    ) -> SearchResult<()> {
+        let (stage, reason_code, message) = stage_override.unwrap_or(match payload.phase {
             SearchOutputPhase::Initial if payload.vector_generation_is_hash => (
                 "retrieve.hash_control",
                 "query.stream.initial_ready",
@@ -8103,7 +8153,7 @@ impl FsfsRuntime {
                 "query.stream.refinement_failed",
                 "quality refinement failed; returning initial results",
             ),
-        };
+        });
         let timeout_message = payload.quality_timeout.as_ref().map(|timeout| format!(
             "quality refinement exceeded {}ms (observed {}ms); returning initial results; increase search.quality_timeout_ms; running backend work remains owned until completion",
             timeout.budget_ms, timeout.elapsed_ms,
@@ -8191,8 +8241,88 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn run_explain_command(&self) -> SearchResult<()> {
+        let session = self.load_explain_session()?;
+        self.emit_explain_session_with_writer(session.as_ref(), &mut std::io::stdout())
+    }
+
+    /// Bind follow-up output to the exact reader that will execute the query.
+    /// Publication may advance during that query; its session keeps this stamp.
+    fn enable_complete_generation_explanations(
+        &mut self,
+        store_root: &Path,
+        generation: &crate::generation_store::PublishedGeneration,
+    ) -> SearchResult<()> {
+        let store_root = fs::canonicalize(store_root)?;
+        if generation.path() != store_root.join("generations").join(generation.id()) {
+            return Err(complete_cli::complete_cli_error(
+                "explain_generation",
+                "explanation destination does not own the admitted generation",
+            ));
+        }
+        crate::generation_store::reject_published_write(&store_root)?;
+        self.complete_explain_target = Some(CompleteExplainTarget {
+            store_root,
+            generation: generation.clone(),
+        });
+        Ok(())
+    }
+
+    /// Replace old result IDs after a successful expansion whose aggregate
+    /// ranks do not carry a complete per-query explanation. Never delete state
+    /// or let the previous ordinary search stand in for the expanded result.
+    fn invalidate_complete_generation_explanation(&self, query: &str) -> SearchResult<()> {
+        let target = self.complete_explain_target.as_ref().ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "explain_generation",
+                "expanded-query explanation invalidation requires an admitted generation",
+            )
+        })?;
+        let mut session = ExplainSession::from_fused(
+            query,
+            SearchOutputPhase::Initial,
+            self.config.search.rrf_k,
+            &[],
+        );
+        session.unavailable = Some(ExplainUnavailableReason::ExpandedQueryFusion);
+        self.persist_explain_session_value(target.generation.path(), session)
+    }
+
+    fn run_complete_generation_explain_with_writer<W: Write>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        retained_search_checkpoint(cx)?;
+        let store = crate::generation_store::CompleteGenerationStore::open(cx, root)?;
+        let generation = store.active(cx)?.ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "selection",
+                "no complete generation has been published",
+            )
+        })?;
+        let session = Self::load_explain_session_at_root(store.root())?;
+        if let Some(session) = &session
+            && (session.schema_version != EXPLAIN_SESSION_SCHEMA_VERSION
+                || session.complete_generation.as_ref()
+                    != Some(&CompleteExplainGeneration::from_generation(&generation)))
+        {
+            return Err(complete_cli::complete_cli_error(
+                "explain_generation",
+                "saved search context does not belong to the selected complete generation; run `fsfs search <query>` again before explaining a result",
+            ));
+        }
+        retained_search_checkpoint(cx)?;
+        self.emit_explain_session_with_writer(session.as_ref(), writer)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_explain_session_with_writer<W: Write>(
+        &self,
+        session: Option<&ExplainSession>,
+        writer: &mut W,
+    ) -> SearchResult<()> {
         let result_id =
             self.cli_input
                 .result_id
@@ -8202,13 +8332,18 @@ impl FsfsRuntime {
                     value: String::new(),
                     reason: "missing result identifier argument".to_owned(),
                 })?;
-        let session = self
-            .load_explain_session()?
-            .ok_or_else(|| SearchError::InvalidConfig {
-                field: "cli.explain.result_id".to_owned(),
+        let session = session.ok_or_else(|| SearchError::InvalidConfig {
+            field: "cli.explain.result_id".to_owned(),
+            value: result_id.to_owned(),
+            reason: "no saved search context found; run `fsfs search <query>` first".to_owned(),
+        })?;
+        if session.unavailable == Some(ExplainUnavailableReason::ExpandedQueryFusion) {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.explain.query_expansion".to_owned(),
                 value: result_id.to_owned(),
-                reason: "no saved search context found; run `fsfs search <query>` first".to_owned(),
-            })?;
+                reason: "the last search fused multiple expanded queries without complete per-query explanation evidence; run `fsfs search <query>` without --expand before explaining a result".to_owned(),
+            });
+        }
         let hit = session
             .resolve(result_id)
             .ok_or_else(|| SearchError::InvalidConfig {
@@ -8361,7 +8496,8 @@ impl FsfsRuntime {
         }
 
         if self.cli_input.format == OutputFormat::Table {
-            println!(
+            writeln!(
+                writer,
                 "{}",
                 render_explain_table(
                     result_id,
@@ -8371,20 +8507,19 @@ impl FsfsRuntime {
                     session.vector_generation_is_hash,
                     session.vector_generation_id.as_deref(),
                 )
-            );
+            )?;
             for warning in &warnings {
-                println!("warning[{}]: {}", warning.code, warning.message);
+                writeln!(writer, "warning[{}]: {}", warning.code, warning.message)?;
             }
-            return Ok(());
+            return writer.flush().map_err(SearchError::Io);
         }
 
         let meta = meta_for_format("explain", self.cli_input.format);
         let envelope =
             OutputEnvelope::success(payload, meta, iso_timestamp_now()).with_warnings(warnings);
-        let mut stdout = std::io::stdout();
-        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        emit_envelope(&envelope, self.cli_input.format, writer)?;
         if self.cli_input.format != OutputFormat::Jsonl {
-            stdout
+            writer
                 .write_all(b"\n")
                 .map_err(|source| SearchError::SubsystemError {
                     subsystem: "fsfs.explain",
@@ -8392,11 +8527,62 @@ impl FsfsRuntime {
                 })?;
         }
 
-        Ok(())
+        writer.flush().map_err(SearchError::Io)
     }
 
     fn explain_session_path(index_root: &Path) -> PathBuf {
         index_root.join(FSFS_EXPLAIN_SESSION_FILE)
+    }
+
+    fn admit_explain_directory(index_root: &Path, create: bool) -> SearchResult<bool> {
+        let directory = index_root.join("explain");
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+            Ok(_) => Err(SearchError::SubsystemError {
+                subsystem: "fsfs.explain.session",
+                source: Box::new(std::io::Error::other(
+                    "explanation directory must be a real directory, not a symlink or other file",
+                )),
+            }),
+            Err(error) if error.kind() == ErrorKind::NotFound && !create => Ok(false),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                match fs::create_dir(&directory) {
+                    Ok(()) => Ok(true),
+                    // Another cooperative search can create the same directory.
+                    // Inspect its actual entry rather than accepting a symlink.
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                        Self::admit_explain_directory(index_root, false)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn persist_search_artifact_explanation(
+        &self,
+        index_root: &Path,
+        query: &str,
+        artifact: &SearchPhaseArtifact,
+    ) {
+        if let Err(error) = self.persist_explain_session_with_payload(
+            index_root,
+            query,
+            artifact.phase,
+            &artifact.fused,
+            Some(&artifact.payload),
+        ) {
+            let destination = self
+                .complete_explain_target
+                .as_ref()
+                .map_or(index_root, |target| target.store_root.as_path());
+            warn!(
+                error = %error,
+                path = %Self::explain_session_path(destination).display(),
+                "failed to persist explain-session context for follow-up `fsfs explain <rank>`"
+            );
+        }
     }
 
     #[cfg(test)]
@@ -8418,6 +8604,32 @@ impl FsfsRuntime {
         fused: &[FusedCandidate],
         payload: Option<&SearchPayload>,
     ) -> SearchResult<()> {
+        let fused = if let Some(payload) = payload {
+            let displayed =
+                fused
+                    .get(..payload.hits.len())
+                    .ok_or_else(|| SearchError::SubsystemError {
+                        subsystem: "fsfs.explain.session",
+                        source: Box::new(std::io::Error::other(
+                            "displayed hits exceed the explanation candidate set",
+                        )),
+                    })?;
+            if displayed
+                .iter()
+                .zip(&payload.hits)
+                .any(|(candidate, hit)| candidate.doc_id != hit.path)
+            {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "fsfs.explain.session",
+                    source: Box::new(std::io::Error::other(
+                        "displayed hit order differs from the explanation candidate set",
+                    )),
+                });
+            }
+            displayed
+        } else {
+            fused
+        };
         let mut session = ExplainSession::from_fused(query, phase, self.config.search.rrf_k, fused);
         if let Some(payload) = payload {
             session.semantic_blend.clone_from(&payload.semantic_blend);
@@ -8447,7 +8659,35 @@ impl FsfsRuntime {
         }
         Self::attach_explain_session_generation(&mut session, index_root, payload);
         session.remap_hash_control_ranks();
-        let path = Self::explain_session_path(index_root);
+        self.persist_explain_session_value(index_root, session)
+    }
+
+    fn persist_explain_session_value(
+        &self,
+        index_root: &Path,
+        mut session: ExplainSession,
+    ) -> SearchResult<()> {
+        let destination = if let Some(target) = &self.complete_explain_target {
+            if index_root != target.generation.path() {
+                return Err(complete_cli::complete_cli_error(
+                    "explain_generation",
+                    "search resources differ from the bound explanation generation",
+                ));
+            }
+            session.complete_generation = Some(CompleteExplainGeneration::from_generation(
+                &target.generation,
+            ));
+            target.store_root.as_path()
+        } else {
+            index_root
+        };
+        crate::generation_store::reject_published_write(destination)?;
+        if self.complete_explain_target.is_some() {
+            // A symlink at store/explain could otherwise redirect the write
+            // into a sealed generation despite a valid store-root binding.
+            Self::admit_explain_directory(destination, true)?;
+        }
+        let path = Self::explain_session_path(destination);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -8481,9 +8721,36 @@ impl FsfsRuntime {
 
     fn load_explain_session(&self) -> SearchResult<Option<ExplainSession>> {
         let index_root = self.resolve_status_index_root()?;
-        let path = Self::explain_session_path(&index_root);
-        let raw = match fs::read_to_string(&path) {
-            Ok(raw) => raw,
+        Self::load_explain_session_at_root(&index_root)
+    }
+
+    fn load_explain_session_at_root(index_root: &Path) -> SearchResult<Option<ExplainSession>> {
+        if !Self::admit_explain_directory(index_root, false)? {
+            return Ok(None);
+        }
+        let path = Self::explain_session_path(index_root);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "fsfs.explain.session",
+                    source: Box::new(std::io::Error::other(
+                        "explanation context must be a regular file, not a symlink or other entry",
+                    )),
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
             Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
             Err(source) => {
                 return Err(SearchError::SubsystemError {
@@ -8492,6 +8759,16 @@ impl FsfsRuntime {
                 });
             }
         };
+        if !file.metadata()?.is_file() {
+            return Err(SearchError::SubsystemError {
+                subsystem: "fsfs.explain.session",
+                source: Box::new(std::io::Error::other(
+                    "explanation context is not a regular file",
+                )),
+            });
+        }
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)?;
         let mut session = serde_json::from_str::<ExplainSession>(&raw).map_err(|source| {
             SearchError::SubsystemError {
                 subsystem: "fsfs.explain.session",
@@ -8637,6 +8914,7 @@ impl FsfsRuntime {
                     &lookup_fingerprint,
                     mode,
                 )?;
+                Self::semantic_retry_checkpoint(cx, "fsfs.search.finalize")?;
                 if let Err(error) =
                     self.persist_explain_session_for_cached_payloads(query, &payloads)
                 {
@@ -8700,19 +8978,7 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
-        let env_map = current_unicode_environment();
-        let query_for_expansion = query.to_owned();
-        let expansion =
-            spawn_blocking(move || query_expansion::expand_query(&query_for_expansion, &env_map))
-                .await;
-
-        info!(
-            original_query = query,
-            expansion_count = expansion.queries.len().saturating_sub(1),
-            backend = ?expansion.backend_used,
-            expansion_elapsed_ms = expansion.elapsed_ms,
-            "fsfs query expansion completed"
-        );
+        let expansion = Self::expand_search_query(cx, query).await?;
 
         // If we only have the original query (no expansions), fast-path to normal search.
         if expansion.queries.len() <= 1 {
@@ -8735,6 +9001,10 @@ impl FsfsRuntime {
                 expansion_limit,
                 &mut resources,
                 &expansion_fingerprint,
+                SearchExecutionFlags {
+                    include_snippets: true,
+                    persist_explain_session: true,
+                },
             )
             .await?;
 
@@ -8750,6 +9020,32 @@ impl FsfsRuntime {
         Ok(vec![fused_payload])
     }
 
+    async fn expand_search_query(
+        cx: &Cx,
+        query: &str,
+    ) -> SearchResult<query_expansion::ExpansionResult> {
+        let checkpoint = || {
+            cx.checkpoint().map_err(|_| SearchError::Cancelled {
+                phase: "fsfs.query_expansion".to_owned(),
+                reason: "query expansion cancelled".to_owned(),
+            })
+        };
+        checkpoint()?;
+        let env_map = current_unicode_environment();
+        let query_for_expansion = query.to_owned();
+        let expansion =
+            spawn_blocking(move || query_expansion::expand_query(&query_for_expansion, &env_map))
+                .await;
+        checkpoint()?;
+        info!(
+            expansion_count = expansion.queries.len().saturating_sub(1),
+            backend = ?expansion.backend_used,
+            expansion_elapsed_ms = expansion.elapsed_ms,
+            "fsfs query expansion completed"
+        );
+        Ok(expansion)
+    }
+
     async fn execute_expanded_query_variants(
         &self,
         cx: &Cx,
@@ -8757,9 +9053,14 @@ impl FsfsRuntime {
         expansion_limit: usize,
         resources: &mut SearchExecutionResources,
         expansion_fingerprint: &str,
+        flags: SearchExecutionFlags,
     ) -> SearchResult<Vec<SearchPayload>> {
         let mut payloads = Vec::new();
         for expanded in queries {
+            cx.checkpoint().map_err(|_| SearchError::Cancelled {
+                phase: "fsfs.query_expansion".to_owned(),
+                reason: "expanded-query retrieval cancelled".to_owned(),
+            })?;
             Self::validate_search_generation_fingerprint(
                 &resources.index_root,
                 expansion_fingerprint,
@@ -8770,17 +9071,14 @@ impl FsfsRuntime {
                 query_text = expanded.text,
                 "fsfs expanded query: executing search variant"
             );
-            let variant_payloads = self
+            let mut variant_payloads = self
                 .execute_search_payloads_with_mode_using_resources(
                     cx,
                     &expanded.text,
                     expansion_limit,
                     SearchExecutionMode::Full,
                     resources,
-                    SearchExecutionFlags {
-                        include_snippets: true,
-                        persist_explain_session: true,
-                    },
+                    flags,
                 )
                 .await?;
             Self::validate_search_generation_fingerprint(
@@ -8788,7 +9086,18 @@ impl FsfsRuntime {
                 expansion_fingerprint,
                 SearchExecutionMode::Full,
             )?;
-            payloads.extend(variant_payloads);
+            // Initial and Refined are successive rankings of the same query,
+            // not independent votes. A failed refinement likewise replays its
+            // Initial hits. Give each query exactly one final ranking in RRF.
+            payloads.push(
+                variant_payloads
+                    .pop()
+                    .ok_or_else(|| SearchError::InvalidConfig {
+                        field: "query_expansion.phase".to_owned(),
+                        value: expanded.strategy.label().to_owned(),
+                        reason: "expanded query completed without a search phase".to_owned(),
+                    })?,
+            );
         }
         Ok(payloads)
     }
@@ -9816,6 +10125,14 @@ impl FsfsRuntime {
                 sink(&artifact.payload)?;
             }
             Self::validate_bound_search_resources(resources, mode)?;
+            Self::semantic_retry_checkpoint(cx, "fsfs.search.finalize")?;
+            if flags.persist_explain_session {
+                self.persist_search_artifact_explanation(
+                    &resources.index_root,
+                    &normalized_query,
+                    &artifact,
+                );
+            }
             return Ok(vec![artifact]);
         }
 
@@ -10486,20 +10803,14 @@ impl FsfsRuntime {
             }
         }
 
+        Self::semantic_retry_checkpoint(cx, "fsfs.search.finalize")?;
         if flags.persist_explain_session
             && let Some(last) = artifacts.last()
-            && let Err(error) = self.persist_explain_session_with_payload(
+        {
+            self.persist_search_artifact_explanation(
                 &resources.index_root,
                 &normalized_query,
-                last.phase,
-                &last.fused,
-                Some(&last.payload),
-            )
-        {
-            warn!(
-                error = %error,
-                path = %Self::explain_session_path(&resources.index_root).display(),
-                "failed to persist explain-session context for follow-up `fsfs explain <rank>`"
+                last,
             );
         }
 
@@ -16470,6 +16781,35 @@ impl FsfsRuntime {
         index_root: &Path,
         candidates: &[FusedCandidate],
     ) -> SearchResult<Vec<RerankDocument>> {
+        Self::semantic_retry_checkpoint(cx, "rerank_documents")?;
+        // The indexed source may have changed or disappeared since this
+        // bundle was sealed. Reranking must use the same retained text as
+        // lexical retrieval, never resolve that row back to the live tree.
+        let retained_lexical = match fs::symlink_metadata(
+            index_root.join(crate::generation_store::COMPLETE_GENERATION_MANIFEST),
+        ) {
+            Ok(metadata) if metadata.is_file() => {
+                let layout = Self::resolve_lexical_engine(index_root)?;
+                let (Some(BlueGreenEngine::Quill), Some(path)) =
+                    (layout.engine(), layout.engine_dir())
+                else {
+                    return Err(SearchError::RerankFailed {
+                        model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                        source: "retained generation has no Quill stored content for reranking"
+                            .into(),
+                    });
+                };
+                Some(QuillSearchIndex::open(cx, path, QuillConfig::default()).await?)
+            }
+            Ok(_) => {
+                return Err(SearchError::RerankFailed {
+                    model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                    source: "complete generation marker must be a regular file".into(),
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
         let worker_cx = cx.clone();
         #[cfg(feature = "rerank")]
         let worker_cx = if let Some(pool) = &self.native_blocking_pool {
@@ -16510,6 +16850,16 @@ impl FsfsRuntime {
             for doc_id in doc_ids {
                 Self::semantic_retry_checkpoint(&child, "rerank_documents")?;
                 Self::semantic_retry_checkpoint(&request_cx, "rerank_documents")?;
+                if let Some(index) = &retained_lexical {
+                    let text = read_retained_rerank_document_text(
+                        &request_cx,
+                        index,
+                        &doc_id,
+                        &canonicalizer,
+                    )?;
+                    documents.push(RerankDocument { doc_id, text });
+                    continue;
+                }
                 let path = resolve_manifest_file_path(&doc_id, sentinel.as_ref(), &index_root);
                 if let Some(text) = read_rerank_document_text(&path, &canonicalizer) {
                     documents.push(RerankDocument { doc_id, text });
@@ -19955,6 +20305,59 @@ fn read_rerank_document_text(path: &Path, canonicalizer: &DefaultCanonicalizer) 
     }
     let text = canonicalizer.canonicalize(&String::from_utf8_lossy(&bytes));
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// Hydrate an exact row from the sealed shipping-schema lexical snapshot.
+/// Missing content fails the optional rerank stage; it never licenses a read
+/// from mutable source files or another generation's catalog.
+fn read_retained_rerank_document_text(
+    cx: &Cx,
+    index: &QuillSearchIndex,
+    doc_id: &str,
+    canonicalizer: &DefaultCanonicalizer,
+) -> SearchResult<String> {
+    let unavailable = |reason: &str| SearchError::RerankFailed {
+        model: FSFS_RERANKER_MODEL_ID.to_owned(),
+        source: format!("retained rerank document {doc_id:?}: {reason}").into(),
+    };
+    let field_id = |name: &str| {
+        DEFAULT_SCHEMA
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.id)
+            .ok_or_else(|| unavailable("shipping schema is missing a required stored field"))
+    };
+    let query = frankensearch_quill::Query::set(
+        field_id("id")?,
+        vec![frankensearch_quill::QueryValue::Str(doc_id.to_owned())],
+    );
+    let result = index.search_preparsed_paginated(cx, &query, 2, 0, false)?;
+    let [hit] = result.hits.as_ref() else {
+        return Err(unavailable("exact stored document is missing or ambiguous"));
+    };
+    if hit.document_id != doc_id {
+        return Err(unavailable(
+            "stored identity differs from the ranked document",
+        ));
+    }
+    let bytes = index
+        .stored_field_value(field_id("content")?, hit.global_docid)?
+        .ok_or_else(|| unavailable("canonical stored body is unavailable"))?;
+    let mut text = String::from_utf8(bytes)
+        .map_err(|_| unavailable("canonical stored body is not valid UTF-8"))?;
+    let mut end = text
+        .len()
+        .min(usize::try_from(FSFS_RERANK_DOCUMENT_READ_LIMIT).unwrap_or(usize::MAX));
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    let text = canonicalizer.canonicalize(&text);
+    if text.trim().is_empty() {
+        return Err(unavailable("canonical stored body is empty"));
+    }
+    Ok(text)
 }
 
 fn normalize_model_key(value: &str) -> String {
@@ -26041,6 +26444,16 @@ mod tests {
             index_dir: Some(temp.path().to_path_buf()),
             ..CliInput::default()
         });
+        runtime
+            .persist_explain_session(
+                temp.path(),
+                "previous completed query",
+                SearchOutputPhase::Initial,
+                &[],
+            )
+            .unwrap();
+        let previous_context =
+            fs::read(temp.path().join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap();
         let cx = Cx::for_request();
         let mut count = 0;
         let mut sink = |payload: &SearchPayload, _cached| {
@@ -26064,6 +26477,11 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(count, 1);
+        assert_eq!(
+            fs::read(temp.path().join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap(),
+            previous_context,
+            "cancelled daemon delivery must preserve the prior explanation"
+        );
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         let guard = futures_lite_block_on(asupersync::sync::OwnedMutexGuard::lock(
             shared,
@@ -28339,6 +28757,106 @@ mod tests {
         assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn retained_rerank_uses_sealed_content_and_refuses_missing_bodies() {
+        run_on_runtime_task(|cx| async move {
+            use crate::generation_store::{CompleteGenerationStore, GenerationPublication};
+
+            let temp = tempfile::tempdir().expect("retained rerank fixture");
+            let source = temp.path().join("source");
+            fs::create_dir(&source).unwrap();
+            let originals = [
+                (
+                    "Alpha[one].md",
+                    "Retained alpha describes bounded retry recovery.",
+                ),
+                (
+                    "removed.md",
+                    "Retained beta describes durable generation publication.",
+                ),
+            ];
+            let store = CompleteGenerationStore::create(&cx, &temp.path().join("store")).unwrap();
+            let build = store.begin(&cx).unwrap();
+            let lexical = create_test_quill(&cx, &build.path().join("lexical")).await;
+            for (name, content) in originals {
+                fs::write(source.join(name), content).unwrap();
+                lexical
+                    .index_document(&cx, &IndexableDocument::new(name, content))
+                    .await
+                    .unwrap();
+            }
+            let mut empty = IndexableDocument::new("empty-body.md", "");
+            empty.title = Some("Stored title without canonical body".to_owned());
+            lexical.index_document(&cx, &empty).await.unwrap();
+            lexical.commit(&cx).await.unwrap();
+            drop(lexical);
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let mut sentinel = publication_lease_test_sentinel(build.path(), "rerank-fixture");
+            sentinel.target_root = source.display().to_string();
+            runtime
+                .write_index_sentinel(build.path(), &sentinel)
+                .unwrap();
+            // This fixture seals the real lexical input to reranking; it does
+            // not need semantic model inference or a synthetic quality claim.
+            let publication = build
+                .publish(&cx, |_, path| {
+                    KeeperSnapshot::open(path.join("lexical"), DEFAULT_SCHEMA)?;
+                    Ok(())
+                })
+                .unwrap();
+            let GenerationPublication::Durable(generation) = publication else {
+                panic!("rerank fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
+            };
+            fs::write(
+                source.join(originals[0].0),
+                "Changed live source must not reach the model.",
+            )
+            .unwrap();
+            fs::rename(source.join(originals[1].0), source.join("moved-source.md")).unwrap();
+            fs::write(
+                source.join("live-only.md"),
+                "Live text without retained membership.",
+            )
+            .unwrap();
+            fs::write(
+                source.join("empty-body.md"),
+                "Live replacement for an empty stored body.",
+            )
+            .unwrap();
+            let candidate = |doc_id: &str| FusedCandidate {
+                doc_id: doc_id.to_owned(),
+                fused_score: 1.0,
+                prior_boost: 0.0,
+                lexical_rank: Some(0),
+                semantic_rank: None,
+                hash_rank: None,
+                lexical_score: Some(1.0),
+                semantic_score: None,
+                hash_score: None,
+                in_both_sources: false,
+            };
+            let ordered = [candidate(originals[1].0), candidate(originals[0].0)];
+            let documents = runtime
+                .rerank_documents(&cx, generation.path(), &ordered)
+                .await
+                .expect("hydrate reranking from sealed lexical bodies");
+            assert_eq!(documents.len(), 2);
+            for (actual, expected) in documents.iter().zip(originals.iter().rev()) {
+                assert_eq!(actual.doc_id, expected.0);
+                assert_eq!(actual.text, expected.1);
+            }
+            for missing in ["live-only.md", "empty-body.md"] {
+                let error = runtime
+                    .rerank_documents(&cx, generation.path(), &[candidate(missing)])
+                    .await
+                    .expect_err("missing retained body must never fall back to live text");
+                assert!(matches!(error, SearchError::RerankFailed { .. }), "{error}");
+            }
+            assert_eq!(store.active(&cx).unwrap(), Some(generation));
+        });
+    }
+
     #[cfg(feature = "rerank")]
     fn rerank_deadline_documents(root: &Path) -> Vec<FusedCandidate> {
         [
@@ -29389,6 +29907,10 @@ mod tests {
                     20,
                     &mut resources,
                     &pinned_fingerprint,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: true,
+                    },
                 )
                 .await
                 .expect("execute first pinned expansion variant");
@@ -29418,6 +29940,10 @@ mod tests {
                     20,
                     &mut resources,
                     &pinned_fingerprint,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: true,
+                    },
                 )
                 .await
                 .expect_err("cross-generation expansion fusion must fail closed");
@@ -29425,6 +29951,132 @@ mod tests {
                 error.to_string().contains("generation changed"),
                 "expanded search must return retry guidance, got {error}"
             );
+        });
+    }
+
+    #[test]
+    fn expanded_query_fusion_counts_each_variant_once_after_quality_failure() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("expansion phase fixture");
+            let queries = [
+                query_expansion::ExpandedQuery {
+                    // Low-confidence input skips quality under the real planner.
+                    text: "???!!!".to_owned(),
+                    strategy: query_expansion::ExpansionStrategy::Original,
+                },
+                query_expansion::ExpandedQuery {
+                    text: "recover after a temporary network outage".to_owned(),
+                    strategy: query_expansion::ExpansionStrategy::Semantic,
+                },
+            ];
+            let documents = ["initial-only.md", "refinement-failed.md"];
+            let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector directory");
+            let fast_embedder = SemanticFastEmbedder;
+            let mut fast = VectorIndex::create_with_revision(
+                &vector_path,
+                fast_embedder.id(),
+                &fast_embedder.identity().unwrap().fingerprint(),
+                fast_embedder.dimension(),
+                frankensearch_index::Quantization::F16,
+            )
+            .expect("create fast phase fixture");
+            for (document, query) in documents.iter().zip(&queries) {
+                fast.write_record(document, &SemanticFastEmbedder::embed_sync(&query.text))
+                    .expect("write distinct query vector");
+            }
+            fast.finish().expect("finish fast phase fixture");
+            let quality_path = temp.path().join(super::FSFS_VECTOR_QUALITY_INDEX_FILE);
+            let mut quality = VectorIndex::create(&quality_path, "failed-quality-384", 384)
+                .expect("create quality phase fixture");
+            quality
+                .write_record(
+                    documents[1],
+                    &SemanticFastEmbedder::embed_sync(&queries[1].text),
+                )
+                .expect("write quality fixture vector");
+            quality.finish().expect("finish quality phase fixture");
+            let mut resources = SearchExecutionResources {
+                index_root: temp.path().to_path_buf(),
+                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+                    .expect("phase fixture fingerprint"),
+                lexical_index: None,
+                shadow_observer: None,
+                shadow_pressure_sampler: None,
+                vector_index: Some(VectorIndex::open_read_only(&vector_path).unwrap()),
+                quality_vector_index: Some(Arc::new(
+                    VectorIndex::open_read_only(&quality_path).unwrap(),
+                )),
+                fast_embedder: Some(Arc::new(fast_embedder)),
+                quality_embedder: Some(Arc::new(FailedQualityEmbedder)),
+                fast_embedder_attempted: true,
+                quality_embedder_attempted: true,
+                degradation_advice: Vec::new(),
+            };
+            let mut config = FsfsConfig::default();
+            config.search.rerank = false;
+            let runtime = FsfsRuntime::new(config);
+            let flags = SearchExecutionFlags {
+                include_snippets: false,
+                persist_explain_session: false,
+            };
+            let mut ordinary_last = Vec::new();
+            for (index, query) in queries.iter().enumerate() {
+                let phases = runtime
+                    .execute_search_phase_artifacts_with_mode_using_resources(
+                        &cx,
+                        &query.text,
+                        1,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                        flags,
+                        None,
+                    )
+                    .await
+                    .expect("execute actual progressive query");
+                assert_eq!(phases[0].phase, SearchOutputPhase::Initial);
+                assert_eq!(phases.len(), index + 1);
+                if index == 1 {
+                    assert_eq!(phases[1].phase, SearchOutputPhase::RefinementFailed);
+                    assert_eq!(phases[0].payload.hits, phases[1].payload.hits);
+                }
+                let last = phases.last().unwrap();
+                assert_eq!(last.payload.hits.len(), 1);
+                assert_eq!(last.payload.hits[0].path, documents[index]);
+                ordinary_last.push(last.payload.clone());
+            }
+
+            let fingerprint = resources.generation_fingerprint.clone();
+            let variants = runtime
+                .execute_expanded_query_variants(
+                    &cx,
+                    &queries,
+                    1,
+                    &mut resources,
+                    &fingerprint,
+                    flags,
+                )
+                .await
+                .expect("execute expanded variants against one generation");
+            assert_eq!(variants.len(), queries.len(), "one final ranking per query");
+            for (actual, expected) in variants.iter().zip(&ordinary_last) {
+                assert_eq!(actual.phase, expected.phase);
+                assert_eq!(actual.hits, expected.hits);
+            }
+            let fused = FsfsRuntime::fuse_expanded_payloads(&queries[0].text, &variants, 2, 60.0);
+            assert_eq!(fused.hits.len(), 2);
+            assert_eq!(
+                fused.hits[0].path, documents[0],
+                "equal votes use path order"
+            );
+            for hit in &fused.hits {
+                assert_eq!(hit.score.to_bits(), (1.0_f64 / 61.0).to_bits());
+                assert!(
+                    !hit.in_both_sources,
+                    "a replayed phase is not another query"
+                );
+            }
         });
     }
 
@@ -33895,6 +34547,411 @@ mod tests {
             text.contains("run `fsfs search <query>` first"),
             "unexpected explain-session error: {text}"
         );
+    }
+
+    #[cfg(all(unix, not(feature = "embedded-models")))]
+    #[test]
+    fn complete_generation_explain_preserves_query_scores_and_rejects_stale_context() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("explanation fixture");
+            let source = temp.path().join("source");
+            let root = temp.path().join("store");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
+            let mut config = FsfsConfig::default();
+            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+            config.indexing.offline = true;
+            config.indexing.quality_model.clear();
+            config.search.fast_only = true;
+            config.search.rerank = false;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(source.clone()),
+                index_dir: Some(root.clone()),
+                quiet: true,
+                ..CliInput::default()
+            });
+            let first = super::complete_cli::require_durable_publication(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            reader
+                .runtime
+                .enable_complete_generation_explanations(&root, &first)
+                .unwrap();
+            let artifacts = reader
+                .runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    "sharedtoken",
+                    10,
+                    SearchExecutionMode::Full,
+                    &mut reader.resources,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: true,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let last = artifacts.last().unwrap();
+            let session = FsfsRuntime::load_explain_session_at_root(&root)
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.query, last.payload.query);
+            assert_eq!(session.phase, last.phase);
+            assert_eq!(session.hits.len(), last.fused.len());
+            assert_eq!(
+                session.complete_generation,
+                Some(super::CompleteExplainGeneration::from_generation(&first))
+            );
+            assert!(!first.path().join(super::FSFS_EXPLAIN_SESSION_FILE).exists());
+            let saved = fs::read(root.join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap();
+            let hit = session.hits.first().expect("search found fixture");
+            let candidate = &last.fused[0];
+            assert_eq!(hit.path, candidate.doc_id);
+            assert_eq!(hit.final_score.to_bits(), candidate.fused_score.to_bits());
+            assert_eq!(hit.lexical_score, candidate.lexical_score);
+            assert_eq!(hit.hash_score, candidate.hash_score);
+
+            let mut explain = runtime.clone();
+            explain.cli_input.command = CliCommand::Explain;
+            explain.cli_input.format = OutputFormat::Json;
+            for target in ["R0", "1", hit.path.as_str(), "alpha.md"] {
+                explain.cli_input.result_id = Some(target.to_owned());
+                let mut output = Vec::new();
+                explain
+                    .run_complete_generation_explain_with_writer(&cx, &root, &mut output)
+                    .unwrap();
+                let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(output["data"]["query"], "sharedtoken");
+                assert_eq!(output["data"]["ranking"]["doc_id"], hit.path);
+                assert_eq!(
+                    output["data"]["ranking"]["final_score"]
+                        .as_f64()
+                        .unwrap()
+                        .to_bits(),
+                    hit.final_score.to_bits()
+                );
+            }
+
+            // A sink that fails after seeing Initial cannot replace the last
+            // completed query's context, even with persistence enabled.
+            let mut reject_phase =
+                |_: &SearchPayload| Err(SearchError::Io(std::io::Error::other("closed output")));
+            assert!(
+                reader
+                    .runtime
+                    .execute_search_phase_artifacts_with_mode_using_resources(
+                        &cx,
+                        "alpha",
+                        10,
+                        SearchExecutionMode::Full,
+                        &mut reader.resources,
+                        SearchExecutionFlags {
+                            include_snippets: true,
+                            persist_explain_session: true,
+                        },
+                        Some(&mut reject_phase),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(root.join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap(),
+                saved
+            );
+            for query in ["alpha", "   "] {
+                let mut cancel_phase = |_: &SearchPayload| {
+                    cx.set_cancel_requested(true);
+                    Ok(())
+                };
+                let result = reader
+                    .runtime
+                    .execute_search_phase_artifacts_with_mode_using_resources(
+                        &cx,
+                        query,
+                        10,
+                        SearchExecutionMode::Full,
+                        &mut reader.resources,
+                        SearchExecutionFlags {
+                            include_snippets: true,
+                            persist_explain_session: true,
+                        },
+                        Some(&mut cancel_phase),
+                    )
+                    .await;
+                cx.set_cancel_requested(false);
+                assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                assert_eq!(
+                    fs::read(root.join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap(),
+                    saved,
+                    "cancelled phase must preserve prior explanation context"
+                );
+            }
+
+            reader
+                .runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    "   ",
+                    10,
+                    SearchExecutionMode::Full,
+                    &mut reader.resources,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: true,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let empty = FsfsRuntime::load_explain_session_at_root(&root)
+                .unwrap()
+                .unwrap();
+            assert!(empty.query.is_empty());
+            assert!(empty.hits.is_empty());
+            let mut output = Vec::new();
+            assert!(
+                explain
+                    .run_complete_generation_explain_with_writer(&cx, &root, &mut output)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown result id")
+            );
+            assert!(output.is_empty());
+
+            reader
+                .runtime
+                .invalidate_complete_generation_explanation("expanded query")
+                .unwrap();
+            assert!(
+                explain
+                    .run_complete_generation_explain_with_writer(&cx, &root, &mut output)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("last search fused multiple expanded queries")
+            );
+            assert!(output.is_empty());
+            reader
+                .runtime
+                .persist_explain_session_with_payload(
+                    first.path(),
+                    &last.payload.query,
+                    last.phase,
+                    &last.fused,
+                    Some(&last.payload),
+                )
+                .unwrap();
+
+            fs::write(source.join("beta.md"), "sharedtoken beta successor").unwrap();
+            let second = super::complete_cli::require_durable_publication(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let store = crate::generation_store::CompleteGenerationStore::open(&cx, &root).unwrap();
+            assert_eq!(store.active(&cx).unwrap(), Some(second.clone()));
+            let mut output = Vec::new();
+            let error = explain
+                .run_complete_generation_explain_with_writer(&cx, &root, &mut output)
+                .unwrap_err();
+            assert!(error.to_string().contains("selected complete generation"));
+            assert!(output.is_empty());
+
+            // The old reader can finish a query after publication. Its saved
+            // identity must still be the old generation, never the new CURRENT.
+            reader
+                .runtime
+                .persist_explain_session_with_payload(
+                    first.path(),
+                    &last.payload.query,
+                    last.phase,
+                    &last.fused,
+                    Some(&last.payload),
+                )
+                .unwrap();
+            assert_eq!(
+                FsfsRuntime::load_explain_session_at_root(&root)
+                    .unwrap()
+                    .unwrap()
+                    .complete_generation,
+                Some(super::CompleteExplainGeneration::from_generation(&first))
+            );
+            assert_eq!(store.active(&cx).unwrap(), Some(second.clone()));
+            assert!(!first.path().join(super::FSFS_EXPLAIN_SESSION_FILE).exists());
+            assert!(
+                !second
+                    .path()
+                    .join(super::FSFS_EXPLAIN_SESSION_FILE)
+                    .exists()
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_generation_explain_rejects_foreign_unstamped_and_corrupt_context() {
+        run_test_with_cx(|cx| async move {
+            use crate::generation_store::CompleteGenerationStore;
+
+            let temp = tempfile::tempdir().expect("explanation identity fixture");
+            let store = CompleteGenerationStore::create(&cx, &temp.path().join("store")).unwrap();
+            let build = store.begin(&cx).unwrap();
+            fs::write(build.path().join("artifact"), b"immutable bytes").unwrap();
+            let generation = super::complete_cli::require_durable_publication(
+                build.publish(&cx, |_| Ok(())).unwrap(),
+            )
+            .unwrap();
+            let mut runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Explain,
+                result_id: Some("R0".to_owned()),
+                index_dir: Some(store.root().to_path_buf()),
+                format: OutputFormat::Json,
+                ..CliInput::default()
+            });
+            let mut output = Vec::new();
+            assert!(
+                runtime
+                    .run_complete_generation_explain_with_writer(&cx, store.root(), &mut output)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("run `fsfs search <query>` first")
+            );
+            assert!(output.is_empty());
+            let other_root = temp.path().join("other");
+            fs::create_dir(&other_root).unwrap();
+            assert!(
+                runtime
+                    .enable_complete_generation_explanations(&other_root, &generation)
+                    .is_err()
+            );
+            runtime
+                .enable_complete_generation_explanations(store.root(), &generation)
+                .unwrap();
+            assert!(
+                runtime
+                    .persist_explain_session(store.root(), "wrong", SearchOutputPhase::Initial, &[])
+                    .is_err()
+            );
+            assert!(!store.root().join(super::FSFS_EXPLAIN_SESSION_FILE).exists());
+            runtime
+                .persist_explain_session(
+                    generation.path(),
+                    "query",
+                    SearchOutputPhase::Initial,
+                    &[],
+                )
+                .unwrap();
+            let session_path = store.root().join(super::FSFS_EXPLAIN_SESSION_FILE);
+            let original: serde_json::Value =
+                serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
+            for mutation in ["unstamped", "wrong_id", "wrong_digest", "future_schema"] {
+                let mut context = original.clone();
+                match mutation {
+                    "unstamped" => context["complete_generation"] = serde_json::Value::Null,
+                    "wrong_id" => context["complete_generation"]["id"] = "foreign".into(),
+                    "wrong_digest" => {
+                        context["complete_generation"]["manifest_sha256"] = "00".into();
+                    }
+                    _ => context["schema_version"] = "future".into(),
+                }
+                fs::write(&session_path, serde_json::to_vec(&context).unwrap()).unwrap();
+                let error = runtime
+                    .run_complete_generation_explain_with_writer(&cx, store.root(), &mut output)
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("selected complete generation"),
+                    "{mutation}"
+                );
+                assert!(output.is_empty(), "{mutation}");
+            }
+            fs::write(&session_path, b"{").unwrap();
+            assert!(
+                runtime
+                    .run_complete_generation_explain_with_writer(&cx, store.root(), &mut output)
+                    .is_err()
+            );
+            assert!(output.is_empty());
+            assert_eq!(store.active(&cx).unwrap(), Some(generation));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_generation_explain_refuses_symlink_redirect_into_sealed_bundle() {
+        run_test_with_cx(|cx| async move {
+            use crate::generation_store::CompleteGenerationStore;
+            use std::os::unix::fs::symlink;
+
+            let temp = tempfile::tempdir().expect("explanation symlink fixture");
+            let store = CompleteGenerationStore::create(&cx, &temp.path().join("store")).unwrap();
+            let build = store.begin(&cx).unwrap();
+            fs::write(build.path().join("artifact"), b"immutable bytes").unwrap();
+            let generation = super::complete_cli::require_durable_publication(
+                build.publish(&cx, |_| Ok(())).unwrap(),
+            )
+            .unwrap();
+            symlink(generation.path(), store.root().join("explain")).unwrap();
+            let mut runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Explain,
+                result_id: Some("R0".to_owned()),
+                index_dir: Some(store.root().to_path_buf()),
+                format: OutputFormat::Json,
+                ..CliInput::default()
+            });
+            runtime
+                .enable_complete_generation_explanations(store.root(), &generation)
+                .unwrap();
+            assert!(
+                runtime
+                    .persist_explain_session(
+                        generation.path(),
+                        "query",
+                        SearchOutputPhase::Initial,
+                        &[]
+                    )
+                    .unwrap_err()
+                    .to_string()
+                    .contains("symlink")
+            );
+            let mut output = Vec::new();
+            assert!(
+                runtime
+                    .run_complete_generation_explain_with_writer(&cx, store.root(), &mut output)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("symlink")
+            );
+            assert!(output.is_empty());
+            assert!(!generation.path().join("last_search_session.json").exists());
+            assert_eq!(store.active(&cx).unwrap(), Some(generation));
+
+            // The final context file is independently no-follow on read.
+            let ordinary_root = temp.path().join("ordinary");
+            fs::create_dir_all(ordinary_root.join("explain")).unwrap();
+            let external = temp.path().join("external.json");
+            fs::write(&external, b"{}").unwrap();
+            symlink(
+                &external,
+                ordinary_root.join(super::FSFS_EXPLAIN_SESSION_FILE),
+            )
+            .unwrap();
+            assert!(
+                FsfsRuntime::load_explain_session_at_root(&ordinary_root)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("symlink")
+            );
+            assert_eq!(fs::read(external).unwrap(), b"{}");
+        });
     }
 
     #[test]
@@ -40002,6 +41059,38 @@ mod tests {
             };
             assert_eq!(replayed, payloads, "cache hit must replay each phase once");
             assert_eq!(replayed_payloads, payloads);
+
+            runtime
+                .persist_explain_session(
+                    &index_root,
+                    "previous completed query",
+                    SearchOutputPhase::Initial,
+                    &[],
+                )
+                .unwrap();
+            let previous_context =
+                fs::read(index_root.join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap();
+            let mut cancel_last_phase = |payload: &SearchPayload| {
+                if payload.phase == SearchOutputPhase::Refined {
+                    cx.set_cancel_requested(true);
+                }
+                Ok(())
+            };
+            let cancelled = runtime
+                .execute_search_payloads_cached_for_cli_with_phase_sink(
+                    &cx,
+                    "cache me",
+                    25,
+                    &mut cancel_last_phase,
+                )
+                .await;
+            cx.set_cancel_requested(false);
+            assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+            assert_eq!(
+                fs::read(index_root.join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap(),
+                previous_context,
+                "cancelled cached delivery must preserve the prior explanation"
+            );
 
             let vector_dir = index_root.join("vector");
             std::fs::create_dir_all(&vector_dir).expect("create vector dir");
