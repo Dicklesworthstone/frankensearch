@@ -51,7 +51,8 @@
       "shadow_sample_rate_basis_points": 2500,
       "shadow_max_in_flight": 8,
       "shadow_score_epsilon": 0.0025,
-      "rerank": false
+      "rerank": false,
+      "rerank_timeout_ms": 300
     },
     "pressure": {
       "profile": "performance",

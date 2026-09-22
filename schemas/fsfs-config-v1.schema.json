@@ -195,6 +195,18 @@
               "minimum": 0,
               "default": 1.0e-5,
               "description": "Accepted absolute lexical score delta. Omitting it is valid and means the default."
+            },
+            "rerank": {
+              "type": "boolean",
+              "default": false,
+              "description": "Opt in to the cross-encoder rerank stage over the refined head. Added after v1 shipped: omitting it is valid and means the default."
+            },
+            "rerank_timeout_ms": {
+              "type": "integer",
+              "minimum": 50,
+              "maximum": 120000,
+              "default": 300,
+              "description": "Rerank-stage deadline in milliseconds; when it expires the fused order stands. Omitting it is valid and means the default."
             }
           }
         },

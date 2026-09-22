@@ -384,6 +384,9 @@ pub struct QueryExecutionPlan {
 pub struct QueryPlannerConfig {
     pub default_limit: usize,
     pub quality_timeout_ms: u64,
+    /// Rerank-stage deadline (`search.rerank_timeout_ms`), independent of the
+    /// quality budget: the cross-encoder runs after Refined is delivered.
+    pub rerank_timeout_ms: u64,
     pub rrf_k: f64,
     pub fast_only: bool,
     pub pressure_profile: PressureProfile,
@@ -396,6 +399,7 @@ impl QueryPlannerConfig {
         Self {
             default_limit: config.search.default_limit.max(1),
             quality_timeout_ms: config.search.quality_timeout_ms,
+            rerank_timeout_ms: config.search.rerank_timeout_ms,
             rrf_k: config.search.rrf_k,
             fast_only: config.search.fast_only,
             pressure_profile: config.pressure.profile,
@@ -680,7 +684,10 @@ impl QueryPlanner {
             StageDirective {
                 enabled: true,
                 candidate_budget: budget.rerank_depth,
-                timeout_ms: quality_timeout_ms.min(300),
+                // Formerly `quality_timeout_ms.min(300)`, a hard cap no setting
+                // could raise: on abstract-length documents the stage then timed
+                // out on every query (bd-e25eo).
+                timeout_ms: self.config.rerank_timeout_ms,
                 reason_code: "query.stage.rerank.enabled",
             }
         } else {
@@ -2121,6 +2128,36 @@ mod tests {
         assert_eq!(budget.rerank_depth, 0);
     }
 
+    /// bd-e25eo: the rerank deadline is `search.rerank_timeout_ms`, not the old
+    /// hard `min(quality_timeout, 300)` cap. A naive fix that still clamped to
+    /// the quality budget would fail the 20 s case.
+    #[test]
+    fn rerank_stage_deadline_follows_its_own_setting() {
+        let plan_for = |config: &FsfsConfig| {
+            QueryPlanner::from_fsfs(config).execution_plan_for_query(
+                "how does query ranking work",
+                Some(10),
+                QueryExecutionCapabilities::all_enabled(),
+            )
+        };
+        let default_plan = plan_for(&FsfsConfig::default());
+        assert!(default_plan.rerank_stage.enabled);
+        assert_eq!(
+            default_plan.rerank_stage.timeout_ms,
+            crate::config::DEFAULT_RERANK_TIMEOUT_MS
+        );
+
+        let mut generous = FsfsConfig::default();
+        generous.search.rerank_timeout_ms = 20_000;
+        generous.search.quality_timeout_ms = 500;
+        let plan = plan_for(&generous);
+        assert_eq!(plan.rerank_stage.timeout_ms, 20_000);
+        assert_eq!(
+            plan.quality_stage.timeout_ms, 500,
+            "the quality budget is unchanged by the rerank setting"
+        );
+    }
+
     #[test]
     fn execution_plan_hybrid_rrf_is_deterministic() {
         let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
@@ -2846,6 +2883,7 @@ mod tests {
         let planner = QueryPlanner::new(QueryPlannerConfig {
             default_limit: 15,
             quality_timeout_ms: 500,
+            rerank_timeout_ms: 300,
             rrf_k: 60.0,
             fast_only: false,
             pressure_profile: PressureProfile::Performance,

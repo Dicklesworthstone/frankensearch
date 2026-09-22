@@ -24,6 +24,11 @@ const CONFIG_LOADED_EMIT_FIELDS: [&str; 4] = [
 ];
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FAST_ONLY_WARNING_CODE: &str = "config.search.fast_only_with_quality_model";
+/// Default rerank-stage deadline, the value the planner hard-coded before the
+/// setting existed. Abstract-length documents need seconds (bd-e25eo).
+pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 300;
+const MIN_RERANK_TIMEOUT_MS: u64 = 50;
+const MAX_RERANK_TIMEOUT_MS: u64 = 120_000;
 
 /// Leading token of `storage.db_path` that stands for the resolved index root.
 ///
@@ -891,6 +896,10 @@ pub struct SearchConfig {
     /// (`--rerank`). Needs the verified `ms-marco-minilm-l-6-v2` model in the
     /// cache; without it the stage is skipped with a typed reason.
     pub rerank: bool,
+    /// Deadline for the rerank stage. When it expires the fused order stands
+    /// (`query.stage.rerank.timeout`). Scoring the head of abstract-length
+    /// documents takes seconds, not the 300 ms default.
+    pub rerank_timeout_ms: u64,
     /// Opt in to bounded lexical shadow-oracle comparisons.
     pub shadow_mode: bool,
     /// Deterministic shadow sample rate in basis points.
@@ -911,6 +920,7 @@ impl Default for SearchConfig {
             fast_only: false,
             explain: false,
             rerank: false,
+            rerank_timeout_ms: DEFAULT_RERANK_TIMEOUT_MS,
             shadow_mode: false,
             shadow_sample_rate_basis_points: 1_000,
             shadow_max_in_flight: 2,
@@ -1070,6 +1080,7 @@ struct SearchConfigPatch {
     fast_only: Option<bool>,
     explain: Option<bool>,
     rerank: Option<bool>,
+    rerank_timeout_ms: Option<u64>,
     shadow_mode: Option<bool>,
     shadow_sample_rate_basis_points: Option<u16>,
     shadow_max_in_flight: Option<usize>,
@@ -1225,6 +1236,10 @@ fn default_shadow_mode() -> bool {
     SearchConfig::default().shadow_mode
 }
 
+fn default_rerank_timeout_ms() -> u64 {
+    SearchConfig::default().rerank_timeout_ms
+}
+
 fn default_shadow_sample_rate_basis_points() -> u16 {
     SearchConfig::default().shadow_sample_rate_basis_points
 }
@@ -1269,6 +1284,9 @@ pub struct ContractSearchConfig {
     // the shadow keys above: defaulted for legacy documents, always serialized.
     #[serde(default)]
     pub rerank: bool,
+    // `rerank_timeout_ms` (bd-e25eo): same rule.
+    #[serde(default = "default_rerank_timeout_ms")]
+    pub rerank_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1339,6 +1357,7 @@ impl From<&FsfsConfig> for ConfigContractValues {
                     fast_only,
                     explain,
                     rerank,
+                    rerank_timeout_ms,
                     shadow_mode,
                     shadow_sample_rate_basis_points,
                     shadow_max_in_flight,
@@ -1356,6 +1375,7 @@ impl From<&FsfsConfig> for ConfigContractValues {
                     shadow_max_in_flight,
                     shadow_score_epsilon,
                     rerank,
+                    rerank_timeout_ms,
                 }
             },
             pressure: ContractPressureConfig {
@@ -2264,6 +2284,9 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         if let Some(rerank) = search.rerank {
             config.search.rerank = rerank;
         }
+        if let Some(rerank_timeout_ms) = search.rerank_timeout_ms {
+            config.search.rerank_timeout_ms = rerank_timeout_ms;
+        }
         if let Some(shadow_mode) = search.shadow_mode {
             config.search.shadow_mode = shadow_mode;
         }
@@ -2464,6 +2487,15 @@ fn apply_env_overrides(
             .or_else(|| env_override(env, "FSFS_RERANK", "FSFS_SEARCH_RERANK"))
     {
         config.search.rerank = parse_bool(value, "search.rerank")?;
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_RERANK_TIMEOUT_MS",
+        "FSFS_RERANK_TIMEOUT_MS",
+    ) {
+        config.search.rerank_timeout_ms = parse_u64(value, "search.rerank_timeout_ms")?;
         keys_used.push(key.into());
     }
 
@@ -2810,6 +2842,7 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
                 "fast_only",
                 "explain",
                 "rerank",
+                "rerank_timeout_ms",
                 "shadow_mode",
                 "shadow_sample_rate_basis_points",
                 "shadow_max_in_flight",
@@ -2980,6 +3013,14 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
             field: "search.quality_timeout_ms".into(),
             value: config.search.quality_timeout_ms.to_string(),
             reason: "must be >= 50".into(),
+        });
+    }
+
+    if !(MIN_RERANK_TIMEOUT_MS..=MAX_RERANK_TIMEOUT_MS).contains(&config.search.rerank_timeout_ms) {
+        return Err(SearchError::InvalidConfig {
+            field: "search.rerank_timeout_ms".into(),
+            value: config.search.rerank_timeout_ms.to_string(),
+            reason: format!("must be within {MIN_RERANK_TIMEOUT_MS}..={MAX_RERANK_TIMEOUT_MS}"),
         });
     }
 
@@ -4058,6 +4099,46 @@ mod tests {
         .expect_err("must reject invalid config");
         assert!(
             matches!(err, SearchError::InvalidConfig { field: err_field, .. } if err_field == field)
+        );
+    }
+
+    /// bd-e25eo: `search.rerank_timeout_ms` defaults to the old 300 ms cap,
+    /// accepts file and environment values, and refuses out-of-range ones.
+    #[test]
+    fn rerank_timeout_setting_defaults_overrides_and_bounds() {
+        assert_eq!(super::FsfsConfig::default().search.rerank_timeout_ms, 300);
+        let from_file = load_from_str(
+            Some("[search]\nrerank_timeout_ms = 20000\n"),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("20 s is admitted");
+        assert_eq!(from_file.config.search.rerank_timeout_ms, 20_000);
+        let env = HashMap::from([(
+            "FRANKENSEARCH_RERANK_TIMEOUT_MS".to_owned(),
+            "4500".to_owned(),
+        )]);
+        let from_env = load_from_str(
+            Some("[search]\nrerank_timeout_ms = 20000\n"),
+            None,
+            &env,
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("environment override is admitted");
+        assert_eq!(
+            from_env.config.search.rerank_timeout_ms, 4_500,
+            "environment outranks the config file"
+        );
+        assert_invalid_field(
+            "[search]\nrerank_timeout_ms = 49\n",
+            "search.rerank_timeout_ms",
+        );
+        assert_invalid_field(
+            "[search]\nrerank_timeout_ms = 120001\n",
+            "search.rerank_timeout_ms",
         );
     }
 
