@@ -779,7 +779,9 @@ mod generation_tests {
     async fn publish(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> PublishedGeneration {
         match runtime.rebuild_retained_generation(cx, root).await.unwrap() {
             GenerationPublication::Durable(generation) => generation,
-            other => panic!("expected durable publication: {other:?}"), // ubs:ignore — cfg(test) assertion.
+            other @ GenerationPublication::VisibleButDurabilityUncertain { .. } => {
+                panic!("expected durable publication: {other:?}") // ubs:ignore — cfg(test) assertion.
+            }
         }
     }
 

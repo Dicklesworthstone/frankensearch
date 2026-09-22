@@ -1370,6 +1370,7 @@ mod lifecycle_tests {
                     let mut changes = lock_changes(&changes)?;
                     changes.record(now, false);
                     changes.record_path(path);
+                    drop(changes);
                     Ok(())
                 })
                 .unwrap();

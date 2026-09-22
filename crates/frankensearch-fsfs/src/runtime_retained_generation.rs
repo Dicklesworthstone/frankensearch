@@ -1015,18 +1015,19 @@ mod retained_delete_tests {
         // An explicitly synthetic independent quality space checks that the
         // mutation reaches both physical tiers, without claiming model parity.
         let quality_path = build.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE);
-        let mut quality = if let Some(embedder) = quality_embedder {
-            VectorIndex::create_with_revision(
-                &quality_path,
-                embedder.id(),
-                &embedder.identity().unwrap().fingerprint(),
-                embedder.dimension(),
-                frankensearch_index::Quantization::F16,
-            )
-            .unwrap()
-        } else {
-            VectorIndex::create(&quality_path, "test-delete-quality", 3).unwrap()
-        };
+        let mut quality = quality_embedder.map_or_else(
+            || VectorIndex::create(&quality_path, "test-delete-quality", 3).unwrap(),
+            |embedder| {
+                VectorIndex::create_with_revision(
+                    &quality_path,
+                    embedder.id(),
+                    &embedder.identity().unwrap().fingerprint(),
+                    embedder.dimension(),
+                    frankensearch_index::Quantization::F16,
+                )
+                .unwrap()
+            },
+        );
         for name in ["alpha.md", "beta.md", "beta-notes.md"] {
             if let Some(embedder) = quality_embedder {
                 // Preserve a real partial-coverage fixture across append.
@@ -1145,7 +1146,7 @@ mod retained_delete_tests {
                         3,
                     );
                 if self.changed_revision {
-                    identity.producer.implementation_revision = "explicit-test-v2".to_owned();
+                    "explicit-test-v2".clone_into(&mut identity.producer.implementation_revision);
                 }
                 identity
             }))
