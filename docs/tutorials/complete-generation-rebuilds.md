@@ -111,8 +111,11 @@ filters and limits apply to the individual request. Use the same configuration
 for both commands. A missing daemon, configuration mismatch, corrupt selection,
 or invalid reply fails the request without opening local search resources or
 retrying retrieval. CLI forwarding does not automatically start a daemon and
-currently refuses `--stream` and `--expand`. Direct `--no-daemon --stream` and
-the raw progressive socket protocol below remain available.
+refuses `--expand`. For progressive delivery, use `--daemon --stream` with
+`--format jsonl` or `--format toon`. The client validates request identity,
+frame sequence, and terminal completion; a transport failure never retries the
+query locally. Direct `--no-daemon --stream` and the raw progressive socket
+protocol below remain available.
 
 ## Progressive Unix-socket requests
 
