@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub(crate) fn find_ancestor_index(
+pub fn find_ancestor_index(
     directory: &Path,
     configured: &Path,
     markers: &[&str],

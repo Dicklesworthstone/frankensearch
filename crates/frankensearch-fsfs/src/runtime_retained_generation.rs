@@ -645,7 +645,7 @@ impl FsfsRuntime {
                 "candidate has no completion sentinel",
             )
         })?;
-        sentinel.command = "append-batch".to_owned();
+        "append-batch".clone_into(&mut sentinel.command);
         sentinel.generated_at_ms = timestamp;
         sentinel.indexed_files = manifests.len();
         sentinel.discovered_files = sentinel.discovered_files.max(manifests.len());
@@ -840,7 +840,7 @@ impl FsfsRuntime {
                 "candidate has no completion sentinel",
             )
         })?;
-        sentinel.command = "delete".to_owned();
+        "delete".clone_into(&mut sentinel.command);
         sentinel.generated_at_ms = pressure_timestamp_ms();
         sentinel.indexed_files = manifests.len();
         sentinel.skipped_files = sentinel.discovered_files.saturating_sub(manifests.len());
@@ -935,7 +935,7 @@ impl FsfsRuntime {
                 "candidate has no completion sentinel",
             )
         })?;
-        sentinel.command = "compact".to_owned();
+        "compact".clone_into(&mut sentinel.command);
         sentinel.generated_at_ms = pressure_timestamp_ms();
         for reason in protect_vector_generations(build.path(), "complete-generation compact") {
             if !sentinel.reason_codes.contains(&reason) {
