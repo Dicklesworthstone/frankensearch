@@ -1,6 +1,205 @@
 # Bridge Plan: frankensearch
 
-## Current assessment — 2026-09-21
+## Current assessment — 2026-09-22
+
+**The core search product works; the next release and the full generation
+migration are not complete.** The previous assessment's compilation failure
+was repaired, and frozen `7bcdfa84` passed all eleven stock quality stages plus
+two real-model watcher/daemon tests. Newer main `ad12acb9` compiles but fails
+strict Clippy in retained embedding reuse. Its subsequent tests did not run.
+There is no current-main release pass to infer from the older success.
+
+This refresh is the owner's explicitly requested end-to-end reality check.
+Consumer: the owner and the existing release/migration assignees. It gates the
+assessment's completion, not a newly invented shipping requirement. Observed
+defects motivating it are stale API-only descriptions, confusion between
+published crates and downloadable binaries, and promotion of partial checks.
+Retire this section from active guidance when a later assessment or completed
+release supersedes it; no file deletion is authorized. This is planning work,
+with zero new runtime-capability credit.
+
+### Source and evidence boundary
+
+Read all 958 project AGENTS lines, all 1,175 README lines and the suite rules.
+Read the architecture overview, Quill map and future distributed design;
+reviewed the existing bridge/bug plans, current feature manifests, production
+dispatch, generation store/reuse/watch code, live task graph and retained
+execution evidence. Ancillary contracts and historical logs were inspected
+selectively, not exhaustively; this is not a claim to have read every source
+line or every document. No new build was launched for this assessment.
+
+The release evidence root **W** remains
+`/data/release-work/frankensearch-release-20260912`. The evaluated source is
+`ad12acb9fa31529a1c1d73623629e3ef7ccdb45f`, with the two previously prepared
+rustfmt-only edits in `runtime/complete_watch.rs` and `runtime/retained_reuse.rs`.
+
+| Evidence inspected | Verdict and boundary |
+|---|---|
+| W/dependencies/quality-quiet-7bcdfa84-validation/receipt.json, SHA-256 `ce875c0e244bd6028576142acce23370335330711b99a6c5e447a7bf0fd3f7f5` | PASS at **7bcdfa84**: all eleven stock stages, real-model direct/native/daemon paths, installed quickstart and its negative probes; separately two real-model retained watch/daemon tests. Existing ignored tests are not passes. |
+| W/dependencies/quality-combined-ad12acb9-controller.log | **FAIL**, September 22 13:28 UTC on vmi1264463. Workspace/all-target check passed; strict Clippy rejected `retained_reuse.rs:421` (`large_stack_arrays`, 64 KiB). Later focused tests and full gate were not executed. Source barriers matched. |
+| W/dependencies/quill-default-7bcdfa84-log-audit.json | Complete default configuration log validation: **976 passed, 0 failed, 5 ignored**, seven target inventories. Not a complete two-configuration release pass. |
+| W/dependencies/quill-resume-all-r2-7bcdfa84-controller.log | Complete all-feature configuration still running at this assessment; no terminal verdict. Preserve inventories, original assertions and both configuration results. |
+| R1 original-family and matched-layout controls in W/dependencies | Original independent-layout exact contract fails. Matched single-segment control passes all six original queries, including with unmodified registry Tantivy. The control diagnoses layout dependence; it does not satisfy or change the original contract. |
+| Live GitHub latest and crates.io APIs, September 22 | Downloadable binary remains **v1.10.0**; registry facade **0.6.1**, fsfs **1.11.0**. Current production changes are not shipped by those versions. |
+| Beads JSONL and `br ready`, `bv --robot-triage`, `br dep cycles` | 1,298 records: 1,153 closed, 89 open, 46 in progress, 6 blocked, 4 deferred. Zero active cycles; two archived closed cycles. Only `bd-8nqz.6` appears in `br ready`. Graph-actionable does not mean unowned/ready. |
+
+### Vision checklist and actual delivery
+
+V1–V24 preserve the prior numbering. WORKING means the stated scoped behavior
+has execution evidence, not that every feature or current main is certified.
+The checklist deliberately has no percentage: its goals differ in scope and
+some require empirical outcomes rather than code completion.
+
+| Goal / testable promise | Current reality | Existing task coverage |
+|---|---|---|
+| V1 Install a verified semantic product on supported platforms | PARTIAL: shipped full/lite profiles exist; new seven-variant candidate and installed-archive qualification remain. | `bd-fsfs-cross-platform-semantic-installer-46z3u`, `bd-dsbym` |
+| V2 Index real documents durably into lexical and both vector tiers | WORKING at 7bc; interruption-safe complete-store replacement is opt-in, not universal migration. | `bd-pz8va`, `bd-xomn.3` |
+| V3 Deliver Initial then Refined/RefinementFailed through CLI and daemon | WORKING at 7bc, including real executable and stream paths. Later source needs requalification. | closed progressive-daemon task; `bd-dsbym` |
+| V4 Apply configured quality blending in actual product ranking | WORKING implementation and prior tests; improved relevance is separately V17. | closed quality-weight task; E6.7 |
+| V5 Preserve Initial on timeout/cancellation and safely reuse warm models | WORKING in scoped stock/native tests at 7bc; not a global latency guarantee. | `bd-2ba5`, `bd-dsbym` |
+| V6 Machine output, snippets, explain and backend equivalence | PARTIAL: ordinary output works; complete-store explain/TUI/expand refuse, and total lexical result equivalence remains open. | `bd-qwkq`, `bd-xomn.3`, E6.4/E6.7 |
+| V7 Independent searches while watcher stays alive | PARTIAL: opt-in complete-store CLI/watch/daemon now exist, with two real-model tests at 7bc. Default legacy lock limitation remains; latest reuse/catch-up changes unqualified. | `bd-z2nfa`, watch staging |
+| V8 Append/delete/compact/flush and daemon stay coherent | PARTIAL: legacy paths work; complete-store dispatcher refuses in-place mutations. Fragmented-session merge/fuel is a separate unresolved defect. | `bd-458gu`, immutable lifecycle, `bd-xomn.3` |
+| V9 Doctor/status report actual model and generation health | WORKING scoped checks, including complete-store selected-root routing; unified recovery remains incomplete. | `bd-p6z6.4`, `bd-3fy9` |
+| V10 Reusable published facade with registry-only consumers | WORKING published family; new source is ahead of public archives. Default hash remains explicitly control-only. | `bd-dsbym`, `bd-8nqz.6` |
+| V11 Full used-surface Quill conformance | PARTIAL: real default engine/bounded witness; original R1 fails and full all-feature verdict pending. | R1, E6/E7, `bd-q4rg` |
+| V12 One identity-bound retained generation across production | PARTIAL: cooperative FSFS-CURRENT bundle is wired, but not fixed AUTHORITY/antirollback/complete typed v2 migration. | `bd-xomn.1`–`.4`, publisher/snapshot/security owners |
+| V13 Repair/recover without mixing generations | PARTIAL: FEC, admission and retained predecessors exist; unified immutable repair/retry lifecycle remains. | `bd-p6z6.3/.4`, `bd-3fy9`, lifecycle |
+| V14 Bounded native ANN in actual serving routes | PARTIAL: optional production ANN still wraps registry frankenhnsw; native_hnsw connectivity fix does not switch serving adapters. | `bd-kcek` |
+| V15 Real optional cross-encoder rerank | WORKING scoped native backend; not a missing feature. New artifact/profile qualification remains. | `bd-dsbym`, E6.7 |
+| V16 Pure-Rust quality replacement across promised platforms | PARTIAL: explicit semantic-native source profile works; default is ONNX. Original numerical, ranking, within-2x and no-C-toolchain obligations remain. | `bd-2ba5`, `bd-6kafg` |
+| V17 Demonstrably better held-out retrieval quality | UNPROVEN broadly. Delivering Refined or finding one known document is insufficient. | E6.6/E6.7, `bd-2g2l`, `bd-q4rg` |
+| V18 Honest latency, memory, cold-load and indexing envelopes | Dated scoped receipts; newest watch reuse and native graph changes have no new performance verdict. | `bd-u8cof`, existing perf campaign |
+| V19 Meet frozen competitive Quill targets | UNPROVEN: all ten activation flags remain false. Correctness and self-speedups are not incumbent wins. | E8/E8-H, `bd-h6eh` |
+| V20 Real CASS/xf/Mail adoption and lifecycle | PARTIAL: integration surfaces exist; downstream-owned semantic/recovery evidence remains. | `bd-cass-semantic-cross-repo-receipt-91k2`, total lexical contract |
+| V21 Privacy, bounded pressure, scope and replay | Implemented components; complete generation fault/rollback/retention matrix still incomplete. | `bd-pz8va`, cache/retention/recovery owners |
+| V22 Complete real-host release, installer and package qualification | NOT COMPLETE: current strict lint failure, R1 failure, full Quill pending, final platforms/publication not qualified. | `bd-dsbym`, R1, installer |
+| V23 Guidance describes actual shipped/source behavior | PARTIAL: release-version guidance now accurate; README omits opt-in complete-store path and active limitations. | `bd-dsbym`, migration documentation |
+| V24 Ops/distributed extension | Deliberately experimental/design-only, not part of the shipped local-search claim. | existing scope decision/deferred work |
+
+### Bridge plan: dependency order and concrete completion
+
+**R — Finish a releasable source, then distribute it (small repair; large
+qualification).** Existing owner `bd-dsbym`; serves V1/V3/V5/V10/V22/V23.
+
+- [ ] Replace the retained-copy stack buffer with one bounded reusable heap
+  buffer, preserving copy limits, cancellation, exclusive creation and errors;
+  do not suppress the lint. Run strict RCH Clippy and existing retained reuse
+  tests before the stock gate. Bind the resulting source and executable.
+- [ ] Complete both full Quill configurations, preserving the executed-name
+  inventory and terminal counts; inspect failures rather than repeatedly
+  restarting completed work. Neither a bounded witness nor one configuration
+  discharges this release requirement.
+- [ ] Finish original R1 exact-family acceptance through its existing owner.
+  Matched-layout evidence is diagnostic. Any contract change requires explicit
+  owner disposition; no generic epsilon or silent replacement fixture.
+- [ ] Run the unchanged full quality gate and real-model watcher/daemon lane
+  on the final frozen source. Preserve previous failures and source differences.
+- [ ] Choose forward-only versions after registry census; qualify all seven
+  planned binary variants, actual installation/update/rollback/model profiles,
+  package archives and registry-only consumers. Publish through DSR/RCH without
+  Actions, verify public downloads/archives/source and GitHub latest routing,
+  and determine Homebrew applicability from the actual tap. Update changelog
+  and guidance only to verified public outcomes.
+
+**G — Complete the existing retained-generation product path (large).**
+Existing watch staging, `bd-xomn.3`, lifecycle and `bd-pz8va`; serves
+V2/V6/V7/V8/V9/V12/V13/V21. `main.rs` really calls
+`run_mode_with_complete_generations`; initial selection is explicit through
+`FRANKENSEARCH_COMPLETE_GENERATIONS` / `FSFS_COMPLETE_GENERATIONS`. Existing
+stores remain recognized after the variable is unset. This supersedes the
+September 21 API-only finding, not the original v2 acceptance criteria.
+
+- [ ] Preserve opt-in and legacy behavior while qualifying current copy reuse,
+  source-change catch-up and sustained-churn recovery against real executables.
+- [ ] Route remaining append/delete/compact/flush/explain/TUI/expand surfaces
+  through the existing immutable lifecycle design; do not enable mutation of
+  a sealed bundle just to remove refusals. Keep the legacy APIs until the
+  migration's original platform/identity/retirement criteria are satisfied.
+- [ ] Complete fixed publisher, retained snapshot, independent tier identity,
+  antirollback and retention-root prerequisites. Trusted-directory publication
+  is useful functionality but cannot be relabeled as hostile-directory safety.
+- [ ] Hold old reader, watcher and daemon alive while add/change/delete/rename
+  becomes visible to fresh readers. Verify quality candidates outside fast
+  top-k, model mismatch, pressure, cancellation, competing publishers and
+  unknown post-rename durability outcome. Retain bounded logs of source,
+  generation, binary/model identity and terminal results.
+- [ ] Document exactly which root/layout/profile supports each command and
+  which work remains. No claim that default legacy watch is fixed merely
+  because an opt-in retained-store E2E passes.
+
+**Q — Prove real retrieval value (large).** Existing R1/E6/E7, total lexical
+contract and CASS receipt owners; serves V6/V11/V17/V20. Preserve public lenient
+queries, raw score bits, IDs, cutoff membership, metadata/snippets/errors.
+Run existing held-out lexical/fast/Initial/Refined/rerank comparisons after
+reopen with fixed corpus, queries and budgets; retain per-slice regressions
+and the predeclared statistical decision rules. Obtain the consuming CASS
+project's actual semantic/recovery execution, not merely package compilation.
+
+**N/P — Complete optional execution and measured performance (large).**
+Existing native inference, native ANN, cold-load, merge/fuel and E8 owners;
+serves V8/V14/V16/V18/V19. Keep ANN tied to retained vector/docset ownership,
+persist/reopen and tombstone recall, then switch the production adapter only
+after its original correctness/performance gates. Native inference keeps
+separate producer identities and its original cross-platform numerical,
+ranking, cost and no-C-toolchain requirements. Measure cold-load and watch
+cost through production callers. Competitive claims require live same-run
+incumbents, admitted hosts and valid null controls; record losses as outcomes.
+
+**Would finishing all existing beads close the gaps?** They cover every
+identified product goal, provided closure means the original end-to-end
+acceptance, not a helper/API or refusal. No new uncovered top-level goal was
+found. Current lint and documentation drift belong to the release task;
+remaining command coverage belongs to the migration. Empirical quality and
+performance improvements are not guaranteed by finishing implementation.
+No new epic, parallel engine, or test-only subgraph is needed.
+
+### Phase execution and bounded review record
+
+Phase 1 is the source/evidence checklist above; Phase 2 is R/G/Q/N/P. Phase 3a
+uses the exact frozen instruction reproduced in the historical September 21
+section below, applying it to existing beads through `br` only. Detailed
+comments must carry the new source findings and acceptance subtasks without
+requiring this plan. Original dependencies, priorities and assignees remain.
+
+**Ambition round 1 — make watch freshness economical, not merely concurrent.**
+Re-examining `seed_candidate` and `copy_tree` shows that reuse saves eligible
+embeddings but still copies and verifies predecessor artifact files. Its
+receipt is deliberately session-bound; restart can rebuild cold. Therefore
+"incremental" must not be reported as O(changed bytes) or cross-process reuse.
+Within the existing watch/retention tasks, measure source-event-to-visible,
+embedding count, copied/verified bytes and retained disk growth separately.
+Use sparse edits, delete-heavy edits and sustained churn, with watcher, daemon
+and pinned old reader alive. Qualify the new settling behavior: two quiet
+observations restore catch-up, while same-metadata content hints and a changed
+publisher cannot be acknowledged away. First use existing batching and reuse;
+only optimize copy cost after evidence identifies it as the dominant cost.
+Do not use hard links to mutable catalogs/vector files. Retention accounting
+and authorized GC remain under their existing owner, with no deletion implied.
+
+**Ambition round 2 — deliver one coherent user workflow across layouts.**
+The valuable finish line is index → watch → search/stream → explain → update
+or compact → restart/recover, retaining one documented feature contract.
+Today the opt-in root solves part of concurrency but rejects commands that
+ordinary users already have. Complete those existing migration subtasks before
+calling the new root a universal replacement; run the same genuine corpus and
+operations against both layouts during migration and retain intentional typed
+differences. This is existing lifecycle acceptance, not a new conformance
+framework. Keep model identity strict when native/ONNX/API selection changes:
+the old native bead's proposed automatic fallback is not authorization to
+query an index with a different producer. Reconcile that historical proposal
+explicitly with the current fail-closed contract, preserving the original
+native numerical/ranking/cost objectives. Do not silently change defaults.
+
+Phase 3a is reapplied verbatim after these rounds. Added copy-cost/session,
+catch-up, command-coverage and producer-selection obligations belong in the
+existing watch/migration/native beads; no new graph or split completion credit.
+
+Refinement results are recorded here as the review proceeds.
+
+---
+
+## Historical September 21 assessment (superseded)
 
 **Verdict: the core search product is real, but current main is not release-ready.**
 The next useful work is to restore compilation, finish the existing exact
