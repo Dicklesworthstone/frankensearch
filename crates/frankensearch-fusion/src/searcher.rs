@@ -1762,7 +1762,7 @@ impl TwoTierSearcher {
             rayon::join(
                 || {
                     let start = Instant::now();
-                    let result = poll_immediate(embed_fast())
+                    let result = poll_immediate(Box::pin(embed_fast()))
                         .unwrap_or_else(|| {
                             Err(SearchError::EmbeddingFailed {
                                 model: self.fast_embedder.id().to_owned(),
@@ -6068,7 +6068,9 @@ mod tests {
             let path = dir.join("fast.fsvi");
             let binding = artifact_binding("native-fast-override", 4, 70);
             let mut ids = ["a", "b", "c", "d"];
-            ids.sort_by_key(|id| frankensearch_index::fnv1a_hash(id.as_bytes()));
+            // FSVI record order is (doc_id FNV-1a hash, doc_id); core exports
+            // the same FNV-1a the index uses for doc-id hashing.
+            ids.sort_by_key(|id| frankensearch_core::filter::fnv1a_hash(id.as_bytes()));
             write_v2_tier(
                 &path,
                 &binding,
