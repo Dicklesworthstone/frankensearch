@@ -263,8 +263,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--full", action="store_true", help="default + all-feature complete nonignored gauntlet")
+    mode.add_argument("--full-configuration", choices=("default", "all"),
+                      help="one complete configuration; both receipts are required for full qualification")
     mode.add_argument("--probes", action="store_true", help="bounded lane plus actual zero/oracle/timeout/output negatives")
     args = parser.parse_args()
+    full = args.full or args.full_configuration is not None
+    configurations = ([args.full_configuration] if args.full_configuration is not None
+                      else ["default", "all"] if args.full else ["all"])
     # Cargo-configuration security fixtures create repositories under TMPDIR.
     # Keeping those below this checkout accidentally gives them an unbound
     # ancestor .cargo/config.toml. A private canonical system-temp directory
@@ -277,7 +282,7 @@ def main():
     if args.probes:
         probe_output_retention(logs)
     failures = []
-    for configuration in (["default", "all"] if args.full else ["all"]):
+    for configuration in configurations:
         binaries = build(configuration, logs)
         listed = {name: inventory(path, f"{configuration}-{name}", logs)
                   for name, path in sorted(binaries.items())}
@@ -286,7 +291,7 @@ def main():
             mutation = [row for row in listed[LIBRARY] if row["name"] == MUTATION and not row["ignore"]]
             if not mutation:
                 raise Refusal("MISSING_MUTATION", MUTATION)
-        deadline = time.monotonic() + (28800 if args.full else BOUNDED_SECONDS)
+        deadline = time.monotonic() + (28800 if full else BOUNDED_SECONDS)
         for name, tests in listed.items():
             bounded = name in {NATIVE, LIBRARY}
             emit("route", configuration=configuration, binary=name,
@@ -297,13 +302,13 @@ def main():
             if not tests:
                 emit("empty_target", binary=name, counted_as_pass=False)
                 continue
-            if not args.full and not bounded:
+            if not full and not bounded:
                 continue
             output = None
-            selectors = [None] if args.full or name == NATIVE else [WITNESS, REPLAY]
+            selectors = [None] if full or name == NATIVE else [WITNESS, REPLAY]
             for ordinal, selector in enumerate(selectors):
                 selected = [row for row in tests if selector is None or selector in row["name"]]
-                if any(row["ignore"] for row in selected) and not args.full:
+                if any(row["ignore"] for row in selected) and not full:
                     raise Refusal("REQUIRED_TEST_IGNORED", name)
                 try:
                     output = execute(binaries[name], tests, f"run-{configuration}-{name}-{ordinal}", logs,
@@ -331,7 +336,9 @@ def main():
             expect_refusal("MISSING_ORACLE", lambda: require_oracle(default_inventory[NATIVE]))
     if failures:
         raise Refusal("LANE_FAILED", "; ".join(failures))
-    emit("passed", mode="full" if args.full else "probes" if args.probes else "bounded",
+    emit("passed", mode="full-configuration" if args.full_configuration is not None
+         else "full" if args.full else "probes" if args.probes else "bounded",
+         configurations=configurations,
          scope="Native witness and typed-query replay correctness; no full conformance or performance claim")
 
 
