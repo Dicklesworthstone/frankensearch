@@ -253,6 +253,11 @@ impl FsfsRuntime {
         if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
             #[cfg(unix)]
             {
+                if self.cli_input.stream {
+                    return self.stream_complete_generation_daemon(
+                        cx, root, query, limit, writer,
+                    ).await;
+                }
                 let payload = self
                     .query_complete_generation_daemon(cx, root, query, limit)
                     .await?;

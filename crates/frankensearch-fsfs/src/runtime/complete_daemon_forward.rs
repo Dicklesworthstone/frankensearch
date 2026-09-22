@@ -33,6 +33,9 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 const VERSION: u32 = 1;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[path = "complete_daemon_forward_stream.rs"]
+mod progressive;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -93,7 +96,8 @@ fn configuration_contract(config: &FsfsConfig) -> SearchResult<serde_json::Value
 }
 
 pub(super) fn is_forwarded(bytes: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(bytes)
+    progressive::is_streamed(bytes)
+        || serde_json::from_slice::<serde_json::Value>(bytes)
         .is_ok_and(|value| value.get("fsfs_complete_cli").is_some())
 }
 
@@ -190,6 +194,9 @@ impl FsfsRuntime {
     /// Transport failures and unrelated subsystem errors return `None`.
     #[must_use]
     pub fn forwarded_search_error(error: &SearchError) -> Option<&OutputError> {
+        if let Some(error) = progressive::reported_error(error) {
+            return Some(error);
+        }
         match error {
             SearchError::SubsystemError { subsystem, source }
                 if *subsystem == "fsfs.complete_generation.remote_search" =>
@@ -198,6 +205,13 @@ impl FsfsRuntime {
             }
             _ => None,
         }
+    }
+
+    /// True when a forwarded stream already emitted its terminal record, or
+    /// its output writer failed after possibly exposing part of a record.
+    #[must_use]
+    pub fn forwarded_search_error_was_emitted(error: &SearchError) -> bool {
+        progressive::reported_error(error).is_some()
     }
 
     /// Query an already-running complete-generation daemon without opening the
@@ -286,6 +300,9 @@ pub(super) async fn serve(
     bytes: &[u8],
     timeout: Duration,
 ) -> SearchResult<PeerOutcome> {
+    if progressive::is_streamed(bytes) {
+        return progressive::serve(cx, runtime, session, peer, bytes, timeout).await;
+    }
     let request = decode_request(bytes);
     let request_id = request.as_ref().map_or_else(|_| String::new(), |value| value.request_id.clone());
     let query = request.as_ref().map_or_else(|_| String::new(), |value| value.search.query.clone());
