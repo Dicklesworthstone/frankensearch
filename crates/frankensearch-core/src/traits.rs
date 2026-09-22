@@ -59,57 +59,102 @@ impl fmt::Debug for IdentityBoundEmbedding {
 }
 
 impl IdentityBoundEmbedding {
-    /// Validate the identity bundle and exact vector dimension.
+    /// Validate the identity, exact vector dimension, and finite coordinates.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidConfig` when the identity is malformed or the vector
-    /// length does not match its declared mathematical space.
+    /// Returns `InvalidConfig` when the identity is malformed, the vector
+    /// length disagrees with its space, or any coordinate is NaN or infinite.
+    /// Valid coordinates are never normalized, repaired, or otherwise changed.
     pub fn validate(&self) -> SearchResult<()> {
-        self.identity.validate()?;
-        let declared_dimension = usize::try_from(self.identity.space.dimension).map_err(|_| {
-            SearchError::InvalidConfig {
-                field: "identity_bound_embedding.dimension".to_owned(),
-                value: self.identity.space.dimension.to_string(),
-                reason: "dimension does not fit usize".to_owned(),
-            }
-        })?;
-        if self.values.len() != declared_dimension {
-            return Err(SearchError::InvalidConfig {
-                field: "identity_bound_embedding.values".to_owned(),
-                value: self.values.len().to_string(),
-                reason: format!("expected {declared_dimension} vector elements"),
-            });
-        }
-        if self.identity.storage.quantization != QuantizationFormat::F32 {
-            return Err(SearchError::InvalidConfig {
-                field: "identity_bound_embedding.storage.quantization".to_owned(),
-                value: format!("{:?}", self.identity.storage.quantization),
-                reason: "an in-process Vec<f32> output must carry an f32 storage identity"
-                    .to_owned(),
-            });
-        }
-        if !self.identity.storage.format.starts_with("in-memory-") {
-            return Err(SearchError::InvalidConfig {
-                field: "identity_bound_embedding.storage.format".to_owned(),
-                value: self.identity.storage.format.clone(),
-                reason: "an in-process Vec<f32> output must carry an in-memory storage format"
-                    .to_owned(),
-            });
-        }
-        if !matches!(
-            self.identity.storage.endianness.as_str(),
-            "native-f32-values" | "native-test-only"
-        ) {
-            return Err(SearchError::InvalidConfig {
-                field: "identity_bound_embedding.storage.endianness".to_owned(),
-                value: self.identity.storage.endianness.clone(),
-                reason: "an in-process Vec<f32> output must carry a native-value contract"
-                    .to_owned(),
-            });
-        }
-        Ok(())
+        let dimension = validate_embedding_identity(&self.identity)?;
+        validate_embedding_values(&self.values, dimension)
     }
+}
+
+// Keep identity checks separate from per-row checks: a batch shares one
+// immutable identity, which must be admitted even when the batch is empty.
+fn validate_embedding_identity(identity: &EmbeddingIdentityBundleV1) -> SearchResult<usize> {
+    identity.validate()?;
+    let dimension = usize::try_from(identity.space.dimension).map_err(|_| {
+        SearchError::InvalidConfig {
+            field: "identity_bound_embedding.dimension".to_owned(),
+            value: identity.space.dimension.to_string(),
+            reason: "dimension does not fit usize".to_owned(),
+        }
+    })?;
+    if identity.storage.quantization != QuantizationFormat::F32 {
+        return Err(SearchError::InvalidConfig {
+            field: "identity_bound_embedding.storage.quantization".to_owned(),
+            value: format!("{:?}", identity.storage.quantization),
+            reason: "an in-process Vec<f32> output must carry an f32 storage identity"
+                .to_owned(),
+        });
+    }
+    if !identity.storage.format.starts_with("in-memory-") {
+        return Err(SearchError::InvalidConfig {
+            field: "identity_bound_embedding.storage.format".to_owned(),
+            value: identity.storage.format.clone(),
+            reason: "an in-process Vec<f32> output must carry an in-memory storage format"
+                .to_owned(),
+        });
+    }
+    if !matches!(
+        identity.storage.endianness.as_str(),
+        "native-f32-values" | "native-test-only"
+    ) {
+        return Err(SearchError::InvalidConfig {
+            field: "identity_bound_embedding.storage.endianness".to_owned(),
+            value: identity.storage.endianness.clone(),
+            reason: "an in-process Vec<f32> output must carry a native-value contract"
+                .to_owned(),
+        });
+    }
+    Ok(dimension)
+}
+
+fn validate_embedder_identity(
+    identity: &EmbeddingIdentityBundleV1,
+    reported_dimension: usize,
+) -> SearchResult<usize> {
+    let dimension = validate_embedding_identity(identity)?;
+    if reported_dimension != dimension {
+        return Err(SearchError::InvalidConfig {
+            field: "embedder.dimension".to_owned(),
+            value: reported_dimension.to_string(),
+            reason: format!("the immutable identity declares {dimension} vector elements"),
+        });
+    }
+    Ok(dimension)
+}
+
+fn validate_embedding_values(values: &[f32], dimension: usize) -> SearchResult<()> {
+    if values.len() != dimension {
+        return Err(SearchError::InvalidConfig {
+            field: "identity_bound_embedding.values".to_owned(),
+            value: values.len().to_string(),
+            reason: format!("expected {dimension} vector elements"),
+        });
+    }
+    if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+        return Err(SearchError::InvalidConfig {
+            field: "identity_bound_embedding.values".to_owned(),
+            value: format!("non-finite coordinate at index {index}"),
+            reason: "embedding coordinates must be finite".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_embedding_batch_length(actual: usize, expected: usize) -> SearchResult<()> {
+    if actual != expected {
+        return Err(SearchError::InvalidConfig {
+            field: "embedder.batch_length".to_owned(),
+            value: actual.to_string(),
+            reason: format!("expected exactly {expected} output vectors, one per input"),
+        });
+    }
+    Ok(())
 }
 
 // ─── Model Category ─────────────────────────────────────────────────────────
@@ -214,7 +259,10 @@ pub struct ModelInfo {
 ///   persisting, comparing, caching, or transporting vectors must use
 ///   `embed_bound()` or `embed_batch_bound()` so space and producer identity
 ///   travel with the values.
-/// - `dimension()` must be constant for the lifetime of the embedder.
+/// - Batches return exactly one vector per input, in input order. Bound
+///   operations reject wrong counts, wrong dimensions, and non-finite values.
+/// - `dimension()` must be constant for the lifetime of the embedder and agree
+///   with its immutable identity.
 /// - `id()` must be stable across process restarts for diagnostics and registry
 ///   selection, but never establishes vector-space compatibility.
 pub trait Embedder: Send + Sync {
@@ -231,65 +279,86 @@ pub trait Embedder: Send + Sync {
 
     /// Embed a batch of text strings.
     ///
-    /// Default implementation calls `embed` in a loop. Neural models should
-    /// override this to exploit batch inference (ONNX has high fixed overhead
-    /// but low marginal cost per additional input).
+    /// Default implementation calls `embed` in a loop and observes cancellation
+    /// between inputs. Neural models should override this to exploit batch
+    /// inference and provide checkpoints within their own long-running work.
     /// This raw primitive carries no compatibility proof; use
     /// [`Self::embed_batch_bound`] when values leave the embedder boundary.
     ///
     /// # Errors
     ///
-    /// Returns `SearchError` if any embedding inference fails.
+    /// Returns `SearchError` if any embedding inference fails or is cancelled.
     fn embed_batch<'a>(
         &'a self,
         cx: &'a Cx,
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
+            embedding_checkpoint(cx, "embedder.embed_batch")?;
             let mut out = Vec::with_capacity(texts.len());
             for text in texts {
+                embedding_checkpoint(cx, "embedder.embed_batch")?;
                 out.push(self.embed(cx, text).await?);
             }
+            embedding_checkpoint(cx, "embedder.embed_batch")?;
             Ok(out)
         })
     }
 
     /// Embed one input and bind the output to the complete verified identity.
+    ///
+    /// Admit the identity before inference; reject malformed or cancelled
+    /// output before it can be persisted, compared, or cached.
     fn embed_bound<'a>(
         &'a self,
         cx: &'a Cx,
         text: &'a str,
     ) -> SearchFuture<'a, IdentityBoundEmbedding> {
         Box::pin(async move {
-            let bound = IdentityBoundEmbedding {
-                values: self.embed(cx, text).await?,
-                identity: self.identity()?.clone(),
-            };
-            bound.validate()?;
-            Ok(bound)
+            embedding_checkpoint(cx, "embedder.embed_bound")?;
+            let identity = self.identity()?;
+            let dimension = validate_embedder_identity(identity, self.dimension())?;
+            let values = self.embed(cx, text).await?;
+            embedding_checkpoint(cx, "embedder.embed_bound")?;
+            validate_embedding_values(&values, dimension)?;
+            Ok(IdentityBoundEmbedding {
+                values,
+                identity: identity.clone(),
+            })
         })
     }
 
     /// Embed a batch and bind every output to the same verified identity.
+    ///
+    /// Validation is all-or-error: a backend returning too few or too many
+    /// vectors cannot silently drop inputs through a downstream `zip`. Even
+    /// an empty batch must carry a valid identity. Inference implementations
+    /// remain responsible for cancellation checkpoints within blocking work.
     fn embed_batch_bound<'a>(
         &'a self,
         cx: &'a Cx,
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
         Box::pin(async move {
-            let identity = self.identity()?.clone();
-            self.embed_batch(cx, texts)
-                .await?
+            embedding_checkpoint(cx, "embedder.embed_batch_bound")?;
+            let identity = self.identity()?;
+            let dimension = validate_embedder_identity(identity, self.dimension())?;
+            let vectors = self.embed_batch(cx, texts).await?;
+            embedding_checkpoint(cx, "embedder.embed_batch_bound")?;
+            validate_embedding_batch_length(vectors.len(), texts.len())?;
+            let bound = vectors
                 .into_iter()
                 .map(|values| {
-                    let bound = IdentityBoundEmbedding {
+                    embedding_checkpoint(cx, "embedder.embed_batch_bound")?;
+                    validate_embedding_values(&values, dimension)?;
+                    Ok(IdentityBoundEmbedding {
                         values,
                         identity: identity.clone(),
-                    };
-                    bound.validate()?;
-                    Ok(bound)
+                    })
                 })
-                .collect()
+                .collect::<SearchResult<Vec<_>>>()?;
+            embedding_checkpoint(cx, "embedder.embed_batch_bound")?;
+            Ok(bound)
         })
     }
 
@@ -429,33 +498,39 @@ pub trait SyncEmbed: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns the embedding error or fails closed when identity/dimension
-    /// validation fails.
+    /// Returns the embedding error or fails closed when identity, dimension,
+    /// or finite-coordinate validation fails. Identity is admitted before work.
     fn embed_bound_sync(&self, text: &str) -> SearchResult<IdentityBoundEmbedding> {
-        let bound = IdentityBoundEmbedding {
-            values: self.embed_sync(text)?,
-            identity: self.identity()?.clone(),
-        };
-        bound.validate()?;
-        Ok(bound)
+        let identity = self.identity()?;
+        let dimension = validate_embedder_identity(identity, self.dimension())?;
+        let values = self.embed_sync(text)?;
+        validate_embedding_values(&values, dimension)?;
+        Ok(IdentityBoundEmbedding {
+            values,
+            identity: identity.clone(),
+        })
     }
 
     /// Synchronously embed a batch and bind every output to one identity.
     ///
     /// # Errors
     ///
-    /// Returns the first embedding or identity validation error.
+    /// Returns the first embedding or validation error. A batch must return
+    /// exactly one finite, correctly dimensioned vector per input; no partial
+    /// batch is returned. Identity is validated even for an empty batch.
     fn embed_batch_bound_sync(&self, texts: &[&str]) -> SearchResult<Vec<IdentityBoundEmbedding>> {
-        let identity = self.identity()?.clone();
-        self.embed_batch_sync(texts)?
+        let identity = self.identity()?;
+        let dimension = validate_embedder_identity(identity, self.dimension())?;
+        let vectors = self.embed_batch_sync(texts)?;
+        validate_embedding_batch_length(vectors.len(), texts.len())?;
+        vectors
             .into_iter()
             .map(|values| {
-                let bound = IdentityBoundEmbedding {
+                validate_embedding_values(&values, dimension)?;
+                Ok(IdentityBoundEmbedding {
                     values,
                     identity: identity.clone(),
-                };
-                bound.validate()?;
-                Ok(bound)
+                })
             })
             .collect()
     }
@@ -516,7 +591,7 @@ pub trait SyncEmbed: Send + Sync {
 /// blocking ONNX inference when called from a `spawn_blocking` context.
 pub struct SyncEmbedderAdapter<T: SyncEmbed>(pub T);
 
-fn sync_embed_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+fn embedding_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
     cx.checkpoint().map_err(|error| SearchError::Cancelled {
         phase: phase.to_owned(),
         reason: cx
@@ -528,8 +603,10 @@ fn sync_embed_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
 impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
     fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
-            sync_embed_checkpoint(cx, "sync_embed.embed")?;
-            self.0.embed_sync(text)
+            embedding_checkpoint(cx, "sync_embed.embed")?;
+            let values = self.0.embed_sync(text)?;
+            embedding_checkpoint(cx, "sync_embed.embed")?;
+            Ok(values)
         })
     }
 
@@ -539,8 +616,10 @@ impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
-            sync_embed_checkpoint(cx, "sync_embed.embed_batch")?;
-            self.0.embed_batch_sync(texts)
+            embedding_checkpoint(cx, "sync_embed.embed_batch")?;
+            let values = self.0.embed_batch_sync(texts)?;
+            embedding_checkpoint(cx, "sync_embed.embed_batch")?;
+            Ok(values)
         })
     }
 
@@ -1699,6 +1778,332 @@ mod tests {
                 }
                 other => panic!("expected a typed subsystem error, got {other:?}"),
             }
+        });
+    }
+
+    struct BatchContractSyncEmbedder {
+        identity: EmbeddingIdentityBundleV1,
+        output_dimension: usize,
+        outputs: Vec<Vec<f32>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BatchContractSyncEmbedder {
+        fn new(outputs: Vec<Vec<f32>>) -> Self {
+            Self {
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("batch-contract", 3),
+                output_dimension: 3,
+                outputs,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl SyncEmbed for BatchContractSyncEmbedder {
+        fn embed_sync(&self, _text: &str) -> SearchResult<Vec<f32>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.outputs.first().cloned().unwrap_or_default())
+        }
+
+        fn embed_batch_sync(&self, _texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.outputs.clone())
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn dimension(&self) -> usize {
+            self.output_dimension
+        }
+
+        fn id(&self) -> &'static str {
+            "batch-contract"
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
+    fn assert_contract_error(error: SearchError, expected_field: &str) {
+        match error {
+            SearchError::InvalidConfig { field, .. } => assert_eq!(field, expected_field),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identity_bound_rejects_non_finite_values_without_repair_or_disclosure() {
+        for bits in [0x7fc0_0000, 0xffc0_0042, 0x7f80_0001, 0x7f80_0000, 0xff80_0000] {
+            let bound = IdentityBoundEmbedding {
+                values: vec![12_345.5, f32::from_bits(bits), -9_876.25],
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("finite-contract", 3),
+            };
+            let error = bound.validate().expect_err("non-finite output must fail closed");
+            let message = error.to_string();
+            assert!(message.contains("index 1"));
+            assert!(!message.contains("12345"));
+            assert!(!message.contains("9876"));
+            assert_contract_error(error, "identity_bound_embedding.values");
+            assert_eq!(bound.values[1].to_bits(), bits);
+        }
+    }
+
+    #[test]
+    fn sync_bound_batch_cardinality_is_exact_including_empty_inputs() {
+        for input_count in 0..=4 {
+            let inputs = vec!["input"; input_count];
+            for output_count in 0..=5 {
+                let embedder = BatchContractSyncEmbedder::new(vec![vec![1.0; 3]; output_count]);
+                let result = embedder.embed_batch_bound_sync(&inputs);
+                if input_count == output_count {
+                    assert_eq!(result.unwrap().len(), input_count);
+                } else {
+                    assert_contract_error(result.unwrap_err(), "embedder.batch_length");
+                }
+                assert_eq!(embedder.call_count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn async_bound_batch_cardinality_is_exact_including_empty_inputs() {
+        run_test_with_cx(|cx| async move {
+            for input_count in 0..=4 {
+                let inputs = vec!["input"; input_count];
+                for output_count in 0..=5 {
+                    let adapter = SyncEmbedderAdapter(BatchContractSyncEmbedder::new(vec![
+                        vec![1.0; 3];
+                        output_count
+                    ]));
+                    let result = adapter.embed_batch_bound(&cx, &inputs).await;
+                    if input_count == output_count {
+                        assert_eq!(result.unwrap().len(), input_count);
+                    } else {
+                        assert_contract_error(result.unwrap_err(), "embedder.batch_length");
+                    }
+                    assert_eq!(adapter.0.call_count(), 1);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn sync_bound_single_and_batch_reject_bad_shapes_and_non_finite_rows() {
+        for output in [
+            vec![],
+            vec![1.0; 2],
+            vec![1.0; 4],
+            vec![1.0, f32::NAN, 0.0],
+            vec![1.0, f32::INFINITY, 0.0],
+            vec![1.0, f32::NEG_INFINITY, 0.0],
+        ] {
+            let single = BatchContractSyncEmbedder::new(vec![output.clone()]);
+            assert_contract_error(
+                single.embed_bound_sync("private-input").unwrap_err(),
+                "identity_bound_embedding.values",
+            );
+            // A valid first row must not let an invalid later row escape as
+            // a partially accepted batch.
+            let batch = BatchContractSyncEmbedder::new(vec![vec![1.0; 3], output]);
+            assert_contract_error(
+                batch.embed_batch_bound_sync(&["first", "second"]).unwrap_err(),
+                "identity_bound_embedding.values",
+            );
+        }
+    }
+
+    #[test]
+    fn async_bound_single_and_batch_reject_bad_shapes_and_non_finite_rows() {
+        run_test_with_cx(|cx| async move {
+            for output in [
+                vec![],
+                vec![1.0; 2],
+                vec![1.0; 4],
+                vec![1.0, f32::NAN, 0.0],
+                vec![1.0, f32::INFINITY, 0.0],
+                vec![1.0, f32::NEG_INFINITY, 0.0],
+            ] {
+                let single = SyncEmbedderAdapter(BatchContractSyncEmbedder::new(vec![
+                    output.clone(),
+                ]));
+                assert_contract_error(
+                    single.embed_bound(&cx, "private-input").await.unwrap_err(),
+                    "identity_bound_embedding.values",
+                );
+                let batch = SyncEmbedderAdapter(BatchContractSyncEmbedder::new(vec![
+                    vec![1.0; 3],
+                    output,
+                ]));
+                assert_contract_error(
+                    batch
+                        .embed_batch_bound(&cx, &["first", "second"])
+                        .await
+                        .unwrap_err(),
+                    "identity_bound_embedding.values",
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn bound_identity_and_declared_dimension_are_admitted_before_inference() {
+        run_test_with_cx(|cx| async move {
+            for invalid_dimension in [false, true] {
+                let mut embedder = BatchContractSyncEmbedder::new(vec![vec![1.0; 3]]);
+                if invalid_dimension {
+                    embedder.output_dimension = 4;
+                } else {
+                    embedder.identity.storage.format = "fsvi-v2".to_owned();
+                }
+                assert!(embedder.embed_bound_sync("input").is_err());
+                assert!(embedder.embed_batch_bound_sync(&["input"]).is_err());
+                assert!(embedder.embed_batch_bound_sync(&[]).is_err());
+                assert_eq!(embedder.call_count(), 0);
+
+                let adapter = SyncEmbedderAdapter(embedder);
+                assert!(adapter.embed_bound(&cx, "input").await.is_err());
+                assert!(adapter.embed_batch_bound(&cx, &["input"]).await.is_err());
+                assert!(adapter.embed_batch_bound(&cx, &[]).await.is_err());
+                assert_eq!(adapter.0.call_count(), 0);
+            }
+        });
+    }
+
+    fn assert_bound_rows_unchanged(
+        rows: &[IdentityBoundEmbedding],
+        expected: &BatchContractSyncEmbedder,
+    ) {
+        assert_eq!(rows.len(), expected.outputs.len());
+        for (row, values) in rows.iter().zip(&expected.outputs) {
+            row.validate().unwrap();
+            assert_eq!(row.identity, expected.identity);
+            let actual_bits: Vec<_> = row.values.iter().map(|value| value.to_bits()).collect();
+            let expected_bits: Vec<_> = values.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(actual_bits, expected_bits);
+        }
+    }
+
+    #[test]
+    fn valid_bound_rows_preserve_order_identity_and_exact_float_bits() {
+        run_test_with_cx(|cx| async move {
+            let adapter = SyncEmbedderAdapter(BatchContractSyncEmbedder::new(vec![
+                vec![0.0, -0.0, f32::from_bits(1)],
+                vec![1.0, -7.25, f32::MAX],
+            ]));
+            let sync = adapter.0.embed_batch_bound_sync(&["first", "second"]).unwrap();
+            assert_bound_rows_unchanged(&sync, &adapter.0);
+            let asynchronous = adapter
+                .embed_batch_bound(&cx, &["first", "second"])
+                .await
+                .unwrap();
+            assert_bound_rows_unchanged(&asynchronous, &adapter.0);
+            assert_eq!(adapter.0.call_count(), 2);
+        });
+    }
+
+    #[test]
+    fn cancelled_bound_calls_never_dispatch_inference() {
+        run_test_with_cx(|cx| async move {
+            let adapter = SyncEmbedderAdapter(BatchContractSyncEmbedder::new(vec![vec![1.0; 3]]));
+            cx.cancel_fast(asupersync::CancelKind::User);
+            assert!(matches!(
+                adapter.embed_bound(&cx, "input").await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                adapter.embed_batch_bound(&cx, &["input"]).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                adapter.embed_batch_bound(&cx, &[]).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(adapter.0.call_count(), 0);
+        });
+    }
+
+    struct CancelDuringInference {
+        identity: EmbeddingIdentityBundleV1,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CancelDuringInference {
+        fn new() -> Self {
+            Self {
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("cancel-during", 3),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Embedder for CancelDuringInference {
+        fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                cx.cancel_fast(asupersync::CancelKind::User);
+                // Deliberately return success after cancellation, modeling a
+                // backend that checks only before its blocking inference.
+                Ok(vec![1.0; 3])
+            })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+
+        fn id(&self) -> &'static str {
+            "cancel-during"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Cancellation fixture"
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
+    #[test]
+    fn default_async_batch_stops_after_cancellation_in_first_input() {
+        run_test_with_cx(|cx| async move {
+            let embedder = CancelDuringInference::new();
+            assert!(matches!(
+                embedder.embed_batch(&cx, &["first", "second", "third"]).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        });
+    }
+
+    #[test]
+    fn bound_single_discards_success_returned_after_cancellation() {
+        run_test_with_cx(|cx| async move {
+            let embedder = CancelDuringInference::new();
+            assert!(matches!(
+                embedder.embed_bound(&cx, "input").await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         });
     }
 }
