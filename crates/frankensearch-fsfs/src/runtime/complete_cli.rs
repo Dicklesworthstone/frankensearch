@@ -222,11 +222,10 @@ impl FsfsRuntime {
         root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
-        if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() || self.cli_input.expand
-        {
+        if self.cli_input.expand {
             return Err(complete_cli_error(
                 "search_options",
-                "complete-generation CLI search currently requires --no-daemon and does not support --expand; no fallback was attempted",
+                "complete-generation search does not support --expand; no fallback was attempted",
             ));
         }
         let query = self
@@ -251,6 +250,20 @@ impl FsfsRuntime {
             ));
         }
         let started = Instant::now();
+        if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
+            #[cfg(unix)]
+            {
+                let payload = self
+                    .query_complete_generation_daemon(cx, root, query, limit)
+                    .await?;
+                return self.emit_complete_search_payload(payload, started, writer);
+            }
+            #[cfg(not(unix))]
+            return Err(complete_cli_error(
+                "daemon_transport",
+                "complete-generation daemon forwarding requires Unix sockets",
+            ));
+        }
         let mut reader = self.open_retained_search(cx, root).await?;
         if self.cli_input.stream {
             let stream_id = format!("search-{}-{}", pressure_timestamp_ms(), std::process::id());
@@ -276,6 +289,15 @@ impl FsfsRuntime {
         let payload = payloads.last().cloned().ok_or_else(|| {
             complete_cli_error("search", "search completed without an Initial phase")
         })?;
+        self.emit_complete_search_payload(payload, started, writer)
+    }
+
+    fn emit_complete_search_payload<W: Write>(
+        &self,
+        payload: crate::output_schema::SearchPayload,
+        started: Instant,
+        writer: &mut W,
+    ) -> SearchResult<()> {
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if self.cli_input.format == OutputFormat::Table {
             let table = crate::adapters::format_emitter::render_search_table_for_cli(
