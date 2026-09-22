@@ -21,7 +21,9 @@ use super::complete_cli::{complete_cli_error, require_durable_publication};
 use super::{FsfsRuntime, retained_search_checkpoint, validate_retained_catalog_path};
 use crate::OutputFormat;
 use crate::config::{DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision};
-use crate::generation_store::{CompleteGenerationStore, GenerationPublication, PublishedGeneration};
+use crate::generation_store::{
+    CompleteGenerationStore, GenerationPublication, PublishedGeneration,
+};
 use crate::mount_info::{MountTable, read_system_mounts};
 use crate::watcher::DEFAULT_DEBOUNCE_MS;
 
@@ -85,7 +87,9 @@ impl Changes {
             return;
         }
         if !path.is_absolute()
-            || path.components().any(|part| matches!(part, Component::ParentDir))
+            || path
+                .components()
+                .any(|part| matches!(part, Component::ParentDir))
             || path.as_os_str().len() > MAX_HINT_PATH_BYTES
             || (!window.paths.contains(path) && window.paths.len() == MAX_HINT_PATHS)
         {
@@ -561,17 +565,22 @@ impl CompleteWatchSession {
             Err(error) => return Err(error),
         };
         check_watch_publication(cx, &self.store_root, self.publication.as_ref())?;
-        let previous = self.settling.as_ref().and_then(|gate| gate.observation.as_ref());
+        let previous = self
+            .settling
+            .as_ref()
+            .and_then(|gate| gate.observation.as_ref());
         let touched = {
             let changes = lock_changes(&self.changes)?;
             // Check backend failure at the same boundary as hints, not only
             // before traversal. A failed backend cannot certify a quiet source.
             changes.check_backend()?;
-            pending.as_ref().is_some_and(|hint| {
-                touches_observed_files(hint, &observed, previous)
-            }) || changes.dirty.as_ref().is_some_and(|hint| {
-                touches_observed_files(hint, &observed, previous)
-            })
+            pending
+                .as_ref()
+                .is_some_and(|hint| touches_observed_files(hint, &observed, previous))
+                || changes
+                    .dirty
+                    .as_ref()
+                    .is_some_and(|hint| touches_observed_files(hint, &observed, previous))
         };
         let completed = now.max(Instant::now());
         if !touched && previous == Some(&observed) {
@@ -967,7 +976,11 @@ mod tests {
             let mut sibling = Changes::default();
             sibling.record(Instant::now(), false);
             sibling.record_path(&source.path.join("nested-sibling"));
-            assert!(!touches_observed_files(sibling.dirty.as_ref().unwrap(), &after, Some(&before)));
+            assert!(!touches_observed_files(
+                sibling.dirty.as_ref().unwrap(),
+                &after,
+                Some(&before)
+            ));
         });
     }
 
@@ -1223,7 +1236,10 @@ mod lifecycle_tests {
                 assert!(session.settling.as_ref().unwrap().observation.is_none());
                 assert_eq!(candidate_count(&root), allocated);
                 assert_eq!(
-                    CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(),
+                    CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap(),
                     Some(before.clone())
                 );
             }
@@ -1241,8 +1257,28 @@ mod lifecycle_tests {
             let current = require_durable_publication(publication).unwrap();
             assert_ne!(before, current);
             let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
-            assert_eq!(reader.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 2);
-            assert_eq!(pinned.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 1);
+            assert_eq!(
+                reader
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
+            assert_eq!(
+                pinned
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
             assert_eq!(pinned.generation(), &before);
         });
     }
@@ -1265,12 +1301,29 @@ mod lifecycle_tests {
             }
             assert_eq!(
                 session.baseline.as_ref(),
-                Some(&session.source.observe(&cx, &runtime.config.discovery).unwrap())
+                Some(
+                    &session
+                        .source
+                        .observe(&cx, &runtime.config.discovery)
+                        .unwrap()
+                )
             );
-            assert!(lock_changes(&session.changes).unwrap().dirty.as_ref().unwrap().force_rebuild);
+            assert!(
+                lock_changes(&session.changes)
+                    .unwrap()
+                    .dirty
+                    .as_ref()
+                    .unwrap()
+                    .force_rebuild
+            );
             let due = session.last_reconcile + DEBOUNCE;
-            let next = require_durable_publication(session.advance(&cx, due).await.unwrap().unwrap()).unwrap();
-            assert_ne!(next, before, "metadata equality must not erase the catch-up obligation");
+            let next =
+                require_durable_publication(session.advance(&cx, due).await.unwrap().unwrap())
+                    .unwrap();
+            assert_ne!(
+                next, before,
+                "metadata equality must not erase the catch-up obligation"
+            );
         });
     }
 
@@ -1304,15 +1357,22 @@ mod lifecycle_tests {
             let now = Instant::now();
             session.settling = Some(SettleWindow {
                 next_probe: now,
-                observation: Some(session.source.observe(&cx, &runtime.config.discovery).unwrap()),
+                observation: Some(
+                    session
+                        .source
+                        .observe(&cx, &runtime.config.discovery)
+                        .unwrap(),
+                ),
             });
             let changes = Arc::clone(&session.changes);
-            session.probe_settling_source_with_entry_check(&cx, now, |path| {
-                let mut changes = lock_changes(&changes)?;
-                changes.record(now, false);
-                changes.record_path(path);
-                Ok(())
-            }).unwrap();
+            session
+                .probe_settling_source_with_entry_check(&cx, now, |path| {
+                    let mut changes = lock_changes(&changes)?;
+                    changes.record(now, false);
+                    changes.record_path(path);
+                    Ok(())
+                })
+                .unwrap();
             assert!(session.settling.as_ref().unwrap().observation.is_none());
             assert!(lock_changes(&session.changes).unwrap().dirty.is_some());
             assert!(!root.exists());
@@ -1329,13 +1389,24 @@ mod lifecycle_tests {
             let now = Instant::now();
             session.settling = Some(SettleWindow {
                 next_probe: now,
-                observation: Some(session.source.observe(&cx, &runtime.config.discovery).unwrap()),
+                observation: Some(
+                    session
+                        .source
+                        .observe(&cx, &runtime.config.discovery)
+                        .unwrap(),
+                ),
             });
             let changes = Arc::clone(&session.changes);
-            let error = session.probe_settling_source_with_entry_check(&cx, now, |_| {
-                record_notification(&changes, Err(notify::Error::generic("probe backend failed")), now);
-                Ok(())
-            }).unwrap_err();
+            let error = session
+                .probe_settling_source_with_entry_check(&cx, now, |_| {
+                    record_notification(
+                        &changes,
+                        Err(notify::Error::generic("probe backend failed")),
+                        now,
+                    );
+                    Ok(())
+                })
+                .unwrap_err();
             assert!(error.to_string().contains("probe backend failed"));
             assert!(session.settling.is_some());
             assert!(lock_changes(&session.changes).unwrap().dirty.is_none());
@@ -1360,7 +1431,13 @@ mod lifecycle_tests {
             cx.set_cancel_requested(false);
             assert!(session.settling.is_some());
             assert_eq!(candidate_count(&root), allocated);
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(before));
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(before)
+            );
         });
     }
 
@@ -1373,15 +1450,25 @@ mod lifecycle_tests {
             controlled_notifications(&mut session);
             let first = publish_tick(&mut session, &cx).await;
             let outside = require_durable_publication(
-                runtime.rebuild_retained_generation(&cx, &root).await.unwrap(),
-            ).unwrap();
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
             let count = candidate_count(&root);
             let error = session.advance(&cx, Instant::now()).await.unwrap_err();
             assert!(matches!(error, SearchError::InvalidConfig { field, .. }
                 if field == "complete_generation.watch_selection_changed"));
             assert_eq!(candidate_count(&root), count);
             assert_eq!(session.publication.as_ref(), Some(&first));
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(outside));
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(outside)
+            );
         });
     }
 
@@ -1394,15 +1481,22 @@ mod lifecycle_tests {
             controlled_notifications(&mut session);
             let first = publish_tick(&mut session, &cx).await;
             let outside = require_durable_publication(
-                runtime.rebuild_retained_generation(&cx, &root).await.unwrap(),
-            ).unwrap();
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
             let before = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
             // Call the actual attempt after the external publication, as when
             // a writer wins after advance's check but before store.begin().
             let error = session.attempt(&cx, true, None).await.unwrap_err();
             assert!(matches!(error, SearchError::InvalidConfig { field, .. }
                 if field == "complete_generation.watch_selection_changed"));
-            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), before);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                before
+            );
             assert_eq!(session.publication.as_ref(), Some(&first));
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
             assert_eq!(store.active(&cx).unwrap(), Some(outside));
@@ -1443,8 +1537,12 @@ mod lifecycle_tests {
             let pointer = root.join(COMPLETE_GENERATION_POINTER);
             let first_pointer = fs::read(&pointer).unwrap();
             let outside = require_durable_publication(
-                runtime.rebuild_retained_generation(&cx, &root).await.unwrap(),
-            ).unwrap();
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
             let outside_pointer = fs::read(&pointer).unwrap();
             // Both descriptors select real, admitted bundles. Replay them at
             // a deterministic point inside the production discovery traversal.
@@ -1454,19 +1552,32 @@ mod lifecycle_tests {
             let now = Instant::now();
             session.settling = Some(SettleWindow {
                 next_probe: now,
-                observation: Some(session.source.observe(&cx, &runtime.config.discovery).unwrap()),
+                observation: Some(
+                    session
+                        .source
+                        .observe(&cx, &runtime.config.discovery)
+                        .unwrap(),
+                ),
             });
-            let error = session.probe_settling_source_with_entry_check(&cx, now, |_| {
-                fs::write(&staged, &outside_pointer)?;
-                fs::rename(&staged, &pointer)?;
-                Ok(())
-            }).unwrap_err();
+            let error = session
+                .probe_settling_source_with_entry_check(&cx, now, |_| {
+                    fs::write(&staged, &outside_pointer)?;
+                    fs::rename(&staged, &pointer)?;
+                    Ok(())
+                })
+                .unwrap_err();
             assert!(matches!(error, SearchError::InvalidConfig { field, .. }
                 if field == "complete_generation.watch_selection_changed"));
             assert!(session.settling.is_some());
             assert!(lock_changes(&session.changes).unwrap().dirty.is_none());
             assert_eq!(session.publication.as_ref(), Some(&first));
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(outside));
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(outside)
+            );
         });
     }
 

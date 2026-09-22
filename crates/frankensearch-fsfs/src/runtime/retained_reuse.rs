@@ -24,8 +24,7 @@ use sha2::{Digest, Sha256};
 use super::{
     CheckpointFileEntry, CliCommand, FSFS_CHECKPOINT_FILE, FsfsIndexPayload, FsfsRuntime,
     INDEXING_CHECKPOINT_SCHEMA_VERSION, IndexingCheckpoint, IndexingProgressStage,
-    SearchExecutionMode, content_sha256_hex, retained_search_checkpoint,
-    write_indexing_checkpoint,
+    SearchExecutionMode, content_sha256_hex, retained_search_checkpoint, write_indexing_checkpoint,
 };
 use crate::generation_store::{COMPLETE_GENERATION_MANIFEST, CompleteGenerationStore};
 
@@ -68,18 +67,19 @@ fn session_id() -> SearchResult<&'static str> {
 fn configuration_digest(runtime: &FsfsRuntime) -> SearchResult<String> {
     // Persist a digest, not the configuration (which can contain private paths
     // or provider settings). A conservative mismatch simply starts cold.
-    let bytes = serde_json::to_vec(runtime.config()).map_err(|source| {
-        SearchError::SubsystemError {
+    let bytes =
+        serde_json::to_vec(runtime.config()).map_err(|source| SearchError::SubsystemError {
             subsystem: "fsfs.complete_generation.reuse_config",
             source: Box::new(source),
-        }
-    })?;
+        })?;
     Ok(content_sha256_hex(&bytes))
 }
 
 fn open_regular(path: &Path) -> SearchResult<File> {
     if !fs::symlink_metadata(path)?.file_type().is_file() {
-        return Err(reuse_error("reuse input is not a regular, non-symlink file"));
+        return Err(reuse_error(
+            "reuse input is not a regular, non-symlink file",
+        ));
     }
     let mut options = OpenOptions::new();
     options.read(true);
@@ -117,7 +117,10 @@ fn proven(entry: &CheckpointFileEntry) -> bool {
     entry.lexical_indexed
         && entry.semantic_indexed
         && entry.content_hash_hex.len() == 64
-        && entry.content_hash_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && entry
+            .content_hash_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn compatible_receipt(runtime: &FsfsRuntime, receipt: &ReuseReceipt) -> SearchResult<bool> {
@@ -181,7 +184,9 @@ fn completed_receipt(
         || checkpoint.embedder_id != payload.vector_generation.id
         || checkpoint.embedder_dimension != payload.vector_generation.dimension
     {
-        return Err(reuse_error("observed checkpoint does not belong to the completed candidate"));
+        return Err(reuse_error(
+            "observed checkpoint does not belong to the completed candidate",
+        ));
     }
     let manifests = FsfsRuntime::read_matching_manifest_generation(root)?
         .ok_or_else(|| reuse_error("completed candidate has no matching manifests"))?;
@@ -207,12 +212,18 @@ fn completed_receipt(
         checkpoint.files.insert(key, entry);
     }
     checkpoint.artifacts_durable = true;
-    checkpoint.source_hash_hex.clone_from(&final_state.source_hash_hex);
-    checkpoint.reason_codes.clone_from(&final_state.reason_codes);
+    checkpoint
+        .source_hash_hex
+        .clone_from(&final_state.source_hash_hex);
+    checkpoint
+        .reason_codes
+        .clone_from(&final_state.reason_codes);
     checkpoint.discovered_files = final_state.discovered_files;
     checkpoint.skipped_files = final_state.skipped_files;
     if FsfsRuntime::read_checkpoint_manifest_generation(root, &checkpoint)?.is_none() {
-        return Err(reuse_error("retained input evidence disagrees with final generation metadata"));
+        return Err(reuse_error(
+            "retained input evidence disagrees with final generation metadata",
+        ));
     }
     Ok(ReuseReceipt {
         version: RECEIPT_VERSION,
@@ -229,17 +240,32 @@ fn write_receipt(cx: &Cx, root: &Path, receipt: &ReuseReceipt) -> SearchResult<(
         source: Box::new(source),
     })?;
     if bytes.len() as u64 > MAX_RECEIPT_BYTES {
-        return Err(reuse_error("retained input evidence exceeds the 64 MiB limit"));
+        return Err(reuse_error(
+            "retained input evidence exceeds the 64 MiB limit",
+        ));
     }
     // The seed excludes its old receipt. Never overwrite a file whose origin
     // is unknown, and never put a live checkpoint into a sealed generation.
-    let mut file = OpenOptions::new().write(true).create_new(true).open(root.join(RECEIPT_FILE))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join(RECEIPT_FILE))?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     File::open(root)?.sync_all()?;
     tracing::info!(
-        eligible_semantic_files = receipt.checkpoint.files.values().filter(|entry| proven(entry)).count(),
-        covered_files = receipt.checkpoint.files.values().filter(|entry| !entry.content_hash_hex.is_empty()).count(),
+        eligible_semantic_files = receipt
+            .checkpoint
+            .files
+            .values()
+            .filter(|entry| proven(entry))
+            .count(),
+        covered_files = receipt
+            .checkpoint
+            .files
+            .values()
+            .filter(|entry| !entry.content_hash_hex.is_empty())
+            .count(),
         total_files = receipt.checkpoint.files.len(),
         "retained completed indexing input evidence; uncovered files require recomputation"
     );
@@ -279,15 +305,26 @@ fn seed_candidate(
     if !compatible_receipt(runtime, &receipt)? {
         return Ok(0);
     }
-    let eligible = receipt.checkpoint.files.values().filter(|entry| proven(entry)).count();
+    let eligible = receipt
+        .checkpoint
+        .files
+        .values()
+        .filter(|entry| proven(entry))
+        .count();
     if eligible == 0 {
         return Ok(0);
     }
     if !receipt.checkpoint.artifacts_durable
         || receipt.checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
-        || FsfsRuntime::read_checkpoint_manifest_generation(predecessor.path(), &receipt.checkpoint)?.is_none()
+        || FsfsRuntime::read_checkpoint_manifest_generation(
+            predecessor.path(),
+            &receipt.checkpoint,
+        )?
+        .is_none()
     {
-        return Err(reuse_error("retained checkpoint is inconsistent with its selected generation"));
+        return Err(reuse_error(
+            "retained checkpoint is inconsistent with its selected generation",
+        ));
     }
     FsfsRuntime::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
     let mut sentinel = FsfsRuntime::read_index_sentinel(predecessor.path())?
@@ -295,14 +332,18 @@ fn seed_candidate(
     if !fs::symlink_metadata(destination)?.file_type().is_dir()
         || fs::read_dir(destination)?.next().transpose()?.is_some()
     {
-        return Err(reuse_error("reuse requires an empty, non-symlink candidate directory"));
+        return Err(reuse_error(
+            "reuse requires an empty, non-symlink candidate directory",
+        ));
     }
     let mut stats = CopyStats::default();
     copy_tree(cx, predecessor.path(), destination, 0, &mut stats)?;
     // The store lease excludes cooperating publication. Rechecking also refuses
     // an out-of-protocol pointer change or source mutation during the copy.
     if store.active(cx)?.as_ref() != Some(&predecessor) {
-        return Err(reuse_error("selected predecessor changed while copying the seed"));
+        return Err(reuse_error(
+            "selected predecessor changed while copying the seed",
+        ));
     }
     let label = destination.display().to_string();
     sentinel.index_root.clone_from(&label);
@@ -329,7 +370,9 @@ fn copy_tree(
 ) -> SearchResult<()> {
     retained_search_checkpoint(cx)?;
     if depth > MAX_COPY_DEPTH || !fs::symlink_metadata(source)?.file_type().is_dir() {
-        return Err(reuse_error("invalid or excessively deep predecessor directory"));
+        return Err(reuse_error(
+            "invalid or excessively deep predecessor directory",
+        ));
     }
     let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
@@ -342,14 +385,23 @@ fn copy_tree(
         let name = entry.file_name();
         let file_type = entry.file_type()?;
         if !file_type.is_dir() && !file_type.is_file() {
-            return Err(reuse_error("predecessor contains a symlink or special filesystem object"));
+            return Err(reuse_error(
+                "predecessor contains a symlink or special filesystem object",
+            ));
         }
         if depth == 0
-            && [COMPLETE_GENERATION_MANIFEST, RECEIPT_FILE, FSFS_CHECKPOINT_FILE]
-                .iter().any(|excluded| name == *excluded)
+            && [
+                COMPLETE_GENERATION_MANIFEST,
+                RECEIPT_FILE,
+                FSFS_CHECKPOINT_FILE,
+            ]
+            .iter()
+            .any(|excluded| name == *excluded)
         {
             if !file_type.is_file() {
-                return Err(reuse_error("generation control artifact is not a regular file"));
+                return Err(reuse_error(
+                    "generation control artifact is not a regular file",
+                ));
             }
             continue;
         }
@@ -360,7 +412,10 @@ fn copy_tree(
         } else {
             let mut input = open_regular(&entry.path())?;
             let expected = input.metadata()?.len();
-            let mut output = OpenOptions::new().write(true).create_new(true).open(&target)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
             // No hard links: tombstones, mmap writes, catalogs and lexical
             // commits in the candidate must never reach a retained reader.
             let mut buffer = [0_u8; 64 * 1024];
@@ -369,8 +424,11 @@ fn copy_tree(
             loop {
                 retained_search_checkpoint(cx)?;
                 let count = input.read(&mut buffer)?;
-                if count == 0 { break; }
-                copied = copied.checked_add(count as u64)
+                if count == 0 {
+                    break;
+                }
+                copied = copied
+                    .checked_add(count as u64)
                     .ok_or_else(|| reuse_error("copied artifact length overflow"))?;
                 if copied > expected {
                     return Err(reuse_error("predecessor artifact grew during copying"));
@@ -379,7 +437,9 @@ fn copy_tree(
                 digest.update(&buffer[..count]);
             }
             if copied != expected || input.metadata()?.len() != expected {
-                return Err(reuse_error("predecessor artifact changed length during copying"));
+                return Err(reuse_error(
+                    "predecessor artifact changed length during copying",
+                ));
             }
             output.sync_all()?;
             let mut verification = open_regular(&target)?;
@@ -387,14 +447,20 @@ fn copy_tree(
             loop {
                 retained_search_checkpoint(cx)?;
                 let count = verification.read(&mut buffer)?;
-                if count == 0 { break; }
+                if count == 0 {
+                    break;
+                }
                 copied_digest.update(&buffer[..count]);
             }
             if digest.finalize() != copied_digest.finalize() {
-                return Err(reuse_error("copied artifact digest differs from its source stream"));
+                return Err(reuse_error(
+                    "copied artifact digest differs from its source stream",
+                ));
             }
             stats.files += 1;
-            stats.bytes = stats.bytes.checked_add(copied)
+            stats.bytes = stats
+                .bytes
+                .checked_add(copied)
                 .ok_or_else(|| reuse_error("total copied artifact length overflow"))?;
         }
     }
@@ -417,7 +483,11 @@ mod copy_tests {
             fs::create_dir_all(source.join("vector")).unwrap();
             fs::create_dir(&destination).unwrap();
             fs::write(source.join("vector/fast.idx"), b"original vector bytes").unwrap();
-            for name in [RECEIPT_FILE, COMPLETE_GENERATION_MANIFEST, FSFS_CHECKPOINT_FILE] {
+            for name in [
+                RECEIPT_FILE,
+                COMPLETE_GENERATION_MANIFEST,
+                FSFS_CHECKPOINT_FILE,
+            ] {
                 fs::write(source.join(name), b"source-only control record").unwrap();
             }
             let mut stats = CopyStats::default();
@@ -425,12 +495,19 @@ mod copy_tests {
             let original = source.join("vector/fast.idx");
             let copied = destination.join("vector/fast.idx");
             assert_eq!(fs::read(&original).unwrap(), fs::read(&copied).unwrap());
-            assert_ne!(fs::metadata(&original).unwrap().ino(), fs::metadata(&copied).unwrap().ino());
+            assert_ne!(
+                fs::metadata(&original).unwrap().ino(),
+                fs::metadata(&copied).unwrap().ino()
+            );
             fs::write(copied, b"candidate mutation").unwrap();
             assert_eq!(fs::read(original).unwrap(), b"original vector bytes");
             assert_eq!(stats.files, 1);
             assert_eq!(stats.bytes, 21);
-            for name in [RECEIPT_FILE, COMPLETE_GENERATION_MANIFEST, FSFS_CHECKPOINT_FILE] {
+            for name in [
+                RECEIPT_FILE,
+                COMPLETE_GENERATION_MANIFEST,
+                FSFS_CHECKPOINT_FILE,
+            ] {
                 assert!(!destination.join(name).exists());
                 assert!(source.join(name).is_file());
             }
@@ -448,7 +525,10 @@ mod copy_tests {
             fs::write(source.join("data"), b"source").unwrap();
             fs::write(destination.join("data"), b"independent evidence").unwrap();
             assert!(copy_tree(&cx, &source, &destination, 0, &mut CopyStats::default()).is_err());
-            assert_eq!(fs::read(destination.join("data")).unwrap(), b"independent evidence");
+            assert_eq!(
+                fs::read(destination.join("data")).unwrap(),
+                b"independent evidence"
+            );
             let links = parent.path().join("links");
             fs::create_dir(&links).unwrap();
             std::os::unix::fs::symlink(source.join("data"), links.join("linked")).unwrap();
@@ -483,23 +563,32 @@ mod copy_tests {
         run_test_with_cx(|cx| async move {
             let parent = tempfile::tempdir().unwrap();
             let large = parent.path().join("large");
-            File::create(&large).unwrap().set_len(MAX_RECEIPT_BYTES + 1).unwrap();
-            assert!(matches!(read_json::<serde_json::Value>(&cx, &large), Err(SearchError::InvalidConfig { .. })));
+            File::create(&large)
+                .unwrap()
+                .set_len(MAX_RECEIPT_BYTES + 1)
+                .unwrap();
+            assert!(matches!(
+                read_json::<serde_json::Value>(&cx, &large),
+                Err(SearchError::InvalidConfig { .. })
+            ));
             let linked = parent.path().join("linked");
             std::os::unix::fs::symlink(&large, &linked).unwrap();
-            assert!(matches!(read_json::<serde_json::Value>(&cx, &linked), Err(SearchError::InvalidConfig { .. })));
+            assert!(matches!(
+                read_json::<serde_json::Value>(&cx, &linked),
+                Err(SearchError::InvalidConfig { .. })
+            ));
         });
     }
 }
 
 #[cfg(all(test, unix, not(feature = "embedded-models")))]
 mod generation_tests {
-    use super::*;
     use super::super::{CheckpointReuse, IndexCandidate, checkpoint_entry_reuse};
-    use asupersync::test_utils::run_test_with_cx;
-    use crate::{CliInput, FsfsConfig};
+    use super::*;
     use crate::config::IngestionClass;
     use crate::generation_store::{GenerationPublication, PublishedGeneration};
+    use crate::{CliInput, FsfsConfig};
+    use asupersync::test_utils::run_test_with_cx;
     use std::collections::HashSet;
     use std::path::PathBuf;
 
@@ -508,7 +597,11 @@ mod generation_tests {
         let root = parent.join("store");
         fs::create_dir(&source).unwrap();
         for number in 0..count {
-            fs::write(source.join(format!("doc-{number}.md")), format!("sharedtoken document {number}")).unwrap();
+            fs::write(
+                source.join(format!("doc-{number}.md")),
+                format!("sharedtoken document {number}"),
+            )
+            .unwrap();
         }
         let mut config = FsfsConfig::default();
         config.indexing.offline = true;
@@ -546,15 +639,31 @@ mod generation_tests {
             let parent = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(parent.path(), 2);
             let generation = publish(&runtime, &cx, &root).await;
-            let receipt: ReuseReceipt = read_json(&cx, &generation.path().join(RECEIPT_FILE)).unwrap();
+            let receipt: ReuseReceipt =
+                read_json(&cx, &generation.path().join(RECEIPT_FILE)).unwrap();
             assert_eq!(receipt.checkpoint.files.len(), 2);
-            assert_eq!(receipt.checkpoint.files.values().filter(|entry| proven(entry)).count(), 1);
+            assert_eq!(
+                receipt
+                    .checkpoint
+                    .files
+                    .values()
+                    .filter(|entry| proven(entry))
+                    .count(),
+                1
+            );
             let tail = receipt.checkpoint.files.values().last().unwrap();
             assert!(tail.content_hash_hex.is_empty());
             assert!(!tail.semantic_indexed);
             assert!(!tail.lexical_indexed);
             assert!(!generation.path().join(FSFS_CHECKPOINT_FILE).exists());
-            assert!(FsfsRuntime::read_checkpoint_manifest_generation(generation.path(), &receipt.checkpoint).unwrap().is_some());
+            assert!(
+                FsfsRuntime::read_checkpoint_manifest_generation(
+                    generation.path(),
+                    &receipt.checkpoint
+                )
+                .unwrap()
+                .is_some()
+            );
         });
     }
 
@@ -568,13 +677,24 @@ mod generation_tests {
             let build = store.begin(&cx).unwrap();
             let next = candidate(&runtime, build.path());
             assert_eq!(seed_candidate(&cx, &next, &store, build.path()).unwrap(), 4);
-            let checkpoint: IndexingCheckpoint = read_json(&cx, &build.path().join(FSFS_CHECKPOINT_FILE)).unwrap();
+            let checkpoint: IndexingCheckpoint =
+                read_json(&cx, &build.path().join(FSFS_CHECKPOINT_FILE)).unwrap();
             assert_eq!(checkpoint.index_root, build.path().display().to_string());
-            assert!(FsfsRuntime::read_checkpoint_manifest_generation(build.path(), &checkpoint).unwrap().is_some());
+            assert!(
+                FsfsRuntime::read_checkpoint_manifest_generation(build.path(), &checkpoint)
+                    .unwrap()
+                    .is_some()
+            );
             assert!(!build.path().join(COMPLETE_GENERATION_MANIFEST).exists());
             assert!(!build.path().join(RECEIPT_FILE).exists());
             assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
-            assert_eq!(FsfsRuntime::read_index_sentinel(predecessor.path()).unwrap().unwrap().index_root, predecessor.path().display().to_string());
+            assert_eq!(
+                FsfsRuntime::read_index_sentinel(predecessor.path())
+                    .unwrap()
+                    .unwrap()
+                    .index_root,
+                predecessor.path().display().to_string()
+            );
         });
     }
 
@@ -584,7 +704,8 @@ mod generation_tests {
             let parent = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(parent.path(), 4);
             let predecessor = publish(&runtime, &cx, &root).await;
-            let mut receipt: ReuseReceipt = read_json(&cx, &predecessor.path().join(RECEIPT_FILE)).unwrap();
+            let mut receipt: ReuseReceipt =
+                read_json(&cx, &predecessor.path().join(RECEIPT_FILE)).unwrap();
             assert!(compatible_receipt(&runtime, &receipt).unwrap());
             receipt.session.push('x');
             assert!(!compatible_receipt(&runtime, &receipt).unwrap());
@@ -610,9 +731,12 @@ mod generation_tests {
             let parent = tempfile::tempdir().unwrap();
             let (runtime, source, root) = fixture(parent.path(), 4);
             let generation = publish(&runtime, &cx, &root).await;
-            let receipt: ReuseReceipt = read_json(&cx, &generation.path().join(RECEIPT_FILE)).unwrap();
+            let receipt: ReuseReceipt =
+                read_json(&cx, &generation.path().join(RECEIPT_FILE)).unwrap();
             let (key, entry) = receipt.checkpoint.files.first_key_value().unwrap();
-            let manifests = FsfsRuntime::read_matching_manifest_generation(generation.path()).unwrap().unwrap();
+            let manifests = FsfsRuntime::read_matching_manifest_generation(generation.path())
+                .unwrap()
+                .unwrap();
             let manifest = &manifests[key];
             let path = source.join("doc-0.md");
             let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
@@ -623,16 +747,41 @@ mod generation_tests {
                 ingestion_class: IngestionClass::FullSemanticLexical,
             };
             let live_ids = HashSet::from([key.clone()]);
-            let classify = |hash: &str| checkpoint_entry_reuse(
-                &receipt.checkpoint, entry, manifest, &probe, hash,
-                &receipt.checkpoint.embedder_id, receipt.checkpoint.embedder_dimension, false, &live_ids,
+            let classify = |hash: &str| {
+                checkpoint_entry_reuse(
+                    &receipt.checkpoint,
+                    entry,
+                    manifest,
+                    &probe,
+                    hash,
+                    &receipt.checkpoint.embedder_id,
+                    receipt.checkpoint.embedder_dimension,
+                    false,
+                    &live_ids,
+                )
+            };
+            assert_eq!(
+                classify(&content_sha256_hex(&fs::read(&path).unwrap())),
+                CheckpointReuse::Complete
             );
-            assert_eq!(classify(&content_sha256_hex(&fs::read(&path).unwrap())), CheckpointReuse::Complete);
             fs::write(&path, b"changed input document").unwrap();
-            File::options().write(true).open(&path).unwrap()
-                .set_times(std::fs::FileTimes::new().set_modified(original_modified)).unwrap();
-            assert_ne!(classify(&content_sha256_hex(&fs::read(path).unwrap())), CheckpointReuse::Complete);
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(generation));
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+                .unwrap();
+            assert_ne!(
+                classify(&content_sha256_hex(&fs::read(path).unwrap())),
+                CheckpointReuse::Complete
+            );
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(generation)
+            );
         });
     }
 
@@ -643,19 +792,43 @@ mod generation_tests {
             let (runtime, source, root) = fixture(parent.path(), 4);
             let first = publish(&runtime, &cx, &root).await;
             let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
-            fs::write(source.join("doc-0.md"), "sharedtoken changed first document").unwrap();
-            fs::rename(source.join("doc-1.md"), parent.path().join("outside-source.md")).unwrap();
+            fs::write(
+                source.join("doc-0.md"),
+                "sharedtoken changed first document",
+            )
+            .unwrap();
+            fs::rename(
+                source.join("doc-1.md"),
+                parent.path().join("outside-source.md"),
+            )
+            .unwrap();
             fs::write(source.join("doc-4.md"), "sharedtoken new fourth document").unwrap();
             let second = publish(&runtime, &cx, &root).await;
             assert_ne!(first.id(), second.id());
-            assert_eq!(pinned.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 4);
+            assert_eq!(
+                pinned
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                4
+            );
             let mut current = runtime.open_retained_search(&cx, &root).await.unwrap();
             let phases = current.search(&cx, "sharedtoken", 10).await.unwrap();
             let hits = &phases.last().unwrap().hits;
             assert_eq!(hits.len(), 4);
             assert!(hits.iter().any(|hit| hit.path.ends_with("doc-4.md")));
             assert!(!hits.iter().any(|hit| hit.path.ends_with("doc-1.md")));
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(second));
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(second)
+            );
             assert!(first.path().is_dir());
         });
     }
