@@ -712,21 +712,23 @@ The repository includes explicit quality harnesses and statistical checks:
 
 This keeps tuning decisions evidence-driven rather than anecdotal.
 
-Measured through the `fsfs` product (release build, `fsfs serve` modes) on BEIR
-SciFact, 5,183 abstracts and 300 held-out queries, default settings,
-2026-09-22 (`docs/quality_harness/fsfs_beir_product_eval.py`):
+nDCG@10 measured through the `fsfs` product (release build, `fsfs serve`
+modes, default settings, held-out BEIR test queries, 2026-09-22;
+`docs/quality_harness/fsfs_beir_product_eval.py`):
 
-| Stage | nDCG@10 | Recall@100 |
-|---|---|---|
-| Lexical only (Quill BM25) | 0.654 | 0.867 |
-| Initial (BM25 + potion-128M, RRF) | 0.588 | 0.910 |
-| Refined (+ MiniLM quality tier) | 0.688 | 0.952 |
+| Corpus (documents / queries) | Lexical only (Quill BM25) | Initial (BM25 + potion-128M, RRF) | Refined (+ MiniLM) |
+|---|---|---|---|
+| SciFact (5,183 / 300) | 0.654 | 0.588 | 0.688 |
+| NFCorpus (3,633 / 323) | 0.296 | 0.289 | 0.331 |
+| ArguAna (8,674 / 1,406) | 0.318 | 0.336 | 0.365 |
 
-Refinement is a significant gain over both Initial and lexical-only search.
-Initial is significantly worse than BM25 alone on this corpus: the first
-results and `fast_only` search rank below plain lexical search here (tracked as
-`bd-zown6`; one corpus so far). The cross-encoder applied only once its
-deadline was raised, and then added +0.019 nDCG@10, which is not significant.
+Refined is significantly better than both lexical-only and Initial results on
+all three corpora (paired bootstrap, 95% intervals excluding zero). Initial
+against BM25 alone is mixed: significantly worse on SciFact, indistinguishable
+on NFCorpus and significantly better on ArguAna, so on some corpora the first
+results and `fast_only` search rank no better than plain lexical search. The
+cross-encoder applied on SciFact only once its deadline was raised
+(`rerank_timeout_ms`), and then added +0.019 nDCG@10, which is not significant.
 
 ## Limits and Tradeoffs
 

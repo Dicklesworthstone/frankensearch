@@ -270,11 +270,13 @@ qualified; individual results below are narrower than release acceptance.
   schema now also declares the `rerank` key it had been rejecting.
   [Change](https://github.com/Dicklesworthstone/frankensearch/commit/550915737bf27809af6b1aa670ced03ad7f268eb).
 
-- **First product-path retrieval-quality measurement.** On BEIR SciFact through
-  `fsfs serve`, nDCG@10 is 0.654 lexical-only, 0.588 Initial and 0.688 Refined:
-  refinement is a significant gain, while Initial ranks significantly below
-  BM25 alone on this corpus (tracked as `bd-zown6`). Reproduce with
-  `docs/quality_harness/fsfs_beir_product_eval.py`.
+- **First product-path retrieval-quality measurement.** Through `fsfs serve`
+  on three BEIR corpora, nDCG@10 (lexical-only / Initial / Refined) is
+  0.654 / 0.588 / 0.688 on SciFact, 0.296 / 0.289 / 0.331 on NFCorpus and
+  0.318 / 0.336 / 0.365 on ArguAna. Refined is significantly better than both
+  on all three. Initial against BM25 alone is mixed: significantly worse on
+  SciFact, no measurable difference on NFCorpus, significantly better on
+  ArguAna. Reproduce with `docs/quality_harness/fsfs_beir_product_eval.py`.
 
 - **Explain and streams report the cross-encoder.** `fsfs explain` JSON now
   includes the `rerank` component (model, raw logit, sigmoid) for hits the
