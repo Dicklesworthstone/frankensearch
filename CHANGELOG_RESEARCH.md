@@ -1120,3 +1120,36 @@ both logs match their hashes, and both invocations executed ELF
 This restoration admits no measured performance rows and changes no WIN/LOSE
 classification. The SIGKILL cause is unproven; no surviving job process or kernel
 OOM record was found. Full Quill, R1, and final release publication remain open.
+
+### September 22: buffered CLI forwarding integration
+
+Upstream `d0d744b8e35edbf045d87342b8793bd4d6ce02a0` connects explicit buffered
+CLI searches to the complete-generation daemon without client-side retrieval.
+The integration preserves that protocol, updates the nightly atomic API spelling,
+renames a private request type for strict Clippy, and formats the new source.
+Its configuration-refusal test now first accepts the canonical store path and
+requires the specific configuration error, preventing a symlinked temporary path
+from masking the intended assertion. The actual-executable Potion test now
+forwards a search, verifies its hit, refuses a corrupt selection without rewriting
+it, and then successfully stops the still-running daemon.
+
+Admitted RCH worker `vmi1264463` passes all-target fsfs check, strict all-target
+Clippy, 40 daemon tests, and the explicitly enabled real-model executable test
+(one pass, zero failures or ignores). Receipt SHA-256 is
+`0f80810d8edbdfb4eb4d3e8507a3ecc469fa2646ea1e496eca17d2493642559b`;
+all stage logs and the four final Rust source hashes match the frozen candidate.
+The real-model log hashes to
+`13695ad1a826dfce98954c02fc51bccd5a9fe17e32e1bcc208269e49d60b3015`;
+its executed test ELF hashes to
+`c653f81b7e5c07a716a7e5a5226121817c3e913117bc49be0420d4880c5e16a7`.
+The post-run production binary hashes to
+`7409cc636a41e8ed61be4b2af2b976de0c8e61ac5e4866bf6770370b180855da`.
+The initial deprecated-API/private-type Clippy failure remains retained in
+receipt `4ecff1f8d3a91ed9d7d80328ca14ede998de9b5811f78112aa3d977743d9b55d`.
+
+Literal changed-file UBS reports zero critical findings, 554 warnings, and 118
+informational findings. Changelog structural validation passes with existing
+bare-hash warnings, and the new upstream commit link resolves through GitHub.
+This is focused forwarding qualification. The stock receipt above predates
+forwarding; the combined source still needs its own stock gate. The separate
+full Quill rerun and exact R1 boundary remain unresolved, with no release claim.

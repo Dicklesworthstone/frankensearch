@@ -96,9 +96,10 @@ notifications/reconciliation drive subsequent publication. No claim is made to
 detect a lost event for an edit that preserves every observed metadata field.
 This is not hostile-directory, anti-rollback, or privileged-adversary protection.
 
-This implementation preserves the existing buffered socket server. It does not
-implement search CLI daemon forwarding, progressive socket requests, legacy
-watcher migration, incremental embedding, or TUI migration. Ctrl-C cancellation
+Complete-store readers support buffered CLI forwarding and progressive socket
+requests as described in [complete-generation serving](complete-generation-rebuilds.md).
+Legacy watcher migration, incremental embedding, and TUI migration remain
+unfinished. Ctrl-C cancellation
 is wired through the existing shutdown coordinator; no hard real-time latency
 is claimed for synchronous native operations or indexing work.
 

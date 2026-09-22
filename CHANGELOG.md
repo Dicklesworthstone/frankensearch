@@ -273,12 +273,16 @@ qualified; individual results below are narrower than release acceptance.
   selection pointer is damaged. Progressive requests reuse canonical stream
   frames, bound pending output, and refuse unsupported per-request overrides.
   Cooperative deadlines release stalled asynchronous requests without cancelling
-  the daemon. Ordinary CLI forwarding and legacy v4 overlays remain separate
-  integration work; complete release qualification is still pending.
+  the daemon. Explicit `search --daemon` now forwards buffered CLI requests,
+  verifies store/configuration identity, and applies request filters and limits
+  without opening local search resources or falling back after a refusal.
+  CLI streaming and legacy v4 overlays remain separate integration work;
+  complete release qualification is still pending.
   [Socket ownership](https://github.com/Dicklesworthstone/frankensearch/commit/f07ab0251c5fc01d0632915890aba5dd69d319b1);
   [shutdown](https://github.com/Dicklesworthstone/frankensearch/commit/07d90a88879129a7f4729b5ff663a4a90a0dde8e);
   [execution deadlines](https://github.com/Dicklesworthstone/frankensearch/commit/1ea51073c59312f3dbac3936c3d4a7860652d4c6);
-  [progressive serving](https://github.com/Dicklesworthstone/frankensearch/commit/07e4838ad09a1dfbe01d9ee4326332776b0188cb).
+  [progressive serving](https://github.com/Dicklesworthstone/frankensearch/commit/07e4838ad09a1dfbe01d9ee4326332776b0188cb);
+  [buffered CLI forwarding](https://github.com/Dicklesworthstone/frankensearch/commit/d0d744b8e35edbf045d87342b8793bd4d6ce02a0).
 
 - **`config init` and `config reset` emit reloadable defaults.** On 64-bit hosts,
   directly serializing the unlimited-result sentinel produced an integer TOML

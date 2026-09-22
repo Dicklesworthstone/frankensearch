@@ -173,7 +173,12 @@ impl FsfsRuntime {
                         // selection. Never let an older v3 cache survive it.
                         cache.clear();
                         let result = Box::pin(forwarding::serve(
-                            cx, self, session, &mut peer, &bytes, peer_timeout,
+                            cx,
+                            self,
+                            session,
+                            &mut peer,
+                            &bytes,
+                            peer_timeout,
                         ))
                         .await;
                         match result {

@@ -345,11 +345,46 @@ fn complete_daemon_binary_serves_and_stops_with_corrupt_selection() {
     assert!(hits[0]["path"].as_str().unwrap().ends_with("alpha.md"));
     assert_streamed_query(&socket);
 
+    let forwarded = Process::start(fixture.command("search", "json").args([
+        "sharedtoken",
+        "--daemon",
+        "--limit",
+        "1",
+    ]))
+    .finish(Duration::from_secs(60));
+    assert!(
+        forwarded.status.success(),
+        "forwarded CLI search failed: {}",
+        String::from_utf8_lossy(&forwarded.stderr)
+    );
+    let forwarded: Value = serde_json::from_slice(&forwarded.stdout).unwrap();
+    assert_eq!(forwarded["ok"], true, "{forwarded}");
+    let forwarded_hits = forwarded["data"]["hits"].as_array().unwrap();
+    assert_eq!(forwarded_hits.len(), 1);
+    assert!(
+        forwarded_hits[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("alpha.md")
+    );
+
     // Stop dispatch must not first admit the selected generation or its models.
     let pointer = fixture
         .store
         .join(frankensearch_fsfs::generation_store::COMPLETE_GENERATION_POINTER);
     fs::write(&pointer, b"corrupt selection for stop dispatch").unwrap();
+    let refused = Process::start(
+        fixture
+            .command("search", "json")
+            .args(["sharedtoken", "--daemon"]),
+    )
+    .finish(Duration::from_secs(30));
+    assert!(!refused.status.success(), "corrupt selection was served");
+    assert_eq!(
+        fs::read(&pointer).unwrap(),
+        b"corrupt selection for stop dispatch"
+    );
+    daemon.assert_alive();
     let stopped = Process::start(fixture.command("daemon", "json").arg("--stop"))
         .finish(Duration::from_secs(10));
     assert!(

@@ -98,6 +98,22 @@ The first command stays in the foreground and listens at
 accepts one newline-terminated query; plain queries return a buffered response. The stop
 command addresses that socket and remains usable if the generation selection is
 damaged. It does not start a replacement daemon or repair the selection.
+
+With that daemon running, forward a buffered search explicitly:
+
+```sh
+fsfs search "connection pooling" --daemon --limit 10 \
+  --index-dir /work/search-store --config /work/fsfs.toml --format json
+```
+
+The client checks the store and resolved configuration against the daemon;
+filters and limits apply to the individual request. Use the same configuration
+for both commands. A missing daemon, configuration mismatch, corrupt selection,
+or invalid reply fails the request without opening local search resources or
+retrying retrieval. CLI forwarding does not automatically start a daemon and
+currently refuses `--stream` and `--expand`. Direct `--no-daemon --stream` and
+the raw progressive socket protocol below remain available.
+
 ## Progressive Unix-socket requests
 
 The complete-generation socket daemon also accepts progressive requests:
@@ -120,9 +136,9 @@ selection before using either the cache or the search resources.
 
 Streaming currently accepts only `query`, `limit`, `stream`, and optional
 `mode: "full"`, under the daemon startup configuration. Extra filter, model,
-format and protocol options are refused, not silently ignored. This endpoint
-does not yet wire ordinary `fsfs search --daemon` forwarding or the legacy
-v4 request-overlay protocol into complete-generation serving.
+format and protocol options are refused, not silently ignored. Buffered CLI
+forwarding uses its separate versioned request. The legacy v4 request-overlay
+protocol is not supported by this endpoint.
 
 A refusal before any stream bytes are emitted uses the existing buffered
 `ok: false` error response. Once streaming starts, an output failure or outer
