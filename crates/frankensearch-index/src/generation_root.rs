@@ -4918,7 +4918,10 @@ pub mod generation_reader {
         /// The new head must not be older than the installed one for the same
         /// root identity: a stale replica or replayed root is refused typed
         /// ([`SnapshotRefusalV1::RegressedHead`]) and the installed snapshot is
-        /// kept. On any refusal or error nothing is installed.
+        /// kept. Equal sequences must name the same exact authority. Concurrent
+        /// refreshes recheck the winning snapshot before installation; expensive
+        /// admission runs outside this atomic update. On refusal or error nothing
+        /// is installed.
         ///
         /// # Errors
         ///
@@ -4934,19 +4937,48 @@ pub mod generation_reader {
             let SnapshotOpenOutcomeV1::Opened(fresh) = &outcome else {
                 return Ok(outcome);
             };
-            if let Some(installed) = self.load()
-                && installed.root_id() == fresh.root_id()
-                && installed.head().authority.sequence > fresh.head().authority.sequence
-            {
-                return Ok(SnapshotOpenOutcomeV1::Refused(
-                    SnapshotRefusalV1::RegressedHead {
-                        installed: installed.head().authority.sequence,
-                        observed: fresh.head().authority.sequence,
-                    },
-                ));
+            let mut installed = self.inner.load();
+            loop {
+                if let Some(current) = installed.as_ref()
+                    && current.root_id() == fresh.root_id()
+                {
+                    let current_head = current.head().authority;
+                    let fresh_head = fresh.head().authority;
+                    if current_head.sequence > fresh_head.sequence {
+                        return Ok(SnapshotOpenOutcomeV1::Refused(
+                            SnapshotRefusalV1::RegressedHead {
+                                installed: current_head.sequence,
+                                observed: fresh_head.sequence,
+                            },
+                        ));
+                    }
+                    if current_head.sequence == fresh_head.sequence && current_head != fresh_head {
+                        return Ok(SnapshotOpenOutcomeV1::Refused(
+                            SnapshotRefusalV1::Authority(
+                                GenerationAuthorityErrorV1::EqualSequenceFork,
+                            ),
+                        ));
+                    }
+                }
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+                super::platform::test_boundary(
+                    super::platform::TestBoundary::BeforeSnapshotCellCompareExchange,
+                )?;
+                let previous = self
+                    .inner
+                    .compare_and_swap(&*installed, Some(Arc::clone(fresh)));
+                let exchanged = match (&*installed, &*previous) {
+                    (None, None) => true,
+                    (Some(expected), Some(previous)) => Arc::ptr_eq(expected, previous),
+                    _ => false,
+                };
+                if exchanged {
+                    return Ok(outcome);
+                }
+                // Another refresher won after our observation. Recheck its
+                // exact head rather than overwriting it with a stale admission.
+                installed = previous;
             }
-            self.inner.store(Some(Arc::clone(fresh)));
-            Ok(outcome)
         }
     }
 
@@ -6250,6 +6282,150 @@ pub mod generation_reader {
         }
 
         #[test]
+        fn concurrent_refresh_cannot_overwrite_a_newer_installed_head() {
+            let (_, stale_root, _) = genesis_root("cell-concurrent-stale");
+            let (current_path, current_root, genesis_slot) =
+                genesis_root("cell-concurrent-current");
+            let publisher = publisher(&current_root);
+            publish_with_manifest(
+                &current_path,
+                &publisher,
+                2,
+                Some(genesis_slot.authority),
+                ExpectedAuthorityPairV1 {
+                    first: None,
+                    second: Some(genesis_slot),
+                },
+                None,
+            );
+            let old = opened(open(
+                &stale_root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            let old_bytes = old.closure().bytes(GenerationComponentRole::Vector);
+
+            // Exercise a race from both None and an installed generation. In
+            // either case the slow thread has already observed the cell before
+            // the newer refresh wins, so a load/check/store would regress it.
+            for initially_populated in [false, true] {
+                let cell = GenerationSnapshotCellV1::new();
+                if initially_populated {
+                    assert!(cell.install(Arc::clone(&old)).is_none());
+                }
+                let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+                let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+                std::thread::scope(|scope| {
+                    let cell = &cell;
+                    let stale_root = &stale_root;
+                    let slow = scope.spawn(move || {
+                        let mut paused = false;
+                        let _hook = platform::install_test_hook(move |boundary| {
+                            if boundary == platform::TestBoundary::BeforeSnapshotCellCompareExchange
+                                && !paused
+                            {
+                                paused = true;
+                                observed_tx.send(()).expect("announce observation");
+                                resume_rx
+                                    .recv_timeout(std::time::Duration::from_secs(30))
+                                    .expect("newer refresh completes");
+                            }
+                            Ok(())
+                        });
+                        cell.refresh(
+                            stale_root,
+                            ROOT_ID,
+                            GenerationRootSecurityProfileV1::CooperativeLocal,
+                            None,
+                        )
+                        .expect("slow refresh runs")
+                    });
+                    observed_rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("slow refresh observed the cell");
+                    let newer = opened(
+                        cell.refresh(
+                            &current_root,
+                            ROOT_ID,
+                            GenerationRootSecurityProfileV1::CooperativeLocal,
+                            None,
+                        )
+                        .expect("newer refresh runs without waiting for slow admission"),
+                    );
+                    resume_tx.send(()).expect("release slow refresher");
+                    assert_eq!(
+                        refused(slow.join().expect("slow refresher completes")),
+                        SnapshotRefusalV1::RegressedHead {
+                            installed: 2,
+                            observed: 1,
+                        }
+                    );
+                    assert!(Arc::ptr_eq(&cell.load().expect("newer stays"), &newer));
+                });
+            }
+            assert_eq!(old.head().authority.sequence, 1);
+            assert_eq!(
+                &*old.closure().bytes(GenerationComponentRole::Vector),
+                &*old_bytes
+            );
+        }
+
+        #[test]
+        fn cell_refuses_an_equal_sequence_fork_but_accepts_the_same_authority() {
+            let (_, root, _) = genesis_root("cell-equal-head");
+            let cell = GenerationSnapshotCellV1::new();
+            let first = opened(
+                cell.refresh(
+                    &root,
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                )
+                .expect("initial refresh"),
+            );
+            let same = opened(
+                cell.refresh(
+                    &root,
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                )
+                .expect("same exact authority remains admissible"),
+            );
+            assert_eq!(same.head(), first.head());
+
+            // A separately admitted root has identical manifest/component
+            // bytes at the same sequence, but a different exact authority
+            // reference. Matching sequence/content alone cannot join the fork.
+            let fork_path = fixture_root("cell-equal-fork");
+            let fork_root = admit(&fork_path);
+            write_component_objects(&fork_path, 1);
+            let id = [0xef; 16];
+            write_manifest_object(&fork_path, id, &same.manifest_bytes());
+            let (len, sha256) = same.manifest().object_receipt();
+            let authority = AuthorityRefV1::new(1, id, len, sha256, None).expect("fork authority");
+            assert!(matches!(
+                publisher(&fork_root)
+                    .publish(authority, ExpectedAuthorityPairV1::default(), None, WRITER)
+                    .expect("fork publication"),
+                PublicationOutcomeV1::Committed { .. }
+            ));
+            assert_eq!(
+                refused(
+                    cell.refresh(
+                        &fork_root,
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                    )
+                    .expect("fork refresh runs")
+                ),
+                SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::EqualSequenceFork)
+            );
+            assert!(Arc::ptr_eq(&cell.load().expect("original stays"), &same));
+        }
+
+        #[test]
         fn long_lived_reader_stays_byte_exact_across_many_publications() {
             const PUBLICATIONS: u64 = 12;
             let root_path = fixture_root("cell-long-lived");
@@ -7037,6 +7213,7 @@ mod platform {
         AfterExactNameEnumeration,
         BeforeAclRead,
         AfterAclRead,
+        BeforeSnapshotCellCompareExchange,
         #[cfg(target_os = "macos")]
         BeforePreopenedQualification,
         #[cfg(target_os = "macos")]
@@ -7104,7 +7281,7 @@ mod platform {
     }
 
     #[cfg(test)]
-    fn test_boundary(boundary: TestBoundary) -> GenerationRootResult<()> {
+    pub(super) fn test_boundary(boundary: TestBoundary) -> GenerationRootResult<()> {
         TEST_HOOK.with(|slot| {
             let mut slot = slot.borrow_mut();
             slot.as_mut().map_or(Ok(()), |hook| hook(boundary))
