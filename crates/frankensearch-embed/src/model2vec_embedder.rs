@@ -31,7 +31,7 @@ use tracing::instrument;
 
 use crate::model_manifest::{
     MODEL2VEC_OUTPUT_NORMALIZATION_V1, MODEL2VEC_POOLING_V1, MODEL2VEC_PREPROCESSING_V1,
-    MODEL2VEC_SEQUENCE_POLICY_V1, ModelArtifactManifestV1,
+    MODEL2VEC_PREPROCESSING_V2, MODEL2VEC_SEQUENCE_POLICY_V1, ModelArtifactManifestV1,
 };
 use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -88,6 +88,10 @@ pub struct Model2VecEmbedder {
     model_dir: PathBuf,
     /// Complete identity derived from the verified frozen manifest.
     identity: EmbeddingIdentityBundleV1,
+    /// Token id excluded from pooling: the `WordPiece` unknown token under the
+    /// V2 preprocessing contract, matching reference `model2vec`. `None`
+    /// under V1, which pools every in-matrix id.
+    dropped_token_id: Option<u32>,
     /// Test-only witness that the shipping tokenizer returned the offset-free encoding shape.
     #[cfg(test)]
     last_tokenizer_route_was_offset_free: AtomicBool,
@@ -333,6 +337,16 @@ impl Model2VecEmbedder {
             });
         }
         identity.validate()?;
+        let dropped_token_id = if identity.space.model_preprocessing == MODEL2VEC_PREPROCESSING_V2 {
+            Some(wordpiece_unknown_token_id(&tokenizer).map_err(|reason| {
+                SearchError::ModelLoadFailed {
+                    path: model_dir.join("tokenizer.json"),
+                    source: reason.into(),
+                }
+            })?)
+        } else {
+            None
+        };
         let admission_ms = elapsed_ms(admission_started);
         tracing::debug!(model = name, admission_ms, "Model2Vec identity admitted");
 
@@ -387,6 +401,7 @@ impl Model2VecEmbedder {
             name: name.to_owned(),
             model_dir: model_dir.to_owned(),
             identity,
+            dropped_token_id,
             #[cfg(test)]
             last_tokenizer_route_was_offset_free: AtomicBool::new(false),
         })
@@ -440,6 +455,21 @@ impl Model2VecEmbedder {
 
     #[inline]
     fn embed_token_ids(&self, token_ids: &[u32]) -> Vec<f32> {
+        // V2 contract: drop the unknown token before pooling, as reference
+        // `model2vec` does. Only texts that actually contain it pay for the
+        // filtered copy.
+        let filtered;
+        let token_ids = match self.dropped_token_id {
+            Some(dropped) if token_ids.contains(&dropped) => {
+                filtered = token_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != dropped)
+                    .collect::<Vec<_>>();
+                filtered.as_slice()
+            }
+            _ => token_ids,
+        };
         if token_ids.is_empty() {
             return vec![0.0; self.dimensions];
         }
@@ -599,15 +629,35 @@ fn finish_mean_pool_and_normalize_former(sum: &mut [f32], count: usize) {
     }
 }
 
+/// The unknown-token id of a `WordPiece` tokenizer, which the V2 preprocessing
+/// contract drops before pooling. Any other tokenizer model cannot honor V2.
+fn wordpiece_unknown_token_id(tokenizer: &Tokenizer) -> Result<u32, String> {
+    let tokenizers::models::ModelWrapper::WordPiece(wordpiece) = tokenizer.get_model() else {
+        return Err(
+            "the V2 Model2Vec preprocessing contract requires a WordPiece tokenizer".to_owned(),
+        );
+    };
+    tokenizer.token_to_id(&wordpiece.unk_token).ok_or_else(|| {
+        format!(
+            "WordPiece unknown token {:?} is absent from the tokenizer vocabulary",
+            wordpiece.unk_token
+        )
+    })
+}
+
 fn validate_registered_execution_contract(
     identity: &EmbeddingIdentityBundleV1,
 ) -> SearchResult<()> {
+    let preprocessing = identity.space.model_preprocessing.as_str();
+    if preprocessing != MODEL2VEC_PREPROCESSING_V1 && preprocessing != MODEL2VEC_PREPROCESSING_V2 {
+        return Err(SearchError::InvalidConfig {
+            field: "model2vec.execution_contract".to_owned(),
+            value: identity.space.logical_model_id.clone(),
+            reason: "registered model preprocessing disagrees with the native Model2Vec backend"
+                .to_owned(),
+        });
+    }
     for (field, actual, expected) in [
-        (
-            "model preprocessing",
-            identity.space.model_preprocessing.as_str(),
-            MODEL2VEC_PREPROCESSING_V1,
-        ),
         (
             "sequence policy",
             identity.space.sequence_policy.as_str(),
@@ -1209,6 +1259,86 @@ mod tests {
         )
         .unwrap();
         create_test_safetensors(dir, 16, 256);
+    }
+
+    /// A `WordPiece` fixture like the potion-base models' tokenizer: `[UNK]`
+    /// (id 0) has its own matrix row, so pooling it is observable.
+    fn create_wordpiece_test_model(dir: &Path, vocab_size: usize, dimensions: usize) {
+        let tokenizer_json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": { "type": "Lowercase" },
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordPiece",
+                "vocab": create_test_vocab(vocab_size),
+                "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 100
+            }
+        });
+        fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_string_pretty(&tokenizer_json).unwrap(),
+        )
+        .unwrap();
+        create_test_safetensors(dir, vocab_size, dimensions);
+    }
+
+    /// GH #50: the V2 contract drops the `WordPiece` unknown token before
+    /// pooling, as reference `model2vec` does, so an unknown word leaves the
+    /// vector bit-identical; V1 pools its row, so the vector moves. V2 on a
+    /// tokenizer with no `WordPiece` unknown token is refused at load.
+    #[test]
+    fn v2_preprocessing_drops_wordpiece_unknown_tokens_and_v1_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        create_wordpiece_test_model(dir.path(), 11, 8);
+        let load = |preprocessing: &str| {
+            let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("wordpiece", 1);
+            preprocessing.clone_into(&mut identity.space.model_preprocessing);
+            Model2VecEmbedder::load_preverified(dir.path(), "wordpiece", identity)
+        };
+
+        let v2 = load(MODEL2VEC_PREPROCESSING_V2).expect("V2 WordPiece load");
+        assert_eq!(v2.dropped_token_id, Some(0));
+        let known = v2.embed_sync("hello world").unwrap();
+        assert!(known.iter().any(|value| *value != 0.0));
+        assert_f32_bits_eq(
+            &v2.embed_sync("hello zzzz world").unwrap(),
+            &known,
+            "V2 must pool exactly the known tokens",
+        );
+        assert!(
+            v2.embed_sync("zzzz qqqq")
+                .unwrap()
+                .iter()
+                .all(|value| *value == 0.0),
+            "an all-unknown text is the zero vector under V2"
+        );
+
+        let v1 = load(MODEL2VEC_PREPROCESSING_V1).expect("V1 WordPiece load");
+        assert_eq!(v1.dropped_token_id, None);
+        assert_ne!(
+            v1.embed_sync("hello zzzz world").unwrap(),
+            v1.embed_sync("hello world").unwrap(),
+            "V1 pools the unknown token's row"
+        );
+
+        let word_level = tempfile::tempdir().unwrap();
+        create_test_model(word_level.path(), 11, 8);
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("word-level", 1);
+        MODEL2VEC_PREPROCESSING_V2.clone_into(&mut identity.space.model_preprocessing);
+        assert!(
+            matches!(
+                Model2VecEmbedder::load_preverified(word_level.path(), "word-level", identity),
+                Err(SearchError::ModelLoadFailed { .. })
+            ),
+            "V2 requires a WordPiece tokenizer"
+        );
     }
 
     /// Create a test vocabulary mapping words to token IDs.
@@ -2423,6 +2553,7 @@ mod tests {
             name: DEFAULT_MODEL_NAME.to_owned(),
             model_dir: dir.to_owned(),
             identity: embedder.identity.clone(),
+            dropped_token_id: embedder.dropped_token_id,
             last_tokenizer_route_was_offset_free: AtomicBool::new(false),
         };
         for text in texts {

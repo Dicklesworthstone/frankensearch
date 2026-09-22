@@ -4642,6 +4642,29 @@ impl NativeQualityModel {
     }
 }
 
+/// Resolve `indexing.fast_model` to a registered `Model2Vec` model (GH #50).
+///
+/// A blank value selects the default. An unrecognized name is a typed
+/// configuration error, never a silent fallback to the default model: each
+/// registered model is a distinct vector space.
+#[cfg(feature = "semantic-support")]
+fn select_fast_model(name: &str) -> SearchResult<frankensearch_embed::RegisteredModel2Vec> {
+    use frankensearch_embed::RegisteredModel2Vec;
+    if name.trim().is_empty() {
+        return RegisteredModel2Vec::potion_128m();
+    }
+    RegisteredModel2Vec::builtin(name).unwrap_or_else(|| {
+        Err(SearchError::InvalidConfig {
+            field: "indexing.fast_model".to_owned(),
+            value: name.to_owned(),
+            reason: format!(
+                "not a registered Model2Vec fast model; select one of {} (see fsfs download-models --list)",
+                RegisteredModel2Vec::BUILTIN_IDS.join(", ")
+            ),
+        })
+    })
+}
+
 /// Runtime reason codes for the rerank stage; the planner's own
 /// `query.stage.rerank.*` codes cover the plan-level skips.
 const REASON_RERANK_NOT_REQUESTED: &str = "query.stage.rerank.disabled.not_requested";
@@ -12634,10 +12657,16 @@ impl FsfsRuntime {
             // process-cache hit would answer from a model read minutes ago
             // rather than from the bytes on disk now — which is exactly the
             // question `doctor` is asked. The duplicate 512 MB read is the
-            // point here, and `doctor` is not a hot path (GH #46).
-            "fast" => Model2VecEmbedder::load_with_name(model_path, &status.name).and_then(|embedder| {
-                Self::validate_doctor_model_generation(index_root, &status.tier, &embedder)
-            }),
+            // point here, and `doctor` is not a hot path (GH #46). The
+            // configured model selects which registered manifest admits the
+            // directory (GH #50).
+            "fast" => select_fast_model(&status.name)
+                .and_then(|registration| {
+                    Model2VecEmbedder::load_registered(model_path, &registration)
+                })
+                .and_then(|embedder| {
+                    Self::validate_doctor_model_generation(index_root, &status.tier, &embedder)
+                }),
             #[cfg(feature = "semantic-loaders")]
             "quality" => FastEmbedEmbedder::load_with_name(model_path, &status.name).and_then(|embedder| {
                 Self::validate_doctor_model_generation(index_root, &status.tier, &embedder)
@@ -13499,6 +13528,8 @@ impl FsfsRuntime {
     fn manifest_install_dir_name(manifest: &ModelManifest) -> String {
         match manifest.id.as_str() {
             "potion-multilingual-128m" => "potion-multilingual-128M".to_owned(),
+            "potion-base-8m" => "potion-base-8M".to_owned(),
+            "potion-base-32m" => "potion-base-32M".to_owned(),
             "all-minilm-l6-v2" => "all-MiniLM-L6-v2".to_owned(),
             FSFS_NATIVE_QUALITY_MODEL_ID => "all-MiniLM-L6-v2-native".to_owned(),
             "paraphrase-multilingual-minilm-l12-v2" => {
@@ -16356,6 +16387,19 @@ impl FsfsRuntime {
 
         #[cfg(not(test))]
         {
+            // An explicitly selected non-default fast model is loaded from its
+            // own verified install, never auto-detected or downloaded: like
+            // the opt-in quality models, acquisition and activation are both
+            // explicit (GH #50).
+            #[cfg(feature = "semantic-support")]
+            {
+                let selected = select_fast_model(&self.config.indexing.fast_model)?;
+                if selected.download_manifest().id
+                    != frankensearch_embed::RegisteredModel2Vec::BUILTIN_IDS[0]
+                {
+                    return self.load_selected_fast_model(&selected);
+                }
+            }
             let configured_root = PathBuf::from(&self.config.indexing.model_dir);
             let options = DetectOptions {
                 offline: Some(self.config.indexing.offline),
@@ -16383,6 +16427,38 @@ impl FsfsRuntime {
 
             embedder
         }
+    }
+
+    /// Load an explicitly selected registered fast model from its verified
+    /// install under `indexing.model_dir`, through the shared process cache.
+    #[cfg(all(feature = "semantic-support", not(test)))]
+    fn load_selected_fast_model(
+        &self,
+        registration: &frankensearch_embed::RegisteredModel2Vec,
+    ) -> SearchResult<Arc<dyn Embedder>> {
+        let manifest_id = registration.download_manifest().id.as_str();
+        let inspection = Self::inspect_registered_model_cache(
+            "fast",
+            manifest_id,
+            Path::new(&self.config.indexing.model_dir),
+        )?;
+        if inspection.state == ModelCacheVerificationState::Missing {
+            return Err(SearchError::EmbedderUnavailable {
+                model: manifest_id.to_owned(),
+                reason: format!(
+                    "indexing.fast_model selects {manifest_id} but it is not installed at {}; run `fsfs download-models {manifest_id}` (installing a model never re-embeds an existing index)",
+                    inspection.path.display(),
+                ),
+            });
+        }
+        let embedder: Arc<dyn Embedder> =
+            Model2VecEmbedder::load_shared_registered(&inspection.path, registration)?;
+        Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
+        info!(
+            fast_embedder = embedder.id(),
+            "fsfs selected verified registered fast model"
+        );
+        Ok(embedder)
     }
 
     /// Resolve the quality-tier embedder alone (never re-opening the fast
@@ -37613,7 +37689,17 @@ mod tests {
                 .await
                 .expect("list payload");
             assert_eq!(payload.operation, "list");
-            assert_eq!(payload.models.len(), 9);
+            // 7 default + 4 opt-in (multilingual, native MiniLM, potion-base 8M/32M).
+            assert_eq!(payload.models.len(), 11);
+            for opt_in in ["potion-base-8m", "potion-base-32m"] {
+                let entry = payload
+                    .models
+                    .iter()
+                    .find(|entry| entry.id == opt_in)
+                    .unwrap_or_else(|| panic!("{opt_in} is listed"));
+                assert_eq!(entry.tier.as_deref(), Some("fast"), "{opt_in}");
+                assert_eq!(entry.state, "missing", "{opt_in} is not installed here");
+            }
             assert!(
                 payload
                     .models
@@ -39118,6 +39204,44 @@ mod tests {
         assert_eq!(session.hits[0].semantic_rank, None);
         assert_eq!(session.hits[0].hash_score, Some(0.4));
         assert_eq!(session.hits[0].semantic_score, None);
+    }
+
+    /// GH #50: `indexing.fast_model` selects a registered `Model2Vec` model by
+    /// manifest id or model name; blank is the default; anything else is a
+    /// typed configuration error rather than a silent fall back to 128M.
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn fast_model_selection_is_strict_and_case_insensitive() {
+        for (name, expected_id, dimension) in [
+            ("potion-multilingual-128M", "potion-multilingual-128m", 256),
+            ("potion-multilingual-128m", "potion-multilingual-128m", 256),
+            ("", "potion-multilingual-128m", 256),
+            ("potion-base-8M", "potion-base-8m", 256),
+            ("POTION-BASE-8M", "potion-base-8m", 256),
+            (" potion-base-32m ", "potion-base-32m", 512),
+        ] {
+            let selected = super::select_fast_model(name).expect("registered fast model");
+            assert_eq!(selected.download_manifest().id, expected_id, "{name:?}");
+            assert_eq!(selected.dimension(), dimension, "{name:?}");
+        }
+        for unknown in ["potion-base-2M", "potion", "all-MiniLM-L6-v2", "hash"] {
+            match super::select_fast_model(unknown) {
+                Err(SearchError::InvalidConfig { field, value, .. }) => {
+                    assert_eq!(field, "indexing.fast_model");
+                    assert_eq!(value, unknown);
+                }
+                other => panic!("{unknown:?} must be refused, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            FsfsRuntime::manifest_install_dir_name(&ModelManifest::potion_base_8m()),
+            "potion-base-8M"
+        );
+        assert_eq!(
+            FsfsRuntime::registered_manifest_for_model("fast", "potion-base-32M")
+                .map(|manifest| manifest.id),
+            Some("potion-base-32m".to_owned())
+        );
     }
 
     /// Explain JSON carries the cross-encoder component for a reranked hit,

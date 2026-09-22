@@ -116,6 +116,58 @@ impl RegisteredModel2Vec {
         })
     }
 
+    /// Select the pinned English `potion-base-8M` model (GH #50): 256-d, a
+    /// 30 MB matrix, and the V2 preprocessing that drops the `WordPiece`
+    /// unknown token exactly as reference `model2vec` does. A distinct space.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the built-in pinned registration is inconsistent.
+    pub fn potion_base_8m() -> SearchResult<Self> {
+        Ok(Self {
+            download_manifest: ModelManifest::potion_base_8m(),
+            artifact_manifest: ModelArtifactManifestV1::potion_base_8m_native()?,
+        })
+    }
+
+    /// Select the pinned English `potion-base-32M` model (GH #50): 512-d, a
+    /// 129 MB matrix, V2 preprocessing. A distinct space.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the built-in pinned registration is inconsistent.
+    pub fn potion_base_32m() -> SearchResult<Self> {
+        Ok(Self {
+            download_manifest: ModelManifest::potion_base_32m(),
+            artifact_manifest: ModelArtifactManifestV1::potion_base_32m_native()?,
+        })
+    }
+
+    /// Download-manifest ids of the built-in registrations, default first.
+    pub const BUILTIN_IDS: [&'static str; 3] = [
+        "potion-multilingual-128m",
+        "potion-base-8m",
+        "potion-base-32m",
+    ];
+
+    /// Look up a built-in registration by download-manifest id, ignoring ASCII
+    /// case (so the install-directory spelling `potion-base-8M` also matches).
+    /// `None` for any other name: callers must refuse it rather than fall back
+    /// to the default model, since every registration is a distinct space.
+    #[must_use]
+    pub fn builtin(name: &str) -> Option<SearchResult<Self>> {
+        let name = name.trim();
+        if name.eq_ignore_ascii_case(Self::BUILTIN_IDS[0]) {
+            Some(Self::potion_128m())
+        } else if name.eq_ignore_ascii_case(Self::BUILTIN_IDS[1]) {
+            Some(Self::potion_base_8m())
+        } else if name.eq_ignore_ascii_case(Self::BUILTIN_IDS[2]) {
+            Some(Self::potion_base_32m())
+        } else {
+            None
+        }
+    }
+
     /// Operational model identifier; compatibility still requires the full identity.
     #[must_use]
     pub fn id(&self) -> &str {
@@ -380,7 +432,15 @@ mod tests {
             selected.artifact_manifest(),
             &ModelArtifactManifestV1::potion_128m_native().unwrap()
         );
-        assert_eq!(selected.id(), super::super::DEFAULT_MODEL_NAME);
+        // The registration id is the frozen logical model id (the lowercase
+        // manifest id), not the legacy display name DEFAULT_MODEL_NAME; fsfs
+        // matches stored generation ids case-insensitively.
+        assert_eq!(selected.id(), "potion-multilingual-128m");
+        assert!(
+            selected
+                .id()
+                .eq_ignore_ascii_case(super::super::DEFAULT_MODEL_NAME)
+        );
         assert_eq!(selected.dimension(), 256);
     }
 
@@ -554,12 +614,10 @@ mod tests {
                 1 => golden.vector_count = 3,
                 _ => golden.dimension = 3,
             }
-            assert!(RegisteredModel2Vec::new(
-                selected.download_manifest().clone(),
-                PROVIDER,
-                golden,
-            )
-            .is_err());
+            assert!(
+                RegisteredModel2Vec::new(selected.download_manifest().clone(), PROVIDER, golden,)
+                    .is_err()
+            );
         }
     }
 
@@ -592,5 +650,126 @@ mod tests {
         assert!(!debug.contains("fixtures/"));
         assert!(!debug.contains("https://"));
         assert!(!debug.contains(&selected.download_manifest.revision));
+    }
+
+    /// `builtin` resolves every built-in id in either spelling and refuses
+    /// anything else rather than falling back to the default model.
+    #[test]
+    fn builtin_lookup_is_exact_and_case_insensitive() {
+        for (name, id, dimension) in [
+            ("potion-multilingual-128M", "potion-multilingual-128m", 256),
+            ("potion-base-8M", "potion-base-8m", 256),
+            (" POTION-BASE-32m ", "potion-base-32m", 512),
+        ] {
+            let registration = RegisteredModel2Vec::builtin(name)
+                .expect("built-in name")
+                .expect("consistent registration");
+            assert_eq!(registration.download_manifest().id, id);
+            assert_eq!(registration.dimension(), dimension);
+        }
+        for unknown in ["potion", "potion-base-2M", "all-minilm-l6-v2", ""] {
+            assert!(
+                RegisteredModel2Vec::builtin(unknown).is_none(),
+                "{unknown:?}"
+            );
+        }
+    }
+
+    /// Real-artifact qualification of the pinned potion-base registrations
+    /// (GH #50): `load_registered` must accept the pinned bytes, which proves
+    /// their exact output certificate; every other built-in registration must
+    /// refuse them.
+    ///
+    /// When `M2V_PYTHON_REFERENCE_JSON` names vectors produced by the
+    /// reference Python `model2vec` package (`StaticModel.encode(texts,
+    /// max_length=None)`, shape `{"texts": [...], "models": {name: {"vectors":
+    /// [...]}}}`), every text must match within 1e-5 per component, including
+    /// texts that tokenize to `[UNK]`, which V2 drops exactly as Python does.
+    #[test]
+    #[ignore = "requires pinned potion-base dirs via POTION_BASE_8M_FIXTURE_DIR and POTION_BASE_32M_FIXTURE_DIR"]
+    fn potion_base_registrations_qualify_real_artifacts_and_match_reference() {
+        let reference = std::env::var("M2V_PYTHON_REFERENCE_JSON").ok().map(|path| {
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(&path).expect("read Python reference vectors"),
+            )
+            .expect("parse Python reference vectors")
+        });
+        for (env, reference_name, registration) in [
+            (
+                "POTION_BASE_8M_FIXTURE_DIR",
+                "potion-base-8M",
+                RegisteredModel2Vec::potion_base_8m().unwrap(),
+            ),
+            (
+                "POTION_BASE_32M_FIXTURE_DIR",
+                "potion-base-32M",
+                RegisteredModel2Vec::potion_base_32m().unwrap(),
+            ),
+        ] {
+            let dir = std::env::var(env).unwrap_or_else(|_| panic!("set {env}"));
+            let dir = Path::new(&dir);
+            let embedder = Model2VecEmbedder::load_registered(dir, &registration)
+                .expect("pinned bytes qualify against the registered certificate");
+            assert_eq!(
+                u32::try_from(embedder.dimension()).unwrap(),
+                registration.dimension()
+            );
+            for other in RegisteredModel2Vec::BUILTIN_IDS
+                .into_iter()
+                .filter(|id| *id != registration.download_manifest().id)
+            {
+                let other = RegisteredModel2Vec::builtin(other).unwrap().unwrap();
+                assert!(
+                    Model2VecEmbedder::load_registered(dir, &other).is_err(),
+                    "{reference_name} bytes must not load as {}",
+                    other.download_manifest().id
+                );
+            }
+
+            let Some(reference) = &reference else {
+                continue;
+            };
+            let unknown = embedder
+                .dropped_token_id
+                .expect("V2 drops the WordPiece [UNK]");
+            let texts = reference["texts"].as_array().expect("reference texts");
+            let vectors = reference["models"][reference_name]["vectors"]
+                .as_array()
+                .expect("reference vectors for this model");
+            let mut unknown_bearing = 0_usize;
+            for (text, expected) in texts.iter().zip(vectors) {
+                let text = text.as_str().expect("reference text");
+                let ids = embedder
+                    .tokenizer
+                    .encode_fast(text, false)
+                    .expect("tokenize")
+                    .get_ids()
+                    .to_vec();
+                unknown_bearing += usize::from(ids.contains(&unknown));
+                let max_abs = embedder
+                    .embed_sync(text)
+                    .expect("embed")
+                    .iter()
+                    .zip(expected.as_array().expect("vector"))
+                    .map(|(a, e)| (f64::from(*a) - e.as_f64().expect("f64")).abs())
+                    .fold(0.0_f64, f64::max);
+                assert!(
+                    max_abs < 1e-5,
+                    "{reference_name} diverges from Python model2vec on {text:?}: {max_abs:.3e}"
+                );
+            }
+            eprintln!(
+                "{reference_name}: {} texts ({unknown_bearing} with [UNK]) match Python model2vec within 1e-5",
+                texts.len()
+            );
+            assert!(
+                texts.len() >= 8,
+                "the parity comparison must not be vacuous"
+            );
+            assert!(
+                unknown_bearing > 0,
+                "the reference must exercise the [UNK] rule"
+            );
+        }
     }
 }

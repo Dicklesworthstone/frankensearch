@@ -83,6 +83,11 @@ pub(crate) const FASTEMBED_OUTPUT_NORMALIZATION_V1: &str =
 /// Exact native `Model2Vec` input preparation and empty/OOV behavior.
 pub(crate) const MODEL2VEC_PREPROCESSING_V1: &str =
     "encode-special-tokens=false;discard-oov=true;empty-or-all-oov=zero-vector";
+/// V1 plus the reference `model2vec` rule for `WordPiece` models: the
+/// tokenizer's unknown-token id is dropped before pooling, as the upstream
+/// `StaticModel.encode` does. Used by the English potion-base models (GH #50);
+/// the frozen multilingual contract keeps V1.
+pub(crate) const MODEL2VEC_PREPROCESSING_V2: &str = "encode-special-tokens=false;discard-oov=true;discard-wordpiece-unk=true;empty-or-all-oov=zero-vector";
 /// Exact sequence behavior of the frozen Potion tokenizer.
 pub(crate) const MODEL2VEC_SEQUENCE_POLICY_V1: &str = "tokenizer-configured;no-padding";
 /// Exact native `Model2Vec` pooling rule.
@@ -249,6 +254,59 @@ impl ModelArtifactManifestV1 {
     /// Returns `InvalidConfig` if the built-in pinned download manifest drifts
     /// from the registered execution contract.
     pub fn potion_128m_native() -> SearchResult<Self> {
+        Self::model2vec_native(
+            &ModelManifest::potion_128m(),
+            MODEL2VEC_PREPROCESSING_V1,
+            "f7dabe71dbb62abf9271f9568d799accb558b982521d3a48337c6a760d7e6c74",
+        )
+    }
+
+    /// Frozen native `Model2Vec` contract for the opt-in English
+    /// `potion-base-8M` fast tier (GH #50).
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the pinned download manifest drifts from the
+    /// registered execution contract.
+    pub fn potion_base_8m_native() -> SearchResult<Self> {
+        Self::model2vec_native(
+            &ModelManifest::potion_base_8m(),
+            MODEL2VEC_PREPROCESSING_V2,
+            "b4a36ff36976bbfa263a13d6b9da4dbc853293400898f6d9cbd0acb6c622391f",
+        )
+    }
+
+    /// Frozen native `Model2Vec` contract for the opt-in English
+    /// `potion-base-32M` fast tier (GH #50).
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the pinned download manifest drifts from the
+    /// registered execution contract.
+    pub fn potion_base_32m_native() -> SearchResult<Self> {
+        Self::model2vec_native(
+            &ModelManifest::potion_base_32m(),
+            MODEL2VEC_PREPROCESSING_V2,
+            "d8c5ddc0d2f252035e5d9dd8b06337e43bae822c69291950f7865df0773d24c1",
+        )
+    }
+
+    /// The one native `Model2Vec` execution contract: every registered potion
+    /// model runs the same tokenizer/row-gather/mean/L2 backend, so only its
+    /// pinned artifacts, its preprocessing rule and its exact output
+    /// certificate differ.
+    fn model2vec_native(
+        download: &ModelManifest,
+        model_preprocessing: &str,
+        vectors_sha256: &str,
+    ) -> SearchResult<Self> {
+        let dimension = download.dimension.ok_or_else(|| {
+            invalid_manifest_field(
+                "dimension",
+                &download.id,
+                "embedding manifests require a fixed output dimension",
+            )
+        })?;
         let execution = ModelExecutionContractV1 {
             backend: "model2vec-native".to_owned(),
             implementation_revision: format!(
@@ -259,7 +317,7 @@ impl ModelArtifactManifestV1 {
             numeric_profile: "f32-row-gather-mean-l2-v1".to_owned(),
             weights_format: "safetensors-f32-matrix-v1".to_owned(),
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
-            model_preprocessing: MODEL2VEC_PREPROCESSING_V1.to_owned(),
+            model_preprocessing: model_preprocessing.to_owned(),
             sequence_policy: MODEL2VEC_SEQUENCE_POLICY_V1.to_owned(),
             pooling: MODEL2VEC_POOLING_V1.to_owned(),
             output_normalization: MODEL2VEC_OUTPUT_NORMALIZATION_V1.to_owned(),
@@ -268,17 +326,12 @@ impl ModelArtifactManifestV1 {
             input_contract: default_plain_text_input_contract(),
             golden_vectors: GoldenVectorCertificateV1 {
                 corpus_sha256: conformance_corpus_fingerprint()?,
-                vectors_sha256: "f7dabe71dbb62abf9271f9568d799accb558b982521d3a48337c6a760d7e6c74"
-                    .to_owned(),
+                vectors_sha256: vectors_sha256.to_owned(),
                 vector_count: 4,
-                dimension: 256,
+                dimension,
             },
         };
-        Self::from_download_manifest(
-            &ModelManifest::potion_128m(),
-            "minishlab-huggingface",
-            execution,
-        )
+        Self::from_download_manifest(download, "minishlab-huggingface", execution)
     }
 
     /// Frozen FastEmbed/ONNX contract for the built-in `MiniLM` quality tier.
@@ -1694,6 +1747,101 @@ impl ModelManifest {
         }
     }
 
+    /// Opt-in manifest for the English `potion-base-8M` `Model2Vec` fast tier
+    /// (GH #50).
+    ///
+    /// Deliberately absent from [`Self::builtin_catalog`]: it is a distinct
+    /// 256-dimensional vector space from `potion-multilingual-128M`, so it is
+    /// acquired and selected only explicitly. Its 30 MB matrix and 30k-piece
+    /// `WordPiece` tokenizer load far faster than the 128M model's 512 MB
+    /// matrix and 500k-piece Unigram tokenizer (GH #46). English-only.
+    #[must_use]
+    pub fn potion_base_8m() -> Self {
+        const REVISION: &str = "bf8b056651a2c21b8d2565580b8569da283cab23";
+        const REPO: &str = "minishlab/potion-base-8M";
+        Self {
+            id: "potion-base-8m".to_owned(),
+            version: "v1".to_owned(),
+            display_name: Some("Potion Base 8M (fast tier, English)".to_owned()),
+            description: Some(
+                "Compact English Model2Vec static embedding model for the fast tier".to_owned(),
+            ),
+            repo: REPO.to_owned(),
+            revision: REVISION.to_owned(),
+            files: vec![
+                ModelFile {
+                    name: "tokenizer.json".to_owned(),
+                    sha256: "e67e803f624fb4d67dea1c730d06e1067e1b14d830e2c2202569e3ef0f70bb50"
+                        .to_owned(),
+                    size: 683_666,
+                    url: Some(
+                        "https://huggingface.co/minishlab/potion-base-8M/resolve/bf8b056651a2c21b8d2565580b8569da283cab23/tokenizer.json"
+                            .to_owned(),
+                    ),
+                },
+                ModelFile {
+                    name: "model.safetensors".to_owned(),
+                    sha256: "f65d0f325faadc1e121c319e2faa41170d3fa07d8c89abd48ca5358d9a223de2"
+                        .to_owned(),
+                    size: 30_236_760,
+                    url: Some(
+                        "https://huggingface.co/minishlab/potion-base-8M/resolve/bf8b056651a2c21b8d2565580b8569da283cab23/model.safetensors"
+                            .to_owned(),
+                    ),
+                },
+            ],
+            license: "MIT".to_owned(),
+            dimension: Some(256),
+            tier: Some(ModelTier::Fast),
+            download_size_bytes: 30_920_426,
+        }
+    }
+
+    /// Opt-in manifest for the English `potion-base-32M` `Model2Vec` fast tier
+    /// (GH #50). A distinct 512-dimensional space; selected only explicitly,
+    /// like [`Self::potion_base_8m`]. English-only.
+    #[must_use]
+    pub fn potion_base_32m() -> Self {
+        const REVISION: &str = "1e5a03f8eeb2c98b928fbbd846f22f816360919f";
+        const REPO: &str = "minishlab/potion-base-32M";
+        Self {
+            id: "potion-base-32m".to_owned(),
+            version: "v1".to_owned(),
+            display_name: Some("Potion Base 32M (fast tier, English)".to_owned()),
+            description: Some(
+                "English Model2Vec static embedding model for the fast tier".to_owned(),
+            ),
+            repo: REPO.to_owned(),
+            revision: REVISION.to_owned(),
+            files: vec![
+                ModelFile {
+                    name: "tokenizer.json".to_owned(),
+                    sha256: "7d75cbc54318138807c401b0f0c9721117c628b39de8e8e0edb6cb17e0ee7d18"
+                        .to_owned(),
+                    size: 1_493_150,
+                    url: Some(
+                        "https://huggingface.co/minishlab/potion-base-32M/resolve/1e5a03f8eeb2c98b928fbbd846f22f816360919f/tokenizer.json"
+                            .to_owned(),
+                    ),
+                },
+                ModelFile {
+                    name: "model.safetensors".to_owned(),
+                    sha256: "99f6c33204c9231a7391871b7a3c91409b532c8f587a9ea44fc282303d8dec28"
+                        .to_owned(),
+                    size: 129_210_456,
+                    url: Some(
+                        "https://huggingface.co/minishlab/potion-base-32M/resolve/1e5a03f8eeb2c98b928fbbd846f22f816360919f/model.safetensors"
+                            .to_owned(),
+                    ),
+                },
+            ],
+            license: "MIT".to_owned(),
+            dimension: Some(512),
+            tier: Some(ModelTier::Fast),
+            download_size_bytes: 130_703_606,
+        }
+    }
+
     /// Built-in manifest for flashrank-nano (cross-encoder reranker).
     #[must_use]
     pub fn flashrank_nano() -> Self {
@@ -2070,7 +2218,12 @@ impl ModelManifest {
     pub fn opt_in_catalog() -> ModelManifestCatalog {
         ModelManifestCatalog {
             schema_version: MANIFEST_SCHEMA_VERSION,
-            models: vec![Self::multilingual_minilm_l12_v2(), Self::minilm_v2_native()],
+            models: vec![
+                Self::multilingual_minilm_l12_v2(),
+                Self::minilm_v2_native(),
+                Self::potion_base_8m(),
+                Self::potion_base_32m(),
+            ],
         }
     }
 
@@ -4481,6 +4634,84 @@ mod tests {
         manifest
     }
 
+    /// GH #50: each registered potion model is its own vector space. A naive
+    /// implementation that reused the 128M contract for the smaller models
+    /// (same logical id or space) would let an index mix them; it must not.
+    #[test]
+    fn registered_potion_models_have_distinct_pinned_identities() {
+        let models = [
+            (
+                ModelManifest::potion_128m(),
+                ModelArtifactManifestV1::potion_128m_native().unwrap(),
+                256,
+            ),
+            (
+                ModelManifest::potion_base_8m(),
+                ModelArtifactManifestV1::potion_base_8m_native().unwrap(),
+                256,
+            ),
+            (
+                ModelManifest::potion_base_32m(),
+                ModelArtifactManifestV1::potion_base_32m_native().unwrap(),
+                512,
+            ),
+        ];
+        let mut logical_ids = std::collections::BTreeSet::new();
+        let mut spaces = std::collections::BTreeSet::new();
+        let mut producers = std::collections::BTreeSet::new();
+        for (download, native, dimension) in &models {
+            assert!(
+                download.is_production_ready(),
+                "{} must be pinned",
+                download.id
+            );
+            assert_eq!(download.revision.len(), 40, "{} revision", download.id);
+            assert_eq!(
+                download.download_size_bytes,
+                download.files.iter().map(|file| file.size).sum::<u64>(),
+                "{} download size is the sum of its files",
+                download.id
+            );
+            let identity = native
+                .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            assert_eq!(identity.space.dimension, *dimension, "{}", download.id);
+            assert_eq!(native.execution.golden_vectors.dimension, *dimension);
+            logical_ids.insert(identity.space.logical_model_id.clone());
+            spaces.insert(identity.space.fingerprint());
+            producers.insert(identity.fingerprint());
+        }
+        assert_eq!(
+            logical_ids.len(),
+            3,
+            "logical model ids must differ: {logical_ids:?}"
+        );
+        assert_eq!(spaces.len(), 3, "vector spaces must differ");
+        assert_eq!(producers.len(), 3, "producer identities must differ");
+
+        // Opt-in only: never part of default bulk acquisition.
+        let default_ids = ModelManifest::builtin_catalog()
+            .models
+            .into_iter()
+            .map(|manifest| manifest.id)
+            .collect::<Vec<_>>();
+        let opt_in_ids = ModelManifest::opt_in_catalog()
+            .models
+            .into_iter()
+            .map(|manifest| manifest.id)
+            .collect::<Vec<_>>();
+        for id in ["potion-base-8m", "potion-base-32m"] {
+            assert!(
+                !default_ids.iter().any(|known| known == id),
+                "{id} is opt-in"
+            );
+            assert!(
+                opt_in_ids.iter().any(|known| known == id),
+                "{id} is registered"
+            );
+        }
+    }
+
     #[test]
     fn registered_manifest_fingerprints_are_exact_fixtures() {
         // GOLDEN-CHANGE bd-2ba5: the explicit F32 producer and dependency
@@ -6023,7 +6254,12 @@ mod tests {
         let opt_in = ModelManifest::opt_in_catalog();
         assert_eq!(
             opt_in.models,
-            vec![manifest, ModelManifest::minilm_v2_native()]
+            vec![
+                manifest,
+                ModelManifest::minilm_v2_native(),
+                ModelManifest::potion_base_8m(),
+                ModelManifest::potion_base_32m(),
+            ]
         );
         opt_in.validate().unwrap();
     }
