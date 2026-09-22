@@ -372,6 +372,7 @@ recognize the store automatically:
 FSFS_COMPLETE_GENERATIONS=1 fsfs index ~/projects --index-dir ./search-store
 fsfs search "structured concurrency" --index-dir ./search-store --no-daemon
 fsfs explain 1 --index-dir ./search-store
+fsfs append-batch --file updates.jsonl --index-dir ./search-store
 fsfs delete src/obsolete.rs --index-dir ./search-store
 fsfs compact --index-dir ./search-store
 fsfs search "ownership rules" --expand --index-dir ./search-store --format json
@@ -381,6 +382,17 @@ For a relative configured index directory, commands also find the nearest
 existing store in a parent directory when run from a project subdirectory.
 Corrupt selections and interrupted first publications produce errors at that
 store instead of redirecting the command to a different legacy index.
+
+`append-batch` accepts JSONL objects with string `id` and `text` fields, from
+`--file` or standard input. It inserts or replaces the supplied documents in
+lexical data, every present vector tier, and an existing catalog, then publishes
+one complete successor. Repeated IDs use their final body in the batch; the
+reported count is the number of unique inserted or replaced IDs. The canonical
+body is shared by all components. It does not scan, create, or edit source files.
+If the store has a quality tier, its matching producer must be available too.
+Malformed input, incompatible embedding responses, and cancellation before
+publication leave the selected generation unchanged. An empty batch publishes
+nothing, and readers already holding the predecessor keep that generation.
 
 `delete` supports exact IDs and `--prefix`; it updates lexical membership, every
 present vector tier, and the catalog in a new generation. Source files remain
@@ -399,8 +411,9 @@ Reranking reads the generation's stored document text, so edits or removals in
 the source tree cannot silently change the content scored for retained results.
 
 This is the cooperative local store. The complete FSVI v2 authority migration
-and automatic reclamation of retained generations remain unfinished. Direct
-`append-batch`, `flush`, and TUI routing are still unavailable for these stores.
+and automatic reclamation of retained generations remain unfinished. Commands
+refuse to create a nested index inside a sealed generation. Direct `flush` and
+TUI routing are still unavailable for these stores.
 
 ## Reproducible Showcase Suite
 

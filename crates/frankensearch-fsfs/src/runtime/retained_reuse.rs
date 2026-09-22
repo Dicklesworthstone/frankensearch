@@ -10,14 +10,15 @@
 //! merely a package version that can stay unchanged across source edits. The
 //! final uncheckpointed batch has no retained input evidence and is recomputed.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{Canonicalizer, DefaultCanonicalizer, SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -279,6 +280,71 @@ struct CopyStats {
     entries: usize,
     files: usize,
     bytes: u64,
+}
+
+/// Read the same JSONL `id`/`text` input as the ordinary append command before
+/// acquiring publication ownership. Explicit batch text is the only content
+/// source: IDs never cause a source-file read. Resolve duplicate IDs first,
+/// then canonicalize their final bodies once for every component.
+pub(super) async fn read_append_documents(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+) -> SearchResult<BTreeMap<String, String>> {
+    retained_search_checkpoint(cx)?;
+    let lines = if let Some(path) = runtime.cli_input.input_file.as_ref() {
+        asupersync::fs::read_to_string(path)
+            .await?
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        BufReader::new(std::io::stdin().lock())
+            .lines()
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    #[derive(Deserialize)]
+    struct Document {
+        id: String,
+        text: String,
+    }
+    let mut documents = BTreeMap::new();
+    for (line_number, line) in lines.iter().enumerate() {
+        retained_search_checkpoint(cx)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let document: Document =
+            serde_json::from_str(line).map_err(|error| SearchError::InvalidConfig {
+                field: "append_batch.input".to_owned(),
+                value: format!("line {}", line_number + 1),
+                reason: format!("expected a JSON object with string id and text fields: {error}"),
+            })?;
+        if document.id.trim().is_empty() || document.id.len() > usize::from(u16::MAX) {
+            return Err(SearchError::InvalidConfig {
+                field: "append_batch.input".to_owned(),
+                value: format!("line {}", line_number + 1),
+                reason:
+                    "document IDs must be nonblank and fit the vector record's 65535-byte limit"
+                        .to_owned(),
+            });
+        }
+        documents.insert(document.id, document.text);
+    }
+    let canonicalizer = DefaultCanonicalizer::default();
+    for text in documents.values_mut() {
+        retained_search_checkpoint(cx)?;
+        *text = canonicalizer.canonicalize(text);
+        if text.trim().is_empty() {
+            return Err(SearchError::InvalidConfig {
+                field: "append_batch.input".to_owned(),
+                value: "empty_canonical_text".to_owned(),
+                reason: "every final document body must contain canonical text; the batch was not applied"
+                    .to_owned(),
+            });
+        }
+    }
+    retained_search_checkpoint(cx)?;
+    Ok(documents)
 }
 
 /// Copy a complete admitted predecessor for an explicit mutation, independently

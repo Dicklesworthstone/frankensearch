@@ -102,6 +102,10 @@ impl FsfsRuntime {
                 self.run_complete_generation_delete_with_writer(cx, &root, &mut stdout)
                     .await
             }
+            CliCommand::AppendBatch => {
+                self.run_complete_generation_append_batch_with_writer(cx, &root, &mut stdout)
+                    .await
+            }
             CliCommand::Compact => {
                 self.run_complete_generation_compact_with_writer(cx, &root, &mut stdout)
                     .await
@@ -126,7 +130,7 @@ impl FsfsRuntime {
             }
             _ => Err(complete_cli_error(
                 "command",
-                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, delete, compact, search, explain, serve, daemon, status, or doctor",
+                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, append-batch, delete, compact, search, explain, serve, daemon, status, or doctor",
             )),
         }
     }
@@ -161,11 +165,16 @@ impl FsfsRuntime {
         } else {
             self.resolve_status_index_root()?
         };
-        if complete_entry_exists(&root.join(COMPLETE_GENERATION_MANIFEST))? {
-            return Err(complete_cli_error(
-                "root",
-                "a sealed generation is not a mutable index root; select its complete-generation store instead",
-            ));
+        // An otherwise new legacy index below a sealed bundle would still
+        // change its inventory. Check every ancestor before allowing fallback,
+        // including when --index-dir names a child that does not exist yet.
+        for ancestor in root.ancestors() {
+            if complete_entry_exists(&ancestor.join(COMPLETE_GENERATION_MANIFEST))? {
+                return Err(complete_cli_error(
+                    "root",
+                    "a sealed generation and its descendants cannot be used as a mutable index root; select its complete-generation store instead",
+                ));
+            }
         }
         // Check directory entries, not Path::exists: a dangling symlink or an
         // unreadable descriptor is not permission to enter the legacy path.
@@ -259,6 +268,52 @@ impl FsfsRuntime {
             let envelope = OutputEnvelope::success(
                 payload,
                 meta_for_format("delete", self.cli_input.format),
+                iso_timestamp_now(),
+            );
+            emit_envelope(&envelope, self.cli_input.format, writer)?;
+            if !matches!(
+                self.cli_input.format,
+                OutputFormat::Jsonl | OutputFormat::Csv
+            ) {
+                writer.write_all(b"\n")?;
+            }
+        }
+        writer.flush().map_err(SearchError::Io)
+    }
+
+    async fn run_complete_generation_append_batch_with_writer<W: Write>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let (publication, appended) = self.append_retained_generation(cx, root).await?;
+        let generation = publication.map(require_durable_publication).transpose()?;
+        if self.cli_input.format == OutputFormat::Table {
+            writeln!(writer, "{appended} documents inserted or replaced")?;
+            if let Some(generation) = &generation {
+                return self.emit_complete_generation_receipt(
+                    root,
+                    generation,
+                    "append-batch",
+                    writer,
+                );
+            }
+        } else {
+            let mut payload = serde_json::json!({
+                "appended": appended,
+                "generation_changed": generation.is_some(),
+            });
+            if let Some(generation) = &generation {
+                payload["generation_id"] = serde_json::json!(generation.id());
+                payload["generation_path"] = serde_json::json!(generation.path());
+                payload["manifest_sha256"] = serde_json::json!(generation.manifest_sha256());
+                payload["publication"] = serde_json::json!("durable");
+                payload["generation_complete"] = serde_json::json!(true);
+            }
+            let envelope = OutputEnvelope::success(
+                payload,
+                meta_for_format("append-batch", self.cli_input.format),
                 iso_timestamp_now(),
             );
             emit_envelope(&envelope, self.cli_input.format, writer)?;
@@ -1147,6 +1202,68 @@ mod tests {
     }
 
     #[test]
+    fn complete_cli_refuses_new_indexes_beneath_published_generations() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let generation = store.active(&cx).unwrap().unwrap();
+            let manifest_path = generation.path().join(COMPLETE_GENERATION_MANIFEST);
+            let before = fs::read(&manifest_path).unwrap();
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let explicit_child = generation.path().join("new-explicit-index");
+            let mut explicit_input = runtime.cli_input.clone();
+            explicit_input.index_dir = Some(explicit_child.clone());
+            let explicit = runtime.clone().with_cli_input(explicit_input);
+
+            // A real existing component supplies the nested target. The
+            // default relative index directory would be a new child beneath
+            // that target, so an exact-root-only marker check misses it.
+            let target = generation.path().join("lexical");
+            assert!(target.is_dir());
+            let mut nested_input = runtime.cli_input.clone();
+            nested_input.target_path = Some(target.clone());
+            nested_input.index_dir = None;
+            let mut nested = runtime.clone().with_cli_input(nested_input);
+            "new-relative-index".clone_into(&mut nested.config.storage.index_dir);
+            let relative_child = target.join("new-relative-index");
+
+            for attempted in [&explicit, &nested] {
+                for initialize in [false, true] {
+                    let error = attempted
+                        .run_mode_with_complete_generations(
+                            &cx,
+                            InterfaceMode::Cli,
+                            None,
+                            initialize,
+                        )
+                        .await
+                        .expect_err("dispatch must refuse a write below a sealed generation");
+                    assert!(
+                        matches!(
+                            error,
+                            SearchError::InvalidConfig { ref field, .. }
+                                if field == "complete_generation.root"
+                        ),
+                        "{error}",
+                    );
+                    // active() rehashes the complete inventory, so this
+                    // verifies every original file and excludes new entries.
+                    assert_eq!(store.active(&cx).unwrap(), Some(generation.clone()));
+                    assert_eq!(fs::read(&manifest_path).unwrap(), before);
+                    assert_eq!(
+                        fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                        pointer
+                    );
+                    assert!(!explicit_child.exists());
+                    assert!(!relative_child.exists());
+                }
+            }
+        });
+    }
+
+    #[test]
     fn complete_cli_rebuild_and_json_search_preserve_an_open_predecessor() {
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
@@ -1280,6 +1397,96 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(store.active(&cx).unwrap(), before);
+        });
+    }
+
+    #[test]
+    fn complete_cli_append_batch_publishes_truthful_receipts_and_preserves_old_readers() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let predecessor = store.active(&cx).unwrap().unwrap();
+            let mut old_reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let batch = directory.path().join("batch.jsonl");
+            fs::write(
+                &batch,
+                concat!(
+                    "{\"id\":\"alpha.md\",\"text\":\"sharedtoken rewritten alpha\"}\n",
+                    "{\"id\":\"beta.md\",\"text\":\"sharedtoken supplied beta\"}\n",
+                ),
+            )
+            .unwrap();
+            let mut input = runtime.cli_input.clone();
+            input.command = CliCommand::AppendBatch;
+            input.input_file = Some(batch.clone());
+            let append = runtime.clone().with_cli_input(input);
+            let mut output = Vec::new();
+            append
+                .run_complete_generation_append_batch_with_writer(&cx, &root, &mut output)
+                .await
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            let successor = store.active(&cx).unwrap().unwrap();
+            assert_eq!(receipt["ok"], true);
+            assert_eq!(receipt["data"]["appended"], 2);
+            assert_eq!(receipt["data"]["generation_changed"], true);
+            assert_eq!(receipt["data"]["publication"], "durable");
+            assert_eq!(receipt["data"]["generation_id"], successor.id());
+            assert_ne!(successor.id(), predecessor.id());
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert_eq!(
+                fresh
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
+            assert_eq!(
+                old_reader
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert_eq!(
+                fs::read_to_string(source.join("alpha.md")).unwrap(),
+                "sharedtoken alpha document"
+            );
+            assert!(!source.join("beta.md").exists());
+
+            fs::write(&batch, " \n\t\n").unwrap();
+            output.clear();
+            append
+                .run_complete_generation_append_batch_with_writer(&cx, &root, &mut output)
+                .await
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(receipt["data"]["appended"], 0);
+            assert_eq!(receipt["data"]["generation_changed"], false);
+            assert_eq!(store.active(&cx).unwrap(), Some(successor.clone()));
+
+            fs::write(
+                &batch,
+                "{\"id\":\"unpublished.md\",\"text\":\"sharedtoken rejected batch\"}\ninvalid JSON\n",
+            )
+            .unwrap();
+            output.clear();
+            append
+                .run_complete_generation_append_batch_with_writer(&cx, &root, &mut output)
+                .await
+                .unwrap_err();
+            assert!(output.is_empty());
+            assert_eq!(store.active(&cx).unwrap(), Some(successor));
         });
     }
 
