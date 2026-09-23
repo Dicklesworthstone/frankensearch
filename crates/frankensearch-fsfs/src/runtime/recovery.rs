@@ -10,7 +10,133 @@ fn retained_recovery_error(reason: &str) -> SearchError {
     }
 }
 
+/// An explicitly chosen, searchable recovery target bound to the observed head.
+///
+/// Preparation opens every stored tier with its real producer before returning.
+/// It releases publication ownership before model loading or preview queries,
+/// so it cannot block a watcher while an operator inspects the target. A later
+/// publisher invalidates this preparation rather than having its work replaced.
+/// Dropping this value never restores a generation or deletes any artifacts.
+///
+/// This is intentional rollback/repair for a cooperative complete-generation
+/// store, not the fixed-authority or external antirollback-floor protocol.
+#[must_use]
+pub struct PreparedRetainedRecovery {
+    plan: crate::generation_store::PreparedGenerationRestore,
+    reader: RetainedSearchReader,
+}
+
+impl std::fmt::Debug for PreparedRetainedRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedRetainedRecovery")
+            .field("generation", &self.reader.generation().id())
+            .field("manifest_sha256", &self.reader.generation().manifest_sha256())
+            // Do not expose the potentially malformed incumbent descriptor.
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedRetainedRecovery {
+    /// The exact admitted target, not a newly discovered predecessor.
+    #[must_use]
+    pub const fn generation(&self) -> &crate::generation_store::PublishedGeneration {
+        self.reader.generation()
+    }
+
+    /// Preview the retained target without changing the active selection.
+    ///
+    /// # Errors
+    /// Returns producer drift, retrieval, configuration or cancellation errors.
+    pub async fn search(
+        &mut self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        self.reader.validate_retained_recovery_resources(cx)?;
+        self.reader.search(cx, query, limit).await
+    }
+
+    /// Abandon restoration and keep only the explicitly admitted reader.
+    #[must_use]
+    pub fn into_retained(self) -> RetainedSearchReader {
+        self.reader
+    }
+
+    /// Revalidate and select this target, preserving every retained directory.
+    ///
+    /// The existing store protocol fences the exact incumbent descriptor and
+    /// authenticates the target again under publication ownership. Producer
+    /// identities are rechecked against the already opened vector resources.
+    /// A stale preparation is refused, never automatically rebased or retried.
+    ///
+    /// The returned reader is the one already admitted, not a second pathname
+    /// reopen. Inspect the publication variant before reporting durability:
+    /// `VisibleButDurabilityUncertain` means selection is already visible and
+    /// must not be described as an aborted restore. No fallible operation or
+    /// cancellation checkpoint follows the store's publication result.
+    /// Synchronous filesystem barriers belong on the caller's blocking lane.
+    ///
+    /// # Errors
+    /// Before publication, returns contention, changed selection/target/producer,
+    /// I/O or cancellation errors without selecting this target.
+    pub fn restore(
+        self,
+        cx: &Cx,
+    ) -> SearchResult<(
+        crate::generation_store::GenerationPublication,
+        RetainedSearchReader,
+    )> {
+        retained_search_checkpoint(cx)?;
+        let Self { plan, reader } = self;
+        let publication = plan.restore(cx, |cx, path| {
+            if path != reader.generation().path() {
+                return Err(retained_recovery_error(
+                    "recovery admission and publication name different targets",
+                ));
+            }
+            reader.validate_retained_recovery_resources(cx)
+        })?;
+        Ok((publication, reader))
+    }
+}
+
 impl FsfsRuntime {
+    /// Prepare a searchable rollback or repair using a trusted publication receipt.
+    ///
+    /// Capture the expected selection before asynchronous model admission, so a
+    /// concurrent publisher cannot be overwritten after loading or previewing.
+    /// No active-generation scan or implicit fallback chooses the target. An
+    /// absent, malformed or damaged current selection does not prevent recovery
+    /// to the explicitly named intact bundle. Unsafe descriptors remain errors.
+    ///
+    /// Preparation does not switch selection. Preview with the returned plan's
+    /// `search`, then call `restore` explicitly or retain the reader without
+    /// restoring. Every stored tier must admit its configured producer; a
+    /// fast-only query policy cannot waive quality-tier recovery validation.
+    ///
+    /// # Errors
+    /// Returns invalid receipt, contention, corrupt bundle, missing/mismatched
+    /// producer, configuration, I/O or cancellation errors.
+    pub async fn prepare_retained_recovery(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        generation_id: &str,
+        manifest_sha256: &str,
+    ) -> SearchResult<PreparedRetainedRecovery> {
+        self.preflight_retained_recovery(cx)?;
+        let store = crate::generation_store::CompleteGenerationStore::open(cx, store_root)?;
+        let generation = store.open_retained(cx, generation_id, manifest_sha256)?;
+        let plan = store.prepare_restore(cx, &generation)?;
+        let reader = self
+            .open_retained_recovery_target(cx, &store, generation)
+            .await?;
+        retained_search_checkpoint(cx)?;
+        Ok(PreparedRetainedRecovery { plan, reader })
+    }
+
     /// Open an explicitly named retained generation without changing selection.
     ///
     /// The ID and manifest SHA-256 must come from a trusted publication receipt,
@@ -444,6 +570,55 @@ mod retained_recovery_tests {
     }
 
     #[test]
+    fn recovery_rejects_a_sealed_but_unreadable_quality_artifact_instead_of_degrading() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root) = fixture(directory.path());
+            let store = CompleteGenerationStore::create(&cx, &root).unwrap();
+            let build = store.begin(&cx).unwrap();
+            let mut input = runtime.cli_input.clone();
+            input.index_dir = Some(build.path().to_path_buf());
+            let candidate = runtime.clone().with_cli_input(input);
+            candidate
+                .run_retained_index_with_reuse(&cx, &store, build.path())
+                .await
+                .unwrap();
+            let quality = build.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+            assert!(quality.is_file());
+            fs::write(&quality, b"invalid quality vector header").unwrap();
+            // Intentionally exercise only the container's inventory seal here.
+            // This is NOT a valid engine publication: the recovery adapter must
+            // supply the missing engine/producer admission and refuse it.
+            let GenerationPublication::Durable(target) =
+                build.publish(&cx, |_, _| Ok(())).unwrap()
+            else {
+                panic!("fixture inventory must be durable"); // ubs:ignore — cfg(test) assertion.
+            };
+            assert_eq!(store.active(&cx).unwrap(), Some(target.clone()));
+            runtime.config.search.fast_only = true;
+            let before = file_bytes(target.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            assert!(
+                runtime
+                    .prepare_retained_recovery(
+                        &cx,
+                        &root,
+                        target.id(),
+                        target.manifest_sha256(),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(file_bytes(target.path()), before);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+        });
+    }
+
+    #[test]
     fn receipt_reader_refuses_unsafe_configuration_and_cancellation_before_side_effects() {
         on_runtime(|cx| async move {
             let _models = RecoveryModels::install();
@@ -487,6 +662,254 @@ mod retained_recovery_tests {
             cx.set_cancel_requested(false);
             assert_eq!(file_bytes(&root), before);
             assert!(!root.join("outside.sqlite").exists());
+        });
+    }
+
+    #[test]
+    fn prepared_recovery_previews_then_restores_without_retargeting_pinned_readers() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            fs::write(source.join("beta.md"), "sharedtoken successor beta document").unwrap();
+            let new = publish(&runtime, &cx, &root).await;
+            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let mut live = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+            assert_eq!(
+                live.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                2
+            );
+            let old_bytes = file_bytes(old.path());
+            let new_bytes = file_bytes(new.path());
+            let before = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            fs::rename(&source, directory.path().join("source-unavailable")).unwrap();
+            let mut plan = fresh_runtime(&runtime)
+                .prepare_retained_recovery(&cx, &root, old.id(), old.manifest_sha256())
+                .await
+                .unwrap();
+            assert_eq!(plan.generation(), &old);
+            let preview = plan.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert_eq!(preview.last().unwrap().hits.len(), 1);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                before
+            );
+            let (publication, mut recovered) = plan.restore(&cx).unwrap();
+            assert!(
+                matches!(publication, GenerationPublication::Durable(ref value) if value == &old)
+            );
+            assert_eq!(recovered.generation(), &old);
+            assert_eq!(
+                recovered.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                1
+            );
+            assert!(live.refresh(&cx).await.unwrap());
+            assert_eq!(live.generation(), &old);
+            assert_eq!(
+                live.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                1
+            );
+            assert_eq!(pinned.generation(), &new);
+            assert_eq!(
+                pinned.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                2
+            );
+            assert_eq!(file_bytes(old.path()), old_bytes);
+            assert_eq!(file_bytes(new.path()), new_bytes);
+            let mut fresh = fresh_runtime(&runtime)
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(fresh.generation(), &old);
+            assert_eq!(
+                fresh.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn prepared_recovery_repairs_corrupt_and_missing_selection_without_deleting_evidence() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            fs::write(source.join("beta.md"), "sharedtoken successor beta document").unwrap();
+            let damaged = publish(&runtime, &cx, &root).await;
+            fs::write(damaged.path().join("unsealed-damage"), b"retained evidence").unwrap();
+            let evidence = file_bytes(damaged.path());
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            assert!(store.active(&cx).is_err());
+            let plan = runtime
+                .prepare_retained_recovery(&cx, &root, old.id(), old.manifest_sha256())
+                .await
+                .unwrap();
+            assert!(matches!(
+                plan.restore(&cx).unwrap().0,
+                GenerationPublication::Durable(_)
+            ));
+            assert_eq!(store.active(&cx).unwrap(), Some(old.clone()));
+            assert_eq!(file_bytes(damaged.path()), evidence);
+            let pointer = root.join(COMPLETE_GENERATION_POINTER);
+            for missing in [false, true] {
+                if missing {
+                    fs::rename(&pointer, root.join("saved-recovery-pointer")).unwrap();
+                } else {
+                    fs::write(&pointer, b"private malformed descriptor").unwrap();
+                }
+                let plan = fresh_runtime(&runtime)
+                    .prepare_retained_recovery(&cx, &root, old.id(), old.manifest_sha256())
+                    .await
+                    .unwrap();
+                assert!(!format!("{plan:?}").contains("private malformed descriptor"));
+                assert!(matches!(
+                    plan.restore(&cx).unwrap().0,
+                    GenerationPublication::Durable(_)
+                ));
+                assert_eq!(store.active(&cx).unwrap(), Some(old.clone()));
+                assert_eq!(file_bytes(damaged.path()), evidence);
+            }
+            assert!(root.join("saved-recovery-pointer").is_file());
+            assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 2);
+        });
+    }
+
+    #[test]
+    fn prepared_recovery_does_not_hold_publication_ownership_or_overwrite_a_successor() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let plan = runtime
+                .prepare_retained_recovery(&cx, &root, old.id(), old.manifest_sha256())
+                .await
+                .unwrap();
+            fs::write(source.join("beta.md"), "sharedtoken concurrent publication").unwrap();
+            // A real publication while the plan is alive proves it owns no lease.
+            let winner = publish(&runtime, &cx, &root).await;
+            let before = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let winner_bytes = file_bytes(winner.path());
+            assert!(plan.restore(&cx).is_err());
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                before
+            );
+            assert_eq!(file_bytes(winner.path()), winner_bytes);
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(winner)
+            );
+        });
+    }
+
+    #[test]
+    fn prepared_recovery_rechecks_both_producers_at_commit_and_can_retry() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            runtime.config.search.fast_only = true;
+            let pointer = root.join(COMPLETE_GENERATION_POINTER);
+            fs::write(&pointer, b"recovery pending").unwrap();
+            let before = file_bytes(old.path());
+            for producer in [&models.fast, &models.quality] {
+                let plan = fresh_runtime(&runtime)
+                    .prepare_retained_recovery(&cx, &root, old.id(), old.manifest_sha256())
+                    .await
+                    .unwrap();
+                producer.changed.store(true, Ordering::Relaxed);
+                let error = plan.restore(&cx).unwrap_err();
+                assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+                producer.changed.store(false, Ordering::Relaxed);
+                assert_eq!(fs::read(&pointer).unwrap(), b"recovery pending");
+                assert_eq!(file_bytes(old.path()), before);
+            }
+            let plan = fresh_runtime(&runtime)
+                .prepare_retained_recovery(&cx, &root, old.id(), old.manifest_sha256())
+                .await
+                .unwrap();
+            let (publication, reader) = plan.restore(&cx).unwrap();
+            assert!(matches!(publication, GenerationPublication::Durable(_)));
+            assert_eq!(reader.generation(), &old);
+            assert_eq!(file_bytes(old.path()), before);
+        });
+    }
+
+    #[test]
+    fn prepared_recovery_cancellation_and_target_damage_cannot_publish() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            fs::write(source.join("beta.md"), "sharedtoken successor beta document").unwrap();
+            let current = publish(&runtime, &cx, &root).await;
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let plan = runtime
+                .prepare_retained_recovery(&cx, &root, old.id(), old.manifest_sha256())
+                .await
+                .unwrap();
+            cx.set_cancel_requested(true);
+            assert!(matches!(plan.restore(&cx), Err(SearchError::Cancelled { .. })));
+            cx.set_cancel_requested(false);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            let plan = runtime
+                .prepare_retained_recovery(&cx, &root, old.id(), old.manifest_sha256())
+                .await
+                .unwrap();
+            fs::write(old.path().join("changed-after-admission"), b"damage").unwrap();
+            let before = file_bytes(old.path());
+            assert!(plan.restore(&cx).is_err());
+            assert_eq!(file_bytes(old.path()), before);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(current)
+            );
+        });
+    }
+
+    #[test]
+    fn abandoning_prepared_recovery_keeps_a_searchable_target_without_selection_change() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let generation = publish(&runtime, &cx, &root).await;
+            let pointer = root.join(COMPLETE_GENERATION_POINTER);
+            fs::write(&pointer, b"explicit repair required").unwrap();
+            let plan = runtime
+                .prepare_retained_recovery(
+                    &cx,
+                    &root,
+                    generation.id(),
+                    generation.manifest_sha256(),
+                )
+                .await
+                .unwrap();
+            let mut reader = plan.into_retained();
+            assert_eq!(reader.generation(), &generation);
+            assert_eq!(
+                reader.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                1
+            );
+            assert_eq!(fs::read(pointer).unwrap(), b"explicit repair required");
         });
     }
 }
