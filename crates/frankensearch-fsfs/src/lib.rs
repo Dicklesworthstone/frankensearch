@@ -57,8 +57,10 @@ pub mod ranking_priors;
 pub mod redaction;
 pub mod repro;
 pub mod root_discovery;
-#[path = "runtime_retained_generation.rs"]
-pub mod runtime;
+pub mod runtime {
+    include!("runtime_retained_generation.rs");
+    include!("runtime/recovery.rs");
+}
 pub mod shutdown;
 pub mod slo_anomaly;
 pub mod snippet_provenance;
