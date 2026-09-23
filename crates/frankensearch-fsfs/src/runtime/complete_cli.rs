@@ -1873,7 +1873,7 @@ mod tests {
                     assert_eq!(receipt["data"]["generation_changed"], false);
                     assert_eq!(receipt["data"]["watch_queue_drained"], false);
                     if format == OutputFormat::Jsonl {
-                        assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                        assert_eq!(String::from_utf8_lossy(&output).matches('\n').count(), 1);
                     }
                 }
                 assert_eq!(store.active(&cx).unwrap(), Some(selected.clone()));

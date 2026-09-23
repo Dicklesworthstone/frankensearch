@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use asupersync::Cx;
 #[cfg(unix)]
 use asupersync::fs::remove_file as async_file_remove;
-use asupersync::fs::{read as async_file_read, read_to_string as async_file_read_to_string};
+use asupersync::fs::read as async_file_read;
 #[cfg(unix)]
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::spawn_blocking;
@@ -383,7 +383,7 @@ impl SearchFilter for SearchFilterExpr {
         self.matches_doc_id(doc_id)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "fsfs.path_and_extension"
     }
 }
@@ -27868,7 +27868,6 @@ mod tests {
             "async_file_read(&abs_path).await",
             "async_file_read(&candidate.file_path).await",
             "async_file_read(&source_path).await",
-            "async_file_read_to_string(file_path).await",
         ] {
             assert!(
                 source.contains(required),
