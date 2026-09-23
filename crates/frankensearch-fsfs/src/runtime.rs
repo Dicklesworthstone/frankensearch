@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
@@ -21319,6 +21320,13 @@ fn count_non_empty_lines(content: &str) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
 }
 
+/// A hit's file, with its snippet line when known (`src/lib.rs:42`).
+fn hit_location(hit: &SearchHitPayload) -> Cow<'_, str> {
+    hit.line.map_or(Cow::Borrowed(hit.path.as_str()), |line| {
+        Cow::Owned(format!("{}:{line}", hit.path))
+    })
+}
+
 fn truncate_middle(text: &str, max_chars: usize) -> String {
     if max_chars < 5 {
         return text.chars().take(max_chars).collect();
@@ -22514,7 +22522,7 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
     if let Some(active_hit) = state.latest_hits().get(state.active_hit_index) {
         let path_line = Line::from(Span::styled(
             truncate_middle(
-                &active_hit.path,
+                &hit_location(active_hit),
                 usize::from(context_rows[2].width).saturating_sub(4).max(18),
             ),
             ui_fg(no_color, PackedRgba::rgb(224, 239, 255)).bold(),
@@ -22658,7 +22666,7 @@ fn render_search_dashboard_compact(
             " "
         };
         let path = truncate_middle(
-            &hit.path,
+            &hit_location(hit),
             usize::from(area.width).saturating_sub(26).max(18),
         );
         lines.push(Line::from_spans(vec![
@@ -22812,7 +22820,7 @@ fn render_search_results_panel(
         let is_active = hit_idx == state.active_hit_index;
         let path_budget = usize::from(inner.width).saturating_sub(32).max(14);
         let snippet_budget = usize::from(inner.width).saturating_sub(8).max(18);
-        let path = truncate_middle(&hit.path, path_budget);
+        let path = truncate_middle(&hit_location(hit), path_budget);
         let source_label = search_hit_source_label(
             hit,
             state
