@@ -26,6 +26,9 @@ use sha2::{Digest, Sha256};
 
 use crate::lifecycle::PublicationLease;
 
+mod maintenance;
+pub use maintenance::PreparedGenerationRestore;
+
 /// A whole-bundle pointer, deliberately distinct from Quill's lexical CURRENT.
 pub const COMPLETE_GENERATION_POINTER: &str = "FSFS-CURRENT";
 /// The presence of a sealed inventory makes a generation read-only to writers.
@@ -160,40 +163,7 @@ impl CompleteGenerationStore {
             return Ok(None);
         };
         let (id, manifest_sha256) = decode_pointer(&pointer, &self.root)?;
-        let parent = self.root.join(GENERATIONS);
-        require_directory(&parent)?;
-        let path = parent.join(&id);
-        require_directory(&path)?;
-        let bytes =
-            read_bounded_regular(&path.join(COMPLETE_GENERATION_MANIFEST), MAX_MANIFEST_BYTES)?;
-        if digest(&bytes) != manifest_sha256 {
-            return Err(invalid(
-                &path,
-                "bundle inventory digest does not match selection",
-            ));
-        }
-        let manifest: BundleManifest = serde_json::from_slice(&bytes)
-            .map_err(|error| invalid(&path, &format!("invalid bundle inventory: {error}")))?;
-        if manifest.schema_version != 1 || manifest.generation != id || manifest.files.is_empty() {
-            return Err(invalid(
-                &path,
-                "invalid bundle inventory version, identity, or empty file set",
-            ));
-        }
-        // Deriving a fresh sorted inventory also refuses traversal, duplicate
-        // names, symlinks, unexpected files, and a file replaced by a directory.
-        let actual = inventory(cx, &path, true)?;
-        if actual != manifest.files {
-            return Err(invalid(
-                &path,
-                "bundle files differ from their sealed inventory",
-            ));
-        }
-        Ok(Some(PublishedGeneration {
-            path,
-            id,
-            manifest_sha256,
-        }))
+        self.open_retained(cx, &id, &manifest_sha256).map(Some)
     }
 
     /// Check whether an already admitted generation is still selected.
