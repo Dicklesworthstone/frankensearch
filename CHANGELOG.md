@@ -253,7 +253,8 @@ qualified; individual results below are narrower than release acceptance.
   windows. On this repository's 524 Rust files, looking up 200 functions
   defined past the first 2,000 characters (seed 20260923) by name with
   lexical-only search found the defining file in the top 10 for 5 of them
-  before and 199 after. On the BEIR corpora, where 5-15% of documents exceed
+  before and 199 after; the default hybrid search's refined results found it
+  for 47 before and 198 after. On the BEIR corpora, where 5-15% of documents exceed
   2,000 characters, lexical-only nDCG@10 moved by +0.005 on SciFact and +0.002 on
   NFCorpus (neither significant) and by -0.005 on ArguAna (significant, small).
   Indexing the code took the same 21 s; the lexical index grew
