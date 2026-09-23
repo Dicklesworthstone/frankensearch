@@ -12,20 +12,28 @@
 //!
 //! The cache is protected by a `std::sync::Mutex`, keeping the wrapper `Send + Sync`.
 //! The lock is held only for the brief `HashMap` lookup/insert — never across an
-//! async `.await` boundary.
+//! async `.await` boundary. Clearing replaces the admission epoch, so inference
+//! started before a clear cannot refill or evict entries in the new cache.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
-use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::traits::{
     Embedder, IdentityBoundEmbedding, ModelCategory, ModelTier, SearchFuture,
 };
+use frankensearch_core::{SearchError, SearchResult};
 
 /// Default maximum number of cached query embeddings.
 const DEFAULT_CAPACITY: usize = 128;
+
+fn cache_checkpoint(cx: &Cx) -> SearchResult<()> {
+    cx.checkpoint().map_err(|_| SearchError::Cancelled {
+        phase: "embedding.cache".to_owned(),
+        reason: "embedding request cancelled".to_owned(),
+    })
+}
 
 /// Statistics snapshot from a [`CachedEmbedder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +79,9 @@ struct CacheState {
     ghost_cap: usize,
     hits: u64,
     misses: u64,
+    // Retained by each miss until admission. Pointer identity cannot wrap or
+    // be reused while an older in-flight operation still owns its token.
+    epoch: Arc<()>,
 }
 
 impl CacheState {
@@ -87,6 +98,7 @@ impl CacheState {
             ghost_cap: capacity,
             hits: 0,
             misses: 0,
+            epoch: Arc::new(()),
         }
     }
 
@@ -190,6 +202,7 @@ impl CacheState {
     }
 
     fn clear(&mut self) {
+        self.epoch = Arc::new(());
         self.entries.clear();
         self.small.clear();
         self.main.clear();
@@ -285,6 +298,52 @@ impl CachedEmbedder {
         Ok(())
     }
 
+    fn validate_batch(&self, embedded: &[Vec<f32>], expected: usize) -> SearchResult<()> {
+        // Validate the entire response before indexing it or mutating the cache.
+        // Short and oversized batches used to panic after caching a partial prefix.
+        if embedded.len() != expected {
+            return Err(self.invalid_response(format!(
+                "embedding batch returned {} vectors for {expected} distinct inputs",
+                embedded.len(),
+            )));
+        }
+        for values in embedded {
+            self.validate_vector(values)?;
+        }
+        Ok(())
+    }
+
+    fn fill_batch_misses(
+        out: &mut [Option<Vec<f32>>],
+        slot_miss: &[Option<usize>],
+        embedded: Vec<Vec<f32>>,
+    ) {
+        // Cardinality was checked before admission. Move each result into its
+        // last output slot, cloning only for same-batch duplicate queries.
+        let mut miss_use_counts = vec![0_usize; embedded.len()];
+        for maybe_idx in slot_miss {
+            if let Some(idx) = *maybe_idx {
+                miss_use_counts[idx] += 1;
+            }
+        }
+        let mut embedded_slots: Vec<Option<Vec<f32>>> = embedded.into_iter().map(Some).collect();
+        for (slot, maybe_idx) in out.iter_mut().zip(slot_miss) {
+            if let Some(idx) = *maybe_idx {
+                let use_count = &mut miss_use_counts[idx];
+                *use_count = use_count.saturating_sub(1);
+                let vec = if *use_count == 0 {
+                    embedded_slots[idx].take().expect("embedding slot filled")
+                } else {
+                    embedded_slots[idx]
+                        .as_ref()
+                        .expect("embedding slot filled")
+                        .clone()
+                };
+                *slot = Some(vec);
+            }
+        }
+    }
+
     /// Return a snapshot of cache statistics.
     #[must_use]
     pub fn cache_stats(&self) -> CacheStats {
@@ -292,6 +351,10 @@ impl CachedEmbedder {
     }
 
     /// Clear all cached embeddings and reset statistics.
+    ///
+    /// This also fences admission by already-running requests. They may return
+    /// their validated results to their original callers, but cannot refill the
+    /// cleared cache, change its reset statistics or evict newer entries.
     pub fn clear_cache(&self) {
         self.state_lock().clear();
     }
@@ -305,19 +368,28 @@ impl CachedEmbedder {
 
 impl Embedder for CachedEmbedder {
     fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
-        // Check cache before acquiring any async resources.
-        // Lock scope is tiny: just a HashMap lookup.
-        let cached = self.state_lock().get(text);
-        if let Some(vec) = cached {
-            return Box::pin(async move { Ok(vec) });
-        }
-
-        let key = text.to_owned();
         Box::pin(async move {
+            // Resolve lazily: constructing an unpolled future must not capture
+            // a stale cache hit, update statistics or begin provider work.
+            cache_checkpoint(cx)?;
+            let epoch = {
+                let mut cache = self.state_lock();
+                cache_checkpoint(cx)?;
+                if let Some(vec) = cache.get(text) {
+                    return Ok(vec);
+                }
+                Arc::clone(&cache.epoch)
+            };
             let vec = self.inner.embed(cx, text).await?;
+            cache_checkpoint(cx)?;
             self.validate_vector(&vec)?;
-            // Insert into cache (lock scope: HashMap insert + possible eviction).
-            self.state_lock().insert(key, vec.clone());
+            {
+                let mut cache = self.state_lock();
+                cache_checkpoint(cx)?;
+                if Arc::ptr_eq(&epoch, &cache.epoch) {
+                    cache.insert(text.to_owned(), vec.clone());
+                }
+            }
             Ok(vec)
         })
     }
@@ -327,7 +399,12 @@ impl Embedder for CachedEmbedder {
         cx: &'a Cx,
         text: &'a str,
     ) -> SearchFuture<'a, IdentityBoundEmbedding> {
-        self.inner.embed_bound(cx, text)
+        Box::pin(async move {
+            cache_checkpoint(cx)?;
+            let response = self.inner.embed_bound(cx, text).await?;
+            cache_checkpoint(cx)?;
+            Ok(response)
+        })
     }
 
     fn embed_batch<'a>(
@@ -336,6 +413,7 @@ impl Embedder for CachedEmbedder {
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
+            cache_checkpoint(cx)?;
             // Pass 1 (single lock scope, released BEFORE the await so the batched
             // inner call holds no lock): resolve cache hits and collect the *distinct*
             // misses. A miss text repeated within the batch folds onto one inner
@@ -347,9 +425,10 @@ impl Embedder for CachedEmbedder {
             let mut slot_miss: Vec<Option<usize>> = Vec::with_capacity(texts.len());
             // Dedup map: distinct miss text -> its index in `miss_texts`.
             let mut miss_index: HashMap<&str, usize> = HashMap::new();
-            {
+            let epoch = {
                 let mut cache = self.state_lock();
                 for &text in texts {
+                    cache_checkpoint(cx)?;
                     if let Some(&idx) = miss_index.get(text) {
                         // Repeat of a text already queued this batch: fold onto the
                         // same inner result, no second inner call, record a hit.
@@ -372,62 +451,32 @@ impl Embedder for CachedEmbedder {
                         }
                     }
                 }
-            }
+                Arc::clone(&cache.epoch)
+            };
             // ONE batched inner call for all distinct misses — vs the old per-text loop
             // that called `inner.embed` N times, defeating a batching inner (e.g.
             // fastembed embeds the whole batch in a single model invocation). N → 1.
             if !miss_texts.is_empty() {
+                cache_checkpoint(cx)?;
                 let all_slots_are_distinct_misses = miss_texts.len() == texts.len();
                 let embedded = self.inner.embed_batch(cx, &miss_texts).await?;
-                // Validate the entire provider response before indexing it or
-                // mutating the cache. Both short and oversized responses used to
-                // panic during fan-out, sometimes after caching a partial prefix.
-                if embedded.len() != miss_texts.len() {
-                    return Err(self.invalid_response(format!(
-                        "embedding batch returned {} vectors for {} distinct inputs",
-                        embedded.len(),
-                        miss_texts.len(),
-                    )));
-                }
-                for values in &embedded {
-                    self.validate_vector(values)?;
-                }
+                cache_checkpoint(cx)?;
+                self.validate_batch(&embedded, miss_texts.len())?;
                 {
                     let mut cache = self.state_lock();
-                    for (idx, vec) in embedded.iter().enumerate() {
-                        cache.insert(miss_texts[idx].to_owned(), vec.clone());
+                    cache_checkpoint(cx)?;
+                    if Arc::ptr_eq(&epoch, &cache.epoch) {
+                        for (idx, vec) in embedded.iter().enumerate() {
+                            cache.insert(miss_texts[idx].to_owned(), vec.clone());
+                        }
                     }
                 }
-                if all_slots_are_distinct_misses && embedded.len() == miss_texts.len() {
+                if all_slots_are_distinct_misses {
                     return Ok(embedded);
                 }
-                // Fan the distinct embeddings back out to every slot that needed them.
-                // Move the owned inner result into its last output slot; clone only
-                // same-batch duplicates that need the vector more than once.
-                let mut miss_use_counts = vec![0_usize; embedded.len()];
-                for maybe_idx in &slot_miss {
-                    if let Some(idx) = *maybe_idx {
-                        miss_use_counts[idx] += 1;
-                    }
-                }
-                let mut embedded_slots: Vec<Option<Vec<f32>>> =
-                    embedded.into_iter().map(Some).collect();
-                for (slot, maybe_idx) in slot_miss.iter().enumerate() {
-                    if let Some(idx) = *maybe_idx {
-                        let use_count = &mut miss_use_counts[idx];
-                        *use_count = use_count.saturating_sub(1);
-                        let vec = if *use_count == 0 {
-                            embedded_slots[idx].take().expect("embedding slot filled")
-                        } else {
-                            embedded_slots[idx]
-                                .as_ref()
-                                .expect("embedding slot filled")
-                                .clone()
-                        };
-                        out[slot] = Some(vec);
-                    }
-                }
+                Self::fill_batch_misses(&mut out, &slot_miss, embedded);
             }
+            cache_checkpoint(cx)?;
             Ok(out
                 .into_iter()
                 .map(|v| v.expect("every slot filled"))
@@ -476,7 +525,7 @@ impl Embedder for CachedEmbedder {
 mod tests {
     use super::*;
     use frankensearch_core::traits::l2_normalize;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Test double: counts how many times `embed()` is called.
     struct CountingEmbedder {
@@ -774,11 +823,8 @@ mod tests {
 
             // "hot" survived the scan (promoted to Main) → still a hit.
             cached.embed(&cx, "hot").await.unwrap();
-            assert_eq!(
-                inner.call_count(),
-                after_hot + 6,
-                "S3-FIFO must keep the reused 'hot' key through the cold scan"
-            );
+            assert_eq!(inner.call_count(), after_hot + 6,
+                "S3-FIFO must keep the reused 'hot' key through the cold scan");
         });
     }
 
@@ -1070,6 +1116,8 @@ mod tests {
         response: Mutex<Vec<Vec<f32>>>,
         calls: AtomicUsize,
         identity: EmbeddingIdentityBundleV1,
+        yield_response: bool,
+        cancel_response: AtomicBool,
     }
 
     impl ResponseEmbedder {
@@ -1078,25 +1126,52 @@ mod tests {
                 response: Mutex::new(vec![vec![1.0, 0.0]]),
                 calls: AtomicUsize::new(0),
                 identity: EmbeddingIdentityBundleV1::explicit_test_model("cache-response-test", 2),
+                yield_response: false,
+                cancel_response: AtomicBool::new(false),
+            }
+        }
+
+        async fn before_response(&self, cx: &Cx) {
+            if self.yield_response {
+                let mut yielded = false;
+                std::future::poll_fn(|task| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        task.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+            if self.cancel_response.load(Ordering::Relaxed) {
+                cx.set_cancel_requested(true);
             }
         }
     }
 
     impl Embedder for ResponseEmbedder {
-        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let response = self.response.lock().unwrap()[0].clone();
-            Box::pin(async move { Ok(response) })
+            Box::pin(async move {
+                self.before_response(cx).await;
+                Ok(response)
+            })
         }
 
         fn embed_batch<'a>(
             &'a self,
-            _cx: &'a Cx,
+            cx: &'a Cx,
             _texts: &'a [&'a str],
         ) -> SearchFuture<'a, Vec<Vec<f32>>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let response = self.response.lock().unwrap().clone();
-            Box::pin(async move { Ok(response) })
+            Box::pin(async move {
+                self.before_response(cx).await;
+                Ok(response)
+            })
         }
 
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
@@ -1205,6 +1280,138 @@ mod tests {
                 vec![vec![0.0, 0.0], vec![1.0, 0.0]]
             );
             assert_eq!(cached.cache_stats().entries, 0);
+        });
+    }
+
+    #[test]
+    fn unpolled_futures_do_not_touch_cache_or_capture_pre_clear_hits() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (cached, inner) = make_cached(4);
+            cached.embed(&cx, "warm").await.unwrap();
+            let before = cached.cache_stats();
+            let hit = cached.embed(&cx, "warm");
+            let miss = cached.embed(&cx, "new");
+            assert_eq!(cached.cache_stats(), before);
+            assert_eq!(inner.call_count(), 1);
+            drop(miss);
+            cached.clear_cache();
+            hit.await.unwrap();
+            assert_eq!(inner.call_count(), 2);
+            assert_eq!(cached.cache_stats().misses, 1);
+            assert_eq!(cached.cache_stats().hits, 0);
+        });
+    }
+
+    #[test]
+    fn clear_fences_in_flight_single_response_and_preserves_new_entries() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for refill in [false, true] {
+                let mut provider = ResponseEmbedder::new();
+                provider.yield_response = true;
+                let inner = Arc::new(provider);
+                let cached = CachedEmbedder::new(inner.clone(), 1);
+                let mut flight = cached.embed(&cx, "old");
+                {
+                    let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(std::future::Future::poll(flight.as_mut(), &mut task).is_pending());
+                }
+                assert_eq!(inner.calls.load(Ordering::Relaxed), 1);
+                cached.clear_cache();
+                cached.clear_cache();
+                if refill {
+                    *inner.response.lock().unwrap() = vec![vec![0.0, 1.0]];
+                    cached.embed(&cx, "new").await.unwrap();
+                }
+                let after_clear = cached.cache_stats();
+                assert_eq!(flight.await.unwrap(), vec![1.0, 0.0]);
+                assert_eq!(cached.cache_stats(), after_clear);
+                assert!(!cached.state_lock().entries.contains_key("old"));
+                if refill {
+                    assert_eq!(cached.embed(&cx, "new").await.unwrap(), vec![0.0, 1.0]);
+                    assert_eq!(inner.calls.load(Ordering::Relaxed), 2);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn clear_fences_in_flight_batch_without_losing_order_or_duplicates() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut provider = ResponseEmbedder::new();
+            provider.yield_response = true;
+            let inner = Arc::new(provider);
+            *inner.response.lock().unwrap() = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+            let cached = CachedEmbedder::new(inner.clone(), 1);
+            let texts = ["first", "second", "first"];
+            let mut flight = cached.embed_batch(&cx, &texts);
+            {
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(std::future::Future::poll(flight.as_mut(), &mut task).is_pending());
+            }
+            cached.clear_cache();
+            *inner.response.lock().unwrap() = vec![vec![0.0, 0.0]];
+            cached.embed(&cx, "new").await.unwrap();
+            let after_clear = cached.cache_stats();
+            assert_eq!(
+                flight.await.unwrap(),
+                vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 0.0]]
+            );
+            assert_eq!(cached.cache_stats(), after_clear);
+            assert!(cached.state_lock().entries.contains_key("new"));
+            assert_eq!(cached.embed(&cx, "new").await.unwrap(), vec![0.0, 0.0]);
+            assert_eq!(inner.calls.load(Ordering::Relaxed), 2);
+        });
+    }
+
+    #[test]
+    fn cancellation_precedes_hits_misses_empty_batches_and_bound_calls() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (cached, inner) = make_cached(4);
+            cached.embed(&cx, "warm").await.unwrap();
+            let before = cached.cache_stats();
+            let constructed_hit = cached.embed(&cx, "warm");
+            cx.set_cancel_requested(true);
+            assert!(matches!(constructed_hit.await, Err(SearchError::Cancelled { .. })));
+            assert!(matches!(cached.embed(&cx, "new").await, Err(SearchError::Cancelled { .. })));
+            for texts in [vec![], vec!["warm"], vec!["warm", "new"]] {
+                assert!(matches!(
+                    cached.embed_batch(&cx, &texts).await,
+                    Err(SearchError::Cancelled { .. })
+                ));
+            }
+            assert!(matches!(
+                cached.embed_bound(&cx, "warm").await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(cached.cache_stats(), before);
+            assert_eq!(inner.call_count(), 1);
+            assert_eq!(inner.bound_calls.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn cancellation_after_provider_success_does_not_admit_single_or_batch_misses() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let inner = Arc::new(ResponseEmbedder::new());
+            let cached = CachedEmbedder::new(inner.clone(), 4);
+            cached.embed(&cx, "warm").await.unwrap();
+            inner.cancel_response.store(true, Ordering::Relaxed);
+            assert!(matches!(
+                cached.embed(&cx, "new").await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(cached.cache_stats().entries, 1);
+            cx.set_cancel_requested(false);
+            assert!(matches!(
+                cached.embed_batch(&cx, &["warm", "new"]).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(cached.cache_stats().entries, 1);
+            assert!(!cached.state_lock().entries.contains_key("new"));
+            cx.set_cancel_requested(false);
+            inner.cancel_response.store(false, Ordering::Relaxed);
+            assert_eq!(cached.embed(&cx, "new").await.unwrap(), vec![1.0, 0.0]);
+            assert_eq!(cached.cache_stats().entries, 2);
         });
     }
 }
