@@ -26206,12 +26206,12 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-        let mut stale = header();
-        if let SearchServeFrame::Attested { schema_version, .. } = &mut stale {
+        let mut outdated = header();
+        if let SearchServeFrame::Attested { schema_version, .. } = &mut outdated {
             *schema_version = "fsfs.search.serve.stream.v1".to_owned();
         }
         assert!(
-            accept(stale, &mut state)
+            accept(outdated, &mut state)
                 .unwrap_err()
                 .to_string()
                 .contains("search policy")

@@ -21653,6 +21653,15 @@ mod tests {
             second_floor, first_floor,
             "a later observation must not restart the recovery grace window"
         );
+        // `std::fs::write` stamps the directory (the floor's witness) when it
+        // creates the temp manifest and the temp's own mtime when it writes;
+        // a clock tick between the two leaves the temp younger than the floor
+        // (bd-yzyvr). Temporaries age from their own mtime, so pin it to the
+        // floor to make both grace boundaries below exact.
+        File::options()
+            .write(true)
+            .open(directory.path().join(".tmp-manifest-2"))?
+            .set_times(std::fs::FileTimes::new().set_modified(first_floor))?;
 
         let options = GarbageCollectionOptions {
             grace_period: Duration::from_secs(60),
