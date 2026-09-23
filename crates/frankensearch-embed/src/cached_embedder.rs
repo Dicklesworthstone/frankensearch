@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
-use frankensearch_core::SearchResult;
+use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::traits::{
     Embedder, IdentityBoundEmbedding, ModelCategory, ModelTier, SearchFuture,
@@ -205,6 +205,9 @@ impl CacheState {
 /// Caches raw `embed()` and `embed_batch()` results for previously seen queries.
 /// `embed_bound()` deliberately bypasses the raw-vector cache: an identity from
 /// `identity()` cannot replace the identity accompanying the provider's response.
+/// Raw responses are validated before insertion: batches must contain exactly
+/// one finite, correctly sized vector per distinct miss. An invalid batch never
+/// inserts a valid-looking prefix into the cache.
 ///
 /// # Construction
 ///
@@ -257,6 +260,31 @@ impl CachedEmbedder {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn invalid_response(&self, detail: impl Into<String>) -> SearchError {
+        SearchError::EmbeddingFailed {
+            model: self.inner.id().to_owned(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                detail.into(),
+            )),
+        }
+    }
+
+    fn validate_vector(&self, values: &[f32]) -> SearchResult<()> {
+        let expected = self.inner.dimension();
+        if values.len() != expected {
+            return Err(SearchError::DimensionMismatch {
+                expected,
+                found: values.len(),
+            });
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            // Do not echo query text, vector values or a provider's raw payload.
+            return Err(self.invalid_response("embedding response contains non-finite values"));
+        }
+        Ok(())
+    }
+
     /// Return a snapshot of cache statistics.
     #[must_use]
     pub fn cache_stats(&self) -> CacheStats {
@@ -287,6 +315,7 @@ impl Embedder for CachedEmbedder {
         let key = text.to_owned();
         Box::pin(async move {
             let vec = self.inner.embed(cx, text).await?;
+            self.validate_vector(&vec)?;
             // Insert into cache (lock scope: HashMap insert + possible eviction).
             self.state_lock().insert(key, vec.clone());
             Ok(vec)
@@ -350,6 +379,19 @@ impl Embedder for CachedEmbedder {
             if !miss_texts.is_empty() {
                 let all_slots_are_distinct_misses = miss_texts.len() == texts.len();
                 let embedded = self.inner.embed_batch(cx, &miss_texts).await?;
+                // Validate the entire provider response before indexing it or
+                // mutating the cache. Both short and oversized responses used to
+                // panic during fan-out, sometimes after caching a partial prefix.
+                if embedded.len() != miss_texts.len() {
+                    return Err(self.invalid_response(format!(
+                        "embedding batch returned {} vectors for {} distinct inputs",
+                        embedded.len(),
+                        miss_texts.len(),
+                    )));
+                }
+                for values in &embedded {
+                    self.validate_vector(values)?;
+                }
                 {
                     let mut cache = self.state_lock();
                     for (idx, vec) in embedded.iter().enumerate() {
@@ -1023,4 +1065,146 @@ mod tests {
     }
 
     // ─── bd-1ocg tests end ───
+
+    struct ResponseEmbedder {
+        response: Mutex<Vec<Vec<f32>>>,
+        calls: AtomicUsize,
+        identity: EmbeddingIdentityBundleV1,
+    }
+
+    impl ResponseEmbedder {
+        fn new() -> Self {
+            Self {
+                response: Mutex::new(vec![vec![1.0, 0.0]]),
+                calls: AtomicUsize::new(0),
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("cache-response-test", 2),
+            }
+        }
+    }
+
+    impl Embedder for ResponseEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let response = self.response.lock().unwrap()[0].clone();
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn embed_batch<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let response = self.response.lock().unwrap().clone();
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn id(&self) -> &str {
+            "cache-response-test"
+        }
+
+        fn model_name(&self) -> &str {
+            "Cache Response Test Embedder"
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
+    #[test]
+    fn malformed_batch_cardinality_is_an_error_without_partial_cache_admission() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for returned in [0, 1, 3] {
+                let inner = Arc::new(ResponseEmbedder::new());
+                let cached = CachedEmbedder::new(inner.clone(), 2);
+                let warm = cached.embed(&cx, "warm").await.unwrap();
+                *inner.response.lock().unwrap() = vec![vec![0.0, 1.0]; returned];
+                let error = cached
+                    .embed_batch(&cx, &["warm", "first", "second", "first"])
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::EmbeddingFailed { .. }));
+                assert_eq!(cached.cache_stats().entries, 1);
+                assert!(!cached.state_lock().entries.contains_key("first"));
+                assert_eq!(cached.embed(&cx, "warm").await.unwrap(), warm);
+                assert_eq!(inner.calls.load(Ordering::Relaxed), 2);
+            }
+        });
+    }
+
+    #[test]
+    fn invalid_batch_vector_does_not_cache_the_valid_prefix() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for invalid in [
+                vec![],
+                vec![1.0],
+                vec![1.0, 0.0, 0.0],
+                vec![f32::NAN, 0.0],
+                vec![0.0, f32::INFINITY],
+                vec![f32::NEG_INFINITY, 0.0],
+            ] {
+                let inner = Arc::new(ResponseEmbedder::new());
+                let cached = CachedEmbedder::new(inner.clone(), 2);
+                let warm = cached.embed(&cx, "warm").await.unwrap();
+                *inner.response.lock().unwrap() = vec![vec![0.0, 1.0], invalid];
+                assert!(matches!(
+                    cached.embed_batch(&cx, &["first", "second"]).await,
+                    Err(SearchError::DimensionMismatch { .. } | SearchError::EmbeddingFailed { .. })
+                ));
+                assert_eq!(cached.cache_stats().entries, 1);
+                assert!(!cached.state_lock().entries.contains_key("first"));
+                assert_eq!(cached.embed(&cx, "warm").await.unwrap(), warm);
+            }
+        });
+    }
+
+    #[test]
+    fn invalid_single_vectors_are_not_returned_or_cached_and_retry_can_recover() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for invalid in [vec![1.0], vec![f32::NAN, 0.0], vec![0.0, f32::INFINITY]] {
+                let inner = Arc::new(ResponseEmbedder::new());
+                let cached = CachedEmbedder::new(inner.clone(), 4);
+                *inner.response.lock().unwrap() = vec![invalid];
+                for _ in 0..2 {
+                    assert!(cached.embed(&cx, "query").await.is_err());
+                    assert_eq!(cached.cache_stats().entries, 0);
+                }
+                *inner.response.lock().unwrap() = vec![vec![1.0, 0.0]];
+                assert_eq!(cached.embed(&cx, "query").await.unwrap(), vec![1.0, 0.0]);
+                assert_eq!(cached.embed(&cx, "query").await.unwrap(), vec![1.0, 0.0]);
+                assert_eq!(inner.calls.load(Ordering::Relaxed), 3);
+            }
+        });
+    }
+
+    #[test]
+    fn disabling_storage_does_not_disable_provider_response_validation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let inner = Arc::new(ResponseEmbedder::new());
+            let cached = CachedEmbedder::new(inner.clone(), 0);
+            assert!(matches!(
+                cached.embed_batch(&cx, &["first", "second"]).await,
+                Err(SearchError::EmbeddingFailed { .. })
+            ));
+            *inner.response.lock().unwrap() = vec![vec![0.0, 0.0], vec![1.0, 0.0]];
+            assert_eq!(
+                cached.embed_batch(&cx, &["first", "second"]).await.unwrap(),
+                vec![vec![0.0, 0.0], vec![1.0, 0.0]]
+            );
+            assert_eq!(cached.cache_stats().entries, 0);
+        });
+    }
 }
