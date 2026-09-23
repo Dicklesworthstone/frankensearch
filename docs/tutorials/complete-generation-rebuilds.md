@@ -68,7 +68,7 @@ fsfs serve --index-dir /work/search-store --config /work/fsfs.toml --format json
 
 Send the existing JSON request shape, for example
 `{"query":"connection pooling","limit":10}`, or a plain query line. Each
-request uses the existing buffered `fsfs.search.serve.v3` response shape, after
+request uses the buffered `fsfs.search.serve.v4` response shape, after
 one ready event. Send `quit` or close stdin to stop. This is not the progressive
 socket transport: use direct `search --stream` for immediate phase delivery.
 

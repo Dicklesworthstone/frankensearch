@@ -21,13 +21,13 @@ use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
+use asupersync::fs::read as async_file_read;
 #[cfg(unix)]
 use asupersync::fs::remove_file as async_file_remove;
-use asupersync::fs::read as async_file_read;
 #[cfg(unix)]
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::spawn_blocking;
-use frankensearch_core::filter::SearchFilter;
+use frankensearch_core::filter::{PredicateFilter, SearchFilter};
 use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
@@ -502,10 +502,12 @@ const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
 const FSFS_SEARCH_SEMANTIC_HEAD_PROGRESSIVE_STEP: usize = 16;
 const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v5";
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v6";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v3";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v1";
+// A retained older daemon must not attest results from the previous ranking
+// policy even when its generation and configured search options still match.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v4";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v2";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -10814,6 +10816,7 @@ impl FsfsRuntime {
                         &normalized_query,
                         quality_budget,
                         filter_expr.as_ref(),
+                        &semantic_candidates,
                     ),
                 )
                 .await;
@@ -17845,6 +17848,7 @@ impl FsfsRuntime {
         query: &str,
         budget: usize,
         filter_expr: Option<&SearchFilterExpr>,
+        fast_candidates: &[SemanticCandidate],
     ) -> SearchResult<Option<Vec<SemanticCandidate>>> {
         self.maybe_prepare_quality_embedder(cx, resources).await?;
         let (Some(index), Some(embedder)) =
@@ -17855,14 +17859,56 @@ impl FsfsRuntime {
         let query_embedding = embedder.embed(cx, query).await?;
         let index = Arc::clone(index);
         let filter_expr = filter_expr.cloned();
+        let mut fast_ids = fast_candidates
+            .iter()
+            .map(|candidate| candidate.doc_id.clone())
+            .collect::<HashSet<_>>();
+        let work_cx = cx.clone();
         let hits = Self::quality_blocking(cx, move || {
-            index.search_top_k(
+            let mut hits = index.search_top_k(
                 &query_embedding,
                 budget,
                 filter_expr
                     .as_ref()
                     .map(|filter| filter as &dyn SearchFilter),
-            )
+            )?;
+            // Independent top-k retrieval admits quality-only documents, but
+            // omission from that bounded pool does not prove a fast candidate
+            // lacks a quality vector. Score those exact eligible IDs too, with
+            // the same embedding and deadline. A retained fast candidate gets
+            // the blend's single-source fallback only when its quality vector
+            // is actually absent; quality-discovered IDs are not rescored fast.
+            for hit in &hits {
+                fast_ids.remove(hit.doc_id.as_str());
+            }
+            if !fast_ids.is_empty() {
+                Self::semantic_retry_checkpoint(&work_cx, "fsfs.quality.score_fast_candidates")?;
+                // A crash can leave both an old main row and its lower-scored
+                // WAL replacement live. Native top-k resolves supersession
+                // after heap selection, so reserve room for both physical
+                // rows of these exact IDs before that resolution.
+                let matching_wal_count = index
+                    .wal_records()
+                    .filter(|(id, _)| fast_ids.contains(*id))
+                    .count();
+                let missing_limit = fast_ids.len().saturating_add(matching_wal_count);
+                let missing_fast =
+                    PredicateFilter::new("fsfs.quality.fast_candidates", move |id| {
+                        fast_ids.contains(id)
+                    });
+                hits.extend(index.search_top_k(
+                    &query_embedding,
+                    missing_limit,
+                    Some(&missing_fast),
+                )?);
+                hits.sort_unstable_by(|left, right| {
+                    right
+                        .score
+                        .total_cmp(&left.score)
+                        .then_with(|| left.doc_id.cmp(&right.doc_id))
+                });
+            }
+            Ok::<_, SearchError>(hits)
         })
         .await??;
         Ok(Some(
@@ -25702,6 +25748,8 @@ mod tests {
             super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v3".to_owned();
+        assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.schema_version = "fsfs.search.serve.v2".to_owned();
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.schema_version = "fsfs.search.serve.v1".to_owned();
@@ -26158,6 +26206,17 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
+        let mut stale = header();
+        if let SearchServeFrame::Attested { schema_version, .. } = &mut stale {
+            *schema_version = "fsfs.search.serve.stream.v1".to_owned();
+        }
+        assert!(
+            accept(stale, &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("search policy")
+        );
+        assert!(!state.attested, "old ranking policy cannot admit any phase");
         let mut bad = header();
         if let SearchServeFrame::Attested { policy, .. } = &mut bad {
             policy.quality_weight_bits = 0;
@@ -34983,34 +35042,46 @@ mod tests {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().expect("vector filter fixture");
             let mut resources = disagreeing_blend_resources(temp.path());
-            let write = |name: &str, embedder: &str, matching: &str| {
-                let path = temp.path().join(name);
-                let mut writer = VectorIndex::create(&path, embedder, 2).unwrap();
-                for index in 0..64 {
-                    writer
-                        .write_record(&format!("docs/excluded-{index}.md"), &[1.0, 0.0])
-                        .unwrap();
-                }
-                writer.write_record("docs/outside.rs", &[1.0, 0.0]).unwrap();
-                writer.write_record(matching, &[0.5, 0.866_025_4]).unwrap();
-                writer.finish().unwrap();
-                let index = VectorIndex::open_read_only(&path).unwrap();
-                assert!(
+            let write =
+                |name: &str, embedder: &str, matching: &str, fast_vector: Option<[f32; 2]>| {
+                    let path = temp.path().join(name);
+                    let mut writer = VectorIndex::create(&path, embedder, 2).unwrap();
+                    for index in 0..64 {
+                        writer
+                            .write_record(&format!("docs/excluded-{index}.md"), &[1.0, 0.0])
+                            .unwrap();
+                    }
+                    writer.write_record("docs/outside.rs", &[1.0, 0.0]).unwrap();
+                    writer.write_record(matching, &[0.5, 0.866_025_4]).unwrap();
+                    if let Some(fast_vector) = fast_vector {
+                        // This score is below the independent quality top-1. It
+                        // must still participate in blending the fast candidate;
+                        // top-k truncation is not missing generation coverage.
+                        writer.write_record("src/fast.rs", &fast_vector).unwrap();
+                    }
+                    writer.finish().unwrap();
+                    let index = VectorIndex::open_read_only(&path).unwrap();
+                    assert!(
+                        index
+                            .search_top_k(&[1.0, 0.0], 64, None)
+                            .unwrap()
+                            .iter()
+                            .all(|hit| !hit.doc_id.starts_with("src/")),
+                        "fixture's permitted hit must be outside the unfiltered head"
+                    );
                     index
-                        .search_top_k(&[1.0, 0.0], 64, None)
-                        .unwrap()
-                        .iter()
-                        .all(|hit| !hit.doc_id.starts_with("src/")),
-                    "fixture's permitted hit must be outside the unfiltered head"
-                );
-                index
-            };
-            resources.vector_index =
-                Some(write("filtered-fast.fsvi", "blend-fast-2", "src/fast.rs"));
+                };
+            resources.vector_index = Some(write(
+                "filtered-fast.fsvi",
+                "blend-fast-2",
+                "src/fast.rs",
+                None,
+            ));
             resources.quality_vector_index = Some(Arc::new(write(
                 "filtered-quality.fsvi",
                 "blend-quality-2",
                 "src/quality.rs",
+                Some([0.0, 1.0]),
             )));
             resources.generation_fingerprint =
                 FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
@@ -35049,6 +35120,102 @@ mod tests {
                     assert_eq!(phases[1].hits.len(), 1);
                     assert_eq!(phases[1].hits[0].path, "src/quality.rs");
                 }
+            }
+
+            // Reproduce a persisted crash state: append durably writes the
+            // replacement WAL, then an interrupted tombstone leaves the old
+            // main image. Keep the old score below the independent quality
+            // winner and above its replacement, isolating score completion.
+            drop(write(
+                "wal-quality.fsvi",
+                "blend-quality-2",
+                "src/quality.rs",
+                Some([0.25, 0.968_245_8]),
+            ));
+            let wal_quality_path = temp.path().join("wal-quality.fsvi");
+            let prior_main = fs::read(&wal_quality_path).unwrap();
+            let mut writer = VectorIndex::open(&wal_quality_path).unwrap();
+            writer.append("src/fast.rs", &[0.0, 1.0]).unwrap();
+            drop(writer);
+            fs::write(&wal_quality_path, prior_main).unwrap();
+            let wal_quality = VectorIndex::open_read_only(&wal_quality_path).unwrap();
+            assert_eq!(wal_quality.wal_record_count(), 1);
+            let main_fast = (0..wal_quality.record_count())
+                .find(|&index| wal_quality.doc_id_at(index).unwrap() == "src/fast.rs")
+                .unwrap();
+            assert!(!wal_quality.is_deleted(main_fast));
+            assert_eq!(wal_quality.vector_at_f32(main_fast).unwrap()[0], 0.25);
+            resources.quality_vector_index = Some(Arc::new(wal_quality));
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            for limit in [1, 2] {
+                let phases = runtime
+                    .execute_search_payloads_with_mode_using_resources(
+                        &cx,
+                        query,
+                        limit,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                        flags,
+                    )
+                    .await
+                    .unwrap();
+                let refined = phases.last().unwrap();
+                assert_eq!(refined.phase, SearchOutputPhase::Refined);
+                assert_eq!(refined.hits.len(), limit);
+                assert_eq!(refined.hits[0].path, "src/quality.rs");
+                if limit == 2 {
+                    let fast = refined
+                        .semantic_blend
+                        .as_ref()
+                        .unwrap()
+                        .hits
+                        .iter()
+                        .find(|hit| hit.path == "src/fast.rs")
+                        .unwrap();
+                    assert_eq!(fast.quality.as_ref().unwrap().raw_score, Some(0.0));
+                }
+            }
+
+            // True absence keeps the documented single-source normalization,
+            // including at weight=1: equal singleton scores tie by document ID.
+            // The quality-only document must still reach the complete union.
+            resources.quality_vector_index = Some(Arc::new(write(
+                "disjoint-quality.fsvi",
+                "blend-quality-2",
+                "src/quality.rs",
+                None,
+            )));
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let disjoint = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    query,
+                    2,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    flags,
+                )
+                .await
+                .unwrap();
+            let refined = disjoint.last().unwrap();
+            assert_eq!(refined.phase, SearchOutputPhase::Refined);
+            assert_eq!(
+                refined
+                    .hits
+                    .iter()
+                    .map(|hit| hit.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["src/fast.rs", "src/quality.rs"]
+            );
+            let blend = refined.semantic_blend.as_ref().unwrap();
+            assert_eq!(blend.hits.len(), 2);
+            for hit in &blend.hits {
+                assert_eq!(hit.score, 1.0);
+                assert_ne!(hit.fast.is_some(), hit.quality.is_some());
+                let tier = hit.fast.as_ref().or(hit.quality.as_ref()).unwrap();
+                assert_eq!(tier.weight, 1.0);
             }
             let mut no_match = runtime.clone();
             no_match.cli_input.filter = Some("path:missing/".to_owned());
@@ -42391,7 +42558,11 @@ mod tests {
             let cache_path = runtime.search_cache_path(&key).unwrap();
             let mut old_record: serde_json::Value =
                 serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
-            for old_schema in ["fsfs.search.cache.v3", "fsfs.search.cache.v4"] {
+            for old_schema in [
+                "fsfs.search.cache.v3",
+                "fsfs.search.cache.v4",
+                "fsfs.search.cache.v5",
+            ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
                 assert!(

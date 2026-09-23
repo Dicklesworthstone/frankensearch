@@ -30,7 +30,9 @@ use crate::output_schema::{
 };
 use crate::{CliCommand, FsfsConfig, OutputFormat};
 
-const VERSION: u32 = 1;
+// Ranking changes invalidate retained peers even when configuration and
+// generation identity match. The progressive request shares this version.
+const VERSION: u32 = 2;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -503,7 +505,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (_, request) = request(root.path());
         let text = serde_json::to_string(&request).unwrap();
-        let duplicate = format!("{{\"fsfs_complete_cli\":1,{}", &text[1..]);
+        let duplicate = format!("{{\"fsfs_complete_cli\":{VERSION},{}", &text[1..]);
         assert!(decode_request(duplicate.as_bytes()).is_err());
         for (field, value) in [
             ("stream", serde_json::json!(true)),
@@ -514,9 +516,11 @@ mod tests {
             assert!(decode_request(&serde_json::to_vec(&value_map).unwrap()).is_err());
         }
         let mut value = serde_json::to_value(&request).unwrap();
-        value["fsfs_complete_cli"] = serde_json::json!(2);
-        assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
-        value["fsfs_complete_cli"] = serde_json::json!(1);
+        for unsupported in [1, VERSION + 1] {
+            value["fsfs_complete_cli"] = serde_json::json!(unsupported);
+            assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        value["fsfs_complete_cli"] = serde_json::json!(VERSION);
         value["search"]["limit"] = serde_json::json!(0);
         assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
     }
@@ -581,6 +585,12 @@ mod tests {
                 .contains("wrong semantic producer: fixture")
         );
         assert!(std::error::Error::source(&error).is_some());
+        reply.fsfs_complete_cli = 1;
+        assert!(
+            matches!(decode_reply(&serde_json::to_vec(&reply).unwrap(), &request),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "complete_generation.daemon_response")
+        );
+        reply.fsfs_complete_cli = VERSION;
         reply.request_id.push('x');
         assert!(
             matches!(decode_reply(&serde_json::to_vec(&reply).unwrap(), &request),

@@ -562,6 +562,12 @@ mod tests {
         let parsed = parse_request(&bytes).unwrap();
         assert_eq!(parsed.explain, Some(true));
         assert_eq!(parsed.request.search.filter, wrapper.request.search.filter);
+        let mut stale = value.clone();
+        stale["fsfs_complete_cli_stream"] = serde_json::json!(1);
+        assert!(parse_request(&serde_json::to_vec(&stale).unwrap()).is_err());
+        stale = value;
+        stale["request"]["fsfs_complete_cli"] = serde_json::json!(1);
+        assert!(parse_request(&serde_json::to_vec(&stale).unwrap()).is_err());
         let raw = String::from_utf8(bytes).unwrap();
         for field in [",\"explain\":false}", ",\"query\":\"legacy bypass\"}"] {
             assert!(parse_request(format!("{}{field}", &raw[..raw.len() - 1]).as_bytes()).is_err());
