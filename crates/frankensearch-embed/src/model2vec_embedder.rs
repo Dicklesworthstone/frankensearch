@@ -58,8 +58,88 @@ const DEFAULT_MODEL_NAME: &str = "potion-multilingual-128M";
 /// Default `HuggingFace` model ID for the primary fast-tier model.
 const DEFAULT_HF_ID: &str = "minishlab/potion-multilingual-128M";
 
+mod compact_unigram;
 mod registered;
+use compact_unigram::{CompactUnigramTokenizer, is_unigram_tokenizer};
 pub use registered::RegisteredModel2Vec;
+
+/// A loaded `Model2Vec` tokenizer. A Unigram vocabulary uses the compact
+/// model in [`compact_unigram`], which segments exactly as the library does at
+/// a fraction of the build time and memory; every other model loads through
+/// the library unchanged.
+enum Model2VecTokenizer {
+    Library(Tokenizer),
+    CompactUnigram(CompactUnigramTokenizer),
+}
+
+impl Model2VecTokenizer {
+    fn from_file(path: &Path) -> tokenizers::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        if is_unigram_tokenizer(&content) {
+            Ok(Self::CompactUnigram(serde_json::from_str(&content)?))
+        } else {
+            Ok(Self::Library(serde_json::from_str(&content)?))
+        }
+    }
+
+    fn encode_fast(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> tokenizers::Result<tokenizers::Encoding> {
+        match self {
+            Self::Library(tokenizer) => tokenizer.encode_fast(text, add_special_tokens),
+            Self::CompactUnigram(tokenizer) => tokenizer.encode_fast(text, add_special_tokens),
+        }
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn encode(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> tokenizers::Result<tokenizers::Encoding> {
+        match self {
+            Self::Library(tokenizer) => tokenizer.encode(text, add_special_tokens),
+            Self::CompactUnigram(tokenizer) => tokenizer.encode(text, add_special_tokens),
+        }
+    }
+
+    fn get_padding(&self) -> Option<&tokenizers::PaddingParams> {
+        match self {
+            Self::Library(tokenizer) => tokenizer.get_padding(),
+            Self::CompactUnigram(tokenizer) => tokenizer.get_padding(),
+        }
+    }
+
+    #[cfg(test)]
+    fn get_added_vocabulary(&self) -> &tokenizers::AddedVocabulary {
+        match self {
+            Self::Library(tokenizer) => tokenizer.get_added_vocabulary(),
+            Self::CompactUnigram(tokenizer) => tokenizer.get_added_vocabulary(),
+        }
+    }
+
+    #[cfg(test)]
+    fn get_truncation(&self) -> Option<&tokenizers::TruncationParams> {
+        match self {
+            Self::Library(tokenizer) => tokenizer.get_truncation(),
+            Self::CompactUnigram(tokenizer) => tokenizer.get_truncation(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_padding(&mut self, padding: Option<tokenizers::PaddingParams>) {
+        match self {
+            Self::Library(tokenizer) => {
+                tokenizer.with_padding(padding);
+            }
+            Self::CompactUnigram(tokenizer) => {
+                tokenizer.with_padding(padding);
+            }
+        }
+    }
+}
 
 /// Static token embedding model (`Model2Vec` / potion).
 ///
@@ -74,8 +154,8 @@ pub use registered::RegisteredModel2Vec;
 /// assert_eq!(embedding.len(), 256);
 /// ```
 pub struct Model2VecEmbedder {
-    /// `HuggingFace` BPE tokenizer.
-    tokenizer: Tokenizer,
+    /// `HuggingFace` tokenizer (compact model for a Unigram vocabulary).
+    tokenizer: Model2VecTokenizer,
     /// Flat embedding matrix: `embeddings[token_id * dim .. (token_id + 1) * dim]`.
     embeddings: Vec<f32>,
     /// Output dimensionality.
@@ -274,11 +354,12 @@ impl Model2VecEmbedder {
         // Load tokenizer
         let tokenizer_started = Instant::now();
         let tokenizer_path = model_dir.join("tokenizer.json");
-        let tokenizer =
-            Tokenizer::from_file(&tokenizer_path).map_err(|e| SearchError::ModelLoadFailed {
+        let tokenizer = Model2VecTokenizer::from_file(&tokenizer_path).map_err(|e| {
+            SearchError::ModelLoadFailed {
                 path: tokenizer_path,
                 source: format!("failed to load tokenizer: {e}").into(),
-            })?;
+            }
+        })?;
         let tokenizer_build_ms = elapsed_ms(tokenizer_started);
         tracing::debug!(
             model = name,
@@ -631,7 +712,12 @@ fn finish_mean_pool_and_normalize_former(sum: &mut [f32], count: usize) {
 
 /// The unknown-token id of a `WordPiece` tokenizer, which the V2 preprocessing
 /// contract drops before pooling. Any other tokenizer model cannot honor V2.
-fn wordpiece_unknown_token_id(tokenizer: &Tokenizer) -> Result<u32, String> {
+fn wordpiece_unknown_token_id(tokenizer: &Model2VecTokenizer) -> Result<u32, String> {
+    let Model2VecTokenizer::Library(tokenizer) = tokenizer else {
+        return Err(
+            "the V2 Model2Vec preprocessing contract requires a WordPiece tokenizer".to_owned(),
+        );
+    };
     let tokenizers::models::ModelWrapper::WordPiece(wordpiece) = tokenizer.get_model() else {
         return Err(
             "the V2 Model2Vec preprocessing contract requires a WordPiece tokenizer".to_owned(),
@@ -2546,7 +2632,11 @@ mod tests {
             "",
         ];
         let reference = Model2VecEmbedder {
-            tokenizer: Tokenizer::from_file(dir.join("tokenizer.json")).unwrap(),
+            // The library tokenizer, so this reference also cross-checks the
+            // compact Unigram model the embedder under test loads.
+            tokenizer: Model2VecTokenizer::Library(
+                Tokenizer::from_file(dir.join("tokenizer.json")).unwrap(),
+            ),
             embeddings: expected,
             dimensions,
             vocab_size,

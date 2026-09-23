@@ -258,6 +258,22 @@ qualified; individual results below are narrower than release acceptance.
   slower. The two models alone take 1.3 GB, so the default setting leaves
   about 14% headroom on a 64-core host.
 
+- **The default fast model starts in half the time and ~570 MB less memory
+  (GH #46).** `tokenizers` builds potion-multilingual-128M's 500,353-piece
+  Unigram vocabulary as a trie with one hash map per node, about 1.1 million
+  maps. A compact model now stores the same trie in sorted arrays and ports
+  the library's segmentation exactly; the rest of the tokenizer is still the
+  library's, loaded from the same `tokenizer.json`, and WordPiece models such
+  as potion-base-8M are unaffected. Same host, receipted default models,
+  interleaved runs: a cold `fsfs search --no-daemon` went from 2.25 s and
+  1.40 GB peak RSS to 1.05 s and 0.83 GB (tokenizer build 1.06 s to 0.24 s);
+  a warm `fsfs serve` from 1.31 GB to 0.74 GB RSS; indexing BEIR NFCorpus from
+  1.77 GB to 1.20 GB peak in the same time, which leaves about 41% headroom
+  under the 2048 MiB default ceiling. Token ids match the library on 23,261
+  real texts (BEIR SciFact, NFCorpus and ArguAna documents and queries) plus
+  randomized adversarial inputs, and the NFCorpus vector files are
+  byte-identical.
+
 - **Smaller opt-in fast models: `potion-base-8M` and `potion-base-32M` (GH #50).**
   `[indexing] fast_model` now selects the Model2Vec model that is actually
   loaded; before, it only fed `status`/`doctor` output and every load used
@@ -281,9 +297,12 @@ qualified; individual results below are narrower than release acceptance.
   hard-capped at 300 ms, so on BEIR SciFact abstracts it timed out on every
   query. `[search] rerank_timeout_ms` (env `FRANKENSEARCH_RERANK_TIMEOUT_MS`,
   default 300) now sets it. With a generous deadline the cross-encoder applied
-  on all 300 queries at limit 10, p50 554 ms per served request, and changed
-  nDCG@10 by +0.019 (95% interval −0.006 to +0.044, not significant). The config
-  schema now also declares the `rerank` key it had been rejecting.
+  on all 300 queries at limit 10, p50 554 ms per served request. Measured
+  after the Quill chunk-overlap fix below, it changed nDCG@10 by +0.021 on
+  SciFact (95% interval −0.003 to +0.045), +0.016 on NFCorpus (+0.009 to
+  +0.025) and −0.013 on ArguAna (−0.020 to −0.006): a gain on one corpus and a
+  loss on another, so the default deadline stays at 300 ms. The config schema
+  now also declares the `rerank` key it had been rejecting.
   [Change](https://github.com/Dicklesworthstone/frankensearch/commit/550915737bf27809af6b1aa670ced03ad7f268eb).
 
 - **Quill no longer indexes and stores chunk overlaps twice.** fsfs rebuilt
