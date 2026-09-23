@@ -58,8 +58,8 @@ use frankensearch_index::VectorIndex;
 use frankensearch_quill::{
     BlueGreenEngine, CURRENT_FILE_NAME, CurrentPointer, DEFAULT_SCHEMA, FSLX_FORMAT_VERSION,
     KeeperError, KeeperSnapshot, QuillConfig, QuillIndex, QuillIndexError, QuillSearchIndex,
-    ResolvedCurrent, SegmentStats, SegmentStatsProvider, SnippetConfig, publish_current,
-    resolve_current,
+    ResolvedCurrent, SegmentStats, SegmentStatsProvider, SnippetConfig, SnippetGenerator,
+    SnippetTerm, publish_current, resolve_current,
 };
 use frankensearch_storage::{
     EmbeddingVectorSink, IngestRequest, IngestResult, JobQueueConfig, PersistentJobQueue,
@@ -502,7 +502,7 @@ const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
 const FSFS_SEARCH_SEMANTIC_HEAD_PROGRESSIVE_STEP: usize = 16;
 const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v7";
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v8";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -9855,6 +9855,79 @@ impl FsfsRuntime {
         payload
     }
 
+    /// Snippet generator for hits that missed the lexical snippet head: the
+    /// query's words analyzed like the content field (alphanumeric runs,
+    /// lowercased), all weighted alike.
+    fn hit_snippet_generator(query: &str, config: &SnippetConfig) -> SnippetGenerator {
+        let terms = alphanumeric_words(query).map(|word| SnippetTerm::new(word.to_lowercase(), 1));
+        SnippetGenerator::new(
+            frankensearch_quill::Analyzer::FrankensearchDefault,
+            terms,
+            config.clone(),
+        )
+    }
+
+    /// Give each returned hit that has no snippet one from its stored text.
+    ///
+    /// Snippets come from the lexical head, so semantic-only and quality-only
+    /// hits (and a lexical tail past the head) would reach the caller as a bare
+    /// path. A document holding none of the query words gets its opening
+    /// fragment — the text the embedders read. A failed lookup leaves the hit
+    /// without a snippet; it never fails the search.
+    fn fill_missing_snippets(
+        cx: &Cx,
+        lexical: &QuillSearchIndex,
+        generator: &mut SnippetGenerator,
+        returned: &[FusedCandidate],
+        snippets_by_doc: &mut HashMap<String, String>,
+    ) -> SearchResult<()> {
+        let field = |name: &str| {
+            DEFAULT_SCHEMA
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| field.id)
+        };
+        let (Some(id_field), Some(content_field)) = (field("id"), field("content")) else {
+            return Ok(());
+        };
+        for candidate in returned.iter().take(FSFS_SEARCH_SNIPPET_HEAD_LIMIT) {
+            if snippets_by_doc.contains_key(&candidate.doc_id) {
+                continue;
+            }
+            Self::semantic_retry_checkpoint(cx, "fsfs.search.snippets")?;
+            let query = frankensearch_quill::Query::set(
+                id_field,
+                vec![frankensearch_quill::QueryValue::Str(
+                    candidate.doc_id.clone(),
+                )],
+            );
+            let content = lexical
+                .search_preparsed_paginated(cx, &query, 1, 0, false)
+                .ok()
+                .and_then(|result| {
+                    result
+                        .hits
+                        .iter()
+                        .find(|hit| hit.document_id == candidate.doc_id)
+                        .map(|hit| hit.global_docid)
+                })
+                .and_then(|docid| lexical.stored_field_value(content_field, docid).ok()?)
+                .and_then(|bytes| String::from_utf8(bytes).ok());
+            if let Some(snippet) = content
+                .as_deref()
+                .and_then(|content| generator.snippet_or_prefix(content))
+                && !snippet.trim().is_empty()
+            {
+                snippets_by_doc.insert(
+                    candidate.doc_id.clone(),
+                    decode_basic_html_entities(&snippet),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn attach_index_freshness(
         mut payload: SearchPayload,
         freshness: Option<IndexFreshnessPayload>,
@@ -10767,6 +10840,20 @@ impl FsfsRuntime {
             } else {
                 filtered_initial_head.clone()
             };
+        let mut hit_snippets = flags
+            .include_snippets
+            .then(|| Self::hit_snippet_generator(&normalized_query, &snippet_config));
+        if let (Some(generator), Some(lexical)) =
+            (hit_snippets.as_mut(), resources.lexical_index.as_ref())
+        {
+            Self::fill_missing_snippets(
+                cx,
+                lexical,
+                generator,
+                &fused_initial[..fused_initial.len().min(output_limit)],
+                &mut snippets_by_doc,
+            )?;
+        }
         let mut payload = Self::attach_search_context(
             Self::build_limited_payload(
                 orchestrator,
@@ -10884,6 +10971,17 @@ impl FsfsRuntime {
                             fused_refined,
                         )
                         .await?;
+                    if let (Some(generator), Some(lexical)) =
+                        (hit_snippets.as_mut(), resources.lexical_index.as_ref())
+                    {
+                        Self::fill_missing_snippets(
+                            cx,
+                            lexical,
+                            generator,
+                            &fused_refined[..fused_refined.len().min(output_limit)],
+                            &mut snippets_by_doc,
+                        )?;
+                    }
                     let mut refined_payload = Self::attach_search_context(
                         Self::build_limited_payload(
                             orchestrator,
@@ -34928,6 +35026,77 @@ mod tests {
         assert_eq!(super::locate_snippet_line(text, "", "more"), None);
     }
 
+    /// Hits outside the lexical snippet head get a snippet from their stored
+    /// text: the query-word window when there is one, else the opening.
+    #[test]
+    fn fill_missing_snippets_covers_hits_outside_the_lexical_head() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let quill = create_test_quill(&cx, &temp.path().join("lexical")).await;
+            for (id, text) in [
+                (
+                    "notes.md",
+                    "Project overview for the wombat tracker. More text follows.",
+                ),
+                ("code.rs", "fn helper() {}\n// the quokka lives here & nowhere < else"),
+                ("kept.rs", "quokka quokka"),
+            ] {
+                quill
+                    .index_document(&cx, &IndexableDocument::new(id, text))
+                    .await
+                    .unwrap();
+            }
+            quill.commit(&cx).await.unwrap();
+            let lexical =
+                QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap();
+            let candidate = |doc_id: &str| FusedCandidate {
+                doc_id: doc_id.to_owned(),
+                fused_score: 1.0,
+                prior_boost: 0.0,
+                lexical_rank: None,
+                semantic_rank: Some(0),
+                hash_rank: None,
+                lexical_score: None,
+                semantic_score: Some(0.5),
+                hash_score: None,
+                in_both_sources: false,
+            };
+            let config = frankensearch_quill::SnippetConfig {
+                highlight_prefix: String::new(),
+                highlight_postfix: String::new(),
+                ..frankensearch_quill::SnippetConfig::default()
+            };
+            let mut snippets =
+                HashMap::from([("kept.rs".to_owned(), "from the lexical head".to_owned())]);
+            FsfsRuntime::fill_missing_snippets(
+                &cx,
+                &lexical,
+                &mut FsfsRuntime::hit_snippet_generator("Quokka", &config),
+                &[
+                    candidate("notes.md"),
+                    candidate("code.rs"),
+                    candidate("kept.rs"),
+                    candidate("gone.rs"),
+                ],
+                &mut snippets,
+            )
+            .unwrap();
+            assert_eq!(
+                snippets["notes.md"],
+                "Project overview for the wombat tracker. More text follows."
+            );
+            assert!(
+                snippets["code.rs"].contains("the quokka lives here & nowhere < else"),
+                "{:?}",
+                snippets["code.rs"]
+            );
+            assert_eq!(snippets["kept.rs"], "from the lexical head");
+            assert!(!snippets.contains_key("gone.rs"));
+        });
+    }
+
     /// Hits name the line of their file where the snippet's query word sits;
     /// once the file stops holding that text, the hit has no line.
     #[test]
@@ -42755,6 +42924,7 @@ mod tests {
                 "fsfs.search.cache.v4",
                 "fsfs.search.cache.v5",
                 "fsfs.search.cache.v6",
+                "fsfs.search.cache.v7",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
