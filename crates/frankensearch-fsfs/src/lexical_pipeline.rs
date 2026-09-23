@@ -663,15 +663,28 @@ fn lexical_flush_checkpoint(cx: &Cx) -> SearchResult<()> {
     })
 }
 
+/// Rebuild the text the planned chunks cover, each byte exactly once.
+///
+/// Adjacent chunks overlap by the policy's overlap span. Concatenating their
+/// texts would index and store every overlap twice (inflating BM25 term
+/// frequencies and document length) and split a word wherever a chunk ends
+/// inside it, so each later chunk contributes only what follows its
+/// predecessor's end.
 fn chunks_into_index_content(chunks: Vec<LexicalChunk>) -> String {
     let mut chunks = chunks.into_iter();
     let Some(first) = chunks.next() else {
         return String::new();
     };
+    let mut covered_end = first.byte_end;
     let mut content = first.text;
     for chunk in chunks {
-        content.push('\n');
-        content.push_str(&chunk.text);
+        // Both offsets are char boundaries of the body, so the difference is
+        // one inside `chunk.text`, which is exactly that body slice.
+        let skip = covered_end.saturating_sub(chunk.byte_start);
+        if let Some(rest) = chunk.text.get(skip..) {
+            content.push_str(rest);
+        }
+        covered_end = covered_end.max(chunk.byte_end);
     }
     content
 }
@@ -958,16 +971,26 @@ mod tests {
 
     #[test]
     fn quill_content_is_projected_from_planned_chunks() {
-        let chunks = LexicalChunkPolicy {
+        let policy = LexicalChunkPolicy {
             max_chars: 10,
             overlap_chars: 3,
-        }
-        .chunk_text("abcdefghijklmnopqrstuvwxyz");
-
+        };
+        let chunks = policy.chunk_text("abcdefghijklmnopqrstuvwxyz");
+        assert!(chunks.len() > 1, "the fixture must cross chunk boundaries");
+        // Overlapping spans are indexed once, with no seam inserted.
         assert_eq!(
             chunks_into_index_content(chunks),
-            "abcdefghij\nhijklmnopq\nopqrstuvwx\nvwxyz"
+            "abcdefghijklmnopqrstuvwxyz"
         );
+
+        // Multi-byte text whose cuts fall back to char boundaries, and the
+        // default policy on a word longer than a chunk.
+        let multibyte = format!("appendnovel α {} tail", "β".repeat(450));
+        for policy in [policy, LexicalChunkPolicy::default()] {
+            let chunks = policy.chunk_text(&multibyte);
+            assert!(chunks.len() > 1);
+            assert_eq!(chunks_into_index_content(chunks), multibyte);
+        }
     }
 
     #[test]
