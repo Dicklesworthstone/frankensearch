@@ -397,8 +397,9 @@ impl FsfsRuntime {
     ///
     /// Duplicate IDs use their last input body and count once. Every present
     /// vector tier must admit its real producer before embedding; missing or
-    /// incompatible quality support refuses the whole batch. Canonical input
-    /// text drives vectors, lexical content and any existing local catalog.
+    /// incompatible quality support refuses the whole batch. Bounded canonical
+    /// input drives vectors and catalog identity; complete lexical text remains
+    /// searchable, including content beyond the models' input budget.
     /// No source directory is scanned or changed. Empty input publishes nothing.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn append_retained_generation(
@@ -499,9 +500,11 @@ impl FsfsRuntime {
         };
         let mut fast_entries = Vec::with_capacity(documents.len());
         let mut quality_entries = Vec::new();
-        for (id, text) in &documents {
+        for (id, document) in &documents {
             retained_search_checkpoint(cx)?;
-            let response = fast_embedder.embed_bound(cx, text).await;
+            let response = fast_embedder
+                .embed_bound(cx, &document.embedding_text)
+                .await;
             retained_search_checkpoint(cx)?;
             let embedding = response?;
             embedding.validate()?;
@@ -516,7 +519,7 @@ impl FsfsRuntime {
             fast_entries.push((id.clone(), embedding.values));
             if let Some((embedder, identity)) = quality.as_ref() {
                 retained_search_checkpoint(cx)?;
-                let response = embedder.embed_bound(cx, text).await;
+                let response = embedder.embed_bound(cx, &document.embedding_text).await;
                 retained_search_checkpoint(cx)?;
                 let embedding = response?;
                 embedding.validate()?;
@@ -549,12 +552,12 @@ impl FsfsRuntime {
         candidate_lease.fence("complete-generation append lexical mutation")?;
         let lexical_mutations = documents
             .iter()
-            .map(|(id, text)| {
+            .map(|(id, document)| {
                 LexicalMutation::upsert(
                     id.clone(),
                     timestamp,
                     IngestionClass::FullSemanticLexical,
-                    text.clone(),
+                    document.lexical_text.clone(),
                     "append_batch",
                 )
             })
@@ -596,8 +599,9 @@ impl FsfsRuntime {
                 db_path: catalog_path,
                 ..PipelineStorageConfig::default()
             })?;
-            for (id, text) in &documents {
+            for (id, document) in &documents {
                 retained_search_checkpoint(cx)?;
+                let text = &document.embedding_text;
                 let created_at = storage
                     .get_document(id)?
                     .map_or(revision, |document| document.created_at);
@@ -615,7 +619,7 @@ impl FsfsRuntime {
                 }
             }
         }
-        for (id, text) in &documents {
+        for (id, document) in &documents {
             manifests.insert(
                 id.clone(),
                 IndexManifestEntry {
@@ -623,7 +627,8 @@ impl FsfsRuntime {
                     revision,
                     ingestion_class: ingestion_class_label(IngestionClass::FullSemanticLexical)
                         .to_owned(),
-                    canonical_bytes: u64::try_from(text.len()).unwrap_or(u64::MAX),
+                    canonical_bytes: u64::try_from(document.embedding_text.len())
+                        .unwrap_or(u64::MAX),
                     reason_code: "append_batch".to_owned(),
                 },
             );
@@ -1465,6 +1470,129 @@ mod retained_delete_tests {
                     .unwrap(),
                 Some(next)
             );
+        });
+    }
+
+    #[test]
+    fn retained_append_preserves_full_lexical_text_and_bounded_embedding_inputs() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let _restore = RestoreQuality(test_quality_embedder_override());
+            let quality: Arc<dyn Embedder> = Arc::new(AppendQualityEmbedder {
+                changed_revision: false,
+            });
+            set_test_quality_embedder(Some(Arc::clone(&quality)));
+            let (runtime, source, root, predecessor) =
+                fixture_with_quality(&cx, parent.path(), false, Some(quality.as_ref())).await;
+            let old = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let before = file_bytes(predecessor.path());
+            let bodies = [
+                (
+                    "alpha.md",
+                    format!("# Café\r\n{}\r\nappendtailsentinel", "context ".repeat(400)),
+                    "appendtailsentinel",
+                ),
+                (
+                    "virtual/code.md",
+                    format!(
+                        "```rust\r\n{}appendmiddlesentinel\r\n{}```\r\n",
+                        "let before = 1;\r\n".repeat(25),
+                        "let after = 2;\r\n".repeat(25),
+                    ),
+                    "appendmiddlesentinel",
+                ),
+            ];
+            let input = bodies
+                .iter()
+                .map(|(id, text, _)| serde_json::json!({"id": id, "text": text}).to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let command = append_input(&runtime, parent.path(), &input);
+            let (publication, count) = command
+                .append_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+            let Some(GenerationPublication::Durable(next)) = publication else {
+                panic!("append must publish durably"); // ubs:ignore — cfg(test) assertion.
+            };
+            // Reopen all retrieval resources from the persisted successor;
+            // the original source still contains the predecessor's body.
+            assert_eq!(
+                fs::read_to_string(source.join("alpha.md")).unwrap(),
+                "sharedtoken document alpha.md",
+            );
+            assert!(!source.join("virtual/code.md").exists());
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let catalog = inspect_catalog_copy(parent.path(), next.path());
+            let manifests = FsfsRuntime::read_matching_manifest_generation(next.path())
+                .unwrap()
+                .unwrap();
+            for (id, text, marker) in &bodies {
+                let bounded = DefaultCanonicalizer::default().canonicalize(text);
+                let lexical = LEXICAL_CANONICALIZER.canonicalize(text);
+                assert!(!bounded.contains(*marker));
+                assert!(lexical.contains(*marker));
+                assert!(bounded.chars().count() <= 2_000);
+                assert!(
+                    old.resources
+                        .lexical_index
+                        .as_ref()
+                        .unwrap()
+                        .search_doc_ids(&cx, marker, 10)
+                        .unwrap()
+                        .is_empty(),
+                );
+                let payloads = fresh.search(&cx, marker, 10).await.unwrap();
+                assert!(payloads.iter().any(|payload| {
+                    payload
+                        .hits
+                        .iter()
+                        .any(|hit| hit.path == *id && hit.lexical_rank.is_some())
+                }));
+                assert_eq!(
+                    read_retained_rerank_document_text(
+                        &cx,
+                        fresh.resources.lexical_index.as_ref().unwrap(),
+                        id,
+                        &LEXICAL_CANONICALIZER,
+                    )
+                    .unwrap(),
+                    lexical,
+                );
+                for (relative, embedder) in [
+                    (
+                        FSFS_VECTOR_INDEX_FILE,
+                        runtime.resolve_fast_embedder().unwrap(),
+                    ),
+                    (FSFS_VECTOR_QUALITY_INDEX_FILE, Arc::clone(&quality)),
+                ] {
+                    let index = VectorIndex::open_read_only(&next.path().join(relative)).unwrap();
+                    let row = (0..index.record_count())
+                        .find(|row| index.doc_id_at(*row).unwrap() == *id)
+                        .unwrap();
+                    let expected = embedder.embed(&cx, &bounded).await.unwrap();
+                    let actual = index.vector_at_f32(row).unwrap();
+                    assert_eq!(actual.len(), expected.len());
+                    assert!(
+                        actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(actual, expected)| { (*actual - expected).abs() < 0.002 })
+                    );
+                }
+                let document = catalog.get_document(id).unwrap().unwrap();
+                assert_eq!(document.content_length, bounded.chars().count());
+                assert_eq!(
+                    document.content_hash,
+                    frankensearch_storage::ContentHasher::hash(&bounded),
+                );
+                assert_eq!(
+                    manifests[*id].canonical_bytes,
+                    u64::try_from(bounded.len()).unwrap(),
+                );
+            }
+            assert_eq!(file_bytes(predecessor.path()), before);
         });
     }
 

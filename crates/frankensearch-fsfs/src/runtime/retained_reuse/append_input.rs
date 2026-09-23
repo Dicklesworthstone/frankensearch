@@ -3,8 +3,10 @@
 //! Input is consumed once in fixed-size chunks. Only the current record and
 //! the final body for each ID survive; there is no whole-input String or Vec
 //! of lines. Every record is validated, duplicates remain last-write-wins,
-//! and canonicalization runs once per final body before publication ownership
-//! is acquired. These are payload/work limits, not a process-wide RSS cap.
+//! and each canonicalizer runs once per final body before publication ownership
+//! is acquired. Lexical text preserves the whole document while embedding text
+//! follows the ordinary indexer's bounded input policy. These are payload/work
+//! limits, not a process-wide RSS cap.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -15,6 +17,13 @@ use frankensearch_core::{Canonicalizer, DefaultCanonicalizer, SearchError, Searc
 use serde::Deserialize;
 
 use super::{FsfsRuntime, retained_search_checkpoint};
+use crate::runtime::LEXICAL_CANONICALIZER;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::runtime) struct AppendDocument {
+    pub(in crate::runtime) embedding_text: String,
+    pub(in crate::runtime) lexical_text: String,
+}
 
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 const INPUT_LIMITS: InputLimits = InputLimits {
@@ -30,7 +39,7 @@ struct InputLimits {
     wire_bytes: usize,
     // Encoded record bytes, excluding LF but including an optional CR.
     record_bytes: usize,
-    // Sum of ID/body lengths, checked before and after canonicalization.
+    // Sum of ID/body lengths, then IDs and both canonical text representations.
     retained_bytes: usize,
     // Distinct IDs, not the number of updates received for those IDs.
     documents: usize,
@@ -59,7 +68,7 @@ fn limit_error(location: impl Into<String>, name: &str, limit: usize) -> SearchE
 pub(in crate::runtime) async fn read_append_documents(
     cx: &Cx,
     runtime: &FsfsRuntime,
-) -> SearchResult<BTreeMap<String, String>> {
+) -> SearchResult<BTreeMap<String, AppendDocument>> {
     retained_search_checkpoint(cx)?;
     if let Some(path) = runtime.cli_input.input_file.as_ref() {
         let mut file = asupersync::fs::File::open(path).await?;
@@ -73,7 +82,7 @@ async fn read_async<R: AsyncRead + Unpin>(
     cx: &Cx,
     reader: &mut R,
     limits: InputLimits,
-) -> SearchResult<BTreeMap<String, String>> {
+) -> SearchResult<BTreeMap<String, AppendDocument>> {
     retained_search_checkpoint(cx)?;
     let mut input = AppendInput::new(limits);
     let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
@@ -97,7 +106,7 @@ fn read_sync<R: Read>(
     cx: &Cx,
     reader: &mut R,
     limits: InputLimits,
-) -> SearchResult<BTreeMap<String, String>> {
+) -> SearchResult<BTreeMap<String, AppendDocument>> {
     retained_search_checkpoint(cx)?;
     let mut input = AppendInput::new(limits);
     let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
@@ -253,7 +262,7 @@ impl AppendInput {
         Ok(())
     }
 
-    fn finish(mut self, cx: &Cx) -> SearchResult<BTreeMap<String, String>> {
+    fn finish(mut self, cx: &Cx) -> SearchResult<BTreeMap<String, AppendDocument>> {
         retained_search_checkpoint(cx)?;
         if !self.line.is_empty() {
             self.accept_line(cx)?;
@@ -261,17 +270,22 @@ impl AppendInput {
         // Release the (possibly large) encoded record before canonicalizing.
         drop(self.line);
         let canonicalizer = DefaultCanonicalizer::default();
-        for text in self.documents.values_mut() {
+        let mut documents = BTreeMap::new();
+        for (id, text) in self.documents {
             retained_search_checkpoint(cx)?;
-            let canonical = canonicalizer.canonicalize(text);
+            let embedding_text = canonicalizer.canonicalize(&text);
             retained_search_checkpoint(cx)?;
-            if canonical.trim().is_empty() {
+            let lexical_text = LEXICAL_CANONICALIZER.canonicalize(&text);
+            retained_search_checkpoint(cx)?;
+            if embedding_text.trim().is_empty() || lexical_text.trim().is_empty() {
                 return Err(input_error(
                     "empty_canonical_text",
                     "every final document body must contain canonical text; the batch was not applied",
                 ));
             }
-            if canonical.len() > self.limits.record_bytes {
+            if embedding_text.len() > self.limits.record_bytes
+                || lexical_text.len() > self.limits.record_bytes
+            {
                 return Err(limit_error(
                     "canonical_document",
                     "record-byte",
@@ -281,7 +295,8 @@ impl AppendInput {
             self.retained_bytes = self
                 .retained_bytes
                 .checked_sub(text.len())
-                .and_then(|total| total.checked_add(canonical.len()))
+                .and_then(|total| total.checked_add(embedding_text.len()))
+                .and_then(|total| total.checked_add(lexical_text.len()))
                 .filter(|&total| total <= self.limits.retained_bytes)
                 .ok_or_else(|| {
                     limit_error(
@@ -290,10 +305,16 @@ impl AppendInput {
                         self.limits.retained_bytes,
                     )
                 })?;
-            *text = canonical;
+            documents.insert(
+                id,
+                AppendDocument {
+                    embedding_text,
+                    lexical_text,
+                },
+            );
         }
         retained_search_checkpoint(cx)?;
-        Ok(self.documents)
+        Ok(documents)
     }
 }
 
@@ -316,7 +337,7 @@ mod tests {
         bytes: &[u8],
         chunk: usize,
         limits: InputLimits,
-    ) -> SearchResult<BTreeMap<String, String>> {
+    ) -> SearchResult<BTreeMap<String, AppendDocument>> {
         let mut parser = AppendInput::new(limits);
         for part in bytes.chunks(chunk) {
             parser.push(cx, part)?;
@@ -341,17 +362,29 @@ mod tests {
             // Final record deliberately has no trailing newline.
             bytes.pop();
             let expected = BTreeMap::from([
-                ("alpha".to_owned(), "hello".to_owned()),
+                (
+                    "alpha".to_owned(),
+                    AppendDocument {
+                        embedding_text: "hello".to_owned(),
+                        lexical_text: "hello".to_owned(),
+                    },
+                ),
                 (
                     "東京".to_owned(),
-                    DefaultCanonicalizer::default().canonicalize("café 🦀"),
+                    AppendDocument {
+                        embedding_text: "café 🦀".to_owned(),
+                        lexical_text: "café 🦀".to_owned(),
+                    },
                 ),
             ]);
             for chunk in 1..=bytes.len() {
                 assert_eq!(parse(&cx, &bytes, chunk, INPUT_LIMITS).unwrap(), expected);
             }
             let crlf = b"{\"id\":\"x\",\"text\":\"hello\"}\r\n";
-            assert_eq!(parse(&cx, crlf, 1, INPUT_LIMITS).unwrap()["x"], "hello");
+            assert_eq!(
+                parse(&cx, crlf, 1, INPUT_LIMITS).unwrap()["x"].embedding_text,
+                "hello"
+            );
         });
     }
 
@@ -364,7 +397,10 @@ mod tests {
                 record_bytes: bytes.len() - 1,
                 ..INPUT_LIMITS
             };
-            assert_eq!(parse(&cx, &bytes, 1, exact).unwrap()["x"], "hello");
+            assert_eq!(
+                parse(&cx, &bytes, 1, exact).unwrap()["x"].embedding_text,
+                "hello"
+            );
             assert_limit(
                 parse(
                     &cx,
@@ -429,7 +465,7 @@ mod tests {
                 assert_eq!(parser.retained_bytes, 2);
                 assert_eq!(parser.documents.len(), 1);
             }
-            assert_eq!(parser.finish(&cx).unwrap()["x"], "a");
+            assert_eq!(parser.finish(&cx).unwrap()["x"].embedding_text, "a");
             let mut parser = AppendInput::new(limits);
             parser.push(&cx, &record("x", "a")).unwrap();
             assert_limit(
@@ -444,10 +480,25 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let bytes = record("ab", "é");
             let limits = InputLimits {
-                retained_bytes: 4,
+                retained_bytes: 6,
                 ..INPUT_LIMITS
             };
             assert!(parse(&cx, &bytes, 2, limits).is_ok());
+            // The final payload holds the ID and both canonical text bodies,
+            // even when the two bodies happen to be equal.
+            assert_limit(
+                parse(
+                    &cx,
+                    &bytes,
+                    2,
+                    InputLimits {
+                        retained_bytes: 5,
+                        ..limits
+                    },
+                )
+                .unwrap_err(),
+                "retained-payload-byte",
+            );
             assert_limit(
                 parse(
                     &cx,
@@ -461,7 +512,10 @@ mod tests {
                 .unwrap_err(),
                 "retained-payload-byte",
             );
-            let mut parser = AppendInput::new(limits);
+            let mut parser = AppendInput::new(InputLimits {
+                retained_bytes: 4,
+                ..limits
+            });
             parser.push(&cx, &record("x", "a")).unwrap();
             assert_limit(
                 parser.push(&cx, &record("y", "abc")).unwrap_err(),
@@ -475,10 +529,49 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let mut bytes = record("x", "");
             bytes.extend(record("x", "hello"));
-            assert_eq!(parse(&cx, &bytes, 3, INPUT_LIMITS).unwrap()["x"], "hello");
+            assert_eq!(
+                parse(&cx, &bytes, 3, INPUT_LIMITS).unwrap()["x"].embedding_text,
+                "hello"
+            );
             bytes.extend(record("x", "  "));
             assert!(matches!(parse(&cx, &bytes, 3, INPUT_LIMITS),
                     Err(SearchError::InvalidConfig { value, .. }) if value == "empty_canonical_text"));
+        });
+    }
+
+    #[test]
+    fn final_bodies_keep_lexical_suffixes_and_code_while_bounding_embedding_input() {
+        run_test_with_cx(|cx| async move {
+            let long = format!(
+                "# Café\r\n{}\r\nlexicaltailsentinel",
+                "context ".repeat(400)
+            );
+            let code = format!(
+                "```rust\r\n{}lexicalmiddlesentinel\r\n{}```\r\n",
+                "let before = 1;\r\n".repeat(25),
+                "let after = 2;\r\n".repeat(25),
+            );
+            for (text, marker) in [
+                (long, "lexicaltailsentinel"),
+                (code, "lexicalmiddlesentinel"),
+            ] {
+                let mut bytes = record("x", "superseded body");
+                bytes.extend(record("x", &text));
+                let parsed = parse(&cx, &bytes, 7, INPUT_LIMITS).unwrap();
+                let document = &parsed["x"];
+                assert!(document.lexical_text.contains(marker));
+                assert!(!document.embedding_text.contains(marker));
+                assert!(document.embedding_text.chars().count() <= 2_000);
+                assert_eq!(
+                    document.embedding_text,
+                    DefaultCanonicalizer::default().canonicalize(&text),
+                    "embeddings must canonicalize the original body, before lexical normalization removes code fences",
+                );
+                assert_eq!(
+                    document.lexical_text,
+                    LEXICAL_CANONICALIZER.canonicalize(&text),
+                );
+            }
         });
     }
 
@@ -672,7 +765,8 @@ mod tests {
                     ..crate::CliInput::default()
                 });
             assert_eq!(
-                read_append_documents(&cx, &runtime).await.unwrap()["not-a-source-path"],
+                read_append_documents(&cx, &runtime).await.unwrap()["not-a-source-path"]
+                    .embedding_text,
                 "hello",
             );
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
