@@ -20516,7 +20516,15 @@ fn print_cli_help() {
     println!(
         "Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --online"
     );
-    println!("Search flags: --daemon --no-daemon --daemon-socket <path> --stream");
+    println!(
+        "Search flags: --limit/-l <n|all> --filter \"type:rs path:src\" --fast-only --rerank --expand"
+    );
+    println!(
+        "              --explain/-e --stream --index-dir <dir> --daemon --no-daemon --daemon-socket <path>"
+    );
+    println!(
+        "Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>"
+    );
 }
 
 /// `pub(crate)` so the advertised-command census (bd-rh0t, `adapters::cli`

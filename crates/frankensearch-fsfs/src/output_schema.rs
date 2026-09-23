@@ -1073,6 +1073,14 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
             "The index was built with {expected}-dim embeddings but the current embedder produces {found}-dim vectors.\n\
              Run: fsfs index --force <directory> to rebuild with the current embedder."
         )),
+        // `cli.*` fields name command-line arguments, which no config file sets.
+        SearchError::InvalidConfig { field, reason, .. } if field.starts_with("cli.") => {
+            Some(format!(
+                "Check the command line.\n\
+                 {reason}\n\
+                 Run: fsfs help"
+            ))
+        }
         SearchError::InvalidConfig { field, reason, .. } => Some(format!(
             "Check the '{field}' setting in your configuration.\n\
              {reason}\n\
@@ -1083,12 +1091,12 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
              Explicit model downloads require space in the selected model cache; search indices vary by corpus size."
                 .to_owned(),
         ),
-        SearchError::SearchTimeout {
-            budget_ms, ..
-        } => Some(format!(
-            "Increase the timeout: fsfs search --timeout {}\n\
-             Or reduce result count: fsfs search --limit 5",
-            budget_ms.saturating_mul(2)
+        // A search whose quality stage runs out of time still returns its
+        // fast results; an error here means the whole operation had no answer.
+        SearchError::SearchTimeout { budget_ms, .. } => Some(format!(
+            "The operation stopped at its {budget_ms} ms budget.\n\
+             Retry when the host is less busy; `fsfs status` shows whether indexing is running.\n\
+             Search refinement's budget is `search.quality_timeout_ms` in fsfs.toml."
         )),
         SearchError::HashMismatch { path, .. } => Some(format!(
             "The file at {} may be corrupted or tampered with.\n\
@@ -2152,6 +2160,36 @@ mod tests {
             suggestion.contains("fsfs index"),
             "should tell user to create index: {suggestion}"
         );
+    }
+
+    /// A bad command-line argument is fixed on the command line; only real
+    /// config fields send the user to config files. No suggestion names a flag
+    /// the parser rejects.
+    #[test]
+    fn suggestions_point_at_the_command_line_or_config_truthfully() {
+        use frankensearch_core::SearchError;
+
+        let invalid = |field: &str| SearchError::InvalidConfig {
+            field: field.into(),
+            value: "--bogus".into(),
+            reason: "unknown flag".into(),
+        };
+        let cli = output_error_from(&invalid("cli.flag")).suggestion.unwrap();
+        assert!(cli.contains("fsfs help"), "{cli}");
+        assert!(!cli.contains("config.toml"), "{cli}");
+        let config = output_error_from(&invalid("search.quality_timeout_ms"))
+            .suggestion
+            .unwrap();
+        assert!(config.contains("config.toml"), "{config}");
+
+        let timeout = output_error_from(&SearchError::SearchTimeout {
+            elapsed_ms: 900,
+            budget_ms: 500,
+        })
+        .suggestion
+        .unwrap();
+        assert!(timeout.contains("500 ms"), "{timeout}");
+        assert!(!timeout.contains("--timeout"), "no such flag: {timeout}");
     }
 
     #[test]

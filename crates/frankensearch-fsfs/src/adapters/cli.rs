@@ -801,10 +801,7 @@ where
                 return Err(SearchError::InvalidConfig {
                     field: "cli.flag".into(),
                     value: flag.into(),
-                    reason: format!(
-                        "unknown flag; valid commands: {}",
-                        CliCommand::ALL_NAMES.join("|")
-                    ),
+                    reason: "unknown flag; `fsfs help` lists each command's flags".into(),
                 });
             }
         }
@@ -1154,6 +1151,11 @@ mod tests {
         let err = parse_cli_args(["status", "--wat"]).expect_err("must fail");
         let msg = err.to_string();
         assert!(msg.contains("unknown flag"));
+        // A flag error points at flags, not at the command list.
+        assert!(
+            msg.contains("fsfs help") && !msg.contains("search|serve"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -1996,6 +1998,7 @@ mod tests {
         "fsfs download-models --model <X> --force",
         "fsfs download-models --model <X> --verify",
         "fsfs explain <X>",
+        "fsfs help",
         "fsfs update",
         "fsfs update --check",
         "fsfs uninstall --yes --dry-run --purge",
@@ -2061,6 +2064,7 @@ mod tests {
                 "config" => CliCommand::Config,
                 "download-models" => CliCommand::Download,
                 "explain" => CliCommand::Explain,
+                "help" => CliCommand::Help,
                 "update" => CliCommand::Update,
                 "uninstall" => CliCommand::Uninstall,
                 other => panic!("census entry names an unmapped command: {other}"),
