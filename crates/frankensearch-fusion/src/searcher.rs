@@ -1124,12 +1124,21 @@ impl TwoTierSearcher {
             Err(err) => {
                 self.export_error(&err);
                 if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                    // A cancelled Initial stops like every later cancellation
+                    // boundary, as a typed warning rather than a failure.
+                    let (severity, reason) = match &err {
+                        SearchError::Cancelled { phase, reason } => (
+                            LifecycleSeverity::Warn,
+                            format!("cancelled:{phase}:{reason}"),
+                        ),
+                        error => (LifecycleSeverity::Error, error.to_string()),
+                    };
                     self.emit_session_stop_telemetry(
                         root_request_id,
                         telemetry_last_event_id.clone(),
                         LifecycleState::Degraded,
-                        LifecycleSeverity::Error,
-                        Some(err.to_string()),
+                        severity,
+                        Some(reason),
                         search_started_at.elapsed(),
                     );
                 }
@@ -5858,13 +5867,14 @@ mod tests {
                                 frankensearch_core::TierQueryCoverageV1::NotRequested
                             }
                         );
+                        // HashControl for both shapes: `artifact_binding` and
+                        // `in_memory_identity` build `explicit_test_model`
+                        // control spaces, which never report a semantic
+                        // topology (bd-ctzo C4). The quality coverage above is
+                        // what distinguishes progressive from fast-only.
                         assert_eq!(
                             coverage.topology,
-                            if with_quality {
-                                frankensearch_core::RetrievalTopology::FullProgressive
-                            } else {
-                                frankensearch_core::RetrievalTopology::FastOnly
-                            }
+                            frankensearch_core::RetrievalTopology::HashControl
                         );
                     }
                 }
