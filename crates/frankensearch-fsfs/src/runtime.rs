@@ -502,7 +502,7 @@ const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
 const FSFS_SEARCH_SEMANTIC_HEAD_PROGRESSIVE_STEP: usize = 16;
 const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v6";
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v7";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -6395,7 +6395,11 @@ impl FsfsRuntime {
 
         if self.cli_input.format == OutputFormat::Table {
             if let Some(mode_hint) = search_runtime.search_mode_hint()? {
-                println!("{}", paint(&mode_hint, "38;5;244", self.cli_input.no_color));
+                // Same color rule as the table below: NO_COLOR and a piped
+                // stdout both mean plain text.
+                let no_color = self.cli_input.no_color
+                    || !crate::adapters::format_emitter::should_use_ansi_color();
+                println!("{}", paint(&mode_hint, "38;5;244", no_color));
             }
             let table = crate::adapters::format_emitter::render_search_table_for_cli(
                 &payload,
@@ -10381,7 +10385,14 @@ impl FsfsRuntime {
                     planned_budget
                 }
             };
-        let mut snippet_config = SnippetConfig::default();
+        // Payload snippets are plain text: every surface (CLI table, JSON,
+        // TUI) highlights query terms itself. Without markup the engine output
+        // is the fragment with only its HTML escaping left to undo.
+        let mut snippet_config = SnippetConfig {
+            highlight_prefix: String::new(),
+            highlight_postfix: String::new(),
+            ..SnippetConfig::default()
+        };
         if !matches!(mode, SearchExecutionMode::Full) {
             snippet_config.max_chars = FSFS_TUI_FAST_STAGE_SNIPPET_MAX_CHARS;
         }
@@ -10400,7 +10411,10 @@ impl FsfsRuntime {
                         if let Some(snippet) = hit.snippet.as_ref()
                             && !snippet.trim().is_empty()
                         {
-                            snippets_by_doc.insert(hit.document_id.clone(), snippet.clone());
+                            snippets_by_doc.insert(
+                                hit.document_id.clone(),
+                                decode_basic_html_entities(snippet),
+                            );
                         }
                     }
 
@@ -21990,11 +22004,11 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
                 },
                 |snippet| {
                     let budget = usize::from(left[2].width).saturating_sub(8).max(26);
-                    html_snippet_to_spans(
-                        snippet.trim(),
+                    highlight_text_spans(
+                        &truncate_tail(snippet.trim(), budget),
+                        &query_terms,
                         ui_fg(no_color, PackedRgba::rgb(152, 174, 211)),
                         ui_fg(no_color, PackedRgba::rgb(152, 174, 211)).bold(),
-                        Some(budget),
                     )
                 },
             )),
@@ -22640,15 +22654,15 @@ fn render_search_results_panel(
                     )]
                 },
                 |snippet| {
-                    html_snippet_to_spans(
-                        snippet.trim(),
+                    highlight_text_spans(
+                        &truncate_tail(snippet.trim(), snippet_budget),
+                        query_terms,
                         ui_fg(no_color, PackedRgba::rgb(151, 173, 211)),
                         ui_fg_bg(
                             no_color,
                             PackedRgba::rgb(9, 23, 36),
                             PackedRgba::rgb(255, 202, 123),
                         ),
-                        Some(snippet_budget),
                     )
                 },
             );
@@ -22852,94 +22866,6 @@ fn decode_basic_html_entities(source: &str) -> String {
     }
     out.push_str(rest);
     out
-}
-
-/// Parse an engine HTML snippet into styled spans.
-///
-/// Decodes HTML entities, converts `<b>` regions into `bold_style` spans,
-/// strips any other HTML tags, and truncates the *visible* text to
-/// `max_visible_chars` (if `Some`).
-fn html_snippet_to_spans(
-    html: &str,
-    base_style: Style,
-    bold_style: Style,
-    max_visible_chars: Option<usize>,
-) -> Vec<Span<'static>> {
-    let decoded = decode_basic_html_entities(html);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut rest = decoded.as_str();
-    let mut in_bold = false;
-    let mut buf = String::new();
-    let mut visible_chars = 0usize;
-    let budget = max_visible_chars.unwrap_or(usize::MAX);
-    let mut truncated = false;
-
-    while !rest.is_empty() && !truncated {
-        if let Some(tag_start) = rest.find('<') {
-            let text_before = &rest[..tag_start];
-            for ch in text_before.chars() {
-                if visible_chars >= budget {
-                    truncated = true;
-                    break;
-                }
-                buf.push(ch);
-                visible_chars += 1;
-            }
-            if truncated {
-                break;
-            }
-            rest = &rest[tag_start..];
-            if let Some(tag_end) = rest.find('>') {
-                let tag = &rest[1..tag_end];
-                let tag_lower = tag.to_ascii_lowercase();
-                if tag_lower == "b" || tag_lower == "strong" {
-                    if !buf.is_empty() {
-                        let style = if in_bold { bold_style } else { base_style };
-                        spans.push(Span::styled(std::mem::take(&mut buf), style));
-                    }
-                    in_bold = true;
-                } else if tag_lower == "/b" || tag_lower == "/strong" {
-                    if !buf.is_empty() {
-                        let style = if in_bold { bold_style } else { base_style };
-                        spans.push(Span::styled(std::mem::take(&mut buf), style));
-                    }
-                    in_bold = false;
-                }
-                // skip any other tags silently
-                rest = &rest[tag_end + 1..];
-            } else {
-                // no closing '>' — treat '<' as literal
-                if visible_chars < budget {
-                    buf.push('<');
-                    visible_chars += 1;
-                } else {
-                    truncated = true;
-                }
-                rest = &rest[1..];
-            }
-        } else {
-            for ch in rest.chars() {
-                if visible_chars >= budget {
-                    truncated = true;
-                    break;
-                }
-                buf.push(ch);
-                visible_chars += 1;
-            }
-            rest = "";
-        }
-    }
-    if !buf.is_empty() {
-        let style = if in_bold { bold_style } else { base_style };
-        spans.push(Span::styled(buf, style));
-    }
-    if truncated {
-        spans.push(Span::styled("…".to_owned(), base_style));
-    }
-    if spans.is_empty() {
-        spans.push(Span::styled(String::new(), base_style));
-    }
-    spans
 }
 
 fn wrap_markdown_for_context_panel(text: Text, width: u16) -> Text {
@@ -34800,6 +34726,61 @@ mod tests {
         });
     }
 
+    /// The engine renders snippets as escaped HTML; payload snippets are the
+    /// source text itself, so an agent reads `a < b`, not `a &lt; b`.
+    #[test]
+    fn search_payload_snippets_are_plain_source_text() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create project dir");
+            fs::write(
+                project.join("cmp.rs"),
+                "fn quokka_cmp(a: &str) -> bool { a < \"b\" && a != 'c' }\n",
+            )
+            .expect("write source");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+
+            let payloads = FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Search,
+                    index_dir: Some(project.join(".frankensearch")),
+                    ..CliInput::default()
+                })
+                .execute_search_payloads_with_mode(
+                    &cx,
+                    "quokka",
+                    5,
+                    SearchExecutionMode::LexicalOnly,
+                )
+                .await
+                .expect("lexical search");
+            let snippet = payloads[0].hits[0]
+                .snippet
+                .as_deref()
+                .expect("lexical hit carries a snippet");
+            assert!(
+                // The fragment ends on its last token, so the closing `' }` is out.
+                snippet.contains("fn quokka_cmp(a: &str) -> bool { a < \"b\" && a != 'c"),
+                "snippet must be the source text: {snippet:?}"
+            );
+            for markup in ["&lt;", "&amp;", "&quot;", "&#x27;", "<b>", "</b>"] {
+                assert!(!snippet.contains(markup), "{markup} in {snippet:?}");
+            }
+        });
+    }
+
     /// The embedding text is the canonicalizer's 2,000-character prefix with
     /// long fenced code collapsed; the lexical index must still see all text.
     #[test]
@@ -42562,6 +42543,7 @@ mod tests {
                 "fsfs.search.cache.v3",
                 "fsfs.search.cache.v4",
                 "fsfs.search.cache.v5",
+                "fsfs.search.cache.v6",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

@@ -585,7 +585,7 @@ fn render_search_table_with_options(
     out
 }
 
-fn should_use_ansi_color() -> bool {
+pub(crate) fn should_use_ansi_color() -> bool {
     if env_var_disables_color() {
         return false;
     }

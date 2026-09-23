@@ -305,8 +305,8 @@ Example output:
 ```text
 PHASE REFINED: 5 hit(s) for "how does retry backoff work"
 vector generation: potion-multilingual-128M  class=semantic
-  1. src/retry.rs  score=0.033  [lexical+semantic]
-     Recover transient network failures with exponential <b>backoff</b>, bounded <b>retries</b>…
+  1. src/retry.rs  score=0.033  [both]
+     Recover transient network failures with exponential backoff, bounded retries…
   2. docs/failures.md  score=0.016  [semantic]
      …
 5 results in 21ms
