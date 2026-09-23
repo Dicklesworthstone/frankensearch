@@ -823,8 +823,11 @@ mod tests {
 
             // "hot" survived the scan (promoted to Main) → still a hit.
             cached.embed(&cx, "hot").await.unwrap();
-            assert_eq!(inner.call_count(), after_hot + 6,
-                "S3-FIFO must keep the reused 'hot' key through the cold scan");
+            assert_eq!(
+                inner.call_count(),
+                after_hot + 6,
+                "S3-FIFO must keep the reused 'hot' key through the cold scan"
+            );
         });
     }
 
@@ -1182,11 +1185,11 @@ mod tests {
             2
         }
 
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "cache-response-test"
         }
 
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "Cache Response Test Embedder"
         }
 
@@ -1371,8 +1374,14 @@ mod tests {
             let before = cached.cache_stats();
             let constructed_hit = cached.embed(&cx, "warm");
             cx.set_cancel_requested(true);
-            assert!(matches!(constructed_hit.await, Err(SearchError::Cancelled { .. })));
-            assert!(matches!(cached.embed(&cx, "new").await, Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                constructed_hit.await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                cached.embed(&cx, "new").await,
+                Err(SearchError::Cancelled { .. })
+            ));
             for texts in [vec![], vec!["warm"], vec!["warm", "new"]] {
                 assert!(matches!(
                     cached.embed_batch(&cx, &texts).await,
