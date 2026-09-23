@@ -15,7 +15,9 @@
 #              fallback platform module missing entry points the portable code calls). Needs
 #              only the target's std, never a Windows host or a linker. Override the triple
 #              with QUALITY_GATE_CROSS_TARGET.
-#   tests      library unit tests for every crate except the gauntlet harness
+#   tests      unit and integration test binaries for every crate except the gauntlet harness
+#              and fsfs (the fsfs stage runs all of its test binaries); integration suites
+#              that no stage ran went red unnoticed (the bd-ctzo activation census)
 #   quill      native Quill + pinned Tantivy witness, validator negatives and typed replay;
 #              complete all-feature Cargo inventory, 90s execution budget after compilation
 #   quill-full default + all-feature gauntlet binaries, unchanged nonignored workloads;
@@ -128,7 +130,7 @@ if want cross; then
   fi
 fi
 
-want tests     && run_stage tests  cargo test --locked --workspace --lib --exclude frankensearch-quill-gauntlet
+want tests     && run_stage tests  cargo test --locked --workspace --tests --exclude frankensearch-quill-gauntlet --exclude frankensearch-fsfs
 want quill     && run_stage quill python3 scripts/check_quill_correctness.py
 want quill-full && run_stage quill-full python3 scripts/check_quill_correctness.py --full
 want quill-probes && run_stage quill-probes python3 scripts/check_quill_correctness.py --probes
