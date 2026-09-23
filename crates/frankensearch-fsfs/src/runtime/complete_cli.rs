@@ -101,6 +101,9 @@ impl FsfsRuntime {
             CliCommand::Explain => {
                 self.run_complete_generation_explain_with_writer(cx, &root, &mut stdout)
             }
+            CliCommand::Flush => {
+                self.run_complete_generation_flush_with_writer(cx, &root, &mut stdout)
+            }
             CliCommand::Delete => {
                 self.run_complete_generation_delete_with_writer(cx, &root, &mut stdout)
                     .await
@@ -133,7 +136,7 @@ impl FsfsRuntime {
             }
             _ => Err(complete_cli_error(
                 "command",
-                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, append-batch, delete, compact, search, explain, tui, serve, daemon, status, or doctor",
+                "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, append-batch, delete, compact, flush, search, explain, tui, serve, daemon, status, or doctor",
             )),
         }
     }
@@ -271,6 +274,56 @@ impl FsfsRuntime {
         let selected = complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
             || complete_entry_exists(&root.join("generations"))?;
         Ok((initialize_store || selected).then_some(root))
+    }
+
+    /// Confirm durability of the selected immutable bundle without rescanning
+    /// sources, loading models or opening engine artifacts for mutation. This
+    /// barrier does not drain a separate watch process's queue. Publisher
+    /// contention and uncertain final synchronization remain errors, not success
+    /// receipts for unpublished or incompletely synchronized work.
+    fn run_complete_generation_flush_with_writer<W: Write>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        retained_search_checkpoint(cx)?;
+        let store = CompleteGenerationStore::open(cx, root)?;
+        let generation = require_durable_publication(store.flush_selected(cx)?)?;
+        // The barrier has completed. A late cancellation cannot revoke it, and
+        // receipt output must not describe this as a newly published generation.
+        if self.cli_input.format == OutputFormat::Table {
+            writeln!(
+                writer,
+                "Confirmed durability of complete generation {} at {} (selection unchanged; watch queue not drained)",
+                generation.id(),
+                generation.path().display(),
+            )?;
+        } else {
+            let payload = serde_json::json!({
+                "generation_id": generation.id(),
+                "generation_path": generation.path(),
+                "store_root": root,
+                "manifest_sha256": generation.manifest_sha256(),
+                "durability": "confirmed",
+                "scope": "selected_generation",
+                "generation_changed": false,
+                "watch_queue_drained": false,
+            });
+            let envelope = OutputEnvelope::success(
+                payload,
+                meta_for_format("flush", self.cli_input.format),
+                iso_timestamp_now(),
+            );
+            emit_envelope(&envelope, self.cli_input.format, writer)?;
+            if !matches!(
+                self.cli_input.format,
+                OutputFormat::Jsonl | OutputFormat::Csv
+            ) {
+                writer.write_all(b"\n")?;
+            }
+        }
+        writer.flush().map_err(SearchError::Io)
     }
 
     #[allow(clippy::future_not_send)]
@@ -1758,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_cli_refuses_legacy_flush_without_touching_the_selected_bundle() {
+    fn complete_cli_flush_dispatch_preserves_the_selected_bundle() {
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(directory.path());
@@ -1772,8 +1825,166 @@ mod tests {
                 .with_cli_input(input)
                 .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
                 .await
-                .unwrap_err();
+                .unwrap();
             assert_eq!(store.active(&cx).unwrap(), before);
+        });
+    }
+
+    #[test]
+    fn complete_cli_flush_receipts_bind_selection_without_rescan_or_model_loading() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let selected = store.active(&cx).unwrap().unwrap();
+            let before = sealed_inventory(selected.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let count = fs::read_dir(root.join("generations")).unwrap().count();
+            fs::write(source.join("alpha.md"), "unindexed replacement body").unwrap();
+            let models = directory.path().join("missing-models");
+            runtime.config.indexing.model_dir = models.display().to_string();
+            super::super::FSFS_NATIVE_QUALITY_MODEL_ID
+                .clone_into(&mut runtime.config.indexing.quality_model);
+            runtime.cli_input.command = CliCommand::Flush;
+            for format in [OutputFormat::Json, OutputFormat::Jsonl, OutputFormat::Table] {
+                runtime.cli_input.format = format;
+                let mut output = Vec::new();
+                runtime
+                    .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                    .unwrap();
+                assert_eq!(output.last(), Some(&b'\n'));
+                if format == OutputFormat::Table {
+                    let text = std::str::from_utf8(&output).unwrap();
+                    assert!(text.contains("Confirmed durability"));
+                    assert!(text.contains(selected.id()));
+                    assert!(text.contains("watch queue not drained"));
+                    assert!(!text.contains("Published"));
+                } else {
+                    let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                    assert_eq!(receipt["ok"], true);
+                    assert_eq!(receipt["data"]["generation_id"], selected.id());
+                    assert_eq!(
+                        receipt["data"]["manifest_sha256"],
+                        selected.manifest_sha256()
+                    );
+                    assert_eq!(receipt["data"]["durability"], "confirmed");
+                    assert_eq!(receipt["data"]["scope"], "selected_generation");
+                    assert_eq!(receipt["data"]["generation_changed"], false);
+                    assert_eq!(receipt["data"]["watch_queue_drained"], false);
+                    if format == OutputFormat::Jsonl {
+                        assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                    }
+                }
+                assert_eq!(store.active(&cx).unwrap(), Some(selected.clone()));
+                assert_eq!(sealed_inventory(selected.path()), before);
+                assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+                assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), count);
+                assert!(!models.exists());
+            }
+        });
+    }
+
+    #[test]
+    fn complete_cli_flush_refuses_absent_corrupt_selection_and_damaged_bundles() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root) = fixture(directory.path());
+            runtime.cli_input.command = CliCommand::Flush;
+            let mut output = Vec::new();
+            assert!(runtime
+                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                .is_err());
+            assert!(output.is_empty());
+            assert!(!root.exists());
+            CompleteGenerationStore::create(&cx, &root).unwrap();
+            assert!(runtime
+                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                .is_err());
+            assert!(output.is_empty());
+            assert!(!root.join(COMPLETE_GENERATION_POINTER).exists());
+            publish(&runtime, &cx, &root).await;
+            let pointer_path = root.join(COMPLETE_GENERATION_POINTER);
+            let pointer = fs::read(&pointer_path).unwrap();
+            fs::write(&pointer_path, b"corrupt selection").unwrap();
+            assert!(runtime
+                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                .is_err());
+            assert!(output.is_empty());
+            assert_eq!(fs::read(&pointer_path).unwrap(), b"corrupt selection");
+            fs::write(&pointer_path, &pointer).unwrap();
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let selected = store.active(&cx).unwrap().unwrap();
+            fs::write(selected.path().join("unexpected-artifact"), b"damage").unwrap();
+            let damaged = sealed_inventory(selected.path());
+            assert!(runtime
+                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                .is_err());
+            assert!(output.is_empty());
+            assert_eq!(sealed_inventory(selected.path()), damaged);
+            assert_eq!(fs::read(pointer_path).unwrap(), pointer);
+        });
+    }
+
+    #[test]
+    fn complete_cli_flush_cancellation_and_publisher_contention_emit_no_success() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let selected = store.active(&cx).unwrap();
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let pending = store.begin(&cx).unwrap();
+            let mut output = Vec::new();
+            assert!(runtime
+                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                .is_err());
+            assert!(output.is_empty());
+            drop(pending);
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                runtime.run_complete_generation_flush_with_writer(&cx, &root, &mut output),
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            assert!(output.is_empty());
+            assert_eq!(store.active(&cx).unwrap(), selected);
+            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+            runtime
+                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(receipt["data"]["durability"], "confirmed");
+        });
+    }
+
+    #[test]
+    fn complete_cli_flush_output_failure_does_not_undo_the_durable_selection() {
+        struct BrokenWriter;
+        impl Write for BrokenWriter {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(ErrorKind::BrokenPipe, "closed output"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            runtime.cli_input.format = OutputFormat::Table;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let selected = store.active(&cx).unwrap();
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            assert!(matches!(
+                runtime.run_complete_generation_flush_with_writer(&cx, &root, &mut BrokenWriter),
+                Err(SearchError::Io(error)) if error.kind() == ErrorKind::BrokenPipe
+            ));
+            assert_eq!(store.active(&cx).unwrap(), selected);
+            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
         });
     }
 
