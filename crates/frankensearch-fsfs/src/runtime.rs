@@ -1517,8 +1517,21 @@ struct PendingIndexDocument {
     content_hash_hex: String,
     lexical_required: bool,
     semantic_reused: bool,
+    /// Embedding input: the default canonicalizer's bounded text.
     document: IndexableDocument,
+    /// The whole file's text for the lexical index (`LEXICAL_CANONICALIZER`).
+    lexical_text: String,
 }
+
+/// Canonicalization for the lexical index: the embedding text's normalization
+/// with no length cap and no fenced-code collapsing, so BM25 sees a file's
+/// whole text. The default canonicalizer's 2,000-character text stays the
+/// embedding input, which is already longer than the models' input windows.
+const LEXICAL_CANONICALIZER: DefaultCanonicalizer = DefaultCanonicalizer {
+    max_length: usize::MAX,
+    code_head_lines: usize::MAX,
+    code_tail_lines: 0,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexDiscoveryStats {
@@ -3131,9 +3144,12 @@ impl LiveIngestPipeline {
         // PDF files are binary but contain extractable text.
         // Try PDF extraction before the generic binary check.
         let mut classification_metadata = None;
-        let canonical = if is_pdf_file(&abs_path) {
+        let (canonical, lexical_text) = if is_pdf_file(&abs_path) {
             match try_extract_pdf_text(&bytes, &abs_path) {
-                Some(pdf_text) => self.canonicalizer.canonicalize(&pdf_text),
+                Some(pdf_text) => (
+                    self.canonicalizer.canonicalize(&pdf_text),
+                    LEXICAL_CANONICALIZER.canonicalize(&pdf_text),
+                ),
                 None => {
                     self.prune_indexes(cx, &rel_key).await?;
                     Self::purge_storage_document(storage_ctx, &rel_key)?;
@@ -3150,7 +3166,10 @@ impl LiveIngestPipeline {
 
             let raw_text = String::from_utf8_lossy(&bytes);
             classification_metadata = Some(classification);
-            self.canonicalizer.canonicalize(&raw_text)
+            (
+                self.canonicalizer.canonicalize(&raw_text),
+                LEXICAL_CANONICALIZER.canonicalize(&raw_text),
+            )
         };
 
         if canonical.trim().is_empty() {
@@ -3173,7 +3192,7 @@ impl LiveIngestPipeline {
             rel_key.clone(),
             u64::try_from(revision).unwrap_or(0),
             ingestion_class,
-            canonical.clone(),
+            lexical_text,
             "watch_upsert",
         );
         mutation.title.clone_from(&doc.title);
@@ -3265,11 +3284,14 @@ impl LiveIngestPipeline {
         };
 
         let mut classification_metadata = None;
-        let canonical = if is_pdf_file(&abs_path) {
+        let (canonical, lexical_text) = if is_pdf_file(&abs_path) {
             let Some(pdf_text) = try_extract_pdf_text(&bytes, &abs_path) else {
                 return Ok(false);
             };
-            self.canonicalizer.canonicalize(&pdf_text)
+            (
+                self.canonicalizer.canonicalize(&pdf_text),
+                LEXICAL_CANONICALIZER.canonicalize(&pdf_text),
+            )
         } else {
             let classification = classify_file_for_ingest(&abs_path, &bytes);
             if !file_classification_allows_index(&classification) {
@@ -3277,7 +3299,10 @@ impl LiveIngestPipeline {
             }
             let raw_text = String::from_utf8_lossy(&bytes);
             classification_metadata = Some(classification);
-            self.canonicalizer.canonicalize(&raw_text)
+            (
+                self.canonicalizer.canonicalize(&raw_text),
+                LEXICAL_CANONICALIZER.canonicalize(&raw_text),
+            )
         };
         if canonical.trim().is_empty() {
             return Ok(false);
@@ -3297,7 +3322,7 @@ impl LiveIngestPipeline {
             rel_key.clone(),
             u64::try_from(revision).unwrap_or(0),
             ingestion_class,
-            canonical.clone(),
+            lexical_text,
             "quarantine_freshness_reindex",
         );
         mutation.title = doc.title;
@@ -14878,9 +14903,12 @@ impl FsfsRuntime {
                 // PDF files are binary but contain extractable text.
                 // Try PDF extraction before the generic binary check.
                 let mut classification_metadata = None;
-                let canonical = if is_pdf_file(&candidate.file_path) {
+                let (canonical, lexical_text) = if is_pdf_file(&candidate.file_path) {
                     match try_extract_pdf_text(&bytes, &candidate.file_path) {
-                        Some(pdf_text) => canonicalizer.canonicalize(&pdf_text),
+                        Some(pdf_text) => (
+                            canonicalizer.canonicalize(&pdf_text),
+                            LEXICAL_CANONICALIZER.canonicalize(&pdf_text),
+                        ),
                         None => {
                             content_skipped_files = content_skipped_files.saturating_add(1);
                             continue;
@@ -14898,7 +14926,10 @@ impl FsfsRuntime {
 
                     let raw_text = String::from_utf8_lossy(&bytes);
                     classification_metadata = Some(classification);
-                    canonicalizer.canonicalize(&raw_text)
+                    (
+                        canonicalizer.canonicalize(&raw_text),
+                        LEXICAL_CANONICALIZER.canonicalize(&raw_text),
+                    )
                 };
 
                 if canonical.trim().is_empty() {
@@ -14964,6 +14995,7 @@ impl FsfsRuntime {
                     ),
                     semantic_reused: reuse == CheckpointReuse::Complete,
                     document: doc,
+                    lexical_text,
                 });
             }
 
@@ -14994,7 +15026,7 @@ impl FsfsRuntime {
                         pending.file_key.clone(),
                         u64::try_from(pending.revision).unwrap_or(0),
                         pending.ingestion_class,
-                        pending.document.content.clone(),
+                        pending.lexical_text.clone(),
                         pending.reason_code.clone(),
                     );
                     mutation.title.clone_from(&pending.document.title);
@@ -34536,6 +34568,79 @@ mod tests {
                     .any(|hit| hit.path.contains("auth") || hit.path.contains("README")),
                 "expected auth-related hit path in payload"
             );
+        });
+    }
+
+    /// The embedding text is the canonicalizer's 2,000-character prefix with
+    /// long fenced code collapsed; the lexical index must still see all text.
+    #[test]
+    fn lexical_index_covers_text_beyond_the_embedding_prefix() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create project dir");
+            let filler = "alpha beta gamma delta epsilon ".repeat(200);
+            fs::write(
+                project.join("long.txt"),
+                format!("zebracorn opening\n{filler}\nquokkafish closing\n"),
+            )
+            .expect("write long file");
+            fs::write(project.join("short.txt"), "zebracorn only\n").expect("write short file");
+            let code = (0..40)
+                .map(|line| {
+                    if line == 20 {
+                        "let narwhalcode = 1;".to_owned()
+                    } else {
+                        format!("let value_{line} = {line};")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(
+                project.join("guide.md"),
+                format!("# Guide\n\n```rust\n{code}\n```\n"),
+            )
+            .expect("write markdown file");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+
+            let search_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(project.join(".frankensearch")),
+                ..CliInput::default()
+            });
+            for (query, expected) in [
+                ("zebracorn", vec!["long.txt", "short.txt"]),
+                ("quokkafish", vec!["long.txt"]),
+                ("narwhalcode", vec!["guide.md"]),
+            ] {
+                let payloads = search_runtime
+                    .execute_search_payloads_with_mode(
+                        &cx,
+                        query,
+                        5,
+                        SearchExecutionMode::LexicalOnly,
+                    )
+                    .await
+                    .expect("lexical search");
+                let mut found = payloads[0]
+                    .hits
+                    .iter()
+                    .filter_map(|hit| hit.path.rsplit('/').next())
+                    .collect::<Vec<_>>();
+                found.sort_unstable();
+                assert_eq!(found, expected, "lexical hits for {query:?}");
+            }
         });
     }
 

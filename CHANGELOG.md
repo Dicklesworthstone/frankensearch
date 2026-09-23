@@ -243,6 +243,25 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **`fsfs` finds text anywhere in a file, not just in its first 2,000
+  characters.** Indexing built one canonical text per file, capped at 2,000
+  characters with long fenced code blocks collapsed to their first 20 and last
+  10 lines, and fed it to both the embedders and the BM25 index. Lexical search
+  therefore never saw most of a typical source file (fsfs 1.10.0 behaves the
+  same). The lexical index now gets the file's whole normalized text; the
+  embedders keep the bounded text, which is already longer than their input
+  windows. On this repository's 524 Rust files, looking up 200 functions
+  defined past the first 2,000 characters (seed 20260923) by name with
+  lexical-only search found the defining file in the top 10 for 5 of them
+  before and 199 after. On the BEIR corpora, where 5-15% of documents exceed
+  2,000 characters, lexical-only nDCG@10 moved by +0.005 on SciFact and +0.002 on
+  NFCorpus (neither significant) and by -0.005 on ArguAna (significant, small).
+  Indexing the code took the same 21 s; the lexical index grew
+  from 24 MB to 84 MB, since it now holds the whole text, and the indexing
+  peak RSS from 1.06 to 1.30 GB. An existing index picks up the whole text
+  the next time `fsfs index` runs over it. Append-batch documents in a
+  complete-generation store are still truncated.
+
 - **Indexing with the quality tier uses a third of the memory, and default
   `fsfs index` works again (GH #43).** The MiniLM quality embedder ran up to
   64 texts through ONNX Runtime at once (256 in fsfs 1.10.0). Its scratch
@@ -322,8 +341,8 @@ qualified; individual results below are narrower than release acceptance.
 
 - **First product-path retrieval-quality measurement.** Through `fsfs serve`
   on three BEIR corpora, nDCG@10 (lexical-only / Initial / Refined) is
-  0.647 / 0.586 / 0.688 on SciFact, 0.299 / 0.290 / 0.333 on NFCorpus and
-  0.320 / 0.338 / 0.366 on ArguAna. Refined is significantly better than both
+  0.653 / 0.590 / 0.689 on SciFact, 0.301 / 0.291 / 0.332 on NFCorpus and
+  0.315 / 0.336 / 0.363 on ArguAna. Refined is significantly better than both
   on all three. Initial against BM25 alone is mixed: significantly worse on
   SciFact, no measurable difference on NFCorpus, significantly better on
   ArguAna. Reproduce with `docs/quality_harness/fsfs_beir_product_eval.py`.

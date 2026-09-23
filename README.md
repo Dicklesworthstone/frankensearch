@@ -726,9 +726,9 @@ modes, default settings, held-out BEIR test queries, 2026-09-22;
 
 | Corpus (documents / queries) | Lexical only (Quill BM25) | Initial (BM25 + potion-128M, RRF) | Refined (+ MiniLM) |
 |---|---|---|---|
-| SciFact (5,183 / 300) | 0.647 | 0.586 | 0.688 |
-| NFCorpus (3,633 / 323) | 0.299 | 0.290 | 0.333 |
-| ArguAna (8,674 / 1,406) | 0.320 | 0.338 | 0.366 |
+| SciFact (5,183 / 300) | 0.653 | 0.590 | 0.689 |
+| NFCorpus (3,633 / 323) | 0.301 | 0.291 | 0.332 |
+| ArguAna (8,674 / 1,406) | 0.315 | 0.336 | 0.363 |
 
 Refined is significantly better than both lexical-only and Initial results on
 all three corpora (paired bootstrap, 95% intervals excluding zero). Initial
