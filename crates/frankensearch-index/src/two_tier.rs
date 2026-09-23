@@ -455,6 +455,10 @@ enum TierSource {
         ///
         /// [`validate_expected_v2_binding`]: crate::VectorIndex::open_admitted_v2
         binding: FsviV2IdentityBinding,
+        /// Absolute path the artifact was admitted from. The owner keeps only
+        /// bytes (its index path is the synthetic `<owned-fsvi-v2>`), so
+        /// output-alias checks compare against this path instead.
+        source_path: PathBuf,
     },
 }
 
@@ -499,7 +503,15 @@ impl TierSource {
     fn admitted_pair(&self) -> Option<(&ValidatedFsviBytes, &FsviV2IdentityBinding)> {
         match self {
             Self::PathOpened(_) => None,
-            Self::AdmittedV2 { owner, binding } => Some((owner, binding)),
+            Self::AdmittedV2 { owner, binding, .. } => Some((owner, binding)),
+        }
+    }
+
+    /// The on-disk artifact this tier serves.
+    fn artifact_path(&self) -> &Path {
+        match self {
+            Self::PathOpened(index) => &index.path,
+            Self::AdmittedV2 { source_path, .. } => source_path,
         }
     }
 }
@@ -694,11 +706,13 @@ impl TwoTierIndex {
         let fast_source = TierSource::AdmittedV2 {
             owner: Arc::new(admit_v2_tier(paths.fast_index(), fast_binding, "fast")?),
             binding: fast_binding.clone(),
+            source_path: paths.fast_index().to_path_buf(),
         };
         let quality_source = match (paths.quality_index(), quality_binding) {
             (Some(path), Some(binding)) => Some(TierSource::AdmittedV2 {
                 owner: Arc::new(admit_v2_tier(path, binding, "quality")?),
                 binding: binding.clone(),
+                source_path: path.to_path_buf(),
             }),
             (None, None) => None,
             (Some(path), None) => {
@@ -1329,9 +1343,12 @@ impl TwoTierIndex {
         let receipt_path = native_hnsw_generation_receipt_path(graph_path)?;
         let outputs = [graph_path, receipt_path.as_path()];
         for output in outputs {
-            for vector in [Some(self.fast_index_path()), self.quality_index_path()]
-                .into_iter()
-                .flatten()
+            for vector in [
+                Some(self.fast_source.artifact_path()),
+                self.quality_source.as_ref().map(TierSource::artifact_path),
+            ]
+            .into_iter()
+            .flatten()
             {
                 if paths_alias(output, vector)? {
                     return Err(SearchError::InvalidConfig {
@@ -1407,7 +1424,7 @@ impl TwoTierIndex {
                     reason: "native retrieval requires an admitted FSVI v2 index".to_owned(),
                 })?;
         match self.quality_source.as_ref() {
-            Some(TierSource::AdmittedV2 { owner, binding }) => {
+            Some(TierSource::AdmittedV2 { owner, binding, .. }) => {
                 // Legacy publication nonces are not the full v2 generation.
                 // Join the exact retained witnesses before graph construction.
                 if fast_owner.witness().generation != owner.witness().generation {
