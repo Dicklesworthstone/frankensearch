@@ -3847,7 +3847,9 @@ fn fused_hits_to_scored_results(
                 doc_id: fh.doc_id.clone(),
                 score,
                 source,
-                index: fh.semantic_index,
+                // A quality-only document carries the vector hit's "no fast
+                // row" sentinel, which is not a fast-tier position.
+                index: fh.semantic_index.filter(|&index| index != u32::MAX),
                 fast_score: fh.hash_score.or(fh.semantic_score),
                 quality_score: None,
                 lexical_score: fh.lexical_score,
