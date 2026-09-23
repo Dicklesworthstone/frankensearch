@@ -146,6 +146,10 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     let mut cli_input = parse_cli_args(args)?;
     let env_map = current_unicode_environment();
     apply_cli_env_overrides(&mut cli_input, &env_map)?;
+    // Escape codes are for terminals; a pipe or file gets plain text.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        cli_input.no_color = true;
+    }
 
     // Version is handled immediately, before config loading.
     if cli_input.command == CliCommand::Version {
@@ -1132,6 +1136,13 @@ fn apply_cli_env_overrides(
     {
         cli_input.no_color = no_color;
     }
+    // no-color.org: a present, non-empty NO_COLOR disables color.
+    if env_map
+        .get("NO_COLOR")
+        .is_some_and(|value| !value.is_empty())
+    {
+        cli_input.no_color = true;
+    }
 
     if !cli_input.verbose
         && !cli_input.quiet
@@ -1270,6 +1281,19 @@ mod tests {
         apply_cli_env_overrides(&mut input, &env).expect("apply env");
         assert!(input.no_color);
         assert!(input.verbose);
+    }
+
+    #[test]
+    fn standard_no_color_env_disables_color_only_when_non_empty() {
+        let mut input = CliInput::default();
+        let env = HashMap::from([("NO_COLOR".to_owned(), "1".to_owned())]);
+        apply_cli_env_overrides(&mut input, &env).expect("apply env");
+        assert!(input.no_color);
+
+        let mut input = CliInput::default();
+        let env = HashMap::from([("NO_COLOR".to_owned(), String::new())]);
+        apply_cli_env_overrides(&mut input, &env).expect("apply env");
+        assert!(!input.no_color, "an empty NO_COLOR is not a request");
     }
 
     #[test]
