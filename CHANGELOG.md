@@ -258,7 +258,7 @@ qualified; individual results below are narrower than release acceptance.
   slower. The two models alone take 1.3 GB, so the default setting leaves
   about 14% headroom on a 64-core host.
 
-- **The default fast model starts in half the time and ~570 MB less memory
+- **The default fast model starts in a third of the time and ~570 MB less memory
   (GH #46).** `tokenizers` builds potion-multilingual-128M's 500,353-piece
   Unigram vocabulary as a trie with one hash map per node, about 1.1 million
   maps. A compact model now stores the same trie in sorted arrays and ports
@@ -272,7 +272,9 @@ qualified; individual results below are narrower than release acceptance.
   under the 2048 MiB default ceiling. Token ids match the library on 23,261
   real texts (BEIR SciFact, NFCorpus and ArguAna documents and queries) plus
   randomized adversarial inputs, and the NFCorpus vector files are
-  byte-identical.
+  byte-identical. The 512 MB embedding matrix is then read with parallel
+  positional reads straight into the final matrix (same bytes and decode):
+  that step went from 369 ms to 35 ms, and a cold search to 0.73 s.
 
 - **Smaller opt-in fast models: `potion-base-8M` and `potion-base-32M` (GH #50).**
   `[indexing] fast_model` now selects the Model2Vec model that is actually

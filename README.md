@@ -244,9 +244,9 @@ distinct queries (2026-09-23, Threadripper PRO 5975WX):
 
 | Fast model | Cold search | Peak RSS |
 |---|---|---|
-| potion-multilingual-128M | 1.04 s | 0.82 GB |
-| potion-base-32M | 0.53 s | 0.40 GB |
-| potion-base-8M | 0.41 s | 0.30 GB |
+| potion-multilingual-128M | 0.75 s | 0.83 GB |
+| potion-base-32M | 0.47 s | 0.42 GB |
+| potion-base-8M | 0.41 s | 0.31 GB |
 
 These are English models, and their retrieval quality relative to the
 multilingual default has not been measured. Library callers select one with
@@ -902,7 +902,7 @@ and are design budgets:
 | Daemon-served `fsfs search` (warm query daemon, one request per connection, INITIAL + REFINED) | ~13 ms | product receipt, 2026-09-03 (p50 12.7 ms, p95 13.9 ms, p99 14.8 ms over 50 queries, 0 cache hits; `:ready` round trip 1.1 ms). Before the adaptive accept poll landed the same run measured p50 50 ms: the daemon slept 50 ms between empty accept polls |
 | Daemon-served `fsfs search --rerank` (cross-encoder over the refined head) | ~250–400 ms | product receipt, 2026-09-03 (p50 412 ms over 20 queries, all applied, with the host at a 15-minute load of 63; an earlier run of the same lane at load 9 measured p50 233 ms, p95 320 ms: the int8 cross-encoder is CPU-bound and shares the box). Those documents were short synthetic prose: on BEIR SciFact abstracts (2026-09-22, limit 10) the default 300 ms deadline expired on every query, and with `rerank_timeout_ms = 60000` a served request took p50 554 ms, p95 722 ms |
 | Watch mode: file written → ingested into both tiers (`fsfs index --watch`) | ~0.7 s | product receipt, 2026-09-03 (20 files written one at a time: event-to-applied p50 725 ms, p95 848 ms, max 886 ms = the 500 ms debounce plus p50 224 ms ingest; all 20 searchable from a fresh process after the watcher's graceful exit; host-pressure sampling pinned for the measurement, since a saturated host pauses the watcher by design) |
-| Cold process start (`fsfs search` without a running daemon, INITIAL + REFINED) | ~1.0 s | product measurement, 2026-09-23 (1.04 s median of 7 on a 56-file corpus, receipted models, 0.82 GB peak RSS; the same protocol measured 2.25 s and 1.40 GB before the compact Unigram tokenizer, and the 2026-09-03 receipt 3.3–3.6 s, when building the 500,353-piece potion vocabulary dominated) |
+| Cold process start (`fsfs search` without a running daemon, INITIAL + REFINED) | ~0.75 s | product measurement, 2026-09-23 (0.75 s median of 7 on a 56-file corpus, receipted models, 0.83 GB peak RSS; the same protocol measured 2.25 s and 1.40 GB before the compact Unigram tokenizer and the parallel matrix read, and the 2026-09-03 receipt 3.3–3.6 s, when building the 500,353-piece potion vocabulary dominated) |
 
 What changes the envelope the most:
 - query class and candidate budget

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -877,9 +877,10 @@ const SAFETENSORS_HEADER_LEN_PREFIX: usize = 8;
 /// corrupt length prefix cannot ask for a huge allocation.
 const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100_000_000;
 
-/// Bytes pulled per `read_exact` while streaming the matrix. A multiple of 4,
-/// so every chunk decodes into whole `f32` values with no carry-over.
-const MATRIX_READ_CHUNK_BYTES: usize = 1 << 20;
+/// Bytes per positional read while streaming the matrix. A multiple of 4, so
+/// every chunk decodes into whole `f32` values with no carry-over; small
+/// enough that one buffer per worker adds little to the load's peak memory.
+const MATRIX_READ_CHUNK_BYTES: usize = 1 << 18;
 
 /// A located, validated F32 matrix inside a safetensors file, not yet read.
 ///
@@ -1014,45 +1015,74 @@ impl SafetensorsF32Matrix {
     /// Stream the tensor into a freshly allocated `Vec<f32>`.
     ///
     /// Decoding is byte-for-byte what `parse_f32_matrix` did — the same
-    /// little-endian `f32::from_le_bytes` over the same bytes in the same
-    /// order — so the resulting matrix is bit-identical to the old path's.
-    /// Only the buffering changes: one chunk of `MATRIX_READ_CHUNK_BYTES` is
-    /// live at a time instead of the whole file.
-    fn read_values(mut self) -> Result<Vec<f32>, String> {
-        self.file
-            .seek(SeekFrom::Start(self.data_start))
-            .map_err(|e| format!("failed to seek to the embedding tensor: {e}"))?;
-
-        let expected_elements = self.byte_len / 4;
-        let mut values: Vec<f32> = Vec::with_capacity(expected_elements);
-        // Never allocate a full chunk for a matrix smaller than one; both this
-        // and `byte_len` are multiples of 4, so the invariant below holds
-        // either way.
-        let mut chunk = vec![0_u8; MATRIX_READ_CHUNK_BYTES.min(self.byte_len.max(4))];
-        let mut remaining = self.byte_len;
-
-        while remaining > 0 {
-            // Both operands are multiples of 4, so every chunk decodes with no
-            // trailing partial value and `as_chunks` leaves no remainder.
-            let take = remaining.min(chunk.len());
-            debug_assert_eq!(take % 4, 0, "matrix reads must stay f32-aligned");
-            self.file
-                .read_exact(&mut chunk[..take])
-                .map_err(|e| format!("failed to read the embedding tensor: {e}"))?;
-            for &bytes in chunk[..take].as_chunks::<4>().0 {
-                values.push(f32::from_le_bytes(bytes));
-            }
-            remaining -= take;
-        }
-
-        if values.len() != expected_elements {
-            return Err(format!(
-                "parsed element count mismatch: expected {expected_elements}, got {}",
-                values.len()
-            ));
-        }
+    /// little-endian `f32::from_le_bytes` over the same bytes — so the
+    /// resulting matrix is bit-identical to the old path's. Chunks of
+    /// `MATRIX_READ_CHUNK_BYTES` are read with positional reads and decoded in
+    /// parallel, each straight into its slice of the final matrix; besides the
+    /// matrix, at most one chunk buffer per worker is live.
+    fn read_values(self) -> Result<Vec<f32>, String> {
+        const CHUNK_VALUES: usize = MATRIX_READ_CHUNK_BYTES / 4;
+        let mut values = vec![0.0_f32; self.byte_len / 4];
+        let (file, data_start) = (&self.file, self.data_start);
+        values
+            .par_chunks_mut(CHUNK_VALUES)
+            .enumerate()
+            .try_for_each_init(
+                || vec![0_u8; MATRIX_READ_CHUNK_BYTES],
+                |buffer, (index, chunk)| {
+                    // Every chunk but the last is full, and `byte_len` is a
+                    // multiple of 4, so `as_chunks` leaves no remainder.
+                    let bytes = &mut buffer[..chunk.len() * 4];
+                    let offset = u64::try_from(index * MATRIX_READ_CHUNK_BYTES)
+                        .ok()
+                        .and_then(|offset| data_start.checked_add(offset))
+                        .ok_or_else(|| "embedding tensor offset overflows".to_owned())?;
+                    read_exact_at(file, bytes, offset)
+                        .map_err(|e| format!("failed to read the embedding tensor: {e}"))?;
+                    for (value, &raw) in chunk.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                        *value = f32::from_le_bytes(raw);
+                    }
+                    Ok::<(), String>(())
+                },
+            )?;
         Ok(values)
     }
+}
+
+/// Read exactly `buffer.len()` bytes at `offset` without moving a shared
+/// cursor, so several threads can read one handle at once.
+#[cfg(unix)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        match file.seek_read(buffer, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => {
+                buffer = &mut buffer[read..];
+                offset += read as u64;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Targets without positional reads share the handle's cursor, so each
+/// seek-and-read runs under one lock.
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    static CURSOR: Mutex<()> = Mutex::new(());
+    let _cursor = CURSOR.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut handle = file;
+    handle.seek(SeekFrom::Start(offset))?;
+    handle.read_exact(buffer)
 }
 
 /// Test hook: how many FULL loads (tokenizer construction plus matrix read)
