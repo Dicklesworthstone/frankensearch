@@ -286,10 +286,23 @@ qualified; individual results below are narrower than release acceptance.
   schema now also declares the `rerank` key it had been rejecting.
   [Change](https://github.com/Dicklesworthstone/frankensearch/commit/550915737bf27809af6b1aa670ced03ad7f268eb).
 
+- **Quill no longer indexes and stores chunk overlaps twice.** fsfs rebuilt
+  each document's lexical content by joining its overlapping 768-byte
+  planning chunks, so every document longer than 768 bytes carried 96
+  duplicated bytes per chunk seam, plus a word split wherever a chunk ended
+  inside one. That inflated BM25 term frequencies and document lengths, and
+  the stored body that `--rerank` and snippets read contained the duplicated
+  text. Content is now the original body, each byte once. Lexical-only
+  nDCG@10 moved by −0.007 (SciFact), +0.003 (NFCorpus) and +0.002 (ArguAna),
+  none significant (paired bootstrap against the previous build). Documents
+  already in an index keep the duplicated content until they are indexed
+  again; a rebuild rewrites all of them. A retained-generation append test
+  that had failed since it was added now passes.
+
 - **First product-path retrieval-quality measurement.** Through `fsfs serve`
   on three BEIR corpora, nDCG@10 (lexical-only / Initial / Refined) is
-  0.654 / 0.588 / 0.688 on SciFact, 0.296 / 0.289 / 0.331 on NFCorpus and
-  0.318 / 0.336 / 0.365 on ArguAna. Refined is significantly better than both
+  0.647 / 0.586 / 0.688 on SciFact, 0.299 / 0.290 / 0.333 on NFCorpus and
+  0.320 / 0.338 / 0.366 on ArguAna. Refined is significantly better than both
   on all three. Initial against BM25 alone is mixed: significantly worse on
   SciFact, no measurable difference on NFCorpus, significantly better on
   ArguAna. Reproduce with `docs/quality_harness/fsfs_beir_product_eval.py`.
