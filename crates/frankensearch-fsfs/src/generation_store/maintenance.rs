@@ -67,7 +67,10 @@ impl CompleteGenerationStore {
         checkpoint(cx)?;
         // Bound untrusted strings before constructing either a path or pointer.
         if id.len() != 60 || !hex(manifest_sha256, 64) {
-            return Err(invalid(&self.root, "invalid retained generation identity or digest"));
+            return Err(invalid(
+                &self.root,
+                "invalid retained generation identity or digest",
+            ));
         }
         let pointer = format!("{POINTER_MAGIC}\n{id}\n{manifest_sha256}\n");
         let _decoded = decode_pointer(pointer.as_bytes(), &self.root)?;
@@ -122,13 +125,16 @@ impl CompleteGenerationStore {
     ) -> SearchResult<PreparedGenerationRestore> {
         checkpoint(cx)?;
         if target.path != self.root.join(GENERATIONS).join(&target.id) {
-            return Err(invalid(&self.root, "restore target belongs to another store"));
+            return Err(invalid(
+                &self.root,
+                "restore target belongs to another store",
+            ));
         }
         let lease = PublicationLease::acquire(&self.root)?;
         lease.fence("complete-generation restore preparation")?;
         let expected_selection = selection_evidence(&self.root)?;
         let target = self.open_retained(cx, target.id(), target.manifest_sha256())?;
-        ensure_selection(&self.root, &expected_selection)?;
+        ensure_selection(&self.root, expected_selection.as_deref())?;
         checkpoint(cx)?;
         lease.fence("complete-generation restore preparation complete")?;
         drop(lease);
@@ -166,7 +172,10 @@ impl CompleteGenerationStore {
         lease.fence("complete-generation flush entry")?;
         let expected = selection_evidence(&self.root)?;
         let generation = self.active(cx)?.ok_or_else(|| {
-            invalid(&self.root, "no complete generation is selected; nothing can be flushed")
+            invalid(
+                &self.root,
+                "no complete generation is selected; nothing can be flushed",
+            )
         })?;
         sync_tree(cx, generation.path(), 0)?;
         sync_directory(&self.root.join(GENERATIONS))?;
@@ -174,7 +183,7 @@ impl CompleteGenerationStore {
         // Refuse detected mutation during sync; a checksum is not permission
         // to accept new bytes as the same generation.
         self.open_retained(cx, generation.id(), generation.manifest_sha256())?;
-        ensure_selection(&self.root, &expected)?;
+        ensure_selection(&self.root, expected.as_deref())?;
         checkpoint(cx)?;
         lease.fence("complete-generation flush completion")?;
         // Once the barrier completes, a concurrent cancellation cannot revoke it.
@@ -222,23 +231,29 @@ impl PreparedGenerationRestore {
         checkpoint(cx)?;
         let lease = PublicationLease::acquire(&self.store.root)?;
         lease.fence("complete-generation restore entry")?;
-        ensure_selection(&self.store.root, &self.expected_selection)?;
-        let target = self.store.open_retained(
-            cx,
-            self.target.id(),
-            self.target.manifest_sha256(),
-        )?;
+        ensure_selection(&self.store.root, self.expected_selection.as_deref())?;
+        let target =
+            self.store
+                .open_retained(cx, self.target.id(), self.target.manifest_sha256())?;
         validate(cx, target.path())?;
         checkpoint(cx)?;
         sync_tree(cx, target.path(), 0)?;
         sync_directory(&self.store.root.join(GENERATIONS))?;
-        self.store.open_retained(cx, target.id(), target.manifest_sha256())?;
-        let pointer = format!("{POINTER_MAGIC}\n{}\n{}\n", target.id(), target.manifest_sha256());
+        self.store
+            .open_retained(cx, target.id(), target.manifest_sha256())?;
+        let pointer = format!(
+            "{POINTER_MAGIC}\n{}\n{}\n",
+            target.id(),
+            target.manifest_sha256()
+        );
         let temporary = stage_restore_pointer(cx, &self.store.root, pointer.as_bytes())?;
         checkpoint(cx)?;
         lease.fence("complete-generation restore publication")?;
-        ensure_selection(&self.store.root, &self.expected_selection)?;
-        fs::rename(&temporary, self.store.root.join(COMPLETE_GENERATION_POINTER))?;
+        ensure_selection(&self.store.root, self.expected_selection.as_deref())?;
+        fs::rename(
+            &temporary,
+            self.store.root.join(COMPLETE_GENERATION_POINTER),
+        )?;
         // The selected generation is now visible. Never turn a post-rename
         // cancellation or sync error into a claimed abort, and never roll back.
         let outcome = synced_outcome(target, final_sync(&self.store.root));
@@ -273,9 +288,12 @@ fn selection_evidence(root: &Path) -> SearchResult<Option<Vec<u8>>> {
     read_bounded_regular(&path, MAX_POINTER_BYTES).map(Some)
 }
 
-fn ensure_selection(root: &Path, expected: &Option<Vec<u8>>) -> SearchResult<()> {
-    if selection_evidence(root)? != *expected {
-        return Err(invalid(root, "selection changed since recovery or flush began"));
+fn ensure_selection(root: &Path, expected: Option<&[u8]>) -> SearchResult<()> {
+    if selection_evidence(root)?.as_deref() != expected {
+        return Err(invalid(
+            root,
+            "selection changed since recovery or flush began",
+        ));
     }
     Ok(())
 }
@@ -284,14 +302,20 @@ fn stage_restore_pointer(cx: &Cx, root: &Path, bytes: &[u8]) -> SearchResult<std
     for _ in 0..64 {
         checkpoint(cx)?;
         let serial = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let path = root.join(format!(".FSFS-RESTORE-{:08x}-{serial:016x}", std::process::id()));
+        let path = root.join(format!(
+            ".FSFS-RESTORE-{:08x}-{serial:016x}",
+            std::process::id()
+        ));
         match write_new_synced(&path, bytes) {
             Ok(()) => return Ok(path),
             Err(SearchError::Io(error)) if error.kind() == ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
-    Err(invalid(root, "cannot allocate an exclusive restore descriptor"))
+    Err(invalid(
+        root,
+        "cannot allocate an exclusive restore descriptor",
+    ))
 }
 
 #[cfg(all(test, unix))]
