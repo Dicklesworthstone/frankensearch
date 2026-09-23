@@ -8,8 +8,6 @@ use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write}
 #[cfg(unix)]
 use std::net::Shutdown;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -12596,12 +12594,32 @@ impl FsfsRuntime {
             };
         }
 
+        // access(2) answers for this user, mount and permission bits without
+        // writing anything, so the check stays observation-only.
         #[cfg(unix)]
-        let permission_metadata_allows_write = metadata.permissions().mode() & 0o222 != 0;
+        let check = match rustix::fs::access(path, rustix::fs::Access::WRITE_OK) {
+            Ok(()) => DoctorCheck {
+                name: name.to_owned(),
+                verdict: DoctorVerdict::Pass,
+                detail: format!("{} is writable by this user", path.display()),
+                suggestion: None,
+            },
+            Err(error) => DoctorCheck {
+                name: name.to_owned(),
+                verdict: DoctorVerdict::Fail,
+                detail: format!("{} is not writable by this user: {error}", path.display()),
+                suggestion: Some(format!("check permissions on {}", path.display())),
+            },
+        };
         #[cfg(not(unix))]
-        let permission_metadata_allows_write = !metadata.permissions().readonly();
-
-        if permission_metadata_allows_write {
+        let check = if metadata.permissions().readonly() {
+            DoctorCheck {
+                name: name.to_owned(),
+                verdict: DoctorVerdict::Fail,
+                detail: format!("{} permission metadata is read-only", path.display()),
+                suggestion: Some(format!("check permissions on {}", path.display())),
+            }
+        } else {
             DoctorCheck {
                 name: name.to_owned(),
                 verdict: DoctorVerdict::Warn,
@@ -12611,14 +12629,8 @@ impl FsfsRuntime {
                 ),
                 suggestion: None,
             }
-        } else {
-            DoctorCheck {
-                name: name.to_owned(),
-                verdict: DoctorVerdict::Fail,
-                detail: format!("{} permission metadata is read-only", path.display()),
-                suggestion: Some(format!("check permissions on {}", path.display())),
-            }
-        }
+        };
+        check
     }
 
     #[allow(clippy::too_many_lines)]
@@ -41095,6 +41107,33 @@ mod tests {
             message.contains("hash-control") && !message.contains("semantic"),
             "hash admission must not claim semantic: {message}"
         );
+    }
+
+    /// Doctor's writability verdict is Pass exactly when a write would work;
+    /// the probe write happens here in the test, never in doctor.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_writability_verdict_matches_an_actual_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let open = temp.path().join("open");
+        let sealed = temp.path().join("sealed");
+        fs::create_dir_all(&open).expect("create open dir");
+        fs::create_dir_all(&sealed).expect("create sealed dir");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o555)).expect("seal dir");
+        for dir in [&open, &sealed] {
+            let check = FsfsRuntime::directory_write_permission_doctor_check("dir.writable", dir);
+            // Root writes through 0o555, so the expectation is observed.
+            let writes = fs::write(dir.join("probe"), b"x").is_ok();
+            let expected = if writes {
+                super::DoctorVerdict::Pass
+            } else {
+                super::DoctorVerdict::Fail
+            };
+            assert_eq!(check.verdict, expected, "{}: {}", dir.display(), check.detail);
+        }
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).expect("unseal dir");
     }
 
     #[test]
