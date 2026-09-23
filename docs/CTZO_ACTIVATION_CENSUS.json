@@ -78,12 +78,14 @@
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": "activate_owner_backed_search",
-      "count": 1
+      "count": 6,
+      "note": "run_phase1: native fast response admission before an exact override, native fast search, exact-params search over admitted embeddings, fast coverage receipt; run_phase2: native quality response admission before PRF, quality retrieval. Each binds the actual response identity (BoundQueryEmbedding) before any vector read. Reviewed 2026-09-23 after the native ANN routes (3c008238, a65b4cfd)."
     },
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": ".coverage(",
-      "count": 1
+      "count": 2,
+      "note": "run_phase1 fast coverage and run_phase2 quality coverage."
     }
   ]
 }
