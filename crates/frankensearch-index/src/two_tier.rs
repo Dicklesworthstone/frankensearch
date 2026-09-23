@@ -2218,15 +2218,19 @@ impl TwoTierIndex {
     }
 
     /// Filesystem path of the loaded fast-tier index artifact.
+    ///
+    /// For admitted v2 tiers this is the original absolute opener path,
+    /// retained as provenance. Queries continue to use the sealed byte owner
+    /// if that pathname is later moved or replaced.
     #[must_use]
     pub fn fast_index_path(&self) -> &Path {
-        &self.fast_tier().path
+        self.fast_source.artifact_path()
     }
 
     /// Filesystem path of the loaded quality-tier index artifact, when loaded.
     #[must_use]
     pub fn quality_index_path(&self) -> Option<&Path> {
-        self.quality_tier().map(|index| index.path.as_path())
+        self.quality_source.as_ref().map(TierSource::artifact_path)
     }
 
     /// Iterate over all document IDs in fast-tier order.
@@ -8017,6 +8021,8 @@ mod tests {
         };
         let params = HnswParams::default();
         let mut index = open();
+        assert_eq!(index.fast_index_path(), fast_path);
+        assert_eq!(index.quality_index_path(), Some(quality_path.as_path()));
         index.enable_native_fast_hnsw(params, 42).unwrap();
         index.enable_native_quality_hnsw(params, 43).unwrap();
         let fast_receipt = index.save_native_fast_hnsw(&fast_graph).unwrap();
@@ -8169,13 +8175,17 @@ mod tests {
                 None,
             )
             .unwrap();
+            assert_eq!(index.fast_index_path(), fast_path);
             index
                 .enable_native_fast_hnsw(HnswParams::default(), 1)
                 .unwrap();
-            assert!(matches!(
-                index.save_native_fast_hnsw(&graph_path),
-                Err(SearchError::InvalidConfig { value, .. }) if value == "vector-alias"
-            ));
+            let saved = index.save_native_fast_hnsw(&graph_path);
+            assert!(
+                matches!(&saved,
+                    Err(SearchError::InvalidConfig { value, .. }) if value == "vector-alias"
+                ),
+                "{vector_name}: {saved:?}"
+            );
             assert_eq!(fs::read(&fast_path).unwrap(), before);
             assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
 
@@ -8649,6 +8659,8 @@ mod tests {
             };
             let mut index = open();
             let mut retained_reader = open();
+            assert_eq!(index.fast_index_path(), paths.fast_index());
+            assert_eq!(index.quality_index_path(), paths.quality_index());
             if enable_fast {
                 index
                     .enable_native_fast_hnsw(HnswParams::default(), 3)
@@ -8679,6 +8691,8 @@ mod tests {
             assert_eq!(index.has_native_fast_hnsw(), enable_fast);
             assert_eq!(index.fast_admitted_owner().unwrap().witness(), &before_fast);
             assert_eq!(index.quality_admitted_owner().unwrap().witness(), &before);
+            assert_eq!(index.fast_index_path(), paths.fast_index());
+            assert_eq!(index.quality_index_path(), paths.quality_index());
             assert_eq!(
                 index
                     .activate_owner_backed_search(&embeddings)
@@ -8719,6 +8733,8 @@ mod tests {
             assert_eq!(index.has_native_fast_hnsw(), enable_fast);
             assert_eq!(index.fast_admitted_owner().unwrap().witness(), &before_fast);
             assert_eq!(index.quality_admitted_owner().unwrap().witness(), &before);
+            assert_eq!(index.fast_index_path(), paths.fast_index());
+            assert_eq!(index.quality_index_path(), paths.quality_index());
 
             let (fast_only_paths, fast_only_binding, _) = make_generation(2, None);
             index
@@ -8726,6 +8742,8 @@ mod tests {
                 .unwrap();
             assert!(!index.has_native_quality_hnsw());
             assert_eq!(index.has_native_fast_hnsw(), enable_fast);
+            assert_eq!(index.fast_index_path(), fast_only_paths.fast_index());
+            assert_eq!(index.quality_index_path(), None);
             let (_, fast_identity) = fsvi_v2_binding("native-refresh-fast", 4, 1);
             let fast_embeddings = TieredQueryEmbeddings::fast_only(bound_query(
                 &fast_identity,
@@ -8754,6 +8772,10 @@ mod tests {
                 .unwrap();
             assert!(index.has_native_quality_hnsw());
             assert_eq!(index.has_native_fast_hnsw(), enable_fast);
+            assert_eq!(index.fast_index_path(), successor_paths.fast_index());
+            assert_eq!(index.quality_index_path(), successor_paths.quality_index());
+            assert_eq!(retained_reader.fast_index_path(), paths.fast_index());
+            assert_eq!(retained_reader.quality_index_path(), paths.quality_index());
             assert_eq!(
                 index
                     .activate_owner_backed_search(&fast_embeddings)

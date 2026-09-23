@@ -11470,7 +11470,7 @@ impl FsfsRuntime {
             .await
     }
 
-    async fn run_append_batch_command_with_writer<W: Write>(
+    async fn run_append_batch_command_with_writer<W: Write + Send>(
         &self,
         cx: &Cx,
         writer: &mut W,
