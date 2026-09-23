@@ -405,6 +405,10 @@ impl fmt::Display for SearchOutputPhase {
 pub struct SearchHitPayload {
     pub rank: usize,
     pub path: String,
+    /// 1-based line of the file on disk where the snippet's first query word
+    /// sits. Absent without a snippet or when the file no longer holds it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub line: Option<u32>,
     pub score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
@@ -1413,6 +1417,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 1,
                     path: "src/auth.rs".to_owned(),
+                    line: Some(1),
                     score: 0.923,
                     snippet: Some("fn authenticate(token: &str) -> bool".to_owned()),
                     lexical_rank: Some(0),
@@ -1423,6 +1428,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 2,
                     path: "docs/auth.md".to_owned(),
+                    line: None,
                     score: 0.811,
                     snippet: None,
                     lexical_rank: Some(2),
@@ -1500,6 +1506,7 @@ mod tests {
             vec![SearchHitPayload {
                 rank: 1,
                 path: "src/lib.rs".to_owned(),
+                line: None,
                 score: 0.1,
                 snippet: None,
                 lexical_rank: None,

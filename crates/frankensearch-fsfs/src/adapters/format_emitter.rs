@@ -399,6 +399,7 @@ fn write_search_payload_csv<W: Write>(payload: &SearchPayload, writer: &mut W) -
             "returned_hits".to_owned(),
             "rank".to_owned(),
             "path".to_owned(),
+            "line".to_owned(),
             "score".to_owned(),
             "in_both_sources".to_owned(),
             "lexical_rank".to_owned(),
@@ -430,6 +431,7 @@ fn write_search_payload_csv<W: Write>(payload: &SearchPayload, writer: &mut W) -
                 payload.returned_hits.to_string(),
                 hit.rank.to_string(),
                 hit.path.clone(),
+                hit.line.map(|line| line.to_string()).unwrap_or_default(),
                 format!("{:.6}", hit.score),
                 hit.in_both_sources.to_string(),
                 lexical_rank,
@@ -540,10 +542,10 @@ fn render_search_table_with_options(
     }
 
     for hit in &payload.hits {
-        let (path_text, line_number) = split_path_and_line_number(&hit.path);
-        let path = paint(path_text, "1;36", color_enabled);
-        let line_segment = line_number
-            .map(|line| format!(":{}", paint(line, "32", color_enabled)))
+        let path = paint(&hit.path, "1;36", color_enabled);
+        let line_segment = hit
+            .line
+            .map(|line| format!(":{}", paint(&line.to_string(), "32", color_enabled)))
             .unwrap_or_default();
         let score = paint(
             &format!("{:.3}", hit.score),
@@ -629,16 +631,6 @@ fn paint(text: &str, style: &str, color_enabled: bool) -> String {
     } else {
         text.to_owned()
     }
-}
-
-fn split_path_and_line_number(path: &str) -> (&str, Option<&str>) {
-    if let Some((left, right)) = path.rsplit_once(':')
-        && !right.is_empty()
-        && right.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return (left, Some(right));
-    }
-    (path, None)
 }
 
 fn source_badge(hit: &SearchHitPayload, hash_control: bool, color_enabled: bool) -> String {
@@ -985,6 +977,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 1,
                     path: "src/auth.rs".to_owned(),
+                    line: None,
                     score: 0.923,
                     snippet: Some("fn authenticate(token: &str) -> bool".to_owned()),
                     lexical_rank: Some(0),
@@ -995,6 +988,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 2,
                     path: "docs/auth.md".to_owned(),
+                    line: None,
                     score: 0.811,
                     snippet: None,
                     lexical_rank: Some(2),
@@ -1030,7 +1024,8 @@ mod tests {
             1,
             vec![SearchHitPayload {
                 rank: 1,
-                path: "src/auth.rs:45".to_owned(),
+                path: "src/auth.rs".to_owned(),
+                line: Some(45),
                 score: 0.91,
                 snippet: Some("auth middleware validates bearer token".to_owned()),
                 lexical_rank: Some(0),
@@ -1116,7 +1111,8 @@ mod tests {
             vec![
                 SearchHitPayload {
                     rank: 1,
-                    path: "src/auth.rs:42".to_owned(),
+                    path: "src/auth.rs".to_owned(),
+                    line: Some(42),
                     score: 0.9234,
                     snippet: Some("middleware validates bearer tokens".to_owned()),
                     lexical_rank: Some(0),
@@ -1127,6 +1123,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 2,
                     path: "docs/auth guide.md".to_owned(),
+                    line: None,
                     score: 0.811,
                     snippet: Some("quoted \"token\" snippet, with comma".to_owned()),
                     lexical_rank: None,
@@ -1141,13 +1138,13 @@ mod tests {
         let mut lines = output.lines();
         assert_eq!(
             lines.next().unwrap_or_default(),
-            "query,phase,total_candidates,returned_hits,rank,path,score,in_both_sources,lexical_rank,semantic_rank,snippet"
+            "query,phase,total_candidates,returned_hits,rank,path,line,score,in_both_sources,lexical_rank,semantic_rank,snippet"
         );
         assert!(
-            lines.next().unwrap_or_default().contains("auth middleware,refined,3,2,1,src/auth.rs:42,0.923400,true,1,2,middleware validates bearer tokens")
+            lines.next().unwrap_or_default().contains("auth middleware,refined,3,2,1,src/auth.rs,42,0.923400,true,1,2,middleware validates bearer tokens")
         );
         assert!(lines.next().unwrap_or_default().contains(
-            "docs/auth guide.md,0.811000,false,,3,\"quoted \"\"token\"\" snippet, with comma\""
+            "docs/auth guide.md,,0.811000,false,,3,\"quoted \"\"token\"\" snippet, with comma\""
         ));
     }
 
@@ -1160,6 +1157,7 @@ mod tests {
             vec![SearchHitPayload {
                 rank: 1,
                 path: "src/lib.rs".to_owned(),
+                line: None,
                 score: 0.4,
                 snippet: None,
                 lexical_rank: Some(0),
@@ -1359,7 +1357,8 @@ mod tests {
             vec![
                 SearchHitPayload {
                     rank: 1,
-                    path: "src/auth/middleware.rs:45".to_owned(),
+                    path: "src/auth/middleware.rs".to_owned(),
+                    line: Some(45),
                     score: 0.923,
                     snippet: Some("JWT validation middleware checks Bearer token".to_owned()),
                     lexical_rank: Some(0),
@@ -1369,7 +1368,8 @@ mod tests {
                 },
                 SearchHitPayload {
                     rank: 2,
-                    path: "src/auth/login.rs:12".to_owned(),
+                    path: "src/auth/login.rs".to_owned(),
+                    line: Some(12),
                     score: 0.811,
                     snippet: Some("Login handler with bcrypt password hashing".to_owned()),
                     lexical_rank: Some(2),
@@ -1380,6 +1380,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 3,
                     path: "docs/auth.md".to_owned(),
+                    line: None,
                     score: 0.421,
                     snippet: None,
                     lexical_rank: None,
@@ -1424,6 +1425,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 1,
                     path: "src/lib.rs".to_owned(),
+                    line: None,
                     score: 0.4,
                     snippet: None,
                     lexical_rank: Some(0),
@@ -1434,6 +1436,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 2,
                     path: "src/hash.rs".to_owned(),
+                    line: None,
                     score: 0.2,
                     snippet: None,
                     lexical_rank: None,
@@ -1473,6 +1476,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 1,
                     path: "high.rs".to_owned(),
+                    line: None,
                     score: 0.923,
                     snippet: None,
                     lexical_rank: Some(0),
@@ -1483,6 +1487,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 2,
                     path: "medium.rs".to_owned(),
+                    line: None,
                     score: 0.65,
                     snippet: None,
                     lexical_rank: None,
@@ -1493,6 +1498,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 3,
                     path: "low.rs".to_owned(),
+                    line: None,
                     score: 0.32,
                     snippet: None,
                     lexical_rank: None,
@@ -1529,6 +1535,7 @@ mod tests {
             vec![SearchHitPayload {
                 rank: 1,
                 path: "src/auth.rs".to_owned(),
+                line: None,
                 score: 0.9,
                 snippet: Some("validates bearer token from header".to_owned()),
                 lexical_rank: Some(0),
@@ -1550,28 +1557,49 @@ mod tests {
     }
 
     #[test]
-    fn render_search_table_for_cli_splits_path_and_line_number() {
+    fn render_search_table_for_cli_appends_the_hit_line() {
         let payload = SearchPayload::new(
             "test",
             SearchOutputPhase::Initial,
-            1,
-            vec![SearchHitPayload {
-                rank: 1,
-                path: "src/lib.rs:42".to_owned(),
-                score: 0.75,
-                snippet: None,
-                lexical_rank: Some(0),
-                semantic_rank: None,
-                hash_rank: None,
-                in_both_sources: false,
-            }],
+            2,
+            vec![
+                SearchHitPayload {
+                    rank: 1,
+                    path: "src/lib.rs".to_owned(),
+                    line: Some(42),
+                    score: 0.75,
+                    snippet: None,
+                    lexical_rank: Some(0),
+                    semantic_rank: None,
+                    hash_rank: None,
+                    in_both_sources: false,
+                },
+                // A file named like a location is a path, not a line.
+                SearchHitPayload {
+                    rank: 2,
+                    path: "notes:7".to_owned(),
+                    line: None,
+                    score: 0.5,
+                    snippet: None,
+                    lexical_rank: Some(1),
+                    semantic_rank: None,
+                    hash_rank: None,
+                    in_both_sources: false,
+                },
+            ],
         );
         let output = render_search_table_with_options(&payload, Some(1), true, 100);
-        // Line number should be separated with green coloring
         assert!(
-            output.contains("\u{1b}[32m42\u{1b}[0m"),
-            "line number should be green: {output}"
+            output.contains("\u{1b}[1;36msrc/lib.rs\u{1b}[0m:\u{1b}[32m42\u{1b}[0m"),
+            "line number should follow the path in green: {output}"
         );
+        assert!(
+            output.contains("\u{1b}[1;36mnotes:7\u{1b}[0m"),
+            "a path is printed whole: {output}"
+        );
+        let plain = render_search_table_with_options(&payload, Some(1), false, 100);
+        assert!(plain.contains("  1. src/lib.rs:42  score="), "{plain}");
+        assert!(plain.contains("  2. notes:7  score="), "{plain}");
     }
 
     #[test]
@@ -1593,6 +1621,7 @@ mod tests {
             vec![SearchHitPayload {
                 rank: 1,
                 path: "src/long.rs".to_owned(),
+                line: None,
                 score: 0.8,
                 snippet: Some(long_snippet),
                 lexical_rank: None,
@@ -1618,6 +1647,7 @@ mod tests {
             vec![SearchHitPayload {
                 rank: 1,
                 path: "src/lib.rs".to_owned(),
+                line: None,
                 score: 0.1,
                 snippet: None,
                 lexical_rank: None,

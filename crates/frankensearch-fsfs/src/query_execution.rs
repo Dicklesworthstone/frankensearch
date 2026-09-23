@@ -1122,6 +1122,7 @@ impl QueryExecutionOrchestrator {
                 SearchHitPayload {
                     rank: idx.saturating_add(1),
                     path: candidate.doc_id.clone(),
+                    line: None,
                     score: sanitize_fused_score(candidate.fused_score),
                     snippet: snippets_by_doc
                         .get(&candidate.doc_id)

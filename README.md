@@ -305,7 +305,7 @@ Example output:
 ```text
 PHASE REFINED: 5 hit(s) for "how does retry backoff work"
 vector generation: potion-multilingual-128M  class=semantic
-  1. src/retry.rs  score=0.033  [both]
+  1. src/retry.rs:14  score=0.033  [both]
      Recover transient network failures with exponential backoff, bounded retries…
   2. docs/failures.md  score=0.016  [semantic]
      …
@@ -378,6 +378,11 @@ publication; `--format jsonl` emits it as one line. The payload includes actual
 file counts, vector model identities, and `generation_complete`. If embedding
 retries are exhausted, `semantic_deferred_files` and a warning explain why the
 published artifacts still need indexing resumed before semantic search.
+
+Each search hit carries its `path`, a plain-text `snippet` of the best-matching
+fragment, and `line`: the 1-based line of the file where the snippet's first
+query word sits (the table prints `path:line`). `line` is absent for hits
+without a snippet and when the file on disk no longer holds the fragment.
 
 ```bash
 # Basic search

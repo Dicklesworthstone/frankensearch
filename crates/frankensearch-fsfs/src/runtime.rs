@@ -4721,6 +4721,9 @@ const REASON_RERANK_TIMEOUT: &str = "query.stage.rerank.timeout";
 /// Bytes read from a candidate file for reranking. The cross-encoder
 /// truncates at 512 tokens, so this head already covers what it can see.
 const FSFS_RERANK_DOCUMENT_READ_LIMIT: u64 = 16 * 1024;
+/// Bytes of a hit's file searched for its snippet's line; covers the default
+/// indexing ceiling (`indexing.max_file_size_mb = 10`).
+const FSFS_HIT_LINE_READ_LIMIT: u64 = 16 << 20;
 
 /// The process cache retains successful cross-encoder initialization. A query
 /// freezes its own slot, including absence, before cache lookup so a concurrent
@@ -9258,7 +9261,7 @@ impl FsfsRuntime {
         // already-present key. `ahash` (not SipHash) matches the sibling RRF paths.
         // Owned strings are materialized only for the top-`limit` output rows.
         let mut scores: ahash::AHashMap<&str, f64> = ahash::AHashMap::new();
-        let mut snippets: ahash::AHashMap<&str, &str> = ahash::AHashMap::new();
+        let mut snippets: ahash::AHashMap<&str, (&str, Option<u32>)> = ahash::AHashMap::new();
         let mut best_lexical_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
         let mut best_semantic_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
         let mut best_hash_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
@@ -9269,9 +9272,11 @@ impl FsfsRuntime {
                 let contribution = 1.0 / (k + hit.rank as f64);
                 *scores.entry(key).or_default() += contribution;
 
-                // Keep the first non-empty snippet.
+                // Keep the first non-empty snippet and the line it was found on.
                 if let Some(snippet) = &hit.snippet {
-                    snippets.entry(key).or_insert_with(|| snippet.as_str());
+                    snippets
+                        .entry(key)
+                        .or_insert_with(|| (snippet.as_str(), hit.line));
                 }
 
                 // Track best ranks across all queries.
@@ -9317,11 +9322,13 @@ impl FsfsRuntime {
                 // means lexical and vector retrieval found this document.
                 let in_both_sources =
                     lexical_rank.is_some() && (semantic_rank.is_some() || hash_rank.is_some());
+                let snippet = snippets.get(path).copied();
                 SearchHitPayload {
                     rank: idx.saturating_add(1),
                     path: path.to_owned(),
+                    line: snippet.and_then(|(_, line)| line),
                     score,
-                    snippet: snippets.get(path).map(|&s| s.to_owned()),
+                    snippet: snippet.map(|(text, _)| text.to_owned()),
                     lexical_rank,
                     semantic_rank,
                     hash_rank,
@@ -10397,6 +10404,7 @@ impl FsfsRuntime {
             snippet_config.max_chars = FSFS_TUI_FAST_STAGE_SNIPPET_MAX_CHARS;
         }
         let mut snippets_by_doc = HashMap::new();
+        let mut hit_lines = HitLineLocator::new(&resources.index_root);
         let (lexical_candidates, lexical_head_candidates) = if plan.lexical_stage.enabled {
             if let Some(lexical) = resources.lexical_index.as_ref() {
                 if flags.include_snippets {
@@ -10775,6 +10783,7 @@ impl FsfsRuntime {
             resources,
             mode,
         );
+        hit_lines.annotate(&mut payload);
         if self.config.search.rerank && !plan.quality_stage.enabled {
             // The stage only re-scores a REFINED head. When no quality stage
             // will follow, say so on the phase the caller actually receives.
@@ -10890,6 +10899,7 @@ impl FsfsRuntime {
                         resources,
                         mode,
                     );
+                    hit_lines.annotate(&mut refined_payload);
                     if self.config.search.rerank {
                         refined_payload.rerank = Some(rerank_payload);
                     }
@@ -10963,6 +10973,7 @@ impl FsfsRuntime {
                         resources,
                         mode,
                     );
+                    hit_lines.annotate(&mut failed_payload);
                     if let SearchError::SearchTimeout {
                         elapsed_ms,
                         budget_ms,
@@ -10996,7 +11007,7 @@ impl FsfsRuntime {
                         original_error: None,
                         replay_command: None,
                     }));
-                    let failed_payload = Self::attach_search_context(
+                    let mut failed_payload = Self::attach_search_context(
                         Self::build_limited_payload(
                             orchestrator,
                             &normalized_query,
@@ -11012,6 +11023,7 @@ impl FsfsRuntime {
                         resources,
                         mode,
                     );
+                    hit_lines.annotate(&mut failed_payload);
                     let failed_artifact = SearchPhaseArtifact {
                         phase: SearchOutputPhase::RefinementFailed,
                         fused: fused_initial.clone(),
@@ -20687,6 +20699,109 @@ fn resolve_manifest_file_path(
     index_root.join(file_key)
 }
 
+/// Places snippet-bearing hits on a line of their file for one search. Phases
+/// share most hits, so each document's answer, found or not, is kept.
+struct HitLineLocator {
+    index_root: PathBuf,
+    sentinel: std::cell::OnceCell<Option<IndexSentinel>>,
+    lines: HashMap<String, Option<u32>>,
+}
+
+impl HitLineLocator {
+    fn new(index_root: &Path) -> Self {
+        Self {
+            index_root: index_root.to_path_buf(),
+            sentinel: std::cell::OnceCell::new(),
+            lines: HashMap::new(),
+        }
+    }
+
+    fn annotate(&mut self, payload: &mut SearchPayload) {
+        for hit in &mut payload.hits {
+            let Some(snippet) = hit.snippet.as_deref() else {
+                continue;
+            };
+            if let Some(line) = self.lines.get(&hit.path) {
+                hit.line = *line;
+                continue;
+            }
+            let sentinel = self.sentinel.get_or_init(|| {
+                FsfsRuntime::read_index_sentinel(&self.index_root).unwrap_or_else(|error| {
+                    debug!(error = %error, "fsfs hit lines: index sentinel unreadable");
+                    None
+                })
+            });
+            let path = resolve_manifest_file_path(&hit.path, sentinel.as_ref(), &self.index_root);
+            let line = read_hit_line_source(&path)
+                .and_then(|text| locate_snippet_line(&text, snippet, &payload.query));
+            self.lines.insert(hit.path.clone(), line);
+            hit.line = line;
+        }
+    }
+}
+
+fn read_hit_line_source(path: &Path) -> Option<String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(FSFS_HIT_LINE_READ_LIMIT)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(String::from_utf8(bytes).unwrap_or_else(|error| {
+        String::from_utf8_lossy(error.as_bytes()).into_owned()
+    }))
+}
+
+/// 1-based line of `text` holding the snippet's first query word (its first
+/// word when no query word appears in it).
+///
+/// A snippet is a fragment of the canonicalized lexical text — whitespace
+/// collapsed, markdown markup stripped, case kept — so it is found by its
+/// alphanumeric words, not its bytes: each whole-word occurrence of the anchor
+/// is checked for up to three matching words on each side, then one on each
+/// side when markup broke that run. `None` when the file no longer holds the
+/// fragment.
+fn locate_snippet_line(text: &str, snippet: &str, query: &str) -> Option<u32> {
+    let snippet_words = alphanumeric_words(snippet).collect::<Vec<_>>();
+    let query_words = alphanumeric_words(query).collect::<Vec<_>>();
+    let anchor = snippet_words
+        .iter()
+        .position(|word| {
+            query_words
+                .iter()
+                .any(|query_word| query_word.eq_ignore_ascii_case(word))
+        })
+        .unwrap_or(0);
+    let anchor_word = *snippet_words.get(anchor)?;
+    for reach in [3, 1] {
+        let before = &snippet_words[anchor.saturating_sub(reach)..anchor];
+        let after = &snippet_words[anchor + 1..snippet_words.len().min(anchor + reach + 1)];
+        let found = text.match_indices(anchor_word).find(|&(at, _)| {
+            let (head, tail) = (&text[..at], &text[at + anchor_word.len()..]);
+            !head.chars().next_back().is_some_and(char::is_alphanumeric)
+                && !tail.chars().next().is_some_and(char::is_alphanumeric)
+                && alphanumeric_words(tail)
+                    .take(after.len())
+                    .eq(after.iter().copied())
+                && head
+                    .rsplit(|ch: char| !ch.is_alphanumeric())
+                    .filter(|word| !word.is_empty())
+                    .take(before.len())
+                    .eq(before.iter().rev().copied())
+        });
+        if let Some((at, _)) = found {
+            return u32::try_from(text[..at].matches('\n').count() + 1).ok();
+        }
+    }
+    None
+}
+
+/// Maximal alphanumeric runs of `text`, in order.
+fn alphanumeric_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+}
+
 /// Canonical text of one candidate file for the cross-encoder, or `None` when
 /// the file is unreadable or canonicalizes to nothing. Reads at most
 /// [`FSFS_RERANK_DOCUMENT_READ_LIMIT`] bytes: the model truncates at 512
@@ -26569,6 +26684,7 @@ mod tests {
                 vec![SearchHitPayload {
                     rank: 1,
                     path: "network.rs".to_owned(),
+                    line: None,
                     score: 1.0,
                     snippet: Some("x".repeat(3 << 20)),
                     lexical_rank: None,
@@ -34781,6 +34897,88 @@ mod tests {
         });
     }
 
+    #[test]
+    fn locate_snippet_line_anchors_on_the_fragment_not_the_first_mention() {
+        let text = "fn alpha() { retry(); }\n\n// retry with backoff after the network fails\n";
+        let snippet = "retry with backoff after the network";
+        assert_eq!(super::locate_snippet_line(text, snippet, "RETRY"), Some(3));
+        // Without a query word in the fragment, its first word anchors it.
+        assert_eq!(super::locate_snippet_line(text, "backoff after", "zzz"), Some(3));
+    }
+
+    #[test]
+    fn locate_snippet_line_survives_collapsed_markup_and_rejects_missing_text() {
+        // Canonicalization collapses whitespace and strips markdown markup.
+        let text = "# Title\n\nSome **bold** words\nand   more words here\n";
+        assert_eq!(
+            super::locate_snippet_line(text, "Title Some bold words and more", "more"),
+            Some(4)
+        );
+        // A link target is gone from the fragment; the one-word window holds.
+        let linked = "see the\n[guide](https://example.com/guide) for setup\n";
+        assert_eq!(
+            super::locate_snippet_line(linked, "see the guide for setup", "setup"),
+            Some(2)
+        );
+        // The file no longer holds the fragment: no line, not a guess.
+        assert_eq!(
+            super::locate_snippet_line("retry later\nwith backoff\n", "retry with jitter", "retry"),
+            None
+        );
+        assert_eq!(super::locate_snippet_line(text, "", "more"), None);
+    }
+
+    /// Hits name the line of their file where the snippet's query word sits;
+    /// once the file stops holding that text, the hit has no line.
+    #[test]
+    fn search_hits_carry_the_line_of_their_snippet() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create project dir");
+            let notes = project.join("notes.md");
+            fs::write(
+                &notes,
+                "# Notes\n\nfirst paragraph\n\nthe wombatine appears here\n",
+            )
+            .expect("write notes");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+
+            let search_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(project.join(".frankensearch")),
+                ..CliInput::default()
+            });
+            let search = || {
+                search_runtime.execute_search_payloads_with_mode(
+                    &cx,
+                    "wombatine",
+                    5,
+                    SearchExecutionMode::LexicalOnly,
+                )
+            };
+            let hit = search().await.expect("lexical search")[0].hits[0].clone();
+            assert_eq!(hit.path, "notes.md");
+            assert_eq!(hit.line, Some(5), "{hit:?}");
+
+            fs::write(&notes, "# Notes\n\nrewritten without the term\n").expect("rewrite notes");
+            let hit = search().await.expect("lexical search")[0].hits[0].clone();
+            assert!(hit.snippet.is_some(), "the index still holds the old text");
+            assert_eq!(hit.line, None, "{hit:?}");
+        });
+    }
+
     /// The embedding text is the canonicalizer's 2,000-character prefix with
     /// long fenced code collapsed; the lexical index must still see all text.
     #[test]
@@ -37917,6 +38115,7 @@ mod tests {
             vec![SearchHitPayload {
                 rank: 1,
                 path: "src/auth.rs".to_owned(),
+                line: None,
                 score: 0.5,
                 snippet: None,
                 lexical_rank: Some(0),
@@ -37969,6 +38168,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 1,
                     path: "src/auth.rs".to_owned(),
+                    line: None,
                     score: 0.82,
                     snippet: Some("auth middleware".to_owned()),
                     lexical_rank: Some(0),
@@ -37979,6 +38179,7 @@ mod tests {
                 SearchHitPayload {
                     rank: 2,
                     path: "README.md".to_owned(),
+                    line: None,
                     score: 0.71,
                     snippet: None,
                     lexical_rank: Some(1),
@@ -38060,6 +38261,7 @@ mod tests {
         let hit = SearchHitPayload {
             rank: 1,
             path: "src/auth.rs".to_owned(),
+            line: None,
             score: 0.016,
             snippet: None,
             lexical_rank: Some(0),
@@ -38120,6 +38322,7 @@ mod tests {
             vec![SearchHitPayload {
                 rank: 1,
                 path: "docs/config.md".to_owned(),
+                line: None,
                 score: 0.91,
                 snippet: None,
                 lexical_rank: Some(0),
@@ -40279,6 +40482,7 @@ mod tests {
             SearchHitPayload {
                 rank,
                 path: path.to_owned(),
+                line: None,
                 score: 0.016,
                 snippet: None,
                 lexical_rank: Some(lexical_rank),
@@ -40398,6 +40602,7 @@ mod tests {
             let hit = |rank, path: &str, lexical_rank, vector_rank| SearchHitPayload {
                 rank,
                 path: path.to_owned(),
+                line: None,
                 score: 0.2,
                 snippet: None,
                 lexical_rank,
@@ -40482,6 +40687,7 @@ mod tests {
         let hash_hit = SearchHitPayload {
             rank: 1,
             path: "src/lib.rs".to_owned(),
+            line: None,
             score: 0.2,
             snippet: None,
             lexical_rank: Some(1),
@@ -40542,6 +40748,7 @@ mod tests {
             vec![SearchHitPayload {
                 rank: 1,
                 path: "src/lib.rs".to_owned(),
+                line: None,
                 score: 0.2,
                 snippet: None,
                 lexical_rank: None,
@@ -40584,6 +40791,7 @@ mod tests {
             vec![SearchHitPayload {
                 rank: 1,
                 path: "src/lib.rs".to_owned(),
+                line: None,
                 score: 0.2,
                 snippet: None,
                 lexical_rank: None,
@@ -40624,6 +40832,7 @@ mod tests {
             vec![SearchHitPayload {
                 rank: 1,
                 path: "src/lib.rs".to_owned(),
+                line: None,
                 score: 0.2,
                 snippet: None,
                 lexical_rank: Some(0),
@@ -40643,6 +40852,7 @@ mod tests {
         let remapped = SearchHitPayload {
             rank: 1,
             path: "src/lib.rs".to_owned(),
+            line: None,
             score: 0.2,
             snippet: None,
             lexical_rank: Some(1),
@@ -42499,6 +42709,7 @@ mod tests {
                 vec![SearchHitPayload {
                     rank: 1,
                     path: "src/lib.rs".to_owned(),
+                    line: None,
                     score: 0.75,
                     snippet: Some("cached snippet".to_owned()),
                     lexical_rank: Some(0),
@@ -42647,6 +42858,7 @@ mod tests {
                 vec![SearchHitPayload {
                     rank: 1,
                     path: "generation-a.rs".to_owned(),
+                    line: None,
                     score: 0.75,
                     snippet: None,
                     lexical_rank: Some(0),
@@ -42767,6 +42979,7 @@ mod tests {
                 vec![SearchHitPayload {
                     rank: 1,
                     path: "src/main.rs".to_owned(),
+                    line: None,
                     score: 0.9,
                     snippet: None,
                     lexical_rank: None,
@@ -42850,6 +43063,7 @@ mod tests {
                 vec![SearchHitPayload {
                     rank: 1,
                     path: document_id.to_owned(),
+                    line: None,
                     score: 1.0,
                     snippet: None,
                     lexical_rank: Some(0),

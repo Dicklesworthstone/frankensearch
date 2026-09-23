@@ -426,6 +426,7 @@ fn json_toon_parity_search_payload_with_degradation_advice()
         vec![SearchHitPayload {
             rank: 1,
             path: "src/search.rs".to_owned(),
+            line: None,
             score: 0.812,
             snippet: Some("quality refinement timed out".to_owned()),
             lexical_rank: Some(1),
