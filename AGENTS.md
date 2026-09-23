@@ -164,7 +164,7 @@ command that runs every gate this repository relies on (there is no GitHub Actio
 gate runs on real hosts through `dsr quality --tool frankensearch`) is:
 
 ```bash
-scripts/quality-gate.sh          # fmt, check, clippy -D warnings, cross-target check, lib tests, fsfs tests, real-model e2e, quick-start gate
+scripts/quality-gate.sh          # fmt, check, clippy -D warnings, cross-target check, workspace unit+integration tests, fsfs tests, real-model e2e, quick-start gate
 ```
 
 Its individual pieces, when you want just one:
