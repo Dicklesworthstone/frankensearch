@@ -417,6 +417,7 @@ fsfs explain 1 --index-dir ./search-store
 fsfs append-batch --file updates.jsonl --index-dir ./search-store
 fsfs delete src/obsolete.rs --index-dir ./search-store
 fsfs compact --index-dir ./search-store
+fsfs flush --index-dir ./search-store --format json
 fsfs search "ownership rules" --expand --index-dir ./search-store --format json
 ```
 
@@ -429,8 +430,10 @@ store instead of redirecting the command to a different legacy index.
 `--file` or standard input. It inserts or replaces the supplied documents in
 lexical data, every present vector tier, and an existing catalog, then publishes
 one complete successor. Repeated IDs use their final body in the batch; the
-reported count is the number of unique inserted or replaced IDs. The canonical
-body is shared by all components. It does not scan, create, or edit source files.
+reported count is the number of unique inserted or replaced IDs. Lexical search
+retains the whole canonical body, including long-document suffixes and code;
+both embedding tiers use the ordinary indexer's bounded canonical input.
+It does not scan, create, or edit source files.
 If the store has a quality tier, its matching producer must be available too.
 Malformed input, incompatible embedding responses, and cancellation before
 publication leave the selected generation unchanged. An empty batch publishes
@@ -460,10 +463,20 @@ using that generation while a watcher or another command publishes successors.
 Reopen the dashboard to select the latest generation. Without an interactive
 terminal, the command reports the selected generation's status.
 
+`flush` revalidates and synchronizes the selected generation, its inventory,
+and its selection descriptor without changing sealed engine files. Its receipt
+identifies the exact generation and reports `durability: confirmed`,
+`scope: selected_generation`, `generation_changed: false`, and
+`watch_queue_drained: false`. The barrier works for every selected complete
+bundle, including vector-only bundles, without loading models, opening search
+engines, rescanning source files, or draining queued watch changes. An active
+publisher, corrupt bundle, cancellation before completion, or failed
+synchronization prevents a success receipt. This also provides an explicit
+durability retry after a publication whose final directory synchronization failed.
+
 This is the cooperative local store. The complete FSVI v2 authority migration
 and automatic reclamation of retained generations remain unfinished. Commands
-refuse to create a nested index inside a sealed generation. Direct `flush` is
-still unavailable for these stores.
+refuse to create a nested index inside a sealed generation.
 
 ## Reproducible Showcase Suite
 
@@ -865,10 +878,36 @@ available through `ActivatedTierSearch` and `TwoTierSearcher`; the raw-vector
 Graph construction is synchronous. Generation replacement builds every requested
 successor graph before installing new state; failure leaves the current index
 intact. The quality policy survives a successor that temporarily has no quality
-tier. This route does not persist graph sidecars, and a fresh open starts with
-exact retrieval. Legacy v1 opens are ineligible. The `fsfs` defaults remain
-unchanged; ANN recall and latency still need qualification at representative
-corpus sizes.
+tier. To retain the graphs across process restarts, explicitly save both graphs
+in a generation-specific staging directory before publishing that generation:
+
+```rust,ignore
+let fast_graph = staging.join("fast.fshnsw");
+let quality_graph = staging.join("quality.fshnsw");
+index.save_native_fast_hnsw(&fast_graph)?;
+index.save_native_quality_hnsw(&quality_graph)?;
+
+// After publishing, dropping the old index and reopening the same admitted
+// FSVI v2 generation, load its graphs before sharing with TwoTierSearcher.
+// Publication may move the staged bundle, so use its final directory.
+let fast_graph = published_generation.join("fast.fshnsw");
+let quality_graph = published_generation.join("quality.fshnsw");
+reopened.load_native_fast_hnsw(&fast_graph, HnswParams::default(), 42)?;
+reopened.load_native_quality_hnsw(&quality_graph, HnswParams::default(), 43)?;
+```
+
+Each `.fshnsw.receipt` binds the graph to the complete FSVI image, generation,
+embedding identity, live document set, construction parameters and seed. Loading
+requires exact agreement with the admitted tier and requested policy. Missing,
+stale, corrupt, wrong-tier or policy-mismatched sidecars return errors and leave
+the previous graph installed. Loading performs no writes or automatic rebuilds;
+a fresh open stays exact until a graph is explicitly built or loaded.
+
+Saving writes the graph and adjacent receipt separately. Callers must serialize
+writers and finish both files before selecting the containing generation; save
+does not publish a generation or authorize mutation of a sealed bundle. Legacy
+v1 opens are ineligible. The `fsfs` defaults remain unchanged; ANN recall and
+latency still need qualification at representative corpus sizes.
 
 ## Baseline Performance Envelope (Reference)
 

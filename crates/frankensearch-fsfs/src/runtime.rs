@@ -27,6 +27,7 @@ use asupersync::fs::{read as async_file_read, read_to_string as async_file_read_
 #[cfg(unix)]
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::spawn_blocking;
+use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
@@ -377,6 +378,16 @@ impl SearchFilterExpr {
     }
 }
 
+impl SearchFilter for SearchFilterExpr {
+    fn matches(&self, doc_id: &str, _metadata: Option<&serde_json::Value>) -> bool {
+        self.matches_doc_id(doc_id)
+    }
+
+    fn name(&self) -> &str {
+        "fsfs.path_and_extension"
+    }
+}
+
 const DISK_BUDGET_RATIO_DIVISOR: u64 = 10;
 const DISK_BUDGET_CAP_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const DISK_BUDGET_FALLBACK_BYTES: u64 = DISK_BUDGET_CAP_BYTES;
@@ -491,7 +502,7 @@ const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
 const FSFS_SEARCH_SEMANTIC_HEAD_PROGRESSIVE_STEP: usize = 16;
 const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v4";
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v5";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v3";
 const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v1";
@@ -8765,9 +8776,10 @@ impl FsfsRuntime {
                 }) {
                     hit.semantic_score = Some(blend_hit.score);
                 }
-                let rerank_hit = payload.rerank.as_ref().and_then(|stage| {
-                    stage.scores.iter().find(|score| score.path == hit.path)
-                });
+                let rerank_hit = payload
+                    .rerank
+                    .as_ref()
+                    .and_then(|stage| stage.scores.iter().find(|score| score.path == hit.path));
                 hit.rerank_score = rerank_hit.map(|score| score.score);
                 hit.rerank_logit = rerank_hit.and_then(|score| score.logit);
             }
@@ -9746,6 +9758,43 @@ impl FsfsRuntime {
         )
     }
 
+    /// Widen the lexical prefix until it contains enough eligible documents.
+    /// Quill's ID-only search has no path predicate, so a fixed oversampling
+    /// factor cannot preserve recall for arbitrarily selective CLI filters.
+    /// Keep the original ranking here for the lexical tail and shadow oracle;
+    /// select the eligible fusion head only after gathering has completed.
+    fn gather_lexical_candidates(
+        cx: &Cx,
+        lexical: &QuillSearchIndex,
+        query: &str,
+        output_limit: usize,
+        filter_expr: Option<&SearchFilterExpr>,
+        live_docs: usize,
+    ) -> SearchResult<Vec<LexicalCandidate>> {
+        if output_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let ceiling = live_docs.max(1);
+        let mut fetch_limit = output_limit.min(ceiling);
+        loop {
+            let hits = lexical.search_doc_ids(cx, query, fetch_limit)?;
+            let enough_matches = filter_expr.is_none_or(|filter| {
+                hits.iter()
+                    .filter(|hit| filter.matches_doc_id(&hit.document_id))
+                    .take(output_limit)
+                    .count()
+                    >= output_limit
+            });
+            if enough_matches || hits.len() < fetch_limit || fetch_limit >= ceiling {
+                return Ok(hits
+                    .iter()
+                    .map(|hit| LexicalCandidate::new(hit.document_id.clone(), hit.score))
+                    .collect());
+            }
+            fetch_limit = fetch_limit.saturating_mul(2).min(ceiling);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_limited_payload(
         orchestrator: QueryExecutionOrchestrator,
@@ -10357,11 +10406,14 @@ impl FsfsRuntime {
                         || filter_expr.is_some()
                         || snippet_hits.is_empty();
                     let full_candidates = if needs_full_lexical {
-                        lexical
-                            .search_doc_ids(cx, &normalized_query, output_limit)?
-                            .iter()
-                            .map(|hit| LexicalCandidate::new(hit.document_id.clone(), hit.score))
-                            .collect::<Vec<_>>()
+                        Self::gather_lexical_candidates(
+                            cx,
+                            lexical,
+                            &normalized_query,
+                            output_limit,
+                            filter_expr.as_ref(),
+                            lexical_doc_count.unwrap_or(0),
+                        )?
                     } else {
                         snippet_hits
                             .into_iter()
@@ -10371,19 +10423,32 @@ impl FsfsRuntime {
                     let lexical_head_budget = lexical_budget.min(planning_limit).max(1);
                     let head_candidates = full_candidates
                         .iter()
+                        .filter(|candidate| {
+                            filter_expr
+                                .as_ref()
+                                .is_none_or(|filter| filter.matches_doc_id(&candidate.doc_id))
+                        })
                         .take(lexical_head_budget)
                         .cloned()
                         .collect::<Vec<_>>();
                     (full_candidates, head_candidates)
                 } else {
-                    let full_candidates = lexical
-                        .search_doc_ids(cx, &normalized_query, output_limit)?
-                        .iter()
-                        .map(|hit| LexicalCandidate::new(hit.document_id.clone(), hit.score))
-                        .collect::<Vec<_>>();
+                    let full_candidates = Self::gather_lexical_candidates(
+                        cx,
+                        lexical,
+                        &normalized_query,
+                        output_limit,
+                        filter_expr.as_ref(),
+                        lexical_doc_count.unwrap_or(0),
+                    )?;
                     let lexical_head_budget = lexical_budget.min(planning_limit).max(1);
                     let head_candidates = full_candidates
                         .iter()
+                        .filter(|candidate| {
+                            filter_expr
+                                .as_ref()
+                                .is_none_or(|filter| filter.matches_doc_id(&candidate.doc_id))
+                        })
                         .take(lexical_head_budget)
                         .cloned()
                         .collect::<Vec<_>>();
@@ -10404,6 +10469,13 @@ impl FsfsRuntime {
             }
             let serving_results = lexical_candidates
                 .iter()
+                // Shadow observes the unfiltered lexical query at its original
+                // limit, not the extra prefix gathered for the CLI predicate.
+                .take(if filter_expr.is_some() {
+                    output_limit
+                } else {
+                    usize::MAX
+                })
                 .map(|candidate| frankensearch_core::ScoredResult {
                     doc_id: candidate.doc_id.clone().into(),
                     score: candidate.score,
@@ -10436,7 +10508,15 @@ impl FsfsRuntime {
                 semantic_index_available: resources.vector_index.is_some(),
                 lexical_stage_enabled: plan.lexical_stage.enabled,
                 lexical_head_count: lexical_head_candidates.len(),
-                lexical_full_count: lexical_candidates.len(),
+                lexical_full_count: filter_expr.as_ref().map_or(
+                    lexical_candidates.len(),
+                    |filter| {
+                        lexical_candidates
+                            .iter()
+                            .filter(|candidate| filter.matches_doc_id(&candidate.doc_id))
+                            .count()
+                    },
+                ),
             });
         let lexical_tail_complete = filter_expr.is_none()
             && plan.lexical_stage.enabled
@@ -10581,8 +10661,13 @@ impl FsfsRuntime {
                         // indistinguishable from "no relevant documents".
                         // Availability failures surface as operator advice;
                         // benign reasons stay debug-level.
-                        match index.search_top_k_classified(&query_embedding, semantic_budget, None)
-                        {
+                        match index.search_top_k_classified(
+                            &query_embedding,
+                            semantic_budget,
+                            filter_expr
+                                .as_ref()
+                                .map(|filter| filter as &dyn SearchFilter),
+                        ) {
                             Ok(classified) => {
                                 if let Some(reason) = classified.zero_signal {
                                     if hash_control_lane {
@@ -10723,7 +10808,13 @@ impl FsfsRuntime {
             let quality_outcome = self
                 .with_quality_deadline(
                     cx,
-                    self.quality_candidates(cx, resources, &normalized_query, quality_budget),
+                    self.quality_candidates(
+                        cx,
+                        resources,
+                        &normalized_query,
+                        quality_budget,
+                        filter_expr.as_ref(),
+                    ),
                 )
                 .await;
 
@@ -11371,25 +11462,57 @@ impl FsfsRuntime {
     /// to the WAL without a full index rebuild.
     ///
     /// Each input line must be a JSON object with at least `"id"` and `"text"`
-    /// fields. The text is embedded using the configured fast embedder and the
-    /// resulting vector is appended to the WAL.
+    /// fields. Both configured tiers receive bounded canonical text, while
+    /// lexical indexing retains the complete canonical body. Admission is
+    /// bounded and all-or-error, with duplicate IDs using their final body.
     async fn run_append_batch_command(&self, cx: &Cx) -> SearchResult<()> {
+        self.run_append_batch_command_with_writer(cx, &mut std::io::stdout())
+            .await
+    }
+
+    async fn run_append_batch_command_with_writer<W: Write>(
+        &self,
+        cx: &Cx,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        retained_search_checkpoint(cx)?;
         let index_root = self.resolve_status_index_root()?;
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
+        // Complete input validation before taking publication ownership or
+        // opening any mutable artifact, using the retained appender's limits.
+        let docs = retained_reuse::read_append_documents(cx, self).await?;
+        if docs.is_empty() {
+            let index = VectorIndex::open_read_only(&vector_path)?;
+            retained_search_checkpoint(cx)?;
+            return self.emit_append_batch_receipt(
+                0,
+                index.wal_record_count(),
+                index.needs_compaction(),
+                writer,
+            );
+        }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let embedder = self.resolve_fast_embedder()?;
-        {
+        let fast_identity = {
             // Admit against a shared reader so we do not hold a write mapping
             // across stdin/file read and embedding (those can block forever).
             let index = VectorIndex::open_read_only(&vector_path)?;
             Self::admit_vector_generation_for_embedder(&index, embedder.as_ref())?;
-        }
-        let dimension = embedder.dimension();
+            let identity = embedder.identity()?.clone();
+            identity.validate()?;
+            if index.embedder_revision() != identity.fingerprint() {
+                return Err(SearchError::UnverifiableRemoteSpace {
+                    producer: "fsfs.append_batch.fast".to_owned(),
+                    reason: "the fast producer identity changed during admission".to_owned(),
+                });
+            }
+            identity
+        };
         // A generation that carries a quality tier must keep it in step: an
         // appended document that the fast tier can find but the quality tier
         // cannot would silently vanish from REFINED results. If the quality
@@ -11408,120 +11531,85 @@ impl FsfsRuntime {
             })?;
             let index = VectorIndex::open_read_only(&quality_vector_path)?;
             Self::admit_quality_generation_for_embedder(&index, quality_embedder.as_ref())?;
-            Some((quality_embedder, index.dimension()))
+            let identity = quality_embedder.identity()?.clone();
+            identity.validate()?;
+            if index.embedder_revision() != identity.fingerprint() {
+                return Err(SearchError::UnverifiableRemoteSpace {
+                    producer: "fsfs.append_batch.quality".to_owned(),
+                    reason: "the quality producer identity changed during admission".to_owned(),
+                });
+            }
+            Some((quality_embedder, identity))
         } else {
             None
         };
-
-        // Read input lines from --file or stdin.
-        let lines: Vec<String> = if let Some(ref file_path) = self.cli_input.input_file {
-            let content = async_file_read_to_string(file_path)
-                .await
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.append_batch.read_file",
-                    source: Box::new(source),
-                })?;
-            content.lines().map(str::to_owned).collect()
-        } else {
-            let stdin = std::io::stdin();
-            let reader = BufReader::new(stdin.lock());
-            reader
-                .lines()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.append_batch.stdin",
-                    source: Box::new(source),
-                })?
-        };
-
-        if lines.is_empty() {
-            info!("append-batch: no input lines; nothing to do");
-            println!("0 documents appended");
-            return Ok(());
-        }
-
-        // Parse JSONL and extract id + text.
-        let mut docs: Vec<(String, String)> = Vec::with_capacity(lines.len());
-        for (line_num, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let parsed: serde_json::Value =
-                serde_json::from_str(trimmed).map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.append_batch.parse",
-                    source: Box::new(std::io::Error::other(format!(
-                        "line {}: invalid JSON: {source}",
-                        line_num + 1
-                    ))),
-                })?;
-            let id = parsed
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| SearchError::InvalidConfig {
-                    field: "append_batch.input".to_owned(),
-                    value: format!("line {}", line_num + 1),
-                    reason: "each JSON line must have a string \"id\" field".to_owned(),
-                })?
-                .to_owned();
-            let text = parsed
-                .get("text")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| SearchError::InvalidConfig {
-                    field: "append_batch.input".to_owned(),
-                    value: format!("line {}", line_num + 1),
-                    reason: "each JSON line must have a string \"text\" field".to_owned(),
-                })?
-                .to_owned();
-            docs.push((id, text));
-        }
-
-        if docs.is_empty() {
-            info!("append-batch: all input lines were blank; nothing to do");
-            println!("0 documents appended");
-            return Ok(());
-        }
 
         // Batch-embed all texts, for every tier this generation carries.
         let mut entries: Vec<(String, Vec<f32>)> = Vec::with_capacity(docs.len());
         let mut quality_entries: Vec<(String, Vec<f32>)> =
             Vec::with_capacity(if quality.is_some() { docs.len() } else { 0 });
-        for (id, text) in &docs {
-            let embedding =
-                embedder
-                    .embed(cx, text)
-                    .await
-                    .map_err(|source| SearchError::SubsystemError {
-                        subsystem: "fsfs.append_batch.embed",
-                        source: Box::new(std::io::Error::other(format!(
-                            "failed to embed doc '{}': {source}",
-                            id
-                        ))),
-                    })?;
-            if embedding.len() != dimension {
-                return Err(SearchError::DimensionMismatch {
-                    expected: dimension,
-                    found: embedding.len(),
+        for (id, document) in &docs {
+            retained_search_checkpoint(cx)?;
+            let response = embedder.embed_bound(cx, &document.embedding_text).await;
+            retained_search_checkpoint(cx)?;
+            let embedding = response?;
+            embedding.validate()?;
+            if embedding.identity != fast_identity {
+                return Err(SearchError::UnverifiableRemoteSpace {
+                    producer: "fsfs.append_batch.fast".to_owned(),
+                    reason:
+                        "the returned fast embedding does not carry the admitted producer identity"
+                            .to_owned(),
                 });
             }
-            entries.push((id.clone(), embedding));
-            if let Some((quality_embedder, quality_dimension)) = quality.as_ref() {
-                let quality_embedding =
-                    quality_embedder.embed(cx, text).await.map_err(|source| {
-                        SearchError::SubsystemError {
-                            subsystem: "fsfs.append_batch.embed_quality",
-                            source: Box::new(std::io::Error::other(format!(
-                                "failed to quality-embed doc '{id}': {source}"
-                            ))),
-                        }
-                    })?;
-                if quality_embedding.len() != *quality_dimension {
-                    return Err(SearchError::DimensionMismatch {
-                        expected: *quality_dimension,
-                        found: quality_embedding.len(),
+            entries.push((id.clone(), embedding.values));
+            if let Some((quality_embedder, identity)) = quality.as_ref() {
+                let response = quality_embedder
+                    .embed_bound(cx, &document.embedding_text)
+                    .await;
+                retained_search_checkpoint(cx)?;
+                let embedding = response?;
+                embedding.validate()?;
+                if &embedding.identity != identity {
+                    return Err(SearchError::UnverifiableRemoteSpace {
+                        producer: "fsfs.append_batch.quality".to_owned(),
+                        reason: "the returned quality embedding does not carry the admitted producer identity"
+                            .to_owned(),
                     });
                 }
-                quality_entries.push((id.clone(), quality_embedding));
+                quality_entries.push((id.clone(), embedding.values));
+            }
+        }
+
+        retained_search_checkpoint(cx)?;
+        // A provider may change its advertised identity during inference.
+        // Re-admit both tiers before publishing even the lexical arm, and bind
+        // that admission to the identities that produced this batch.
+        for (path, producer, identity, is_quality) in [
+            (&vector_path, Some(&embedder), Some(&fast_identity), false),
+            (
+                &quality_vector_path,
+                quality.as_ref().map(|(producer, _)| producer),
+                quality.as_ref().map(|(_, identity)| identity),
+                true,
+            ),
+        ] {
+            let (Some(producer), Some(identity)) = (producer, identity) else {
+                continue;
+            };
+            let index = VectorIndex::open_read_only(path)?;
+            if is_quality {
+                Self::admit_quality_generation_for_embedder(&index, producer.as_ref())?;
+            } else {
+                Self::admit_vector_generation_for_embedder(&index, producer.as_ref())?;
+            }
+            if producer.identity()? != identity
+                || index.embedder_revision() != identity.fingerprint()
+            {
+                return Err(SearchError::UnverifiableRemoteSpace {
+                    producer: "fsfs.append_batch".to_owned(),
+                    reason: "the producer or generation changed after batch embedding".to_owned(),
+                });
             }
         }
 
@@ -11533,16 +11621,17 @@ impl FsfsRuntime {
         // The lexical arm first: a document must be findable by BM25 (and
         // therefore eligible for `in_both_sources`) in the same publication
         // that makes it findable semantically.
+        retained_search_checkpoint(cx)?;
         publication_lease.fence("append-batch lexical publication")?;
         let lexical_revision = pressure_timestamp_ms();
         let lexical_mutations = docs
             .iter()
-            .map(|(id, text)| {
+            .map(|(id, document)| {
                 LexicalMutation::upsert(
                     id.clone(),
                     lexical_revision,
                     IngestionClass::FullSemanticLexical,
-                    text.clone(),
+                    document.lexical_text.clone(),
                     "append_batch",
                 )
             })
@@ -11550,6 +11639,9 @@ impl FsfsRuntime {
         self.apply_one_shot_lexical_mutations(cx, &index_root, &lexical_mutations)
             .await?;
 
+        // Lexical publication has begun the legacy cross-engine mutation.
+        // Complete both WAL writes without introducing another cancellation
+        // boundary that would deliberately leave the tiers at different bodies.
         publication_lease.fence("append-batch WAL publication")?;
         #[cfg(unix)]
         self.quiesce_query_daemon("append-batch")?;
@@ -11569,27 +11661,44 @@ impl FsfsRuntime {
             needs_compaction = index.needs_compaction(),
             "append-batch completed"
         );
+        self.emit_append_batch_receipt(
+            count,
+            index.wal_record_count(),
+            index.needs_compaction(),
+            writer,
+        )
+    }
 
+    fn emit_append_batch_receipt<W: Write>(
+        &self,
+        count: usize,
+        wal_total: usize,
+        needs_compaction: bool,
+        writer: &mut W,
+    ) -> SearchResult<()> {
         if self.cli_input.format == OutputFormat::Table {
-            println!("{count} documents appended to WAL");
-            if index.needs_compaction() {
-                println!(
-                    "hint: WAL has {} entries; consider running 'fsfs compact'",
-                    index.wal_record_count()
-                );
+            if count == 0 {
+                writeln!(writer, "0 documents appended")?;
+            } else {
+                writeln!(writer, "{count} documents appended to WAL")?;
+            }
+            if needs_compaction {
+                writeln!(
+                    writer,
+                    "hint: WAL has {wal_total} entries; consider running 'fsfs compact'",
+                )?;
             }
         } else {
             let payload = serde_json::json!({
                 "appended": count,
-                "wal_total": index.wal_record_count(),
-                "needs_compaction": index.needs_compaction(),
+                "wal_total": wal_total,
+                "needs_compaction": needs_compaction,
             });
             let meta = meta_for_format("append-batch", self.cli_input.format);
             let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
-            let mut stdout = std::io::stdout();
-            emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+            emit_envelope(&envelope, self.cli_input.format, writer)?;
             if self.cli_input.format != OutputFormat::Jsonl {
-                stdout
+                writer
                     .write_all(b"\n")
                     .map_err(|source| SearchError::SubsystemError {
                         subsystem: "fsfs.append_batch",
@@ -13615,6 +13724,13 @@ impl FsfsRuntime {
     }
 
     fn resolve_lexical_engine(index_root: &Path) -> SearchResult<LexicalEngineLayout> {
+        match fs::symlink_metadata(
+            index_root.join(crate::generation_store::COMPLETE_GENERATION_MANIFEST),
+        ) {
+            Ok(_) => return Self::resolve_sealed_lexical_engine(index_root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         if index_root.join(CURRENT_FILE_NAME).is_file() {
             return Self::resolve_blue_green_lexical_root(index_root);
         }
@@ -13644,6 +13760,51 @@ impl FsfsRuntime {
         }
 
         Self::resolve_blue_green_lexical_root(&lexical_root)
+    }
+
+    /// Classify a sealed lexical root without adopting a child or publishing
+    /// CURRENT. Readers and status share this path, including failed opens.
+    fn resolve_sealed_lexical_engine(index_root: &Path) -> SearchResult<LexicalEngineLayout> {
+        use frankensearch_quill::LexicalLayout;
+
+        let lexical_root = if index_root.join(CURRENT_FILE_NAME).try_exists()? {
+            index_root.to_path_buf()
+        } else {
+            index_root.join("lexical")
+        };
+        let layout =
+            frankensearch_quill::inspect_lexical_layout(&lexical_root).map_err(|source| {
+                SearchError::SubsystemError {
+                    subsystem: "fsfs.lexical.current",
+                    source: Box::new(source),
+                }
+            })?;
+        match layout {
+            LexicalLayout::Empty => Ok(LexicalEngineLayout::Missing { lexical_root }),
+            LexicalLayout::DirectQuill | LexicalLayout::DirectTantivy => {
+                let engine = if matches!(layout, LexicalLayout::DirectQuill) {
+                    BlueGreenEngine::Quill
+                } else {
+                    BlueGreenEngine::Tantivy
+                };
+                Ok(LexicalEngineLayout::LegacyDirect {
+                    lexical_root: index_root.to_path_buf(),
+                    engine,
+                    engine_dir: lexical_root,
+                })
+            }
+            LexicalLayout::BlueGreen {
+                pointer,
+                pointer_on_disk: true,
+            } => Ok(LexicalEngineLayout::BlueGreen {
+                lexical_root,
+                pointer,
+            }),
+            _ => Err(complete_cli::complete_cli_error(
+                "lexical_layout",
+                "the sealed lexical layout is incomplete or corrupt; adoption and repair must happen before generation publication",
+            )),
+        }
     }
 
     fn resolve_blue_green_lexical_root(lexical_root: &Path) -> SearchResult<LexicalEngineLayout> {
@@ -15756,6 +15917,7 @@ impl FsfsRuntime {
         if layout.engine() != Some(BlueGreenEngine::Tantivy) {
             return Ok(());
         }
+        crate::generation_store::reject_published_write(index_root)?;
 
         let previous_dir = layout
             .engine_dir()
@@ -17682,6 +17844,7 @@ impl FsfsRuntime {
         resources: &mut SearchExecutionResources,
         query: &str,
         budget: usize,
+        filter_expr: Option<&SearchFilterExpr>,
     ) -> SearchResult<Option<Vec<SemanticCandidate>>> {
         self.maybe_prepare_quality_embedder(cx, resources).await?;
         let (Some(index), Some(embedder)) =
@@ -17691,8 +17854,15 @@ impl FsfsRuntime {
         };
         let query_embedding = embedder.embed(cx, query).await?;
         let index = Arc::clone(index);
+        let filter_expr = filter_expr.cloned();
         let hits = Self::quality_blocking(cx, move || {
-            index.search_top_k(&query_embedding, budget, None)
+            index.search_top_k(
+                &query_embedding,
+                budget,
+                filter_expr
+                    .as_ref()
+                    .map(|filter| filter as &dyn SearchFilter),
+            )
         })
         .await??;
         Ok(Some(
@@ -24860,7 +25030,8 @@ mod tests {
         });
     }
     use frankensearch_core::{
-        Embedder, IndexableDocument, LexicalRead as _, ModelCategory, SearchError, SearchFuture,
+        Canonicalizer as _, DefaultCanonicalizer, Embedder, IndexableDocument, LexicalRead as _,
+        ModelCategory, SearchError, SearchFuture,
     };
     // QuillIndex writes go through its inherent methods; the only trait-dispatched
     // writer here is the Tantivy oracle, which lives behind `shadow-oracle`.
@@ -34702,6 +34873,203 @@ mod tests {
     }
 
     #[test]
+    fn runtime_search_selective_lexical_filter_fills_requested_limit() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("filter fixture");
+            let lexical_path = temp.path().join("lexical");
+            let writer = create_test_quill(&cx, &lexical_path).await;
+            for index in 0..64 {
+                writer
+                    .index_document(
+                        &cx,
+                        &IndexableDocument::new(format!("docs/excluded-{index}.md"), "needle"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            for (path, repetitions) in [
+                ("docs/outside.rs", 0),
+                ("src/first.RS", 20),
+                ("src/second.rs", 40),
+            ] {
+                writer
+                    .index_document(
+                        &cx,
+                        &IndexableDocument::new(
+                            path,
+                            format!("needle {}", "irrelevant ".repeat(repetitions)),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+            writer.commit(&cx).await.unwrap();
+            let unfiltered = writer.search_doc_ids(&cx, "needle", 67).unwrap();
+            assert!(
+                unfiltered
+                    .iter()
+                    .take(64)
+                    .all(|hit| !hit.document_id.starts_with("src/")),
+                "eligible documents must lie beyond every initial lexical budget"
+            );
+            drop(writer);
+
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                filter: Some("path:src/ ext:rs".to_owned()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_execution_resources(&cx, SearchExecutionMode::LexicalOnly)
+                .await
+                .unwrap();
+            for include_snippets in [false, true] {
+                for limit in [1, 2, 10, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL] {
+                    let phases = runtime
+                        .execute_search_payloads_with_mode_using_resources(
+                            &cx,
+                            "needle",
+                            limit,
+                            SearchExecutionMode::LexicalOnly,
+                            &mut resources,
+                            SearchExecutionFlags {
+                                include_snippets,
+                                persist_explain_session: false,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let paths = phases[0]
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.as_str())
+                        .collect::<Vec<_>>();
+                    let expected = if limit == 1 {
+                        vec!["src/first.RS"]
+                    } else {
+                        vec!["src/first.RS", "src/second.rs"]
+                    };
+                    assert_eq!(
+                        paths, expected,
+                        "limit={limit}, snippets={include_snippets}"
+                    );
+                    assert_eq!(phases[0].hits[0].lexical_rank, Some(0));
+                }
+            }
+            let mut no_match = runtime.clone();
+            no_match.cli_input.filter = Some("path:missing/ ext:rs".to_owned());
+            let phases = no_match
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    "needle",
+                    1,
+                    SearchExecutionMode::LexicalOnly,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                phases[0].hits.is_empty(),
+                "exhaustion must not admit excluded documents"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_search_selective_filter_reaches_both_vector_tiers() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().expect("vector filter fixture");
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let write = |name: &str, embedder: &str, matching: &str| {
+                let path = temp.path().join(name);
+                let mut writer = VectorIndex::create(&path, embedder, 2).unwrap();
+                for index in 0..64 {
+                    writer
+                        .write_record(&format!("docs/excluded-{index}.md"), &[1.0, 0.0])
+                        .unwrap();
+                }
+                writer.write_record("docs/outside.rs", &[1.0, 0.0]).unwrap();
+                writer.write_record(matching, &[0.5, 0.866_025_4]).unwrap();
+                writer.finish().unwrap();
+                let index = VectorIndex::open_read_only(&path).unwrap();
+                assert!(
+                    index
+                        .search_top_k(&[1.0, 0.0], 64, None)
+                        .unwrap()
+                        .iter()
+                        .all(|hit| !hit.doc_id.starts_with("src/")),
+                    "fixture's permitted hit must be outside the unfiltered head"
+                );
+                index
+            };
+            resources.vector_index =
+                Some(write("filtered-fast.fsvi", "blend-fast-2", "src/fast.rs"));
+            resources.quality_vector_index = Some(Arc::new(write(
+                "filtered-quality.fsvi",
+                "blend-quality-2",
+                "src/quality.rs",
+            )));
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let mut config = FsfsConfig::default();
+            config.search.quality_weight = 1.0;
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                filter: Some("ext:rs path:src/".to_owned()),
+                ..CliInput::default()
+            });
+            let flags = SearchExecutionFlags {
+                include_snippets: false,
+                persist_explain_session: false,
+            };
+            let query = "how do semantic policies affect ranking";
+            for mode in [SearchExecutionMode::FastOnly, SearchExecutionMode::Full] {
+                let phases = runtime
+                    .execute_search_payloads_with_mode_using_resources(
+                        &cx,
+                        query,
+                        1,
+                        mode,
+                        &mut resources,
+                        flags,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(phases[0].phase, SearchOutputPhase::Initial);
+                assert_eq!(phases[0].hits.len(), 1);
+                assert_eq!(phases[0].hits[0].path, "src/fast.rs");
+                assert_eq!(phases[0].hits[0].semantic_rank, Some(0));
+                if matches!(mode, SearchExecutionMode::Full) {
+                    assert_eq!(phases.len(), 2);
+                    assert_eq!(phases[1].phase, SearchOutputPhase::Refined);
+                    assert_eq!(phases[1].hits.len(), 1);
+                    assert_eq!(phases[1].hits[0].path, "src/quality.rs");
+                }
+            }
+            let mut no_match = runtime.clone();
+            no_match.cli_input.filter = Some("path:missing/".to_owned());
+            let phases = no_match
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    query,
+                    1,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    flags,
+                )
+                .await
+                .unwrap();
+            assert!(phases.iter().all(|phase| phase.hits.is_empty()));
+            assert_eq!(phases.last().unwrap().phase, SearchOutputPhase::Refined);
+        });
+    }
+
+    #[test]
     fn runtime_search_payload_rejects_invalid_filter_key() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -36205,6 +36573,385 @@ mod tests {
         });
     }
 
+    struct AppendEmbedderOverrides {
+        fast: Option<Arc<dyn Embedder>>,
+        quality: Option<Arc<dyn Embedder>>,
+    }
+
+    impl AppendEmbedderOverrides {
+        fn install() -> Self {
+            let previous = Self {
+                fast: super::test_fast_embedder_override(),
+                quality: super::test_quality_embedder_override(),
+            };
+            super::set_test_fast_embedder(Some(Arc::new(SemanticFastEmbedder)));
+            super::set_test_quality_embedder(Some(Arc::new(SemanticQualityStub)));
+            previous
+        }
+    }
+
+    impl Drop for AppendEmbedderOverrides {
+        fn drop(&mut self) {
+            super::set_test_fast_embedder(self.fast.take());
+            super::set_test_quality_embedder(self.quality.take());
+        }
+    }
+
+    async fn append_batch_fixture(cx: &Cx, parent: &Path) -> FsfsRuntime {
+        let root = parent.join("index");
+        fs::create_dir_all(root.join("vector")).unwrap();
+        let lexical = create_test_quill(cx, &root.join("lexical")).await;
+        lexical
+            .index_document(
+                cx,
+                &IndexableDocument::new("existing.md", "preservedlexical original body"),
+            )
+            .await
+            .unwrap();
+        lexical.commit(cx).await.unwrap();
+        drop(lexical);
+        for (relative, embedder) in [
+            (
+                super::FSFS_VECTOR_INDEX_FILE,
+                &SemanticFastEmbedder as &dyn Embedder,
+            ),
+            (
+                super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+                &SemanticQualityStub as &dyn Embedder,
+            ),
+        ] {
+            let mut writer = VectorIndex::create_with_revision(
+                &root.join(relative),
+                embedder.id(),
+                &embedder.identity().unwrap().fingerprint(),
+                embedder.dimension(),
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            let vector = embedder
+                .embed(cx, "preservedlexical original body")
+                .await
+                .unwrap();
+            writer.write_record("existing.md", &vector).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut config = FsfsConfig::default();
+        config.indexing.offline = true;
+        FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::AppendBatch,
+            index_dir: Some(root),
+            input_file: Some(parent.join("input.jsonl")),
+            format: OutputFormat::Json,
+            ..CliInput::default()
+        })
+    }
+
+    #[test]
+    fn append_batch_preserves_full_lexical_text_and_canonical_vectors_in_both_tiers() {
+        run_test_with_cx(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = append_batch_fixture(&cx, temp.path()).await;
+            let root = runtime.cli_input.index_dir.as_ref().unwrap();
+            let raw = format!("# Café\r\n{}\r\nappendtailsentinel", "context ".repeat(400));
+            let body = [
+                serde_json::json!({"id": "existing.md", "text": "superseded body"}),
+                serde_json::json!({"id": "existing.md", "text": raw}),
+            ]
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+            fs::write(runtime.cli_input.input_file.as_ref().unwrap(), body).unwrap();
+            let mut output = Vec::new();
+            runtime
+                .run_append_batch_command_with_writer(&cx, &mut output)
+                .await
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(receipt["data"]["appended"], 1);
+            assert_eq!(receipt["data"]["wal_total"], 1);
+            let canonical = DefaultCanonicalizer::default().canonicalize(&raw);
+            assert!(!canonical.contains("appendtailsentinel"));
+            for (relative, embedder) in [
+                (
+                    super::FSFS_VECTOR_INDEX_FILE,
+                    &SemanticFastEmbedder as &dyn Embedder,
+                ),
+                (
+                    super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+                    &SemanticQualityStub as &dyn Embedder,
+                ),
+            ] {
+                let index = VectorIndex::open_read_only(&root.join(relative)).unwrap();
+                let records = index.wal_records().collect::<Vec<_>>();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].0, "existing.md");
+                assert_eq!(records[0].1, embedder.embed(&cx, &canonical).await.unwrap());
+            }
+            let lexical =
+                QuillSearchIndex::open(&cx, &root.join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap();
+            let hits = lexical
+                .search_doc_ids(&cx, "appendtailsentinel", 10)
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].document_id, "existing.md");
+            assert!(
+                lexical
+                    .search_doc_ids(&cx, "superseded", 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[derive(Clone, Copy)]
+    enum AppendProviderFault {
+        ForeignBoundIdentity,
+        NonFinite,
+        ChangedAdvertisedIdentity,
+        Cancelled,
+    }
+
+    struct FaultingAppendEmbedder {
+        inner: Arc<dyn Embedder>,
+        fault: AppendProviderFault,
+        changed: AtomicBool,
+        changed_identity: frankensearch_core::EmbeddingIdentityBundleV1,
+    }
+
+    impl FaultingAppendEmbedder {
+        fn new(inner: Arc<dyn Embedder>, fault: AppendProviderFault) -> Self {
+            let mut changed_identity = inner.identity().unwrap().clone();
+            changed_identity
+                .producer
+                .implementation_revision
+                .push_str("-changed");
+            Self {
+                inner,
+                fault,
+                changed: AtomicBool::new(false),
+                changed_identity,
+            }
+        }
+    }
+
+    impl Embedder for FaultingAppendEmbedder {
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            if self.changed.load(Ordering::SeqCst) {
+                Ok(&self.changed_identity)
+            } else {
+                self.inner.identity()
+            }
+        }
+
+        fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            // The raw path succeeds, so these failures only appear when the
+            // production appender actually checks bound provider responses.
+            self.inner.embed(cx, text)
+        }
+
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, frankensearch_core::IdentityBoundEmbedding> {
+            Box::pin(async move {
+                let mut response = self.inner.embed_bound(cx, text).await?;
+                match self.fault {
+                    AppendProviderFault::ForeignBoundIdentity => {
+                        response.identity = self.changed_identity.clone();
+                    }
+                    AppendProviderFault::NonFinite => response.values[0] = f32::NAN,
+                    AppendProviderFault::ChangedAdvertisedIdentity => {
+                        self.changed.store(true, Ordering::SeqCst);
+                    }
+                    AppendProviderFault::Cancelled => {
+                        cx.set_cancel_requested(true);
+                        return Err(SearchError::EmbeddingFailed {
+                            model: self.id().to_owned(),
+                            source: "cancelled provider failure".into(),
+                        });
+                    }
+                }
+                Ok(response)
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+        fn is_semantic(&self) -> bool {
+            self.inner.is_semantic()
+        }
+        fn category(&self) -> ModelCategory {
+            self.inner.category()
+        }
+    }
+
+    #[test]
+    fn append_batch_refuses_bound_provider_faults_before_any_tier_or_lexical_write() {
+        run_test_with_cx(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            for fault_quality in [false, true] {
+                for fault in [
+                    AppendProviderFault::ForeignBoundIdentity,
+                    AppendProviderFault::NonFinite,
+                    AppendProviderFault::ChangedAdvertisedIdentity,
+                    AppendProviderFault::Cancelled,
+                ] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let runtime = append_batch_fixture(&cx, temp.path()).await;
+                    let root = runtime.cli_input.index_dir.as_ref().unwrap();
+                    let before = [
+                        super::FSFS_VECTOR_INDEX_FILE,
+                        super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+                    ]
+                    .map(|relative| fs::read(root.join(relative)).unwrap());
+                    super::set_test_fast_embedder(Some(if fault_quality {
+                        Arc::new(SemanticFastEmbedder)
+                    } else {
+                        Arc::new(FaultingAppendEmbedder::new(
+                            Arc::new(SemanticFastEmbedder),
+                            fault,
+                        ))
+                    }));
+                    super::set_test_quality_embedder(Some(if fault_quality {
+                        Arc::new(FaultingAppendEmbedder::new(
+                            Arc::new(SemanticQualityStub),
+                            fault,
+                        ))
+                    } else {
+                        Arc::new(SemanticQualityStub)
+                    }));
+                    fs::write(
+                        runtime.cli_input.input_file.as_ref().unwrap(),
+                        "{\"id\":\"new.md\",\"text\":\"unpublishedsentinel replacement\"}\n",
+                    )
+                    .unwrap();
+                    let mut output = Vec::new();
+                    let error = runtime
+                        .run_append_batch_command_with_writer(&cx, &mut output)
+                        .await
+                        .unwrap_err();
+                    cx.set_cancel_requested(false);
+                    match fault {
+                        AppendProviderFault::ForeignBoundIdentity
+                        | AppendProviderFault::ChangedAdvertisedIdentity => {
+                            assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+                        }
+                        AppendProviderFault::NonFinite => {
+                            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                                if field == "identity_bound_embedding.values"));
+                        }
+                        AppendProviderFault::Cancelled => {
+                            assert!(matches!(error, SearchError::Cancelled { .. }));
+                        }
+                    }
+                    assert!(output.is_empty());
+                    for (relative, bytes) in [
+                        super::FSFS_VECTOR_INDEX_FILE,
+                        super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+                    ]
+                    .into_iter()
+                    .zip(&before)
+                    {
+                        assert_eq!(fs::read(root.join(relative)).unwrap(), *bytes);
+                        assert_eq!(
+                            VectorIndex::open_read_only(&root.join(relative))
+                                .unwrap()
+                                .wal_record_count(),
+                            0
+                        );
+                    }
+                    let lexical =
+                        QuillSearchIndex::open(&cx, &root.join("lexical"), QuillConfig::default())
+                            .await
+                            .unwrap();
+                    assert!(
+                        lexical
+                            .search_doc_ids(&cx, "unpublishedsentinel", 10)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert_eq!(
+                        lexical
+                            .search_doc_ids(&cx, "preservedlexical", 10)
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn append_batch_rejects_malformed_input_and_emits_structured_empty_receipt() {
+        run_test_with_cx(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = append_batch_fixture(&cx, temp.path()).await;
+            let root = runtime.cli_input.index_dir.as_ref().unwrap();
+            let input = runtime.cli_input.input_file.as_ref().unwrap();
+            fs::write(
+                input,
+                "{\"id\":\"new.md\",\"text\":\"unpublishedsentinel\"}\n{invalid}",
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            assert!(
+                runtime
+                    .run_append_batch_command_with_writer(&cx, &mut output)
+                    .await
+                    .is_err()
+            );
+            assert!(output.is_empty());
+            for relative in [
+                super::FSFS_VECTOR_INDEX_FILE,
+                super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+            ] {
+                assert_eq!(
+                    VectorIndex::open_read_only(&root.join(relative))
+                        .unwrap()
+                        .wal_record_count(),
+                    0
+                );
+            }
+            fs::write(input, "\n\r\n  \n").unwrap();
+            runtime
+                .run_append_batch_command_with_writer(&cx, &mut output)
+                .await
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(receipt["ok"], true);
+            assert_eq!(receipt["data"]["appended"], 0);
+            assert_eq!(receipt["data"]["wal_total"], 0);
+            assert_eq!(receipt["data"]["needs_compaction"], false);
+            let lexical =
+                QuillSearchIndex::open(&cx, &root.join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap();
+            assert!(
+                lexical
+                    .search_doc_ids(&cx, "unpublishedsentinel", 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
     #[test]
     fn live_ingest_refuses_identity_mismatched_vector_generation() {
         run_test_with_cx(|cx| async move {
@@ -37192,7 +37939,10 @@ mod tests {
         let applied = rerank_progress_frames(&payload);
         assert_eq!(applied.len(), 1);
         assert_eq!(applied[0].reason_code, "query.stage.rerank.applied");
-        assert_eq!((applied[0].completed_units, applied[0].total_units), (1, Some(4)));
+        assert_eq!(
+            (applied[0].completed_units, applied[0].total_units),
+            (1, Some(4))
+        );
         assert!(applied[0].message.contains("ms-marco-minilm-l-6-v2"));
 
         payload.rerank = Some(RerankStagePayload::skipped(
@@ -37201,7 +37951,10 @@ mod tests {
         ));
         let skipped = rerank_progress_frames(&payload);
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].reason_code, "query.stage.rerank.disabled.unavailable");
+        assert_eq!(
+            skipped[0].reason_code,
+            "query.stage.rerank.disabled.unavailable"
+        );
         assert_eq!(skipped[0].completed_units, 0);
     }
 
@@ -41639,14 +42392,17 @@ mod tests {
             let cache_path = runtime.search_cache_path(&key).unwrap();
             let mut old_record: serde_json::Value =
                 serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
-            old_record["schema_version"] = "fsfs.search.cache.v3".into();
-            fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
-            assert!(
-                runtime
-                    .try_load_search_payload_cache(&key, &cache_fingerprint)
-                    .unwrap()
-                    .is_none()
-            );
+            for old_schema in ["fsfs.search.cache.v3", "fsfs.search.cache.v4"] {
+                old_record["schema_version"] = old_schema.into();
+                fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
+                assert!(
+                    runtime
+                        .try_load_search_payload_cache(&key, &cache_fingerprint)
+                        .unwrap()
+                        .is_none(),
+                    "old ranking policy must not replay from {old_schema}"
+                );
+            }
             runtime
                 .write_search_payload_cache(&key, &payloads, &cache_fingerprint)
                 .unwrap();

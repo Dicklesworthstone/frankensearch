@@ -1878,8 +1878,14 @@ mod tests {
                 }
                 assert_eq!(store.active(&cx).unwrap(), Some(selected.clone()));
                 assert_eq!(sealed_inventory(selected.path()), before);
-                assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
-                assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), count);
+                assert_eq!(
+                    fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    pointer
+                );
+                assert_eq!(
+                    fs::read_dir(root.join("generations")).unwrap().count(),
+                    count
+                );
                 assert!(!models.exists());
             }
         });
@@ -1892,24 +1898,30 @@ mod tests {
             let (mut runtime, _, root) = fixture(directory.path());
             runtime.cli_input.command = CliCommand::Flush;
             let mut output = Vec::new();
-            assert!(runtime
-                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
-                .is_err());
+            assert!(
+                runtime
+                    .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                    .is_err()
+            );
             assert!(output.is_empty());
             assert!(!root.exists());
             CompleteGenerationStore::create(&cx, &root).unwrap();
-            assert!(runtime
-                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
-                .is_err());
+            assert!(
+                runtime
+                    .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                    .is_err()
+            );
             assert!(output.is_empty());
             assert!(!root.join(COMPLETE_GENERATION_POINTER).exists());
             publish(&runtime, &cx, &root).await;
             let pointer_path = root.join(COMPLETE_GENERATION_POINTER);
             let pointer = fs::read(&pointer_path).unwrap();
             fs::write(&pointer_path, b"corrupt selection").unwrap();
-            assert!(runtime
-                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
-                .is_err());
+            assert!(
+                runtime
+                    .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                    .is_err()
+            );
             assert!(output.is_empty());
             assert_eq!(fs::read(&pointer_path).unwrap(), b"corrupt selection");
             fs::write(&pointer_path, &pointer).unwrap();
@@ -1917,9 +1929,11 @@ mod tests {
             let selected = store.active(&cx).unwrap().unwrap();
             fs::write(selected.path().join("unexpected-artifact"), b"damage").unwrap();
             let damaged = sealed_inventory(selected.path());
-            assert!(runtime
-                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
-                .is_err());
+            assert!(
+                runtime
+                    .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                    .is_err()
+            );
             assert!(output.is_empty());
             assert_eq!(sealed_inventory(selected.path()), damaged);
             assert_eq!(fs::read(pointer_path).unwrap(), pointer);
@@ -1937,9 +1951,11 @@ mod tests {
             let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
             let pending = store.begin(&cx).unwrap();
             let mut output = Vec::new();
-            assert!(runtime
-                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
-                .is_err());
+            assert!(
+                runtime
+                    .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                    .is_err()
+            );
             assert!(output.is_empty());
             drop(pending);
             cx.set_cancel_requested(true);
@@ -1950,7 +1966,10 @@ mod tests {
             cx.set_cancel_requested(false);
             assert!(output.is_empty());
             assert_eq!(store.active(&cx).unwrap(), selected);
-            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
             runtime
                 .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
                 .unwrap();
@@ -1984,7 +2003,103 @@ mod tests {
                 Err(SearchError::Io(error)) if error.kind() == ErrorKind::BrokenPipe
             ));
             assert_eq!(store.active(&cx).unwrap(), selected);
-            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+        });
+    }
+
+    #[test]
+    fn complete_cli_flush_confirms_selected_bundle_and_preserves_pinned_readers() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let before = store.active(&cx).unwrap().unwrap();
+            let inventory = sealed_inventory(before.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let hits_before = reader.search(&cx, "sharedtoken", 10).await.unwrap();
+            let mut input = runtime.cli_input.clone();
+            input.command = CliCommand::Flush;
+            let command = runtime.clone().with_cli_input(input);
+            let mut output = Vec::new();
+            command
+                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(receipt["ok"], true);
+            assert_eq!(receipt["data"]["generation_id"], before.id());
+            assert_eq!(receipt["data"]["manifest_sha256"], before.manifest_sha256());
+            assert_eq!(receipt["data"]["durability"], "confirmed");
+            assert_eq!(receipt["data"]["scope"], "selected_generation");
+            assert_eq!(receipt["data"]["generation_changed"], false);
+            assert_eq!(receipt["data"]["watch_queue_drained"], false);
+            // Exercise the public dispatcher too: the selected store must no
+            // longer hit the legacy writer path or the unsupported-command arm.
+            command
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await
+                .unwrap();
+            assert_eq!(sealed_inventory(before.path()), inventory);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(store.active(&cx).unwrap(), Some(before));
+            let hits_after = reader.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert_eq!(
+                hits_after.last().unwrap().hits,
+                hits_before.last().unwrap().hits
+            );
+        });
+    }
+
+    #[test]
+    fn complete_cli_flush_and_failed_readers_never_adopt_an_unpublished_lexical_child() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let store = CompleteGenerationStore::create(&cx, &root).unwrap();
+            let candidate = store.begin(&cx).unwrap();
+            let lexical = candidate.path().join("lexical");
+            fs::create_dir_all(lexical.join("quill-v1")).unwrap();
+            fs::write(lexical.join("quill-v1/MANIFEST"), b"adoption marker").unwrap();
+            // A generic complete store validates inventory, while engine
+            // admission belongs to the consumer. Plant exactly the layout
+            // that the legacy resolver would adopt by writing a new CURRENT.
+            let selected =
+                require_durable_publication(candidate.publish(&cx, |_, _| Ok(())).unwrap())
+                    .unwrap();
+            let before = sealed_inventory(selected.path());
+            let mut output = Vec::new();
+            runtime
+                .run_complete_generation_flush_with_writer(&cx, &root, &mut output)
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(receipt["ok"], true);
+            assert_eq!(receipt["data"]["generation_id"], selected.id());
+            assert_eq!(receipt["data"]["durability"], "confirmed");
+            assert_eq!(receipt["data"]["scope"], "selected_generation");
+            assert_eq!(receipt["data"]["generation_changed"], false);
+            assert_eq!(sealed_inventory(selected.path()), before);
+            assert!(!selected.path().join("lexical/CURRENT").exists());
+            let error = runtime.open_retained_search(&cx, &root).await.unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "complete_generation.lexical_layout"));
+            let mut input = runtime.cli_input.clone();
+            input.index_dir = Some(selected.path().to_path_buf());
+            let error = runtime
+                .clone()
+                .with_cli_input(input)
+                .collect_status_payload()
+                .unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "complete_generation.lexical_layout"));
+            assert_eq!(sealed_inventory(selected.path()), before);
+            assert_eq!(store.active(&cx).unwrap(), Some(selected));
         });
     }
 
