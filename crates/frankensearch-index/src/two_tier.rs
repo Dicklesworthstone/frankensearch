@@ -28,7 +28,10 @@ use tracing::{debug, info, warn};
 use crate::hnsw::HNSW_META_FORMAT_CURRENT;
 #[cfg(feature = "ann")]
 use crate::hnsw::HnswLoadDisposition;
-use crate::native_hnsw::{HnswParams, ValidatedNativeHnsw};
+use crate::native_hnsw::{
+    HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
+    native_hnsw_generation_receipt_path,
+};
 use crate::{
     ClassifiedHits, FsviAdmissionError, FsviUpgradeRequired, FsviV2IdentityBinding, Quantization,
     SearchParams, ValidatedFsviBytes, VectorIndex, VectorMetadata, dot_product_f32_f32,
@@ -501,7 +504,7 @@ impl TierSource {
     }
 }
 
-/// Explicit in-memory tier retrieval policy and its current owner's graph.
+/// Explicit tier retrieval policy and its current owner's built or loaded graph.
 /// A fast-only successor retains the policy with no graph until quality returns.
 #[derive(Debug)]
 struct NativeTierHnsw {
@@ -1129,7 +1132,8 @@ impl TwoTierIndex {
     /// without an exact retry. A failed build preserves the previous policy.
     ///
     /// [`Self::try_replace_admitted_v2`] builds the successor's graph before
-    /// swapping either tier. Fresh pathname opens require explicit opt-in again.
+    /// swapping either tier. Fresh pathname opens require explicit opt-in again,
+    /// either by construction or [`Self::load_native_fast_hnsw`].
     ///
     /// # Errors
     /// Rejects invalid graph parameters, legacy tiers, or disagreement between
@@ -1182,7 +1186,8 @@ impl TwoTierIndex {
     /// [`Self::try_replace_admitted_v2`]. A successor without quality keeps the
     /// policy with no graph; a later quality-bearing successor builds its own
     /// graph. A fresh pathname reopen starts in exact mode until explicitly
-    /// opted in again. Build and query failures propagate without exact retry.
+    /// opted in again, either by construction or [`Self::load_native_quality_hnsw`].
+    /// Build and query failures propagate without exact retry.
     ///
     /// # Errors
     /// Rejects invalid graph parameters, legacy tiers, or disagreement between
@@ -1210,6 +1215,184 @@ impl TwoTierIndex {
             graph,
         });
         Ok(())
+    }
+
+    /// Persist the installed fast graph and its exact-owner receipt.
+    ///
+    /// The destination must use the `.fshnsw` extension. Its adjacent
+    /// `.fshnsw.receipt` binds the graph to the complete retained FSVI bytes,
+    /// generation, producer, input, storage, live document set, parameters and
+    /// seed. Neither output may alias either vector artifact.
+    ///
+    /// This is an explicit staging operation. The caller owns a trusted,
+    /// generation-specific destination and serializes its writers. Publish
+    /// the containing generation only after both files are durable: the two
+    /// file replacements are not one transaction. This never selects a new
+    /// generation or changes the installed retrieval policy.
+    ///
+    /// # Errors
+    /// Returns an error if no fast graph is installed, an output aliases a
+    /// vector artifact, or graph/receipt validation or persistence fails.
+    pub fn save_native_fast_hnsw(
+        &self,
+        graph_path: &Path,
+    ) -> SearchResult<NativeHnswGenerationReceiptV2> {
+        self.save_native_hnsw_policy(self.native_fast_hnsw.as_ref(), "fast", graph_path)
+    }
+
+    /// Persist the installed quality graph and its exact-owner receipt.
+    ///
+    /// Follows the explicit staging and durability contract of
+    /// [`Self::save_native_fast_hnsw`]. A fast-only generation cannot persist
+    /// an absent quality graph, even when its quality policy is retained.
+    ///
+    /// # Errors
+    /// Returns an error if no quality graph is installed, an output aliases a
+    /// vector artifact, or graph/receipt validation or persistence fails.
+    pub fn save_native_quality_hnsw(
+        &self,
+        graph_path: &Path,
+    ) -> SearchResult<NativeHnswGenerationReceiptV2> {
+        self.save_native_hnsw_policy(self.native_quality_hnsw.as_ref(), "quality", graph_path)
+    }
+
+    /// Load and install a persisted fast graph for this exact retained tier.
+    ///
+    /// Receipt admission checks the complete owner identity and bytes before
+    /// graph loading. The graph's stored parameters and seed must also equal
+    /// the requested policy. Loading performs no writes and never rebuilds or
+    /// silently falls back to exact retrieval. Any failure preserves both
+    /// tiers and their existing retrieval policies. After success, queries
+    /// retain the admitted graph in memory; later pathname changes cannot
+    /// retarget it. Generation replacement rebuilds for the successor owner.
+    ///
+    /// # Errors
+    /// Rejects legacy/mixed tiers, invalid or mismatched parameters/seed, and
+    /// missing, stale, corrupt or incompatible graph/receipt artifacts.
+    pub fn load_native_fast_hnsw(
+        &mut self,
+        graph_path: &Path,
+        params: HnswParams,
+        seed: u64,
+    ) -> SearchResult<()> {
+        let policy = self.load_native_hnsw_policy(
+            Some(&self.fast_source),
+            "fast",
+            graph_path,
+            params,
+            seed,
+        )?;
+        self.native_fast_hnsw = Some(policy);
+        Ok(())
+    }
+
+    /// Load and install a persisted quality graph for this exact retained tier.
+    ///
+    /// Follows [`Self::load_native_fast_hnsw`]'s read-only, validate-before-swap
+    /// contract. A missing quality tier is an error; a sidecar cannot supply
+    /// missing vector coverage. Quality candidates remain independent of the
+    /// fast candidate pool after loading.
+    ///
+    /// # Errors
+    /// Rejects absent/legacy/mixed tiers, invalid or mismatched parameters/seed,
+    /// and missing, stale, corrupt or incompatible graph/receipt artifacts.
+    pub fn load_native_quality_hnsw(
+        &mut self,
+        graph_path: &Path,
+        params: HnswParams,
+        seed: u64,
+    ) -> SearchResult<()> {
+        let policy = self.load_native_hnsw_policy(
+            self.quality_source.as_ref(),
+            "quality",
+            graph_path,
+            params,
+            seed,
+        )?;
+        self.native_quality_hnsw = Some(policy);
+        Ok(())
+    }
+
+    fn save_native_hnsw_policy(
+        &self,
+        policy: Option<&NativeTierHnsw>,
+        tier: &str,
+        graph_path: &Path,
+    ) -> SearchResult<NativeHnswGenerationReceiptV2> {
+        let graph = policy
+            .and_then(|policy| policy.graph.as_ref())
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: format!("two_tier.native_{tier}_hnsw.graph"),
+                value: "absent".to_owned(),
+                reason: "build or load this tier's graph before persisting it".to_owned(),
+            })?;
+        let receipt_path = native_hnsw_generation_receipt_path(graph_path)?;
+        let outputs = [graph_path, receipt_path.as_path()];
+        for output in outputs {
+            for vector in [Some(self.fast_index_path()), self.quality_index_path()]
+                .into_iter()
+                .flatten()
+            {
+                if paths_alias(output, vector)? {
+                    return Err(SearchError::InvalidConfig {
+                        field: format!("two_tier.native_{tier}_hnsw.path"),
+                        value: "vector-alias".to_owned(),
+                        reason:
+                            "graph and receipt outputs must be distinct from both vector artifacts"
+                                .to_owned(),
+                    });
+                }
+            }
+        }
+        if paths_alias(graph_path, &receipt_path)? {
+            return Err(SearchError::InvalidConfig {
+                field: format!("two_tier.native_{tier}_hnsw.path"),
+                value: "receipt-alias".to_owned(),
+                reason: "graph and receipt outputs must be distinct artifacts".to_owned(),
+            });
+        }
+        graph.save(graph_path)
+    }
+
+    fn load_native_hnsw_policy(
+        &self,
+        source: Option<&TierSource>,
+        tier: &str,
+        graph_path: &Path,
+        params: HnswParams,
+        seed: u64,
+    ) -> SearchResult<NativeTierHnsw> {
+        params.validate()?;
+        self.validate_native_hnsw_tiers(tier)?;
+        let Some(TierSource::AdmittedV2 { owner, .. }) = source else {
+            return Err(SearchError::InvalidConfig {
+                field: format!("two_tier.native_{tier}_hnsw.owner"),
+                value: "absent".to_owned(),
+                reason: "a persisted graph requires its admitted vector tier".to_owned(),
+            });
+        };
+        let (graph, receipt) = ValidatedNativeHnsw::load(Arc::clone(owner), graph_path)?;
+        let parameters_match = [
+            (receipt.params.m, params.m),
+            (receipt.params.m0, params.m0),
+            (receipt.params.ef_construction, params.ef_construction),
+            (receipt.params.ef_search, params.ef_search),
+        ]
+        .into_iter()
+        .all(|(loaded, requested)| usize::try_from(loaded) == Ok(requested));
+        if !parameters_match || receipt.seed != seed {
+            return Err(SearchError::InvalidConfig {
+                field: format!("two_tier.native_{tier}_hnsw.policy"),
+                value: "mismatch".to_owned(),
+                reason: "persisted graph parameters and seed must equal the requested policy"
+                    .to_owned(),
+            });
+        }
+        Ok(NativeTierHnsw {
+            params,
+            seed,
+            graph: Some(graph),
+        })
     }
 
     /// Join the complete retained generation and cross-tier contracts before
@@ -7783,6 +7966,216 @@ mod tests {
         "native-f32-values".clone_into(&mut query_identity.storage.endianness);
         BoundQueryEmbedding::new(vector.to_vec(), query_identity)
             .expect("bind a query embedding in the fixture's space")
+    }
+
+    #[test]
+    fn native_graph_load_rejects_policy_changes_without_replacing_either_tier() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let fast_path = root.join("fast.fsvi");
+        let quality_path = root.join("quality.fsvi");
+        let fast_graph = root.join("fast.fshnsw");
+        let quality_graph = root.join("quality.fshnsw");
+        let (fast_binding, fast_identity) = fsvi_v2_binding("persist-fast", 4, 74);
+        let (quality_binding, quality_identity) = fsvi_v2_binding("persist-quality", 4, 74);
+        write_v2_tier(
+            &fast_path,
+            &fast_binding,
+            &[("fast", &[1.0, 0.0, 0.0, 0.0])],
+        );
+        write_v2_tier(
+            &quality_path,
+            &quality_binding,
+            &[("quality", &[0.0, 1.0, 0.0, 0.0])],
+        );
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let open = || {
+            TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &fast_binding,
+                Some(&quality_binding),
+            )
+            .unwrap()
+        };
+        let params = HnswParams::default();
+        let mut index = open();
+        index.enable_native_fast_hnsw(params, 42).unwrap();
+        index.enable_native_quality_hnsw(params, 43).unwrap();
+        let fast_receipt = index.save_native_fast_hnsw(&fast_graph).unwrap();
+        let quality_receipt = index.save_native_quality_hnsw(&quality_graph).unwrap();
+        assert_eq!(fast_receipt.seed, 42);
+        assert_eq!(quality_receipt.seed, 43);
+        drop(index);
+
+        let mut index = open();
+        assert!(!index.has_native_fast_hnsw());
+        assert!(!index.has_native_quality_hnsw());
+        index
+            .load_native_fast_hnsw(&fast_graph, params, 42)
+            .unwrap();
+        index
+            .load_native_quality_hnsw(&quality_graph, params, 43)
+            .unwrap();
+        let embeddings = TieredQueryEmbeddings::progressive(
+            bound_query(&fast_identity, &[1.0, 0.0, 0.0, 0.0]),
+            bound_query(&quality_identity, &[0.0, 1.0, 0.0, 0.0]),
+        );
+        let before = index
+            .activate_owner_backed_search(&embeddings)
+            .unwrap()
+            .search_union(2)
+            .unwrap();
+        for changed in [
+            HnswParams {
+                m: params.m + 1,
+                ..params
+            },
+            HnswParams {
+                m0: params.m0 + 1,
+                ..params
+            },
+            HnswParams {
+                ef_construction: params.ef_construction + 1,
+                ..params
+            },
+            HnswParams {
+                ef_search: params.ef_search + 1,
+                ..params
+            },
+        ] {
+            for error in [
+                index
+                    .load_native_fast_hnsw(&fast_graph, changed, 42)
+                    .unwrap_err(),
+                index
+                    .load_native_quality_hnsw(&quality_graph, changed, 43)
+                    .unwrap_err(),
+            ] {
+                assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field.ends_with(".policy")));
+            }
+        }
+        assert!(
+            index
+                .load_native_fast_hnsw(&fast_graph, params, 43)
+                .is_err()
+        );
+        assert!(
+            index
+                .load_native_quality_hnsw(&quality_graph, params, 42)
+                .is_err()
+        );
+        assert!(index.has_native_fast_hnsw());
+        assert!(index.has_native_quality_hnsw());
+        let fast_policy = index.native_fast_hnsw.as_ref().unwrap();
+        let quality_policy = index.native_quality_hnsw.as_ref().unwrap();
+        assert_eq!((fast_policy.params, fast_policy.seed), (params, 42));
+        assert_eq!((quality_policy.params, quality_policy.seed), (params, 43));
+        assert_eq!(
+            index
+                .activate_owner_backed_search(&embeddings)
+                .unwrap()
+                .search_union(2)
+                .unwrap(),
+            before,
+        );
+
+        // Corruption must not discard a loaded graph or start a hidden rebuild.
+        fs::write(&fast_graph, b"corrupt graph").unwrap();
+        assert!(
+            index
+                .load_native_fast_hnsw(&fast_graph, params, 42)
+                .is_err()
+        );
+        fs::rename(&quality_graph, root.join("moved.fshnsw")).unwrap();
+        assert!(
+            index
+                .load_native_quality_hnsw(&quality_graph, params, 43)
+                .is_err()
+        );
+        assert!(!quality_graph.exists());
+        assert_eq!(fs::read(&fast_graph).unwrap(), b"corrupt graph");
+        assert_eq!(
+            index
+                .activate_owner_backed_search(&embeddings)
+                .unwrap()
+                .search_union(2)
+                .unwrap(),
+            before,
+        );
+    }
+
+    #[test]
+    fn native_graph_persistence_requires_present_graph_and_quality_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let fast_path = root.join("fast.fsvi");
+        let graph_path = root.join("missing.fshnsw");
+        let (binding, _) = fsvi_v2_binding("persist-fast-only", 4, 75);
+        write_v2_tier(&fast_path, &binding, &[("fast", &[1.0, 0.0, 0.0, 0.0])]);
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &TwoTierIndexPaths::new(&fast_path),
+            TwoTierConfig::default(),
+            &binding,
+            None,
+        )
+        .unwrap();
+        assert!(index.save_native_fast_hnsw(&graph_path).is_err());
+        index
+            .enable_native_quality_hnsw(HnswParams::default(), 1)
+            .unwrap();
+        assert!(index.save_native_quality_hnsw(&graph_path).is_err());
+        assert!(matches!(
+            index.load_native_quality_hnsw(&graph_path, HnswParams::default(), 1),
+            Err(SearchError::InvalidConfig { field, .. })
+                if field == "two_tier.native_quality_hnsw.owner"
+        ));
+        assert!(!index.has_native_quality_hnsw());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn native_graph_save_refuses_vector_and_receipt_aliases_before_writing() {
+        for vector_name in ["graph.fshnsw", "graph.fshnsw.receipt"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let fast_path = root.join(vector_name);
+            let graph_path = root.join("graph.fshnsw");
+            let (binding, _) = fsvi_v2_binding("persist-alias", 4, 76);
+            write_v2_tier(&fast_path, &binding, &[("fast", &[1.0, 0.0, 0.0, 0.0])]);
+            let before = fs::read(&fast_path).unwrap();
+            let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                &TwoTierIndexPaths::new(&fast_path),
+                TwoTierConfig::default(),
+                &binding,
+                None,
+            )
+            .unwrap();
+            index
+                .enable_native_fast_hnsw(HnswParams::default(), 1)
+                .unwrap();
+            assert!(matches!(
+                index.save_native_fast_hnsw(&graph_path),
+                Err(SearchError::InvalidConfig { value, .. }) if value == "vector-alias"
+            ));
+            assert_eq!(fs::read(&fast_path).unwrap(), before);
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+
+            #[cfg(unix)]
+            {
+                let hard_link = root.join("hard-link.fshnsw");
+                fs::hard_link(&fast_path, &hard_link).unwrap();
+                assert!(index.save_native_fast_hnsw(&hard_link).is_err());
+                assert_eq!(fs::read(&fast_path).unwrap(), before);
+                assert_eq!(fs::read(&hard_link).unwrap(), before);
+                assert!(
+                    !native_hnsw_generation_receipt_path(&hard_link)
+                        .unwrap()
+                        .exists()
+                );
+            }
+        }
     }
 
     #[test]

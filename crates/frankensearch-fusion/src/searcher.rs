@@ -5712,7 +5712,9 @@ mod tests {
     fn native_fast_and_both_tiers_preserve_progressive_hybrid_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for with_quality in [false, true] {
-                let dir = owner_backed_dir("native-fast-progressive");
+                let dir = owner_backed_dir("native-fast-progressive")
+                    .canonicalize()
+                    .expect("native persistence requires a canonical fixture root");
                 let fast_binding = artifact_binding("native-progressive-fast", 4, 67);
                 let quality_binding = artifact_binding("native-progressive-quality", 4, 67);
                 let mut index = if with_quality {
@@ -5738,31 +5740,117 @@ mod tests {
                         .unwrap(),
                     )
                 };
+                let fast_graph_path = dir.join("fast.fshnsw");
+                let quality_graph_path = dir.join("quality.fshnsw");
+                let params = frankensearch_index::native_hnsw::HnswParams::default();
                 let mut exact = None;
-                for (native, native_quality, asynchronous) in [
-                    (false, false, false),
-                    (true, false, false),
-                    (true, true, false),
-                    (true, true, true),
+                for mode in [
+                    "exact",
+                    "native-fast",
+                    "native-both",
+                    "native-async",
+                    "reopened",
+                    "refused-reload",
                 ] {
+                    let native = mode != "exact";
+                    let native_quality = !matches!(mode, "exact" | "native-fast");
+                    let asynchronous = matches!(mode, "native-async" | "refused-reload");
                     if native && !index.has_native_fast_hnsw() {
                         let index = Arc::get_mut(&mut index).expect("previous searcher dropped");
-                        index
-                            .enable_native_fast_hnsw(
-                                frankensearch_index::native_hnsw::HnswParams::default(),
-                                17,
-                            )
-                            .unwrap();
+                        index.enable_native_fast_hnsw(params, 17).unwrap();
                     }
                     if native_quality && with_quality && !index.has_native_quality_hnsw() {
                         Arc::get_mut(&mut index)
                             .expect("previous searcher dropped")
-                            .enable_native_quality_hnsw(
-                                frankensearch_index::native_hnsw::HnswParams::default(),
-                                19,
-                            )
+                            .enable_native_quality_hnsw(params, 19)
                             .unwrap();
                     }
+                    if mode == "reopened" {
+                        let receipt = index
+                            .save_native_fast_hnsw(&fast_graph_path)
+                            .expect("persist the fast graph with its owner receipt");
+                        assert_eq!(receipt.artifact_generation.sequence, 67);
+                        if with_quality {
+                            let receipt = index
+                                .save_native_quality_hnsw(&quality_graph_path)
+                                .expect("persist the quality graph with its owner receipt");
+                            assert_eq!(receipt.artifact_generation.sequence, 67);
+                        }
+                        // Release the original owners and topology. The next
+                        // invocation must use newly admitted FSVI bytes and
+                        // graphs loaded from the persisted artifacts.
+                        drop(index);
+                        let paths = if with_quality {
+                            frankensearch_index::TwoTierIndexPaths::new(dir.join("vector.fast.idx"))
+                                .with_quality_index(dir.join("vector.quality.idx"))
+                        } else {
+                            frankensearch_index::TwoTierIndexPaths::new(dir.join("fast.fsvi"))
+                        };
+                        let mut reopened = TwoTierIndex::open_admitted_v2_with_paths(
+                            &paths,
+                            TwoTierConfig::default(),
+                            &fast_binding,
+                            with_quality.then_some(&quality_binding),
+                        )
+                        .expect("reopen the persisted owners");
+                        assert!(!reopened.has_native_fast_hnsw());
+                        assert!(!reopened.has_native_quality_hnsw());
+                        reopened
+                            .load_native_fast_hnsw(&fast_graph_path, params, 17)
+                            .expect("load the persisted fast graph");
+                        if with_quality {
+                            reopened
+                                .load_native_quality_hnsw(&quality_graph_path, params, 19)
+                                .expect("load the persisted quality graph");
+                        }
+                        index = Arc::new(reopened);
+                    }
+                    if mode == "refused-reload" {
+                        let current = Arc::get_mut(&mut index).expect("previous searcher dropped");
+                        current
+                            .load_native_fast_hnsw(&fast_graph_path, params, 18)
+                            .expect_err("a foreign seed cannot replace the loaded fast policy");
+                        if with_quality {
+                            // Only the artifact generation differs in these
+                            // stale fixtures: models, vectors, parameters, and
+                            // construction seeds match the serving generation.
+                            let stale_dir = owner_backed_dir("native-progressive-stale")
+                                .canonicalize()
+                                .expect("native persistence requires a canonical fixture root");
+                            let mut stale = owner_backed_two_tier_index(
+                                &stale_dir,
+                                &artifact_binding("native-progressive-fast", 4, 66),
+                                &artifact_binding("native-progressive-quality", 4, 66),
+                            );
+                            let stale = Arc::get_mut(&mut stale).unwrap();
+                            stale.enable_native_fast_hnsw(params, 17).unwrap();
+                            stale.enable_native_quality_hnsw(params, 19).unwrap();
+                            let stale_fast_path = stale_dir.join("fast.fshnsw");
+                            let stale_quality_path = stale_dir.join("quality.fshnsw");
+                            stale.save_native_fast_hnsw(&stale_fast_path).unwrap();
+                            stale.save_native_quality_hnsw(&stale_quality_path).unwrap();
+                            for (path, seed) in [(&quality_graph_path, 19), (&stale_fast_path, 17)]
+                            {
+                                current
+                                    .load_native_fast_hnsw(path, params, seed)
+                                    .expect_err("foreign tier or generation cannot replace fast");
+                            }
+                            for (path, seed) in [(&fast_graph_path, 17), (&stale_quality_path, 19)]
+                            {
+                                current
+                                    .load_native_quality_hnsw(path, params, seed)
+                                    .expect_err(
+                                        "foreign tier or generation cannot replace quality",
+                                    );
+                            }
+                        }
+                    }
+                    assert_eq!(index.has_native_fast_hnsw(), native, "{mode}");
+                    assert_eq!(
+                        index.has_native_quality_hnsw(),
+                        native_quality && with_quality,
+                        "{mode}"
+                    );
                     let identity = in_memory_identity("native-progressive-fast", 4);
                     let mut fast = IdentityCountingEmbedder::new(
                         "fast",
@@ -5781,14 +5869,13 @@ mod tests {
                     )
                     .with_lexical(Arc::new(StubLexical))
                     .with_embedding_cache(8);
+                    let quality = Arc::new(IdentityCountingEmbedder::new(
+                        "quality",
+                        in_memory_identity("native-progressive-quality", 4),
+                        vec![0.0, 1.0, 0.0, 0.0],
+                    ));
                     if with_quality {
-                        searcher = searcher.with_quality_embedder(Arc::new(
-                            IdentityCountingEmbedder::new(
-                                "quality",
-                                in_memory_identity("native-progressive-quality", 4),
-                                vec![0.0, 1.0, 0.0, 0.0],
-                            ),
-                        ));
+                        searcher = searcher.with_quality_embedder(quality.clone());
                     }
                     let mut phases = Vec::new();
                     let mut snapshots = Vec::new();
@@ -5815,10 +5902,18 @@ mod tests {
                                     "doc-dead" | "doc-b" | "doc-far" | "lex-doc-1"
                                 )));
                                 assert!(results.iter().any(|hit| hit.doc_id == "lex-doc-0"));
-                                if with_quality && name == "refined" {
-                                    assert!(
-                                        results.iter().any(|hit| hit.doc_id == "doc-quality-only")
-                                    );
+                                if with_quality {
+                                    let quality_only =
+                                        results.iter().find(|hit| hit.doc_id == "doc-quality-only");
+                                    if name == "initial" {
+                                        assert!(quality_only.is_none());
+                                    } else {
+                                        let hit = quality_only.expect(
+                                            "quality retrieval reaches beyond the fast pool",
+                                        );
+                                        assert_eq!(hit.index, None);
+                                        assert!(hit.quality_score.is_some());
+                                    }
                                 }
                                 phases.push(name);
                                 snapshots.push(serde_json::to_value(results).unwrap());
@@ -5835,12 +5930,17 @@ mod tests {
                         }
                     );
                     assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), u64::from(native));
+                    assert_eq!(
+                        quality.bound_embeds.load(Ordering::Relaxed),
+                        u64::from(native_quality && with_quality),
+                        "{mode} must use the selected quality policy"
+                    );
                     assert_eq!(fast.embed_count(), 1);
                     assert_eq!(fast.identity_count(), 1);
                     if let Some(expected) = &exact {
                         assert_eq!(
                             &snapshots, expected,
-                            "native and exact public results agree"
+                            "{mode}: native and exact public results agree"
                         );
                     } else {
                         exact = Some(snapshots);
