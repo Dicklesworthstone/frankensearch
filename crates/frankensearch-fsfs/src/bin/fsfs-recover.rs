@@ -30,7 +30,8 @@ use serde::Serialize;
 
 const MAX_QUERY_BYTES: usize = 64 * 1024;
 const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
-const HELP: &str = "fsfs-recover --index-dir STORE --generation ID --manifest-sha256 SHA256 [OPTIONS]
+const HELP: &str =
+    "fsfs-recover --index-dir STORE --generation ID --manifest-sha256 SHA256 [OPTIONS]
 
 Inspect an explicitly receipted complete generation, even if FSFS-CURRENT is damaged.
 No directory scan, source rebuild, model download or automatic fallback is performed.
@@ -74,7 +75,9 @@ fn invalid(reason: impl Into<String>) -> SearchError {
 }
 
 fn text(value: OsString) -> SearchResult<String> {
-    value.into_string().map_err(|_| invalid("expected UTF-8 text"))
+    value
+        .into_string()
+        .map_err(|_| invalid("expected UTF-8 text"))
 }
 
 impl Options {
@@ -167,7 +170,8 @@ impl Options {
         // Bound identity text here; the store's canonical pointer decoder owns
         // the exact generation grammar. Do not accept a pathname as an identity.
         if self.generation.len() != 60
-            || self.generation
+            || self
+                .generation
                 .bytes()
                 .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-')
         {
@@ -180,7 +184,8 @@ impl Options {
                 "manifest SHA-256 must be exactly 64 hexadecimal characters",
             ));
         }
-        if self.query
+        if self
+            .query
             .as_ref()
             .is_some_and(|query| query.trim().is_empty() || query.len() > MAX_QUERY_BYTES)
         {
@@ -422,8 +427,7 @@ async fn execute(
 }
 
 fn configured_runtime(options: &Options) -> SearchResult<FsfsRuntime> {
-    let home =
-        frankensearch_core::platform_dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let home = frankensearch_core::platform_dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let env = current_unicode_environment();
     let overrides = CliOverrides::default();
     let loaded = if let Some(path) = &options.config {
@@ -515,7 +519,12 @@ fn render(response: &Response, format: OutputFormat) -> SearchResult<Vec<u8>> {
             report.producer_admission_checked,
         )?;
         for phase in &report.preview {
-            writeln!(output, "Preview {:?}: {} hits", phase.phase, phase.hits.len())?;
+            writeln!(
+                output,
+                "Preview {:?}: {} hits",
+                phase.phase,
+                phase.hits.len()
+            )?;
             for hit in &phase.hits {
                 writeln!(output, "  {:?}", hit.path)?;
             }
@@ -569,7 +578,9 @@ fn main() -> ExitCode {
         stdout.flush().map_err(SearchError::Io)
     });
     if emission.is_err() {
-        eprintln!("fsfs-recover: output failed; a requested restore may already be visible. Inspect the selection before retrying.");
+        eprintln!(
+            "fsfs-recover: output failed; a requested restore may already be visible. Inspect the selection before retrying."
+        );
         return ExitCode::FAILURE;
     }
     ExitCode::from(code)
@@ -724,13 +735,10 @@ mod tests {
         assert_eq!(code, 1);
         assert_eq!(value["ok"], false);
         assert!(value.get("data").is_none());
-        assert_eq!(
-            value["recovery"]["state"],
-            "restored_durability_uncertain"
-        );
+        assert_eq!(value["recovery"]["state"], "restored_durability_uncertain");
         assert_eq!(value["recovery"]["selection_write_performed"], true);
         assert_eq!(value["recovery"]["durability_confirmed"], false);
-        assert_eq!(encoded.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        assert_eq!(String::from_utf8_lossy(&encoded).matches('\n').count(), 1);
     }
 
     #[test]
@@ -752,14 +760,21 @@ mod tests {
 
     #[test]
     fn confirmation_outcomes_never_claim_model_admission_or_selection_writes() {
-        for state in [RecoveryState::DurabilityConfirmed, RecoveryState::DurabilityStillUncertain] {
+        for state in [
+            RecoveryState::DurabilityConfirmed,
+            RecoveryState::DurabilityStillUncertain,
+        ] {
             let (response, code) = Response::from_report(report(state), OutputFormat::Json);
             let encoded = encode(&response).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
             let confirmed = state == RecoveryState::DurabilityConfirmed;
             assert_eq!(code, u8::from(!confirmed));
             assert_eq!(value["ok"], confirmed);
-            let facts = if confirmed { &value["data"] } else { &value["recovery"] };
+            let facts = if confirmed {
+                &value["data"]
+            } else {
+                &value["recovery"]
+            };
             assert_eq!(facts["selection_write_performed"], false);
             assert_eq!(facts["producer_admission_checked"], false);
             assert_eq!(facts["durability_confirmed"], confirmed);

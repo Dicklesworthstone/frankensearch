@@ -374,8 +374,7 @@ mod receipt_durability_tests {
     fn publish(store: &CompleteGenerationStore, cx: &Cx, body: &[u8]) -> PublishedGeneration {
         let build = store.begin(cx).unwrap();
         fs::write(build.path().join("payload"), body).unwrap();
-        let GenerationPublication::Durable(generation) =
-            build.publish(cx, |_, _| Ok(())).unwrap()
+        let GenerationPublication::Durable(generation) = build.publish(cx, |_, _| Ok(())).unwrap()
         else {
             panic!("fixture publication must be durable"); // ubs:ignore — test assertion.
         };
@@ -393,10 +392,14 @@ mod receipt_durability_tests {
             let before = fs::read(&pointer).unwrap();
             let inode = fs::metadata(&pointer).unwrap().ino();
             let mut sync_called = false;
-            assert!(store.flush_with_expected_sync(&cx, Some(&old), |_| {
-                sync_called = true;
-                Ok(())
-            }).is_err());
+            assert!(
+                store
+                    .flush_with_expected_sync(&cx, Some(&old), |_| {
+                        sync_called = true;
+                        Ok(())
+                    })
+                    .is_err()
+            );
             assert!(!sync_called);
             assert!(store.confirm_retained_durability(&cx, &old).is_err());
             let mut foreign = new.clone();
@@ -410,7 +413,12 @@ mod receipt_durability_tests {
             assert_eq!(fs::metadata(&pointer).unwrap().ino(), inode);
             assert_eq!(fs::read(old.path().join("payload")).unwrap(), b"old");
             assert_eq!(fs::read(new.path().join("payload")).unwrap(), b"new");
-            assert_eq!(fs::read_dir(directory.path().join(GENERATIONS)).unwrap().count(), 2);
+            assert_eq!(
+                fs::read_dir(directory.path().join(GENERATIONS))
+                    .unwrap()
+                    .count(),
+                2
+            );
         });
     }
 
@@ -423,17 +431,26 @@ mod receipt_durability_tests {
             let _new = publish(&store, &cx, b"new");
             let plan = store.prepare_restore(&cx, &old).unwrap();
             assert!(matches!(
-                plan.restore_with_sync(&cx, |_, _| Ok(()), |_| Err(io::Error::other("injected sync failure"))).unwrap(),
+                plan.restore_with_sync(
+                    &cx,
+                    |_, _| Ok(()),
+                    |_| Err(io::Error::other("injected sync failure"))
+                )
+                .unwrap(),
                 GenerationPublication::VisibleButDurabilityUncertain { .. }
             ));
             let pointer = directory.path().join(COMPLETE_GENERATION_POINTER);
             let before = fs::read(&pointer).unwrap();
             let inode = fs::metadata(&pointer).unwrap().ino();
             let reopened = CompleteGenerationStore::open(&cx, directory.path()).unwrap();
-            let expected = reopened.open_retained(&cx, old.id(), old.manifest_sha256()).unwrap();
-            let uncertain = reopened.flush_with_expected_sync(&cx, Some(&expected), |_| {
-                Err(io::Error::other("still unavailable"))
-            }).unwrap();
+            let expected = reopened
+                .open_retained(&cx, old.id(), old.manifest_sha256())
+                .unwrap();
+            let uncertain = reopened
+                .flush_with_expected_sync(&cx, Some(&expected), |_| {
+                    Err(io::Error::other("still unavailable"))
+                })
+                .unwrap();
             assert!(matches!(uncertain,
                 GenerationPublication::VisibleButDurabilityUncertain { generation, .. } if generation == old));
             assert!(matches!(
@@ -442,7 +459,12 @@ mod receipt_durability_tests {
             ));
             assert_eq!(fs::read(&pointer).unwrap(), before);
             assert_eq!(fs::metadata(&pointer).unwrap().ino(), inode);
-            assert_eq!(fs::read_dir(directory.path().join(GENERATIONS)).unwrap().count(), 2);
+            assert_eq!(
+                fs::read_dir(directory.path().join(GENERATIONS))
+                    .unwrap()
+                    .count(),
+                2
+            );
         });
     }
 
@@ -457,9 +479,15 @@ mod receipt_durability_tests {
             assert!(store.confirm_retained_durability(&cx, &target).is_err());
             drop(build);
             cx.set_cancel_requested(true);
-            assert!(matches!(store.confirm_retained_durability(&cx, &target), Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                store.confirm_retained_durability(&cx, &target),
+                Err(SearchError::Cancelled { .. })
+            ));
             cx.set_cancel_requested(false);
-            assert_eq!(fs::read(directory.path().join(COMPLETE_GENERATION_POINTER)).unwrap(), before);
+            assert_eq!(
+                fs::read(directory.path().join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                before
+            );
             assert_eq!(store.active(&cx).unwrap(), Some(target));
         });
     }

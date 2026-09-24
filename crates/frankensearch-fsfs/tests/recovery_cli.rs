@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::test_utils::run_test_with_cx;
+use frankensearch_fsfs::default_project_config_file_path;
 use frankensearch_fsfs::generation_store::{
     COMPLETE_GENERATION_POINTER, CompleteGenerationStore, GenerationPublication,
     PublishedGeneration,
 };
-use frankensearch_fsfs::default_project_config_file_path;
 
 struct ChildGuard(Child);
 
@@ -39,7 +39,10 @@ fn run(command: &mut Command, directory: &Path, timeout: Duration) -> Output {
         if let Some(status) = child.0.try_wait().unwrap() {
             break status;
         }
-        assert!(start.elapsed() < timeout, "recovery child exceeded its deadline");
+        assert!(
+            start.elapsed() < timeout,
+            "recovery child exceeded its deadline"
+        );
         std::thread::sleep(Duration::from_millis(10));
     };
     Output {
@@ -51,8 +54,10 @@ fn run(command: &mut Command, directory: &Path, timeout: Duration) -> Output {
 
 fn recover(directory: &Path, store: &Path, id: &str, digest: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
-    command.current_dir(directory)
-        .arg("--index-dir").arg(store)
+    command
+        .current_dir(directory)
+        .arg("--index-dir")
+        .arg(store)
         .args(["--generation", id, "--manifest-sha256", digest])
         .env("HOME", directory)
         .env("XDG_CONFIG_HOME", directory.join("empty-config"))
@@ -62,7 +67,10 @@ fn recover(directory: &Path, store: &Path, id: &str, digest: &str) -> Command {
 
 fn body(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!("invalid CLI JSON: {error}; stderr={}", String::from_utf8_lossy(&output.stderr))
+        panic!(
+            "invalid CLI JSON: {error}; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        )
     })
 }
 
@@ -85,7 +93,10 @@ fn files(root: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
             if entry.file_type().unwrap().is_dir() {
                 pending.push(entry.path());
             } else {
-                files.insert(entry.path().strip_prefix(root).unwrap().to_path_buf(), fs::read(entry.path()).unwrap());
+                files.insert(
+                    entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(entry.path()).unwrap(),
+                );
             }
         }
     }
@@ -101,7 +112,11 @@ fn command_help_and_usage_errors_do_not_create_a_store() {
     let output = run(&mut help, directory.path(), Duration::from_secs(10));
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("--confirm-durability"));
-    for suffix in [vec!["--apply", "--apply"], vec!["--apply", "--confirm-durability"], vec!["--unknown"]] {
+    for suffix in [
+        vec!["--apply", "--apply"],
+        vec!["--apply", "--confirm-durability"],
+        vec!["--unknown"],
+    ] {
         let id = format!("g-{}-{}-{}", "a".repeat(32), "b".repeat(8), "c".repeat(16));
         let mut command = recover(directory.path(), &root, &id, &"a".repeat(64));
         command.args(suffix);
@@ -129,10 +144,19 @@ fn confirmation_survives_invalid_config_and_missing_models_without_republication
         let inode = fs::metadata(&pointer).unwrap().ino();
         let old_files = files(old.path());
         let current_files = files(current.path());
-        let mut command = recover(directory.path(), &root, current.id(), current.manifest_sha256());
+        let mut command = recover(
+            directory.path(),
+            &root,
+            current.id(),
+            current.manifest_sha256(),
+        );
         command.arg("--confirm-durability");
         let output = run(&mut command, directory.path(), Duration::from_secs(20));
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let result = body(&output);
         assert_eq!(result["data"]["state"], "durability_confirmed");
         assert_eq!(result["data"]["generation_id"], current.id());
@@ -187,7 +211,11 @@ fn genuine_models_preview_restore_and_fresh_search_without_source_files() {
     let source = directory.path().join("source");
     let root = directory.path().join("store");
     fs::create_dir(&source).unwrap();
-    fs::write(source.join("alpha.md"), "recoverytoken preserves durable searchable generations and the original documents").unwrap();
+    fs::write(
+        source.join("alpha.md"),
+        "recoverytoken preserves durable searchable generations and the original documents",
+    )
+    .unwrap();
     let mut config = FsfsConfig::default();
     config.indexing.model_dir = models.display().to_string();
     config.indexing.offline = true;
@@ -199,18 +227,32 @@ fn genuine_models_preview_restore_and_fresh_search_without_source_files() {
     fs::write(&config_path, config.to_toml().unwrap()).unwrap();
     let index = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fsfs"));
-        command.current_dir(directory.path()).arg("index").arg(&source)
-            .arg("--index-dir").arg(&root).arg("--config").arg(&config_path)
+        command
+            .current_dir(directory.path())
+            .arg("index")
+            .arg(&source)
+            .arg("--index-dir")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path)
             .args(["--format", "json", "--quiet"])
             .env("FRANKENSEARCH_COMPLETE_GENERATIONS", "1")
             .env("FRANKENSEARCH_CHECK_UPDATES", "0")
             .env("FRANKENSEARCH_MODEL_DIR", &models);
         let output = run(&mut command, directory.path(), Duration::from_secs(180));
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         body(&output)["data"].clone()
     };
     let first = index();
-    fs::write(source.join("beta.md"), "recoverytoken searchable successor document").unwrap();
+    fs::write(
+        source.join("beta.md"),
+        "recoverytoken searchable successor document",
+    )
+    .unwrap();
     let second = index();
     let old_root = std::path::PathBuf::from(first["generation_path"].as_str().unwrap());
     let new_root = std::path::PathBuf::from(second["generation_path"].as_str().unwrap());
@@ -224,11 +266,20 @@ fn genuine_models_preview_restore_and_fresh_search_without_source_files() {
     let query = "how does recoverytoken preserve durable search generations";
     for apply in [false, true] {
         let mut command = recover(directory.path(), &root, id, digest);
-        command.arg("--config").arg(&config_path).args(["--query", query])
+        command
+            .arg("--config")
+            .arg(&config_path)
+            .args(["--query", query])
             .env("FRANKENSEARCH_MODEL_DIR", &models);
-        if apply { command.arg("--apply"); }
+        if apply {
+            command.arg("--apply");
+        }
         let output = run(&mut command, directory.path(), Duration::from_secs(180));
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let result = body(&output);
         assert_eq!(result["data"]["generation_id"], id);
         assert_eq!(result["data"]["selection_write_performed"], apply);
@@ -237,18 +288,29 @@ fn genuine_models_preview_restore_and_fresh_search_without_source_files() {
         let refined = serde_json::to_value(SearchOutputPhase::Refined).unwrap();
         assert!(phases.iter().any(|phase| phase["phase"] == refined));
         assert_eq!(phases.last().unwrap()["hits"].as_array().unwrap().len(), 1);
-        if !apply { assert_eq!(fs::read(&pointer).unwrap(), b"corrupt selection"); }
+        if !apply {
+            assert_eq!(fs::read(&pointer).unwrap(), b"corrupt selection");
+        }
         assert_eq!(files(&old_root), old_bytes);
         assert_eq!(files(&new_root), new_bytes);
     }
     let mut search = Command::new(env!("CARGO_BIN_EXE_fsfs"));
-    search.current_dir(directory.path()).args(["search", query])
-        .arg("--index-dir").arg(&root).arg("--config").arg(&config_path)
+    search
+        .current_dir(directory.path())
+        .args(["search", query])
+        .arg("--index-dir")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path)
         .args(["--format", "json", "--quiet"])
         .env("FRANKENSEARCH_CHECK_UPDATES", "0")
         .env("FRANKENSEARCH_MODEL_DIR", &models);
     let output = run(&mut search, directory.path(), Duration::from_secs(180));
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(body(&output)["data"]["hits"].as_array().unwrap().len(), 1);
     let selected = fs::read(&pointer).unwrap();
     let mut confirm = recover(directory.path(), &root, id, digest);

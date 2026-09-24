@@ -257,7 +257,7 @@ impl ShutdownCoordinator {
     ///
     /// The state check and registration share a lock with notification so a
     /// shutdown racing registration cannot leave the operation running.
-    pub(crate) fn cancellation_scope(&self, cx: &Cx) -> Arc<Cx> {
+    pub fn cancellation_scope(&self, cx: &Cx) -> Arc<Cx> {
         let context = Arc::new(cx.clone());
         let mut contexts = lock_or_recover(&self.cancellation_contexts);
         contexts.retain(|context| context.strong_count() > 0);
