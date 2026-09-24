@@ -146,17 +146,21 @@ Queries are capped at 10,000 Unicode scalar values. Truncation selects the first
 
 ### 4.3 CASS Boolean grammar
 
-CASS uses implicit `AND`; explicit `AND`/`&&`; explicit `OR`/`||`; and `NOT` or a leading `-`. Its intentionally non-standard precedence makes OR bind tighter than AND:
+CASS uses implicit `AND`; explicit `AND`/`&&`; explicit `OR`/`||`; `NOT` or a leading `-`; and parentheses. Since frankensearch-quill 0.3.3 the native parser uses standard precedence (NOT, then AND, then OR):
 
 ```text
-query      := and_expr
-and_expr   := or_expr ((AND | && | implicit_whitespace) or_expr)*
-or_expr    := unary ((OR | ||) unary)*
+query      := or_expr
+or_expr    := and_expr ((OR | ||) and_expr)*
+and_expr   := unary ((AND | && | implicit_whitespace) unary)*
 unary      := (NOT | '-')* primary
-primary    := term | quoted_phrase
+primary    := term | quoted_phrase | '(' or_expr ')'
 ```
 
-For example, `auth OR token AND cache` means `(auth OR token) AND cache`. One or more adjacent negators lower to one `MustNot`; `NOT NOT a` is not logical double negation. In a conjunction, a negative is a raw top-level `MustNot`, so `auth AND NOT deprecated` is `Must(auth) + MustNot(deprecated)` and does not gain an `All` score. A negation used as a positive-valued OR operand is wrapped as `Must(All) + MustNot(primary)`. A standalone negative has the same complement target shape; the shipping CASS builder anchors every non-empty all-negative root with `Must(All)` while leaving mixed positive conjunctions unanchored. Sanitization preserves alphanumerics, `*`, `"`, and `-`, replacing other characters with spaces.
+For example, `auth OR token AND cache` means `auth OR (token AND cache)`, and `(auth OR token) AND cache` groups explicitly. A `(` opens a group only at the start of a word, and a `)` closes one only while a group is open, so code such as `foo(bar)` remains one term. An unclosed group is closed at the end of the query, and an empty group is skipped; both carry a `SyntaxRecovery` diagnostic. Negation is parity-based: an odd number of adjacent negators negates and `NOT NOT a` is `a`.
+
+**Divergence from the pinned oracle (cass #52).** The shipping Tantivy CASS builder, and the native parser before 0.3.3, made OR bind tighter than AND (`auth OR token AND cache` meant `(auth OR token) AND cache`), treated parentheses as term characters, and made repeated negators idempotent. The result-set differential therefore compares only queries on which both grammars agree, and `cass_parser_precedence_matches_set_algebra_over_the_oracle` pins the native semantics.
+
+In a conjunction, a negative is a raw top-level `MustNot`, so `auth AND NOT deprecated` is `Must(auth) + MustNot(deprecated)` and does not gain an `All` score. A negation used as a positive-valued OR operand is wrapped as `Must(All) + MustNot(primary)`. A standalone negative has the same complement target shape; the shipping CASS builder anchors every non-empty all-negative root with `Must(All)` while leaving mixed positive conjunctions unanchored. Sanitization preserves alphanumerics, `*`, `"`, and `-`, replacing other characters with spaces.
 
 ### 4.4 Boolean `Occur` semantics
 

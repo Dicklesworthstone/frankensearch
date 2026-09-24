@@ -1381,47 +1381,47 @@
       }
     },
     {
-      "id": "query-boolean-or-tighter-than-and",
+      "id": "query-boolean-and-tighter-than-or",
       "query_class": "boolean",
       "parser": "cass",
       "input": "auth OR token AND cache",
       "expected_ast": {
         "type": "Boolean",
-        "operator": "AND",
+        "operator": "OR",
         "children": [
           {
-            "occur": "Must",
+            "occur": "Should",
             "query": {
-              "type": "Boolean",
-              "operator": "OR",
-              "children": [
+              "type": "Term",
+              "text": "auth",
+              "fields": [
                 {
-                  "occur": "Should",
-                  "query": {
-                    "type": "Term",
-                    "text": "auth",
-                    "fields": [
-                      {
-                        "name": "title",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "content",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "title_prefix",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "content_prefix",
-                        "boost": 1.0
-                      }
-                    ]
-                  }
+                  "name": "title",
+                  "boost": 1.0
                 },
                 {
-                  "occur": "Should",
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "AND",
+              "children": [
+                {
+                  "occur": "Must",
                   "query": {
                     "type": "Term",
                     "text": "token",
@@ -1444,31 +1444,31 @@
                       }
                     ]
                   }
-                }
-              ]
-            }
-          },
-          {
-            "occur": "Must",
-            "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Must",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 }
               ]
             }
@@ -1661,7 +1661,7 @@
       }
     },
     {
-      "id": "query-boolean-repeated-not-is-idempotent",
+      "id": "query-boolean-double-not-cancels",
       "query_class": "boolean",
       "parser": "cass",
       "input": "auth AND NOT NOT deprecated",
@@ -1695,7 +1695,7 @@
             }
           },
           {
-            "occur": "MustNot",
+            "occur": "Must",
             "query": {
               "type": "Term",
               "text": "deprecated",
@@ -1716,13 +1716,12 @@
                   "name": "content_prefix",
                   "boost": 1.0
                 }
-              ],
-              "score": 0.0
+              ]
             }
           }
         ]
       },
-      "double_negation": false
+      "double_negation": true
     },
     {
       "id": "query-glob-exact",
@@ -2586,19 +2585,78 @@
       }
     },
     {
-      "id": "query-cass-right-or-precedence",
+      "id": "query-cass-and-binds-before-or",
       "query_class": "boolean",
       "parser": "cass",
       "input": "auth AND token OR cache",
       "expected_ast": {
         "type": "Boolean",
-        "operator": "AND",
+        "operator": "OR",
         "children": [
           {
-            "occur": "Must",
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "AND",
+              "children": [
+                {
+                  "occur": "Must",
+                  "query": {
+                    "type": "Term",
+                    "text": "auth",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Must",
+                  "query": {
+                    "type": "Term",
+                    "text": "token",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
             "query": {
               "type": "Term",
-              "text": "auth",
+              "text": "cache",
               "fields": [
                 {
                   "name": "title",
@@ -2618,13 +2676,50 @@
                 }
               ]
             }
-          },
+          }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-parentheses-group",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "(auth OR token) AND cache",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
           {
             "occur": "Must",
             "query": {
               "type": "Boolean",
               "operator": "OR",
               "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "auth",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
                 {
                   "occur": "Should",
                   "query": {
@@ -2649,37 +2744,109 @@
                       }
                     ]
                   }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Term",
+              "text": "cache",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
                 },
                 {
-                  "occur": "Should",
-                  "query": {
-                    "type": "Term",
-                    "text": "cache",
-                    "fields": [
-                      {
-                        "name": "title",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "content",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "title_prefix",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "content_prefix",
-                        "boost": 1.0
-                      }
-                    ]
-                  }
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
                 }
               ]
             }
           }
         ]
       }
+    },
+    {
+      "id": "query-cass-implied-and-binds-before-or",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth token OR cache",
+      "expected_ast": {
+        "ref": "query-cass-and-binds-before-or"
+      }
+    },
+    {
+      "id": "query-cass-recovery-unclosed-group",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "(auth OR token",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "auth",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "token",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "expected_diagnostic": "unclosed '(' was closed at the end"
     },
     {
       "id": "query-cass-hyphen-negative-with-positive",
@@ -3771,11 +3938,11 @@
         "query-default-field-scoped-group",
         "query-default-field-scope-explicit-override",
         "query-default-field-scoped-typed-leaves",
-        "query-boolean-or-tighter-than-and",
+        "query-boolean-and-tighter-than-or",
         "query-boolean-negative-standalone-universe",
         "query-boolean-negative-or-operand-universe",
         "query-boolean-and-not-no-all-score",
-        "query-boolean-repeated-not-is-idempotent",
+        "query-boolean-double-not-cancels",
         "query-glob-exact",
         "query-glob-prefix",
         "query-glob-suffix",
@@ -3799,7 +3966,10 @@
         "query-cass-symbolic-and-equivalent",
         "query-cass-or-chain",
         "query-cass-symbolic-or",
-        "query-cass-right-or-precedence",
+        "query-cass-and-binds-before-or",
+        "query-cass-parentheses-group",
+        "query-cass-implied-and-binds-before-or",
+        "query-cass-recovery-unclosed-group",
         "query-cass-hyphen-negative-with-positive",
         "query-cass-created-from-only",
         "query-cass-created-to-only",

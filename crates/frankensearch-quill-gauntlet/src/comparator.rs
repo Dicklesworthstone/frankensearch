@@ -5170,11 +5170,19 @@ pub enum CassProfileField<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CassProfileTokenKind {
-    Term { text: SensitiveValueObservation },
-    Phrase { text: SensitiveValueObservation },
+    Term {
+        text: SensitiveValueObservation,
+    },
+    Phrase {
+        text: SensitiveValueObservation,
+    },
     And,
     Or,
     Not,
+    /// Group-opening parenthesis (native Quill grammar only).
+    LParen,
+    /// Group-closing parenthesis (native Quill grammar only).
+    RParen,
 }
 
 /// One ordered parser token and its source position where the backend retains it.
@@ -5533,6 +5541,8 @@ pub fn observe_quill_cass_profile(
                 | CassQueryToken::And { .. }
                 | CassQueryToken::Or { .. }
                 | CassQueryToken::Not { .. }
+                | CassQueryToken::LParen { .. }
+                | CassQueryToken::RParen { .. }
         )
     });
     let tokens = parsed
@@ -5572,6 +5582,18 @@ pub fn observe_quill_cass_profile(
                     token: CassProfileTokenKind::Not,
                     byte_offset: CassProfileField::Value {
                         value: usize_to_u64(*byte_offset, "Quill CASS NOT byte offset")?,
+                    },
+                },
+                CassQueryToken::LParen { byte_offset } => CassProfileTokenObservation {
+                    token: CassProfileTokenKind::LParen,
+                    byte_offset: CassProfileField::Value {
+                        value: usize_to_u64(*byte_offset, "Quill CASS '(' byte offset")?,
+                    },
+                },
+                CassQueryToken::RParen { byte_offset } => CassProfileTokenObservation {
+                    token: CassProfileTokenKind::RParen,
+                    byte_offset: CassProfileField::Value {
+                        value: usize_to_u64(*byte_offset, "Quill CASS ')' byte offset")?,
                     },
                 },
             })
@@ -6254,7 +6276,9 @@ impl CassLexicalProfileObservation {
                 }
                 CassProfileTokenKind::And
                 | CassProfileTokenKind::Or
-                | CassProfileTokenKind::Not => {
+                | CassProfileTokenKind::Not
+                | CassProfileTokenKind::LParen
+                | CassProfileTokenKind::RParen => {
                     observed_boolean_operator = true;
                 }
             }
@@ -6405,7 +6429,11 @@ fn valid_cass_token_extent(
         CassProfileTokenKind::Phrase { text } => {
             cass_sensitive_len(text).and_then(|length| length.checked_add(1))
         }
-        CassProfileTokenKind::And | CassProfileTokenKind::Or | CassProfileTokenKind::Not => Some(1),
+        CassProfileTokenKind::And
+        | CassProfileTokenKind::Or
+        | CassProfileTokenKind::Not
+        | CassProfileTokenKind::LParen
+        | CassProfileTokenKind::RParen => Some(1),
     };
     content_bytes.is_some_and(|length| {
         byte_offset
