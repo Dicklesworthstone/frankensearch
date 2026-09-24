@@ -161,6 +161,7 @@ mod tests {
     const DRIFT: u8 = 7;
     const CANCEL_OK: u8 = 8;
     const CANCEL_ERROR: u8 = 9;
+    const PENDING: u8 = 10;
 
     struct Producer {
         identity: EmbeddingIdentityBundleV1,
@@ -246,6 +247,7 @@ mod tests {
                             source: "cancelled alongside backend failure".into(),
                         });
                     }
+                    PENDING => std::future::pending::<()>().await,
                     _ => {}
                 }
                 Ok(response)
@@ -558,6 +560,168 @@ mod tests {
             assert!(matches!(
                 reader.search(&cx, QUERY, 10).await,
                 Err(SearchError::UnverifiableRemoteSpace { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn failed_fast_or_quality_preview_cannot_authorize_restoration() {
+        run(|cx| async move {
+            let models = Models::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, root) = fixture(directory.path());
+            let generation = publish(&runtime, &cx, &root).await;
+            fs::write(root.join(COMPLETE_GENERATION_POINTER), b"preview must complete").unwrap();
+            for fast in [true, false] {
+                let mut plan = runtime
+                    .prepare_retained_recovery(
+                        &cx,
+                        &root,
+                        generation.id(),
+                        generation.manifest_sha256(),
+                    )
+                    .await
+                    .unwrap();
+                let producer = if fast { &models.fast } else { &models.quality };
+                producer.mode.store(FOREIGN_PRODUCER, Ordering::Relaxed);
+                let before = bytes(&root);
+                let result = plan.search(&cx, QUERY, 10).await;
+                if fast {
+                    assert!(matches!(
+                        result,
+                        Err(SearchError::UnverifiableRemoteSpace { .. })
+                    ));
+                } else {
+                    assert_eq!(
+                        result.unwrap().last().unwrap().phase,
+                        SearchOutputPhase::RefinementFailed
+                    );
+                }
+                // A now-healthy advertised producer cannot erase a failed preview.
+                producer.mode.store(GOOD, Ordering::Relaxed);
+                let error = plan.restore(&cx).unwrap_err();
+                assert!(error.to_string().contains("preview"));
+                assert_eq!(bytes(&root), before);
+            }
+        });
+    }
+
+    #[test]
+    fn successful_preview_retry_restores_permission_without_repreparing() {
+        run(|cx| async move {
+            let models = Models::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, root) = fixture(directory.path());
+            let generation = publish(&runtime, &cx, &root).await;
+            fs::write(root.join(COMPLETE_GENERATION_POINTER), b"retry preview").unwrap();
+            let mut plan = runtime
+                .prepare_retained_recovery(
+                    &cx,
+                    &root,
+                    generation.id(),
+                    generation.manifest_sha256(),
+                )
+                .await
+                .unwrap();
+            models.quality.mode.store(FOREIGN_PRODUCER, Ordering::Relaxed);
+            assert_eq!(
+                plan.search(&cx, QUERY, 10).await.unwrap().last().unwrap().phase,
+                SearchOutputPhase::RefinementFailed
+            );
+            models.quality.mode.store(GOOD, Ordering::Relaxed);
+            assert_eq!(
+                plan.search(&cx, QUERY, 10).await.unwrap().last().unwrap().phase,
+                SearchOutputPhase::Refined
+            );
+            let (publication, reader) = plan.restore(&cx).unwrap();
+            assert!(matches!(publication, GenerationPublication::Durable(_)));
+            assert_eq!(reader.generation(), &generation);
+        });
+    }
+
+    #[test]
+    fn cancelled_preview_cannot_restore_after_cancellation_is_cleared() {
+        run(|cx| async move {
+            let models = Models::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, root) = fixture(directory.path());
+            let generation = publish(&runtime, &cx, &root).await;
+            fs::write(root.join(COMPLETE_GENERATION_POINTER), b"cancelled preview").unwrap();
+            let mut plan = runtime
+                .prepare_retained_recovery(
+                    &cx,
+                    &root,
+                    generation.id(),
+                    generation.manifest_sha256(),
+                )
+                .await
+                .unwrap();
+            let before = bytes(&root);
+            models.quality.mode.store(CANCEL_ERROR, Ordering::Relaxed);
+            assert!(matches!(
+                plan.search(&cx, QUERY, 10).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            models.quality.mode.store(GOOD, Ordering::Relaxed);
+            assert!(plan.restore(&cx).unwrap_err().to_string().contains("preview"));
+            assert_eq!(bytes(&root), before);
+        });
+    }
+
+    #[test]
+    fn dropped_preview_revokes_prior_success_but_unpolled_preview_has_no_effect() {
+        run(|cx| async move {
+            let models = Models::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, root) = fixture(directory.path());
+            let generation = publish(&runtime, &cx, &root).await;
+            fs::write(root.join(COMPLETE_GENERATION_POINTER), b"dropped preview").unwrap();
+            let mut plan = runtime
+                .prepare_retained_recovery(
+                    &cx,
+                    &root,
+                    generation.id(),
+                    generation.manifest_sha256(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                plan.search(&cx, QUERY, 10).await.unwrap().last().unwrap().phase,
+                SearchOutputPhase::Refined
+            );
+            models.reset_calls();
+            models.fast.mode.store(PENDING, Ordering::Relaxed);
+            let before = bytes(&root);
+            let mut preview = Box::pin(plan.search(&cx, QUERY, 10));
+            std::future::poll_fn(|task_cx| {
+                assert!(preview.as_mut().poll(task_cx).is_pending());
+                if models.fast.bound_calls.load(Ordering::Relaxed) > 0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            drop(preview);
+            models.fast.mode.store(GOOD, Ordering::Relaxed);
+            assert!(plan.restore(&cx).unwrap_err().to_string().contains("preview"));
+            assert_eq!(bytes(&root), before);
+
+            let mut plan = runtime
+                .prepare_retained_recovery(
+                    &cx,
+                    &root,
+                    generation.id(),
+                    generation.manifest_sha256(),
+                )
+                .await
+                .unwrap();
+            // Async construction alone must not revoke an explicit no-preview restore.
+            drop(plan.search(&cx, QUERY, 10));
+            assert!(matches!(
+                plan.restore(&cx).unwrap().0,
+                GenerationPublication::Durable(_)
             ));
         });
     }

@@ -28,6 +28,10 @@ fn retained_recovery_error(reason: &str) -> SearchError {
 pub struct PreparedRetainedRecovery {
     plan: crate::generation_store::PreparedGenerationRestore,
     reader: RetainedSearchReader,
+    // No preview is required, but an attempted preview must finish successfully.
+    // Set false before any await so dropping a polled future cannot authorize a
+    // restore, including when an earlier preview completed successfully.
+    preview_ready: bool,
 }
 
 impl std::fmt::Debug for PreparedRetainedRecovery {
@@ -50,6 +54,12 @@ impl PreparedRetainedRecovery {
 
     /// Preview the retained target without changing the active selection.
     ///
+    /// Once polled, this preview must complete successfully before restoration.
+    /// Errors, cancellation, failed refinement and dropping an unfinished future
+    /// block `restore`. A successful retry on this same preparation clears that
+    /// block without rebasing the captured selection. Merely constructing an
+    /// unpolled future has no effect. Returned progressive payloads are unchanged.
+    ///
     /// # Errors
     /// Returns producer drift, retrieval, configuration or cancellation errors.
     pub async fn search(
@@ -58,8 +68,20 @@ impl PreparedRetainedRecovery {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
+        self.preview_ready = false;
         self.reader.validate_retained_recovery_resources(cx)?;
-        self.reader.search(cx, query, limit).await
+        let result = self.reader.search(cx, query, limit).await;
+        retained_search_checkpoint(cx)?;
+        let payloads = result?;
+        self.preview_ready = match payloads.as_slice() {
+            [initial] => initial.phase == SearchOutputPhase::Initial,
+            [initial, refined] => {
+                initial.phase == SearchOutputPhase::Initial
+                    && refined.phase == SearchOutputPhase::Refined
+            }
+            _ => false,
+        };
+        Ok(payloads)
     }
 
     /// Abandon restoration and keep only the explicitly admitted reader.
@@ -74,6 +96,9 @@ impl PreparedRetainedRecovery {
     /// authenticates the target again under publication ownership. Producer
     /// identities are rechecked against the already opened vector resources.
     /// A stale preparation is refused, never automatically rebased or retried.
+    /// Any preview that was started must have completed successfully. After a
+    /// failed or abandoned preview, retry `search` successfully or prepare a new
+    /// explicit recovery; clearing cancellation alone does not authorize restore.
     ///
     /// The returned reader is the one already admitted, not a second pathname
     /// reopen. Inspect the publication variant before reporting durability:
@@ -84,7 +109,7 @@ impl PreparedRetainedRecovery {
     ///
     /// # Errors
     /// Before publication, returns contention, changed selection/target/producer,
-    /// I/O or cancellation errors without selecting this target.
+    /// incomplete preview, I/O or cancellation errors without selecting this target.
     pub fn restore(
         self,
         cx: &Cx,
@@ -93,7 +118,12 @@ impl PreparedRetainedRecovery {
         RetainedSearchReader,
     )> {
         retained_search_checkpoint(cx)?;
-        let Self { plan, reader } = self;
+        if !self.preview_ready {
+            return Err(retained_recovery_error(
+                "the recovery preview did not complete successfully; retry the preview or prepare a new explicit recovery",
+            ));
+        }
+        let Self { plan, reader, .. } = self;
         let publication = plan.restore(cx, |cx, path| {
             if path != reader.generation().path() {
                 return Err(retained_recovery_error(
@@ -138,7 +168,11 @@ impl FsfsRuntime {
             .open_retained_recovery_target(cx, &store, generation)
             .await?;
         retained_search_checkpoint(cx)?;
-        Ok(PreparedRetainedRecovery { plan, reader })
+        Ok(PreparedRetainedRecovery {
+            plan,
+            reader,
+            preview_ready: true,
+        })
     }
 
     /// Open an explicitly named retained generation without changing selection.
