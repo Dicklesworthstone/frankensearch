@@ -4224,10 +4224,11 @@ pub mod generation_reader {
         ForeignDevice,
     }
 
-    /// The retained component objects of one generation, each admitted
-    /// descriptor-relatively at the exact length and digest its manifest
-    /// receipt names. Vector, lexical and metadata are mandatory. ANN is
-    /// present only when the selected manifest declares it; historical ANN
+    /// The retained component objects of one admitted generation.
+    ///
+    /// Each object is admitted descriptor-relatively at the exact length and
+    /// digest its manifest receipt names. Vector, lexical and metadata are
+    /// mandatory. ANN is present only when the selected manifest declares it; historical ANN
     /// objects elsewhere in the root never supply an absent accelerator.
     pub struct GenerationClosureV1 {
         vector: QualifiedGenerationFile,

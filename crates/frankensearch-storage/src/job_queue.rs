@@ -10,6 +10,9 @@ use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
 use crate::connection::{Storage, map_storage_error, retry_transient_storage};
+use crate::document::{
+    DocumentRecord, get_document_inner, mark_embedded_inner, mark_failed_inner, mark_skipped_inner,
+};
 
 const SUBSYSTEM: &str = "storage";
 const MAX_BACKOFF_EXPONENT: u32 = 20;
@@ -115,6 +118,10 @@ pub struct BatchEnqueueResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimedJob {
     pub job_id: i64,
+    /// Durable attempt number. Never reset by retry, reclaim or resurrection.
+    pub claim_epoch: i64,
+    /// Worker identity selected for this exact attempt.
+    pub worker_id: String,
     pub doc_id: String,
     pub embedder_id: String,
     pub priority: i32,
@@ -122,6 +129,18 @@ pub struct ClaimedJob {
     pub max_retries: u32,
     pub submitted_at: i64,
     pub content_hash: Option<[u8; 32]>,
+}
+
+/// The result of acting on one exact queue attempt and document revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaimOutcome<T> {
+    /// The exact owner and document revision were current; the operation applied.
+    Applied(T),
+    /// This attempt no longer owns the job. Nothing was changed.
+    LostClaim,
+    /// The document or a pending replacement superseded this owned row.
+    /// Only that processing row retired; current document status was preserved.
+    Superseded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,7 +362,7 @@ impl PersistentJobQueue {
         // prevent duplicate assignments.
         let claimed = self.storage.immediate_transaction(|conn| {
             let claim_params = [SqliteValue::Integer(now_ms), SqliteValue::Integer(limit)];
-            let candidates = conn.query_with_params_sync("SELECT job_id, doc_id, embedder_id, priority, retry_count, max_retries, content_hash, submitted_at \
+            let candidates = conn.query_with_params_sync("SELECT job_id, doc_id, embedder_id, priority, retry_count, max_retries, content_hash, submitted_at, claim_epoch \
              FROM embedding_jobs \
              WHERE status = 'pending' \
                AND submitted_at <= ?1 \
@@ -361,15 +380,21 @@ impl PersistentJobQueue {
             let mut claimed = Vec::with_capacity(candidates.len());
             for row in &candidates {
                 let job_id = row_i64(row, 0, "embedding_jobs.job_id")?;
+                let old_epoch = row_i64(row, 8, "embedding_jobs.claim_epoch")?;
+                let claim_epoch = old_epoch.checked_add(1).filter(|_| old_epoch >= 0).ok_or_else(|| {
+                    queue_error(QueueErrorKind::Validation, "embedding job claim epoch exhausted or invalid".to_owned())
+                })?;
                 let update_params = [
                     SqliteValue::Text(JobStatus::Processing.as_str().to_owned().into()),
                     SqliteValue::Integer(now_ms),
                     SqliteValue::Text(worker_id.to_owned().into()),
                     SqliteValue::Integer(job_id),
+                    SqliteValue::Integer(claim_epoch),
+                    SqliteValue::Integer(old_epoch),
                 ];
                 let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
-                 SET status = ?1, started_at = ?2, worker_id = ?3, error_message = NULL \
-                 WHERE job_id = ?4 AND status = 'pending';",
+                 SET status = ?1, started_at = ?2, worker_id = ?3, error_message = NULL, claim_epoch = ?5 \
+                 WHERE job_id = ?4 AND status = 'pending' AND claim_epoch = ?6;",
                 &update_params,)
                     .map_err(map_storage_error)?;
                 if updated != 1 {
@@ -378,6 +403,8 @@ impl PersistentJobQueue {
 
                 claimed.push(ClaimedJob {
                     job_id,
+                    claim_epoch,
+                    worker_id: worker_id.to_owned(),
                     doc_id: row_text(row, 1, "embedding_jobs.doc_id")?.to_owned(),
                     embedder_id: row_text(row, 2, "embedding_jobs.embedder_id")?.to_owned(),
                     priority: row_i32(row, 3, "embedding_jobs.priority")?,
@@ -410,18 +437,41 @@ impl PersistentJobQueue {
         Ok(claimed)
     }
 
-    pub fn complete(&self, job_id: i64) -> SearchResult<()> {
+    /// Check an exact attempt and return its current catalog document.
+    ///
+    /// Use `None` to capture the initial document, then supply its hash after
+    /// inference and immediately before the independent vector sink operation.
+    /// This transaction does not cover that sink or verify external file bytes.
+    pub fn check_claim(
+        &self,
+        claim: &ClaimedJob,
+        expected_document_hash: Option<&[u8; 32]>,
+    ) -> SearchResult<ClaimOutcome<DocumentRecord>> {
+        self.storage.immediate_transaction(|conn| {
+            Ok(
+                match check_claim_inner(conn, claim, expected_document_hash)? {
+                    ClaimOutcome::Applied((_, document)) => ClaimOutcome::Applied(document),
+                    ClaimOutcome::LostClaim => ClaimOutcome::LostClaim,
+                    ClaimOutcome::Superseded => ClaimOutcome::Superseded,
+                },
+            )
+        })
+    }
+
+    /// Complete the owned attempt and mark its exact document embedded atomically.
+    pub fn complete(
+        &self,
+        claim: &ClaimedJob,
+        expected_document_hash: &[u8; 32],
+    ) -> SearchResult<ClaimOutcome<()>> {
+        let job_id = claim.job_id;
         let now_ms = unix_timestamp_ms()?;
-        let started_at = self.storage.transaction(|conn| {
-            let Some(state) = load_job_state(conn, job_id)? else {
-                return Err(not_found_error("embedding_jobs", &job_id.to_string()));
+        let outcome = self.storage.immediate_transaction(|conn| {
+            let state = match check_claim_inner(conn, claim, Some(expected_document_hash))? {
+                ClaimOutcome::Applied((state, _)) => state,
+                ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+                ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
             };
-            if state.status != JobStatus::Processing {
-                return Err(conflict_error(format!(
-                    "job {job_id} is not processing (status={})",
-                    state.status.as_str()
-                )));
-            }
 
             let target_status = JobStatus::Completed.as_str();
             let delete_params = [
@@ -440,12 +490,17 @@ impl PersistentJobQueue {
                 SqliteValue::Text(target_status.to_owned().into()),
                 SqliteValue::Integer(now_ms),
                 SqliteValue::Integer(job_id),
+                SqliteValue::Integer(claim.claim_epoch),
+                SqliteValue::Text(claim.worker_id.clone().into()),
+                SqliteValue::Text(claim.doc_id.clone().into()),
+                SqliteValue::Text(claim.embedder_id.clone().into()),
             ];
             let updated = conn
                 .execute_with_params_sync(
                     "UPDATE embedding_jobs \
              SET status = ?1, completed_at = ?2, worker_id = NULL, error_message = NULL \
-             WHERE job_id = ?3 AND status = 'processing';",
+             WHERE job_id = ?3 AND status = 'processing' AND claim_epoch = ?4 \
+               AND worker_id = ?5 AND doc_id = ?6 AND embedder_id = ?7;",
                     &params,
                 )
                 .map_err(map_storage_error)?;
@@ -454,8 +509,15 @@ impl PersistentJobQueue {
                     "job {job_id} changed status during completion"
                 )));
             }
-            Ok(state.started_at)
+            mark_embedded_inner(conn, &claim.doc_id, &claim.embedder_id, now_ms)?;
+            Ok(ClaimOutcome::Applied(state.started_at))
         })?;
+
+        let started_at = match outcome {
+            ClaimOutcome::Applied(started_at) => started_at,
+            ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+            ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
+        };
 
         self.metrics.total_completed.fetch_add(1, Ordering::Relaxed);
         if let Some(started_at_ms) = started_at {
@@ -473,24 +535,26 @@ impl PersistentJobQueue {
             job_id,
             "embedding job marked completed"
         );
-        Ok(())
+        Ok(ClaimOutcome::Applied(()))
     }
 
-    pub fn fail(&self, job_id: i64, error: &str) -> SearchResult<FailResult> {
+    /// Retry an owned attempt, or atomically mark both queue and catalog failed.
+    pub fn fail(
+        &self,
+        claim: &ClaimedJob,
+        expected_document_hash: &[u8; 32],
+        error: &str,
+    ) -> SearchResult<ClaimOutcome<FailResult>> {
         ensure_non_empty(error, "error")?;
-
+        let job_id = claim.job_id;
         let now_ms = unix_timestamp_ms()?;
         let retry_base_delay_ms = self.config.retry_base_delay_ms;
-        let result = self.storage.transaction(|conn| {
-            let Some(state) = load_job_state(conn, job_id)? else {
-                return Err(not_found_error("embedding_jobs", &job_id.to_string()));
+        let outcome = self.storage.immediate_transaction(|conn| {
+            let state = match check_claim_inner(conn, claim, Some(expected_document_hash))? {
+                ClaimOutcome::Applied((state, _)) => state,
+                ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+                ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
             };
-            if state.status != JobStatus::Processing {
-                return Err(conflict_error(format!(
-                    "job {job_id} is not processing (status={})",
-                    state.status.as_str()
-                )));
-            }
 
             let retry_count = state.retry_count.saturating_add(1);
             if retry_count > state.max_retries {
@@ -511,10 +575,15 @@ impl PersistentJobQueue {
                     SqliteValue::Integer(now_ms),
                     SqliteValue::Text(error.to_owned().into()),
                     SqliteValue::Integer(job_id),
+                    SqliteValue::Integer(claim.claim_epoch),
+                    SqliteValue::Text(claim.worker_id.clone().into()),
+                    SqliteValue::Text(claim.doc_id.clone().into()),
+                    SqliteValue::Text(claim.embedder_id.clone().into()),
                 ];
                 let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
                  SET status = ?1, retry_count = ?2, completed_at = ?3, error_message = ?4, worker_id = NULL \
-                 WHERE job_id = ?5 AND status = 'processing';",
+                 WHERE job_id = ?5 AND status = 'processing' AND claim_epoch = ?6 \
+                   AND worker_id = ?7 AND doc_id = ?8 AND embedder_id = ?9;",
                 &params,)
                     .map_err(map_storage_error)?;
                 if updated != 1 {
@@ -522,51 +591,18 @@ impl PersistentJobQueue {
                         "job {job_id} changed status during fail/terminal transition"
                     )));
                 }
-                return Ok(FailResult::TerminalFailed { retry_count });
+                mark_failed_inner(conn, &claim.doc_id, &claim.embedder_id, error)?;
+                return Ok(ClaimOutcome::Applied(FailResult::TerminalFailed { retry_count }));
             }
 
-            let pending_params = [
-                SqliteValue::Text(state.doc_id.clone().into()),
-                SqliteValue::Text(state.embedder_id.clone().into()),
-            ];
-            let pending_exists = !conn.query_with_params_sync("SELECT job_id \
-             FROM embedding_jobs \
-             WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending' \
-             LIMIT 1;",
-            &pending_params,)
-                .map_err(map_storage_error)?
-                .is_empty();
-
-            if pending_exists {
-                // This processing job has been superseded by a newer pending job.
-                // Do not retry the old job. Delete it to allow the newer one to proceed.
-                let delete_params = [SqliteValue::Integer(job_id)];
-                let deleted = conn.execute_with_params_sync("DELETE FROM embedding_jobs WHERE job_id = ?1 AND status = 'processing';",
-                &delete_params,)
-                    .map_err(map_storage_error)?;
-                if deleted != 1 {
-                    return Err(conflict_error(format!(
-                        "job {job_id} changed status during supersede transition"
-                    )));
-                }
-                return Ok(FailResult::TerminalFailed { retry_count });
+            if !clear_stale_pending_for_retry(conn, claim, expected_document_hash)? {
+                retire_owned_claim(conn, claim)?;
+                return Ok(ClaimOutcome::Superseded);
             }
 
             let delay_ms =
                 compute_retry_delay_ms(retry_base_delay_ms, retry_count.saturating_sub(1));
             let next_attempt_at_ms = now_ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX));
-
-            // Delete any existing pending row for the same (doc_id, embedder_id)
-            // to avoid UNIQUE constraint violation when updating status to pending.
-            let delete_params = [
-                SqliteValue::Text(state.doc_id.clone().into()),
-                SqliteValue::Text(state.embedder_id.clone().into()),
-                SqliteValue::Text(JobStatus::Pending.as_str().to_owned().into()),
-            ];
-            conn.execute_with_params_sync("DELETE FROM embedding_jobs \
-             WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
-            &delete_params,)
-            .map_err(map_storage_error)?;
 
             let params = [
                 SqliteValue::Text(JobStatus::Pending.as_str().to_owned().into()),
@@ -574,11 +610,16 @@ impl PersistentJobQueue {
                 SqliteValue::Integer(next_attempt_at_ms),
                 SqliteValue::Text(error.to_owned().into()),
                 SqliteValue::Integer(job_id),
+                SqliteValue::Integer(claim.claim_epoch),
+                SqliteValue::Text(claim.worker_id.clone().into()),
+                SqliteValue::Text(claim.doc_id.clone().into()),
+                SqliteValue::Text(claim.embedder_id.clone().into()),
             ];
             let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
              SET status = ?1, retry_count = ?2, submitted_at = ?3, started_at = NULL, completed_at = NULL, \
                  error_message = ?4, worker_id = NULL \
-             WHERE job_id = ?5 AND status = 'processing';",
+             WHERE job_id = ?5 AND status = 'processing' AND claim_epoch = ?6 \
+               AND worker_id = ?7 AND doc_id = ?8 AND embedder_id = ?9;",
             &params,)
                 .map_err(map_storage_error)?;
             if updated != 1 {
@@ -586,12 +627,18 @@ impl PersistentJobQueue {
                     "job {job_id} changed status during fail/retry transition"
                 )));
             }
-            Ok(FailResult::Retried {
+            Ok(ClaimOutcome::Applied(FailResult::Retried {
                 retry_count,
                 delay_ms,
                 next_attempt_at_ms,
-            })
+            }))
         })?;
+
+        let result = match outcome {
+            ClaimOutcome::Applied(result) => result,
+            ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+            ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
+        };
 
         match result {
             FailResult::Retried { .. } => {
@@ -610,22 +657,25 @@ impl PersistentJobQueue {
             "embedding job failure transition completed"
         );
 
-        Ok(result)
+        Ok(ClaimOutcome::Applied(result))
     }
 
-    pub fn skip(&self, job_id: i64, reason: &str) -> SearchResult<()> {
+    /// Skip the owned attempt and mark its exact document skipped atomically.
+    pub fn skip(
+        &self,
+        claim: &ClaimedJob,
+        expected_document_hash: &[u8; 32],
+        reason: &str,
+    ) -> SearchResult<ClaimOutcome<()>> {
         ensure_non_empty(reason, "reason")?;
+        let job_id = claim.job_id;
         let now_ms = unix_timestamp_ms()?;
-        self.storage.transaction(|conn| {
-            let Some(state) = load_job_state(conn, job_id)? else {
-                return Err(not_found_error("embedding_jobs", &job_id.to_string()));
+        let outcome = self.storage.immediate_transaction(|conn| {
+            let state = match check_claim_inner(conn, claim, Some(expected_document_hash))? {
+                ClaimOutcome::Applied((state, _)) => state,
+                ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+                ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
             };
-            if !matches!(state.status, JobStatus::Pending | JobStatus::Processing) {
-                return Err(conflict_error(format!(
-                    "job {job_id} cannot be skipped from status {}",
-                    state.status.as_str()
-                )));
-            }
 
             let target_status = JobStatus::Skipped.as_str();
             let delete_params = [
@@ -645,12 +695,17 @@ impl PersistentJobQueue {
                 SqliteValue::Integer(now_ms),
                 SqliteValue::Text(reason.to_owned().into()),
                 SqliteValue::Integer(job_id),
+                SqliteValue::Integer(claim.claim_epoch),
+                SqliteValue::Text(claim.worker_id.clone().into()),
+                SqliteValue::Text(claim.doc_id.clone().into()),
+                SqliteValue::Text(claim.embedder_id.clone().into()),
             ];
             let updated = conn
                 .execute_with_params_sync(
                     "UPDATE embedding_jobs \
              SET status = ?1, completed_at = ?2, worker_id = NULL, error_message = ?3 \
-             WHERE job_id = ?4 AND status IN ('pending', 'processing');",
+             WHERE job_id = ?4 AND status = 'processing' AND claim_epoch = ?5 \
+               AND worker_id = ?6 AND doc_id = ?7 AND embedder_id = ?8;",
                     &params,
                 )
                 .map_err(map_storage_error)?;
@@ -659,8 +714,15 @@ impl PersistentJobQueue {
                     "job {job_id} changed status during skip transition"
                 )));
             }
-            Ok(())
+            mark_skipped_inner(conn, &claim.doc_id, &claim.embedder_id, reason)?;
+            Ok(ClaimOutcome::Applied(()))
         })?;
+
+        match outcome {
+            ClaimOutcome::Applied(()) => {}
+            ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+            ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
+        }
 
         self.metrics.total_skipped.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
@@ -669,7 +731,7 @@ impl PersistentJobQueue {
             job_id,
             "embedding job marked skipped"
         );
-        Ok(())
+        Ok(ClaimOutcome::Applied(()))
     }
 
     pub fn reclaim_stale_jobs(&self) -> SearchResult<usize> {
@@ -679,9 +741,9 @@ impl PersistentJobQueue {
             .visibility_timeout_ms
             .min(self.config.stale_job_threshold_ms);
         let cutoff = now_ms.saturating_sub(i64::try_from(reclaim_after_ms).unwrap_or(i64::MAX));
-        let (reclaimed_pending, superseded) = self.storage.transaction(|conn| {
+        let (reclaimed_pending, superseded) = self.storage.immediate_transaction(|conn| {
             let stale_params = [SqliteValue::Integer(cutoff)];
-            let stale_rows = conn.query_with_params_sync("SELECT job_id, doc_id, embedder_id \
+            let stale_rows = conn.query_with_params_sync("SELECT job_id, doc_id, embedder_id, content_hash \
              FROM embedding_jobs \
              WHERE status = 'processing' \
                AND (started_at IS NULL OR started_at <= ?1);",
@@ -695,19 +757,16 @@ impl PersistentJobQueue {
                 let doc_id = row_text(row, 1, "embedding_jobs.doc_id")?.to_owned();
                 let embedder_id = row_text(row, 2, "embedding_jobs.embedder_id")?.to_owned();
 
-                let pending_params = [
-                    SqliteValue::Text(doc_id.clone().into()),
-                    SqliteValue::Text(embedder_id.clone().into()),
-                ];
-                let pending_exists = !conn.query_with_params_sync("SELECT job_id \
-                 FROM embedding_jobs \
-                 WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending' \
-                 LIMIT 1;",
-                &pending_params,)
-                    .map_err(map_storage_error)?
-                    .is_empty();
+                let claimed_hash = row_optional_blob_32(row, 3, "embedding_jobs.content_hash")?;
+                let document = get_document_inner(conn, &doc_id)?;
+                let can_retry = match document {
+                    Some(document) if claimed_hash.as_ref().is_none_or(|hash| *hash == document.content_hash) => {
+                        clear_stale_pending_for_document(conn, &doc_id, &embedder_id, &document.content_hash)?
+                    }
+                    _ => false,
+                };
 
-                if pending_exists {
+                if !can_retry {
                     let delete_params = [SqliteValue::Integer(job_id)];
                     let deleted = conn.execute_with_params_sync("DELETE FROM embedding_jobs \
                      WHERE job_id = ?1 AND status = 'processing';",
@@ -891,11 +950,115 @@ pub(crate) enum EnqueueOutcome {
 #[derive(Debug, Clone)]
 struct JobState {
     status: JobStatus,
+    claim_epoch: i64,
+    worker_id: Option<String>,
+    content_hash: Option<[u8; 32]>,
     retry_count: u32,
     max_retries: u32,
     started_at: Option<i64>,
     doc_id: String,
     embedder_id: String,
+}
+
+fn check_claim_inner(
+    conn: &AsyncConnection,
+    claim: &ClaimedJob,
+    expected_document_hash: Option<&[u8; 32]>,
+) -> SearchResult<ClaimOutcome<(JobState, DocumentRecord)>> {
+    let Some(state) = load_job_state(conn, claim.job_id)? else {
+        return Ok(ClaimOutcome::LostClaim);
+    };
+    // Check ownership before inspecting the document or deleting any history.
+    // In particular, a reused worker ID cannot substitute for an attempt fence.
+    if claim.claim_epoch <= 0
+        || state.status != JobStatus::Processing
+        || state.claim_epoch != claim.claim_epoch
+        || state.worker_id.as_deref() != Some(claim.worker_id.as_str())
+        || state.doc_id != claim.doc_id
+        || state.embedder_id != claim.embedder_id
+        || state.content_hash != claim.content_hash
+    {
+        return Ok(ClaimOutcome::LostClaim);
+    }
+    let document = get_document_inner(conn, &claim.doc_id)?;
+    if let Some(document) = document.filter(|document| {
+        claim
+            .content_hash
+            .as_ref()
+            .is_none_or(|hash| *hash == document.content_hash)
+            && expected_document_hash.is_none_or(|hash| *hash == document.content_hash)
+    }) {
+        return Ok(ClaimOutcome::Applied((state, document)));
+    }
+    retire_owned_claim(conn, claim)?;
+    Ok(ClaimOutcome::Superseded)
+}
+
+fn retire_owned_claim(conn: &AsyncConnection, claim: &ClaimedJob) -> SearchResult<()> {
+    let params = [
+        SqliteValue::Integer(claim.job_id),
+        SqliteValue::Integer(claim.claim_epoch),
+        SqliteValue::Text(claim.worker_id.clone().into()),
+        SqliteValue::Text(claim.doc_id.clone().into()),
+        SqliteValue::Text(claim.embedder_id.clone().into()),
+    ];
+    conn.execute_with_params_sync(
+        "DELETE FROM embedding_jobs WHERE job_id = ?1 AND status = 'processing' \
+         AND claim_epoch = ?2 AND worker_id = ?3 AND doc_id = ?4 AND embedder_id = ?5;",
+        &params,
+    )
+    .map_err(map_storage_error)?;
+    Ok(())
+}
+
+/// Free the unique pending slot only when its revision is provably obsolete.
+/// A pending current revision or a legacy unknown hash remains authoritative.
+fn clear_stale_pending_for_retry(
+    conn: &AsyncConnection,
+    claim: &ClaimedJob,
+    current_document_hash: &[u8; 32],
+) -> SearchResult<bool> {
+    clear_stale_pending_for_document(
+        conn,
+        &claim.doc_id,
+        &claim.embedder_id,
+        current_document_hash,
+    )
+}
+
+fn clear_stale_pending_for_document(
+    conn: &AsyncConnection,
+    doc_id: &str,
+    embedder_id: &str,
+    current_document_hash: &[u8; 32],
+) -> SearchResult<bool> {
+    let params = [
+        SqliteValue::Text(doc_id.to_owned().into()),
+        SqliteValue::Text(embedder_id.to_owned().into()),
+    ];
+    let rows = conn
+        .query_with_params_sync(
+            "SELECT job_id, content_hash FROM embedding_jobs \
+         WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending';",
+            &params,
+        )
+        .map_err(map_storage_error)?;
+    for row in rows {
+        let pending_hash = row_optional_blob_32(&row, 1, "embedding_jobs.content_hash")?;
+        if pending_hash
+            .as_ref()
+            .is_none_or(|hash| hash == current_document_hash)
+        {
+            return Ok(false);
+        }
+        let job_id = row_i64(&row, 0, "embedding_jobs.job_id")?;
+        conn.execute_with_params_sync(
+            "DELETE FROM embedding_jobs WHERE job_id = ?1 AND status = 'pending';",
+            &[SqliteValue::Integer(job_id)],
+        )
+        .map_err(map_storage_error)?;
+    }
+    Ok(true)
 }
 
 pub(crate) fn enqueue_inner(
@@ -973,7 +1136,7 @@ fn load_job_state(conn: &AsyncConnection, job_id: i64) -> SearchResult<Option<Jo
     let params = [SqliteValue::Integer(job_id)];
     let rows = conn
         .query_with_params_sync(
-            "SELECT status, retry_count, max_retries, started_at, doc_id, embedder_id \
+            "SELECT status, retry_count, max_retries, started_at, doc_id, embedder_id, claim_epoch, worker_id, content_hash \
      FROM embedding_jobs \
      WHERE job_id = ?1 \
      LIMIT 1;",
@@ -999,6 +1162,12 @@ fn load_job_state(conn: &AsyncConnection, job_id: i64) -> SearchResult<Option<Jo
         started_at: row_optional_i64(row, 3)?,
         doc_id: row_text(row, 4, "embedding_jobs.doc_id")?.to_owned(),
         embedder_id: row_text(row, 5, "embedding_jobs.embedder_id")?.to_owned(),
+        claim_epoch: row_i64(row, 6, "embedding_jobs.claim_epoch")?,
+        worker_id: match row.get(7) {
+            Some(SqliteValue::Null) => None,
+            _ => Some(row_text(row, 7, "embedding_jobs.worker_id")?.to_owned()),
+        },
+        content_hash: row_optional_blob_32(row, 8, "embedding_jobs.content_hash")?,
     }))
 }
 
@@ -1042,18 +1211,6 @@ fn not_found_error(entity: &str, key: &str) -> SearchError {
 
 fn conflict_error(message: String) -> SearchError {
     queue_error(QueueErrorKind::Conflict, message)
-}
-
-pub(crate) fn is_queue_conflict(error: &SearchError) -> bool {
-    let SearchError::SubsystemError { subsystem, source } = error else {
-        return false;
-    };
-    if *subsystem != SUBSYSTEM {
-        return false;
-    }
-    source
-        .downcast_ref::<QueueError>()
-        .is_some_and(|queue_error| queue_error.kind == QueueErrorKind::Conflict)
 }
 
 fn queue_error(kind: QueueErrorKind, message: String) -> SearchError {
@@ -1209,8 +1366,8 @@ mod tests {
     use crate::document::DocumentRecord;
 
     use super::{
-        ClaimedJob, EnqueueRequest, FailResult, JobQueueConfig, JobStatus, PersistentJobQueue,
-        QueueDepth, unix_timestamp_ms,
+        ClaimOutcome, ClaimedJob, EnqueueRequest, FailResult, JobQueueConfig, JobStatus,
+        PersistentJobQueue, QueueDepth, unix_timestamp_ms,
     };
 
     struct TempDbPath {
@@ -1317,6 +1474,448 @@ mod tests {
             .into_iter()
             .next()
             .expect("claim result should contain a job")
+    }
+
+    fn queue_rows(storage: &Storage) -> Vec<Vec<SqliteValue>> {
+        storage.connection().query_sync(
+            "SELECT job_id, doc_id, embedder_id, priority, submitted_at, started_at, completed_at, \
+             status, retry_count, max_retries, error_message, content_hash, worker_id, claim_epoch \
+             FROM embedding_jobs ORDER BY job_id;",
+        ).unwrap().iter().map(|row| {
+            (0..14).map(|column| row.get(column).unwrap().clone()).collect()
+        }).collect()
+    }
+
+    fn catalog_status_rows(storage: &Storage) -> Vec<Vec<SqliteValue>> {
+        storage
+            .connection()
+            .query_sync("SELECT * FROM embedding_status ORDER BY doc_id, embedder_id;")
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (0..7)
+                    .map(|column| row.get(column).unwrap().clone())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reclaimed_attempt_cannot_mutate_current_owner_even_with_same_worker_id() {
+        for next_worker in ["worker-original", "worker-replacement"] {
+            let (queue, storage) = queue_fixture(JobQueueConfig {
+                visibility_timeout_ms: 1,
+                stale_job_threshold_ms: 1,
+                ..JobQueueConfig::default()
+            });
+            insert_document(&storage, "fenced", 31);
+            queue.enqueue("fenced", "emb", &[31; 32], 0).unwrap();
+            let old = claim_single(&queue, "worker-original");
+            assert_eq!(old.claim_epoch, 1);
+            storage
+                .connection()
+                .execute_sync(
+                    "UPDATE embedding_jobs SET started_at = 0 WHERE status = 'processing';",
+                )
+                .unwrap();
+            assert_eq!(queue.reclaim_stale_jobs().unwrap(), 1);
+            let current = claim_single(&queue, next_worker);
+            assert_eq!(current.job_id, old.job_id);
+            assert_eq!(current.claim_epoch, old.claim_epoch + 1);
+            let before = queue_rows(&storage);
+            let metrics = queue.metrics().snapshot();
+            assert_eq!(
+                queue.check_claim(&old, None).unwrap(),
+                ClaimOutcome::LostClaim
+            );
+            assert_eq!(
+                queue.complete(&old, &[31; 32]).unwrap(),
+                ClaimOutcome::LostClaim
+            );
+            assert_eq!(
+                queue.fail(&old, &[31; 32], "late error").unwrap(),
+                ClaimOutcome::LostClaim
+            );
+            assert_eq!(
+                queue.skip(&old, &[31; 32], "late skip").unwrap(),
+                ClaimOutcome::LostClaim
+            );
+            assert_eq!(queue_rows(&storage), before);
+            assert_eq!(queue.metrics().snapshot(), metrics);
+            assert_eq!(storage.count_by_status("emb").unwrap().pending, 1);
+            assert_eq!(
+                queue.complete(&current, &[31; 32]).unwrap(),
+                ClaimOutcome::Applied(())
+            );
+            assert_eq!(storage.count_by_status("emb").unwrap().embedded, 1);
+        }
+    }
+
+    #[test]
+    fn claimed_identity_fields_are_admitted_before_any_lifecycle_side_effect() {
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(&storage, "identity-fence", 32);
+        queue
+            .enqueue("identity-fence", "emb", &[32; 32], 0)
+            .unwrap();
+        let current = claim_single(&queue, "owner");
+        for changed_field in ["epoch", "worker", "document", "embedder", "hash"] {
+            let mut forged = current.clone();
+            match changed_field {
+                "epoch" => forged.claim_epoch = 0,
+                "worker" => forged.worker_id = "other".to_owned(),
+                "document" => forged.doc_id = "other".to_owned(),
+                "embedder" => forged.embedder_id = "other".to_owned(),
+                "hash" => forged.content_hash = Some([33; 32]),
+                _ => unreachable!(),
+            }
+            let before = queue_rows(&storage);
+            let metrics = queue.metrics().snapshot();
+            assert_eq!(
+                queue.check_claim(&forged, None).unwrap(),
+                ClaimOutcome::LostClaim,
+                "{changed_field}"
+            );
+            assert_eq!(
+                queue.complete(&forged, &[32; 32]).unwrap(),
+                ClaimOutcome::LostClaim,
+                "{changed_field}"
+            );
+            assert_eq!(
+                queue.fail(&forged, &[32; 32], "error").unwrap(),
+                ClaimOutcome::LostClaim,
+                "{changed_field}"
+            );
+            assert_eq!(
+                queue.skip(&forged, &[32; 32], "reason").unwrap(),
+                ClaimOutcome::LostClaim,
+                "{changed_field}"
+            );
+            assert_eq!(queue_rows(&storage), before, "{changed_field}");
+            assert_eq!(queue.metrics().snapshot(), metrics, "{changed_field}");
+        }
+        assert_eq!(
+            queue.complete(&current, &[32; 32]).unwrap(),
+            ClaimOutcome::Applied(())
+        );
+    }
+
+    #[test]
+    fn resurrection_preserves_epoch_against_a_late_attempt_from_the_same_worker() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            max_retries: 0,
+            retry_base_delay_ms: 0,
+            ..JobQueueConfig::default()
+        });
+        insert_document(&storage, "resurrection-fence", 34);
+        queue
+            .enqueue("resurrection-fence", "emb", &[34; 32], 0)
+            .unwrap();
+        let old = claim_single(&queue, "same-worker");
+        assert!(matches!(
+            queue.fail(&old, &[34; 32], "first attempt failed").unwrap(),
+            ClaimOutcome::Applied(FailResult::TerminalFailed { .. })
+        ));
+        assert_eq!(queue.resurrect_terminal_failures("emb").unwrap(), 1);
+        let current = claim_single(&queue, "same-worker");
+        assert_eq!(current.job_id, old.job_id);
+        assert_eq!(current.retry_count, 0);
+        assert_eq!(current.claim_epoch, old.claim_epoch + 1);
+        let before = queue_rows(&storage);
+        let metrics = queue.metrics().snapshot();
+        assert_eq!(
+            queue.complete(&old, &[34; 32]).unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        assert_eq!(
+            queue.fail(&old, &[34; 32], "late failure").unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        assert_eq!(
+            queue.skip(&old, &[34; 32], "late skip").unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        assert_eq!(queue_rows(&storage), before);
+        assert_eq!(queue.metrics().snapshot(), metrics);
+        assert_eq!(
+            queue.complete(&current, &[34; 32]).unwrap(),
+            ClaimOutcome::Applied(())
+        );
+        assert_eq!(storage.count_by_status("emb").unwrap().embedded, 1);
+    }
+
+    #[test]
+    fn invalid_or_exhausted_claim_epoch_rolls_back_the_whole_claim_batch() {
+        for invalid_epoch in [-1_i64, i64::MAX] {
+            let (queue, storage) = queue_fixture(JobQueueConfig::default());
+            insert_document(&storage, "claim-first", 35);
+            insert_document(&storage, "claim-overflow", 36);
+            queue.enqueue("claim-first", "emb", &[35; 32], 10).unwrap();
+            queue
+                .enqueue("claim-overflow", "emb", &[36; 32], 0)
+                .unwrap();
+            storage
+                .connection()
+                .execute_with_params_sync(
+                    "UPDATE embedding_jobs SET claim_epoch = ?1 WHERE doc_id = 'claim-overflow';",
+                    &[SqliteValue::Integer(invalid_epoch)],
+                )
+                .unwrap();
+            let before = queue_rows(&storage);
+            let metrics = queue.metrics().snapshot();
+            let error = queue.claim_batch("worker", 2).unwrap_err();
+            assert!(error.to_string().contains("claim epoch"), "{error}");
+            assert_eq!(queue_rows(&storage), before);
+            assert_eq!(queue.metrics().snapshot(), metrics);
+        }
+    }
+
+    #[test]
+    fn superseded_lifecycle_actions_retire_only_the_owned_obsolete_row() {
+        for operation in ["check", "complete", "fail", "skip"] {
+            let (queue, storage) = queue_fixture(JobQueueConfig {
+                max_retries: 0,
+                ..JobQueueConfig::default()
+            });
+            insert_document(&storage, "revision", 37);
+            queue.enqueue("revision", "emb", &[37; 32], 0).unwrap();
+            let old = claim_single(&queue, "worker-old");
+            insert_document(&storage, "revision", 38);
+            queue.enqueue("revision", "emb", &[38; 32], 0).unwrap();
+            let metrics = queue.metrics().snapshot();
+            match operation {
+                "check" => assert_eq!(
+                    queue.check_claim(&old, Some(&[37; 32])).unwrap(),
+                    ClaimOutcome::Superseded
+                ),
+                "complete" => assert_eq!(
+                    queue.complete(&old, &[37; 32]).unwrap(),
+                    ClaimOutcome::Superseded
+                ),
+                "fail" => assert_eq!(
+                    queue.fail(&old, &[37; 32], "old failure").unwrap(),
+                    ClaimOutcome::Superseded
+                ),
+                "skip" => assert_eq!(
+                    queue.skip(&old, &[37; 32], "old skip").unwrap(),
+                    ClaimOutcome::Superseded
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(queue.metrics().snapshot(), metrics, "{operation}");
+            assert_eq!(queue.queue_depth().unwrap().pending, 1);
+            assert_eq!(queue.queue_depth().unwrap().processing, 0);
+            assert_eq!(storage.count_by_status("emb").unwrap().pending, 1);
+            let current = claim_single(&queue, "worker-new");
+            assert_eq!(current.content_hash, Some([38; 32]));
+            assert_eq!(
+                queue.complete(&current, &[38; 32]).unwrap(),
+                ClaimOutcome::Applied(())
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_job_hash_is_bound_to_the_captured_document_revision() {
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(&storage, "legacy-hash", 39);
+        queue.enqueue("legacy-hash", "emb", &[39; 32], 0).unwrap();
+        storage
+            .connection()
+            .execute_sync("UPDATE embedding_jobs SET content_hash = NULL;")
+            .unwrap();
+        let claim = claim_single(&queue, "worker");
+        assert_eq!(claim.content_hash, None);
+        let ClaimOutcome::Applied(captured) = queue.check_claim(&claim, None).unwrap() else {
+            panic!("current legacy job should capture its catalog revision");
+        };
+        insert_document(&storage, "legacy-hash", 40);
+        let metrics = queue.metrics().snapshot();
+        assert_eq!(
+            queue.complete(&claim, &captured.content_hash).unwrap(),
+            ClaimOutcome::Superseded
+        );
+        assert_eq!(queue.metrics().snapshot(), metrics);
+        assert_eq!(storage.count_by_status("emb").unwrap().pending, 1);
+    }
+
+    #[test]
+    fn deleted_document_retires_its_owned_orphan_without_recreating_catalog_status() {
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(&storage, "removed-document", 40);
+        queue
+            .enqueue("removed-document", "emb", &[40; 32], 0)
+            .unwrap();
+        let claim = claim_single(&queue, "worker");
+        // Imported legacy databases may contain an orphan despite the normal
+        // cascading foreign key. Exercise that path explicitly.
+        storage
+            .connection()
+            .execute_sync("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        storage
+            .connection()
+            .execute_sync("DELETE FROM documents WHERE doc_id = 'removed-document';")
+            .unwrap();
+        storage
+            .connection()
+            .execute_sync("PRAGMA foreign_keys=ON;")
+            .unwrap();
+        assert_eq!(queue.queue_depth().unwrap().processing, 1);
+        let metrics = queue.metrics().snapshot();
+        assert_eq!(
+            queue.check_claim(&claim, Some(&[40; 32])).unwrap(),
+            ClaimOutcome::Superseded
+        );
+        assert!(queue_rows(&storage).is_empty());
+        assert!(catalog_status_rows(&storage).is_empty());
+        assert_eq!(queue.metrics().snapshot(), metrics);
+    }
+
+    #[test]
+    fn returned_document_revision_keeps_retry_and_reclaim_live() {
+        for reclaim in [false, true] {
+            let (queue, storage) = queue_fixture(JobQueueConfig {
+                retry_base_delay_ms: 0,
+                visibility_timeout_ms: 1,
+                stale_job_threshold_ms: 1,
+                ..JobQueueConfig::default()
+            });
+            insert_document(&storage, "return-to-a", 41);
+            queue.enqueue("return-to-a", "emb", &[41; 32], 0).unwrap();
+            let a = claim_single(&queue, "worker-a");
+            insert_document(&storage, "return-to-a", 42);
+            queue.enqueue("return-to-a", "emb", &[42; 32], 0).unwrap();
+            insert_document(&storage, "return-to-a", 41);
+            assert!(!queue.enqueue("return-to-a", "emb", &[41; 32], 0).unwrap());
+            if reclaim {
+                storage
+                    .connection()
+                    .execute_sync(
+                        "UPDATE embedding_jobs SET started_at = 0 WHERE status = 'processing';",
+                    )
+                    .unwrap();
+                assert_eq!(queue.reclaim_stale_jobs().unwrap(), 1);
+            } else {
+                assert!(matches!(
+                    queue.fail(&a, &[41; 32], "retry current A").unwrap(),
+                    ClaimOutcome::Applied(FailResult::Retried { .. })
+                ));
+            }
+            assert_eq!(queue.queue_depth().unwrap().pending, 1);
+            let current = claim_single(&queue, "worker-a");
+            assert_eq!(current.job_id, a.job_id);
+            assert_eq!(current.content_hash, Some([41; 32]));
+            assert_eq!(current.claim_epoch, a.claim_epoch + 1);
+            assert_eq!(
+                queue.complete(&current, &[41; 32]).unwrap(),
+                ClaimOutcome::Applied(())
+            );
+        }
+    }
+
+    #[test]
+    fn retry_preserves_current_or_unknown_pending_replacement() {
+        for pending_hash in [Some([43_u8; 32]), None] {
+            let (queue, storage) = queue_fixture(JobQueueConfig {
+                retry_base_delay_ms: 0,
+                ..JobQueueConfig::default()
+            });
+            insert_document(&storage, "preserve-pending", 43);
+            queue
+                .enqueue("preserve-pending", "emb", &[43; 32], 0)
+                .unwrap();
+            let processing = claim_single(&queue, "worker");
+            // An imported or legacy pending row can coexist with the current attempt.
+            storage.connection().execute_with_params_sync(
+                "INSERT INTO embedding_jobs(doc_id, embedder_id, submitted_at, status, content_hash) \
+                 VALUES ('preserve-pending', 'emb', 0, 'pending', ?1);",
+                &[pending_hash.map_or(SqliteValue::Null, |hash| SqliteValue::Blob(hash.to_vec().into()))],
+            ).unwrap();
+            let metrics = queue.metrics().snapshot();
+            assert_eq!(
+                queue.fail(&processing, &[43; 32], "retry").unwrap(),
+                ClaimOutcome::Superseded
+            );
+            assert_eq!(queue.metrics().snapshot(), metrics);
+            let replacement = claim_single(&queue, "worker-new");
+            assert_ne!(replacement.job_id, processing.job_id);
+            assert_eq!(replacement.content_hash, pending_hash);
+            assert_eq!(
+                queue.complete(&replacement, &[43; 32]).unwrap(),
+                ClaimOutcome::Applied(())
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_write_failure_rolls_back_lifecycle_and_history_mutations() {
+        for operation in ["complete", "fail", "skip"] {
+            let (queue, storage) = queue_fixture(JobQueueConfig {
+                max_retries: 0,
+                ..JobQueueConfig::default()
+            });
+            insert_document(&storage, "atomic-status", 44);
+            queue.enqueue("atomic-status", "emb", &[44; 32], 0).unwrap();
+            let claim = claim_single(&queue, "worker");
+            let history_status = match operation {
+                "complete" => "completed",
+                "fail" => "failed",
+                _ => "skipped",
+            };
+            storage.connection().execute_with_params_sync(
+                "INSERT INTO embedding_jobs(doc_id, embedder_id, submitted_at, status, content_hash) \
+                 VALUES ('atomic-status', 'emb', 0, ?1, ?2);",
+                &[SqliteValue::Text(history_status.to_owned().into()), SqliteValue::Blob(vec![44; 32].into())],
+            ).unwrap();
+            storage
+                .mark_failed("atomic-status", "emb", "existing catalog history")
+                .unwrap();
+            let catalog_before = catalog_status_rows(&storage);
+            // Make only the final catalog write fail, after queue history and status mutations.
+            storage
+                .connection()
+                .execute_sync(
+                    "ALTER TABLE embedding_status RENAME COLUMN status TO unavailable_status;",
+                )
+                .unwrap();
+            let before = queue_rows(&storage);
+            let metrics = queue.metrics().snapshot();
+            let result = match operation {
+                "complete" => queue.complete(&claim, &[44; 32]),
+                "fail" => queue
+                    .fail(&claim, &[44; 32], "failure")
+                    .map(|outcome| match outcome {
+                        ClaimOutcome::Applied(_) => ClaimOutcome::Applied(()),
+                        ClaimOutcome::LostClaim => ClaimOutcome::LostClaim,
+                        ClaimOutcome::Superseded => ClaimOutcome::Superseded,
+                    }),
+                _ => queue.skip(&claim, &[44; 32], "skip"),
+            };
+            assert!(result.is_err(), "{operation} must surface catalog failure");
+            assert_eq!(
+                queue_rows(&storage),
+                before,
+                "{operation} must roll back queue changes"
+            );
+            assert_eq!(
+                catalog_status_rows(&storage),
+                catalog_before,
+                "{operation} must preserve catalog history"
+            );
+            assert_eq!(queue.metrics().snapshot(), metrics);
+            storage
+                .connection()
+                .execute_sync(
+                    "ALTER TABLE embedding_status RENAME COLUMN unavailable_status TO status;",
+                )
+                .unwrap();
+            assert_eq!(
+                queue.complete(&claim, &[44; 32]).unwrap(),
+                ClaimOutcome::Applied(())
+            );
+            assert_eq!(storage.count_by_status("emb").unwrap().embedded, 1);
+        }
     }
 
     #[test]
@@ -1485,7 +2084,7 @@ mod tests {
         assert_eq!(depth.pending, 1, "replacement should be queued as pending");
 
         queue
-            .complete(inflight.job_id)
+            .complete(&inflight, &old_hash)
             .expect("completing inflight job should still succeed");
         let replacement = claim_single(&queue, "worker-replacement");
         assert_ne!(
@@ -1515,22 +2114,22 @@ mod tests {
         let first_claim = claim_single(&queue, "worker-f1");
 
         let first_fail = queue
-            .fail(first_claim.job_id, "transient failure")
+            .fail(&first_claim, &hash, "transient failure")
             .expect("first fail should succeed");
         assert!(matches!(
             first_fail,
-            FailResult::Retried { retry_count: 1, .. }
+            ClaimOutcome::Applied(FailResult::Retried { retry_count: 1, .. })
         ));
 
         let second_claim = claim_single(&queue, "worker-f2");
         assert_eq!(second_claim.job_id, first_claim.job_id);
 
         let second_fail = queue
-            .fail(second_claim.job_id, "permanent failure")
+            .fail(&second_claim, &hash, "permanent failure")
             .expect("second fail should succeed");
         assert!(matches!(
             second_fail,
-            FailResult::TerminalFailed { retry_count: 2 }
+            ClaimOutcome::Applied(FailResult::TerminalFailed { retry_count: 2 })
         ));
 
         let depth = queue.queue_depth().expect("queue depth should load");
@@ -1673,6 +2272,11 @@ mod tests {
 
         let recovered = claim_single(&queue_b, "worker-after-restart");
         assert_eq!(recovered.job_id, claim.job_id);
+        assert_eq!(recovered.claim_epoch, claim.claim_epoch + 1);
+        assert_eq!(
+            queue_b.complete(&claim, &hash).unwrap(),
+            ClaimOutcome::LostClaim
+        );
     }
 
     #[test]
@@ -1690,6 +2294,7 @@ mod tests {
             .enqueue("doc-superseded", "all-MiniLM-L6-v2", &old_hash, 0)
             .expect("initial enqueue should succeed");
         let claim = claim_single(&queue, "worker-superseded");
+        insert_document(storage.as_ref(), "doc-superseded", 45);
         queue
             .enqueue("doc-superseded", "all-MiniLM-L6-v2", &new_hash, 0)
             .expect("replacement enqueue should succeed");
@@ -1827,10 +2432,10 @@ mod tests {
             .expect("enqueue should succeed");
         let claim = claim_single(&queue, "worker-delay");
         let retry = queue
-            .fail(claim.job_id, "transient")
+            .fail(&claim, &hash, "transient")
             .expect("fail should schedule retry");
         assert!(
-            matches!(retry, FailResult::Retried { delay_ms, .. } if delay_ms >= 1_000),
+            matches!(retry, ClaimOutcome::Applied(FailResult::Retried { delay_ms, .. }) if delay_ms >= 1_000),
             "retry should include a future delay"
         );
 
@@ -1903,15 +2508,20 @@ mod tests {
 
         // 3. User updates document, enqueues new version.
         // This creates a NEW 'pending' job because the old one is 'processing'.
+        insert_document(storage.as_ref(), "doc-race", 101);
         queue
             .enqueue("doc-race", "all-MiniLM-L6-v2", &new_hash, 0)
             .unwrap();
 
         // 4. Worker fails to process the OLD version.
-        let fail_result = queue.fail(claim.job_id, "transient network error").unwrap();
-        assert!(
-            matches!(fail_result, FailResult::TerminalFailed { .. }),
-            "Old job should be terminally failed because a newer pending job exists"
+        let fail_result = queue
+            .fail(&claim, &old_hash, "transient network error")
+            .unwrap();
+        assert_eq!(fail_result, ClaimOutcome::Superseded);
+        assert_eq!(queue.metrics().snapshot().total_failed, 0);
+        assert_eq!(
+            storage.count_by_status("all-MiniLM-L6-v2").unwrap().failed,
+            0
         );
 
         // 5. The pending job should STILL be the NEW version, not the old one retrying!
@@ -2383,6 +2993,8 @@ mod tests {
     fn claimed_job_serde_roundtrip() {
         let job = ClaimedJob {
             job_id: 42,
+            claim_epoch: 7,
+            worker_id: "worker-42".to_owned(),
             doc_id: "doc-1".into(),
             embedder_id: "emb-1".to_owned(),
             priority: 5,
@@ -2400,6 +3012,8 @@ mod tests {
     fn claimed_job_without_content_hash() {
         let job = ClaimedJob {
             job_id: 1,
+            claim_epoch: 1,
+            worker_id: "worker-1".to_owned(),
             doc_id: "d".into(),
             embedder_id: "e".to_owned(),
             priority: 0,
@@ -2452,116 +3066,119 @@ mod tests {
     }
 
     #[test]
-    fn complete_missing_job_returns_error() {
-        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
-        let err = queue
-            .complete(99999)
-            .expect_err("completing nonexistent job should fail");
-        assert!(err.to_string().contains("not_found"), "error: {err}");
+    fn missing_job_returns_lost_claim_for_every_lifecycle_operation() {
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(&storage, "missing-job", 49);
+        queue.enqueue("missing-job", "emb", &[49; 32], 0).unwrap();
+        let mut claim = claim_single(&queue, "worker");
+        claim.job_id = 99999;
+        let before = queue.metrics().snapshot();
+        assert_eq!(
+            queue.check_claim(&claim, None).unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        assert_eq!(
+            queue.complete(&claim, &[49; 32]).unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        assert_eq!(
+            queue.fail(&claim, &[49; 32], "error").unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        assert_eq!(
+            queue.skip(&claim, &[49; 32], "reason").unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        assert_eq!(queue.metrics().snapshot(), before);
     }
 
     #[test]
-    fn complete_pending_job_returns_conflict() {
+    fn old_claim_cannot_complete_or_skip_pending_retry() {
         let (queue, storage) = queue_fixture(JobQueueConfig::default());
         insert_document(storage.as_ref(), "doc-cp", 50);
 
         let hash = [50_u8; 32];
         queue.enqueue("doc-cp", "emb", &hash, 0).unwrap();
 
-        // Get job_id from the pending row
-        let rows = storage
-            .connection()
-            .query_sync("SELECT job_id FROM embedding_jobs WHERE status = 'pending' LIMIT 1;")
-            .expect("query should succeed");
-        let job_id = match rows[0].get(0) {
-            Some(SqliteValue::Integer(id)) => *id,
-            _ => panic!("expected integer job_id"),
-        };
-
-        let err = queue
-            .complete(job_id)
-            .expect_err("completing pending job should fail");
-        assert!(err.to_string().contains("not processing"), "error: {err}");
-    }
-
-    #[test]
-    fn fail_missing_job_returns_error() {
-        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
-        let err = queue
-            .fail(99999, "error message")
-            .expect_err("failing nonexistent job should fail");
-        assert!(err.to_string().contains("not_found"), "error: {err}");
+        let claim = claim_single(&queue, "worker");
+        assert!(matches!(
+            queue.fail(&claim, &hash, "retry").unwrap(),
+            ClaimOutcome::Applied(FailResult::Retried { .. })
+        ));
+        let before = queue.metrics().snapshot();
+        assert_eq!(
+            queue.complete(&claim, &hash).unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        assert_eq!(
+            queue.skip(&claim, &hash, "not needed").unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        assert_eq!(queue.metrics().snapshot(), before);
+        assert_eq!(queue.queue_depth().unwrap().pending, 1);
     }
 
     #[test]
     fn fail_empty_error_rejected() {
-        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(&storage, "empty-error", 50);
+        queue.enqueue("empty-error", "emb", &[50; 32], 0).unwrap();
+        let claim = claim_single(&queue, "worker");
         let err = queue
-            .fail(1, "")
+            .fail(&claim, &[50; 32], "")
             .expect_err("empty error message should be rejected");
         assert!(err.to_string().contains("error"), "error: {err}");
     }
 
     #[test]
-    fn skip_missing_job_returns_error() {
-        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
-        let err = queue
-            .skip(99999, "reason")
-            .expect_err("skipping nonexistent job should fail");
-        assert!(err.to_string().contains("not_found"), "error: {err}");
-    }
-
-    #[test]
     fn skip_empty_reason_rejected() {
-        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(&storage, "empty-reason", 50);
+        queue.enqueue("empty-reason", "emb", &[50; 32], 0).unwrap();
+        let claim = claim_single(&queue, "worker");
         let err = queue
-            .skip(1, "")
+            .skip(&claim, &[50; 32], "")
             .expect_err("empty reason should be rejected");
         assert!(err.to_string().contains("reason"), "error: {err}");
     }
 
     #[test]
-    fn skip_completed_job_returns_conflict() {
+    fn skip_completed_job_returns_lost_claim() {
         let (queue, storage) = queue_fixture(JobQueueConfig::default());
         insert_document(storage.as_ref(), "doc-sc", 51);
 
         let hash = [51_u8; 32];
         queue.enqueue("doc-sc", "emb", &hash, 0).unwrap();
         let claimed = claim_single(&queue, "worker-sc");
-        queue.complete(claimed.job_id).unwrap();
-
-        let err = queue
-            .skip(claimed.job_id, "not needed")
-            .expect_err("skipping completed job should fail");
-        assert!(
-            err.to_string().contains("cannot be skipped"),
-            "error: {err}"
+        assert_eq!(
+            queue.complete(&claimed, &hash).unwrap(),
+            ClaimOutcome::Applied(())
         );
+        assert_eq!(
+            queue.skip(&claimed, &hash, "not needed").unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        assert_eq!(storage.count_by_status("emb").unwrap().embedded, 1);
     }
 
     #[test]
-    fn skip_pending_job_succeeds() {
+    fn skip_owned_processing_job_updates_catalog_and_queue() {
         let (queue, storage) = queue_fixture(JobQueueConfig::default());
         insert_document(storage.as_ref(), "doc-sp", 52);
 
         let hash = [52_u8; 32];
         queue.enqueue("doc-sp", "emb", &hash, 0).unwrap();
 
-        // Get job_id from pending row
-        let rows = storage
-            .connection()
-            .query_sync("SELECT job_id FROM embedding_jobs WHERE status = 'pending' LIMIT 1;")
-            .expect("query should succeed");
-        let job_id = match rows[0].get(0) {
-            Some(SqliteValue::Integer(id)) => *id,
-            _ => panic!("expected integer job_id"),
-        };
-
-        queue.skip(job_id, "not needed").unwrap();
+        let claim = claim_single(&queue, "worker");
+        assert_eq!(
+            queue.skip(&claim, &hash, "not needed").unwrap(),
+            ClaimOutcome::Applied(())
+        );
 
         let depth = queue.queue_depth().unwrap();
         assert_eq!(depth.pending, 0);
         assert_eq!(depth.skipped, 1);
+        assert_eq!(storage.count_by_status("emb").unwrap().skipped, 1);
     }
 
     #[test]
@@ -2657,20 +3274,6 @@ mod tests {
     }
 
     #[test]
-    fn is_queue_conflict_detects_conflict_errors() {
-        use super::{conflict_error, is_queue_conflict};
-        let err = conflict_error("job changed status".to_owned());
-        assert!(is_queue_conflict(&err));
-    }
-
-    #[test]
-    fn is_queue_conflict_ignores_non_conflict_errors() {
-        use super::{QueueErrorKind, is_queue_conflict, queue_error};
-        let err = queue_error(QueueErrorKind::Validation, "bad input".to_owned());
-        assert!(!is_queue_conflict(&err));
-    }
-
-    #[test]
     fn queue_error_creates_subsystem_error() {
         use super::{QueueErrorKind, queue_error};
         let err = queue_error(QueueErrorKind::Validation, "bad input".to_owned());
@@ -2749,9 +3352,13 @@ mod tests {
 
         // Claim and fail both (max_retries=0 means terminal on first fail)
         let claimed1 = claim_single(&queue, "worker-1");
-        queue.fail(claimed1.job_id, "test-error-1").unwrap();
+        queue
+            .fail(&claimed1, &claimed1.content_hash.unwrap(), "test-error-1")
+            .unwrap();
         let claimed2 = claim_single(&queue, "worker-1");
-        queue.fail(claimed2.job_id, "test-error-2").unwrap();
+        queue
+            .fail(&claimed2, &claimed2.content_hash.unwrap(), "test-error-2")
+            .unwrap();
 
         // Verify both are in failed state
         let depth_before = queue.queue_depth().unwrap();
@@ -2791,9 +3398,13 @@ mod tests {
 
         // Fail both
         let claimed1 = claim_single(&queue, "worker-1");
-        queue.fail(claimed1.job_id, "error").unwrap();
+        queue
+            .fail(&claimed1, &claimed1.content_hash.unwrap(), "error")
+            .unwrap();
         let claimed2 = claim_single(&queue, "worker-1");
-        queue.fail(claimed2.job_id, "error").unwrap();
+        queue
+            .fail(&claimed2, &claimed2.content_hash.unwrap(), "error")
+            .unwrap();
 
         // Only resurrect embedder-A
         let resurrected = queue

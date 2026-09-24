@@ -2254,7 +2254,7 @@ impl GenerationComponentReceiptsV2 {
         self.vector.encode(encoder);
         self.lexical.encode(encoder);
         encoder.option(self.ann.as_ref(), |receipt, encoder| {
-            receipt.encode(encoder)
+            receipt.encode(encoder);
         });
         self.metadata.encode(encoder);
     }

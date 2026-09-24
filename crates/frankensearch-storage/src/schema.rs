@@ -7,7 +7,7 @@ use fsqlite_types::value::SqliteValue;
 
 use crate::connection::{map_storage_error_at, retry_transient_storage};
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Governed marker table for the FTS5 Porter tokenizer rebuild.
 ///
@@ -57,6 +57,7 @@ const LATEST_SCHEMA: &[&str] = &[
         error_message TEXT,\
         content_hash BLOB,\
         worker_id TEXT,\
+        claim_epoch INTEGER NOT NULL DEFAULT 0,\
         UNIQUE(doc_id, embedder_id, status)\
     );",
     "CREATE TABLE IF NOT EXISTS embedding_status (\
@@ -340,6 +341,12 @@ const MIGRATIONS: &[Migration] = &[
                 table_name TEXT PRIMARY KEY,\
                 rebuild_version INTEGER NOT NULL\
             );",
+        ],
+    },
+    Migration {
+        version: 8,
+        statements: &[
+            "ALTER TABLE embedding_jobs ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0;",
         ],
     },
 ];
@@ -668,6 +675,25 @@ mod tests {
             index_exists(&conn, "embedding_jobs", "idx_jobs_processing"),
             "latest schema should include queue processing index"
         );
+        conn.execute_sync(
+            "INSERT INTO documents(doc_id, content_preview, content_hash, content_length, created_at, updated_at) \
+             VALUES ('fresh-doc', 'preview', X'0102', 7, 100, 100);",
+        )
+        .expect("fresh document");
+        conn.execute_sync(
+            "INSERT INTO embedding_jobs(doc_id, embedder_id, submitted_at) \
+             VALUES ('fresh-doc', 'model', 100);",
+        )
+        .expect("jobs may omit the initial claim epoch");
+        let rows = conn
+            .query_sync("SELECT claim_epoch FROM embedding_jobs;")
+            .expect("fresh schema includes claim epoch");
+        assert_eq!(super::row_i64(&rows[0], 0, "claim_epoch").unwrap(), 0);
+        assert!(
+            conn.execute_sync("UPDATE embedding_jobs SET claim_epoch = NULL;")
+                .is_err(),
+            "a claim epoch cannot become NULL"
+        );
     }
 
     #[test]
@@ -727,11 +753,147 @@ mod tests {
         );
         assert!(
             index_exists(&conn, "search_history", "idx_history_query"),
-            "v6 search-history index must survive the v7 rebuild-marker migration"
+            "search-history index must survive later migrations"
         );
         assert!(
             table_exists(&conn, "frankensearch_fts5_rebuild_version"),
-            "v7 migration must create the FTS5 rebuild-version marker table"
+            "FTS5 rebuild-version marker table must survive later migrations"
+        );
+    }
+
+    #[test]
+    fn bootstrap_migrates_populated_v7_queue_without_losing_claim_state() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "frankensearch-schema-v7-claims-{}-{nanos}.sqlite3",
+            process::id()
+        ));
+        let open = || {
+            AsyncConnection::open_sync(db_path.to_string_lossy().into_owned())
+                .expect("migration database should open")
+        };
+        let conn = open();
+        seed_historical_schema(&conn, 7);
+        assert!(
+            conn.query_sync("SELECT claim_epoch FROM embedding_jobs;")
+                .is_err(),
+            "fixture must represent the pre-epoch schema"
+        );
+        for (job_id, status, started, completed, retries, worker, error) in [
+            (101, "pending", None, None, 0, None, None),
+            (
+                102,
+                "processing",
+                Some(200),
+                None,
+                1,
+                Some("worker-active"),
+                None,
+            ),
+            (
+                103,
+                "completed",
+                Some(201),
+                Some(301),
+                2,
+                Some("worker-done"),
+                None,
+            ),
+            (
+                104,
+                "failed",
+                Some(202),
+                Some(302),
+                3,
+                Some("worker-failed"),
+                Some("exhausted retries"),
+            ),
+        ] {
+            let doc_id = format!("doc-{status}");
+            let hash =
+                SqliteValue::Blob(vec![u8::try_from(job_id).expect("fixture ID fits"); 32].into());
+            conn.execute_with_params_sync(
+                "INSERT INTO documents(doc_id, source_path, content_preview, content_hash, content_length, created_at, updated_at, metadata_json) \
+                 VALUES (?1, ?2, ?3, ?4, 7, 100, 150, ?5);",
+                &[
+                    SqliteValue::Text(doc_id.clone().into()),
+                    SqliteValue::Text(format!("/source/{status}").into()),
+                    SqliteValue::Text("preview".to_owned().into()),
+                    hash.clone(),
+                    SqliteValue::Text("{\"preserved\":true}".to_owned().into()),
+                ],
+            )
+            .expect("historical document");
+            conn.execute_with_params_sync(
+                "INSERT INTO embedding_jobs(job_id, doc_id, embedder_id, priority, submitted_at, started_at, completed_at, status, retry_count, max_retries, error_message, content_hash, worker_id) \
+                 VALUES (?1, ?2, 'model-v7', ?3, 175, ?4, ?5, ?6, ?7, 3, ?8, ?9, ?10);",
+                &[
+                    SqliteValue::Integer(job_id),
+                    SqliteValue::Text(doc_id.into()),
+                    SqliteValue::Integer(job_id - 100),
+                    started.map_or(SqliteValue::Null, SqliteValue::Integer),
+                    completed.map_or(SqliteValue::Null, SqliteValue::Integer),
+                    SqliteValue::Text(status.to_owned().into()),
+                    SqliteValue::Integer(retries),
+                    error.map_or(SqliteValue::Null, |message| SqliteValue::Text(message.to_owned().into())),
+                    hash,
+                    worker.map_or(SqliteValue::Null, |id| SqliteValue::Text(id.to_owned().into())),
+                ],
+            )
+            .expect("historical job");
+        }
+        let job_state = |conn: &AsyncConnection| {
+            conn.query_sync(
+                "SELECT job_id, doc_id, embedder_id, priority, submitted_at, started_at, completed_at, status, retry_count, max_retries, error_message, content_hash, worker_id \
+                 FROM embedding_jobs ORDER BY job_id;",
+            )
+            .expect("read all historical job fields")
+            .iter()
+            .map(|row| {
+                (0..13)
+                    .map(|column| row.get(column).expect("selected column").clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+        };
+        let before = job_state(&conn);
+        assert_eq!(before.len(), 4);
+        drop(conn);
+
+        let conn = open();
+        bootstrap(&conn).expect("populated v7 database should migrate additively");
+        assert_eq!(current_version(&conn).unwrap(), 8);
+        assert_eq!(job_state(&conn), before, "all existing job fields survive");
+        let epochs = conn
+            .query_sync("SELECT claim_epoch FROM embedding_jobs ORDER BY job_id;")
+            .expect("read migrated epochs");
+        assert_eq!(epochs.len(), 4);
+        for row in &epochs {
+            assert_eq!(super::row_i64(row, 0, "claim_epoch").unwrap(), 0);
+        }
+        assert!(index_exists(&conn, "embedding_jobs", "idx_jobs_pending"));
+        assert!(index_exists(&conn, "embedding_jobs", "idx_jobs_processing"));
+        conn.execute_sync("UPDATE embedding_jobs SET claim_epoch = 17 WHERE job_id = 102;")
+            .expect("record a later claim fence");
+        drop(conn);
+
+        let conn = open();
+        bootstrap(&conn).expect("latest-schema bootstrap is idempotent");
+        assert_eq!(job_state(&conn), before, "reopen preserves queue history");
+        let epochs = conn
+            .query_sync("SELECT claim_epoch FROM embedding_jobs ORDER BY job_id;")
+            .expect("durable epochs");
+        let epochs: Vec<_> = epochs
+            .iter()
+            .map(|row| super::row_i64(row, 0, "claim_epoch").unwrap())
+            .collect();
+        assert_eq!(
+            epochs,
+            [0, 17, 0, 0],
+            "bootstrap never resets a claim fence"
         );
     }
 
@@ -897,8 +1059,8 @@ mod tests {
     // ── Schema version constant ─────────────────────────────────────────
 
     #[test]
-    fn schema_version_is_seven() {
-        assert_eq!(SCHEMA_VERSION, 7);
+    fn schema_version_is_eight() {
+        assert_eq!(SCHEMA_VERSION, 8);
     }
 
     // ── Migration array invariants ──────────────────────────────────────

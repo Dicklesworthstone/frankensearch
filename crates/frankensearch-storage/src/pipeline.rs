@@ -15,7 +15,9 @@ use crate::Storage;
 use crate::connection::map_storage_error;
 use crate::content_hash::{ContentHasher, record_content_hash};
 use crate::document::{DocumentRecord, EmbeddingStatus, upsert_document};
-use crate::job_queue::{EnqueueOutcome, EnqueueRequest, PersistentJobQueue, enqueue_inner};
+use crate::job_queue::{
+    ClaimOutcome, EnqueueOutcome, EnqueueRequest, PersistentJobQueue, enqueue_inner,
+};
 use crate::schema::row_i64;
 
 const PIPELINE_SUBSYSTEM: &str = "storage_pipeline";
@@ -102,6 +104,8 @@ pub struct BatchProcessResult {
     pub jobs_completed: usize,
     pub jobs_failed: usize,
     pub jobs_skipped: usize,
+    /// Local attempts whose claim or document version was superseded.
+    pub jobs_suppressed: usize,
     pub terminal_failures: usize,
     pub embed_time: Duration,
     pub total_time: Duration,
@@ -114,6 +118,7 @@ pub struct WorkerReport {
     pub jobs_completed: usize,
     pub jobs_failed: usize,
     pub jobs_skipped: usize,
+    pub jobs_suppressed: usize,
     pub idle_cycles: usize,
     pub terminal_failures_encountered: usize,
 }
@@ -129,6 +134,7 @@ pub struct PipelineMetrics {
     pub total_jobs_completed: AtomicU64,
     pub total_jobs_failed: AtomicU64,
     pub total_jobs_skipped: AtomicU64,
+    pub total_jobs_suppressed: AtomicU64,
     pub total_embed_time_us: AtomicU64,
     pub total_reclaimed: AtomicU64,
 }
@@ -144,6 +150,7 @@ pub struct PipelineMetricsSnapshot {
     pub total_jobs_completed: u64,
     pub total_jobs_failed: u64,
     pub total_jobs_skipped: u64,
+    pub total_jobs_suppressed: u64,
     pub total_embed_time_us: u64,
     pub total_reclaimed: u64,
 }
@@ -161,6 +168,7 @@ impl PipelineMetrics {
             total_jobs_completed: self.total_jobs_completed.load(Ordering::Relaxed),
             total_jobs_failed: self.total_jobs_failed.load(Ordering::Relaxed),
             total_jobs_skipped: self.total_jobs_skipped.load(Ordering::Relaxed),
+            total_jobs_suppressed: self.total_jobs_suppressed.load(Ordering::Relaxed),
             total_embed_time_us: self.total_embed_time_us.load(Ordering::Relaxed),
             total_reclaimed: self.total_reclaimed.load(Ordering::Relaxed),
         }
@@ -171,6 +179,13 @@ pub trait EmbeddingVectorSink: Send + Sync {
     /// Persist a vector after the job runner has validated its complete
     /// producer identity and response. Implementations remain responsible for
     /// admitting that producer against their own retained index generation.
+    ///
+    /// The runner checks claim ownership and document version immediately
+    /// before this call, without holding a database transaction across it.
+    /// A replacement during this call cannot be committed to the catalog by
+    /// the stale worker, but this interface cannot undo already written vector
+    /// bytes. Sinks that need atomic version publication must provide their
+    /// own version-aware compare-and-swap boundary.
     fn persist(&self, doc_id: &str, embedder_id: &str, embedding: &[f32]) -> SearchResult<()>;
 }
 
@@ -546,27 +561,12 @@ impl StorageBackedJobRunner {
         for job in &claimed {
             pipeline_checkpoint(cx, "storage.pipeline.process_batch")?;
             let job_started = Instant::now();
-            let doc = self.storage.get_document(&job.doc_id)?;
-            let Some(doc) = doc else {
-                let message = format!("document {} missing during process_batch", job.doc_id);
-                if let Err(fail_err) = self.queue.fail(job.job_id, &message) {
-                    tracing::warn!(
-                        target: "frankensearch.storage.pipeline",
-                        job_id = job.job_id,
-                        error = %fail_err,
-                        "failed to record job failure in queue"
-                    );
-                }
-                result.jobs_failed += 1;
-                tracing::warn!(
-                    target: "frankensearch.storage.pipeline",
-                    stage = "process_batch",
-                    worker_id,
-                    doc_id = %job.doc_id,
-                    embedder_id = %job.embedder_id,
-                    reason = "document_missing",
-                    "embedding job failed"
-                );
+            // Claimed batches may outlive their leases while an earlier item
+            // awaits inference. Bind this exact attempt to the current catalog
+            // hash before resolving a producer or reading embedding input.
+            let Some(doc) =
+                record_claim_outcome(job, self.queue.check_claim(job, None)?, &mut result)
+            else {
                 continue;
             };
 
@@ -607,21 +607,14 @@ impl StorageBackedJobRunner {
 
             if text.trim().is_empty() {
                 let skip_reason = "empty content preview";
-                self.queue.skip(job.job_id, skip_reason)?;
-                if let Err(error) =
-                    self.storage
-                        .mark_skipped(&job.doc_id, &job.embedder_id, skip_reason)
+                if record_claim_outcome(
+                    job,
+                    self.queue.skip(job, &doc.content_hash, skip_reason)?,
+                    &mut result,
+                )
+                .is_none()
                 {
-                    tracing::warn!(
-                        target: "frankensearch.storage.pipeline",
-                        stage = "mark_skipped",
-                        worker_id,
-                        correlation_id = %correlation_id,
-                        doc_id = %job.doc_id,
-                        embedder_id = %job.embedder_id,
-                        error = %error,
-                        "failed to record skipped status"
-                    );
+                    continue;
                 }
                 result.jobs_skipped += 1;
                 tracing::info!(
@@ -639,21 +632,14 @@ impl StorageBackedJobRunner {
 
             if is_hash_embedder(&job.embedder_id) {
                 let skip_reason = "hash embeddings computed on-the-fly";
-                self.queue.skip(job.job_id, skip_reason)?;
-                if let Err(error) =
-                    self.storage
-                        .mark_skipped(&job.doc_id, &job.embedder_id, skip_reason)
+                if record_claim_outcome(
+                    job,
+                    self.queue.skip(job, &doc.content_hash, skip_reason)?,
+                    &mut result,
+                )
+                .is_none()
                 {
-                    tracing::warn!(
-                        target: "frankensearch.storage.pipeline",
-                        stage = "mark_skipped",
-                        worker_id,
-                        correlation_id = %correlation_id,
-                        doc_id = %job.doc_id,
-                        embedder_id = %job.embedder_id,
-                        error = %error,
-                        "failed to record skipped status"
-                    );
+                    continue;
                 }
                 result.jobs_skipped += 1;
                 tracing::info!(
@@ -673,10 +659,9 @@ impl StorageBackedJobRunner {
                 Ok(embedder) => embedder,
                 Err(error) => {
                     let error_message = error.to_string();
-                    if self.handle_job_failure(job, &error) {
-                        result.terminal_failures += 1;
+                    if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
+                        continue;
                     }
-                    result.jobs_failed += 1;
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
                         stage = "process_batch",
@@ -691,16 +676,28 @@ impl StorageBackedJobRunner {
             };
             let response = embed_for_persistence(cx, embedder.as_ref(), text).await;
             pipeline_checkpoint(cx, "storage.pipeline.embedding_admitted")?;
+            let response = match response {
+                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                response => response,
+            };
+            // Cancellation wins before a stale attempt is retired. Check
+            // ownership before interpreting either success or provider error:
+            // a late failure has no authority to fail a successor's work.
+            if record_claim_outcome(
+                job,
+                self.queue.check_claim(job, Some(&doc.content_hash))?,
+                &mut result,
+            )
+            .is_none()
+            {
+                continue;
+            }
             let embedding = match response {
                 Ok(embedding) => embedding,
                 Err(error) => {
-                    if matches!(error, SearchError::Cancelled { .. }) {
-                        return Err(error);
+                    if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
+                        continue;
                     }
-                    if self.handle_job_failure(job, &error) {
-                        result.terminal_failures += 1;
-                    }
-                    result.jobs_failed += 1;
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
                         stage = "embed",
@@ -731,10 +728,9 @@ impl StorageBackedJobRunner {
                              an unsearchable record"
                         .to_owned(),
                 };
-                if self.handle_job_failure(job, &error) {
-                    result.terminal_failures += 1;
+                if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
+                    continue;
                 }
-                result.jobs_failed += 1;
                 tracing::warn!(
                     target: "frankensearch.storage.pipeline",
                     stage = "validate",
@@ -749,6 +745,15 @@ impl StorageBackedJobRunner {
             }
 
             pipeline_checkpoint(cx, "storage.pipeline.persist")?;
+            if record_claim_outcome(
+                job,
+                self.queue.check_claim(job, Some(&doc.content_hash))?,
+                &mut result,
+            )
+            .is_none()
+            {
+                continue;
+            }
             let write_result = self
                 .vector_sink
                 .persist(&job.doc_id, &job.embedder_id, &embedding);
@@ -756,10 +761,9 @@ impl StorageBackedJobRunner {
                 if matches!(error, SearchError::Cancelled { .. }) {
                     return Err(error);
                 }
-                if self.handle_job_failure(job, &error) {
-                    result.terminal_failures += 1;
+                if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
+                    continue;
                 }
-                result.jobs_failed += 1;
                 tracing::warn!(
                     target: "frankensearch.storage.pipeline",
                     stage = "persist",
@@ -773,47 +777,17 @@ impl StorageBackedJobRunner {
                 continue;
             }
 
-            if let Err(error) = self.storage.mark_embedded(&job.doc_id, &job.embedder_id) {
-                if self.handle_job_failure(job, &error) {
-                    result.terminal_failures += 1;
-                }
-                result.jobs_failed += 1;
-                tracing::warn!(
-                    target: "frankensearch.storage.pipeline",
-                    stage = "mark_embedded",
-                    worker_id,
-                    correlation_id = %correlation_id,
-                    doc_id = %job.doc_id,
-                    embedder_id = %job.embedder_id,
-                    error = %error,
-                    "failed to record embedded status"
-                );
+            // The sink is outside the queue transaction. Its successful write
+            // does not authorize a stale attempt to change catalog or queue
+            // state, even if ownership changed during synchronous persistence.
+            if record_claim_outcome(
+                job,
+                self.queue.complete(job, &doc.content_hash)?,
+                &mut result,
+            )
+            .is_none()
+            {
                 continue;
-            }
-            if let Err(error) = self.queue.complete(job.job_id) {
-                if crate::job_queue::is_queue_conflict(&error) {
-                    let skip_reason =
-                        "embedding persisted after completion conflict; skipping reclaimed job";
-                    match self.queue.skip(job.job_id, skip_reason) {
-                        Ok(()) => {}
-                        Err(skip_error) if crate::job_queue::is_queue_conflict(&skip_error) => {}
-                        Err(skip_error) => return Err(skip_error),
-                    }
-                    result.jobs_skipped += 1;
-                    tracing::warn!(
-                        target: "frankensearch.storage.pipeline",
-                        stage = "complete_conflict",
-                        worker_id,
-                        correlation_id = %correlation_id,
-                        job_id = job.job_id,
-                        doc_id = %job.doc_id,
-                        embedder_id = %job.embedder_id,
-                        error = %error,
-                        "queue completion raced with lease reclaim; job left non-fatal"
-                    );
-                    continue;
-                }
-                return Err(error);
             }
             result.jobs_completed += 1;
             tracing::info!(
@@ -892,6 +866,7 @@ impl StorageBackedJobRunner {
             report.jobs_completed += batch.jobs_completed;
             report.jobs_failed += batch.jobs_failed;
             report.jobs_skipped += batch.jobs_skipped;
+            report.jobs_suppressed += batch.jobs_suppressed;
             report.terminal_failures_encountered += batch.terminal_failures;
         }
 
@@ -904,6 +879,7 @@ impl StorageBackedJobRunner {
             jobs_completed = report.jobs_completed,
             jobs_failed = report.jobs_failed,
             jobs_skipped = report.jobs_skipped,
+            jobs_suppressed = report.jobs_suppressed,
             terminal_failures_encountered = report.terminal_failures_encountered,
             idle_cycles = report.idle_cycles,
             "storage-backed embedding worker exited"
@@ -926,43 +902,26 @@ impl StorageBackedJobRunner {
         )))
     }
 
-    /// Handle a job failure by recording it in the queue and optionally
-    /// marking the document as failed in storage. Returns `true` if the
-    /// failure was terminal (no more retries).
-    fn handle_job_failure(&self, job: &crate::ClaimedJob, error: &SearchError) -> bool {
-        let error_message = error.to_string();
-        let fail_result = self.queue.fail(job.job_id, &error_message);
-
-        let is_terminal = match &fail_result {
-            Ok(crate::job_queue::FailResult::TerminalFailed { .. }) => true,
-            Ok(crate::job_queue::FailResult::Retried { .. }) => false,
-            Err(_) => true,
+    /// Record a failure only while this exact attempt still owns the current
+    /// document version. Queue and catalog updates commit together; database
+    /// errors propagate without being reclassified as terminal job failures.
+    /// Returns whether the failure was applied, rather than locally suppressed.
+    fn handle_job_failure(
+        &self,
+        job: &crate::ClaimedJob,
+        document_hash: &[u8; 32],
+        error: &SearchError,
+        result: &mut BatchProcessResult,
+    ) -> SearchResult<bool> {
+        let outcome = self.queue.fail(job, document_hash, &error.to_string())?;
+        let Some(failure) = record_claim_outcome(job, outcome, result) else {
+            return Ok(false);
         };
-
-        if let Err(fail_err) = fail_result {
-            tracing::warn!(
-                target: "frankensearch.storage.pipeline",
-                job_id = job.job_id,
-                error = %fail_err,
-                "failed to record job failure in queue"
-            );
+        result.jobs_failed += 1;
+        if matches!(failure, crate::job_queue::FailResult::TerminalFailed { .. }) {
+            result.terminal_failures += 1;
         }
-
-        if is_terminal {
-            if let Err(mark_err) =
-                self.storage
-                    .mark_failed(&job.doc_id, &job.embedder_id, &error_message)
-            {
-                tracing::warn!(
-                    target: "frankensearch.storage.pipeline",
-                    doc_id = %job.doc_id,
-                    error = %mark_err,
-                    "failed to mark document as failed in storage"
-                );
-            }
-        }
-
-        is_terminal
+        Ok(true)
     }
 
     fn record_ingest_metrics(&self, tx_result: &IngestTxResult) {
@@ -1000,12 +959,40 @@ impl StorageBackedJobRunner {
         self.metrics
             .total_jobs_skipped
             .fetch_add(usize_to_u64(result.jobs_skipped), Ordering::Relaxed);
+        self.metrics
+            .total_jobs_suppressed
+            .fetch_add(usize_to_u64(result.jobs_suppressed), Ordering::Relaxed);
 
         let embed_time_us = duration_as_u64(result.embed_time.as_micros());
         self.metrics
             .total_embed_time_us
             .fetch_add(embed_time_us, Ordering::Relaxed);
     }
+}
+
+fn record_claim_outcome<T>(
+    job: &crate::ClaimedJob,
+    outcome: ClaimOutcome<T>,
+    result: &mut BatchProcessResult,
+) -> Option<T> {
+    let reason = match outcome {
+        ClaimOutcome::Applied(value) => return Some(value),
+        ClaimOutcome::LostClaim => "claim_lost",
+        ClaimOutcome::Superseded => "attempt_superseded",
+    };
+    result.jobs_suppressed += 1;
+    tracing::info!(
+        target: "frankensearch.storage.pipeline",
+        stage = "claim_admission",
+        worker_id = %job.worker_id,
+        job_id = job.job_id,
+        claim_epoch = job.claim_epoch,
+        doc_id = %job.doc_id,
+        embedder_id = %job.embedder_id,
+        reason,
+        "embedding attempt suppressed without changing newer work"
+    );
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1357,8 +1344,11 @@ fn duration_as_u64(value: u128) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashSet;
     use std::io::Write;
+    use std::marker::PhantomData;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
 
@@ -1609,6 +1599,218 @@ mod tests {
             Arc::clone(&sink),
         );
         (runner, probe, sink)
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ClaimHookStage {
+        Inference,
+        Persistence,
+    }
+
+    type ClaimHook = (ClaimHookStage, Box<dyn FnOnce()>);
+
+    thread_local! {
+        // Storage is intentionally not Send. Keep the interleaving on the
+        // test executor's thread instead of weakening the producer/sink traits.
+        static CLAIM_HOOK: RefCell<Option<ClaimHook>> = const { RefCell::new(None) };
+    }
+
+    struct ScopedClaimHook(PhantomData<Rc<()>>);
+
+    impl ScopedClaimHook {
+        fn install(stage: ClaimHookStage, hook: impl FnOnce() + 'static) -> Self {
+            CLAIM_HOOK.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                assert!(slot.is_none(), "claim hooks must not overlap");
+                *slot = Some((stage, Box::new(hook)));
+            });
+            Self(PhantomData)
+        }
+    }
+
+    impl Drop for ScopedClaimHook {
+        fn drop(&mut self) {
+            // Also clear an unconsumed callback during a failed assertion.
+            CLAIM_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    fn run_claim_hook(stage: ClaimHookStage) {
+        let hook = CLAIM_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|(selected, _)| *selected == stage)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        if let Some((_, hook)) = hook {
+            hook();
+        }
+    }
+
+    struct ClaimProbeEmbedder {
+        id: &'static str,
+        identity: EmbeddingIdentityBundleV1,
+        inputs: Mutex<Vec<String>>,
+        fail_next: AtomicBool,
+    }
+
+    impl Embedder for ClaimProbeEmbedder {
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async { panic!("the runner must use the actual bound operation") })
+        }
+
+        fn embed_bound<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+            Box::pin(async move {
+                self.inputs.lock().unwrap().push(text.to_owned());
+                run_claim_hook(ClaimHookStage::Inference);
+                if self.fail_next.swap(false, Ordering::SeqCst) {
+                    return Err(SearchError::EmbeddingFailed {
+                        model: self.id.to_owned(),
+                        source: io::Error::other("late inference failure").into(),
+                    });
+                }
+                Ok(IdentityBoundEmbedding {
+                    values: vec![0.6, 0.8],
+                    identity: self.identity.clone(),
+                })
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    #[derive(Default)]
+    struct ClaimProbeSink {
+        stored: InMemoryVectorSink,
+        fail_next: AtomicBool,
+    }
+
+    impl EmbeddingVectorSink for ClaimProbeSink {
+        fn persist(&self, doc_id: &str, embedder_id: &str, values: &[f32]) -> SearchResult<()> {
+            self.stored.persist(doc_id, embedder_id, values)?;
+            run_claim_hook(ClaimHookStage::Persistence);
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err(SearchError::EmbeddingFailed {
+                    model: embedder_id.to_owned(),
+                    source: io::Error::other("sink failed after its independent write").into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn make_claim_probe_runner(
+        quality: bool,
+        fail_inference: bool,
+        sink: Arc<dyn EmbeddingVectorSink>,
+    ) -> (Rc<StorageBackedJobRunner>, Arc<ClaimProbeEmbedder>) {
+        let id = if quality { "quality-tier" } else { "fast-tier" };
+        let probe = Arc::new(ClaimProbeEmbedder {
+            id,
+            identity: EmbeddingIdentityBundleV1::explicit_test_model(id, 2),
+            inputs: Mutex::new(Vec::new()),
+            fail_next: AtomicBool::new(fail_inference),
+        });
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let queue = Arc::new(PersistentJobQueue::new(
+            Arc::clone(&storage),
+            JobQueueConfig {
+                retry_base_delay_ms: 0,
+                ..JobQueueConfig::default()
+            },
+        ));
+        let fast: Arc<dyn Embedder> = if quality {
+            Arc::new(StubEmbedder::new("fnv1a-384", 2, None, 1.0))
+        } else {
+            probe.clone()
+        };
+        let mut runner = StorageBackedJobRunner::new(
+            storage,
+            queue,
+            Arc::new(DefaultCanonicalizer::default()),
+            fast,
+            sink,
+        );
+        if quality {
+            runner = runner.with_quality_embedder(probe.clone());
+        }
+        (Rc::new(runner), probe)
+    }
+
+    fn expire_processing_document(runner: &StorageBackedJobRunner, doc_id: &str) {
+        assert_eq!(
+            runner
+                .storage
+                .connection()
+                .execute_with_params_sync(
+                    "UPDATE embedding_jobs SET started_at = 0 \
+                     WHERE doc_id = ?1 AND status = 'processing';",
+                    &[SqliteValue::Text(doc_id.to_owned().into())],
+                )
+                .unwrap(),
+            1,
+        );
+        assert_eq!(runner.queue.reclaim_stale_jobs().unwrap(), 1);
+    }
+
+    fn assert_only_suppressed(result: &BatchProcessResult, count: usize) {
+        assert_eq!(result.jobs_claimed, count);
+        assert_eq!(result.jobs_suppressed, count);
+        assert_eq!(result.jobs_completed, 0);
+        assert_eq!(result.jobs_failed, 0);
+        assert_eq!(result.jobs_skipped, 0);
+        assert_eq!(result.terminal_failures, 0);
+    }
+
+    fn assert_catalog_status(runner: &StorageBackedJobRunner, id: &str, status: EmbeddingStatus) {
+        let counts = runner.storage.count_by_status(id).unwrap();
+        assert_eq!(
+            counts.pending,
+            u64::from(status == EmbeddingStatus::Pending)
+        );
+        assert_eq!(
+            counts.embedded,
+            u64::from(status == EmbeddingStatus::Embedded)
+        );
+        assert_eq!(counts.failed, u64::from(status == EmbeddingStatus::Failed));
+        assert_eq!(
+            counts.skipped,
+            u64::from(status == EmbeddingStatus::Skipped)
+        );
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1992,6 +2194,346 @@ mod tests {
                     assert_eq!(metrics.total_jobs_failed, 0);
                 });
             }
+        }
+    }
+
+    #[test]
+    fn process_batch_suppresses_reclaimed_same_worker_success_and_error() {
+        for quality in [false, true] {
+            for fail_inference in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(InMemoryVectorSink::default());
+                    let (runner, probe) =
+                        make_claim_probe_runner(quality, fail_inference, sink.clone());
+                    runner
+                        .ingest(IngestRequest::new("doc-reclaim", "original content"))
+                        .unwrap();
+                    let successor = Rc::new(RefCell::new(None));
+                    let metrics_at_reclaim = Rc::new(RefCell::new(None));
+                    let hook_runner = Rc::clone(&runner);
+                    let hook_successor = Rc::clone(&successor);
+                    let hook_metrics = Rc::clone(&metrics_at_reclaim);
+                    let _hook = ScopedClaimHook::install(ClaimHookStage::Inference, move || {
+                        expire_processing_document(&hook_runner, "doc-reclaim");
+                        let mut claims = hook_runner.queue.claim_batch("same-worker", 1).unwrap();
+                        assert_eq!(claims.len(), 1);
+                        assert_eq!(claims[0].claim_epoch, 2);
+                        *hook_successor.borrow_mut() = claims.pop();
+                        *hook_metrics.borrow_mut() = Some(hook_runner.queue.metrics().snapshot());
+                    });
+
+                    let result = runner.process_batch(&cx, "same-worker").await.unwrap();
+                    assert_only_suppressed(&result, 1);
+                    assert!(sink.entries().is_empty());
+                    assert_eq!(
+                        probe.inputs.lock().unwrap().as_slice(),
+                        ["original content"]
+                    );
+                    assert_catalog_status(&runner, probe.id, EmbeddingStatus::Pending);
+                    let depth = runner.queue.queue_depth().unwrap();
+                    assert_eq!(depth.processing, 1);
+                    assert_eq!(
+                        depth.pending + depth.completed + depth.failed + depth.skipped,
+                        0
+                    );
+                    assert_eq!(
+                        runner.queue.metrics().snapshot(),
+                        metrics_at_reclaim.borrow().unwrap()
+                    );
+                    let metrics = runner.metrics().snapshot();
+                    assert_eq!(metrics.total_jobs_suppressed, 1);
+                    assert_eq!(
+                        metrics.total_jobs_completed
+                            + metrics.total_jobs_failed
+                            + metrics.total_jobs_skipped,
+                        0
+                    );
+
+                    let successor = successor.borrow().clone().unwrap();
+                    let hash = successor.content_hash.unwrap();
+                    assert!(matches!(
+                        runner.queue.check_claim(&successor, Some(&hash)).unwrap(),
+                        ClaimOutcome::Applied(_)
+                    ));
+                    // Its lease can still be recovered, and the next actual
+                    // runner attempt persists and completes this document.
+                    expire_processing_document(&runner, "doc-reclaim");
+                    let resumed = runner.process_batch(&cx, "same-worker").await.unwrap();
+                    assert_eq!(resumed.jobs_completed, 1);
+                    assert_eq!(resumed.jobs_suppressed, 0);
+                    assert_eq!(sink.entries().len(), 1);
+                    assert_catalog_status(&runner, probe.id, EmbeddingStatus::Embedded);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn process_batch_preserves_replacement_status_after_late_success_and_error() {
+        for quality in [false, true] {
+            for fail_inference in [false, true] {
+                for status in [
+                    EmbeddingStatus::Pending,
+                    EmbeddingStatus::Embedded,
+                    EmbeddingStatus::Failed,
+                ] {
+                    asupersync::test_utils::run_test_with_cx(|cx| async move {
+                        let sink = Arc::new(InMemoryVectorSink::default());
+                        let (runner, probe) =
+                            make_claim_probe_runner(quality, fail_inference, sink.clone());
+                        runner
+                            .ingest(IngestRequest::new("doc-replace", "old content"))
+                            .unwrap();
+                        let hook_runner = Rc::clone(&runner);
+                        let id = probe.id;
+                        let _hook =
+                            ScopedClaimHook::install(ClaimHookStage::Inference, move || {
+                                let changed = hook_runner
+                                    .ingest(IngestRequest::new(
+                                        "doc-replace",
+                                        "replacement content",
+                                    ))
+                                    .unwrap();
+                                assert_eq!(changed.action, IngestAction::Updated);
+                                match status {
+                                    EmbeddingStatus::Embedded => hook_runner
+                                        .storage
+                                        .mark_embedded("doc-replace", id)
+                                        .unwrap(),
+                                    EmbeddingStatus::Failed => hook_runner
+                                        .storage
+                                        .mark_failed("doc-replace", id, "replacement's own failure")
+                                        .unwrap(),
+                                    EmbeddingStatus::Pending => {}
+                                    EmbeddingStatus::Skipped => {
+                                        unreachable!("not selected by this test")
+                                    }
+                                }
+                            });
+
+                        let result = runner.process_batch(&cx, "old-worker").await.unwrap();
+                        assert_only_suppressed(&result, 1);
+                        assert!(sink.entries().is_empty());
+                        assert_catalog_status(&runner, probe.id, status);
+                        let replacement =
+                            runner.storage.get_document("doc-replace").unwrap().unwrap();
+                        assert_eq!(replacement.content_preview, "replacement content");
+                        assert_eq!(
+                            replacement.content_hash,
+                            ContentHasher::hash("replacement content")
+                        );
+                        let depth = runner.queue.queue_depth().unwrap();
+                        assert_eq!(depth.pending, 1, "the replacement remains runnable");
+                        assert_eq!(
+                            depth.processing + depth.completed + depth.failed + depth.skipped,
+                            0
+                        );
+                        let metrics = runner.queue.metrics().snapshot();
+                        assert_eq!(
+                            metrics.total_completed
+                                + metrics.total_failed
+                                + metrics.total_skipped
+                                + metrics.total_retried,
+                            0
+                        );
+
+                        let resumed = runner.process_batch(&cx, "new-worker").await.unwrap();
+                        assert_eq!(resumed.jobs_completed, 1);
+                        assert_eq!(resumed.jobs_suppressed + resumed.jobs_failed, 0);
+                        assert_eq!(
+                            probe.inputs.lock().unwrap().as_slice(),
+                            ["old content", "replacement content"]
+                        );
+                        assert_eq!(sink.entries().len(), 1);
+                        assert_catalog_status(&runner, probe.id, EmbeddingStatus::Embedded);
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn process_batch_does_not_infer_later_batch_item_reclaimed_during_first_await() {
+        for quality in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let sink = Arc::new(InMemoryVectorSink::default());
+                let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
+                runner
+                    .ingest(IngestRequest::new("first", "first input"))
+                    .unwrap();
+                runner
+                    .ingest(IngestRequest::new("later", "later input"))
+                    .unwrap();
+                // Fix ordering independently of clock resolution or row order.
+                runner
+                    .storage
+                    .connection()
+                    .execute_sync(
+                        "UPDATE embedding_jobs SET priority = 100 WHERE doc_id = 'first';",
+                    )
+                    .unwrap();
+                let successor = Rc::new(RefCell::new(None));
+                let hook_runner = Rc::clone(&runner);
+                let hook_successor = Rc::clone(&successor);
+                let _hook = ScopedClaimHook::install(ClaimHookStage::Inference, move || {
+                    expire_processing_document(&hook_runner, "later");
+                    let mut claims = hook_runner.queue.claim_batch("next-worker", 1).unwrap();
+                    assert_eq!(claims.len(), 1);
+                    assert_eq!(claims[0].doc_id, "later");
+                    assert_eq!(claims[0].claim_epoch, 2);
+                    *hook_successor.borrow_mut() = claims.pop();
+                });
+
+                let result = runner.process_batch(&cx, "old-worker").await.unwrap();
+                assert_eq!(result.jobs_claimed, 2);
+                assert_eq!(result.jobs_completed, 1);
+                assert_eq!(result.jobs_suppressed, 1);
+                assert_eq!(
+                    result.jobs_failed + result.jobs_skipped + result.terminal_failures,
+                    0
+                );
+                assert_eq!(probe.inputs.lock().unwrap().as_slice(), ["first input"]);
+                let entries = sink.entries();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].doc_id, "first");
+                let successor = successor.borrow().clone().unwrap();
+                assert!(matches!(
+                    runner
+                        .queue
+                        .check_claim(&successor, successor.content_hash.as_ref())
+                        .unwrap(),
+                    ClaimOutcome::Applied(_)
+                ));
+                let counts = runner.storage.count_by_status(probe.id).unwrap();
+                assert_eq!(counts.embedded, 1);
+                assert_eq!(counts.pending, 1);
+                assert_eq!(counts.failed + counts.skipped, 0);
+
+                expire_processing_document(&runner, "later");
+                let resumed = runner.process_batch(&cx, "next-worker").await.unwrap();
+                assert_eq!(resumed.jobs_completed, 1);
+                assert_eq!(resumed.jobs_suppressed, 0);
+                assert_eq!(
+                    probe.inputs.lock().unwrap().as_slice(),
+                    ["first input", "later input"]
+                );
+                assert_eq!(sink.entries().len(), 2);
+            });
+        }
+    }
+
+    #[test]
+    fn process_batch_sink_interleaving_fences_catalog_without_claiming_vector_rollback() {
+        for quality in [false, true] {
+            for fail_sink in [false, true] {
+                for replace_document in [false, true] {
+                    asupersync::test_utils::run_test_with_cx(|cx| async move {
+                        let sink = Arc::new(ClaimProbeSink::default());
+                        sink.fail_next.store(fail_sink, Ordering::SeqCst);
+                        let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
+                        runner
+                            .ingest(IngestRequest::new("doc-sink", "old content"))
+                            .unwrap();
+                        let successor = Rc::new(RefCell::new(None));
+                        let hook_runner = Rc::clone(&runner);
+                        let hook_successor = Rc::clone(&successor);
+                        let _hook =
+                            ScopedClaimHook::install(ClaimHookStage::Persistence, move || {
+                                if replace_document {
+                                    hook_runner
+                                        .ingest(IngestRequest::new(
+                                            "doc-sink",
+                                            "replacement content",
+                                        ))
+                                        .unwrap();
+                                } else {
+                                    expire_processing_document(&hook_runner, "doc-sink");
+                                    let mut claims =
+                                        hook_runner.queue.claim_batch("same-worker", 1).unwrap();
+                                    assert_eq!(claims.len(), 1);
+                                    *hook_successor.borrow_mut() = claims.pop();
+                                }
+                            });
+
+                        let result = runner.process_batch(&cx, "same-worker").await.unwrap();
+                        assert_only_suppressed(&result, 1);
+                        assert_catalog_status(&runner, probe.id, EmbeddingStatus::Pending);
+                        // The independent sink wrote before losing authority:
+                        // queue fencing cannot promise to undo those bytes.
+                        assert_eq!(sink.stored.entries().len(), 1);
+                        let depth = runner.queue.queue_depth().unwrap();
+                        assert_eq!(depth.pending, usize::from(replace_document));
+                        assert_eq!(depth.processing, usize::from(!replace_document));
+                        assert_eq!(depth.completed + depth.failed + depth.skipped, 0);
+                        if let Some(claim) = successor.borrow().as_ref() {
+                            assert!(matches!(
+                                runner
+                                    .queue
+                                    .check_claim(claim, claim.content_hash.as_ref())
+                                    .unwrap(),
+                                ClaimOutcome::Applied(_)
+                            ));
+                        }
+                        let doc = runner.storage.get_document("doc-sink").unwrap().unwrap();
+                        assert_eq!(
+                            doc.content_preview,
+                            if replace_document {
+                                "replacement content"
+                            } else {
+                                "old content"
+                            }
+                        );
+                        let metrics = runner.queue.metrics().snapshot();
+                        assert_eq!(
+                            metrics.total_completed + metrics.total_failed + metrics.total_skipped,
+                            0
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn process_batch_accepts_current_hash_after_a_to_b_to_a_replacement() {
+        for quality in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let sink = Arc::new(InMemoryVectorSink::default());
+                let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
+                runner
+                    .ingest(IngestRequest::new("doc-revert", "original content"))
+                    .unwrap();
+                let hook_runner = Rc::clone(&runner);
+                let _hook = ScopedClaimHook::install(ClaimHookStage::Inference, move || {
+                    hook_runner
+                        .ingest(IngestRequest::new("doc-revert", "temporary content"))
+                        .unwrap();
+                    hook_runner
+                        .ingest(IngestRequest::new("doc-revert", "original content"))
+                        .unwrap();
+                    assert_eq!(hook_runner.queue.queue_depth().unwrap().pending, 1);
+                });
+
+                let result = runner.process_batch(&cx, "worker-revert").await.unwrap();
+                assert_eq!(
+                    result.jobs_completed, 1,
+                    "current content A still matches the response"
+                );
+                assert_eq!(
+                    result.jobs_suppressed + result.jobs_failed + result.jobs_skipped,
+                    0
+                );
+                assert_eq!(sink.entries().len(), 1);
+                assert_catalog_status(&runner, probe.id, EmbeddingStatus::Embedded);
+                let obsolete = runner.process_batch(&cx, "worker-revert").await.unwrap();
+                assert_only_suppressed(&obsolete, 1);
+                assert_eq!(
+                    probe.inputs.lock().unwrap().as_slice(),
+                    ["original content"]
+                );
+                assert_eq!(sink.entries().len(), 1);
+                assert_catalog_status(&runner, probe.id, EmbeddingStatus::Embedded);
+            });
         }
     }
 
@@ -2416,10 +2958,19 @@ mod tests {
 
         let fail_result = runner
             .queue
-            .fail(claimed[0].job_id, "transient")
+            .fail(
+                &claimed[0],
+                &claimed[0]
+                    .content_hash
+                    .expect("ingested job has content hash"),
+                "transient",
+            )
             .expect("fail should schedule retry");
         assert!(
-            matches!(fail_result, FailResult::Retried { .. }),
+            matches!(
+                fail_result,
+                ClaimOutcome::Applied(FailResult::Retried { .. })
+            ),
             "first failure should schedule a retry, got {fail_result:?}"
         );
 
@@ -3040,6 +3591,7 @@ mod tests {
         assert_eq!(r.jobs_completed, 0);
         assert_eq!(r.jobs_failed, 0);
         assert_eq!(r.jobs_skipped, 0);
+        assert_eq!(r.jobs_suppressed, 0);
         assert_eq!(r.embed_time, Duration::ZERO);
         assert_eq!(r.total_time, Duration::ZERO);
     }
@@ -3052,6 +3604,7 @@ mod tests {
         assert_eq!(r.jobs_completed, 0);
         assert_eq!(r.jobs_failed, 0);
         assert_eq!(r.jobs_skipped, 0);
+        assert_eq!(r.jobs_suppressed, 0);
         assert_eq!(r.idle_cycles, 0);
     }
 
@@ -3067,6 +3620,7 @@ mod tests {
         assert_eq!(snap.total_jobs_completed, 0);
         assert_eq!(snap.total_jobs_failed, 0);
         assert_eq!(snap.total_jobs_skipped, 0);
+        assert_eq!(snap.total_jobs_suppressed, 0);
         assert_eq!(snap.total_embed_time_us, 0);
         assert_eq!(snap.total_reclaimed, 0);
     }
@@ -3145,10 +3699,11 @@ mod tests {
     #[test]
     fn batch_process_result_serde_roundtrip() {
         let r = BatchProcessResult {
-            jobs_claimed: 10,
+            jobs_claimed: 12,
             jobs_completed: 8,
             jobs_failed: 1,
             jobs_skipped: 1,
+            jobs_suppressed: 2,
             terminal_failures: 0,
             embed_time: Duration::from_millis(42),
             total_time: Duration::from_millis(100),
@@ -3166,6 +3721,7 @@ mod tests {
             jobs_completed: 40,
             jobs_failed: 2,
             jobs_skipped: 1,
+            jobs_suppressed: 2,
             idle_cycles: 7,
             terminal_failures_encountered: 0,
         };

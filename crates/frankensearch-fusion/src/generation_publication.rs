@@ -1163,9 +1163,7 @@ mod tests {
                     let predecessor = retained.last().map(|old| old.head().authority);
                     let expected = retained
                         .last()
-                        .map_or(ExpectedAuthorityPairV1::default(), |old| {
-                            old.authority_pair()
-                        });
+                        .map_or_else(ExpectedAuthorityPairV1::default, |old| old.authority_pair());
                     let candidate = candidate_with_ann(generation, predecessor, with_ann);
                     stage(&path, &candidate, generation, None);
                     let result = publish(&mut publisher, &cx, &candidate, expected);
