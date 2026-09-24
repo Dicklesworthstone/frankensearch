@@ -74,7 +74,18 @@ fsfs search "where is rrf fusion implemented" --limit 5 --compact --format json
 fsfs explain R0    # why the first hit ranked where it did
 ```
 
-The `id` values are the ones `fsfs explain` accepts for that search.
+The `id` values are the ones `fsfs explain` accepts for that search. Its JSON
+splits the hit's BM25 score by query word and field, so an agent can see which
+words the file matched before refining the query:
+
+```bash
+fsfs explain R0 --format json \
+  | jq -c '.data.ranking.components[] | select(.source == "lexical_bm25")
+           | .terms[] | select(.score > 0) | {field, term, score}'
+```
+
+Query words missing from that list did not match the file; the README's
+"Query syntax" section covers phrases, `title:`, `+`/`-` and boosts.
 
 ## 5) Pair with exact text search
 
