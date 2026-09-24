@@ -658,19 +658,18 @@ fn run_config_set_command(
     } else {
         String::new()
     };
-    let mut doc: toml::Value = if existing_text.trim().is_empty() {
-        toml::Value::Table(toml::map::Map::new())
-    } else {
-        existing_text
-            .parse()
-            .map_err(|source: toml::de::Error| SearchError::SubsystemError {
-                subsystem: CONFIG_SUBSYSTEM,
-                source: Box::new(io::Error::other(format!(
-                    "failed to parse existing config at {}: {source}",
-                    path.display()
-                ))),
-            })?
-    };
+    // A config file is a TOML document. `str::parse::<toml::Value>` reads one
+    // value, so it refused every table header, including the file this command
+    // itself wrote; an empty document parses to an empty table.
+    let mut doc = toml::Value::Table(toml::from_str::<toml::Table>(&existing_text).map_err(
+        |source| SearchError::SubsystemError {
+            subsystem: CONFIG_SUBSYSTEM,
+            source: Box::new(io::Error::other(format!(
+                "failed to parse existing config at {}: {source}",
+                path.display()
+            ))),
+        },
+    )?);
 
     // Navigate the dotted key path and set the value.
     let segments: Vec<&str> = key.split('.').collect();
@@ -1606,6 +1605,52 @@ mod tests {
                 .and_then(|v| v.get("rrf_k"))
                 .and_then(Value::as_integer),
             Some(75)
+        );
+    }
+
+    #[test]
+    fn config_set_keeps_existing_settings_and_can_run_twice() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fsfs.toml");
+        std::fs::write(
+            &path,
+            "[indexing]\nmodel_dir = \"/models\"\n\n[search]\nrrf_k = 60\n",
+        )
+        .expect("write existing config");
+        let cli = CliInput {
+            format: frankensearch_fsfs::OutputFormat::Json,
+            ..CliInput::default()
+        };
+
+        run_config_set_command(
+            &cli,
+            Some(path.as_path()),
+            None,
+            None,
+            "search.default_limit",
+            "25",
+        )
+        .expect("config set on a file with table headers");
+        run_config_set_command(&cli, Some(path.as_path()), None, None, "search.rrf_k", "50")
+            .expect("config set on the file the first set wrote");
+
+        let contents = std::fs::read_to_string(&path).expect("read config");
+        let parsed: Value = toml::from_str(&contents).expect("parse toml");
+        let search = |key: &str| {
+            parsed
+                .get("search")
+                .and_then(|v| v.get(key))
+                .and_then(Value::as_integer)
+        };
+        assert_eq!(search("default_limit"), Some(25));
+        assert_eq!(search("rrf_k"), Some(50));
+        assert_eq!(
+            parsed
+                .get("indexing")
+                .and_then(|v| v.get("model_dir"))
+                .and_then(Value::as_str),
+            Some("/models"),
+            "an untouched setting must survive: {contents}"
         );
     }
 

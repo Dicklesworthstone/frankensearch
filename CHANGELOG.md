@@ -258,6 +258,12 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **`fsfs config set` works on an existing config file.** It read the file as
+  a single TOML value rather than a document, so any table header failed to
+  parse: the first `config set` created the file and every later one refused
+  it ("TOML parse error at line 1 … expected nothing"). It now reads the
+  document and keeps the settings it does not change (bd-y6imv).
+
 - **An interrupted `fsfs index` is reported, with the command that finishes
   it.** Stopping a re-index of an existing index (Ctrl-C, SIGTERM) leaves a
   half-written generation that search refuses until an `fsfs index` run
