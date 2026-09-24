@@ -12853,17 +12853,6 @@ impl FsfsRuntime {
             suggestion: None,
         });
 
-        // 8. Nightly toolchain note
-        checks.push(DoctorCheck {
-            name: "rust_edition".to_owned(),
-            verdict: DoctorVerdict::Pass,
-            detail: format!(
-                "edition {} (requires nightly)",
-                env!("CARGO_PKG_RUST_VERSION")
-            ),
-            suggestion: None,
-        });
-
         // Tally
         let pass_count = checks
             .iter()
