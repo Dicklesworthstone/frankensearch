@@ -258,6 +258,16 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **Warm searches are about a sixth faster.** Every search generated snippets
+  for up to 200 lexical candidates (those hits doubled as fusion input) and
+  showed about 10. Candidates now come from the plain ranked search and
+  snippets are made only for the returned hits, through a new Quill
+  `snippets_for_documents` that uses the same terms and document-frequency
+  weights, so lexical hits keep identical snippets (402 of 402 on a fixed
+  query set) and rankings are unchanged. Warm `fsfs serve` on a 524-file code
+  repository, limit 10: fast-only median 20.5 to 17.0 ms (p90 35.5 to 26.5),
+  full 27.5 to 22.8 ms (p90 43.8 to 31.6).
+
 - **`--format toon` works on refined searches.** The TOON encoder
   (`toon-rust` 0.1.3) rejected every refined payload ("Non-primitive value
   in tabular array") and wrote objects inside lists on one line, which a

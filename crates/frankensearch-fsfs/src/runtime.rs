@@ -57,8 +57,8 @@ use frankensearch_index::VectorIndex;
 use frankensearch_quill::{
     BlueGreenEngine, CURRENT_FILE_NAME, CurrentPointer, DEFAULT_SCHEMA, FSLX_FORMAT_VERSION,
     KeeperError, KeeperSnapshot, QuillConfig, QuillIndex, QuillIndexError, QuillSearchIndex,
-    ResolvedCurrent, SegmentStats, SegmentStatsProvider, SnippetConfig, SnippetGenerator,
-    SnippetTerm, publish_current, resolve_current,
+    ResolvedCurrent, SegmentStats, SegmentStatsProvider, SnippetConfig, publish_current,
+    resolve_current,
 };
 use frankensearch_storage::{
     EmbeddingVectorSink, IngestRequest, IngestResult, JobQueueConfig, PersistentJobQueue,
@@ -9859,82 +9859,57 @@ impl FsfsRuntime {
         payload
     }
 
-    /// Snippet generator for hits that missed the lexical snippet head: the
-    /// query's words analyzed like the content field (alphanumeric runs,
-    /// lowercased), all weighted alike.
-    fn hit_snippet_generator(query: &str, config: &SnippetConfig) -> SnippetGenerator {
-        let terms = alphanumeric_words(query).map(|word| SnippetTerm::new(word.to_lowercase(), 1));
-        SnippetGenerator::new(
-            frankensearch_quill::Analyzer::FrankensearchDefault,
-            terms,
-            config.clone(),
-        )
-    }
-
-    /// Give each returned hit that has no snippet one from its stored text.
+    /// Give each returned hit that has no snippet yet one from its stored text.
     ///
-    /// Snippets come from the lexical head, so semantic-only and quality-only
-    /// hits (and a lexical tail past the head) would reach the caller as a bare
-    /// path. Only the text's opening [`FSFS_FILL_SNIPPET_SCAN_BYTES`] are
-    /// scanned: a query-word window there, else the opening fragment — the
-    /// text the embedders read. A failed lookup leaves the hit without a
-    /// snippet; it never fails the search.
-    fn fill_missing_snippets(
+    /// Snippets are made for the hits a phase returns, not for the whole
+    /// lexical candidate head (up to 200 documents, most never shown).
+    /// Lexically ranked hits scan their whole text, as the ranked snippet
+    /// search did; hits found only by the vector tiers scan their opening
+    /// [`FSFS_FILL_SNIPPET_SCAN_BYTES`] — the text the embedders read. Snippets
+    /// are decoration: a failure other than cancellation leaves hits without
+    /// one rather than failing the search.
+    fn fill_hit_snippets(
         cx: &Cx,
         lexical: &QuillSearchIndex,
-        generator: &mut SnippetGenerator,
+        query: &str,
+        config: &SnippetConfig,
         returned: &[FusedCandidate],
         snippets_by_doc: &mut HashMap<String, String>,
     ) -> SearchResult<()> {
-        let field = |name: &str| {
-            DEFAULT_SCHEMA
-                .fields
-                .iter()
-                .find(|field| field.name == name)
-                .map(|field| field.id)
+        let missing = returned
+            .iter()
+            .take(FSFS_SEARCH_SNIPPET_HEAD_LIMIT)
+            .filter(|candidate| !snippets_by_doc.contains_key(&candidate.doc_id));
+        let (lexical_ids, vector_ids): (Vec<&str>, Vec<&str>) = {
+            let (ranked, vector_only): (Vec<_>, Vec<_>) =
+                missing.partition(|candidate| candidate.lexical_rank.is_some());
+            (
+                ranked.iter().map(|candidate| candidate.doc_id.as_str()).collect(),
+                vector_only
+                    .iter()
+                    .map(|candidate| candidate.doc_id.as_str())
+                    .collect(),
+            )
         };
-        let (Some(id_field), Some(content_field)) = (field("id"), field("content")) else {
-            return Ok(());
-        };
-        for candidate in returned.iter().take(FSFS_SEARCH_SNIPPET_HEAD_LIMIT) {
-            if snippets_by_doc.contains_key(&candidate.doc_id) {
+        let mut found = Vec::new();
+        for (ids, max_source_bytes) in [
+            (lexical_ids, usize::MAX),
+            (vector_ids, FSFS_FILL_SNIPPET_SCAN_BYTES),
+        ] {
+            if ids.is_empty() {
                 continue;
             }
-            Self::semantic_retry_checkpoint(cx, "fsfs.search.snippets")?;
-            let query = frankensearch_quill::Query::set(
-                id_field,
-                vec![frankensearch_quill::QueryValue::Str(
-                    candidate.doc_id.clone(),
-                )],
-            );
-            let content = lexical
-                .search_preparsed_paginated(cx, &query, 1, 0, false)
-                .ok()
-                .and_then(|result| {
-                    result
-                        .hits
-                        .iter()
-                        .find(|hit| hit.document_id == candidate.doc_id)
-                        .map(|hit| hit.global_docid)
-                })
-                .and_then(|docid| lexical.stored_field_value(content_field, docid).ok()?)
-                .and_then(|bytes| String::from_utf8(bytes).ok());
-            if let Some(snippet) = content
-                .as_deref()
-                .map(|content| {
-                    let mut end = content.len().min(FSFS_FILL_SNIPPET_SCAN_BYTES);
-                    while !content.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    &content[..end]
-                })
-                .and_then(|content| generator.snippet_or_prefix(content))
-                && !snippet.trim().is_empty()
-            {
-                snippets_by_doc.insert(
-                    candidate.doc_id.clone(),
-                    decode_basic_html_entities(&snippet),
-                );
+            match lexical.snippets_for_documents(cx, query, &ids, config, max_source_bytes) {
+                Ok(snippets) => found.extend(ids.into_iter().zip(snippets)),
+                Err(error) => {
+                    Self::semantic_retry_checkpoint(cx, "fsfs.search.snippets")?;
+                    debug!(error = %error, "fsfs search: hit snippets unavailable");
+                }
+            }
+        }
+        for (doc_id, snippet) in found {
+            if let Some(snippet) = snippet.filter(|snippet| !snippet.trim().is_empty()) {
+                snippets_by_doc.insert(doc_id.to_owned(), decode_basic_html_entities(&snippet));
             }
         }
         Ok(())
@@ -10493,23 +10468,11 @@ impl FsfsRuntime {
         let (lexical_candidates, lexical_head_candidates) = if plan.lexical_stage.enabled {
             if let Some(lexical) = resources.lexical_index.as_ref() {
                 if flags.include_snippets {
+                    // Ranked like `search_with_snippets`, but snippets are made
+                    // later for the returned hits only (`fill_hit_snippets`).
                     let snippet_limit = lexical_budget.clamp(1, FSFS_SEARCH_SNIPPET_HEAD_LIMIT);
-                    let snippet_hits = lexical.search_with_snippets(
-                        cx,
-                        &normalized_query,
-                        snippet_limit,
-                        &snippet_config,
-                    )?;
-                    for hit in &snippet_hits {
-                        if let Some(snippet) = hit.snippet.as_ref()
-                            && !snippet.trim().is_empty()
-                        {
-                            snippets_by_doc.insert(
-                                hit.document_id.clone(),
-                                decode_basic_html_entities(snippet),
-                            );
-                        }
-                    }
+                    let snippet_hits =
+                        lexical.search_doc_ids(cx, &normalized_query, snippet_limit)?;
 
                     let needs_full_lexical = output_limit > snippet_limit
                         || filter_expr.is_some()
@@ -10525,8 +10488,8 @@ impl FsfsRuntime {
                         )?
                     } else {
                         snippet_hits
-                            .into_iter()
-                            .map(|hit| LexicalCandidate::new(hit.document_id, hit.score))
+                            .iter()
+                            .map(|hit| LexicalCandidate::new(hit.document_id.clone(), hit.score))
                             .collect::<Vec<_>>()
                     };
                     let lexical_head_budget = lexical_budget.min(planning_limit).max(1);
@@ -10852,16 +10815,14 @@ impl FsfsRuntime {
             } else {
                 filtered_initial_head.clone()
             };
-        let mut hit_snippets = flags
-            .include_snippets
-            .then(|| Self::hit_snippet_generator(&normalized_query, &snippet_config));
-        if let (Some(generator), Some(lexical)) =
-            (hit_snippets.as_mut(), resources.lexical_index.as_ref())
+        if flags.include_snippets
+            && let Some(lexical) = resources.lexical_index.as_ref()
         {
-            Self::fill_missing_snippets(
+            Self::fill_hit_snippets(
                 cx,
                 lexical,
-                generator,
+                &normalized_query,
+                &snippet_config,
                 &fused_initial[..fused_initial.len().min(output_limit)],
                 &mut snippets_by_doc,
             )?;
@@ -10983,13 +10944,14 @@ impl FsfsRuntime {
                             fused_refined,
                         )
                         .await?;
-                    if let (Some(generator), Some(lexical)) =
-                        (hit_snippets.as_mut(), resources.lexical_index.as_ref())
+                    if flags.include_snippets
+                        && let Some(lexical) = resources.lexical_index.as_ref()
                     {
-                        Self::fill_missing_snippets(
+                        Self::fill_hit_snippets(
                             cx,
                             lexical,
-                            generator,
+                            &normalized_query,
+                            &snippet_config,
                             &fused_refined[..fused_refined.len().min(output_limit)],
                             &mut snippets_by_doc,
                         )?;
@@ -35067,10 +35029,11 @@ mod tests {
         assert_eq!(super::locate_snippet_line(text, "", "more"), None);
     }
 
-    /// Hits outside the lexical snippet head get a snippet from their stored
-    /// text: the query-word window when there is one, else the opening.
+    /// Returned hits get a snippet from their stored text: the query-word
+    /// window when there is one, else the opening. Lexically ranked hits scan
+    /// the whole text; vector-only hits only its opening.
     #[test]
-    fn fill_missing_snippets_covers_hits_outside_the_lexical_head() {
+    fn fill_hit_snippets_covers_returned_hits() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let quill = create_test_quill(&cx, &temp.path().join("lexical")).await;
@@ -35092,10 +35055,12 @@ mod tests {
                 "Opening words of a long file. {}the quokka hides deep",
                 "filler ".repeat(super::FSFS_FILL_SNIPPET_SCAN_BYTES / 7 + 1)
             );
-            quill
-                .index_document(&cx, &IndexableDocument::new("deep.md", deep.as_str()))
-                .await
-                .unwrap();
+            for id in ["deep.md", "deep-lexical.md"] {
+                quill
+                    .index_document(&cx, &IndexableDocument::new(id, deep.as_str()))
+                    .await
+                    .unwrap();
+            }
             quill.commit(&cx).await.unwrap();
             let lexical =
                 QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
@@ -35119,17 +35084,22 @@ mod tests {
                 ..frankensearch_quill::SnippetConfig::default()
             };
             let mut snippets =
-                HashMap::from([("kept.rs".to_owned(), "from the lexical head".to_owned())]);
-            FsfsRuntime::fill_missing_snippets(
+                HashMap::from([("kept.rs".to_owned(), "an earlier phase's snippet".to_owned())]);
+            FsfsRuntime::fill_hit_snippets(
                 &cx,
                 &lexical,
-                &mut FsfsRuntime::hit_snippet_generator("Quokka", &config),
+                "Quokka",
+                &config,
                 &[
                     candidate("notes.md"),
                     candidate("code.rs"),
                     candidate("kept.rs"),
                     candidate("gone.rs"),
                     candidate("deep.md"),
+                    FusedCandidate {
+                        lexical_rank: Some(0),
+                        ..candidate("deep-lexical.md")
+                    },
                 ],
                 &mut snippets,
             )
@@ -35140,6 +35110,11 @@ mod tests {
                 "{:?}",
                 snippets["deep.md"]
             );
+            assert!(
+                snippets["deep-lexical.md"].contains("the quokka"),
+                "a lexical hit scans its whole text: {:?}",
+                snippets["deep-lexical.md"]
+            );
             assert_eq!(
                 snippets["notes.md"],
                 "Project overview for the wombat tracker. More text follows."
@@ -35149,7 +35124,7 @@ mod tests {
                 "{:?}",
                 snippets["code.rs"]
             );
-            assert_eq!(snippets["kept.rs"], "from the lexical head");
+            assert_eq!(snippets["kept.rs"], "an earlier phase's snippet");
             assert!(!snippets.contains_key("gone.rs"));
         });
     }

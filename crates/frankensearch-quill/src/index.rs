@@ -11067,6 +11067,101 @@ impl QuillReader {
         Ok(results)
     }
 
+    fn snippets_for_documents(
+        &self,
+        cx: &Cx,
+        query: &str,
+        document_ids: &[&str],
+        snippet_config: &SnippetConfig,
+        max_source_bytes: usize,
+    ) -> Result<Vec<Option<String>>, QuillIndexError> {
+        let snapshot = self.published_snapshot.load();
+        self.snippets_for_documents_on(
+            cx,
+            query,
+            document_ids,
+            snippet_config,
+            max_source_bytes,
+            snapshot.as_ref(),
+        )
+    }
+
+    /// Snippets for chosen documents with the query terms, global document
+    /// frequencies and analyzer [`Self::search_with_snippets_on`] uses, so a
+    /// document it ranks gets the same snippet here. A caller that ranks from
+    /// identifiers alone then pays for snippets only on what it returns.
+    fn snippets_for_documents_on(
+        &self,
+        cx: &Cx,
+        query: &str,
+        document_ids: &[&str],
+        snippet_config: &SnippetConfig,
+        max_source_bytes: usize,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<Vec<Option<String>>, QuillIndexError> {
+        check_cancel(cx, "snippets")?;
+        if document_ids.is_empty() || classify_query(query) == QueryExplanation::Empty {
+            return Ok(vec![None; document_ids.len()]);
+        }
+        let mut parsed = self.default_parser()?.parse_lenient(query);
+        let _canonicalization = canonicalize_query(&mut parsed.query);
+        let work_upper_bound = snippet_tail_work_upper_bound(
+            &parsed.query,
+            snapshot,
+            document_ids.len(),
+            self.config.glob_expansion_limit,
+        )?;
+        let checkpoint: QueryCheckpointHandle<'_> = self.query_checkpoint(
+            cx,
+            "snippets",
+            self.config.query_fuel_budget,
+            work_upper_bound,
+        );
+        checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+        let terms = compiled_snippet_terms(
+            &checkpoint,
+            &parsed.query,
+            snapshot,
+            self.schema,
+            self.config.glob_expansion_limit,
+        )?;
+        let analyzer = match self.schema.fields.get(usize::from(CONTENT_FIELD)) {
+            Some(field) => match field.kind {
+                FieldKind::Text { analyzer, .. } => analyzer,
+                _ => return Err(invalid_state("content field is not text")),
+            },
+            None => return Err(invalid_state("schema has no content field")),
+        };
+        let mut generator = SnippetGenerator::new(analyzer, terms, snippet_config.clone());
+        let mut snippets = Vec::new();
+        snippets
+            .try_reserve_exact(document_ids.len())
+            .map_err(|_| invalid_state("could not allocate document snippets"))?;
+        for document_id in document_ids {
+            // One stored value per document, as the ranked snippet tail admits.
+            checkpoint.admit(QueryWorkKind::PositionDocument, 1)?;
+            let Some(global_docid) = snapshot.resolve_document_id(document_id)? else {
+                snippets.push(None);
+                continue;
+            };
+            let content = snapshot
+                .materialize_stored_value(CONTENT_FIELD, global_docid)?
+                .map(|content| {
+                    String::from_utf8(content)
+                        .map_err(|_| invalid_state("stored content contains non-UTF-8 bytes"))
+                })
+                .transpose()?;
+            snippets.push(content.as_deref().and_then(|content| {
+                let mut end = content.len().min(max_source_bytes);
+                while !content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                generator.snippet_or_prefix(&content[..end])
+            }));
+        }
+        Ok(snippets)
+    }
+
     fn segment_stats(&self) -> SearchResult<SegmentStats> {
         let snapshot = self
             .checked_published_snapshot()
@@ -11535,6 +11630,37 @@ impl QuillSearchIndex {
     ) -> Result<Vec<QuillSnippetHit>, QuillIndexError> {
         self.reader
             .search_with_snippets(cx, query, limit, snippet_config)
+    }
+
+    /// Generate snippets for chosen documents of the pinned publication.
+    ///
+    /// Uses the query terms, global document frequencies and analyzer that
+    /// [`Self::search_with_snippets`] uses, so a document it returns gets the
+    /// same snippet here — but only the listed documents are materialized, so
+    /// a caller that ranks with [`Self::search_doc_ids`] pays for snippets
+    /// only on what it shows. At most `max_source_bytes` of each stored text
+    /// are scanned (cut on a character boundary). A document holding no query
+    /// term gets its opening fragment; one that is not live gets `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, query parsing, snippet-term compilation,
+    /// stored-content, UTF-8, or allocation failures.
+    pub fn snippets_for_documents(
+        &self,
+        cx: &Cx,
+        query: &str,
+        document_ids: &[&str],
+        snippet_config: &SnippetConfig,
+        max_source_bytes: usize,
+    ) -> Result<Vec<Option<String>>, QuillIndexError> {
+        self.reader.snippets_for_documents(
+            cx,
+            query,
+            document_ids,
+            snippet_config,
+            max_source_bytes,
+        )
     }
 
     /// Collect every matching global document id from the pinned publication.
@@ -12524,6 +12650,32 @@ impl QuillIndex {
         let snapshot = self.checked_published_snapshot()?;
         self.reader
             .search_with_snippets_on(cx, query, limit, snippet_config, snapshot.as_ref())
+    }
+
+    /// Generate snippets for chosen documents of the published snapshot; see
+    /// [`QuillSearchIndex::snippets_for_documents`].
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, query parsing, snippet-term compilation,
+    /// stored-content, UTF-8, or allocation failures.
+    pub fn snippets_for_documents(
+        &self,
+        cx: &Cx,
+        query: &str,
+        document_ids: &[&str],
+        snippet_config: &SnippetConfig,
+        max_source_bytes: usize,
+    ) -> Result<Vec<Option<String>>, QuillIndexError> {
+        let snapshot = self.checked_published_snapshot()?;
+        self.reader.snippets_for_documents_on(
+            cx,
+            query,
+            document_ids,
+            snippet_config,
+            max_source_bytes,
+            snapshot.as_ref(),
+        )
     }
 
     /// Collect the complete deterministic set of matching global document IDs.
@@ -21552,6 +21704,69 @@ mod tests {
                 tombstoned.keeper.segments()[0].stored_meta_lookup_cache_counts(),
                 (3, 1),
                 "tombstone-only rebinds share the one plan only for the exact immutable backing"
+            );
+        });
+    }
+
+    /// Snippets for chosen documents equal the ranked snippet tail's for what
+    /// it returns (so the same terms and document-frequency weights pick the
+    /// window), fall back to the opening without query terms, stop at
+    /// `max_source_bytes`, and skip documents that are not live.
+    #[test]
+    fn snippets_for_documents_match_the_ranked_snippets() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("create index");
+            let filler = "filler ".repeat(40);
+            let mixed = format!("ownership {filler}lifetime");
+            let deep = format!("opening words {filler}ownership");
+            for (id, text) in [
+                ("common", "ownership ownership borrow rules"),
+                ("rare", "the lifetime elision rule"),
+                ("none", "an unrelated opening line about gardening"),
+                ("mixed", mixed.as_str()),
+                ("deep", deep.as_str()),
+            ] {
+                LexicalWrite::index_document(&index, &cx, &IndexableDocument::new(id, text))
+                    .await
+                    .expect("index document");
+            }
+            LexicalWrite::commit(&index, &cx).await.expect("commit");
+
+            let config = crate::SnippetConfig::default();
+            let query = "ownership lifetime";
+            let ranked = index
+                .search_with_snippets(&cx, query, 10, &config)
+                .expect("ranked snippets");
+            assert!(ranked.iter().any(|hit| hit.document_id == "mixed"));
+            let ids = ranked
+                .iter()
+                .map(|hit| hit.document_id.as_str())
+                .collect::<Vec<_>>();
+            let chosen = index
+                .snippets_for_documents(&cx, query, &ids, &config, usize::MAX)
+                .expect("chosen snippets");
+            for (hit, snippet) in ranked.iter().zip(&chosen) {
+                assert_eq!(snippet, &hit.snippet, "{}", hit.document_id);
+            }
+
+            let extra = index
+                .snippets_for_documents(&cx, query, &["none", "missing", "deep"], &config, 40)
+                .expect("snippets beyond the ranked tail");
+            assert!(
+                extra[0]
+                    .as_deref()
+                    .is_some_and(|snippet| snippet.starts_with("an unrelated opening line")),
+                "{:?}",
+                extra[0]
+            );
+            assert_eq!(extra[1], None);
+            assert!(
+                extra[2]
+                    .as_deref()
+                    .is_some_and(|snippet| snippet.starts_with("opening words")
+                        && !snippet.contains("ownership")),
+                "{:?}",
+                extra[2]
             );
         });
     }
