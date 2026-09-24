@@ -125,6 +125,42 @@ fn validate_embedder_identity(
     Ok(dimension)
 }
 
+fn embedding_identity_changed() -> SearchError {
+    SearchError::UnverifiableRemoteSpace {
+        producer: "embedding.bound".to_owned(),
+        reason: "embedding producer or response differs from the identity admitted before inference"
+            .to_owned(),
+    }
+}
+
+// Compare full contracts, never operational names or dimensions alone. A
+// provider that loses identity after inference must not become a value-only
+// failure that a partial-coverage builder can silently skip.
+fn validate_embedding_producer(
+    expected: &EmbeddingIdentityBundleV1,
+    actual: SearchResult<&EmbeddingIdentityBundleV1>,
+    dimension: usize,
+) -> SearchResult<()> {
+    if actual.is_ok_and(|identity| identity == expected)
+        && usize::try_from(expected.space.dimension).ok() == Some(dimension)
+    {
+        Ok(())
+    } else {
+        Err(embedding_identity_changed())
+    }
+}
+
+fn validate_embedding_response(
+    response: &IdentityBoundEmbedding,
+    expected: &EmbeddingIdentityBundleV1,
+) -> SearchResult<()> {
+    // Reject foreign fields before invoking diagnostics that might echo them.
+    if &response.identity != expected {
+        return Err(embedding_identity_changed());
+    }
+    response.validate()
+}
+
 fn validate_embedding_values(values: &[f32], dimension: usize) -> SearchResult<()> {
     if values.len() != dimension {
         return Err(SearchError::InvalidConfig {
@@ -295,7 +331,9 @@ pub trait Embedder: Send + Sync {
             let mut out = Vec::with_capacity(texts.len());
             for text in texts {
                 embedding_checkpoint(cx, "embedder.embed_batch")?;
-                out.push(self.embed(cx, text).await?);
+                let outcome = self.embed(cx, text).await;
+                embedding_checkpoint(cx, "embedder.embed_batch")?;
+                out.push(outcome?);
             }
             embedding_checkpoint(cx, "embedder.embed_batch")?;
             Ok(out)
@@ -305,7 +343,8 @@ pub trait Embedder: Send + Sync {
     /// Embed one input and bind the output to the complete verified identity.
     ///
     /// Admit the identity before inference; reject malformed or cancelled
-    /// output before it can be persisted, compared, or cached.
+    /// output before it can be persisted, compared, or cached. Producer drift
+    /// is refused, and cancellation takes precedence over an inference error.
     fn embed_bound<'a>(
         &'a self,
         cx: &'a Cx,
@@ -313,15 +352,15 @@ pub trait Embedder: Send + Sync {
     ) -> SearchFuture<'a, IdentityBoundEmbedding> {
         Box::pin(async move {
             embedding_checkpoint(cx, "embedder.embed_bound")?;
-            let identity = self.identity()?;
-            let dimension = validate_embedder_identity(identity, self.dimension())?;
-            let values = self.embed(cx, text).await?;
+            let identity = self.identity()?.clone();
+            let dimension = validate_embedder_identity(&identity, self.dimension())?;
+            let outcome = self.embed(cx, text).await;
             embedding_checkpoint(cx, "embedder.embed_bound")?;
+            let values = outcome?;
+            validate_embedding_producer(&identity, self.identity(), self.dimension())?;
             validate_embedding_values(&values, dimension)?;
-            Ok(IdentityBoundEmbedding {
-                values,
-                identity: identity.clone(),
-            })
+            embedding_checkpoint(cx, "embedder.embed_bound")?;
+            Ok(IdentityBoundEmbedding { values, identity })
         })
     }
 
@@ -329,8 +368,10 @@ pub trait Embedder: Send + Sync {
     ///
     /// Validation is all-or-error: a backend returning too few or too many
     /// vectors cannot silently drop inputs through a downstream `zip`. Even
-    /// an empty batch must carry a valid identity. Inference implementations
-    /// remain responsible for cancellation checkpoints within blocking work.
+    /// an empty batch must carry a valid identity. Producer identity is checked
+    /// again after inference; cancellation outranks a backend error.
+    /// Inference implementations remain responsible for cancellation checkpoints
+    /// within blocking work.
     fn embed_batch_bound<'a>(
         &'a self,
         cx: &'a Cx,
@@ -338,10 +379,12 @@ pub trait Embedder: Send + Sync {
     ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
         Box::pin(async move {
             embedding_checkpoint(cx, "embedder.embed_batch_bound")?;
-            let identity = self.identity()?;
-            let dimension = validate_embedder_identity(identity, self.dimension())?;
-            let vectors = self.embed_batch(cx, texts).await?;
+            let identity = self.identity()?.clone();
+            let dimension = validate_embedder_identity(&identity, self.dimension())?;
+            let outcome = self.embed_batch(cx, texts).await;
             embedding_checkpoint(cx, "embedder.embed_batch_bound")?;
+            let vectors = outcome?;
+            validate_embedding_producer(&identity, self.identity(), self.dimension())?;
             validate_embedding_batch_length(vectors.len(), texts.len())?;
             let bound = vectors
                 .into_iter()
@@ -496,16 +539,15 @@ pub trait SyncEmbed: Send + Sync {
     /// # Errors
     ///
     /// Returns the embedding error or fails closed when identity, dimension,
-    /// or finite-coordinate validation fails. Identity is admitted before work.
+    /// or finite-coordinate validation fails. Identity is admitted before work
+    /// and checked again before returning values.
     fn embed_bound_sync(&self, text: &str) -> SearchResult<IdentityBoundEmbedding> {
-        let identity = self.identity()?;
-        let dimension = validate_embedder_identity(identity, self.dimension())?;
+        let identity = self.identity()?.clone();
+        let dimension = validate_embedder_identity(&identity, self.dimension())?;
         let values = self.embed_sync(text)?;
+        validate_embedding_producer(&identity, self.identity(), self.dimension())?;
         validate_embedding_values(&values, dimension)?;
-        Ok(IdentityBoundEmbedding {
-            values,
-            identity: identity.clone(),
-        })
+        Ok(IdentityBoundEmbedding { values, identity })
     }
 
     /// Synchronously embed a batch and bind every output to one identity.
@@ -514,11 +556,13 @@ pub trait SyncEmbed: Send + Sync {
     ///
     /// Returns the first embedding or validation error. A batch must return
     /// exactly one finite, correctly dimensioned vector per input; no partial
-    /// batch is returned. Identity is validated even for an empty batch.
+    /// batch is returned. Identity is validated even for an empty batch and
+    /// producer drift during inference is refused.
     fn embed_batch_bound_sync(&self, texts: &[&str]) -> SearchResult<Vec<IdentityBoundEmbedding>> {
-        let identity = self.identity()?;
-        let dimension = validate_embedder_identity(identity, self.dimension())?;
+        let identity = self.identity()?.clone();
+        let dimension = validate_embedder_identity(&identity, self.dimension())?;
         let vectors = self.embed_batch_sync(texts)?;
+        validate_embedding_producer(&identity, self.identity(), self.dimension())?;
         validate_embedding_batch_length(vectors.len(), texts.len())?;
         vectors
             .into_iter()
@@ -583,9 +627,15 @@ pub trait SyncEmbed: Send + Sync {
 
 /// Adapts a [`SyncEmbed`] implementor into a full async [`Embedder`].
 ///
-/// The sync `embed_sync()` call is wrapped in `Box::pin(async move { ... })`,
-/// which is zero-cost for pure computation (hash embedders) and acceptable for
-/// blocking ONNX inference when called from a `spawn_blocking` context.
+/// Each operation invokes its corresponding synchronous method when polled.
+/// Bound operations preserve custom `embed_bound_sync`/`embed_batch_bound_sync`
+/// dispatch and validate the actual responses against the pre-inference identity;
+/// they never replace a provider's bound result with relabeled raw inference.
+/// Cancellation is checked before work and after either success or failure.
+///
+/// This adapter does not create a blocking pool or preempt running inference.
+/// Expensive synchronous providers must still be polled on the caller's blocking
+/// lane. Raw methods remain raw, including for legacy identity-unaware providers.
 pub struct SyncEmbedderAdapter<T: SyncEmbed>(pub T);
 
 fn embedding_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
@@ -601,9 +651,9 @@ impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
     fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
             embedding_checkpoint(cx, "sync_embed.embed")?;
-            let values = self.0.embed_sync(text)?;
+            let outcome = self.0.embed_sync(text);
             embedding_checkpoint(cx, "sync_embed.embed")?;
-            Ok(values)
+            outcome
         })
     }
 
@@ -614,9 +664,51 @@ impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
             embedding_checkpoint(cx, "sync_embed.embed_batch")?;
-            let values = self.0.embed_batch_sync(texts)?;
+            let outcome = self.0.embed_batch_sync(texts);
             embedding_checkpoint(cx, "sync_embed.embed_batch")?;
-            Ok(values)
+            outcome
+        })
+    }
+
+    fn embed_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+    ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+        Box::pin(async move {
+            embedding_checkpoint(cx, "sync_embed.embed_bound")?;
+            let identity = self.0.identity()?.clone();
+            validate_embedder_identity(&identity, self.0.dimension())?;
+            let outcome = self.0.embed_bound_sync(text);
+            embedding_checkpoint(cx, "sync_embed.embed_bound")?;
+            let response = outcome?;
+            validate_embedding_producer(&identity, self.0.identity(), self.0.dimension())?;
+            validate_embedding_response(&response, &identity)?;
+            embedding_checkpoint(cx, "sync_embed.embed_bound")?;
+            Ok(response)
+        })
+    }
+
+    fn embed_batch_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+        Box::pin(async move {
+            embedding_checkpoint(cx, "sync_embed.embed_batch_bound")?;
+            let identity = self.0.identity()?.clone();
+            validate_embedder_identity(&identity, self.0.dimension())?;
+            let outcome = self.0.embed_batch_bound_sync(texts);
+            embedding_checkpoint(cx, "sync_embed.embed_batch_bound")?;
+            let responses = outcome?;
+            validate_embedding_producer(&identity, self.0.identity(), self.0.dimension())?;
+            validate_embedding_batch_length(responses.len(), texts.len())?;
+            for response in &responses {
+                embedding_checkpoint(cx, "sync_embed.embed_batch_bound")?;
+                validate_embedding_response(response, &identity)?;
+            }
+            embedding_checkpoint(cx, "sync_embed.embed_batch_bound")?;
+            Ok(responses)
         })
     }
 
@@ -855,24 +947,29 @@ pub trait SyncRerank: Send + Sync {
 ///
 /// The sync `rerank_sync()` call is wrapped in `Box::pin(async move { ... })`,
 /// which is acceptable for blocking ONNX inference when called from a
-/// `spawn_blocking` context.
+/// `spawn_blocking` context. Cancellation is checked before inference and after
+/// success or failure; already-running synchronous work is not preempted.
 pub struct SyncRerankerAdapter<T: SyncRerank>(pub T);
 
 impl<T: SyncRerank + 'static> Reranker for SyncRerankerAdapter<T> {
     fn rerank<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         query: &'a str,
         documents: &'a [RerankDocument],
     ) -> SearchFuture<'a, Vec<RerankScore>> {
         Box::pin(async move {
-            let mut scores = self.0.rerank_sync(query, documents)?;
+            embedding_checkpoint(cx, "sync_rerank.rerank")?;
+            let outcome = self.0.rerank_sync(query, documents);
+            embedding_checkpoint(cx, "sync_rerank.rerank")?;
+            let mut scores = outcome?;
             scores.sort_by(|lhs, rhs| {
                 rhs.score
                     .total_cmp(&lhs.score)
                     .then_with(|| lhs.original_rank.cmp(&rhs.original_rank))
                     .then_with(|| lhs.doc_id.cmp(&rhs.doc_id))
             });
+            embedding_checkpoint(cx, "sync_rerank.rerank")?;
             Ok(scores)
         })
     }
