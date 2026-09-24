@@ -223,7 +223,7 @@ fn image_digest<R: std::io::Read>(cx: &Cx, reader: &mut R, expected: u64) -> Sea
         ));
     }
     retained_search_checkpoint(cx)?;
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(crate::runtime::sha256_digest_hex(hash.finalize()))
 }
 
 #[cfg(test)]
