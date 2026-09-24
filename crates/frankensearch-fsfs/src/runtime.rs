@@ -783,13 +783,13 @@ struct SearchExecutionResources {
     degradation_advice: Vec<DegradationAdvice>,
 }
 
-/// A tier's query embedder with the identity it was admitted under.
+/// A tier's embedder with the identity it was admitted under.
 ///
-/// Admission checks what the embedder advertises; a query vector is scored
-/// only after the identity bound to that very response has been checked too
-/// ([`Self::embed_query`]). Keeping the two together means warm reuse and
-/// generation rebinds carry the original admission rather than whatever the
-/// provider reports later.
+/// Admission checks what the embedder advertises; a vector is scored or
+/// stored only after the identity bound to that very response has been
+/// checked too ([`Self::embed_admitted`]). Keeping the two together means
+/// warm reuse and generation rebinds carry the original admission rather than
+/// whatever the provider reports later.
 #[derive(Clone)]
 struct AdmittedEmbedder {
     embedder: Arc<dyn Embedder>,
@@ -819,20 +819,20 @@ impl AdmittedEmbedder {
         Ok(())
     }
 
-    /// Embed a query and return its values only when the response itself
-    /// carries the admitted identity, the exact width and finite values. A
-    /// cancellation observed after inference takes precedence over a
-    /// provider error.
-    async fn embed_query(&self, cx: &Cx, query: &str) -> SearchResult<Vec<f32>> {
-        let response = self.embedder.embed_bound(cx, query).await;
+    /// Embed a query or document text and return its values only when the
+    /// response itself carries the admitted identity, the exact width and
+    /// finite values. A cancellation observed after inference takes
+    /// precedence over a provider error.
+    async fn embed_admitted(&self, cx: &Cx, text: &str) -> SearchResult<Vec<f32>> {
+        let response = self.embedder.embed_bound(cx, text).await;
         cx.checkpoint().map_err(|_| SearchError::Cancelled {
-            phase: "query_embedding".to_owned(),
+            phase: "admitted_embedding".to_owned(),
             reason: "runtime cancellation requested".to_owned(),
         })?;
         let bound = response?;
         bound.validate()?;
         if bound.identity != self.identity {
-            return Err(self.identity_mismatch("returned a query vector from", &bound.identity));
+            return Err(self.identity_mismatch("returned a vector from", &bound.identity));
         }
         Ok(bound.values)
     }
@@ -843,9 +843,9 @@ impl AdmittedEmbedder {
         observed: &frankensearch_core::EmbeddingIdentityBundleV1,
     ) -> SearchError {
         SearchError::UnverifiableRemoteSpace {
-            producer: format!("fsfs.query_embedding.{}", self.embedder.id()),
+            producer: format!("fsfs.admitted_embedding.{}", self.embedder.id()),
             reason: format!(
-                "the embedder {action} identity {} but its tier was admitted under {}; scores against the stored vectors would compare different embedding spaces",
+                "the embedder {action} identity {} but its tier was admitted under {}; the vector would mix embedding spaces with the stored ones",
                 observed.fingerprint(),
                 self.identity.fingerprint()
             ),
@@ -2609,7 +2609,7 @@ struct LiveIngestPipeline {
     target_root: PathBuf,
     lexical_index: QuillIndex,
     vector_index: Arc<std::sync::Mutex<VectorIndex>>,
-    embedder: Arc<dyn Embedder>,
+    embedder: AdmittedEmbedder,
     /// Quality-tier generation and its embedder, when the watched generation
     /// carries one. Every live upsert and delete is mirrored into it.
     quality_tier: Option<LiveQualityTier>,
@@ -2619,7 +2619,7 @@ struct LiveIngestPipeline {
 
 struct LiveQualityTier {
     vector_index: Arc<std::sync::Mutex<VectorIndex>>,
-    embedder: Arc<dyn Embedder>,
+    embedder: AdmittedEmbedder,
 }
 
 #[derive(Debug)]
@@ -2801,7 +2801,7 @@ impl LiveIngestPipeline {
         target_root: PathBuf,
         lexical_index: QuillIndex,
         vector_index: VectorIndex,
-        embedder: Arc<dyn Embedder>,
+        embedder: AdmittedEmbedder,
     ) -> Self {
         Self {
             target_root,
@@ -2819,7 +2819,7 @@ impl LiveIngestPipeline {
         self
     }
 
-    fn with_quality_tier(mut self, vector_index: VectorIndex, embedder: Arc<dyn Embedder>) -> Self {
+    fn with_quality_tier(mut self, vector_index: VectorIndex, embedder: AdmittedEmbedder) -> Self {
         self.quality_tier = Some(LiveQualityTier {
             vector_index: Arc::new(std::sync::Mutex::new(vector_index)),
             embedder,
@@ -2946,7 +2946,8 @@ impl LiveIngestPipeline {
             Arc::clone(&storage),
             Arc::clone(&queue),
             Arc::new(DefaultCanonicalizer::default()),
-            Arc::clone(&self.embedder),
+            // The storage pipeline binds each response to its own admission.
+            Arc::clone(&self.embedder.embedder),
             sink,
         )
         .with_config(PipelineConfig {
@@ -3091,7 +3092,7 @@ impl LiveIngestPipeline {
         canonical: &str,
         reason_code: &str,
     ) -> frankensearch_core::SearchResult<()> {
-        match tier.embedder.embed(cx, canonical).await {
+        match tier.embedder.embed_admitted(cx, canonical).await {
             Ok(embedding) => {
                 let mut quality = tier
                     .vector_index
@@ -3137,7 +3138,7 @@ impl LiveIngestPipeline {
                     self.soft_delete_vector(rel_key)?;
                 }
                 VectorIndexWriteAction::AppendFast { .. } => {
-                    match self.embedder.embed(cx, canonical).await {
+                    match self.embedder.embed_admitted(cx, canonical).await {
                         Ok(embedding) => {
                             let mut vi = self
                                 .vector_index
@@ -3291,7 +3292,7 @@ impl LiveIngestPipeline {
                 // vectors are expected to be computed inline. Preserve live watcher behavior by
                 // writing those vectors directly. Catalog dedup is not evidence
                 // that a previous inline vector append succeeded.
-                if !self.embedder.is_semantic() {
+                if !self.embedder.embedder().is_semantic() {
                     let content_len_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
                     let vector_plan = Self::plan_live_vector_upsert(
                         self.quality_tier.is_some(),
@@ -3315,7 +3316,7 @@ impl LiveIngestPipeline {
                 // behind and REFINED never ranked the new content
                 // (bd-orb50). Write the quality vector inline, as the direct
                 // path does.
-                if self.embedder.is_semantic()
+                if self.embedder.embedder().is_semantic()
                     && let Some(tier) = self.quality_tier.as_ref()
                 {
                     self.append_quality_vector(
@@ -10896,7 +10897,7 @@ impl FsfsRuntime {
                 resources.vector_index.as_ref(),
                 resources.fast_embedder.as_ref(),
             ) {
-                match embedder.embed_query(cx, &normalized_query).await {
+                match embedder.embed_admitted(cx, &normalized_query).await {
                     Ok(query_embedding) => {
                         // Classified lane (bd-tqhc): an empty vector result
                         // carries a typed ZeroSignalReason instead of being
@@ -18131,7 +18132,7 @@ impl FsfsRuntime {
         else {
             return Ok(None);
         };
-        let query_embedding = embedder.embed_query(cx, query).await?;
+        let query_embedding = embedder.embed_admitted(cx, query).await?;
         let index = Arc::clone(index);
         let filter_expr = filter_expr.cloned();
         let mut fast_ids = fast_candidates
@@ -18360,7 +18361,7 @@ impl FsfsRuntime {
                 WATCH_OPEN_BUDGET,
             )?;
             Self::admit_quality_generation_for_embedder(&quality_index, quality_embedder.as_ref())?;
-            Some((quality_index, quality_embedder))
+            Some((quality_index, AdmittedEmbedder::admit(quality_embedder)?))
         } else {
             None
         };
@@ -18374,9 +18375,13 @@ impl FsfsRuntime {
             "live ingest pipeline initialized for watch mode"
         );
 
-        let mut pipeline =
-            LiveIngestPipeline::new(target_root, lexical_index, vector_index, embedder)
-                .with_storage_db_path(storage_db_path);
+        let mut pipeline = LiveIngestPipeline::new(
+            target_root,
+            lexical_index,
+            vector_index,
+            AdmittedEmbedder::admit(embedder)?,
+        )
+        .with_storage_db_path(storage_db_path);
         if let Some((quality_index, quality_embedder)) = quality_tier {
             pipeline = pipeline.with_quality_tier(quality_index, quality_embedder);
         }
@@ -25801,7 +25806,7 @@ mod tests {
             let query = |script| async {
                 let embedder = ScriptedBoundEmbedder::new(script);
                 let calls = Arc::clone(&embedder.calls);
-                let result = admitted(embedder).embed_query(&cx, "query").await;
+                let result = admitted(embedder).embed_admitted(&cx, "query").await;
                 (result, calls.load(Ordering::SeqCst))
             };
 
@@ -25859,7 +25864,7 @@ mod tests {
             drifting.drift.store(true, Ordering::SeqCst);
             assert!(admission.check_current_identity().is_err());
             assert!(matches!(
-                admission.embed_query(&cx, "query").await,
+                admission.embed_admitted(&cx, "query").await,
                 Err(SearchError::UnverifiableRemoteSpace { .. })
             ));
 
@@ -25872,7 +25877,7 @@ mod tests {
         for script in [BoundScript::CancelThenRespond, BoundScript::CancelThenFail] {
             run_test_with_cx(|cx| async move {
                 let result = admitted(ScriptedBoundEmbedder::new(script))
-                    .embed_query(&cx, "query")
+                    .embed_admitted(&cx, "query")
                     .await;
                 assert!(matches!(result, Err(SearchError::Cancelled { .. })), "{result:?}");
             });
@@ -25965,6 +25970,75 @@ mod tests {
                     "attempt {attempt}"
                 );
                 assert_eq!(response.payloads[0].hits[0].path, "a.rs");
+            }
+        });
+    }
+
+    /// GH #55 on the watch path: a live upsert stores a document vector only
+    /// when the response carries the identity its tier was admitted under.
+    /// The provider's raw `embed` would succeed; the stored vector survives.
+    #[test]
+    fn watch_ingest_refuses_a_foreign_bound_document_vector() {
+        run_test_with_cx(|cx| async move {
+            for foreign_tier in ["fast", "quality"] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("project");
+                fs::create_dir_all(&root).unwrap();
+                fs::write(root.join("doc.md"), "live content the watcher embeds").unwrap();
+                let fast_path = temp.path().join("fast.fsvi");
+                let quality_path = temp.path().join("quality.fsvi");
+                for path in [&fast_path, &quality_path] {
+                    let mut writer = VectorIndex::create(path, "scripted-query-2", 2).unwrap();
+                    writer.write_record("doc.md", &[0.0, 1.0]).unwrap();
+                    writer.finish().unwrap();
+                }
+                let foreign = || {
+                    admitted(ScriptedBoundEmbedder::new(BoundScript::Identity(Box::new(
+                        test_identity("another-model-2", 2).clone(),
+                    ))))
+                };
+                let matching =
+                    || admitted(ScriptedBoundEmbedder::new(BoundScript::Values(vec![1.0, 0.0])));
+                let (fast, quality) = if foreign_tier == "fast" {
+                    (foreign(), matching())
+                } else {
+                    (matching(), foreign())
+                };
+                let pipeline = LiveIngestPipeline::new(
+                    root,
+                    create_test_quill(&cx, &temp.path().join("lexical")).await,
+                    VectorIndex::open(&fast_path).unwrap(),
+                    fast,
+                )
+                .with_quality_tier(VectorIndex::open(&quality_path).unwrap(), quality);
+                let batch = [WatchIngestOp::Upsert {
+                    file_key: "doc.md".to_owned(),
+                    revision: 2,
+                    ingestion_class: IngestionClass::FullSemanticLexical,
+                }];
+                let error = pipeline
+                    .apply_batch(&cx, &batch)
+                    .await
+                    .expect_err("a foreign document vector must not be acknowledged");
+                assert!(
+                    matches!(error, SearchError::UnverifiableRemoteSpace { .. }),
+                    "{foreign_tier}: {error:?}"
+                );
+                let handle = if foreign_tier == "fast" {
+                    &pipeline.vector_index
+                } else {
+                    &pipeline.quality_tier.as_ref().unwrap().vector_index
+                };
+                let hits = handle
+                    .lock()
+                    .unwrap()
+                    .search_top_k(&[0.0, 1.0], 2, None)
+                    .unwrap();
+                assert_eq!(hits.len(), 1, "{foreign_tier}");
+                assert!(
+                    hits[0].score > 0.99,
+                    "{foreign_tier}: the foreign vector replaced the stored one"
+                );
             }
         });
     }
@@ -33526,7 +33600,7 @@ mod tests {
                 target_root,
                 create_test_quill(&cx, &lexical_path).await,
                 VectorIndex::open(&vector_path).expect("open live vector index"),
-                Arc::new(HashEmbedder::default_256()),
+                admitted(HashEmbedder::default_256()),
             );
             let plan = VectorPipelinePlan {
                 file_key: "doc.md".to_owned(),
@@ -33949,12 +34023,12 @@ mod tests {
                 root,
                 create_test_quill(cx, &temp.path().join("lexical")).await,
                 VectorIndex::open(&fast_path).unwrap(),
-                Arc::new(StorageRetryEmbedder::new("retry-fast")),
+                admitted(StorageRetryEmbedder::new("retry-fast")),
             )
             .with_storage_db_path(temp.path().join("catalog.db"))
             .with_quality_tier(
                 VectorIndex::open(&quality_path).unwrap(),
-                Arc::new(StorageRetryEmbedder::new("retry-quality")),
+                admitted(StorageRetryEmbedder::new("retry-quality")),
             );
             let blocked = if block_quality {
                 &quality_path
@@ -34049,11 +34123,11 @@ mod tests {
                 temp.path().to_path_buf(),
                 create_test_quill(&cx, &temp.path().join("lexical")).await,
                 VectorIndex::open(&fast_path).unwrap(),
-                Arc::new(CancelledEmbedder),
+                admitted(CancelledEmbedder),
             )
             .with_quality_tier(
                 VectorIndex::open(&quality_path).unwrap(),
-                Arc::new(CancelledEmbedder),
+                admitted(CancelledEmbedder),
             );
             let plan = LiveIngestPipeline::plan_live_vector_upsert(
                 false,
@@ -34103,7 +34177,7 @@ mod tests {
                 temp.path().to_path_buf(),
                 create_test_quill(&cx, &temp.path().join("lexical")).await,
                 VectorIndex::open(&vector_path).unwrap(),
-                Arc::new(StorageRetryEmbedder::new("retry-fast")),
+                admitted(StorageRetryEmbedder::new("retry-fast")),
             )
             .with_storage_db_path(temp.path().join("catalog.db"));
             let context = pipeline.build_storage_batch_context().unwrap().unwrap();
@@ -34236,7 +34310,7 @@ mod tests {
 
             let semantic_query = pipeline
                 .embedder
-                .embed(&cx, "semantic storage integration")
+                .embed_admitted(&cx, "semantic storage integration")
                 .await
                 .expect("embed semantic probe query");
             let vector_hits = {
@@ -34306,7 +34380,7 @@ mod tests {
                 target_root.clone(),
                 lexical_index,
                 vector_index,
-                Arc::new(HashEmbedder::default_256()),
+                admitted(HashEmbedder::default_256()),
             );
             let missing_path = target_root.join("src/ghost.rs");
             let applied = pipeline
@@ -34352,7 +34426,7 @@ mod tests {
                 target_root.clone(),
                 lexical_index,
                 vector_index,
-                Arc::new(HashEmbedder::default_256()),
+                admitted(HashEmbedder::default_256()),
             );
 
             let escaped = target_root.join("../outside.txt");
@@ -34408,7 +34482,7 @@ mod tests {
                 resolved_root,
                 lexical_index,
                 vector_index,
-                Arc::new(HashEmbedder::default_256()),
+                admitted(HashEmbedder::default_256()),
             );
 
             let (resolved_file, rel_key) = pipeline
@@ -34463,7 +34537,7 @@ mod tests {
                 target_root.clone(),
                 lexical_index,
                 vector_index,
-                Arc::new(HashEmbedder::default_256()),
+                admitted(HashEmbedder::default_256()),
             );
             let applied = pipeline
                 .apply_batch(
@@ -34533,7 +34607,7 @@ mod tests {
                 target_root.clone(),
                 lexical_index,
                 vector_index,
-                Arc::new(HashEmbedder::default_256()),
+                admitted(HashEmbedder::default_256()),
             );
             let applied = pipeline
                 .apply_batch(
@@ -34618,7 +34692,7 @@ mod tests {
                 target_root.clone(),
                 lexical_index,
                 vector_index,
-                Arc::new(HashEmbedder::default_256()),
+                admitted(HashEmbedder::default_256()),
             );
             let applied = pipeline
                 .apply_batch(
@@ -39820,7 +39894,7 @@ mod tests {
                 target_root,
                 lexical,
                 VectorIndex::open(&vector_path).expect("open vector index"),
-                Arc::new(HashEmbedder::default_256()),
+                admitted(HashEmbedder::default_256()),
             );
             let requester_path = lexical_root.clone();
             let requester = std::thread::spawn(move || {
