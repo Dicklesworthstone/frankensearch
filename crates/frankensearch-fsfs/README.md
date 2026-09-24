@@ -6,7 +6,7 @@ Standalone `fsfs` CLI and runtime for two-tier hybrid local search.
 
 `frankensearch-fsfs` is the user-facing CLI application that provides a full-featured local search experience. It combines semantic vector search, BM25 lexical search, and two-tier progressive ranking into a terminal application with both a rich TUI mode and structured output formats (JSON, TOON). It includes filesystem watching for live index updates, configurable pressure sensing, query planning, and an explainability screen.
 
-The crate is split into a library (`src/lib.rs`) for reusable runtime, configuration, and adapter logic, and a binary (`src/main.rs`) for the `fsfs` CLI entrypoint.
+The crate is split into a library (`src/lib.rs`) for reusable runtime, configuration, and adapter logic, the `fsfs` CLI (`src/main.rs`), and the receipt-directed `fsfs-recover` utility (`src/bin/fsfs-recover.rs`).
 
 ## Build Profiles
 
@@ -138,6 +138,80 @@ fsfs config show
 # Launch interactive TUI
 fsfs --tui
 ```
+
+## Retained-generation recovery (unreleased source)
+
+`fsfs-recover` exposes the existing retained recovery APIs without normal root
+discovery or startup update checks. Build it from this checkout; these source
+changes do not update release archives or the installer:
+
+```bash
+cargo build -p frankensearch-fsfs --bin fsfs-recover
+```
+
+Use the exact `generation_id` and `manifest_sha256` saved from a trusted complete
+publication receipt. Never compute a replacement digest merely to admit damaged
+files. Explicit store selection is mandatory; legacy mutable indexes and the
+fixed-authority/antirollback layout are not targets for this command.
+
+```bash
+# Read-only inspection and an optional query preview; does not change selection.
+fsfs-recover --index-dir /data/search-store \
+  --generation "$GENERATION_ID" --manifest-sha256 "$MANIFEST_SHA256" \
+  --config /path/to/fsfs.toml --query "durable search generations" --limit 10
+
+# Explicit rollback/repair through the guarded publication protocol.
+fsfs-recover --index-dir /data/search-store \
+  --generation "$GENERATION_ID" --manifest-sha256 "$MANIFEST_SHA256" \
+  --config /path/to/fsfs.toml --apply
+
+# Confirm an already-visible target after an uncertain durability outcome.
+# This does not load models, read fsfs configuration, or republish the target.
+fsfs-recover --index-dir /data/search-store \
+  --generation "$GENERATION_ID" --manifest-sha256 "$MANIFEST_SHA256" \
+  --confirm-durability
+```
+
+Inspection and restoration require matching locally available producers for all
+stored tiers, including quality when normal queries are configured fast-only.
+They use the normal configuration loader, require a generation-local catalog,
+and run with indexing offline. No source tree is rebuilt, no implicit fallback
+chooses a predecessor, and retained data is not deleted. A requested preview
+must complete before restoration; a failed refinement prevents the apply.
+
+Inspection is not a saved restore authorization. `--apply` prepares anew and
+binds the active selection at that invocation, refusing later competing
+publication. It never silently rebases or retries. A visible-but-unconfirmed
+outcome returns nonzero with `ok: false` and typed `recovery` facts rather than
+claiming an aborted restore. Output failure also does not undo publication.
+
+`--confirm-durability` compares the complete target identity under publication
+ownership before syncing. It refuses a superseded, foreign, missing or corrupt
+selection instead of republishing it or confirming a different generation.
+Confirmation bypasses model and configuration loading, so its report explicitly
+sets `producer_admission_checked: false` and `selection_write_performed: false`.
+It proves neither semantic readiness nor a drained watcher queue. This mode is
+exclusive of `--apply`, `--config`, `--query`, and `--limit`.
+
+Output defaults to JSON; `--format jsonl` and `--format table` are also supported.
+Queries are bounded to 64 KiB, preview results to 100 per phase, and encoded
+responses to 16 MiB. Duplicate or unsupported flags are rejected. The normal
+`cargo run -p frankensearch-fsfs` entry remains `fsfs`.
+
+Focused validation commands (not a claim that they have been executed):
+
+```bash
+cargo test -p frankensearch-fsfs --bin fsfs-recover
+cargo test -p frankensearch-fsfs --lib receipt_durability_tests
+cargo test -p frankensearch-fsfs --test recovery_cli
+FRANKENSEARCH_RECOVERY_E2E_MODEL_DIR=/path/to/verified/models \
+  cargo test -p frankensearch-fsfs --test recovery_cli \
+  genuine_models_preview_restore_and_fresh_search_without_source_files -- --ignored
+```
+
+The final test uses genuine Potion/MiniLM loaders and the actual binaries. It
+requires the loader-capable feature profile and explicit verified artifacts;
+it does not substitute hash or mocked inference when those are missing.
 
 ## Dependency Graph Position
 

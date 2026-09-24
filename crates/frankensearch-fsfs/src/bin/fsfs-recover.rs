@@ -15,7 +15,9 @@ use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use frankensearch_core::rfc3339::{format_unix_nanos, now_unix_nanos};
 use frankensearch_core::{SearchError, SearchResult};
-use frankensearch_fsfs::generation_store::{GenerationPublication, PublishedGeneration};
+use frankensearch_fsfs::generation_store::{
+    CompleteGenerationStore, GenerationPublication, PublishedGeneration,
+};
 use frankensearch_fsfs::output_schema::{SearchOutputPhase, SearchPayload};
 use frankensearch_fsfs::runtime::SearchBlockingPool;
 use frankensearch_fsfs::{
@@ -37,6 +39,7 @@ No directory scan, source rebuild, model download or automatic fallback is perfo
   --query TEXT        Preview a query against the target before any restoration
   --limit N           Preview results per phase (1..=100; default 10)
   --apply             Explicitly restore the admitted target; default is read-only inspection
+  --confirm-durability Confirm the exact selected target without models or republication
   --format FORMAT     json (default), jsonl, or table
   --help              Show this help (use alone)
 
@@ -44,6 +47,8 @@ Use the generation ID and manifest SHA-256 from a trusted publication receipt.
 All stored vector tiers must admit their configured producers, even in fast-only mode.
 A competing publication refuses restoration; no attempt is automatically retried.
 Predecessors and damaged bundles are retained. No file is deleted.
+--confirm-durability cannot be combined with --apply, --config, --query, or --limit.
+Durability confirmation is not model admission or a drained watcher queue.
 This operates on cooperative complete stores, not the fixed-authority antirollback layout.
 ";
 
@@ -56,6 +61,7 @@ struct Options {
     query: Option<String>,
     limit: usize,
     apply: bool,
+    confirm_durability: bool,
     format: OutputFormat,
 }
 
@@ -80,6 +86,7 @@ impl Options {
         let mut query = None;
         let mut limit = 10;
         let mut apply = false;
+        let mut confirm_durability = false;
         let mut format = OutputFormat::Json;
         let mut seen = HashSet::new();
         let mut args = args.into_iter();
@@ -94,6 +101,7 @@ impl Options {
                     | "--query"
                     | "--limit"
                     | "--apply"
+                    | "--confirm-durability"
                     | "--format"
             ) {
                 return Err(invalid("unknown argument; run fsfs-recover --help"));
@@ -103,6 +111,10 @@ impl Options {
             }
             if flag == "--apply" {
                 apply = true;
+                continue;
+            }
+            if flag == "--confirm-durability" {
+                confirm_durability = true;
                 continue;
             }
             let value = args
@@ -135,12 +147,27 @@ impl Options {
                 _ => return Err(invalid("invalid value-bearing argument")),
             }
         }
-        let generation = generation.ok_or_else(|| invalid("--generation is required"))?;
-        let digest = digest.ok_or_else(|| invalid("--manifest-sha256 is required"))?;
+        Self {
+            root: root.ok_or_else(|| {
+                invalid("--index-dir is required; recovery never guesses a store")
+            })?,
+            generation: generation.ok_or_else(|| invalid("--generation is required"))?,
+            digest: digest.ok_or_else(|| invalid("--manifest-sha256 is required"))?,
+            config,
+            query,
+            limit,
+            apply,
+            confirm_durability,
+            format,
+        }
+        .validate(seen.contains("--limit"))
+    }
+
+    fn validate(mut self, explicit_limit: bool) -> SearchResult<Self> {
         // Bound identity text here; the store's canonical pointer decoder owns
         // the exact generation grammar. Do not accept a pathname as an identity.
-        if generation.len() != 60
-            || generation
+        if self.generation.len() != 60
+            || self.generation
                 .bytes()
                 .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-')
         {
@@ -148,34 +175,29 @@ impl Options {
                 "invalid generation ID; use the trusted publication receipt",
             ));
         }
-        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if self.digest.len() != 64 || !self.digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(invalid(
                 "manifest SHA-256 must be exactly 64 hexadecimal characters",
             ));
         }
-        if query
+        if self.query
             .as_ref()
             .is_some_and(|query| query.trim().is_empty() || query.len() > MAX_QUERY_BYTES)
         {
-            return Err(invalid(
-                "preview query must be nonblank and at most 64 KiB",
-            ));
+            return Err(invalid("preview query must be nonblank and at most 64 KiB"));
         }
-        if seen.contains("--limit") && query.is_none() {
+        if explicit_limit && self.query.is_none() {
             return Err(invalid("--limit requires --query"));
         }
-        Ok(Self {
-            root: root.ok_or_else(|| {
-                invalid("--index-dir is required; recovery never guesses a store")
-            })?,
-            generation,
-            digest: digest.to_ascii_lowercase(),
-            config,
-            query,
-            limit,
-            apply,
-            format,
-        })
+        if self.confirm_durability
+            && (self.apply || self.config.is_some() || self.query.is_some() || explicit_limit)
+        {
+            return Err(invalid(
+                "--confirm-durability cannot be combined with --apply, --config, --query, or --limit",
+            ));
+        }
+        self.digest.make_ascii_lowercase();
+        Ok(self)
     }
 }
 
@@ -185,6 +207,8 @@ enum RecoveryState {
     Inspected,
     RestoredDurable,
     RestoredDurabilityUncertain,
+    DurabilityConfirmed,
+    DurabilityStillUncertain,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +219,7 @@ struct Report {
     manifest_sha256: String,
     selection_write_performed: bool,
     durability_confirmed: bool,
+    producer_admission_checked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_error_kind: Option<String>,
     preview: Vec<SearchPayload>,
@@ -209,22 +234,32 @@ impl Report {
             manifest_sha256: generation.manifest_sha256().to_owned(),
             selection_write_performed: false,
             durability_confirmed: false,
+            producer_admission_checked: true,
             sync_error_kind: None,
             preview: Vec::new(),
         }
     }
 
-    fn publication(mut self, publication: GenerationPublication) -> Self {
+    fn completed(mut self, publication: GenerationPublication, restored: bool) -> Self {
         // Nothing fallible follows publication. Keep its original visible
         // outcome even if a later output write or cancellation fails.
-        self.selection_write_performed = true;
+        self.selection_write_performed = restored;
+        self.producer_admission_checked = restored;
         match publication {
             GenerationPublication::Durable(_) => {
-                self.state = RecoveryState::RestoredDurable;
+                self.state = if restored {
+                    RecoveryState::RestoredDurable
+                } else {
+                    RecoveryState::DurabilityConfirmed
+                };
                 self.durability_confirmed = true;
             }
             GenerationPublication::VisibleButDurabilityUncertain { source, .. } => {
-                self.state = RecoveryState::RestoredDurabilityUncertain;
+                self.state = if restored {
+                    RecoveryState::RestoredDurabilityUncertain
+                } else {
+                    RecoveryState::DurabilityStillUncertain
+                };
                 self.sync_error_kind = Some(format!("{:?}", source.kind()));
             }
         }
@@ -246,14 +281,17 @@ impl Response {
     fn from_report(report: Report, format: OutputFormat) -> (Self, u8) {
         let meta = meta_for_format("recover", format);
         let now = format_unix_nanos(now_unix_nanos());
-        if report.state == RecoveryState::RestoredDurabilityUncertain {
+        if matches!(
+            report.state,
+            RecoveryState::RestoredDurabilityUncertain | RecoveryState::DurabilityStillUncertain
+        ) {
             let error = OutputError::new(
                 "subsystem_error",
-                "The restored generation is visible, but durability is not confirmed.",
+                "The selected generation is visible, but durability is not confirmed.",
                 1,
             )
             .with_field("complete_generation.recovery.durability")
-            .with_suggestion("Do not assume an abort or blindly restore again. Inspect the current selection and confirm its durability with fsfs flush.");
+            .with_suggestion("Do not assume an abort or blindly restore again. Use fsfs-recover --confirm-durability with the same trusted generation receipt; a changed selection will be refused.");
             (
                 Self {
                     envelope: OutputEnvelope::error(error, meta, now),
@@ -309,11 +347,9 @@ impl Write for BoundedOutput {
 
 fn encode<T: Serialize>(value: &T) -> SearchResult<Vec<u8>> {
     let mut buffer = BoundedOutput::new(MAX_REPORT_BYTES);
-    serde_json::to_writer(&mut buffer, value).map_err(|source| {
-        SearchError::SubsystemError {
-            subsystem: "fsfs.recovery.output",
-            source: Box::new(source),
-        }
+    serde_json::to_writer(&mut buffer, value).map_err(|source| SearchError::SubsystemError {
+        subsystem: "fsfs.recovery.output",
+        source: Box::new(source),
     })?;
     buffer.write_all(b"\n")?;
     Ok(buffer.bytes)
@@ -339,7 +375,21 @@ fn validate_preview(preview: &[SearchPayload]) -> SearchResult<()> {
     Ok(())
 }
 
-async fn execute(cx: &Cx, runtime: &FsfsRuntime, options: &Options) -> SearchResult<Report> {
+async fn execute(
+    cx: &Cx,
+    runtime: Option<&FsfsRuntime>,
+    options: &Options,
+) -> SearchResult<Report> {
+    if options.confirm_durability {
+        let store = CompleteGenerationStore::open(cx, &options.root)?;
+        let expected = store.open_retained(cx, &options.generation, &options.digest)?;
+        let report = Report::inspected(&expected);
+        // The API rechecks this exact target under the publication lease.
+        // Do not substitute a separate is_selected() check plus unbound flush.
+        let publication = store.confirm_retained_durability(cx, &expected)?;
+        return Ok(report.completed(publication, false));
+    }
+    let runtime = runtime.ok_or_else(|| invalid("recovery runtime was not initialized"))?;
     if options.apply {
         let mut plan = runtime
             .prepare_retained_recovery(cx, &options.root, &options.generation, &options.digest)
@@ -350,7 +400,7 @@ async fn execute(cx: &Cx, runtime: &FsfsRuntime, options: &Options) -> SearchRes
             validate_preview(&report.preview)?;
         }
         let (publication, _reader) = plan.restore(cx)?;
-        Ok(report.publication(publication))
+        Ok(report.completed(publication, true))
     } else {
         // Inspection never takes publication ownership and never replaces a
         // corrupt descriptor. The caller must separately authorize --apply.
@@ -371,7 +421,7 @@ async fn execute(cx: &Cx, runtime: &FsfsRuntime, options: &Options) -> SearchRes
     }
 }
 
-fn run(options: Options) -> SearchResult<Report> {
+fn configured_runtime(options: &Options) -> SearchResult<FsfsRuntime> {
     let home =
         frankensearch_core::platform_dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let env = current_unicode_environment();
@@ -391,17 +441,27 @@ fn run(options: Options) -> SearchResult<Report> {
     // indexing, automatic fallback, update check or watch-mode entrypoint.
     config.indexing.offline = true;
     config.indexing.watch_mode = false;
-    let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+    Ok(FsfsRuntime::new(config).with_cli_input(CliInput {
         command: CliCommand::Doctor,
         index_dir: Some(options.root.clone()),
         quiet: true,
         no_color: true,
         format: options.format,
         ..CliInput::default()
-    });
+    }))
+}
+
+fn run(options: Options) -> SearchResult<Report> {
+    // Pure durability confirmation must work when model/configuration state is
+    // unavailable. It never claims the selected generation is semantic-ready.
+    let runtime = if options.confirm_durability {
+        None
+    } else {
+        Some(configured_runtime(&options)?)
+    };
     let pool = Arc::new(SearchBlockingPool::default());
     #[cfg(feature = "rerank")]
-    let runtime = runtime.with_native_blocking_pool(pool.handle());
+    let runtime = runtime.map(|runtime| runtime.with_native_blocking_pool(pool.handle()));
     let scheduler = RuntimeBuilder::current_thread()
         .blocking_threads(0, 2)
         .build()
@@ -416,7 +476,7 @@ fn run(options: Options) -> SearchResult<Report> {
     let task = scheduler.handle().spawn(async move {
         let cx = worker_pool.context(Cx::current().expect("runtime installs a request context"));
         let _cancellation = worker_shutdown.cancellation_scope(&cx);
-        execute(&cx, &runtime, &options).await
+        execute(&cx, runtime.as_ref(), &options).await
     });
     let result = scheduler.block_on(task);
     shutdown.stop_signal_listener();
@@ -448,6 +508,11 @@ fn render(response: &Response, format: OutputFormat) -> SearchResult<Vec<u8>> {
             output,
             "Selection write performed: {}\nDurability confirmed: {}",
             report.selection_write_performed, report.durability_confirmed,
+        )?;
+        writeln!(
+            output,
+            "Producer admission checked: {}",
+            report.producer_admission_checked,
         )?;
         for phase in &report.preview {
             writeln!(output, "Preview {:?}: {} hits", phase.phase, phase.hits.len())?;
@@ -602,14 +667,47 @@ mod tests {
         assert_eq!(output.bytes, b"abc");
     }
 
+    #[test]
+    fn confirmation_is_explicit_and_rejects_ignored_or_conflicting_options() {
+        let mut input = args();
+        input.push("--confirm-durability".into());
+        let parsed = Options::parse(input.clone()).unwrap();
+        assert!(parsed.confirm_durability);
+        assert!(!parsed.apply);
+        for suffix in [
+            vec!["--apply"],
+            vec!["--config", "configuration.toml"],
+            vec!["--query", "hello"],
+            vec!["--limit", "10"],
+            vec!["--confirm-durability"],
+        ] {
+            let mut conflicting = input.clone();
+            conflicting.extend(suffix.into_iter().map(OsString::from));
+            assert!(Options::parse(conflicting).is_err());
+        }
+        let mut query = args();
+        query.extend(["--query", "--confirm-durability"].map(OsString::from));
+        assert!(!Options::parse(query).unwrap().confirm_durability);
+    }
+
     fn report(state: RecoveryState) -> Report {
         Report {
             schema_version: 1,
             state,
             generation_id: "g-test".to_owned(),
             manifest_sha256: "a".repeat(64),
-            selection_write_performed: state != RecoveryState::Inspected,
-            durability_confirmed: state == RecoveryState::RestoredDurable,
+            selection_write_performed: matches!(
+                state,
+                RecoveryState::RestoredDurable | RecoveryState::RestoredDurabilityUncertain
+            ),
+            durability_confirmed: matches!(
+                state,
+                RecoveryState::RestoredDurable | RecoveryState::DurabilityConfirmed
+            ),
+            producer_admission_checked: !matches!(
+                state,
+                RecoveryState::DurabilityConfirmed | RecoveryState::DurabilityStillUncertain
+            ),
             sync_error_kind: None,
             preview: Vec::new(),
         }
@@ -650,5 +748,54 @@ mod tests {
                 state == RecoveryState::RestoredDurable
             );
         }
+    }
+
+    #[test]
+    fn confirmation_outcomes_never_claim_model_admission_or_selection_writes() {
+        for state in [RecoveryState::DurabilityConfirmed, RecoveryState::DurabilityStillUncertain] {
+            let (response, code) = Response::from_report(report(state), OutputFormat::Json);
+            let encoded = encode(&response).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            let confirmed = state == RecoveryState::DurabilityConfirmed;
+            assert_eq!(code, u8::from(!confirmed));
+            assert_eq!(value["ok"], confirmed);
+            let facts = if confirmed { &value["data"] } else { &value["recovery"] };
+            assert_eq!(facts["selection_write_performed"], false);
+            assert_eq!(facts["producer_admission_checked"], false);
+            assert_eq!(facts["durability_confirmed"], confirmed);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmation_executes_without_a_model_runtime_and_refuses_stale_targets() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let publish = || {
+                let build = store.begin(&cx).unwrap();
+                std::fs::write(build.path().join("payload"), b"container fixture").unwrap();
+                let GenerationPublication::Durable(generation) =
+                    build.publish(&cx, |_, _| Ok(())).unwrap()
+                else {
+                    panic!("fixture publication must be durable"); // ubs:ignore — test assertion.
+                };
+                generation
+            };
+            let first = publish();
+            let mut input = args();
+            input[1] = directory.path().as_os_str().to_owned();
+            input[3] = first.id().into();
+            input[5] = first.manifest_sha256().into();
+            input.push("--confirm-durability".into());
+            let options = Options::parse(input).unwrap();
+            let report = execute(&cx, None, &options).await.unwrap();
+            assert_eq!(report.state, RecoveryState::DurabilityConfirmed);
+            assert!(!report.producer_admission_checked);
+            assert!(!report.selection_write_performed);
+            let successor = publish();
+            assert!(execute(&cx, None, &options).await.is_err());
+            assert_eq!(store.active(&cx).unwrap(), Some(successor));
+        });
     }
 }
