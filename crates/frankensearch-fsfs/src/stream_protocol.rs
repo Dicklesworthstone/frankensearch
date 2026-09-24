@@ -14,7 +14,6 @@ use crate::explanation_payload::FsfsExplanationPayload;
 use crate::output_schema::{OutputError, OutputWarning, exit_code_for, output_error_from};
 
 const SUBSYSTEM: &str = "fsfs_stream_protocol";
-const TOON_DEFAULT_DELIMITER: char = ',';
 
 /// Current stream protocol version.
 pub const STREAM_PROTOCOL_VERSION: u32 = 1;
@@ -423,15 +422,14 @@ pub fn encode_stream_frame_toon<T>(frame: &StreamFrame<T>) -> SearchResult<Strin
 where
     T: Serialize,
 {
-    let mut value = serde_json::to_value(frame).map_err(|source| SearchError::SubsystemError {
+    let value = serde_json::to_value(frame).map_err(|source| SearchError::SubsystemError {
         subsystem: SUBSYSTEM,
         source: Box::new(io::Error::other(format!(
             "failed to project stream frame to JSON value: {source}"
         ))),
     })?;
-    prepare_toon_value_for_lossless_strings(&mut value)?;
 
-    toon_rust::encode(&value, None).map_err(|source| SearchError::SubsystemError {
+    toon_format::encode_default(&value).map_err(|source| SearchError::SubsystemError {
         subsystem: SUBSYSTEM,
         source: Box::new(io::Error::other(format!(
             "failed to encode stream frame as TOON: {source}"
@@ -448,11 +446,13 @@ pub fn decode_stream_frame_toon<T>(input: &str) -> SearchResult<StreamFrame<T>>
 where
     T: DeserializeOwned,
 {
-    let value = toon_rust::decode(input, None).map_err(|source| SearchError::SubsystemError {
-        subsystem: SUBSYSTEM,
-        source: Box::new(io::Error::other(format!(
-            "failed to decode TOON stream frame: {source}"
-        ))),
+    let value = toon_format::decode_default::<serde_json::Value>(input).map_err(|source| {
+        SearchError::SubsystemError {
+            subsystem: SUBSYSTEM,
+            source: Box::new(io::Error::other(format!(
+                "failed to decode TOON stream frame: {source}"
+            ))),
+        }
     })?;
 
     serde_json::from_value(value).map_err(|source| SearchError::SubsystemError {
@@ -620,61 +620,6 @@ fn validate_terminal_event(
                 message: "next_attempt must be within retry budget".into(),
             });
         }
-    }
-}
-
-fn prepare_toon_value_for_lossless_strings(value: &mut serde_json::Value) -> SearchResult<()> {
-    match value {
-        serde_json::Value::String(value) => {
-            if should_wrap_toon_string_value(value) {
-                let wrapped =
-                    serde_json::to_string(value).map_err(|source| SearchError::SubsystemError {
-                        subsystem: SUBSYSTEM,
-                        source: Box::new(io::Error::other(format!(
-                            "failed to prepare TOON stream string token: {source}"
-                        ))),
-                    })?;
-                *value = wrapped;
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for item in values {
-                prepare_toon_value_for_lossless_strings(item)?;
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for item in map.values_mut() {
-                prepare_toon_value_for_lossless_strings(item)?;
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
-    Ok(())
-}
-
-fn should_wrap_toon_string_value(value: &str) -> bool {
-    !toon_encoder_would_quote_string(value, TOON_DEFAULT_DELIMITER)
-        && !toon_unquoted_value_roundtrips_as_same_string(value)
-}
-
-fn toon_encoder_would_quote_string(value: &str, delimiter: char) -> bool {
-    value.contains(delimiter)
-        || value.contains(' ')
-        || value.contains('\n')
-        || value.contains('\t')
-        || value == "true"
-        || value == "false"
-        || value == "null"
-        || value.parse::<f64>().is_ok()
-}
-
-fn toon_unquoted_value_roundtrips_as_same_string(value: &str) -> bool {
-    let probe = format!("v: {value}");
-    match toon_rust::decode(&probe, None) {
-        Ok(serde_json::Value::Object(map)) => {
-            map.get("v") == Some(&serde_json::Value::String(value.to_owned()))
-        }
-        _ => false,
     }
 }
 

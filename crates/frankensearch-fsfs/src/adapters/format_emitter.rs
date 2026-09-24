@@ -37,7 +37,7 @@ const SUBSYSTEM: &str = "fsfs_format_emitter";
 /// | Format | Behaviour |
 /// |--------|-----------|
 /// | `Json` | Pretty-printed JSON with 2-space indent |
-/// | `Toon` | TOON encoding via `toon-rust` |
+/// | `Toon` | TOON encoding via `toon-format` |
 /// | `Jsonl` | Compact single-line JSON (no trailing newline added by serializer) |
 /// | `Table` | Human-readable key/value table |
 /// | `Csv` | RFC4180-compatible rows for search payloads, generic payloads, and envelope errors |

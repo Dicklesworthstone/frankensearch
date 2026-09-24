@@ -243,6 +243,36 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **Search results are plain text and say which line matched.** Snippets
+  used to reach every format as the engine's escaped HTML
+  (`Receipt&gt;, <b>grace</b>_<b>period</b>`); they are now the source text,
+  and the table and TUI highlight query words themselves. Each hit gains
+  `line`: the 1-based line of its file where the snippet's first query word
+  sits, printed as `path:line` in the table and TUI and added as a CSV
+  column. It is found by the snippet's words (the indexed text has
+  collapsed whitespace and stripped markdown) and left out when the file no
+  longer holds the fragment; locating a hit at line 3,170 of a 1.7 MB file
+  takes about 0.2 ms. Hits found only by the vector tiers, which never had
+  a snippet, now get one from the index's stored text: the query-word
+  window when there is one, else the file's opening, which is what the
+  embedders read. The on-disk answer cache moves to schema v8, so older
+  cached answers are recomputed once.
+
+- **`--format toon` works on refined searches.** The TOON encoder
+  (`toon-rust` 0.1.3) rejected every refined payload ("Non-primitive value
+  in tabular array") and wrote objects inside lists on one line, which a
+  TOON parser reads as a single string. fsfs now uses the reference
+  implementation, `toon-format` 0.5.0, without its CLI feature.
+
+- **Smaller CLI fixes.** `fsfs help` lists the search flags (`--limit`,
+  `--filter`, `--fast-only`, `--rerank`, `--expand`, `--explain`,
+  `--index-dir`, ...) and an index line; a mistyped flag points to
+  `fsfs help` instead of to config files; the timeout remedy no longer
+  suggests a `--timeout` flag that does not exist. Color follows `NO_COLOR`
+  and is off when stdout is not a terminal. `fsfs doctor` checks directory
+  writability with `access(2)` instead of warning "unknown" on every
+  healthy install.
+
 - **`fsfs` finds text anywhere in a file, not just in its first 2,000
   characters.** Indexing built one canonical text per file, capped at 2,000
   characters with long fenced code blocks collapsed to their first 20 and last

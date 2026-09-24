@@ -82,7 +82,8 @@ rustix = { version = "=1.1.5", default-features = false, features = [
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toon-rust = "0.1.3"
+# The reference TOON implementation; its default `cli` feature pulls a TUI stack.
+toon-format = { version = "0.5.0", default-features = false }
 
 # Error handling
 thiserror = "2"

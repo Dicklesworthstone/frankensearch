@@ -112,7 +112,7 @@ serde = { workspace = true }
 # Receipt hashes include JSON Value bytes; keep their insertion order stable
 # instead of depending on another workspace member to enable this feature.
 serde_json = { workspace = true, features = ["preserve_order"] }
-toon-rust = { workspace = true }
+toon-format = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 toml = { workspace = true }

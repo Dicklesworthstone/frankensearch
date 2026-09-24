@@ -38,7 +38,6 @@ use crate::degradation_advisor::DegradationAdvice;
 use crate::evidence::{ValidationResult, ValidationViolation};
 
 const SUBSYSTEM: &str = "fsfs_output_schema";
-const TOON_DEFAULT_DELIMITER: char = ',';
 
 // ─── Schema Version ─────────────────────────────────────────────────────────
 
@@ -141,7 +140,10 @@ impl<T> OutputEnvelope<T> {
     }
 }
 
-/// Encode an output envelope into TOON text via `toon-rust`.
+/// Encode an output envelope into TOON text via `toon-format`.
+///
+/// The envelope is projected through JSON first so TOON carries exactly the
+/// values the JSON formats do.
 ///
 /// # Errors
 ///
@@ -151,16 +153,14 @@ pub fn encode_envelope_toon<T>(envelope: &OutputEnvelope<T>) -> SearchResult<Str
 where
     T: Serialize,
 {
-    let mut value =
-        serde_json::to_value(envelope).map_err(|source| SearchError::SubsystemError {
-            subsystem: SUBSYSTEM,
-            source: Box::new(io::Error::other(format!(
-                "failed to project output envelope to JSON value: {source}"
-            ))),
-        })?;
-    prepare_toon_value_for_lossless_strings(&mut value)?;
+    let value = serde_json::to_value(envelope).map_err(|source| SearchError::SubsystemError {
+        subsystem: SUBSYSTEM,
+        source: Box::new(io::Error::other(format!(
+            "failed to project output envelope to JSON value: {source}"
+        ))),
+    })?;
 
-    toon_rust::encode(&value, None).map_err(|source| SearchError::SubsystemError {
+    toon_format::encode_default(&value).map_err(|source| SearchError::SubsystemError {
         subsystem: SUBSYSTEM,
         source: Box::new(io::Error::other(format!(
             "failed to encode output envelope as TOON: {source}"
@@ -168,7 +168,7 @@ where
     })
 }
 
-/// Decode TOON text into an output envelope via `toon-rust`.
+/// Decode TOON text into an output envelope via `toon-format`.
 ///
 /// # Errors
 ///
@@ -178,11 +178,13 @@ pub fn decode_envelope_toon<T>(input: &str) -> SearchResult<OutputEnvelope<T>>
 where
     T: DeserializeOwned,
 {
-    let value = toon_rust::decode(input, None).map_err(|source| SearchError::SubsystemError {
-        subsystem: SUBSYSTEM,
-        source: Box::new(io::Error::other(format!(
-            "failed to decode TOON output envelope: {source}"
-        ))),
+    let value = toon_format::decode_default::<serde_json::Value>(input).map_err(|source| {
+        SearchError::SubsystemError {
+            subsystem: SUBSYSTEM,
+            source: Box::new(io::Error::other(format!(
+                "failed to decode TOON output envelope: {source}"
+            ))),
+        }
     })?;
 
     serde_json::from_value(value).map_err(|source| SearchError::SubsystemError {
@@ -191,61 +193,6 @@ where
             "failed to deserialize TOON payload into output envelope: {source}"
         ))),
     })
-}
-
-fn prepare_toon_value_for_lossless_strings(value: &mut serde_json::Value) -> SearchResult<()> {
-    match value {
-        serde_json::Value::String(token) => {
-            if should_wrap_toon_string_token(token) {
-                let wrapped =
-                    serde_json::to_string(token).map_err(|source| SearchError::SubsystemError {
-                        subsystem: SUBSYSTEM,
-                        source: Box::new(io::Error::other(format!(
-                            "failed to prepare TOON string token for lossless encoding: {source}"
-                        ))),
-                    })?;
-                *token = wrapped;
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for item in values {
-                prepare_toon_value_for_lossless_strings(item)?;
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for item in map.values_mut() {
-                prepare_toon_value_for_lossless_strings(item)?;
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
-    Ok(())
-}
-
-fn should_wrap_toon_string_token(token: &str) -> bool {
-    !toon_encoder_would_quote_string(token, TOON_DEFAULT_DELIMITER)
-        && !toon_unquoted_token_roundtrips_as_same_string(token)
-}
-
-fn toon_encoder_would_quote_string(token: &str, delimiter: char) -> bool {
-    token.contains(delimiter)
-        || token.contains(' ')
-        || token.contains('\n')
-        || token.contains('\t')
-        || token == "true"
-        || token == "false"
-        || token == "null"
-        || token.parse::<f64>().is_ok()
-}
-
-fn toon_unquoted_token_roundtrips_as_same_string(token: &str) -> bool {
-    let probe = format!("v: {token}");
-    match toon_rust::decode(&probe, None) {
-        Ok(serde_json::Value::Object(map)) => {
-            map.get("v") == Some(&serde_json::Value::String(token.to_owned()))
-        }
-        _ => false,
-    }
 }
 
 // ─── Output Error ───────────────────────────────────────────────────────────
@@ -1683,15 +1630,83 @@ mod tests {
         assert_eq!(decoded.meta.request_id, env.meta.request_id);
     }
 
+    /// A refined search payload — hits of differing shape, a semantic blend
+    /// whose uniform rows nest objects, strings that read as other types —
+    /// encodes as TOON and decodes to the same envelope. `toon-rust` 0.1.3
+    /// refused this shape ("Non-primitive value in tabular array") and wrote
+    /// list objects on one line.
     #[test]
-    fn toon_string_token_wrap_decision_matches_parser_behavior() {
-        assert!(should_wrap_toon_string_token("2026-02-14T12:00:00Z"));
-        assert!(should_wrap_toon_string_token("1abc"));
-        assert!(should_wrap_toon_string_token("\"quoted\""));
-        assert!(should_wrap_toon_string_token("[array-like"));
-        assert!(should_wrap_toon_string_token("null1"));
-        assert!(should_wrap_toon_string_token("-abc"));
-        assert!(!should_wrap_toon_string_token("doc-1"));
+    fn toon_roundtrip_covers_refined_search_payloads() {
+        let tier = |weight| {
+            Some(SemanticTierScore {
+                raw_score: Some(0.5),
+                normalized_score: 0.25,
+                weight,
+            })
+        };
+        let hit = |rank: usize, path: &str| SearchHitPayload {
+            rank,
+            path: path.to_owned(),
+            line: None,
+            score: 0.5,
+            snippet: None,
+            lexical_rank: None,
+            semantic_rank: None,
+            hash_rank: None,
+            in_both_sources: false,
+        };
+        let mut payload = SearchPayload::new(
+            "true",
+            SearchOutputPhase::Refined,
+            2,
+            vec![
+                SearchHitPayload {
+                    line: Some(42),
+                    snippet: Some("a: b, - x \"quoted\" 42".to_owned()),
+                    lexical_rank: Some(0),
+                    ..hit(1, "src/lib.rs")
+                },
+                SearchHitPayload {
+                    semantic_rank: Some(0),
+                    ..hit(2, "null")
+                },
+            ],
+        );
+        payload.semantic_blend = Some(SemanticBlendPayload {
+            quality_weight: 0.75,
+            fast_embedder: "potion".to_owned(),
+            quality_embedder: "minilm".to_owned(),
+            hits: vec![
+                SemanticBlendHit {
+                    path: "src/lib.rs".to_owned(),
+                    score: 0.5,
+                    fast: tier(0.25),
+                    quality: tier(0.75),
+                },
+                SemanticBlendHit {
+                    path: "null".to_owned(),
+                    score: 0.25,
+                    fast: tier(0.25),
+                    quality: tier(0.75),
+                },
+            ],
+        });
+        let env = OutputEnvelope::success(payload, OutputMeta::new("search", "toon"), sample_ts());
+
+        let toon = encode_envelope_toon(&env).expect("encode refined payload");
+        assert!(
+            !toon
+                .lines()
+                .any(|line| line.contains("rank:") && line.contains("path:")),
+            "one field per line:\n{toon}"
+        );
+        let decoded: OutputEnvelope<SearchPayload> =
+            decode_envelope_toon(&toon).expect("decode refined payload");
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("decoded"),
+            serde_json::to_value(&env).expect("original"),
+            "{toon}"
+        );
     }
 
     // ─── OutputMeta ────────────────────────────────────────────────────
