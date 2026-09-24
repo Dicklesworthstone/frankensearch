@@ -501,12 +501,15 @@ const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
 const FSFS_SEARCH_SEMANTIC_HEAD_PROGRESSIVE_STEP: usize = 16;
 const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v8";
+// v9: vector top-k no longer lets a WAL-superseded main row take a slot
+// (0dc3df2f); answers cached by the older search are misses, not replays.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v9";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v4";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v2";
+// v5 / stream v3: the WAL top-k repair (0dc3df2f).
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v5";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v3";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -25622,6 +25625,107 @@ mod tests {
         }
     }
 
+    /// GH #54: the crash window 0dc3df2f repaired reaches the fsfs query path.
+    /// Every `stale-*` row was replaced through the WAL, but the main file
+    /// kept its pre-tombstone bytes, as after a crash between the two writes.
+    /// Those rows score 1.0 and their live WAL revisions 0.0, so a top-k that
+    /// admits them fills every slot with rows it then has to drop. Cold and
+    /// warm, the one slot goes to the live `survivor`, and search writes
+    /// neither file.
+    #[test]
+    fn crash_window_wal_replacements_leave_the_top_slot_to_the_live_row() {
+        run_on_runtime_task(|cx| async move {
+            // More superseded rows than the fast stage asks the index for:
+            // with one, fsfs over-fetching hides the defect.
+            const STALE_ROWS: usize = 64;
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut writer = VectorIndex::create(&path, "blend-fast-2", 2).unwrap();
+            for row in 0..STALE_ROWS {
+                writer
+                    .write_record(&format!("stale-{row}"), &[1.0, 0.0])
+                    .unwrap();
+            }
+            writer
+                .write_record("survivor", &[0.5, 0.866_025_4])
+                .unwrap();
+            writer.write_record("tail", &[-1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            let sealed = fs::read(&path).unwrap();
+            {
+                let mut writer = VectorIndex::open(&path).unwrap();
+                for row in 0..STALE_ROWS {
+                    writer
+                        .append(&format!("stale-{row}"), &[0.0, 1.0])
+                        .unwrap();
+                }
+            }
+            fs::write(&path, &sealed).unwrap();
+            let wal_path = frankensearch_index::wal::wal_path_for(&path);
+            let wal = fs::read(&wal_path).unwrap();
+
+            let mut resources = SearchExecutionResources {
+                index_root: temp.path().to_path_buf(),
+                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+                    .unwrap(),
+                lexical_index: None,
+                shadow_observer: None,
+                shadow_pressure_sampler: None,
+                vector_index: Some(VectorIndex::open_read_only(&path).unwrap()),
+                quality_vector_index: None,
+                fast_embedder: Some(Arc::new(BlendQueryEmbedder("blend-fast-2"))),
+                quality_embedder: None,
+                fast_embedder_attempted: true,
+                quality_embedder_attempted: true,
+                degradation_advice: Vec::new(),
+            };
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.fast_only = true;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let request = || SearchServeRequest {
+                query: "live rows only".to_owned(),
+                limit: Some(1),
+                mode: Some("fast_only".to_owned()),
+                filter: None,
+                rerank: Some(false),
+                quality_weight: None,
+                quality_timeout_ms: None,
+                rrf_k: None,
+                fast_only: Some(true),
+            };
+            let mut cache = std::collections::HashMap::new();
+            let cold = runtime
+                .execute_search_serve_request(&cx, request(), &mut resources, &mut cache, true)
+                .await
+                .unwrap();
+            assert!(!cold.cached);
+            let paths = |response: &super::SearchServeResponse| {
+                response
+                    .payloads
+                    .last()
+                    .unwrap()
+                    .hits
+                    .iter()
+                    .map(|hit| hit.path.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(paths(&cold), ["survivor"]);
+            let warm = runtime
+                .execute_search_serve_request(&cx, request(), &mut resources, &mut cache, true)
+                .await
+                .unwrap();
+            assert!(warm.cached);
+            assert_eq!(paths(&warm), ["survivor"]);
+            assert_eq!(fs::read(&path).unwrap(), sealed, "search wrote the FSVI");
+            assert_eq!(fs::read(&wal_path).unwrap(), wal, "search wrote the WAL");
+        });
+    }
+
     #[test]
     fn quality_blend_real_retrieval_daemon_disk_explain_and_tui_share_policy() {
         run_on_runtime_task(|cx| async move {
@@ -26007,6 +26111,11 @@ mod tests {
             super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v4".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon from before the WAL top-k repair cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v3".to_owned();
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.schema_version = "fsfs.search.serve.v2".to_owned();
@@ -26470,17 +26579,22 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-        let mut outdated = header();
-        if let SearchServeFrame::Attested { schema_version, .. } = &mut outdated {
-            *schema_version = "fsfs.search.serve.stream.v1".to_owned();
+        // v2 predates the WAL top-k repair; v1 an older ranking policy.
+        for version in ["fsfs.search.serve.stream.v2", "fsfs.search.serve.stream.v1"] {
+            let mut outdated = header();
+            if let SearchServeFrame::Attested { schema_version, .. } = &mut outdated {
+                version.clone_into(schema_version);
+            }
+            let error = accept(outdated, &mut state).unwrap_err();
+            assert!(error.to_string().contains("search policy"), "{version}");
+            // Only `cli.daemon_socket` (no daemon to reach) falls back to an
+            // in-process search; a refused attestation is not retried.
+            assert!(
+                matches!(&error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon"),
+                "{version}: {error:?}"
+            );
+            assert!(!state.attested, "{version} cannot admit any phase");
         }
-        assert!(
-            accept(outdated, &mut state)
-                .unwrap_err()
-                .to_string()
-                .contains("search policy")
-        );
-        assert!(!state.attested, "old ranking policy cannot admit any phase");
         let mut bad = header();
         if let SearchServeFrame::Attested { policy, .. } = &mut bad {
             policy.quality_weight_bits = 0;
@@ -43244,6 +43358,8 @@ mod tests {
                 "fsfs.search.cache.v5",
                 "fsfs.search.cache.v6",
                 "fsfs.search.cache.v7",
+                // Written by the vector top-k from before the WAL repair.
+                "fsfs.search.cache.v8",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

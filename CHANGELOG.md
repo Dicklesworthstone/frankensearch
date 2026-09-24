@@ -258,6 +258,18 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **Answers from before the WAL top-k repair are not replayed.**
+  [`0dc3df2f`](https://github.com/Dicklesworthstone/frankensearch/commit/0dc3df2f)
+  stopped a WAL-superseded main row from taking a top-k slot (after a crash
+  between the WAL append and the main-file tombstone, a valid query could
+  come back empty). That changes results without changing the index, the
+  models or the configuration, so the on-disk answer cache moves to
+  `fsfs.search.cache.v9`, the daemon protocols to `fsfs.search.serve.v5` and
+  `fsfs.search.serve.stream.v3`, and complete-generation forwarding to
+  version 3: answers cached before the repair are recomputed once, and a
+  daemon still running the older binary is refused rather than trusted
+  (GH #54).
+
 - **A healthy `fsfs search` table starts with its results.** Every table
   search used to open with a four-sentence "Search readiness" paragraph,
   including on a healthy install where it only repeated pre-indexing advice.
