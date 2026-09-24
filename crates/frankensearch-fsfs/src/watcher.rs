@@ -8886,11 +8886,8 @@ mod tests {
                 .stop_checked(&cx)
                 .await
                 .expect("stop resumed watcher");
-            assert_eq!(
-                pipeline.all_ops().len(),
-                1,
-                "resume must ingest the owed file"
-            );
+            let ops = pipeline.all_ops();
+            assert_eq!(ops.len(), 1, "resume must ingest the owed file: {ops:?}");
         });
     }
 
