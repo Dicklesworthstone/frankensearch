@@ -19199,3 +19199,28 @@ byte-identical; effect below the perf bar.**
   if (a) a real workload profiles snapshot_string_range_terms/snapshot_glob_terms
   as a >=1% hotspot ... or (b) pursued as throughput/CPU-waste reduction under
   concurrent fan-out load".
+
+### 2026-09-24 — REJECT: rusty_alloc 2.2.0 as the fsfs global allocator costs 19-25% RSS for no warm-query gain (GH #48, bd-4unep)
+
+Same-source experiment requested on GH #48: two abtest (release-inheriting)
+builds of one tree, differing only in `#[global_allocator] static ALLOC:
+rusty_alloc_api::RustyAlloc` in the fsfs binary (SYS = glibc, ELF sha256
+10c1e7f0…; RA, 0b8c6ef9…). 524-file code corpus, default models
+(potion-multilingual-128M + MiniLM), thinkstation, load ~13-29, interleaved
+arms. Indexing (3 fresh-index runs each): SYS 18.02 / 18.08 / 18.08 s, RA
+17.95 / 17.84 / 17.82 s; peak RSS SYS 1.33 GB, RA 1.66 GB. Cold `search
+--no-daemon` (7 runs): median 790 vs 750 ms, peak RSS 0.89 vs 0.95 GB. Warm
+`fsfs serve`, 50 queries x fast_only/full x 4 rounds, answer cache off:
+fast_only 4.27 vs 4.29 ms, full 10.32 vs 10.37 ms; A/A null (SYS again,
+same invocation) 4.08 / 10.16 ms, so neither warm difference exceeds the
+null. Retained serve RSS 0.81 vs 0.96 GB. Top-10 results identical for all
+100 query/mode pairs. Indexing and cold start had no null arm; their 1% and
+5% gains are not claimed.
+
+**Decision: REJECT.** Comparison class: SELF-SPEEDUP diagnostic (same-source
+A/B with an A/A null). The dependency was never committed.
+
+- **Retry predicate:** only if a release of the allocator (or its heap tuning)
+  shows retained and peak RSS at or below glibc on this same corpus and
+  harness, or a workload profiles allocation as a measured share of warm
+  query time; Linux results do not cover macOS or Windows.
