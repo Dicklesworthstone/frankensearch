@@ -258,6 +258,13 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **A healthy `fsfs search` table starts with its results.** Every table
+  search used to open with a four-sentence "Search readiness" paragraph,
+  including on a healthy install where it only repeated pre-indexing advice.
+  Only readiness notes that ask for action now print there: missing models,
+  a missing quality cache, a hash-control or missing vector generation. The
+  TUI status panel still shows the full note.
+
 - **The snippet preview under each hit shows the matched word.** The
   table and TUI cut each snippet to one line from its start, so when the
   first query word sat further in, the preview showed none: 51 of 200

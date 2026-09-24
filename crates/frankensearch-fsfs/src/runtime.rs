@@ -6402,7 +6402,7 @@ impl FsfsRuntime {
         );
 
         if self.cli_input.format == OutputFormat::Table {
-            if let Some(mode_hint) = search_runtime.search_mode_hint()? {
+            if let Some(mode_hint) = search_runtime.search_readiness_warning()? {
                 // Same color rule as the table below: NO_COLOR and a piped
                 // stdout both mean plain text.
                 let no_color = self.cli_input.no_color
@@ -6499,18 +6499,32 @@ impl FsfsRuntime {
         }
     }
 
+    fn search_mode_hint(&self) -> SearchResult<Option<String>> {
+        Ok(self.search_readiness()?.map(|(hint, _)| hint))
+    }
+
+    /// The readiness hint to print above a table of results: only one that
+    /// asks for action (missing models, a hash-control or missing vector
+    /// generation). A healthy install gets its results without a preamble.
+    fn search_readiness_warning(&self) -> SearchResult<Option<String>> {
+        Ok(self
+            .search_readiness()?
+            .and_then(|(hint, actionable)| actionable.then_some(hint)))
+    }
+
+    /// The search readiness hint and whether it asks the user to act.
     #[cfg_attr(
         not(feature = "semantic-support"),
         allow(clippy::unnecessary_wraps, clippy::unused_self)
     )]
-    fn search_mode_hint(&self) -> SearchResult<Option<String>> {
+    fn search_readiness(&self) -> SearchResult<Option<(String, bool)>> {
         if let Some(hint) = self.published_generation_search_hint()? {
-            return Ok(Some(hint));
+            return Ok(Some((hint, true)));
         }
 
         #[cfg(not(feature = "semantic-support"))]
         {
-            Ok(Some(model_free_semantic_recovery_guidance().to_owned()))
+            Ok(Some((model_free_semantic_recovery_guidance().to_owned(), true)))
         }
 
         #[cfg(feature = "semantic-support")]
@@ -6524,27 +6538,31 @@ impl FsfsRuntime {
                 .any(|model| model.tier == "quality" && model.cached);
 
             if fast_cached && quality_cached && !self.config.search.fast_only {
-                return Ok(Some(
+                return Ok(Some((
                     "Search readiness: fast and quality model caches passed their registered manifests. Run `fsfs doctor` to exercise both compiled loaders before indexing. Full search fails before Initial if the fast lane is unavailable; a generation that carries a quality tier (`vector/quality.fsvi`) emits INITIAL then REFINED, and one without it serves INITIAL only. A quality-only failure preserves Initial and emits an actionable RefinementFailed phase."
                         .to_owned(),
-                ));
+                    false,
+                )));
             }
             if fast_cached {
                 if self.config.search.fast_only {
-                    return Ok(Some(
+                    return Ok(Some((
                         "Search readiness: the fast model cache passed its registered manifest and quality is disabled by `fast_only=true`. Run `fsfs doctor` to exercise the compiled fast loader before indexing."
                             .to_owned(),
-                    ));
+                        false,
+                    )));
                 }
-                return Ok(Some(
+                return Ok(Some((
                     "Search readiness: the fast model cache passed its registered manifest, but the quality cache did not. Run `fsfs download-models` and `fsfs doctor`; status alone does not claim that a compiled loader can open either cache."
                         .to_owned(),
-                ));
+                    true,
+                )));
             }
-            Ok(Some(
+            Ok(Some((
                 "Search readiness: no semantic model cache passed a registered manifest. Run `fsfs download-models`, or point FRANKENSEARCH_MODEL_DIR at a registered cache, then run `fsfs doctor`; semantic results never use the hash control embedder."
                     .to_owned(),
-            ))
+                true,
+            )))
         }
     }
 
@@ -40613,6 +40631,10 @@ mod tests {
             missing.contains("no readable vector generation"),
             "missing FSVI must not hide behind model-cache readiness: {missing}"
         );
+        assert_eq!(
+            runtime.search_readiness_warning().expect("warning"),
+            Some(missing)
+        );
 
         let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
         fs::create_dir_all(vector_path.parent().expect("vector parent"))
@@ -40628,6 +40650,11 @@ mod tests {
         assert!(
             hashed.contains("fnv1a-256") && hashed.contains("hash control"),
             "hash generation must beat model-cache readiness: {hashed}"
+        );
+        // Both gaps ask for action, so the table still prints them.
+        assert_eq!(
+            runtime.search_readiness_warning().expect("warning"),
+            Some(hashed)
         );
 
         let started = runtime.search_stream_started_event("ownership", "stream-hash");
@@ -43087,6 +43114,11 @@ mod tests {
         assert!(mode_hint.contains("fsfs download-models"));
         assert!(!mode_hint.contains("lacks semantic model loaders"));
         assert!(!mode_hint.contains("--features"));
+        assert_eq!(
+            runtime.search_readiness_warning().expect("warning"),
+            Some(mode_hint),
+            "missing models are printed above search results"
+        );
 
         let status =
             FsfsRuntime::collect_model_status("fast", "potion-multilingual-128M", temp.path())
