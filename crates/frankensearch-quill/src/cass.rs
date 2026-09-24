@@ -865,6 +865,155 @@ mod tests {
         });
     }
 
+    /// A date-filtered query must keep working once a sealed segment holds a
+    /// tombstone (frankensearch#49, cass GH #499).
+    ///
+    /// cass revises a message by upserting it under its stable identity, which
+    /// tombstones the old row inside the segment it was sealed in. cass's
+    /// `--since`/`--days` window is a NUMERIC range leaf over `created_at`,
+    /// composed in a Boolean with the query's term leaves. Before the fix the
+    /// range leaf was scored on the segment's at-seal row count while the term
+    /// leaves used its live count, and the Boolean refused to compose them
+    /// ("Boolean children belong to different segment domains"). The
+    /// unfiltered control, the in-window counts (every live match, never the
+    /// tombstoned original), and the empty out-of-window result mean a fix
+    /// that dropped the range leaf or resurrected tombstones fails here too.
+    #[test]
+    fn date_filtered_query_survives_a_tombstone_in_a_sealed_segment() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            // cass's production settings: no engine tier merge and no
+            // lag-driven publication. With the defaults a commit may merge or
+            // compact the segment and drop the tombstone before any query
+            // runs, which is how a first version of this test passed on the
+            // unfixed engine.
+            let config = crate::QuillConfig {
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..crate::QuillConfig::default()
+            };
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+
+            // One tombstone in 40 rows (2.5%) stays far below the default
+            // compaction_tombstone_density (20%), like the reporter's large
+            // segments with thousands of scattered tombstones.
+            let sealed = (0..40_u64)
+                .map(|msg_idx| {
+                    sample_document(
+                        "gh499",
+                        msg_idx,
+                        "codex",
+                        "Tombstone probe",
+                        &format!("window probe original {msg_idx}"),
+                    )
+                    .to_schema_document()
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_schema_documents(&cx, &sealed)
+                .await
+                .expect("ingest the first generation");
+            index.commit(&cx).await.expect("seal the first generation");
+
+            // Revise message 20 under its stable identity, as cass does for an
+            // edited message: its sealed row becomes a tombstone.
+            let revised = [sample_document(
+                "gh499",
+                20,
+                "codex",
+                "Tombstone probe",
+                "window probe revised",
+            )
+            .to_schema_document()];
+            index
+                .upsert_schema_documents(&cx, &revised)
+                .await
+                .expect("upsert a sealed identity");
+            index.commit(&cx).await.expect("publish the revision");
+
+            // Guard the fixture itself: without a surviving tombstone in a
+            // sealed segment this test cannot observe the defect.
+            let snapshot = index.snapshot().expect("published snapshot");
+            let tombstones: u64 = snapshot
+                .segments()
+                .iter()
+                .map(|segment| segment.tombstone_count())
+                .sum();
+            assert!(
+                tombstones >= 1,
+                "the fixture must leave a tombstone in a sealed segment"
+            );
+
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config,
+            )
+            .await
+            .expect("open a CASS-schema reader");
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS query parser");
+            let count = |text: &str, filters: &crate::query::CassQueryFilters| {
+                let parsed = parser.parse(text, filters);
+                reader
+                    .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                    .map(|page| page.total_count)
+            };
+
+            let unfiltered = crate::query::CassQueryFilters::default();
+            assert_eq!(
+                count("probe", &unfiltered).expect("unfiltered search"),
+                Some(40),
+                "forty live messages mention probe"
+            );
+
+            // created_at is 1_700_000_000 + msg_idx, so this window holds
+            // messages 10..=39. It must cover only part of the sealed segment:
+            // a range over every row is lowered as a whole-segment match and
+            // never reaches the range scorer, which is how the first two
+            // versions of this test passed on the unfixed engine.
+            let in_window = crate::query::CassQueryFilters {
+                created_from: Some(1_700_000_010),
+                created_to: Some(1_800_000_000),
+                ..Default::default()
+            };
+            assert_eq!(
+                count("probe", &in_window)
+                    .expect("a date filter over a tombstoned sealed segment must not fail"),
+                Some(30),
+                "the window holds messages 10..=39"
+            );
+            assert_eq!(
+                count("original", &in_window).expect("windowed search for originals"),
+                Some(29),
+                "the tombstoned original must stay invisible inside the window"
+            );
+            assert_eq!(
+                count("revised", &in_window).expect("windowed search for the revision"),
+                Some(1),
+                "the revision is live inside the window"
+            );
+
+            let out_of_window = crate::query::CassQueryFilters {
+                created_from: Some(1_800_000_000),
+                ..Default::default()
+            };
+            assert_eq!(
+                count("probe", &out_of_window).expect("out-of-window search"),
+                Some(0),
+                "a window after every message must match nothing"
+            );
+        });
+    }
+
     #[test]
     fn preview_is_character_bounded_and_only_ellipsizes_when_truncating() {
         assert_eq!(cass_build_preview("abc", 400), "abc");
