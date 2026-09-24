@@ -88,7 +88,10 @@ impl<'a> ExcludeDocIdsFilter<'a> {
         excluded: impl IntoIterator<Item = &'a str>,
     ) -> Self {
         let excluded: HashSet<_> = excluded.into_iter().collect();
-        let excluded_hashes = excluded.iter().map(|id| fnv1a_hash(id.as_bytes())).collect();
+        let excluded_hashes = excluded
+            .iter()
+            .map(|id| fnv1a_hash(id.as_bytes()))
+            .collect();
         Self {
             inner,
             excluded,
@@ -110,7 +113,9 @@ impl fmt::Debug for ExcludeDocIdsFilter<'_> {
 impl SearchFilter for ExcludeDocIdsFilter<'_> {
     fn matches(&self, doc_id: &str, metadata: Option<&serde_json::Value>) -> bool {
         !self.excluded.contains(doc_id)
-            && self.inner.is_none_or(|inner| inner.matches(doc_id, metadata))
+            && self
+                .inner
+                .is_none_or(|inner| inner.matches(doc_id, metadata))
     }
 
     fn matches_doc_id_hash(
@@ -143,7 +148,8 @@ impl SearchFilter for ExcludeDocIdsFilter<'_> {
 
     fn immutable_candidate_hashes(&self) -> Option<&DocIdHashSet> {
         if self.excluded.is_empty() {
-            self.inner.and_then(SearchFilter::immutable_candidate_hashes)
+            self.inner
+                .and_then(SearchFilter::immutable_candidate_hashes)
         } else {
             None
         }
@@ -635,7 +641,10 @@ mod tests {
         assert!(!filter.matches("replace", None));
         assert!(filter.matches("keep", None));
         assert!(!filter.matches("outside", None));
-        assert_eq!(filter.matches_doc_id_hash(fnv1a_hash(b"replace"), None), None);
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"replace"), None),
+            None
+        );
         assert_eq!(
             filter.matches_doc_id_hash(fnv1a_hash(b"keep"), None),
             Some(true)
@@ -646,12 +655,19 @@ mod tests {
         );
         assert!(filter.candidate_hashes().is_none());
         assert!(filter.immutable_candidate_hashes().is_none());
-        let predicate = PredicateFilter::new("suffix", |id| id.ends_with(".rs"));
+        let predicate = PredicateFilter::new("suffix", |id| {
+            std::path::Path::new(id)
+                .extension()
+                .is_some_and(|ext| ext == "rs")
+        });
         let filter = ExcludeDocIdsFilter::new(Some(&predicate), ["old.rs"]);
         assert!(!filter.matches("old.rs", None));
         assert!(filter.matches("new.rs", None));
         assert!(!filter.matches("new.txt", None));
-        assert_eq!(filter.matches_doc_id_hash(fnv1a_hash(b"new.rs"), None), None);
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"new.rs"), None),
+            None
+        );
     }
 
     #[test]
