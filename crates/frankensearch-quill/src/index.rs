@@ -83,7 +83,8 @@ use crate::keeper::{
     LexicalLayout, LiveDocumentFloor, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest,
     ManifestFieldStats, ManifestSegment, PublicationAuthorityPhase, PublicationAuthorityState,
     PublicationReadState, PublishIntent, RecoveredSegment, TierMergePolicy, TierPolicyError,
-    TombstoneSet, inspect_lexical_layout, plan_tier_merge, validate_manifest_successor,
+    TombstoneSet, inspect_lexical_layout, load_manifest_pair, plan_tier_merge,
+    validate_manifest_successor,
 };
 use crate::query::{
     BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError, QueryDiagnostic,
@@ -11477,6 +11478,21 @@ impl QuillSearchIndex {
     /// failures. A regressed durable generation is rejected.
     pub async fn refresh(&self, cx: &Cx) -> Result<bool, QuillIndexError> {
         check_cancel(cx, "read-only index refresh")?;
+        // Catch-up decides on the MANIFEST alone: an identical one installs
+        // nothing. Reading the two small MANIFEST slots first spares the full
+        // reopen, which authenticates every segment by hashing the whole file,
+        // when nothing was published. Anything else takes the full path below,
+        // so regressions and collisions keep their typed errors.
+        let probe_directory = self.directory.clone();
+        let on_disk = spawn_blocking(move || load_manifest_pair(probe_directory)).await;
+        let published = self.reader.published_snapshot.load();
+        if published.deltas.is_empty()
+            && on_disk
+                .is_ok_and(|loaded| loaded.manifest == published.keeper.loaded_manifest().manifest)
+        {
+            return Ok(false);
+        }
+        drop(published);
         let directory = self.directory.clone();
         // Refresh with the schema this reader was OPENED with, not the shipping
         // default: a reader bound to a wider schema (the CASS profile) would
@@ -17927,6 +17943,69 @@ mod tests {
             crate::segment::FSLX_FORMAT_VERSION,
         )
         .expect("valid root-bound Quill pointer")
+    }
+
+    /// A refresh with nothing new published reads only the MANIFEST: it
+    /// succeeds even when the (immutable) segment files cannot be opened, and
+    /// a later publication is still caught.
+    #[cfg(unix)]
+    #[test]
+    fn read_only_refresh_without_publication_opens_no_segment() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("refresh directory");
+        let cx = Cx::for_testing();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("build refresh runtime");
+        runtime.block_on(async {
+            let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create writer");
+            LexicalWrite::index_document(&writer, &cx, &IndexableDocument::new("old", "old token"))
+                .await
+                .expect("index first document");
+            LexicalWrite::commit(&writer, &cx)
+                .await
+                .expect("publish first document");
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open read-only reader");
+            assert!(!reader.refresh(&cx).await.expect("unchanged refresh"));
+
+            let segments = std::fs::read_dir(directory.path())
+                .expect("list index directory")
+                .map(|entry| entry.expect("index entry").path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "fslx"))
+                .collect::<Vec<_>>();
+            assert!(!segments.is_empty(), "fixture must have a sealed segment");
+            let set_mode = |mode| {
+                for segment in &segments {
+                    std::fs::set_permissions(segment, std::fs::Permissions::from_mode(mode))
+                        .expect("set segment mode");
+                }
+            };
+            set_mode(0o000);
+            let unchanged = reader.refresh(&cx).await;
+            set_mode(0o644);
+            assert!(!unchanged.expect("an unchanged MANIFEST needs no segment"));
+
+            LexicalWrite::index_document(&writer, &cx, &IndexableDocument::new("new", "new token"))
+                .await
+                .expect("index successor document");
+            LexicalWrite::commit(&writer, &cx)
+                .await
+                .expect("publish successor");
+            assert!(reader.refresh(&cx).await.expect("refresh to successor"));
+            assert_eq!(
+                LexicalRead::search(&reader, &cx, "new", 10)
+                    .await
+                    .expect("search successor")[0]
+                    .doc_id,
+                "new"
+            );
+        });
     }
 
     #[test]
