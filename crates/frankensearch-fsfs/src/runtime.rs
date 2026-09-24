@@ -27771,11 +27771,14 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let mut resources = disagreeing_blend_resources(temp.path());
             let completed = Arc::new(AtomicUsize::new(0));
+            // A 1 s deadline against a 3 s backend (as in bd-5tiyv): under load
+            // a 50 ms deadline could fire before the blocking pool started the
+            // backend, leaving no admitted inference to drain.
             resources.quality_embedder = Some(admitted(BlockingQualityFixture {
                 gate: Arc::new(asupersync::sync::Mutex::new(())),
                 calls: Arc::new(AtomicUsize::new(0)),
                 completed: Arc::clone(&completed),
-                hold: Duration::from_millis(400),
+                hold: Duration::from_secs(3),
             }));
             let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
             let server_shared = Arc::clone(&shared);
@@ -27792,7 +27795,7 @@ mod tests {
                     true,
                 );
             });
-            client.write_all(b"{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":50,\"stream\":true}").unwrap();
+            client.write_all(b"{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":1000,\"stream\":true}").unwrap();
             client.shutdown(std::net::Shutdown::Write).unwrap();
             let mut reader = std::io::BufReader::new(client);
             let mut header = String::new();
@@ -27834,7 +27837,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(frames.len(), 2);
                 assert_eq!(frames[0]["payload"]["phase"], "refinement_failed");
-                assert_eq!(frames[0]["payload"]["quality_timeout"]["budget_ms"], 50);
+                assert_eq!(frames[0]["payload"]["quality_timeout"]["budget_ms"], 1000);
                 assert_eq!(frames[1]["event"], "terminal");
                 assert_eq!(frames[1]["ok"], true);
             }
