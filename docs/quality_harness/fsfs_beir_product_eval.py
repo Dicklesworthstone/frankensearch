@@ -12,11 +12,16 @@ Steps (BEIR layout: corpus.jsonl, queries.jsonl, qrels/test.tsv):
   fsfs index FILES --index-dir IDX --config CFG --format json
   fsfs_beir_product_eval.py ablate --fsfs BIN --dataset D --index-dir IDX --config CFG
   fsfs_beir_product_eval.py rerank --fsfs BIN --dataset D --index-dir IDX --config CFG
+  fsfs_beir_product_eval.py compare --fsfs BIN --dataset D --arm LABEL IDX CFG --arm ...
 
 `ablate` compares lexical_only, the full-mode Initial payload and the Refined payload
 (limit 100); `rerank` compares Refined with rerank=true at limit 10 and records request
 latency (set `[search] rerank_timeout_ms` in CFG high enough for the stage to finish;
-the reason codes show whether it applied). Metrics: nDCG@10 (BEIR graded formula, as
+the reason codes show whether it applied). `compare` runs the same queries against
+indexes built with different configurations (a fast model, say) and pairs each arm's
+Initial and Refined payloads with the first arm's; it counts queries whose Refined
+payload was missing (scored as their Initial), so set `[search] quality_timeout_ms`
+high enough that host load does not decide which arm refines. Metrics: nDCG@10 (BEIR graded formula, as
 in beir_eval.py), MRR@10, Recall@100; paired bootstrap over queries, 10,000 resamples,
 seed 20260922, 95% percentile interval. Decide comparisons before running; do not
 retune on held-out judgments.
@@ -174,6 +179,29 @@ def rerank(args):
     compare("MRR@10 reranked - refined", rr["mrr10"], ref["mrr10"])
 
 
+def compare_arms(args):
+    queries, qids, qrels = load(args.dataset)
+    scored = []
+    for label, index_dir, config in args.arm:
+        serve = Serve(args.fsfs, index_dir, config)
+        initial, refined, missing = [], [], 0
+        for q in qids:
+            reply, _ = serve.ask({"query": queries[q], "limit": 100})
+            init = phase(reply, "initial")[0] or []
+            ref = phase(reply, "refined")[0]
+            missing += ref is None
+            initial.append(init)
+            refined.append(ref or init)
+        serve.close()
+        print(f"{label}: {missing} of {len(qids)} queries had no Refined payload")
+        scored.append((label, report(f"initial {label}", initial, qids, qrels),
+                       report(f"refined {label}", refined, qids, qrels)))
+    base_label, base_initial, base_refined = scored[0]
+    for label, initial, refined in scored[1:]:
+        compare(f"nDCG@10 initial {label} - {base_label}", initial["ndcg10"], base_initial["ndcg10"])
+        compare(f"nDCG@10 refined {label} - {base_label}", refined["ndcg10"], base_refined["ndcg10"])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -186,8 +214,17 @@ def main():
         p.add_argument("--dataset", required=True)
         p.add_argument("--index-dir", required=True)
         p.add_argument("--config", required=True)
+    c = sub.add_parser("compare")
+    c.add_argument("--fsfs", required=True)
+    c.add_argument("--dataset", required=True)
+    c.add_argument("--arm", nargs=3, action="append", required=True,
+                   metavar=("LABEL", "INDEX_DIR", "CONFIG"),
+                   help="repeat; the first arm is the baseline every other arm is paired with")
     args = parser.parse_args()
-    {"materialize": materialize, "ablate": ablate, "rerank": rerank}[args.command](args)
+    if args.command == "compare" and len(args.arm) < 2:
+        parser.error("compare needs at least two --arm")
+    commands = {"materialize": materialize, "ablate": ablate, "rerank": rerank, "compare": compare_arms}
+    commands[args.command](args)
 
 
 if __name__ == "__main__":

@@ -248,8 +248,24 @@ distinct queries (2026-09-23, Threadripper PRO 5975WX):
 | potion-base-32M | 0.47 s | 0.42 GB |
 | potion-base-8M | 0.41 s | 0.31 GB |
 
-These are English models, and their retrieval quality relative to the
-multilingual default has not been measured. Library callers select one with
+These are English models. On three English BEIR sets they rank as well as the
+multilingual default once results are refined, and as well or better before
+that: nDCG@10, INITIAL / REFINED, one release build and otherwise identical
+configuration, paired over each set's test queries (2026-09-24):
+
+| Fast model | SciFact | NFCorpus | ArguAna |
+|---|---|---|---|
+| potion-multilingual-128M | 0.590 / 0.679 | 0.291 / 0.331 | 0.336 / 0.357 |
+| potion-base-32M | 0.655 / 0.678 | 0.307 / 0.332 | 0.342 / 0.358 |
+| potion-base-8M | 0.604 / 0.672 | 0.306 / 0.333 | 0.340 / 0.358 |
+
+No REFINED difference from the default is significant (95% paired bootstrap;
+the largest is 8M's -0.007 on SciFact). In INITIAL, 32M is ahead on SciFact
+(+0.066) and both are ahead on NFCorpus (about +0.015). Non-English text was
+not tested, and it is what the multilingual default is for. The comparison
+is `docs/quality_harness/fsfs_beir_product_eval.py compare`.
+
+Library callers select one with
 `Model2VecEmbedder::load_registered(dir, &RegisteredModel2Vec::potion_base_8m()?)`.
 
 To build the full binary profile with Potion and MiniLM embedded, provision the
