@@ -147,60 +147,10 @@ impl Storage {
 
     pub fn get_document(&self, doc_id: &str) -> SearchResult<Option<DocumentRecord>> {
         ensure_non_empty(doc_id, "doc_id")?;
-
-        let params = [SqliteValue::Text(doc_id.to_owned().into())];
-        let rows = retry_transient_storage(
-            || {
-                self.connection()
-                    .query_with_params_sync(
-                        "SELECT doc_id, source_path, content_preview, content_hash, content_length, \
-            created_at, updated_at, metadata_json \
-         FROM documents WHERE doc_id = ?1 LIMIT 1;",
-                        &params,
-                    )
-                    .map_err(storage_error)
-            },
+        retry_transient_storage(
+            || get_document_inner(self.connection(), doc_id),
             "document fetch",
-        )?;
-
-        let Some(row) = rows.first() else {
-            tracing::debug!(
-                target: "frankensearch.storage",
-                op = "get_document",
-                doc_id,
-                found = false,
-                "document fetch completed"
-            );
-            return Ok(None);
-        };
-
-        let metadata_json = row_optional_text(row, 7)?;
-        let metadata = metadata_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(storage_error)?;
-
-        let document = DocumentRecord {
-            doc_id: row_text(row, 0, "documents.doc_id")?.to_owned(),
-            source_path: row_optional_text(row, 1)?,
-            content_preview: row_text(row, 2, "documents.content_preview")?.to_owned(),
-            content_hash: row_blob_32(row, 3, "documents.content_hash")?,
-            content_length: i64_to_usize(row_i64(row, 4, "documents.content_length")?)?,
-            created_at: row_i64(row, 5, "documents.created_at")?,
-            updated_at: row_i64(row, 6, "documents.updated_at")?,
-            metadata,
-        };
-
-        tracing::debug!(
-            target: "frankensearch.storage",
-            op = "get_document",
-            doc_id,
-            found = true,
-            "document fetch completed"
-        );
-
-        Ok(Some(document))
+        )
     }
 
     pub fn list_pending_embeddings(
@@ -260,28 +210,7 @@ impl Storage {
         ensure_non_empty(embedder_id, "embedder_id")?;
 
         let finished_at = unix_timestamp_ms()?;
-        self.transaction(|conn| {
-            if !document_exists(conn, doc_id)? {
-                return Err(not_found_error("documents", doc_id));
-            }
-
-            let params = [
-                SqliteValue::Text(doc_id.to_owned().into()),
-                SqliteValue::Text(embedder_id.to_owned().into()),
-                SqliteValue::Text(EmbeddingStatus::Embedded.as_str().to_owned().into()),
-                SqliteValue::Integer(finished_at),
-            ];
-            conn.execute_with_params_sync("INSERT INTO embedding_status \
-             (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
-             VALUES (?1, ?2, NULL, ?3, ?4, NULL, 0) \
-             ON CONFLICT(doc_id, embedder_id) DO UPDATE SET \
-             status = excluded.status, \
-             embedded_at = excluded.embedded_at, \
-             error_message = NULL;",
-            &params,)
-            .map_err(storage_error)?;
-            Ok(())
-        })?;
+        self.transaction(|conn| mark_embedded_inner(conn, doc_id, embedder_id, finished_at))?;
 
         tracing::debug!(
             target: "frankensearch.storage",
@@ -304,29 +233,7 @@ impl Storage {
         ensure_non_empty(embedder_id, "embedder_id")?;
         ensure_non_empty(error_message, "error_message")?;
 
-        self.transaction(|conn| {
-            if !document_exists(conn, doc_id)? {
-                return Err(not_found_error("documents", doc_id));
-            }
-
-            let params = [
-                SqliteValue::Text(doc_id.to_owned().into()),
-                SqliteValue::Text(embedder_id.to_owned().into()),
-                SqliteValue::Text(EmbeddingStatus::Failed.as_str().to_owned().into()),
-                SqliteValue::Text(error_message.to_owned().into()),
-            ];
-            conn.execute_with_params_sync("INSERT INTO embedding_status \
-             (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
-             VALUES (?1, ?2, NULL, ?3, NULL, ?4, 1) \
-             ON CONFLICT(doc_id, embedder_id) DO UPDATE SET \
-             status = excluded.status, \
-             embedded_at = NULL, \
-             error_message = excluded.error_message, \
-             retry_count = embedding_status.retry_count + 1;",
-            &params,)
-            .map_err(storage_error)?;
-            Ok(())
-        })?;
+        self.transaction(|conn| mark_failed_inner(conn, doc_id, embedder_id, error_message))?;
 
         tracing::debug!(
             target: "frankensearch.storage",
@@ -343,28 +250,7 @@ impl Storage {
         ensure_non_empty(doc_id, "doc_id")?;
         ensure_non_empty(embedder_id, "embedder_id")?;
 
-        self.transaction(|conn| {
-            if !document_exists(conn, doc_id)? {
-                return Err(not_found_error("documents", doc_id));
-            }
-
-            let params = [
-                SqliteValue::Text(doc_id.to_owned().into()),
-                SqliteValue::Text(embedder_id.to_owned().into()),
-                SqliteValue::Text(EmbeddingStatus::Skipped.as_str().to_owned().into()),
-                SqliteValue::Text(reason.to_owned().into()),
-            ];
-            conn.execute_with_params_sync("INSERT INTO embedding_status \
-             (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
-             VALUES (?1, ?2, NULL, ?3, NULL, ?4, 0) \
-             ON CONFLICT(doc_id, embedder_id) DO UPDATE SET \
-             status = excluded.status, \
-             embedded_at = NULL, \
-             error_message = excluded.error_message;",
-            &params,)
-            .map_err(storage_error)?;
-            Ok(())
-        })?;
+        self.transaction(|conn| mark_skipped_inner(conn, doc_id, embedder_id, reason))?;
 
         tracing::debug!(
             target: "frankensearch.storage",
@@ -559,6 +445,122 @@ pub fn upsert_document(conn: &AsyncConnection, doc: &DocumentRecord) -> SearchRe
         &params,)
         .map_err(storage_error)
     }
+}
+
+/// Read one document on the caller's transaction connection.
+pub(crate) fn get_document_inner(
+    conn: &AsyncConnection,
+    doc_id: &str,
+) -> SearchResult<Option<DocumentRecord>> {
+    let params = [SqliteValue::Text(doc_id.to_owned().into())];
+    let rows = conn
+        .query_with_params_sync(
+            "SELECT doc_id, source_path, content_preview, content_hash, content_length, \
+         created_at, updated_at, metadata_json FROM documents WHERE doc_id = ?1 LIMIT 1;",
+            &params,
+        )
+        .map_err(storage_error)?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let metadata_json = row_optional_text(row, 7)?;
+    let metadata = metadata_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(storage_error)?;
+    Ok(Some(DocumentRecord {
+        doc_id: row_text(row, 0, "documents.doc_id")?.to_owned(),
+        source_path: row_optional_text(row, 1)?,
+        content_preview: row_text(row, 2, "documents.content_preview")?.to_owned(),
+        content_hash: row_blob_32(row, 3, "documents.content_hash")?,
+        content_length: i64_to_usize(row_i64(row, 4, "documents.content_length")?)?,
+        created_at: row_i64(row, 5, "documents.created_at")?,
+        updated_at: row_i64(row, 6, "documents.updated_at")?,
+        metadata,
+    }))
+}
+
+pub(crate) fn mark_embedded_inner(
+    conn: &AsyncConnection,
+    doc_id: &str,
+    embedder_id: &str,
+    finished_at: i64,
+) -> SearchResult<()> {
+    if !document_exists(conn, doc_id)? {
+        return Err(not_found_error("documents", doc_id));
+    }
+    let params = [
+        SqliteValue::Text(doc_id.to_owned().into()),
+        SqliteValue::Text(embedder_id.to_owned().into()),
+        SqliteValue::Text(EmbeddingStatus::Embedded.as_str().to_owned().into()),
+        SqliteValue::Integer(finished_at),
+    ];
+    conn.execute_with_params_sync(
+        "INSERT INTO embedding_status \
+        (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
+        VALUES (?1, ?2, NULL, ?3, ?4, NULL, 0) \
+        ON CONFLICT(doc_id, embedder_id) DO UPDATE SET status = excluded.status, \
+        embedded_at = excluded.embedded_at, error_message = NULL;",
+        &params,
+    )
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+pub(crate) fn mark_failed_inner(
+    conn: &AsyncConnection,
+    doc_id: &str,
+    embedder_id: &str,
+    error_message: &str,
+) -> SearchResult<()> {
+    if !document_exists(conn, doc_id)? {
+        return Err(not_found_error("documents", doc_id));
+    }
+    let params = [
+        SqliteValue::Text(doc_id.to_owned().into()),
+        SqliteValue::Text(embedder_id.to_owned().into()),
+        SqliteValue::Text(EmbeddingStatus::Failed.as_str().to_owned().into()),
+        SqliteValue::Text(error_message.to_owned().into()),
+    ];
+    conn.execute_with_params_sync(
+        "INSERT INTO embedding_status \
+        (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
+        VALUES (?1, ?2, NULL, ?3, NULL, ?4, 1) \
+        ON CONFLICT(doc_id, embedder_id) DO UPDATE SET status = excluded.status, \
+        embedded_at = NULL, error_message = excluded.error_message, \
+        retry_count = embedding_status.retry_count + 1;",
+        &params,
+    )
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+pub(crate) fn mark_skipped_inner(
+    conn: &AsyncConnection,
+    doc_id: &str,
+    embedder_id: &str,
+    reason: &str,
+) -> SearchResult<()> {
+    if !document_exists(conn, doc_id)? {
+        return Err(not_found_error("documents", doc_id));
+    }
+    let params = [
+        SqliteValue::Text(doc_id.to_owned().into()),
+        SqliteValue::Text(embedder_id.to_owned().into()),
+        SqliteValue::Text(EmbeddingStatus::Skipped.as_str().to_owned().into()),
+        SqliteValue::Text(reason.to_owned().into()),
+    ];
+    conn.execute_with_params_sync(
+        "INSERT INTO embedding_status \
+        (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
+        VALUES (?1, ?2, NULL, ?3, NULL, ?4, 0) \
+        ON CONFLICT(doc_id, embedder_id) DO UPDATE SET status = excluded.status, \
+        embedded_at = NULL, error_message = excluded.error_message;",
+        &params,
+    )
+    .map_err(storage_error)?;
+    Ok(())
 }
 
 pub fn list_document_ids(conn: &AsyncConnection, limit: usize) -> SearchResult<Vec<String>> {

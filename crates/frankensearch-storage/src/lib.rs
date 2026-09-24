@@ -48,8 +48,9 @@ pub use index_metadata::{
     StalenessReason,
 };
 pub use job_queue::{
-    BatchEnqueueResult, ClaimedJob, EnqueueRequest, FailResult, JobQueueConfig, JobQueueMetrics,
-    JobQueueMetricsSnapshot, JobStatus, PersistentJobQueue, QueueDepth, QueueErrorKind,
+    BatchEnqueueResult, ClaimOutcome, ClaimedJob, EnqueueRequest, FailResult, JobQueueConfig,
+    JobQueueMetrics, JobQueueMetricsSnapshot, JobStatus, PersistentJobQueue, QueueDepth,
+    QueueErrorKind,
 };
 pub use metrics::{StorageMetrics, StorageMetricsSnapshot};
 pub use pipeline::{

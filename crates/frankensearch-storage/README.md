@@ -30,6 +30,7 @@ This crate owns the persistent storage layer for frankensearch, backed by Franke
 
 - `PersistentJobQueue` - durable embedding job queue with claim/complete/fail lifecycle
 - `ClaimedJob` / `EnqueueRequest` - job queue request and claim types
+- `ClaimOutcome` - applied, lost-claim, or superseded-attempt result of a guarded operation
 - `JobQueueConfig` / `JobQueueMetrics` - queue configuration and telemetry
 - `QueueDepth` - current queue depth by status
 
@@ -46,9 +47,28 @@ and rejects a producer that changes identity during inference. Custom
 embedders must provide `Embedder::identity`; a model name and dimension alone
 do not authorize persistence. Cancellation after inference leaves the claim
 unfinished for the existing lease-recovery path, without writing a vector or
-recording a job failure. A sink must still admit the producer against its own
-index generation; these checks do not make separate sink and catalog writes
-one atomic transaction.
+recording a job failure.
+
+Every claimed attempt carries a durable epoch and worker ID. The runner checks
+that exact owner and binds the catalog's current content hash before each item,
+then checks again after inference and immediately before persistence. Reclaiming
+a job under the same worker name still invalidates the old attempt. Completion,
+terminal failure, and skip update the queue and document embedding status in
+one guarded transaction. Retries validate ownership and document revision but
+do not mark a terminal catalog status. Stale responses and stale errors cannot
+complete, fail, or overwrite a replacement job. Reports expose these local
+attempts as `jobs_suppressed`,
+separately from actual skipped jobs and failures. The current document hash is
+the authority: a document that changes from A to B and back to A can still admit
+an A response even while an obsolete B job remains queued.
+
+A sink must still admit the producer against its own index generation. The
+runner deliberately holds no database transaction across the synchronous sink
+call. If ownership or content changes during that call, its guarded completion
+leaves the newer queue and catalog untouched, but vector bytes may already have
+been written. Atomic vector publication requires a version-aware sink or a
+compare-and-swap publication protocol; these queue fences alone do not provide
+that boundary.
 
 ### History and Bookmarks
 
