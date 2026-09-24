@@ -7,8 +7,8 @@ use frankensearch_core::{
     E2E_ARTIFACT_REPLAY_COMMAND_TXT, E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
     E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType,
     E2eOutcome, E2eSeverity, EventBody, EvidenceEventType, ExitStatus, ExplainedSource,
-    ExplanationPhase, HitExplanation, ManifestBody, ModelVersion, PipelineState, Platform,
-    ReplayBody, ReplayEventType, ScoreComponent, Severity, Suite, build_artifact_entries,
+    ExplanationPhase, HitExplanation, LexicalTermScore, ManifestBody, ModelVersion, PipelineState,
+    Platform, ReplayBody, ReplayEventType, ScoreComponent, Severity, Suite, build_artifact_entries,
     render_artifacts_index, sha256_checksum, validate_envelope, validate_event_envelope,
     validate_manifest_envelope,
 };
@@ -137,9 +137,16 @@ fn sample_ranking() -> RankingExplanation {
         final_score: 0.73,
         components: vec![ScoreComponent {
             source: ExplainedSource::LexicalBm25 {
-                matched_terms: vec!["privacy".to_owned(), "redaction".to_owned()],
-                tf: 2.0,
-                idf: 3.0,
+                terms: ["privacy", "redaction"]
+                    .into_iter()
+                    .map(|term| LexicalTermScore {
+                        term: term.to_owned(),
+                        field: "content".to_owned(),
+                        score: 1.6,
+                        doc_freq: Some(2),
+                        idf: Some(3.0),
+                    })
+                    .collect(),
             },
             raw_score: 3.2,
             normalized_score: 0.8,

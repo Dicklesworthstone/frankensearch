@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::io;
 
 use frankensearch_core::{
-    ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent, SearchError,
-    SearchResult,
+    ExplainedSource, ExplanationPhase, HitExplanation, LexicalTermScore, RankMovement,
+    ScoreComponent, SearchError, SearchResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -374,6 +374,9 @@ pub struct ScoreComponentBreakdown {
     pub rrf_contribution: f64,
     pub weight: f64,
     pub confidence_per_mille: u16,
+    /// A lexical component's score split by query term and field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terms: Vec<LexicalTermScore>,
 }
 
 impl From<&ScoreComponent> for ScoreComponentBreakdown {
@@ -386,6 +389,10 @@ impl From<&ScoreComponent> for ScoreComponentBreakdown {
             rrf_contribution: value.rrf_contribution,
             weight: value.weight,
             confidence_per_mille: component_confidence_per_mille(value),
+            terms: match &value.source {
+                ExplainedSource::LexicalBm25 { terms } => terms.clone(),
+                _ => Vec::new(),
+            },
         }
     }
 }
@@ -707,7 +714,8 @@ mod tests {
         RetrievalBudget,
     };
     use frankensearch_core::{
-        ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
+        ExplainedSource, ExplanationPhase, HitExplanation, LexicalTermScore, RankMovement,
+        ScoreComponent,
     };
 
     #[test]
@@ -724,9 +732,13 @@ mod tests {
             components: vec![
                 ScoreComponent {
                     source: ExplainedSource::LexicalBm25 {
-                        matched_terms: vec!["rust".to_owned()],
-                        tf: 1.0,
-                        idf: 2.0,
+                        terms: vec![LexicalTermScore {
+                            term: "rust".to_owned(),
+                            field: "content".to_owned(),
+                            score: 12.0,
+                            doc_freq: Some(7),
+                            idf: Some(2.0),
+                        }],
                     },
                     raw_score: 12.0,
                     normalized_score: 0.9,
@@ -760,6 +772,12 @@ mod tests {
             ranking.components[1].source,
             ScoreComponentSource::SemanticFast
         );
+        assert_eq!(ranking.components[0].summary, "BM25(content:rust=12.00)");
+        assert_eq!(ranking.components[0].terms.len(), 1);
+        assert_eq!(ranking.components[0].terms[0].doc_freq, Some(7));
+        assert!(ranking.components[1].terms.is_empty());
+        let json = serde_json::to_value(&ranking.components[1]).expect("serialize component");
+        assert!(json.get("terms").is_none(), "{json}");
         assert!(ranking.rank_movement.is_some());
     }
 
@@ -1256,11 +1274,7 @@ mod tests {
                 phase: ExplanationPhase::Initial,
                 rank_movement: None,
                 components: vec![ScoreComponent {
-                    source: ExplainedSource::LexicalBm25 {
-                        matched_terms: vec!["test".to_owned()],
-                        tf: 1.0,
-                        idf: 1.5,
-                    },
+                    source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
                     raw_score: 5.0,
                     normalized_score: 0.7,
                     rrf_contribution: 0.01,
@@ -1306,11 +1320,7 @@ mod tests {
     fn source_from_explained_maps_all_variants() {
         use super::source_from_explained;
         assert_eq!(
-            source_from_explained(&ExplainedSource::LexicalBm25 {
-                matched_terms: vec![],
-                tf: 0.0,
-                idf: 0.0,
-            }),
+            source_from_explained(&ExplainedSource::LexicalBm25 { terms: Vec::new() }),
             ScoreComponentSource::LexicalBm25
         );
         assert_eq!(
@@ -1356,11 +1366,7 @@ mod tests {
     #[test]
     fn component_confidence_zero_scores() {
         let component = ScoreComponent {
-            source: ExplainedSource::LexicalBm25 {
-                matched_terms: vec![],
-                tf: 0.0,
-                idf: 0.0,
-            },
+            source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
             raw_score: 0.0,
             normalized_score: 0.0,
             rrf_contribution: 0.0,

@@ -3805,11 +3805,7 @@ fn fused_hits_to_scored_results(
 
                 if let (Some(rank), Some(raw_score)) = (fh.lexical_rank, fh.lexical_score) {
                     components.push(ScoreComponent {
-                        source: ExplainedSource::LexicalBm25 {
-                            matched_terms: Vec::new(),
-                            tf: 0.0,
-                            idf: 0.0,
-                        },
+                        source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
                         raw_score: f64::from(raw_score),
                         normalized_score: f64::from(raw_score),
                         rrf_contribution: rank_contribution(rrf_k, rank),

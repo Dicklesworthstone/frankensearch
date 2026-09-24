@@ -64,10 +64,23 @@ fsfs explain src/lib.rs   # or a path from that search (a unique file-name suffi
 ```
 
 The target is resolved against the last `fsfs search` in this index directory: the 1-based rank
-from the table or JSON `rank` field, a path, or the session id (`R0` is rank 1). BM25 term
-statistics are not exported by the lexical engine, so the explanation flags its `tf`/`idf`
-placeholders with the `bm25_stats_unavailable` warning; the lexical raw score and RRF
-contribution are real.
+from the table or JSON `rank` field, a path, or the session id (`R0` is rank 1). The BM25 score
+is split by query word and field, and the parts add up to it. For the third hit of
+`fsfs search "quantize vectors to f16"` on this repository's crates:
+
+```text
+Lexical (BM25): 24.158022
+  content:quantize = 8.104690 (doc_freq 11, idf 3.8153)
+  title:quantize = 10.972879 (doc_freq 2, idf 5.3414)
+  content:to = 0.166461 (doc_freq 483, idf 0.0766)
+  content:f16 = 4.913994 (doc_freq 54, idf 2.2595)
+  unmatched: vectors
+```
+
+`title` is the file name, which counts double. `unmatched` lists query words the file does not
+contain. If the index changed after the search, the split is left out with a
+`bm25_stats_unavailable` warning (run the search again); the lexical score and its RRF
+contribution are still shown.
 
 ## 5) Recommended next step
 

@@ -639,6 +639,7 @@ mod tests {
                     rrf_contribution: 0.0159,
                     weight: 0.3,
                     confidence_per_mille: 850,
+                    terms: Vec::new(),
                 },
                 ScoreComponentBreakdown {
                     source: ScoreComponentSource::SemanticFast,
@@ -648,6 +649,7 @@ mod tests {
                     rrf_contribution: 0.0149,
                     weight: 0.7,
                     confidence_per_mille: 800,
+                    terms: Vec::new(),
                 },
             ],
         }

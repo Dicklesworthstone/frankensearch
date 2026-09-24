@@ -716,9 +716,10 @@ impl OutputWarningCode {
     pub const SEMANTIC_INDEX_DEFERRED: &str = "semantic_index_deferred";
     /// Schema version is newer than consumer expects.
     pub const SCHEMA_NEWER: &str = "schema_version_newer";
-    /// `explain` could not obtain per-term BM25 statistics from the lexical
-    /// engine: `matched_terms` lists the query terms and `tf`/`idf` are
-    /// placeholders (0.0); the raw score and RRF contribution are real.
+    /// `explain` could not split the BM25 score by query term (the lexical
+    /// index is missing, or no longer scores the result as the search did),
+    /// so the lexical component has no `terms`; the raw score and RRF
+    /// contribution are real.
     pub const BM25_STATS_UNAVAILABLE: &str = "bm25_stats_unavailable";
 }
 

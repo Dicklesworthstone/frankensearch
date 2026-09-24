@@ -87,8 +87,8 @@ use crate::keeper::{
     validate_manifest_successor,
 };
 use crate::query::{
-    BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError, QueryDiagnostic,
-    QueryExplanation, QueryNode, QueryNodeId, QueryParserConfigError, QueryValue,
+    BooleanClause, BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError,
+    QueryDiagnostic, QueryExplanation, QueryNode, QueryNodeId, QueryParserConfigError, QueryValue,
     canonicalize_query, classify_query, validate_index_capabilities,
 };
 use crate::quiver::{
@@ -290,6 +290,48 @@ pub struct QuillSnippetHit {
     pub query_type: QueryExplanation,
     /// Canonical stored metadata.
     pub metadata: Option<Arc<serde_json::Value>>,
+}
+
+/// The kind of query clause a [`QuillTermScore`] itemizes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuillClauseKind {
+    /// One analyzed term.
+    Term,
+    /// An exact-position phrase.
+    Phrase,
+    /// A glob pattern.
+    Glob,
+}
+
+/// One query clause's share of a document's BM25 score in one field.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuillTermScore {
+    /// The analyzed term, a phrase's terms joined by spaces, or a glob pattern.
+    pub text: String,
+    /// What kind of clause `text` came from.
+    pub kind: QuillClauseKind,
+    /// Schema name of the field the clause was scored in.
+    pub field: &'static str,
+    /// Contribution to the document's score, field and query boosts
+    /// included; `0.0` when the clause does not match the document there.
+    pub score: f32,
+    /// Documents holding the term in this field, as the scorer counts them
+    /// (terms only).
+    pub doc_freq: Option<u64>,
+    /// BM25 inverse document frequency the scorer applied (terms only).
+    pub idf: Option<f32>,
+}
+
+/// A document's BM25 score split by query clause and field; see
+/// [`QuillSearchIndex::explain_document`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuillScoreExplanation {
+    /// The document's score for the whole query, as a search reports it.
+    pub score: f32,
+    /// One entry per term, phrase or glob clause and field, in query order.
+    /// Their scores add up to `score` up to f32 rounding; set, range and
+    /// match-all clauses score a constant and are not itemized.
+    pub terms: Vec<QuillTermScore>,
 }
 
 /// One globally paginated exhaustive result.
@@ -11163,6 +11205,127 @@ impl QuillReader {
         Ok(snippets)
     }
 
+    /// Split one document's score for `query` by clause and field.
+    ///
+    /// Every term, phrase and glob leaf of the parsed query is scored alone,
+    /// once per field and under the boosts above it, by the same evaluator
+    /// the search runs, restricted to the one document by a zero-weight
+    /// identifier clause. A Boolean score is the sum of its matching
+    /// clauses', so the parts add up to the whole.
+    fn explain_document_on(
+        &self,
+        cx: &Cx,
+        query: &str,
+        document_id: &str,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<Option<QuillScoreExplanation>, QuillIndexError> {
+        check_cancel(cx, "explain")?;
+        if classify_query(query) == QueryExplanation::Empty {
+            return Ok(None);
+        }
+        let mut parsed = self.default_parser()?.parse_lenient(query);
+        let _canonicalization = canonicalize_query(&mut parsed.query);
+        let score_of = |clause: Query| -> Result<Option<f32>, QuillIndexError> {
+            let only_this_document = Query::boost(
+                Query::set(ID_FIELD, vec![QueryValue::Str(document_id.to_owned())]),
+                0.0,
+            );
+            let pinned = Query::boolean(
+                vec![
+                    BooleanClause::new(Occur::Must, clause),
+                    BooleanClause::new(Occur::Must, only_this_document),
+                ],
+                None,
+            );
+            Ok(self
+                .search_preparsed_uncached_on(cx, &pinned, 1, 0, false, snapshot)?
+                .hits
+                .first()
+                .map(|hit| hit.score))
+        };
+        let Some(score) = score_of(parsed.query.clone())? else {
+            return Ok(None);
+        };
+        let field_name = |field_id: u16| {
+            self.schema
+                .fields
+                .get(usize::from(field_id))
+                .map_or("unknown", |field| field.name)
+        };
+        let doc_count = snapshot.bm25_doc_count();
+        let mut terms = Vec::new();
+        let mut pending = vec![(parsed.query.root_id(), 1.0_f32)];
+        while let Some((node, boost)) = pending.pop() {
+            match parsed.query.node(node) {
+                QueryNode::Boolean { clauses, .. } => pending.extend(
+                    clauses
+                        .iter()
+                        .rev()
+                        .filter(|clause| clause.occur != Occur::MustNot)
+                        .map(|clause| (clause.query, boost)),
+                ),
+                QueryNode::Boost { query, factor } => pending.push((*query, boost * factor)),
+                QueryNode::Term { fields, text } => {
+                    for field in fields {
+                        let doc_freq = snapshot.bm25_doc_freq(field.field_id, text.as_bytes())?;
+                        let clause = Query::term(vec![*field], text.clone());
+                        terms.push(QuillTermScore {
+                            text: text.clone(),
+                            kind: QuillClauseKind::Term,
+                            field: field_name(field.field_id),
+                            score: score_of(Query::boost(clause, boost))?.unwrap_or(0.0),
+                            doc_freq: Some(doc_freq),
+                            idf: (doc_freq <= doc_count)
+                                .then(|| crate::contract::idf(doc_freq, doc_count)),
+                        });
+                    }
+                }
+                QueryNode::Phrase {
+                    fields,
+                    terms: words,
+                    slop,
+                    prefix,
+                } => {
+                    let text = words
+                        .iter()
+                        .map(|word| word.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    for field in fields {
+                        let clause = Query::phrase(vec![*field], words.clone(), *slop, *prefix);
+                        terms.push(QuillTermScore {
+                            text: text.clone(),
+                            kind: QuillClauseKind::Phrase,
+                            field: field_name(field.field_id),
+                            score: score_of(Query::boost(clause, boost))?.unwrap_or(0.0),
+                            doc_freq: None,
+                            idf: None,
+                        });
+                    }
+                }
+                QueryNode::Glob { field_ids, pattern } => {
+                    for &field_id in field_ids {
+                        let clause = Query::glob(vec![field_id], pattern.clone());
+                        terms.push(QuillTermScore {
+                            text: pattern.clone(),
+                            kind: QuillClauseKind::Glob,
+                            field: field_name(field_id),
+                            score: score_of(Query::boost(clause, boost))?.unwrap_or(0.0),
+                            doc_freq: None,
+                            idf: None,
+                        });
+                    }
+                }
+                QueryNode::Empty
+                | QueryNode::AllocationFailure { .. }
+                | QueryNode::All
+                | QueryNode::Range { .. }
+                | QueryNode::Set { .. } => {}
+            }
+        }
+        Ok(Some(QuillScoreExplanation { score, terms }))
+    }
+
     fn segment_stats(&self) -> SearchResult<SegmentStats> {
         let snapshot = self
             .checked_published_snapshot()
@@ -11677,6 +11840,28 @@ impl QuillSearchIndex {
             snippet_config,
             max_source_bytes,
         )
+    }
+
+    /// Split one document's BM25 score for `query` by clause and field.
+    ///
+    /// Each term, phrase and glob clause of the parsed query is scored on its
+    /// own against `document_id` by the evaluator a search runs, so the parts
+    /// add up to the score that search reports for the document. Returns
+    /// `None` when the document is not live or `query` does not match it.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, parsing, lowering, scoring, or dictionary
+    /// failures.
+    pub fn explain_document(
+        &self,
+        cx: &Cx,
+        query: &str,
+        document_id: &str,
+    ) -> Result<Option<QuillScoreExplanation>, QuillIndexError> {
+        let published = self.reader.published_snapshot.load();
+        self.reader
+            .explain_document_on(cx, query, document_id, published.as_ref())
     }
 
     /// Collect every matching global document id from the pinned publication.
@@ -12692,6 +12877,24 @@ impl QuillIndex {
             max_source_bytes,
             snapshot.as_ref(),
         )
+    }
+
+    /// Split one document's BM25 score by clause and field on the published
+    /// snapshot; see [`QuillSearchIndex::explain_document`].
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, parsing, lowering, scoring, or dictionary
+    /// failures.
+    pub fn explain_document(
+        &self,
+        cx: &Cx,
+        query: &str,
+        document_id: &str,
+    ) -> Result<Option<QuillScoreExplanation>, QuillIndexError> {
+        let snapshot = self.checked_published_snapshot()?;
+        self.reader
+            .explain_document_on(cx, query, document_id, snapshot.as_ref())
     }
 
     /// Collect the complete deterministic set of matching global document IDs.
@@ -21783,6 +21986,114 @@ mod tests {
                 tombstoned.keeper.segments()[0].stored_meta_lookup_cache_counts(),
                 (3, 1),
                 "tombstone-only rebinds share the one plan only for the exact immutable backing"
+            );
+        });
+    }
+
+    /// A document's explanation reproduces its search score, and its per
+    /// clause parts add up to that score: field boosts (the title's 2x) and
+    /// query boosts (`^3`) are carried into each part, a term the document
+    /// lacks scores zero, prohibited clauses are not itemized, and a document
+    /// the query does not match has no explanation.
+    #[test]
+    fn explain_document_parts_add_up_to_the_search_score() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("create index");
+            for document in [
+                IndexableDocument::new("guide", "ownership ownership borrow rules")
+                    .with_title("Ownership guide"),
+                IndexableDocument::new("elision", "the lifetime elision rule"),
+                IndexableDocument::new("both", "ownership and lifetime together"),
+                IndexableDocument::new("garden", "an unrelated line about gardening"),
+            ] {
+                LexicalWrite::index_document(&index, &cx, &document)
+                    .await
+                    .expect("index document");
+            }
+            LexicalWrite::commit(&index, &cx).await.expect("commit");
+
+            for query in [
+                "ownership lifetime",
+                "ownership^3 lifetime",
+                "\"lifetime elision\" ownership",
+            ] {
+                let hits = index
+                    .search_paginated(&cx, query, 10, 0, false)
+                    .expect("search")
+                    .hits;
+                assert!(hits.len() >= 2, "{query}: {hits:?}");
+                for hit in hits.iter() {
+                    let explanation = index
+                        .explain_document(&cx, query, &hit.document_id)
+                        .expect("explain")
+                        .expect("a ranked document has an explanation");
+                    assert_eq!(explanation.score, hit.score, "{query} {}", hit.document_id);
+                    let parts = explanation
+                        .terms
+                        .iter()
+                        .map(|term| f64::from(term.score))
+                        .sum::<f64>();
+                    assert!(
+                        (parts - f64::from(hit.score)).abs() <= 1e-4 * f64::from(hit.score),
+                        "{query} {}: parts {parts} vs score {} in {:?}",
+                        hit.document_id,
+                        hit.score,
+                        explanation.terms
+                    );
+                }
+            }
+
+            let guide = index
+                .explain_document(&cx, "ownership lifetime", "guide")
+                .expect("explain")
+                .expect("guide matches");
+            let part = |text: &str, field: &str| {
+                guide
+                    .terms
+                    .iter()
+                    .find(|term| term.text == text && term.field == field)
+                    .unwrap_or_else(|| panic!("no {text}/{field} in {:?}", guide.terms))
+            };
+            assert!(part("ownership", "title").score > 0.0);
+            assert!(part("ownership", "content").score > 0.0);
+            assert!(part("lifetime", "content").score.abs() < f32::EPSILON);
+            assert!(part("lifetime", "title").score.abs() < f32::EPSILON);
+            let ownership = part("ownership", "content");
+            assert_eq!(ownership.kind, QuillClauseKind::Term);
+            assert_eq!(ownership.doc_freq, Some(2));
+            assert_eq!(ownership.idf, Some(crate::contract::idf(2, 4)));
+
+            let phrase = index
+                .explain_document(&cx, "\"lifetime elision\"", "elision")
+                .expect("explain")
+                .expect("the phrase matches");
+            assert!(
+                phrase
+                    .terms
+                    .iter()
+                    .any(|term| term.kind == QuillClauseKind::Phrase
+                        && term.text == "lifetime elision"
+                        && term.field == "content"
+                        && term.score > 0.0)
+            );
+
+            let prohibited = index
+                .explain_document(&cx, "ownership -gardening", "both")
+                .expect("explain")
+                .expect("both matches");
+            assert!(prohibited.terms.iter().all(|term| term.text == "ownership"));
+
+            assert_eq!(
+                index
+                    .explain_document(&cx, "ownership", "garden")
+                    .expect("explain"),
+                None
+            );
+            assert_eq!(
+                index
+                    .explain_document(&cx, "ownership", "missing")
+                    .expect("explain"),
+                None
             );
         });
     }

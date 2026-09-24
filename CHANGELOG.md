@@ -258,6 +258,21 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **`fsfs explain` splits the BM25 score by query word.** The lexical
+  component used to read `BM25(terms=[every query word], tf=0.00,
+  idf=0.00)` with a `bm25_stats_unavailable` warning; no producer ever
+  filled those fields. Quill now scores each term, phrase and glob of the
+  query alone against the explained file, per field and with the file
+  name's 2x title boost, using the evaluator the search ran, so the parts
+  add up to the reported score. The table prints one `field:term = score
+  (doc_freq, idf)` line per matching part and an `unmatched:` list; JSON
+  carries the parts as `terms` on the lexical component. If the index
+  scores the file differently from the saved search (it was reindexed),
+  the split is withheld and the warning says to search again. Core's
+  `ExplainedSource::LexicalBm25` now holds `terms: Vec<LexicalTermScore>`
+  in place of `matched_terms`/`tf`/`idf`; the library searchers leave it
+  empty (bd-5r0su).
+
 - **`fsfs search --compact` for agents.** The compact envelope that
   `agent_ergonomics` defined but no command emitted is now the output of
   `--compact` (json, jsonl, toon): hits as `id` (the `R0`-style id

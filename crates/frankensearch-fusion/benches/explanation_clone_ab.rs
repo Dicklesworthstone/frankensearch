@@ -2,7 +2,7 @@
 //! the metadata→Arc landing).
 //!
 //! When `explain=true`, each winner carries a `HitExplanation` (nested
-//! `Vec<ScoreComponent>` with `Vec<String>` matched-terms / embedder `String`, +
+//! `Vec<ScoreComponent>` with embedder `String`s, +
 //! `RankMovement.reason: String`). The async progressive-phase emission clones
 //! `Vec<ScoredResult>` per phase (`searcher.rs:543/637/683/806`), deep-cloning
 //! every explanation — N per phase, 2 phases per query. This measures whether an
@@ -25,23 +25,14 @@ use frankensearch_core::explanation::{
 use frankensearch_fusion::bench_support::paired_median_ratio;
 
 /// A representative populated `HitExplanation` (a hybrid hit: lexical + semantic
-/// components with a few matched terms, plus a rank movement) — the shape the
-/// async searcher builds when `explain=true`.
+/// components, plus a rank movement) — the shape the async searcher builds when
+/// `explain=true`.
 fn realistic_explanation(i: usize) -> HitExplanation {
     HitExplanation {
         final_score: 0.87,
         components: vec![
             ScoreComponent {
-                source: ExplainedSource::LexicalBm25 {
-                    matched_terms: vec![
-                        format!("term{}", i % 7),
-                        "rust".to_owned(),
-                        "hybrid".to_owned(),
-                        "search".to_owned(),
-                    ],
-                    tf: 3.0,
-                    idf: 2.1,
-                },
+                source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
                 raw_score: 12.5,
                 normalized_score: 0.8,
                 rrf_contribution: 1.0 / 61.0,

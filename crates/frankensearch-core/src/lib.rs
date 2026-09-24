@@ -106,7 +106,8 @@ pub use e2e_artifact::{
 };
 pub use error::{SearchError, SearchResult};
 pub use explanation::{
-    ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
+    ExplainedSource, ExplanationPhase, HitExplanation, LexicalTermScore, RankMovement,
+    ScoreComponent,
 };
 pub use filter::{
     BitsetFilter, DateRangeFilter, DocTypeFilter, FilterChain, FilterMode, PredicateFilter,

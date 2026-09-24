@@ -777,11 +777,9 @@ mod generation_tests {
                 explain.cli_input.command = CliCommand::Explain;
                 explain.cli_input.result_id = Some("R0".to_owned());
                 let mut explanation = Vec::new();
-                explain.run_complete_generation_explain_with_writer(
-                    &cx,
-                    &root,
-                    &mut explanation,
-                )?;
+                explain
+                    .run_complete_generation_explain_with_writer(&cx, &root, &mut explanation)
+                    .await?;
                 let explanation: serde_json::Value = serde_json::from_slice(&explanation).unwrap();
                 assert_eq!(
                     explanation["data"]["ranking"]["doc_id"],

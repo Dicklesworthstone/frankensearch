@@ -30,8 +30,8 @@ use frankensearch_core::filter::{PredicateFilter, SearchFilter};
 use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
-    HitExplanation, IndexableDocument, ModelCategory, RerankDocument, Reranker, ScoreComponent,
-    SearchError, SearchResult, VectorHit,
+    HitExplanation, IndexableDocument, LexicalTermScore, ModelCategory, RerankDocument, Reranker,
+    ScoreComponent, SearchError, SearchResult, VectorHit,
 };
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FileProtector, FsviProtector, FsviVerifyResult,
@@ -6212,7 +6212,8 @@ impl FsfsRuntime {
             return Ok(());
         }
         if command == CliCommand::Explain {
-            self.run_explain_command()?;
+            self.run_explain_command_with_writer(cx, &mut std::io::stdout())
+                .await?;
             return Ok(());
         }
         if command == CliCommand::Status {
@@ -8360,9 +8361,71 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    fn run_explain_command(&self) -> SearchResult<()> {
-        let session = self.load_explain_session()?;
-        self.emit_explain_session_with_writer(session.as_ref(), &mut std::io::stdout())
+    #[allow(clippy::future_not_send)]
+    async fn run_explain_command_with_writer<W: Write>(
+        &self,
+        cx: &Cx,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let index_root = self.resolve_status_index_root()?;
+        let session = Self::load_explain_session_at_root(&index_root)?;
+        let lexical = match &session {
+            Some(_) => Self::open_explain_lexical_index(cx, &index_root).await,
+            None => Err(String::new()),
+        };
+        self.emit_explain_session_with_writer(cx, session.as_ref(), lexical.as_ref(), writer)
+    }
+
+    /// The lexical index `explain` splits BM25 scores with. Without it the
+    /// explanation keeps its scores and says why the split is missing.
+    #[allow(clippy::future_not_send)]
+    async fn open_explain_lexical_index(
+        cx: &Cx,
+        index_root: &Path,
+    ) -> Result<QuillSearchIndex, String> {
+        let layout = Self::resolve_lexical_engine(index_root).map_err(|error| error.to_string())?;
+        let (Some(BlueGreenEngine::Quill), Some(path)) = (layout.engine(), layout.engine_dir())
+        else {
+            return Err("the index has no Quill lexical engine".to_owned());
+        };
+        QuillSearchIndex::open(cx, path, QuillConfig::default())
+            .await
+            .map_err(|error| format!("the lexical index could not be opened: {error}"))
+    }
+
+    /// Split a hit's BM25 score by query term and field on the index it was
+    /// searched on. Refused when that index no longer scores the document as
+    /// the search did: the parts would then explain some other score.
+    fn lexical_term_scores(
+        cx: &Cx,
+        index: &QuillSearchIndex,
+        query: &str,
+        doc_id: &str,
+        searched_score: f32,
+    ) -> Result<Vec<LexicalTermScore>, String> {
+        let explanation = index
+            .explain_document(cx, &Self::normalize_search_query(query), doc_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "the lexical index no longer matches this result; run the search again".to_owned()
+            })?;
+        if (explanation.score - searched_score).abs() > searched_score.abs() * 1e-5 {
+            return Err(format!(
+                "the lexical index now scores this result {} where the search saw {searched_score}; run the search again",
+                explanation.score
+            ));
+        }
+        Ok(explanation
+            .terms
+            .into_iter()
+            .map(|part| LexicalTermScore {
+                term: part.text,
+                field: part.field.to_owned(),
+                score: f64::from(part.score),
+                doc_freq: part.doc_freq,
+                idf: part.idf.map(f64::from),
+            })
+            .collect())
     }
 
     /// Bind follow-up output to the exact reader that will execute the query.
@@ -8407,7 +8470,8 @@ impl FsfsRuntime {
         self.persist_explain_session_value(target.generation.path(), session)
     }
 
-    fn run_complete_generation_explain_with_writer<W: Write>(
+    #[allow(clippy::future_not_send)]
+    async fn run_complete_generation_explain_with_writer<W: Write>(
         &self,
         cx: &Cx,
         root: &Path,
@@ -8433,13 +8497,19 @@ impl FsfsRuntime {
             ));
         }
         retained_search_checkpoint(cx)?;
-        self.emit_explain_session_with_writer(session.as_ref(), writer)
+        let lexical = match &session {
+            Some(_) => Self::open_explain_lexical_index(cx, generation.path()).await,
+            None => Err(String::new()),
+        };
+        self.emit_explain_session_with_writer(cx, session.as_ref(), lexical.as_ref(), writer)
     }
 
     #[allow(clippy::too_many_lines)]
     fn emit_explain_session_with_writer<W: Write>(
         &self,
+        cx: &Cx,
         session: Option<&ExplainSession>,
+        lexical: Result<&QuillSearchIndex, &String>,
         writer: &mut W,
     ) -> SearchResult<()> {
         let result_id =
@@ -8474,11 +8544,22 @@ impl FsfsRuntime {
                 ),
             })?;
 
-        let matched_terms = session
-            .query
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        let (lexical_terms, lexical_terms_unavailable) =
+            hit.lexical_score
+                .map_or_else(|| (Vec::new(), None), |searched_score| {
+                    match lexical.map_err(String::clone).and_then(|index| {
+                        Self::lexical_term_scores(
+                            cx,
+                            index,
+                            &session.query,
+                            &hit.path,
+                            searched_score,
+                        )
+                    }) {
+                        Ok(terms) => (terms, None),
+                        Err(reason) => (Vec::new(), Some(reason)),
+                    }
+                });
         let source_count = usize::from(hit.lexical_score.is_some())
             .saturating_add(usize::from(hit.hash_score.or(hit.semantic_score).is_some()));
         let shared_weight = if source_count == 0 {
@@ -8491,9 +8572,7 @@ impl FsfsRuntime {
         if let Some(lexical_score) = hit.lexical_score {
             components.push(ScoreComponent {
                 source: ExplainedSource::LexicalBm25 {
-                    matched_terms: matched_terms.clone(),
-                    tf: 0.0,
-                    idf: 0.0,
+                    terms: lexical_terms,
                 },
                 raw_score: f64::from(lexical_score),
                 normalized_score: f64::from(lexical_score),
@@ -8559,11 +8638,7 @@ impl FsfsRuntime {
         }
         if components.is_empty() {
             components.push(ScoreComponent {
-                source: ExplainedSource::LexicalBm25 {
-                    matched_terms,
-                    tf: 0.0,
-                    idf: 0.0,
-                },
+                source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
                 raw_score: 0.0,
                 normalized_score: 0.0,
                 rrf_contribution: 0.0,
@@ -8620,15 +8695,17 @@ impl FsfsRuntime {
         } else {
             Vec::new()
         };
-        if hit.lexical_score.is_some() {
-            // Typed omission rather than a fabricated statistic: the lexical
-            // engine does not export per-term BM25 stats to the session.
+        if let Some(reason) = lexical_terms_unavailable {
             warnings.push(OutputWarning::new(
                 OutputWarningCode::BM25_STATS_UNAVAILABLE,
                 if hit.lexical_fallback_tail {
-                    "BM25 tf/idf are placeholders (0.0) and matched_terms lists the query terms; the raw lexical score was retained without RRF for this fallback tail hit"
+                    format!(
+                        "no per-term BM25 breakdown: {reason}; the raw lexical score was retained without RRF for this fallback tail hit"
+                    )
                 } else {
-                    "BM25 tf/idf are placeholders (0.0) and matched_terms lists the query terms; the lexical raw score and its RRF contribution are real"
+                    format!(
+                        "no per-term BM25 breakdown: {reason}; the lexical raw score and its RRF contribution are real"
+                    )
                 },
             ));
         }
@@ -8861,6 +8938,7 @@ impl FsfsRuntime {
         }
     }
 
+    #[cfg(test)]
     fn load_explain_session(&self) -> SearchResult<Option<ExplainSession>> {
         let index_root = self.resolve_status_index_root()?;
         Self::load_explain_session_at_root(&index_root)
@@ -20617,6 +20695,28 @@ fn render_explain_table(
     lines.push(format!("Query: {}", payload.query));
     lines.push(String::new());
     lines.push(format!("Lexical (BM25): {lexical_score}"));
+    let lexical_terms = payload
+        .ranking
+        .components
+        .iter()
+        .find(|component| {
+            component.source == crate::explanation_payload::ScoreComponentSource::LexicalBm25
+        })
+        .map_or(&[][..], |component| component.terms.as_slice());
+    for part in lexical_terms.iter().filter(|part| part.score > 0.0) {
+        let stats = match (part.doc_freq, part.idf) {
+            (Some(doc_freq), Some(idf)) => format!(" (doc_freq {doc_freq}, idf {idf:.4})"),
+            _ => String::new(),
+        };
+        lines.push(format!(
+            "  {}:{} = {:.6}{stats}",
+            part.field, part.term, part.score
+        ));
+    }
+    let unmatched = frankensearch_core::explanation::unmatched_terms(lexical_terms);
+    if !unmatched.is_empty() {
+        lines.push(format!("  unmatched: {}", unmatched.join(", ")));
+    }
     if vector_generation_is_hash {
         let generation = vector_generation_id.unwrap_or("hash");
         lines.push(format!(
@@ -35703,23 +35803,26 @@ mod tests {
 
     #[test]
     fn runtime_explain_command_errors_without_saved_search_context() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
-            command: CliCommand::Explain,
-            result_id: Some("R0".to_owned()),
-            index_dir: Some(temp.path().join("index-root")),
-            format: OutputFormat::Json,
-            ..CliInput::default()
-        });
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Explain,
+                result_id: Some("R0".to_owned()),
+                index_dir: Some(temp.path().join("index-root")),
+                format: OutputFormat::Json,
+                ..CliInput::default()
+            });
 
-        let err = runtime
-            .run_explain_command()
-            .expect_err("missing explain session should fail");
-        let text = err.to_string();
-        assert!(
-            text.contains("run `fsfs search <query>` first"),
-            "unexpected explain-session error: {text}"
-        );
+            let err = runtime
+                .run_explain_command_with_writer(&cx, &mut Vec::new())
+                .await
+                .expect_err("missing explain session should fail");
+            let text = err.to_string();
+            assert!(
+                text.contains("run `fsfs search <query>` first"),
+                "unexpected explain-session error: {text}"
+            );
+        });
     }
 
     #[cfg(all(unix, not(feature = "embedded-models")))]
@@ -35800,10 +35903,31 @@ mod tests {
                 let mut output = Vec::new();
                 explain
                     .run_complete_generation_explain_with_writer(&cx, &root, &mut output)
+                    .await
                     .unwrap();
                 let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
                 assert_eq!(output["data"]["query"], "sharedtoken");
                 assert_eq!(output["data"]["ranking"]["doc_id"], hit.path);
+                let lexical = &output["data"]["ranking"]["components"][0];
+                assert_eq!(lexical["source"], "lexical_bm25");
+                let terms = lexical["terms"].as_array().expect("BM25 breakdown");
+                assert!(terms.iter().any(|part| part["term"] == "sharedtoken"
+                    && part["field"] == "content"
+                    && part["score"].as_f64().unwrap() > 0.0));
+                let parts = terms
+                    .iter()
+                    .map(|part| part["score"].as_f64().unwrap())
+                    .sum::<f64>();
+                let raw = lexical["raw_score"].as_f64().unwrap();
+                assert!((parts - raw).abs() <= 1e-4 * raw, "{parts} vs {raw}");
+                assert!(
+                    !output["warnings"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|warning| warning["code"] == "bm25_stats_unavailable"),
+                    "{output}"
+                );
                 assert_eq!(
                     output["data"]["ranking"]["final_score"]
                         .as_f64()
@@ -35893,6 +36017,7 @@ mod tests {
             assert!(
                 explain
                     .run_complete_generation_explain_with_writer(&cx, &root, &mut output)
+                    .await
                     .unwrap_err()
                     .to_string()
                     .contains("unknown result id")
@@ -35906,6 +36031,7 @@ mod tests {
             assert!(
                 explain
                     .run_complete_generation_explain_with_writer(&cx, &root, &mut output)
+                    .await
                     .unwrap_err()
                     .to_string()
                     .contains("last search fused multiple expanded queries")
@@ -35935,6 +36061,7 @@ mod tests {
             let mut output = Vec::new();
             let error = explain
                 .run_complete_generation_explain_with_writer(&cx, &root, &mut output)
+                .await
                 .unwrap_err();
             assert!(error.to_string().contains("selected complete generation"));
             assert!(output.is_empty());
@@ -35994,6 +36121,7 @@ mod tests {
             assert!(
                 runtime
                     .run_complete_generation_explain_with_writer(&cx, store.root(), &mut output)
+                    .await
                     .unwrap_err()
                     .to_string()
                     .contains("run `fsfs search <query>` first")
@@ -36039,6 +36167,7 @@ mod tests {
                 fs::write(&session_path, serde_json::to_vec(&context).unwrap()).unwrap();
                 let error = runtime
                     .run_complete_generation_explain_with_writer(&cx, store.root(), &mut output)
+                    .await
                     .unwrap_err();
                 assert!(
                     error.to_string().contains("selected complete generation"),
@@ -36050,6 +36179,7 @@ mod tests {
             assert!(
                 runtime
                     .run_complete_generation_explain_with_writer(&cx, store.root(), &mut output)
+                    .await
                     .is_err()
             );
             assert!(output.is_empty());
@@ -36099,6 +36229,7 @@ mod tests {
             assert!(
                 runtime
                     .run_complete_generation_explain_with_writer(&cx, store.root(), &mut output)
+                    .await
                     .unwrap_err()
                     .to_string()
                     .contains("symlink")
@@ -36167,16 +36298,80 @@ mod tests {
                 .await
                 .expect("search payload");
 
-            let explain_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            let explain_runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
                 command: CliCommand::Explain,
-                result_id: Some("R0".to_owned()),
+                result_id: Some("README.md".to_owned()),
                 index_dir: Some(project.join(".frankensearch")),
                 format: OutputFormat::Json,
                 ..CliInput::default()
             });
-            explain_runtime
-                .run_explain_command()
-                .expect("explain command should resolve saved R0 context");
+            let explain = |runtime: &FsfsRuntime| {
+                let runtime = runtime.clone();
+                let cx = cx.clone();
+                async move {
+                    let mut output = Vec::new();
+                    runtime
+                        .run_explain_command_with_writer(&cx, &mut output)
+                        .await
+                        .expect("explain command should resolve saved context");
+                    serde_json::from_slice::<serde_json::Value>(&output).expect("explain JSON")
+                }
+            };
+            let output = explain(&explain_runtime).await;
+            let lexical = &output["data"]["ranking"]["components"][0];
+            assert_eq!(lexical["source"], "lexical_bm25", "{output}");
+            let terms = lexical["terms"].as_array().expect("BM25 breakdown");
+            for word in ["authentication", "middleware"] {
+                assert!(
+                    terms
+                        .iter()
+                        .any(|part| part["term"] == word && part["score"].as_f64().unwrap() > 0.0),
+                    "{word} in {terms:?}"
+                );
+            }
+            let parts = terms
+                .iter()
+                .map(|part| part["score"].as_f64().unwrap())
+                .sum::<f64>();
+            let raw = lexical["raw_score"].as_f64().unwrap();
+            assert!((parts - raw).abs() <= 1e-4 * raw, "{parts} vs {raw}");
+            let bm25_warning = |output: &serde_json::Value| {
+                output["warnings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|warning| warning["code"] == "bm25_stats_unavailable")
+                    .cloned()
+            };
+            assert_eq!(bm25_warning(&output), None, "{output}");
+
+            // A reindex that changes the result's text changes its score: the
+            // saved search no longer describes it, so no breakdown is offered.
+            fs::write(
+                project.join("README.md"),
+                "Authentication middleware validates incoming bearer tokens. \
+                 The middleware also rotates keys and logs every authentication attempt.\n",
+            )
+            .expect("rewrite readme");
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("reindex command should succeed");
+            let stale = explain(&explain_runtime).await;
+            let lexical = &stale["data"]["ranking"]["components"][0];
+            assert!(lexical.get("terms").is_none(), "{stale}");
+            let warning = bm25_warning(&stale).expect("stale breakdown is refused");
+            assert!(
+                warning["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("run the search again")),
+                "{stale}"
+            );
         });
     }
 
@@ -40707,8 +40902,14 @@ mod tests {
                 .expect("load explain session")
                 .expect("session exists");
             let mut out = Vec::new();
+            let no_lexical = "this fixture has no lexical index".to_owned();
             runtime
-                .emit_explain_session_with_writer(Some(&session), &mut out)
+                .emit_explain_session_with_writer(
+                    &Cx::for_testing(),
+                    Some(&session),
+                    Err(&no_lexical),
+                    &mut out,
+                )
                 .expect("emit explain");
             serde_json::from_slice(&out).expect("explain json")
         }

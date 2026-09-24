@@ -17,9 +17,13 @@
 //!     components: vec![
 //!         ScoreComponent {
 //!             source: ExplainedSource::LexicalBm25 {
-//!                 matched_terms: vec!["rust".into(), "async".into()],
-//!                 tf: 2.0,
-//!                 idf: 3.5,
+//!                 terms: vec![LexicalTermScore {
+//!                     term: "rust".into(),
+//!                     field: "content".into(),
+//!                     score: 12.5,
+//!                     doc_freq: Some(40),
+//!                     idf: Some(3.5),
+//!                 }],
 //!             },
 //!             raw_score: 12.5,
 //!             normalized_score: 0.85,
@@ -68,12 +72,9 @@ impl std::fmt::Display for ExplanationPhase {
 pub enum ExplainedSource {
     /// Lexical BM25 score with term-level detail.
     LexicalBm25 {
-        /// Terms from the query that matched this document.
-        matched_terms: Vec<String>,
-        /// Aggregate term frequency.
-        tf: f64,
-        /// Aggregate inverse document frequency.
-        idf: f64,
+        /// The score split by query term and field; empty when the producer
+        /// did not compute a breakdown.
+        terms: Vec<LexicalTermScore>,
     },
 
     /// Fast-tier semantic score.
@@ -111,6 +112,41 @@ pub enum ExplainedSource {
     },
 }
 
+/// One query term's share of a document's BM25 score in one field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LexicalTermScore {
+    /// Analyzed query term; a phrase's terms joined by spaces, or a glob
+    /// pattern.
+    pub term: String,
+    /// Indexed field the term was scored in.
+    pub field: String,
+    /// The term's contribution to the document's BM25 score, boosts
+    /// included; `0.0` when the document does not contain it in this field.
+    pub score: f64,
+    /// Documents containing the term in this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_freq: Option<u64>,
+    /// BM25 inverse document frequency of the term in this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idf: Option<f64>,
+}
+
+/// The terms of a BM25 breakdown that score in no field, in query order.
+#[must_use]
+pub fn unmatched_terms(terms: &[LexicalTermScore]) -> Vec<&str> {
+    let mut unmatched = Vec::new();
+    for part in terms {
+        if !unmatched.contains(&part.term.as_str())
+            && !terms
+                .iter()
+                .any(|other| other.term == part.term && other.score > 0.0)
+        {
+            unmatched.push(part.term.as_str());
+        }
+    }
+    unmatched
+}
+
 impl ExplainedSource {
     /// Fast-tier vector component. Hash/fnv/jl identities become [`Self::HashControl`].
     #[must_use]
@@ -133,16 +169,26 @@ impl ExplainedSource {
 impl std::fmt::Display for ExplainedSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LexicalBm25 {
-                matched_terms,
-                tf,
-                idf,
-            } => {
-                write!(
-                    f,
-                    "BM25(terms=[{}], tf={tf:.2}, idf={idf:.2})",
-                    matched_terms.join(", ")
-                )
+            Self::LexicalBm25 { terms } => {
+                f.write_str("BM25")?;
+                if terms.is_empty() {
+                    return Ok(());
+                }
+                let mut separator = "(";
+                for part in terms.iter().filter(|part| part.score > 0.0) {
+                    write!(
+                        f,
+                        "{separator}{}:{}={:.2}",
+                        part.field, part.term, part.score
+                    )?;
+                    separator = ", ";
+                }
+                let unmatched = unmatched_terms(terms);
+                if !unmatched.is_empty() {
+                    let lead = if separator == "(" { "(" } else { "; " };
+                    write!(f, "{lead}unmatched: {}", unmatched.join(", "))?;
+                }
+                f.write_str(")")
             }
             Self::SemanticFast {
                 embedder,
@@ -287,6 +333,22 @@ impl std::fmt::Display for HitExplanation {
 mod tests {
     use super::*;
 
+    /// A BM25 source from `(term, field, score)` parts.
+    fn bm25(parts: &[(&str, &str, f64)]) -> ExplainedSource {
+        ExplainedSource::LexicalBm25 {
+            terms: parts
+                .iter()
+                .map(|&(term, field, score)| LexicalTermScore {
+                    term: term.to_owned(),
+                    field: field.to_owned(),
+                    score,
+                    doc_freq: None,
+                    idf: None,
+                })
+                .collect(),
+        }
+    }
+
     // ── Construction ─────────────────────────────────────────────────────
 
     #[test]
@@ -295,11 +357,7 @@ mod tests {
             final_score: 0.032,
             components: vec![
                 ScoreComponent {
-                    source: ExplainedSource::LexicalBm25 {
-                        matched_terms: vec!["rust".into(), "async".into()],
-                        tf: 2.0,
-                        idf: 3.5,
-                    },
+                    source: bm25(&[("rust", "content", 8.0), ("async", "content", 4.5)]),
                     raw_score: 12.5,
                     normalized_score: 0.85,
                     rrf_contribution: 0.016,
@@ -359,11 +417,7 @@ mod tests {
             final_score: 0.028,
             components: vec![
                 ScoreComponent {
-                    source: ExplainedSource::LexicalBm25 {
-                        matched_terms: vec!["test".into()],
-                        tf: 1.0,
-                        idf: 2.0,
-                    },
+                    source: bm25(&[("test", "content", 2.0)]),
                     raw_score: 5.0,
                     normalized_score: 0.5,
                     rrf_contribution: 0.016,
@@ -443,11 +497,7 @@ mod tests {
         let explanation = HitExplanation {
             final_score: 0.032,
             components: vec![ScoreComponent {
-                source: ExplainedSource::LexicalBm25 {
-                    matched_terms: vec!["rust".into()],
-                    tf: 1.0,
-                    idf: 3.0,
-                },
+                source: bm25(&[("rust", "content", 8.0)]),
                 raw_score: 8.0,
                 normalized_score: 0.7,
                 rrf_contribution: 0.016,
@@ -466,13 +516,22 @@ mod tests {
 
     #[test]
     fn display_explained_source_variants() {
-        let bm25 = ExplainedSource::LexicalBm25 {
-            matched_terms: vec!["a".into(), "b".into()],
-            tf: 2.0,
-            idf: 3.0,
-        };
-        assert!(bm25.to_string().contains("BM25"));
-        assert!(bm25.to_string().contains("a, b"));
+        let lexical = bm25(&[
+            ("a", "content", 2.0),
+            ("a", "title", 0.0),
+            ("b", "content", 0.0),
+            ("b", "title", 1.5),
+            ("c", "content", 0.0),
+            ("c", "title", 0.0),
+        ]);
+        assert_eq!(
+            lexical.to_string(),
+            "BM25(content:a=2.00, title:b=1.50; unmatched: c)"
+        );
+        assert_eq!(
+            bm25(&[("c", "content", 0.0)]).to_string(),
+            "BM25(unmatched: c)"
+        );
 
         let fast = ExplainedSource::SemanticFast {
             embedder: "model".into(),
@@ -538,11 +597,7 @@ mod tests {
             final_score: 0.025,
             components: vec![
                 ScoreComponent {
-                    source: ExplainedSource::LexicalBm25 {
-                        matched_terms: vec!["search".into()],
-                        tf: 1.0,
-                        idf: 2.5,
-                    },
+                    source: bm25(&[("search", "content", 2.5)]),
                     raw_score: 6.0,
                     normalized_score: 0.6,
                     rrf_contribution: 0.014,
@@ -587,9 +642,13 @@ mod tests {
         // Ensure each variant round-trips correctly.
         let sources = vec![
             ExplainedSource::LexicalBm25 {
-                matched_terms: vec!["test".into()],
-                tf: 1.0,
-                idf: 2.0,
+                terms: vec![LexicalTermScore {
+                    term: "test".into(),
+                    field: "content".into(),
+                    score: 2.0,
+                    doc_freq: Some(3),
+                    idf: Some(1.2),
+                }],
             },
             ExplainedSource::SemanticFast {
                 embedder: "potion".into(),
@@ -651,14 +710,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_matched_terms() {
-        let source = ExplainedSource::LexicalBm25 {
-            matched_terms: vec![],
-            tf: 0.0,
-            idf: 0.0,
-        };
-        let display = source.to_string();
-        assert!(display.contains("BM25(terms=[]"));
+    fn bm25_without_a_breakdown_displays_bare() {
+        let source = ExplainedSource::LexicalBm25 { terms: vec![] };
+        assert_eq!(source.to_string(), "BM25");
     }
 
     // ─── bd-7fn8 tests begin ───
@@ -692,11 +746,7 @@ mod tests {
 
     #[test]
     fn explained_source_clone() {
-        let original = ExplainedSource::LexicalBm25 {
-            matched_terms: vec!["hello".into(), "world".into()],
-            tf: 2.0,
-            idf: 3.5,
-        };
+        let original = bm25(&[("hello", "content", 2.0), ("world", "title", 3.5)]);
         let cloned = original.clone();
         assert_eq!(original.to_string(), cloned.to_string());
 
@@ -743,11 +793,7 @@ mod tests {
     #[test]
     fn score_component_clone_debug() {
         let component = ScoreComponent {
-            source: ExplainedSource::LexicalBm25 {
-                matched_terms: vec!["test".into()],
-                tf: 1.0,
-                idf: 2.0,
-            },
+            source: bm25(&[("test", "content", 2.0)]),
             raw_score: 5.0,
             normalized_score: 0.5,
             rrf_contribution: 0.016,
@@ -863,11 +909,7 @@ mod tests {
         let explanation = HitExplanation {
             final_score: 0.03,
             components: vec![ScoreComponent {
-                source: ExplainedSource::LexicalBm25 {
-                    matched_terms: vec!["clone".into()],
-                    tf: 1.0,
-                    idf: 2.0,
-                },
+                source: bm25(&[("clone", "content", 2.0)]),
                 raw_score: 4.0,
                 normalized_score: 0.4,
                 rrf_contribution: 0.01,
@@ -920,11 +962,7 @@ mod tests {
     fn many_components() {
         let components: Vec<ScoreComponent> = (0..100)
             .map(|i| ScoreComponent {
-                source: ExplainedSource::LexicalBm25 {
-                    matched_terms: vec![format!("term{i}")],
-                    tf: f64::from(i),
-                    idf: 1.0,
-                },
+                source: bm25(&[(&format!("term{i}"), "content", f64::from(i))]),
                 raw_score: f64::from(i),
                 normalized_score: f64::from(i) / 100.0,
                 rrf_contribution: 1.0 / (60.0 + f64::from(i) + 1.0),

@@ -100,6 +100,7 @@ impl FsfsRuntime {
             }
             CliCommand::Explain => {
                 self.run_complete_generation_explain_with_writer(cx, &root, &mut stdout)
+                    .await
             }
             CliCommand::Flush => {
                 self.run_complete_generation_flush_with_writer(cx, &root, &mut stdout)

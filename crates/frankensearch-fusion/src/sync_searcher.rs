@@ -1268,11 +1268,7 @@ fn fused_hits_to_scored_results(
                 let mut components = Vec::with_capacity(2);
                 if let (Some(rank), Some(raw_score)) = (hit.lexical_rank, hit.lexical_score) {
                     components.push(ScoreComponent {
-                        source: ExplainedSource::LexicalBm25 {
-                            matched_terms: Vec::new(),
-                            tf: 0.0,
-                            idf: 0.0,
-                        },
+                        source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
                         raw_score: f64::from(raw_score),
                         normalized_score: f64::from(raw_score),
                         rrf_contribution: rrf_rank_contribution(config.rrf_k, rank),
