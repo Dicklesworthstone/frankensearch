@@ -268,7 +268,12 @@ qualified; individual results below are narrower than release acceptance.
   the response. A refused fast vector fails the search before Initial; a
   refused quality vector keeps Initial and reports `RefinementFailed`, which
   is never cached. Recovery re-admission also refuses a provider whose
-  reported identity changed since admission (GH #55).
+  reported identity changed since admission. The same rule now covers
+  every vector fsfs stores: `fsfs index` batches and watch-mode updates
+  come from the bound operations and must carry the identity the
+  generation is stamped with; a mismatch fails that batch or update
+  without retry and leaves the stored vectors unchanged. The check
+  measured no cost on warm search (GH #55).
 
 - **Answers from before the WAL top-k repair are not replayed.**
   [`0dc3df2f`](https://github.com/Dicklesworthstone/frankensearch/commit/0dc3df2f)
