@@ -628,7 +628,7 @@ fn render_search_table_with_options(
         }
         let _ = writeln!(out);
         if let Some(snippet) = hit.snippet.as_deref() {
-            let clipped = truncate_for_width(snippet.trim(), snippet_width);
+            let clipped = focused_preview(snippet, &query_terms, snippet_width);
             let highlighted = highlight_query_terms(&clipped, &query_terms, color_enabled);
             let _ = writeln!(out, "     {highlighted}");
         }
@@ -709,6 +709,46 @@ fn truncate_for_width(text: &str, max_chars: usize) -> String {
     }
     let kept: String = text.chars().take(max_chars.saturating_sub(1)).collect();
     format!("{kept}…")
+}
+
+/// A one-line preview of `snippet`, at most `max_chars` wide, that shows a
+/// query word: when the first word holding one ends past the cut, the
+/// preview starts a few words before it behind a leading `…`. Terms shorter
+/// than three characters (`to`, `a`) occur inside too many words to steer by.
+pub(crate) fn focused_preview(snippet: &str, query_terms: &[String], max_chars: usize) -> String {
+    let words = snippet.split_whitespace().collect::<Vec<_>>();
+    let text = words.join(" ");
+    let steering = query_terms
+        .iter()
+        .filter(|term| term.chars().count() >= 3)
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let Some(matched) = words.iter().position(|word| {
+        let word = word.to_ascii_lowercase();
+        steering.iter().any(|term| word.contains(term.as_str()))
+    }) else {
+        return truncate_for_width(&text, max_chars);
+    };
+    let matched_end = words[..=matched]
+        .iter()
+        .map(|word| word.chars().count())
+        .sum::<usize>()
+        + matched;
+    if matched_end < max_chars {
+        return truncate_for_width(&text, max_chars);
+    }
+    let context = max_chars / 4;
+    let mut start = matched;
+    let mut used = 0;
+    while let Some(previous) = start.checked_sub(1) {
+        let width = words[previous].chars().count() + 1;
+        if used + width > context {
+            break;
+        }
+        used += width;
+        start = previous;
+    }
+    truncate_for_width(&format!("…{}", words[start..].join(" ")), max_chars)
 }
 
 fn collect_query_terms(query: &str) -> Vec<String> {
@@ -1687,6 +1727,42 @@ mod tests {
             output.contains('…'),
             "long snippet should be truncated with ellipsis: {output}"
         );
+    }
+
+    /// The table preview shows a query word even when the snippet holds it
+    /// past the cut: the preview then opens a few words before it.
+    #[test]
+    fn focused_preview_brings_the_first_query_word_into_view() {
+        let terms = ["rrf".to_owned(), "fusion".to_owned()];
+        let snippet = "Criterion, criterion_group, criterion_main};\n use \
+                       frankensearch_core::types::{ScoreSource, ScoredResult, VectorHit}; \
+                       use frankensearch_fusion::rrf::{ RrfConfig, rrf_fuse_with_graph }";
+        let preview = focused_preview(snippet, &terms, 66);
+        assert!(preview.starts_with('…'), "{preview}");
+        assert!(preview.contains("frankensearch_fusion::rrf"), "{preview}");
+        assert!(preview.chars().count() <= 66, "{preview}");
+        // Four words of context fit in a quarter of the width.
+        assert!(preview.starts_with("…VectorHit}; use"), "{preview}");
+
+        // A word inside the cut keeps the head preview; whitespace is folded.
+        let near = "the rrf  fusion\nstep then a long tail of unrelated words that runs on";
+        assert_eq!(
+            focused_preview(near, &terms, 40),
+            "the rrf fusion step then a long tail of…"
+        );
+        // No query word: the head, exactly as before.
+        let none = "nothing here matches the query at all, and it keeps going on";
+        assert_eq!(
+            focused_preview(none, &terms, 30),
+            truncate_for_width(none, 30)
+        );
+        // A two-letter term inside `token` does not steer the window.
+        let short = ["to".to_owned(), "quantize".to_owned()];
+        let late = "token tokenizer tokens token stream tokens again and again then quantize";
+        let preview = focused_preview(late, &short, 32);
+        assert!(preview.contains("quantize"), "{preview}");
+        // Short snippets are untouched.
+        assert_eq!(focused_preview("fusion", &terms, 32), "fusion");
     }
 
     #[test]

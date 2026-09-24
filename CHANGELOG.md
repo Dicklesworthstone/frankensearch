@@ -258,6 +258,13 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **The snippet preview under each hit shows the matched word.** The
+  table and TUI cut each snippet to one line from its start, so when the
+  first query word sat further in, the preview showed none: 51 of 200
+  previews on 20 code-corpus queries. The preview now starts a few words
+  before that word, marked `…`; 9 of 200 still show none, and those are
+  snippets with no query word at all (bd-kq5j1).
+
 - **`fsfs explain` splits the BM25 score by query word.** The lexical
   component used to read `BM25(terms=[every query word], tf=0.00,
   idf=0.00)` with a `bm25_stats_unavailable` warning; no producer ever

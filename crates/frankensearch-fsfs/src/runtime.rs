@@ -22323,7 +22323,11 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
                 |snippet| {
                     let budget = usize::from(left[2].width).saturating_sub(8).max(26);
                     highlight_text_spans(
-                        &truncate_tail(snippet.trim(), budget),
+                        &crate::adapters::format_emitter::focused_preview(
+                            snippet,
+                            &query_terms,
+                            budget,
+                        ),
                         &query_terms,
                         ui_fg(no_color, PackedRgba::rgb(152, 174, 211)),
                         ui_fg(no_color, PackedRgba::rgb(152, 174, 211)).bold(),
@@ -22973,7 +22977,11 @@ fn render_search_results_panel(
                 },
                 |snippet| {
                     highlight_text_spans(
-                        &truncate_tail(snippet.trim(), snippet_budget),
+                        &crate::adapters::format_emitter::focused_preview(
+                            snippet,
+                            query_terms,
+                            snippet_budget,
+                        ),
                         query_terms,
                         ui_fg(no_color, PackedRgba::rgb(151, 173, 211)),
                         ui_fg_bg(
