@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use ahash::AHashSet;
 
 use frankensearch_core::config::ZeroSignalReason;
-use frankensearch_core::filter::{DocIdHashSet, SearchFilter};
+use frankensearch_core::filter::{DocIdHashSet, ExcludeDocIdsFilter, SearchFilter};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use rayon::prelude::*;
 
@@ -391,7 +391,7 @@ impl VectorIndex {
             BinaryHeap::with_capacity(limit.min(self.wal_entries.len()).saturating_add(1))
         };
         if has_wal {
-            self.scan_wal(query, &mut heap, limit, filter)?;
+            heap = self.merge_wal_top_k(query, heap, limit, filter, SearchParams::default())?;
         }
         self.resolve_hits(heap)
     }
@@ -418,9 +418,70 @@ impl VectorIndex {
             BinaryHeap::with_capacity(limit.min(self.wal_entries.len()).saturating_add(1))
         };
         if !self.wal_entries.is_empty() {
-            self.scan_wal(query, &mut heap, limit, Some(filter))?;
+            heap =
+                self.merge_wal_top_k(query, heap, limit, Some(filter), SearchParams::default())?;
         }
         self.resolve_hits(heap)
+    }
+
+    // The input heap contains main-slab candidates only. Ordinary appends
+    // tombstone superseded rows, but a durable WAL can survive a crash before
+    // that tombstone reaches the main file. Dropping stale winners only in
+    // resolve_sorted_entries is too late: they already displaced live rows.
+    fn merge_wal_top_k(
+        &self,
+        query: &[f32],
+        mut heap: BinaryHeap<HeapEntry>,
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        params: SearchParams,
+    ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        let shadowed_winner = {
+            let wal_hashes: AHashSet<u64> = self
+                .wal_entries
+                .iter()
+                .map(|entry| entry.doc_id_hash)
+                .collect();
+            let wal_ids: AHashSet<&str> = self
+                .wal_entries
+                .iter()
+                .map(|entry| entry.doc_id.as_str())
+                .collect();
+            let mut shadowed = false;
+            for winner in &heap {
+                let hash = self.record_at(winner.index)?.doc_id_hash;
+                if wal_hashes.contains(&hash) && wal_ids.contains(self.doc_id_at(winner.index)?) {
+                    shadowed = true;
+                    break;
+                }
+            }
+            // Release these temporary sets before allocating the exclusion view.
+            shadowed
+        };
+        if shadowed_winner {
+            let visible_main = ExcludeDocIdsFilter::new(
+                filter,
+                self.wal_entries.iter().map(|entry| entry.doc_id.as_str()),
+            );
+            // Only an actual superseded winner takes the extra scan. Normal
+            // WAL appends preserve the existing selective gather and SIMD path.
+            // Do not forward candidate_hashes: hashes alone cannot represent
+            // the exact-ID exclusion when a collision occurs.
+            heap = if params.parallel_enabled && self.record_count() >= params.parallel_threshold {
+                self.scan_parallel(
+                    query,
+                    limit,
+                    Some(&visible_main),
+                    params.parallel_chunk_size.max(1),
+                )?
+            } else {
+                self.scan_sequential(query, limit, Some(&visible_main))?
+            };
+        }
+        // Apply the caller's original filter to the live WAL, NOT visible_main,
+        // which would exclude the very replacements that must remain searchable.
+        self.scan_wal(query, &mut heap, limit, filter)?;
+        Ok(heap)
     }
 
     fn search_top_k_internal(
@@ -485,9 +546,19 @@ impl VectorIndex {
             BinaryHeap::with_capacity(limit.min(max_wal).saturating_add(1))
         };
 
-        // Merge WAL entries into the same heap.
+        // Resolve main/WAL visibility before the final bounded selection.
         if has_wal {
-            self.scan_wal(query, &mut heap, limit, filter)?;
+            heap = self.merge_wal_top_k(
+                query,
+                heap,
+                limit,
+                filter,
+                SearchParams {
+                    parallel_threshold,
+                    parallel_chunk_size: chunk_size,
+                    parallel_enabled,
+                },
+            )?;
         }
 
         self.resolve_hits(heap)
