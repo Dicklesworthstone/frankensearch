@@ -873,12 +873,18 @@ fn build_stage_snapshots(
 }
 
 fn flatten_config_values(config: &FsfsConfig) -> SearchResult<BTreeMap<String, Value>> {
-    let projected = serde_json::to_value(config).map_err(|source| SearchError::SubsystemError {
-        subsystem: CONFIG_SUBSYSTEM,
-        source: Box::new(io::Error::other(format!(
-            "failed to project config to JSON value map: {source}"
-        ))),
-    })?;
+    // Show values as a config file spells them: an unlimited
+    // `search.default_limit` is `0` there, not the in-memory `usize::MAX`.
+    let mut projected =
+        serde_json::to_value(config).map_err(|source| SearchError::SubsystemError {
+            subsystem: CONFIG_SUBSYSTEM,
+            source: Box::new(io::Error::other(format!(
+                "failed to project config to JSON value map: {source}"
+            ))),
+        })?;
+    if config.search.default_limit == usize::MAX {
+        projected["search"]["default_limit"] = Value::from(0);
+    }
     let mut out = BTreeMap::new();
     flatten_json_paths("", &projected, &mut out);
     Ok(out)
@@ -1632,6 +1638,19 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn config_values_spell_an_unlimited_default_limit_as_zero() {
+        let unlimited = frankensearch_fsfs::FsfsConfig::default();
+        assert_eq!(unlimited.search.default_limit, usize::MAX);
+        let values = flatten_config_values(&unlimited).expect("flatten default config");
+        assert_eq!(values["search.default_limit"], serde_json::Value::from(0));
+
+        let mut limited = frankensearch_fsfs::FsfsConfig::default();
+        limited.search.default_limit = 25;
+        let values = flatten_config_values(&limited).expect("flatten limited config");
+        assert_eq!(values["search.default_limit"], serde_json::Value::from(25));
     }
 
     #[test]
