@@ -1869,7 +1869,7 @@ mod tests {
                     }
                     2 => provider.identities[1].storage.quantization = QuantizationFormat::F16,
                     3 => {
-                        "private-canary".clone_into(&mut provider.identities[1].storage.endianness)
+                        "private-canary".clone_into(&mut provider.identities[1].storage.endianness);
                     }
                     _ => {}
                 }
@@ -1904,7 +1904,8 @@ mod tests {
                 let inner = Arc::new(BoundCacheProvider::new());
                 match invalid {
                     0 => {
-                        *inner.response_identity.lock().unwrap() = Some(inner.identities[1].clone())
+                        *inner.response_identity.lock().unwrap() =
+                            Some(inner.identities[1].clone());
                     }
                     1 => {
                         let mut malformed = inner.identities[0].clone();
@@ -2161,10 +2162,12 @@ mod tests {
                 }
                 assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 3);
                 assert_eq!(inner.bound_calls.load(Ordering::Relaxed), 3);
-                let state = cached.state_lock();
-                assert!(state.ghost.len() <= capacity);
-                assert!(state.ghost_set.len() <= capacity);
-                drop(state);
+                let (ghosts, ghost_set) = {
+                    let state = cached.state_lock();
+                    (state.ghost.len(), state.ghost_set.len())
+                };
+                assert!(ghosts <= capacity);
+                assert!(ghost_set <= capacity);
                 cached.clear_cache();
                 *inner.values.lock().unwrap() = vec![f32::NAN, 0.0];
                 assert!(matches!(
