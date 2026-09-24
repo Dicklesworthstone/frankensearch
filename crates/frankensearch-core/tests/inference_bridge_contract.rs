@@ -165,10 +165,14 @@ impl SyncEmbed for NativeProvider {
 }
 
 fn signature(response: &IdentityBoundEmbedding) -> Vec<u32> {
-    response.values.iter().map(|value| value.to_bits()).collect()
+    response
+        .values
+        .iter()
+        .map(|value| value.to_bits())
+        .collect()
 }
 
-fn assert_identity_error(error: SearchError) {
+fn assert_identity_error(error: &SearchError) {
     assert!(!error.to_string().contains("private-canary"));
     assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
 }
@@ -237,9 +241,9 @@ fn foreign_bound_contracts_are_rejected_without_disclosing_the_response() {
                 _ => "private-canary-endian".clone_into(&mut foreign.storage.endianness),
             }
             let adapter = SyncEmbedderAdapter(native);
-            assert_identity_error(adapter.embed_bound(&cx, "input").await.unwrap_err());
+            assert_identity_error(&adapter.embed_bound(&cx, "input").await.unwrap_err());
             assert_identity_error(
-                adapter
+                &adapter
                     .embed_batch_bound(&cx, &["a", "b"])
                     .await
                     .unwrap_err(),
@@ -326,7 +330,7 @@ fn producer_identity_dimension_or_availability_drift_cannot_escape_the_bridge() 
                 } else {
                     adapter.embed_bound(&cx, "a").await.unwrap_err()
                 };
-                assert_identity_error(error);
+                assert_identity_error(&error);
                 assert_eq!(adapter.0.counts(), (0, 1));
             }
         }
@@ -338,7 +342,10 @@ async fn call_adapter(provider: &dyn Embedder, cx: &Cx, operation: usize) -> Sea
         0 => provider.embed(cx, "input").await.map(|_| ()),
         1 => provider.embed_batch(cx, &["a", "b"]).await.map(|_| ()),
         2 => provider.embed_bound(cx, "input").await.map(|_| ()),
-        _ => provider.embed_batch_bound(cx, &["a", "b"]).await.map(|_| ()),
+        _ => provider
+            .embed_batch_bound(cx, &["a", "b"])
+            .await
+            .map(|_| ()),
     }
 }
 
@@ -475,13 +482,11 @@ fn default_sync_and_async_bound_operations_recheck_the_captured_producer() {
                 native.effect = effect;
                 let synchronous = RawDefaults(native);
                 let error = if batch {
-                    synchronous
-                        .embed_batch_bound_sync(&["a", "b"])
-                        .unwrap_err()
+                    synchronous.embed_batch_bound_sync(&["a", "b"]).unwrap_err()
                 } else {
                     synchronous.embed_bound_sync("a").unwrap_err()
                 };
-                assert_identity_error(error);
+                assert_identity_error(&error);
                 let mut native = NativeProvider::new(&cx);
                 native.effect = effect;
                 let asynchronous = AsyncDefaults(native);
@@ -493,7 +498,7 @@ fn default_sync_and_async_bound_operations_recheck_the_captured_producer() {
                 } else {
                     asynchronous.embed_bound(&cx, "a").await.unwrap_err()
                 };
-                assert_identity_error(error);
+                assert_identity_error(&error);
             }
         }
     });

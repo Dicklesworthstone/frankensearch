@@ -128,8 +128,9 @@ fn validate_embedder_identity(
 fn embedding_identity_changed() -> SearchError {
     SearchError::UnverifiableRemoteSpace {
         producer: "embedding.bound".to_owned(),
-        reason: "embedding producer or response differs from the identity admitted before inference"
-            .to_owned(),
+        reason:
+            "embedding producer or response differs from the identity admitted before inference"
+                .to_owned(),
     }
 }
 
