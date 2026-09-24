@@ -59,7 +59,9 @@ mod tests {
             VectorIndex::create_with_revision(&path, "wal-top-k-test", "r1", 2, quantization)
                 .unwrap();
         writer.write_record("updated", &[1.0, 0.0]).unwrap();
-        writer.write_record("survivor", &[0.5, 0.866_025_4]).unwrap();
+        writer
+            .write_record("survivor", &[0.5, 0.866_025_4])
+            .unwrap();
         writer.write_record("tail", &[-1.0, 0.0]).unwrap();
         writer.finish().unwrap();
         let sealed = fs::read(&path).unwrap();
@@ -97,7 +99,9 @@ mod tests {
             let query = [1.0, 0.0];
             let all = index.search_top_k(&query, 4, None).unwrap();
             assert_eq!(
-                all.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+                all.iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
                 ["survivor", "updated", "tail"]
             );
             assert_eq!(all[1].score.to_bits(), 0.0_f32.to_bits());
@@ -199,21 +203,19 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), main_before);
         assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
         let reopened = VectorIndex::open_read_only(&path).unwrap();
-        assert_eq!(reopened.search_top_k(&[1.0, 0.0], 1, None).unwrap().len(), 1);
+        assert_eq!(
+            reopened.search_top_k(&[1.0, 0.0], 1, None).unwrap().len(),
+            1
+        );
     }
 
     #[test]
     fn ordinary_wal_appends_and_zero_limits_keep_existing_behavior() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ordinary.fsvi");
-        let mut writer = VectorIndex::create_with_revision(
-            &path,
-            "wal-top-k-test",
-            "r1",
-            2,
-            Quantization::F32,
-        )
-        .unwrap();
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "wal-top-k-test", "r1", 2, Quantization::F32)
+                .unwrap();
         writer.write_record("main", &[0.0, 1.0]).unwrap();
         writer.finish().unwrap();
         let mut index = VectorIndex::open(&path).unwrap();
@@ -230,18 +232,15 @@ mod tests {
     fn one_wal_replacement_excludes_every_superseded_physical_row() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("duplicate-main.fsvi");
-        let mut writer = VectorIndex::create_with_revision(
-            &path,
-            "wal-top-k-test",
-            "r1",
-            2,
-            Quantization::F32,
-        )
-        .unwrap();
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "wal-top-k-test", "r1", 2, Quantization::F32)
+                .unwrap();
         for _ in 0..8 {
             writer.write_record("updated", &[1.0, 0.0]).unwrap();
         }
-        writer.write_record("survivor", &[0.5, 0.866_025_4]).unwrap();
+        writer
+            .write_record("survivor", &[0.5, 0.866_025_4])
+            .unwrap();
         writer.finish().unwrap();
         let original = fs::read(&path).unwrap();
         {
@@ -266,14 +265,9 @@ mod tests {
     fn unrelated_wal_does_not_change_main_duplicate_cutoff_policy() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("unchanged-duplicates.fsvi");
-        let mut writer = VectorIndex::create_with_revision(
-            &path,
-            "wal-top-k-test",
-            "r1",
-            2,
-            Quantization::F32,
-        )
-        .unwrap();
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "wal-top-k-test", "r1", 2, Quantization::F32)
+                .unwrap();
         writer.write_record("duplicate", &[1.0, 0.0]).unwrap();
         writer.write_record("duplicate", &[1.0, 0.0]).unwrap();
         writer.write_record("other", &[0.5, 0.866_025_4]).unwrap();
