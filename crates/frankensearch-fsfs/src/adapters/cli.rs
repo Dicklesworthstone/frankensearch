@@ -719,13 +719,17 @@ where
                     });
                 }
                 let value = expect_value(&tokens, idx, "--poll-ms")?;
-                input.daemon_poll_ms = Some(parse_usize(value, "daemon.poll_ms")? as u64);
+                input.daemon_poll_ms = Some(parse_flag_usize(
+                    value,
+                    "cli.daemon.poll_ms",
+                    "--poll-ms expects a non-negative whole number of milliseconds",
+                )? as u64);
                 idx += 2;
             }
             "--idle-timeout-ms" => {
                 let field = match command {
-                    CliCommand::Serve => "serve.idle_timeout_ms",
-                    CliCommand::Daemon => "daemon.idle_timeout_ms",
+                    CliCommand::Serve => "cli.serve.idle_timeout_ms",
+                    CliCommand::Daemon => "cli.daemon.idle_timeout_ms",
                     _ => {
                         return Err(SearchError::InvalidConfig {
                             field: "cli.flag".into(),
@@ -737,7 +741,11 @@ where
                     }
                 };
                 let value = expect_value(&tokens, idx, "--idle-timeout-ms")?;
-                input.daemon_idle_timeout_ms = Some(parse_usize(value, field)? as u64);
+                input.daemon_idle_timeout_ms = Some(parse_flag_usize(
+                    value,
+                    field,
+                    "--idle-timeout-ms expects a non-negative whole number of milliseconds (0 = never)",
+                )? as u64);
                 idx += 2;
             }
             "--stop" => {
@@ -1032,13 +1040,15 @@ fn split_csv(value: &str) -> SearchResult<Vec<String>> {
     Ok(parts)
 }
 
-fn parse_usize(value: &str, field: &str) -> SearchResult<usize> {
+/// Parse a numeric flag value. The error names the flag and a `cli.*` field:
+/// the value came from the command line, so no config file can fix it.
+fn parse_flag_usize(value: &str, field: &str, reason: &str) -> SearchResult<usize> {
     value
         .parse::<usize>()
         .map_err(|_| SearchError::InvalidConfig {
             field: field.into(),
             value: value.into(),
-            reason: "expected unsigned integer".into(),
+            reason: reason.into(),
         })
 }
 
@@ -1046,7 +1056,11 @@ fn parse_search_limit(value: &str) -> SearchResult<usize> {
     if value.eq_ignore_ascii_case("all") {
         return Ok(usize::MAX);
     }
-    parse_usize(value, "search.default_limit")
+    parse_flag_usize(
+        value,
+        "cli.search.limit",
+        "--limit expects a non-negative whole number or `all`",
+    )
 }
 
 #[must_use]
@@ -1361,6 +1375,30 @@ mod tests {
     fn parse_limit_all_alias() {
         let input = parse_cli_args(["search", "query", "--limit", "all"]).unwrap();
         assert_eq!(input.overrides.limit, Some(usize::MAX));
+    }
+
+    #[test]
+    fn malformed_numeric_flags_point_at_the_flag_not_a_config_file() {
+        for args in [
+            vec!["search", "query", "--limit", "-3"],
+            vec!["search", "query", "--limit", "abc"],
+            vec!["daemon", "--poll-ms", "soon"],
+            vec!["serve", "--idle-timeout-ms", "soon"],
+            vec!["daemon", "--idle-timeout-ms", "-1"],
+        ] {
+            let flag = args[args.len() - 2];
+            let error = parse_cli_args(args.clone()).expect_err("malformed value must fail");
+            let rendered = crate::output_schema::output_error_from(&error);
+            let suggestion = rendered.suggestion.unwrap_or_default();
+            assert!(
+                suggestion.starts_with("Check the command line.") && suggestion.contains(flag),
+                "{args:?}: {suggestion}"
+            );
+            assert!(
+                !suggestion.contains("configuration") && !suggestion.contains("fsfs.toml"),
+                "{args:?} blames a config file: {suggestion}"
+            );
+        }
     }
 
     #[test]
