@@ -274,9 +274,13 @@ fn malformed_single_or_late_batch_response_is_rejected_without_disclosure() {
             assert!(!error.to_string().contains("private-canary"));
             inner.responses.lock().unwrap()[0] = invalid;
             let error = cached.embed_bound(&cx, "warm").await.unwrap_err();
-            assert!(matches!(error, SearchError::InvalidConfig { .. }));
+            // Single-query admission rejects the foreign identity before
+            // inspecting its malformed, potentially sensitive response fields.
+            assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
             assert!(!error.to_string().contains("private-canary"));
-            assert_eq!(cached.cache_stats(), before);
+            assert_eq!(cached.cache_stats().entries, before.entries);
+            assert_eq!(cached.cache_stats().hits, before.hits);
+            assert_eq!(cached.cache_stats().misses, before.misses + 1);
         }
     });
 }
@@ -353,8 +357,11 @@ fn cancellation_beats_success_and_backend_error_on_all_four_cache_operations() {
                 };
                 assert!(matches!(result, Err(SearchError::Cancelled { .. })));
                 assert_eq!(cached.cache_stats().entries, before.entries);
-                if operation >= 2 {
+                if operation == 3 {
                     assert_eq!(cached.cache_stats(), before);
+                } else if operation == 2 {
+                    assert_eq!(cached.cache_stats().hits, before.hits);
+                    assert_eq!(cached.cache_stats().misses, before.misses + 1);
                 }
             });
         }
