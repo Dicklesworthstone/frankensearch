@@ -837,6 +837,23 @@ impl AdmittedEmbedder {
         Ok(bound.values)
     }
 
+    /// Embed a batch through the provider's bound batch operation; every
+    /// response must validate and carry the admitted identity. The caller
+    /// checks cancellation and the response count, which the indexing retry
+    /// loop already does after inference.
+    async fn embed_batch_admitted(&self, cx: &Cx, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
+        let responses = self.embedder.embed_batch_bound(cx, texts).await?;
+        let mut values = Vec::with_capacity(responses.len());
+        for response in responses {
+            response.validate()?;
+            if response.identity != self.identity {
+                return Err(self.identity_mismatch("returned a vector from", &response.identity));
+            }
+            values.push(response.values);
+        }
+        Ok(values)
+    }
+
     fn identity_mismatch(
         &self,
         action: &str,
@@ -14872,6 +14889,14 @@ impl FsfsRuntime {
         if let Some(quality_embedder) = quality_embedder.as_ref() {
             Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;
         }
+        // Each generation is stamped with its producer's identity; every
+        // vector stored in it must come from a response bound to that same
+        // identity, so capture it once and hold each batch to it.
+        let fast_admission = AdmittedEmbedder::admit(Arc::clone(&embedder))?;
+        let quality_admission = quality_embedder
+            .as_ref()
+            .map(|embedder| AdmittedEmbedder::admit(Arc::clone(embedder)))
+            .transpose()?;
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
 
         control.checkpoint(cx, "index.artifact_directories", true)?;
@@ -14983,7 +15008,7 @@ impl FsfsRuntime {
         )?;
 
         let mut vector_generation_compatible = false;
-        let embedder_revision = embedder.identity()?.fingerprint();
+        let embedder_revision = fast_admission.identity.fingerprint();
         let mut vector_index = if checkpoint_manifests.is_some() && vector_path.exists() {
             match VectorIndex::open(&vector_path) {
                 Ok(index)
@@ -15041,8 +15066,9 @@ impl FsfsRuntime {
         // generation it belonged to.
         let mut quality_vector_index: Option<VectorIndex> = None;
         let mut initial_live_quality_ids: HashSet<String> = HashSet::new();
-        if let Some(quality_embedder) = quality_embedder.as_ref() {
-            let quality_revision = quality_embedder.identity()?.fingerprint();
+        if let Some(quality_admission) = quality_admission.as_ref() {
+            let quality_embedder = quality_admission.embedder();
+            let quality_revision = quality_admission.identity.fingerprint();
             let reusable = if vector_generation_compatible && quality_vector_path.exists() {
                 match VectorIndex::open(&quality_vector_path) {
                     Ok(index)
@@ -15511,7 +15537,7 @@ impl FsfsRuntime {
                 const RETRY_BACKOFFS_MS: [u64; EMBEDDING_BATCH_MAX_ATTEMPTS - 1] = [200, 400];
                 let batch_outcome = Self::embed_indexing_batch_with_backoffs(
                     cx,
-                    embedder.as_ref(),
+                    &fast_admission,
                     &semantic_texts,
                     &RETRY_BACKOFFS_MS,
                     |retry_number, retry_budget, backoff_ms, error, batch_embedding_elapsed_ms| {
@@ -15620,8 +15646,8 @@ impl FsfsRuntime {
             // The tier is all-or-nothing per generation: if its retry budget
             // is exhausted, the tier is abandoned (never published partial)
             // and the generation finishes fast-only with the reason recorded.
-            if let (Some(quality_embedder), Some(quality_index)) =
-                (quality_embedder.as_ref(), quality_vector_index.as_mut())
+            if let (Some(quality_admission), Some(quality_index)) =
+                (quality_admission.as_ref(), quality_vector_index.as_mut())
             {
                 let quality_docs = chunk_docs
                     .iter()
@@ -15641,7 +15667,7 @@ impl FsfsRuntime {
                         [200, 400];
                     let quality_outcome = Self::embed_indexing_batch_with_backoffs(
                         cx,
-                        quality_embedder.as_ref(),
+                        quality_admission,
                         &quality_texts,
                         &QUALITY_RETRY_BACKOFFS_MS,
                         |retry_number, retry_budget, backoff_ms, error, _elapsed_ms| {
@@ -16513,7 +16539,7 @@ impl FsfsRuntime {
 
     async fn embed_indexing_batch_with_backoffs<'a, F>(
         cx: &'a Cx,
-        embedder: &'a dyn Embedder,
+        admitted: &'a AdmittedEmbedder,
         texts: &'a [&'a str],
         retry_backoffs_ms: &[u64],
         mut on_retry_started: F,
@@ -16547,7 +16573,7 @@ impl FsfsRuntime {
             }
 
             let embed_start = Instant::now();
-            let embeddings_result = embedder.embed_batch(cx, texts).await;
+            let embeddings_result = admitted.embed_batch_admitted(cx, texts).await;
             embedding_elapsed_ms =
                 embedding_elapsed_ms.saturating_add(embed_start.elapsed().as_millis());
             let embeddings_result = match embeddings_result {
@@ -16570,7 +16596,7 @@ impl FsfsRuntime {
                         });
                     }
                     for embedding in &embeddings {
-                        Self::validate_semantic_embedding_vector(embedder, embedding)?;
+                        Self::validate_semantic_embedding_vector(admitted.embedder(), embedding)?;
                     }
                     return Ok(IndexingBatchEmbeddingOutcome::Ready {
                         embeddings,
@@ -25666,6 +25692,12 @@ mod tests {
         super::AdmittedEmbedder::admit(Arc::new(embedder)).expect("test embedder has an identity")
     }
 
+    /// Admit a shared test embedder while the test keeps its handle.
+    fn admitted_shared<E: Embedder + 'static>(embedder: &Arc<E>) -> super::AdmittedEmbedder {
+        super::AdmittedEmbedder::admit(Arc::clone(embedder) as Arc<dyn Embedder>)
+            .expect("test embedder has an identity")
+    }
+
     /// Query vectors are explicit basis vectors; this is a ranking fixture,
     /// not evidence of semantic quality. Retrieval uses actual FSVI files.
     struct BlendQueryEmbedder(&'static str);
@@ -25769,6 +25801,19 @@ mod tests {
                         failure()
                     }
                 }
+            })
+        }
+        fn embed_batch_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<frankensearch_core::IdentityBoundEmbedding>> {
+            Box::pin(async move {
+                let mut responses = Vec::with_capacity(texts.len());
+                for text in texts {
+                    responses.push(self.embed_bound(cx, text).await?);
+                }
+                Ok(responses)
             })
         }
         fn identity(
@@ -25971,6 +26016,57 @@ mod tests {
                 );
                 assert_eq!(response.payloads[0].hits[0].path, "a.rs");
             }
+        });
+    }
+
+    /// GH #55 on `fsfs index`: a batch whose responses carry another identity
+    /// than the generation is stamped with is a permanent error on its first
+    /// attempt, never retried and never handed to the vector writer.
+    #[test]
+    fn indexing_batch_refuses_a_foreign_bound_batch() {
+        run_test_with_cx(|cx| async move {
+            let texts = ["alpha", "beta"];
+            let foreign = ScriptedBoundEmbedder::new(BoundScript::Identity(Box::new(
+                test_identity("another-model-2", 2).clone(),
+            )));
+            let calls = Arc::clone(&foreign.calls);
+            let mut retries = 0_usize;
+            let error = FsfsRuntime::embed_indexing_batch_with_backoffs(
+                &cx,
+                &admitted(foreign),
+                &texts,
+                &[0, 0],
+                |_, _, _, _, _| {
+                    retries += 1;
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("a foreign batch must not become Ready");
+            assert!(
+                matches!(error, SearchError::UnverifiableRemoteSpace { .. }),
+                "{error:?}"
+            );
+            assert_eq!(retries, 0, "an identity mismatch is not transient");
+            assert_eq!(calls.load(Ordering::SeqCst), texts.len(), "one attempt");
+
+            let matching = admitted(ScriptedBoundEmbedder::new(BoundScript::Values(vec![
+                0.6, 0.8,
+            ])));
+            let outcome = FsfsRuntime::embed_indexing_batch_with_backoffs(
+                &cx,
+                &matching,
+                &texts,
+                &[0, 0],
+                |_, _, _, _, _| Ok(()),
+            )
+            .await
+            .expect("a batch under the admitted identity is ready");
+            assert!(matches!(
+                outcome,
+                IndexingBatchEmbeddingOutcome::Ready { ref embeddings, .. }
+                    if embeddings == &vec![vec![0.6, 0.8]; texts.len()]
+            ));
         });
     }
 
@@ -28458,11 +28554,11 @@ mod tests {
     fn indexing_batch_retries_only_transient_failures_with_exact_accounting() {
         run_test_with_cx(|cx| async move {
             let texts = ["alpha", "beta"];
-            let transient = BatchProbeEmbedder::new(BatchProbeBehavior::Transient);
+            let transient = Arc::new(BatchProbeEmbedder::new(BatchProbeBehavior::Transient));
             let mut retry_events = Vec::new();
             let outcome = FsfsRuntime::embed_indexing_batch_with_backoffs(
                 &cx,
-                &transient,
+                &admitted_shared(&transient),
                 &texts,
                 &[0, 0],
                 |retry_number, retry_budget, backoff_ms, error, _elapsed_ms| {
@@ -28486,10 +28582,10 @@ mod tests {
             assert_eq!(retries_executed, 2);
             assert_eq!(retry_events, [(1, 2, 0), (2, 2, 0)]);
 
-            let permanent = BatchProbeEmbedder::new(BatchProbeBehavior::Permanent);
+            let permanent = Arc::new(BatchProbeEmbedder::new(BatchProbeBehavior::Permanent));
             let error = FsfsRuntime::embed_indexing_batch_with_backoffs(
                 &cx,
-                &permanent,
+                &admitted_shared(&permanent),
                 &texts,
                 &[0, 0],
                 |_, _, _, _, _| Ok(()),
@@ -28503,10 +28599,10 @@ mod tests {
             ));
             assert_eq!(permanent.attempts.load(Ordering::Acquire), 1);
 
-            let cancelled = BatchProbeEmbedder::new(BatchProbeBehavior::Cancelled);
+            let cancelled = Arc::new(BatchProbeEmbedder::new(BatchProbeBehavior::Cancelled));
             let error = FsfsRuntime::embed_indexing_batch_with_backoffs(
                 &cx,
-                &cancelled,
+                &admitted_shared(&cancelled),
                 &texts,
                 &[0, 0],
                 |_, _, _, _, _| Ok(()),
@@ -28527,16 +28623,19 @@ mod tests {
     fn indexing_batch_rejects_invalid_vectors_before_ready_or_retry() {
         run_test_with_cx(|cx| async move {
             let texts = ["alpha", "beta"];
-            for behavior in [
-                BatchProbeBehavior::CountMismatch,
-                BatchProbeBehavior::Empty,
-                BatchProbeBehavior::NonFinite,
-                BatchProbeBehavior::ZeroSignal,
+            // The bound batch boundary rejects a wrong count and malformed
+            // values; a finite all-zero vector passes it and is caught by the
+            // indexing check.
+            for (behavior, expected_field) in [
+                (BatchProbeBehavior::CountMismatch, "embedder.batch_length"),
+                (BatchProbeBehavior::Empty, "identity_bound_embedding.values"),
+                (BatchProbeBehavior::NonFinite, "identity_bound_embedding.values"),
+                (BatchProbeBehavior::ZeroSignal, "semantic.embedding_output"),
             ] {
-                let embedder = BatchProbeEmbedder::new(behavior);
+                let embedder = Arc::new(BatchProbeEmbedder::new(behavior));
                 let error = FsfsRuntime::embed_indexing_batch_with_backoffs(
                     &cx,
-                    &embedder,
+                    &admitted_shared(&embedder),
                     &texts,
                     &[0, 0],
                     |_, _, _, _, _| Ok(()),
@@ -28549,8 +28648,7 @@ mod tests {
                         SearchError::InvalidConfig {
                             ref field,
                             ..
-                        } if field == "semantic.embedding_batch"
-                            || field == "semantic.embedding_output"
+                        } if field == expected_field
                     ),
                     "invalid batch output lost its permanent typed error: {error:?}"
                 );
@@ -28561,10 +28659,10 @@ mod tests {
                 );
             }
 
-            let valid = BatchProbeEmbedder::new(BatchProbeBehavior::Valid);
+            let valid = Arc::new(BatchProbeEmbedder::new(BatchProbeBehavior::Valid));
             let outcome = FsfsRuntime::embed_indexing_batch_with_backoffs(
                 &cx,
-                &valid,
+                &admitted_shared(&valid),
                 &texts,
                 &[0, 0],
                 |_, _, _, _, _| Ok(()),
@@ -28591,10 +28689,10 @@ mod tests {
                 BatchProbeBehavior::CancelWithSuccess,
                 BatchProbeBehavior::CancelWithPermanent,
             ] {
-                let embedder = BatchProbeEmbedder::new(behavior);
+                let embedder = Arc::new(BatchProbeEmbedder::new(behavior));
                 let error = FsfsRuntime::embed_indexing_batch_with_backoffs(
                     &cx,
-                    &embedder,
+                    &admitted_shared(&embedder),
                     &texts,
                     &[0, 0],
                     |_, _, _, _, _| Ok(()),
@@ -28602,12 +28700,15 @@ mod tests {
                 .await
                 .expect_err("inference-time cancellation must override non-cancel batch output");
                 cx.set_cancel_requested(false);
-                assert!(matches!(
-                    error,
-                    SearchError::Cancelled { phase, reason }
-                        if phase == "fsfs.semantic_batch_after_inference"
-                            && reason == "runtime cancellation requested"
-                ));
+                // The bound batch boundary observes the cancellation first.
+                assert!(
+                    matches!(
+                        error,
+                        SearchError::Cancelled { ref phase, .. }
+                            if phase == "embedder.embed_batch_bound"
+                    ),
+                    "{error:?}"
+                );
                 assert_eq!(embedder.attempts.load(Ordering::Acquire), 1);
             }
         });
@@ -28617,12 +28718,12 @@ mod tests {
     fn indexing_batch_cancellation_prevents_attempts_and_pending_backoff_retries() {
         run_test_with_cx(|cx| async move {
             let texts = ["alpha"];
-            let never_started = BatchProbeEmbedder::new(BatchProbeBehavior::Transient);
+            let never_started = Arc::new(BatchProbeEmbedder::new(BatchProbeBehavior::Transient));
             let mut pre_attempt_retry_events = 0_usize;
             cx.set_cancel_requested(true);
             let pre_attempt_error = FsfsRuntime::embed_indexing_batch_with_backoffs(
                 &cx,
-                &never_started,
+                &admitted_shared(&never_started),
                 &texts,
                 &[100],
                 |_, _, _, _, _| {
@@ -28642,11 +28743,12 @@ mod tests {
             assert_eq!(never_started.attempts.load(Ordering::Acquire), 0);
             assert_eq!(pre_attempt_retry_events, 0);
 
-            let transient = BatchProbeEmbedder::new(BatchProbeBehavior::Transient);
+            let transient = Arc::new(BatchProbeEmbedder::new(BatchProbeBehavior::Transient));
+            let transient_admission = admitted_shared(&transient);
             let mut pending_backoff_retry_events = 0_usize;
             let mut pending_backoff = Box::pin(FsfsRuntime::embed_indexing_batch_with_backoffs(
                 &cx,
-                &transient,
+                &transient_admission,
                 &texts,
                 &[100],
                 |_, _, _, _, _| {
