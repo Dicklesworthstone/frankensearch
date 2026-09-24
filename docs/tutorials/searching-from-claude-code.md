@@ -37,8 +37,13 @@ handle progress errors and the terminal outcome.
 ```bash
 set -o pipefail
 fsfs search "query classification" --stream --format jsonl \
-  | jq -c 'select(.event == "result") | .payload.item | {rank, path, score}'
+  | jq -c 'select(.event == "result") | .payload.item | {rank, path, line, score}'
 ```
+
+`line` is the 1-based line of the file where the hit's snippet has its first
+query word, so an agent can open `path` at `line` directly. It is absent when
+the hit has no snippet or the file no longer holds that text (for example a
+document added with `append-batch` and never written to disk).
 
 For a two-tier smoke check, retain the stream from a query that has hits and
 verify that both phases actually returned results. Parsing an empty selection
@@ -58,7 +63,20 @@ jq -se '
 ' "$stream_path"
 ```
 
-## 4) Pair with exact text search
+## 4) Keep results small
+
+`--compact` drops the fusion and freshness diagnostics and keeps what an agent
+acts on: `id`, `doc` (path), `s` (score), `r` (0-based rank), `snip` and `line`.
+A 10-hit result shrinks from about 8 KB to 3 KB of JSON:
+
+```bash
+fsfs search "where is rrf fusion implemented" --limit 5 --compact --format json
+fsfs explain R0    # why the first hit ranked where it did
+```
+
+The `id` values are the ones `fsfs explain` accepts for that search.
+
+## 5) Pair with exact text search
 
 Use semantic retrieval first, then `rg` in the narrowed files:
 
@@ -67,7 +85,7 @@ fsfs search "adaptive budgets for short keyword queries" --limit 5
 rg -n "candidate_multiplier|QueryClass" crates/frankensearch-fusion
 ```
 
-## 5) Capture structured artifacts
+## 6) Capture structured artifacts
 
 For deterministic debugging or CI logs:
 
