@@ -28,6 +28,7 @@ use tracing::{instrument, warn};
 
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
 use frankensearch_core::traits::LexicalRead;
 use frankensearch_core::traits::{Embedder, MetricsExporter};
 use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, IndexableDocument};
@@ -341,6 +342,13 @@ impl IndexBuilder {
     }
 
     /// Use a specific embedder stack instead of auto-detecting.
+    ///
+    /// Identity-aware producers are checked on every bound embedding response
+    /// and again before publication. Existing custom producers whose default
+    /// `identity()` reports `embedder.identity` remain on the explicit legacy
+    /// v1 build path: their raw vectors receive no identity or attestation.
+    /// Any other identity failure aborts the build; a declared identity can
+    /// never fall back to raw inference or be silently replaced mid-build.
     #[must_use]
     pub fn with_embedder_stack(mut self, stack: EmbedderStack) -> Self {
         self.embedder_stack = Some(stack);
@@ -552,6 +560,21 @@ impl IndexBuilder {
             }
         });
 
+        // Capture each producer independently before allocating a writer.
+        // These exact values bind both the persisted header and every accepted
+        // response; consulting only identity() before inference would let a
+        // provider return foreign vectors under an unchanged advertised label.
+        let identities = BuildEmbeddingIdentities {
+            fast: capture_build_identity(fast_embedder.as_ref(), "fast")
+                .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?,
+            quality: quality_embedder
+                .as_ref()
+                .map(|embedder| capture_build_identity(embedder.as_ref(), "quality"))
+                .transpose()
+                .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?
+                .flatten(),
+        };
+
         // Create index builder.
         let mut index_builder = match TwoTierIndex::create(&self.data_dir, self.config) {
             Ok(builder) => builder,
@@ -564,47 +587,15 @@ impl IndexBuilder {
         if let Some(ref qe) = quality_embedder {
             index_builder.set_quality_embedder_id(qe.id());
         }
-        // bd-9xuj T2-C2: the warning above promises the written vectors carry
-        // this embedder's identity — perform that binding for real. When the
-        // embedder supplies its complete identity bundle, thread it through
-        // the builder so the built index carries the typed producing identity
-        // (validated, dimension-checked at finish) and its header revision,
-        // not just the id string. A legacy embedder without a bundle stays a
-        // typed legacy-unidentified build: absence is routed, never
-        // fabricated from id strings.
-        match fast_embedder.identity() {
-            Ok(identity) => {
-                if let Err(error) = index_builder.set_fast_identity(identity) {
-                    export_error(metrics_exporter.as_ref(), &error);
-                    return Err(error);
-                }
-            }
-            Err(reason) => {
-                tracing::debug!(
-                    fast_embedder = %fast_embedder.id(),
-                    %reason,
-                    "fast embedder supplies no identity bundle; this generation is \
-                     built legacy-unidentified"
-                );
-            }
+        if let Some(identity) = &identities.fast {
+            index_builder
+                .set_fast_identity(identity)
+                .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?;
         }
-        if let Some(ref qe) = quality_embedder {
-            match qe.identity() {
-                Ok(identity) => {
-                    if let Err(error) = index_builder.set_quality_identity(identity) {
-                        export_error(metrics_exporter.as_ref(), &error);
-                        return Err(error);
-                    }
-                }
-                Err(reason) => {
-                    tracing::debug!(
-                        quality_embedder = %qe.id(),
-                        %reason,
-                        "quality embedder supplies no identity bundle; this generation's \
-                         quality tier is built legacy-unidentified"
-                    );
-                }
-            }
+        if let Some(identity) = &identities.quality {
+            index_builder
+                .set_quality_identity(identity)
+                .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?;
         }
 
         let total = self.documents.len();
@@ -631,6 +622,7 @@ impl IndexBuilder {
                         cx,
                         &fast_embedder,
                         quality_embedder.as_deref(),
+                        &identities,
                         &mut index_builder,
                         doc,
                         metrics_exporter.as_ref(),
@@ -644,7 +636,10 @@ impl IndexBuilder {
                             doc_count += 1;
                             lexical_docs.push(doc.clone());
                         }
-                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                        Err(
+                            error @ (SearchError::Cancelled { .. }
+                            | SearchError::UnverifiableRemoteSpace { .. }),
+                        ) => return Err(error),
                         Err(err) => {
                             tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                             errors.push((doc.id.clone(), err.to_string()));
@@ -672,6 +667,7 @@ impl IndexBuilder {
                         cx,
                         &fast_embedder,
                         quality_embedder.as_deref(),
+                        &identities,
                         &mut index_builder,
                         &doc,
                         metrics_exporter.as_ref(),
@@ -687,7 +683,10 @@ impl IndexBuilder {
                             }
                             lexical_docs.push(doc);
                         }
-                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                        Err(
+                            error @ (SearchError::Cancelled { .. }
+                            | SearchError::UnverifiableRemoteSpace { .. }),
+                        ) => return Err(error),
                         Err(err) => {
                             tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                             errors.push((doc.id.clone(), err.to_string()));
@@ -726,6 +725,7 @@ impl IndexBuilder {
                         cx,
                         &fast_embedder,
                         quality_embedder.as_deref(),
+                        &identities,
                         &mut index_builder,
                         &doc,
                         metrics_exporter.as_ref(),
@@ -741,7 +741,10 @@ impl IndexBuilder {
                             }
                             lexical_docs.push(doc);
                         }
-                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                        Err(
+                            error @ (SearchError::Cancelled { .. }
+                            | SearchError::UnverifiableRemoteSpace { .. }),
+                        ) => return Err(error),
                         Err(err) => {
                             tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                             errors.push((doc.id.clone(), err.to_string()));
@@ -775,6 +778,7 @@ impl IndexBuilder {
                     cx,
                     &fast_embedder,
                     quality_embedder.as_deref(),
+                    &identities,
                     &mut index_builder,
                     doc,
                     metrics_exporter.as_ref(),
@@ -789,7 +793,10 @@ impl IndexBuilder {
                             quality_indexed += 1;
                         }
                     }
-                    Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                    Err(
+                        error @ (SearchError::Cancelled { .. }
+                        | SearchError::UnverifiableRemoteSpace { .. }),
+                    ) => return Err(error),
                     Err(err) => {
                         tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                         errors.push((doc.id.clone(), err.to_string()));
@@ -853,6 +860,13 @@ impl IndexBuilder {
             build_checkpoint(cx, "vector index finalize")?;
         }
 
+        validate_build_producer(fast_embedder.as_ref(), identities.fast.as_ref(), "fast")
+            .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?;
+        if let Some(embedder) = quality_embedder.as_ref() {
+            validate_build_producer(embedder.as_ref(), identities.quality.as_ref(), "quality")
+                .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?;
+        }
+        build_checkpoint(cx, "vector index producer admission")?;
         let _index = match index_builder.finish() {
             Ok(index) => index,
             Err(error) => {
@@ -969,6 +983,7 @@ impl IndexBuilder {
         cx: &Cx,
         fast_embedder: &Arc<dyn Embedder>,
         quality_embedder: Option<&dyn Embedder>,
+        identities: &BuildEmbeddingIdentities,
         builder: &mut TwoTierIndexBuilder,
         doc: &IndexableDocument,
         metrics_exporter: Option<&Arc<dyn MetricsExporter>>,
@@ -978,7 +993,15 @@ impl IndexBuilder {
         // Fast embedding (required).
         build_checkpoint(cx, "fast document embedding")?;
         let fast_start = Instant::now();
-        let fast_vec = match fast_embedder.embed(cx, text).await {
+        let fast_vec = match embed_build_document(
+            cx,
+            fast_embedder.as_ref(),
+            identities.fast.as_ref(),
+            "fast",
+            text,
+        )
+        .await
+        {
             Ok(fast_vec) => {
                 let duration_ms = fast_start.elapsed().as_secs_f64() * 1000.0;
                 export_embedding_completed(metrics_exporter, fast_embedder.as_ref(), duration_ms);
@@ -996,14 +1019,17 @@ impl IndexBuilder {
         if let Some(qe) = quality_embedder {
             build_checkpoint(cx, "quality document embedding")?;
             let quality_start = Instant::now();
-            match qe.embed(cx, text).await {
+            match embed_build_document(cx, qe, identities.quality.as_ref(), "quality", text).await {
                 Ok(quality_vec) => {
                     build_checkpoint(cx, "quality document embedding completion")?;
                     let duration_ms = quality_start.elapsed().as_secs_f64() * 1000.0;
                     export_embedding_completed(metrics_exporter, qe, duration_ms);
                     builder.add_quality_record(&doc.id, &quality_vec)?;
                 }
-                Err(error @ SearchError::Cancelled { .. }) => {
+                Err(
+                    error @ (SearchError::Cancelled { .. }
+                    | SearchError::UnverifiableRemoteSpace { .. }),
+                ) => {
                     export_error(metrics_exporter, &error);
                     return Err(error);
                 }
@@ -1021,6 +1047,122 @@ impl IndexBuilder {
 
         Ok(None)
     }
+}
+
+struct BuildEmbeddingIdentities {
+    fast: Option<EmbeddingIdentityBundleV1>,
+    quality: Option<EmbeddingIdentityBundleV1>,
+}
+
+fn missing_build_identity(error: &SearchError) -> bool {
+    matches!(error, SearchError::InvalidConfig { field, .. } if field == "embedder.identity")
+}
+
+fn capture_build_identity(
+    embedder: &dyn Embedder,
+    tier: &'static str,
+) -> SearchResult<Option<EmbeddingIdentityBundleV1>> {
+    match embedder.identity() {
+        Ok(identity) => {
+            identity.validate()?;
+            if usize::try_from(identity.space.dimension).ok() != Some(embedder.dimension()) {
+                return Err(SearchError::InvalidConfig {
+                    field: format!("{tier}_identity.space.dimension"),
+                    value: identity.space.dimension.to_string(),
+                    reason: "declared identity does not describe the producer's vector dimension"
+                        .to_owned(),
+                });
+            }
+            if identity.storage.quantization != QuantizationFormat::F32
+                || !identity.storage.format.starts_with("in-memory-")
+                || !matches!(
+                    identity.storage.endianness.as_str(),
+                    "native-f32-values" | "native-test-only"
+                )
+            {
+                return Err(SearchError::InvalidConfig {
+                    field: format!("{tier}_identity.storage"),
+                    value: "output_contract".to_owned(),
+                    reason: "embedding producers must declare an in-memory f32 output contract"
+                        .to_owned(),
+                });
+            }
+            Ok(Some(identity.clone()))
+        }
+        // Preserve only the pre-existing explicit legacy custom-embedder path.
+        // This does not recover from a malformed or rejected declared identity,
+        // and none of its raw vectors acquire typed identity or attestation.
+        Err(error) if missing_build_identity(&error) => {
+            tracing::debug!(
+                tier,
+                "building explicit legacy-unidentified custom embeddings"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_build_producer(
+    embedder: &dyn Embedder,
+    expected: Option<&EmbeddingIdentityBundleV1>,
+    tier: &'static str,
+) -> SearchResult<()> {
+    let unchanged = match (expected, embedder.identity()) {
+        (Some(expected), Ok(actual)) => {
+            actual == expected
+                && usize::try_from(expected.space.dimension).ok() == Some(embedder.dimension())
+        }
+        (None, Err(error)) => missing_build_identity(&error),
+        _ => false,
+    };
+    if !unchanged {
+        return Err(SearchError::UnverifiableRemoteSpace {
+            producer: format!("index_builder.{tier}"),
+            reason: "producer identity changed after build admission".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+async fn embed_build_document(
+    cx: &Cx,
+    embedder: &dyn Embedder,
+    identity: Option<&EmbeddingIdentityBundleV1>,
+    tier: &'static str,
+    text: &str,
+) -> SearchResult<Vec<f32>> {
+    validate_build_producer(embedder, identity, tier)?;
+    let completion_phase = match tier {
+        "fast" => "fast document embedding completion",
+        _ => "quality document embedding completion",
+    };
+    let values = if let Some(expected) = identity {
+        let response = embedder.embed_bound(cx, text).await;
+        // Preserve an already-typed cancellation; otherwise caller cancellation
+        // wins before validating or accepting a late response or provider error.
+        if !matches!(&response, Err(SearchError::Cancelled { .. })) {
+            build_checkpoint(cx, completion_phase)?;
+        }
+        let bound = response?;
+        if &bound.identity != expected {
+            return Err(SearchError::UnverifiableRemoteSpace {
+                producer: format!("index_builder.{tier}"),
+                reason: "embedding response does not carry the admitted producer identity"
+                    .to_owned(),
+            });
+        }
+        bound.validate()?;
+        bound.values
+    } else {
+        let response = embedder.embed(cx, text).await;
+        if !matches!(&response, Err(SearchError::Cancelled { .. })) {
+            build_checkpoint(cx, completion_phase)?;
+        }
+        response?
+    };
+    validate_build_producer(embedder, identity, tier)?;
+    Ok(values)
 }
 
 fn build_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
@@ -1635,10 +1777,9 @@ impl std::fmt::Debug for IndexBuilder {
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    #[cfg(not(any(feature = "lexical", feature = "quill")))]
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[cfg(not(any(feature = "lexical", feature = "quill")))]
     use asupersync::types::CancelKind;
@@ -2182,6 +2323,164 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum BoundBuildFault {
+        None,
+        ForeignIdentity,
+        MalformedForeignIdentity,
+        ChangedProducer,
+        NonFinite,
+        WrongDimension,
+        CancelWithError,
+        RejectIdentity,
+        PersistedOutputContract,
+    }
+
+    struct BoundBuildEmbedder {
+        inner: IdentityStubEmbedder,
+        fault: BoundBuildFault,
+        changed_identity: EmbeddingIdentityBundleV1,
+        changed: AtomicBool,
+        raw_calls: AtomicUsize,
+        bound_calls: AtomicUsize,
+    }
+
+    impl BoundBuildEmbedder {
+        fn new(id: &'static str, dim: usize, fault: BoundBuildFault) -> Self {
+            let mut inner = IdentityStubEmbedder::new(id, dim);
+            if fault == BoundBuildFault::PersistedOutputContract {
+                "fsvi-v2".clone_into(&mut inner.identity.storage.format);
+                inner.identity.storage.quantization = QuantizationFormat::F16;
+                "little-endian".clone_into(&mut inner.identity.storage.endianness);
+                inner.identity.validate().unwrap();
+            }
+            let mut changed_identity = inner.identity.clone();
+            changed_identity
+                .producer
+                .implementation_revision
+                .push_str("-changed");
+            Self {
+                inner,
+                fault,
+                changed_identity,
+                changed: AtomicBool::new(false),
+                raw_calls: AtomicUsize::new(0),
+                bound_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Embedder for BoundBuildEmbedder {
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            if self.fault == BoundBuildFault::RejectIdentity {
+                return Err(SearchError::UnverifiableRemoteSpace {
+                    producer: self.id().to_owned(),
+                    reason: "injected producer trust refusal".to_owned(),
+                });
+            }
+            if self.changed.load(Ordering::SeqCst) {
+                Ok(&self.changed_identity)
+            } else {
+                self.inner.identity()
+            }
+        }
+
+        fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.raw_calls.fetch_add(1, Ordering::SeqCst);
+            // Raw inference deliberately succeeds: only callers of the real
+            // bound operation can observe the injected provider failures.
+            self.inner.embed(cx, text)
+        }
+
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, frankensearch_core::IdentityBoundEmbedding> {
+            Box::pin(async move {
+                self.bound_calls.fetch_add(1, Ordering::SeqCst);
+                let mut bound = self.inner.embed_bound(cx, text).await?;
+                if text == "fault-trigger" {
+                    match self.fault {
+                        BoundBuildFault::ForeignIdentity => {
+                            bound.identity = self.changed_identity.clone();
+                        }
+                        BoundBuildFault::MalformedForeignIdentity => {
+                            bound.identity.space.dimension = 0;
+                        }
+                        BoundBuildFault::ChangedProducer => {
+                            self.changed.store(true, Ordering::SeqCst);
+                        }
+                        BoundBuildFault::NonFinite => bound.values[0] = f32::NAN,
+                        BoundBuildFault::WrongDimension => {
+                            bound.values.pop();
+                        }
+                        BoundBuildFault::CancelWithError => {
+                            cx.set_cancel_requested(true);
+                            return Err(SearchError::EmbeddingFailed {
+                                model: self.id().to_owned(),
+                                source: "cancelled provider failure".into(),
+                            });
+                        }
+                        BoundBuildFault::None
+                        | BoundBuildFault::RejectIdentity
+                        | BoundBuildFault::PersistedOutputContract => {}
+                    }
+                }
+                Ok(bound)
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            self.inner.category()
+        }
+    }
+
+    fn bound_build_stack(
+        fault_tier: &str,
+        fault: BoundBuildFault,
+    ) -> (
+        EmbedderStack,
+        Arc<BoundBuildEmbedder>,
+        Arc<BoundBuildEmbedder>,
+    ) {
+        let fast = Arc::new(BoundBuildEmbedder::new(
+            "bound-fast",
+            4,
+            if fault_tier == "fast" {
+                fault
+            } else {
+                BoundBuildFault::None
+            },
+        ));
+        let quality = Arc::new(BoundBuildEmbedder::new(
+            "bound-quality",
+            6,
+            if fault_tier == "quality" {
+                fault
+            } else {
+                BoundBuildFault::None
+            },
+        ));
+        let stack = EmbedderStack::from_parts(
+            Arc::clone(&fast) as Arc<dyn Embedder>,
+            Some(Arc::clone(&quality) as Arc<dyn Embedder>),
+        );
+        (stack, fast, quality)
+    }
+
     fn fast_only_stack() -> EmbedderStack {
         let fast = Arc::new(StubEmbedder {
             id: "stub-fast",
@@ -2417,7 +2716,7 @@ mod tests {
     /// previously succeeded now fails when an embedder's declared identity
     /// does not describe the vectors it actually emits. Pin the failure:
     /// declared space dimension 8, emitted vectors dimension 4 →
-    /// `TwoTierIndexBuilder::finish` rejects with typed `InvalidConfig` at
+    /// Producer admission rejects with typed `InvalidConfig` at
     /// `fast_identity.space.dimension` — never a panic, and never an index
     /// carrying an identity that lies about its vectors.
     #[test]
@@ -2425,7 +2724,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             // Emits 4-dim vectors but declares an 8-dim space: exactly the
-            // self-inconsistent embedder the finish()-time check exists for.
+            // self-inconsistent embedder rejected before inference or writing.
             let lying = IdentityStubEmbedder {
                 id: "identity-lying-fast",
                 dim: 4,
@@ -2460,6 +2759,196 @@ mod tests {
                  (value 8, refusing an identity that does not describe the \
                  written vectors), got {error:?}"
             );
+        });
+    }
+
+    #[test]
+    fn build_bound_response_identity_and_cancellation_failures_preserve_persisted_generation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tier in ["fast", "quality"] {
+                for fault in [
+                    BoundBuildFault::ForeignIdentity,
+                    BoundBuildFault::MalformedForeignIdentity,
+                    BoundBuildFault::ChangedProducer,
+                    BoundBuildFault::CancelWithError,
+                ] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let (seed, _, _) = bound_build_stack("", BoundBuildFault::None);
+                    IndexBuilder::new(dir.path())
+                        .with_embedder_stack(seed)
+                        .add_document("retained", "previous complete document")
+                        .build(&cx)
+                        .await
+                        .unwrap();
+                    let before = [VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME]
+                        .map(|name| (name, std::fs::read(dir.path().join(name)).unwrap()));
+                    let (stack, fast, quality) = bound_build_stack(tier, fault);
+                    let error = IndexBuilder::new(dir.path())
+                        .with_embedder_stack(stack)
+                        .add_document("accepted", "valid first document")
+                        .add_document("rejected", "fault-trigger")
+                        .build(&cx)
+                        .await
+                        .unwrap_err();
+                    cx.set_cancel_requested(false);
+                    if fault == BoundBuildFault::CancelWithError {
+                        assert!(matches!(error, SearchError::Cancelled { .. }));
+                    } else {
+                        assert!(
+                            matches!(error, SearchError::UnverifiableRemoteSpace { producer, .. }
+                            if producer == format!("index_builder.{tier}"))
+                        );
+                    }
+                    assert_eq!(fast.raw_calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(quality.raw_calls.load(Ordering::SeqCst), 0);
+                    let faulty = if tier == "fast" { &fast } else { &quality };
+                    assert_eq!(faulty.bound_calls.load(Ordering::SeqCst), 2);
+                    for (name, bytes) in &before {
+                        assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), *bytes);
+                    }
+                    let reopened =
+                        TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+                    assert_eq!(reopened.doc_count(), 1);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn build_bound_response_validation_keeps_only_usable_vectors_and_truthful_coverage() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tier in ["fast", "quality"] {
+                for fault in [BoundBuildFault::NonFinite, BoundBuildFault::WrongDimension] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let (stack, fast, quality) = bound_build_stack(tier, fault);
+                    let stats = IndexBuilder::new(dir.path())
+                        .with_embedder_stack(stack)
+                        .add_document("accepted", "valid first document")
+                        .add_document("rejected", "fault-trigger")
+                        .build(&cx)
+                        .await
+                        .unwrap();
+                    assert_eq!(stats.quality_indexed, 1);
+                    assert_eq!(stats.error_count, usize::from(tier == "fast"));
+                    assert_eq!(stats.quality_errors.len(), usize::from(tier == "quality"));
+                    assert_eq!(stats.doc_count, if tier == "fast" { 1 } else { 2 });
+                    assert_eq!(fast.raw_calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(quality.raw_calls.load(Ordering::SeqCst), 0);
+                    let path = dir.path().join(if tier == "fast" {
+                        VECTOR_INDEX_FAST_FILENAME
+                    } else {
+                        VECTOR_INDEX_QUALITY_FILENAME
+                    });
+                    let index = frankensearch_index::VectorIndex::open_read_only(&path).unwrap();
+                    assert_eq!(index.record_count(), 1);
+                    assert_eq!(index.doc_id_at(0).unwrap(), "accepted");
+                    assert!(
+                        index
+                            .vector_at_f32(0)
+                            .unwrap()
+                            .iter()
+                            .all(|value| value.is_finite())
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn build_rechecks_both_producers_after_final_progress_callback() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tier in ["fast", "quality"] {
+                let dir = tempfile::tempdir().unwrap();
+                let (stack, fast, quality) = bound_build_stack("", BoundBuildFault::None);
+                let changed = if tier == "fast" {
+                    Arc::clone(&fast)
+                } else {
+                    Arc::clone(&quality)
+                };
+                let error = IndexBuilder::new(dir.path())
+                    .with_embedder_stack(stack)
+                    .with_progress(move |progress| {
+                        if progress.completed == progress.total {
+                            changed.changed.store(true, Ordering::SeqCst);
+                        }
+                    })
+                    .add_document("document", "all inference completed successfully")
+                    .build(&cx)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, SearchError::UnverifiableRemoteSpace { producer, .. }
+                    if producer == format!("index_builder.{tier}"))
+                );
+                assert_eq!(fast.bound_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(quality.bound_calls.load(Ordering::SeqCst), 1);
+                assert!(!dir.path().join(VECTOR_INDEX_FAST_FILENAME).exists());
+                assert!(!dir.path().join(VECTOR_INDEX_QUALITY_FILENAME).exists());
+            }
+        });
+    }
+
+    #[test]
+    fn build_identity_refusal_cannot_fall_back_to_raw_inference() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tier in ["fast", "quality"] {
+                let dir = tempfile::tempdir().unwrap();
+                let (stack, fast, quality) =
+                    bound_build_stack(tier, BoundBuildFault::RejectIdentity);
+                let error = IndexBuilder::new(dir.path())
+                    .with_embedder_stack(stack)
+                    .add_document("document", "must not be embedded")
+                    .build(&cx)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+                for embedder in [&fast, &quality] {
+                    assert_eq!(embedder.raw_calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(embedder.bound_calls.load(Ordering::SeqCst), 0);
+                }
+                assert!(!dir.path().join(VECTOR_INDEX_FAST_FILENAME).exists());
+                assert!(!dir.path().join(VECTOR_INDEX_QUALITY_FILENAME).exists());
+            }
+        });
+    }
+
+    #[test]
+    fn build_rejects_persisted_output_contract_before_inference_or_generation_replacement() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tier in ["fast", "quality"] {
+                let dir = tempfile::tempdir().unwrap();
+                let (seed, _, _) = bound_build_stack("", BoundBuildFault::None);
+                IndexBuilder::new(dir.path())
+                    .with_embedder_stack(seed)
+                    .add_document("retained", "previous complete document")
+                    .build(&cx)
+                    .await
+                    .unwrap();
+                let before = [VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME]
+                    .map(|name| (name, std::fs::read(dir.path().join(name)).unwrap()));
+                let (stack, fast, quality) =
+                    bound_build_stack(tier, BoundBuildFault::PersistedOutputContract);
+                let error = IndexBuilder::new(dir.path())
+                    .with_embedder_stack(stack)
+                    .add_document("replacement", "must not be embedded")
+                    .build(&cx)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, value, .. }
+                    if field == format!("{tier}_identity.storage") && value == "output_contract")
+                );
+                for embedder in [&fast, &quality] {
+                    assert_eq!(embedder.raw_calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(embedder.bound_calls.load(Ordering::SeqCst), 0);
+                }
+                for (name, bytes) in &before {
+                    assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), *bytes);
+                }
+                let reopened = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+                assert_eq!(reopened.doc_count(), 1);
+                assert!(reopened.has_quality_index());
+            }
         });
     }
 
