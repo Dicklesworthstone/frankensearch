@@ -9041,7 +9041,10 @@ impl FsfsRuntime {
                 source: Box::new(source),
             }
         })?;
-        write_durable(path, json)?;
+        // The session only lets `fsfs explain` name the last search's hits; a
+        // crash that loses it costs one re-run. Two fsyncs per search did cost
+        // every daemon-backed `fsfs search` two journal commits.
+        write_replace(path, json)?;
         Ok(())
     }
 
@@ -9117,7 +9120,11 @@ impl FsfsRuntime {
         let mut session = serde_json::from_str::<ExplainSession>(&raw).map_err(|source| {
             SearchError::SubsystemError {
                 subsystem: "fsfs.explain.session",
-                source: Box::new(source),
+                // Written without fsync (a convenience record), so an OS crash
+                // can leave it empty or cut short.
+                source: Box::new(std::io::Error::other(format!(
+                    "the saved context of the last search is unreadable ({source}); run the search again, then explain"
+                ))),
             }
         })?;
         session.remap_hash_control_ranks();
@@ -25226,7 +25233,18 @@ const fn degradation_controller_config_for_profile(
 /// Used for metadata whose partial publication would make a durable index
 /// generation ambiguous after a crash.
 fn write_durable(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let path = path.as_ref();
+    write_through_temporary(path.as_ref(), data.as_ref(), true)
+}
+
+/// Atomically replace `path` with `data` without forcing it to disk: readers see
+/// the old bytes or the new ones, never a mix, but an OS crash or power loss soon
+/// after may keep the old file or leave an empty one. Only for records that are
+/// cheap to recreate and read defensively.
+fn write_replace(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    write_through_temporary(path.as_ref(), data.as_ref(), false)
+}
+
+fn write_through_temporary(path: &Path, data: &[u8], durable: bool) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
@@ -25246,11 +25264,15 @@ fn write_durable(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Res
         .prefix(&format!(".{file_name}."))
         .suffix(".tmp")
         .tempfile_in(parent)?;
-    temporary.write_all(data.as_ref())?;
-    temporary.as_file().sync_all()?;
+    temporary.write_all(data)?;
+    if durable {
+        temporary.as_file().sync_all()?;
+    }
     temporary.persist(path).map_err(|error| error.error)?;
     #[cfg(unix)]
-    fs::File::open(parent)?.sync_all()?;
+    if durable {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -42977,6 +42999,35 @@ mod tests {
         assert_eq!(
             error.suggestion.as_deref(),
             Some("reinstall and verify the fast model")
+        );
+    }
+
+    #[test]
+    fn write_replace_swaps_whole_files_and_leaves_no_temporaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        super::write_replace(&path, b"first").unwrap();
+        super::write_replace(&path, b"second, longer").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second, longer");
+        let names = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [std::ffi::OsString::from("record.json")]);
+    }
+
+    #[test]
+    fn an_unreadable_explain_session_asks_for_a_new_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(super::FSFS_EXPLAIN_SESSION_FILE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // What an OS crash can leave behind a write that was never fsynced.
+        fs::write(&path, b"").unwrap();
+        let error = FsfsRuntime::load_explain_session_at_root(dir.path())
+            .expect_err("an empty session is not a session");
+        assert!(
+            error.to_string().contains("run the search again"),
+            "{error}"
         );
     }
 

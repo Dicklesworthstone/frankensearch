@@ -258,6 +258,17 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **A warm `fsfs search` no longer waits on two fsyncs.** Every search saves
+  its hits so `fsfs explain` can name them, and that small file was written
+  with an fsync of the file and of its directory: two journal commits on
+  every call, more than half the wall time of a warm daemon-backed search.
+  It is now replaced atomically without fsync (the answer cache was never
+  fsynced); an OS crash can lose it, which costs one re-run, and an
+  unreadable one now says to run the search again. Same-source A/B at load
+  ~11, 120 calls per arm: median 47.4 -> 20.0 ms and 38.8 -> 20.5 ms in
+  two runs, p90 64.6 -> 27.3 ms; the A/A null moved 1.5 and 0.01 ms
+  (bd-fwa96).
+
 - **A query that runs lexical-only says so.** The planner runs a query over
   4,096 characters, or one holding a control character, lexical-only and
   without refinement, and a low-signal one without refinement. The answer
