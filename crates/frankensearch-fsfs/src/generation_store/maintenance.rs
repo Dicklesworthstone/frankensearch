@@ -163,7 +163,44 @@ impl CompleteGenerationStore {
         self.flush_with_sync(cx, sync_directory)
     }
 
+    /// Confirm durability only while the exact receipted generation is selected.
+    ///
+    /// Unlike [`Self::flush_selected`], this binds confirmation to the caller's
+    /// expected generation, including its store path, ID and manifest digest.
+    /// The comparison happens under publication ownership, before artifact sync,
+    /// so a concurrent publisher cannot redirect the confirmation to a successor.
+    /// Reopen a trusted receipt with [`Self::open_retained`] after process restart.
+    ///
+    /// No selection is written, no generation is created or deleted, and no model
+    /// is loaded. This confirms filesystem durability, not semantic readiness or
+    /// a drained watcher queue. A superseded target requires a new explicit
+    /// decision; it is never republished merely to make confirmation succeed.
+    ///
+    /// # Errors
+    /// Returns contention, changed/foreign/absent/corrupt selection, I/O or
+    /// cancellation errors. Final-sync failure retains the visible-uncertain
+    /// outcome; success is bound to the expected generation at the barrier.
+    pub fn confirm_retained_durability(
+        &self,
+        cx: &Cx,
+        expected: &PublishedGeneration,
+    ) -> SearchResult<GenerationPublication> {
+        self.flush_with_expected_sync(cx, Some(expected), sync_directory)
+    }
+
     fn flush_with_sync<S>(&self, cx: &Cx, final_sync: S) -> SearchResult<GenerationPublication>
+    where
+        S: FnOnce(&Path) -> io::Result<()>,
+    {
+        self.flush_with_expected_sync(cx, None, final_sync)
+    }
+
+    fn flush_with_expected_sync<S>(
+        &self,
+        cx: &Cx,
+        expected_generation: Option<&PublishedGeneration>,
+        final_sync: S,
+    ) -> SearchResult<GenerationPublication>
     where
         S: FnOnce(&Path) -> io::Result<()>,
     {
@@ -177,6 +214,12 @@ impl CompleteGenerationStore {
                 "no complete generation is selected; nothing can be flushed",
             )
         })?;
+        if expected_generation.is_some_and(|expected| expected != &generation) {
+            return Err(invalid(
+                &self.root,
+                "selected generation differs from the trusted durability target; no confirmation was performed",
+            ));
+        }
         sync_tree(cx, generation.path(), 0)?;
         sync_directory(&self.root.join(GENERATIONS))?;
         open_regular(&self.root.join(COMPLETE_GENERATION_POINTER))?.sync_all()?;
@@ -320,3 +363,126 @@ fn stage_restore_pointer(cx: &Cx, root: &Path, bytes: &[u8]) -> SearchResult<std
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod receipt_durability_tests {
+    use super::*;
+    use asupersync::test_utils::run_test_with_cx;
+    use std::os::unix::fs::MetadataExt;
+
+    // Container-level durability fixtures, not semantic readiness evidence.
+    fn publish(store: &CompleteGenerationStore, cx: &Cx, body: &[u8]) -> PublishedGeneration {
+        let build = store.begin(cx).unwrap();
+        fs::write(build.path().join("payload"), body).unwrap();
+        let GenerationPublication::Durable(generation) =
+            build.publish(cx, |_, _| Ok(())).unwrap()
+        else {
+            panic!("fixture publication must be durable"); // ubs:ignore — test assertion.
+        };
+        generation
+    }
+
+    #[test]
+    fn confirmation_binds_exact_selected_identity_before_sync() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let old = publish(&store, &cx, b"old");
+            let new = publish(&store, &cx, b"new");
+            let pointer = directory.path().join(COMPLETE_GENERATION_POINTER);
+            let before = fs::read(&pointer).unwrap();
+            let inode = fs::metadata(&pointer).unwrap().ino();
+            let mut sync_called = false;
+            assert!(store.flush_with_expected_sync(&cx, Some(&old), |_| {
+                sync_called = true;
+                Ok(())
+            }).is_err());
+            assert!(!sync_called);
+            assert!(store.confirm_retained_durability(&cx, &old).is_err());
+            let mut foreign = new.clone();
+            foreign.path = directory.path().join("foreign-store").join(new.id());
+            assert!(store.confirm_retained_durability(&cx, &foreign).is_err());
+            assert!(matches!(
+                store.confirm_retained_durability(&cx, &new).unwrap(),
+                GenerationPublication::Durable(value) if value == new
+            ));
+            assert_eq!(fs::read(&pointer).unwrap(), before);
+            assert_eq!(fs::metadata(&pointer).unwrap().ino(), inode);
+            assert_eq!(fs::read(old.path().join("payload")).unwrap(), b"old");
+            assert_eq!(fs::read(new.path().join("payload")).unwrap(), b"new");
+            assert_eq!(fs::read_dir(directory.path().join(GENERATIONS)).unwrap().count(), 2);
+        });
+    }
+
+    #[test]
+    fn uncertain_restore_is_confirmed_without_republishing_after_reopen() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let old = publish(&store, &cx, b"old");
+            let _new = publish(&store, &cx, b"new");
+            let plan = store.prepare_restore(&cx, &old).unwrap();
+            assert!(matches!(
+                plan.restore_with_sync(&cx, |_, _| Ok(()), |_| Err(io::Error::other("injected sync failure"))).unwrap(),
+                GenerationPublication::VisibleButDurabilityUncertain { .. }
+            ));
+            let pointer = directory.path().join(COMPLETE_GENERATION_POINTER);
+            let before = fs::read(&pointer).unwrap();
+            let inode = fs::metadata(&pointer).unwrap().ino();
+            let reopened = CompleteGenerationStore::open(&cx, directory.path()).unwrap();
+            let expected = reopened.open_retained(&cx, old.id(), old.manifest_sha256()).unwrap();
+            let uncertain = reopened.flush_with_expected_sync(&cx, Some(&expected), |_| {
+                Err(io::Error::other("still unavailable"))
+            }).unwrap();
+            assert!(matches!(uncertain,
+                GenerationPublication::VisibleButDurabilityUncertain { generation, .. } if generation == old));
+            assert!(matches!(
+                reopened.confirm_retained_durability(&cx, &expected).unwrap(),
+                GenerationPublication::Durable(generation) if generation == old
+            ));
+            assert_eq!(fs::read(&pointer).unwrap(), before);
+            assert_eq!(fs::metadata(&pointer).unwrap().ino(), inode);
+            assert_eq!(fs::read_dir(directory.path().join(GENERATIONS)).unwrap().count(), 2);
+        });
+    }
+
+    #[test]
+    fn confirmation_cannot_bypass_publisher_ownership_or_cancellation() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let target = publish(&store, &cx, b"target");
+            let before = fs::read(directory.path().join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let build = store.begin(&cx).unwrap();
+            assert!(store.confirm_retained_durability(&cx, &target).is_err());
+            drop(build);
+            cx.set_cancel_requested(true);
+            assert!(matches!(store.confirm_retained_durability(&cx, &target), Err(SearchError::Cancelled { .. })));
+            cx.set_cancel_requested(false);
+            assert_eq!(fs::read(directory.path().join(COMPLETE_GENERATION_POINTER)).unwrap(), before);
+            assert_eq!(store.active(&cx).unwrap(), Some(target));
+        });
+    }
+
+    #[test]
+    fn confirmation_never_repairs_missing_or_corrupt_selection_implicitly() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let target = publish(&store, &cx, b"target");
+            let pointer = directory.path().join(COMPLETE_GENERATION_POINTER);
+            let before = fs::read(&pointer).unwrap();
+            fs::rename(&pointer, directory.path().join("saved-pointer")).unwrap();
+            assert!(store.confirm_retained_durability(&cx, &target).is_err());
+            assert!(!pointer.exists());
+            fs::write(&pointer, b"broken selection").unwrap();
+            assert!(store.confirm_retained_durability(&cx, &target).is_err());
+            assert_eq!(fs::read(&pointer).unwrap(), b"broken selection");
+            fs::write(&pointer, &before).unwrap();
+            fs::write(target.path().join("payload"), b"damaged").unwrap();
+            assert!(store.confirm_retained_durability(&cx, &target).is_err());
+            assert_eq!(fs::read(&pointer).unwrap(), before);
+            assert_eq!(fs::read(target.path().join("payload")).unwrap(), b"damaged");
+        });
+    }
+}

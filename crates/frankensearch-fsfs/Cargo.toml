@@ -1,6 +1,7 @@
 [package]
 name = "frankensearch-fsfs"
 version = "1.11.0"
+default-run = "fsfs"
 description = "Standalone fsfs CLI for two-tier hybrid local search"
 edition.workspace = true
 rust-version.workspace = true
@@ -37,6 +38,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "fsfs"
 path = "src/main.rs"
+
+[[bin]]
+name = "fsfs-recover"
+path = "src/bin/fsfs-recover.rs"
 
 # These integration targets execute the production fsfs binary. Legacy suites
 # use the embedded fixture lane; `default_build_quickstart` deliberately uses
