@@ -5,11 +5,11 @@
 //! to independent files, and feed that existing path rather than introduce a
 //! second embedding cache. No serving artifact is opened for writing.
 //!
-//! Version-2 receipts can survive a process restart when the actual running
-//! Linux executable is proven byte-identical. Configuration, source hashes and
-//! both producers are still checked independently. Unsupported or unprovable
-//! executable identity retains session-local reuse; version-1 receipts start
-//! cold. The final uncheckpointed batch remains unproven and is recomputed.
+//! Receipts bind every completed input, including the final batch, to the
+//! running executable bytes and configuration that produced it on Linux. A
+//! fresh Linux process can reuse that work only after the immutable selected
+//! bundle is verified; other platforms retain process-scoped reuse. This
+//! is not a mutable-root cache or an unchanged-tree publication shortcut.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -24,8 +24,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     CheckpointFileEntry, CliCommand, FSFS_CHECKPOINT_FILE, FsfsIndexPayload, FsfsRuntime,
-    INDEXING_CHECKPOINT_SCHEMA_VERSION, IndexingCheckpoint, IndexingProgressStage,
-    SearchExecutionMode, content_sha256_hex, retained_search_checkpoint, write_indexing_checkpoint,
+    INDEXING_CHECKPOINT_SCHEMA_VERSION, IndexingCheckpoint, SearchExecutionMode,
+    content_sha256_hex, retained_search_checkpoint, write_indexing_checkpoint,
 };
 use crate::generation_store::{
     COMPLETE_GENERATION_MANIFEST, CompleteGenerationStore, PublishedGeneration,
@@ -171,30 +171,16 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         execution::prepare(cx).await?;
         seed_candidate(cx, self, store, candidate_root)?;
-        let mut observed = None;
         let payload = Box::pin(self.run_one_shot_index_scaffold_internal(
             cx,
             CliCommand::Index,
-            |progress| {
-                if matches!(progress.stage, IndexingProgressStage::Finalizing) {
-                    // This file contains input hashes actually observed by the
-                    // indexer, not hashes of files reread after indexing. The
-                    // pipeline can overwrite/remove it after this callback.
-                    observed = Some(read_json::<IndexingCheckpoint>(
-                        cx,
-                        &candidate_root.join(FSFS_CHECKPOINT_FILE),
-                    )?);
-                }
-                Ok(())
-            },
+            |_| Ok(()),
             false,
         ))
         .await?;
         Self::validate_search_generation_at_root(candidate_root, SearchExecutionMode::Full)?;
-        if let Some(checkpoint) = observed {
-            let receipt = completed_receipt(self, candidate_root, checkpoint, &payload)?;
-            write_receipt(cx, candidate_root, &receipt)?;
-        }
+        let receipt = completed_receipt(self, candidate_root, payload)?;
+        write_receipt(cx, candidate_root, &receipt)?;
         Ok(())
     }
 }
@@ -202,11 +188,12 @@ impl FsfsRuntime {
 fn completed_receipt(
     runtime: &FsfsRuntime,
     root: &Path,
-    mut checkpoint: IndexingCheckpoint,
-    payload: &FsfsIndexPayload,
+    payload: FsfsIndexPayload,
 ) -> SearchResult<ReuseReceipt> {
+    let checkpoint = payload.input_checkpoint;
     let final_state = &payload.generation;
     if !final_state.generation_complete
+        || !checkpoint.artifacts_durable
         || checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
         || checkpoint.target_root != final_state.target_root
         || checkpoint.index_root != final_state.index_root
@@ -220,36 +207,25 @@ fn completed_receipt(
     }
     let manifests = FsfsRuntime::read_matching_manifest_generation(root)?
         .ok_or_else(|| reuse_error("completed candidate has no matching manifests"))?;
-    let mut observed = std::mem::take(&mut checkpoint.files);
-    for (key, manifest) in manifests {
-        let entry = observed.remove(&key).filter(|entry| {
-            entry.revision == manifest.revision
-                && entry.ingestion_class == manifest.ingestion_class
-                && entry.canonical_bytes == manifest.canonical_bytes
-                && entry.reason_code == manifest.reason_code
-        });
-        // Supply membership for the existing checkpoint validator, but never
-        // invent a successful embedding or source hash for the uncovered tail.
-        let entry = entry.unwrap_or(CheckpointFileEntry {
-            revision: manifest.revision,
-            ingestion_class: manifest.ingestion_class,
-            canonical_bytes: manifest.canonical_bytes,
-            reason_code: manifest.reason_code,
-            lexical_indexed: false,
-            semantic_indexed: false,
-            content_hash_hex: String::new(),
-        });
-        checkpoint.files.insert(key, entry);
+    if manifests.len() != checkpoint.files.len()
+        || manifests.iter().any(|(key, manifest)| {
+            !checkpoint.files.get(key).is_some_and(|entry| {
+                entry.revision == manifest.revision
+                    && entry.ingestion_class == manifest.ingestion_class
+                    && entry.canonical_bytes == manifest.canonical_bytes
+                    && entry.reason_code == manifest.reason_code
+                    && entry.content_hash_hex.len() == 64
+                    && entry
+                        .content_hash_hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+            })
+        })
+    {
+        return Err(reuse_error(
+            "completed input evidence does not cover its exact manifest",
+        ));
     }
-    checkpoint.artifacts_durable = true;
-    checkpoint
-        .source_hash_hex
-        .clone_from(&final_state.source_hash_hex);
-    checkpoint
-        .reason_codes
-        .clone_from(&final_state.reason_codes);
-    checkpoint.discovered_files = final_state.discovered_files;
-    checkpoint.skipped_files = final_state.skipped_files;
     if FsfsRuntime::read_checkpoint_manifest_generation(root, &checkpoint)?.is_none() {
         return Err(reuse_error(
             "retained input evidence disagrees with final generation metadata",
@@ -394,7 +370,19 @@ fn seed_candidate(
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
-    let mut receipt: ReuseReceipt = read_json(cx, &path)?;
+    let encoded: serde_json::Value = read_json(cx, &path)?;
+    let version = encoded
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| reuse_error("reuse receipt has no valid version"))?;
+    if version != u64::from(RECEIPT_VERSION) {
+        return Ok(0);
+    }
+    let mut receipt: ReuseReceipt =
+        serde_json::from_value(encoded).map_err(|source| SearchError::SubsystemError {
+            subsystem: "fsfs.complete_generation.reuse_receipt",
+            source: Box::new(source),
+        })?;
     if !compatible_receipt(runtime, &receipt)? {
         return Ok(0);
     }
@@ -951,7 +939,7 @@ mod generation_tests {
     fn fixture(parent: &Path, count: usize) -> (FsfsRuntime, PathBuf, PathBuf) {
         let source = parent.join("source");
         let root = parent.join("store");
-        fs::create_dir(&source).unwrap();
+        fs::create_dir_all(&source).unwrap();
         for number in 0..count {
             fs::write(
                 source.join(format!("doc-{number}.md")),
@@ -976,6 +964,284 @@ mod generation_tests {
         (runtime, source, root)
     }
 
+    mod completed_batch_tests {
+        use super::*;
+        use frankensearch_core::{
+            Canonicalizer, DefaultCanonicalizer, Embedder, EmbeddingIdentityBundleV1,
+            ModelCategory, SearchFuture,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct InferenceCounts {
+            probes: AtomicUsize,
+            documents: AtomicUsize,
+        }
+
+        struct CountingEmbedder {
+            id: &'static str,
+            identity: EmbeddingIdentityBundleV1,
+            counts: Arc<InferenceCounts>,
+            dimension: usize,
+        }
+
+        impl CountingEmbedder {
+            fn new(id: &'static str, dimension: usize, drift: bool) -> Self {
+                let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(
+                    id,
+                    u32::try_from(dimension).unwrap(),
+                );
+                if drift {
+                    identity
+                        .producer
+                        .implementation_revision
+                        .push_str("-changed");
+                }
+                identity.validate().unwrap();
+                Self {
+                    id,
+                    identity,
+                    counts: Arc::default(),
+                    dimension,
+                }
+            }
+
+            fn vector(&self, text: &str) -> Vec<f32> {
+                let mut vector = vec![0.0; self.dimension];
+                let slot = text.bytes().fold(0_usize, |sum, byte| {
+                    (sum + usize::from(byte)) % self.dimension
+                });
+                vector[slot] = 1.0;
+                vector
+            }
+        }
+
+        impl Embedder for CountingEmbedder {
+            fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+                Ok(&self.identity)
+            }
+
+            fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                Box::pin(async move {
+                    if text == "probe" {
+                        self.counts.probes.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        self.counts.documents.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(self.vector(text))
+                })
+            }
+
+            fn dimension(&self) -> usize {
+                self.dimension
+            }
+            fn id(&self) -> &str {
+                self.id
+            }
+            fn model_name(&self) -> &str {
+                self.id
+            }
+            fn is_semantic(&self) -> bool {
+                true
+            }
+            fn category(&self) -> ModelCategory {
+                ModelCategory::StaticEmbedder
+            }
+        }
+
+        struct RestoreEmbedders {
+            fast: Option<Arc<dyn Embedder>>,
+            quality: Option<Arc<dyn Embedder>>,
+        }
+
+        impl RestoreEmbedders {
+            fn install(fast: Arc<dyn Embedder>, quality: Arc<dyn Embedder>) -> Self {
+                let previous = Self {
+                    fast: super::super::super::test_fast_embedder_override(),
+                    quality: super::super::super::test_quality_embedder_override(),
+                };
+                super::super::super::set_test_fast_embedder(Some(fast));
+                super::super::super::set_test_quality_embedder(Some(quality));
+                previous
+            }
+        }
+
+        impl Drop for RestoreEmbedders {
+            fn drop(&mut self) {
+                super::super::super::set_test_fast_embedder(self.fast.take());
+                super::super::super::set_test_quality_embedder(self.quality.take());
+            }
+        }
+
+        fn assert_index_calls(report: &serde_json::Value, fast: usize, quality: usize) {
+            assert_eq!(report["fast_documents"], fast);
+            assert_eq!(report["quality_documents"], quality);
+            assert_eq!(report["fast_probes"], 1, "readiness probes still run");
+            assert_eq!(
+                report["quality_probes"], 1,
+                "quality readiness remains independent"
+            );
+            assert_eq!(report["checkpoint_present"], false);
+            assert_eq!(report["receipt_present"], true);
+        }
+
+        /// Use fresh producer instances for each run. The execution helper's
+        /// restart suite independently proves the cross-process boundary; these
+        /// controls exercise both tiers and the final, previously omitted batch.
+        async fn run_counted(cx: &Cx, parent: &Path, operation: &str) -> serde_json::Value {
+            let (mut runtime, source, root) = fixture(parent, 0);
+            runtime.config.search.fast_only = false;
+            runtime.config.search.quality_timeout_ms = 5_000;
+            "reuse-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            runtime.cli_input.full_reindex = operation == "force";
+            let fast = Arc::new(CountingEmbedder::new(
+                "reuse-fast",
+                4,
+                operation == "fast_drift",
+            ));
+            let quality = Arc::new(CountingEmbedder::new(
+                "reuse-quality",
+                6,
+                operation == "quality_drift",
+            ));
+            let _restore = RestoreEmbedders::install(fast.clone(), quality.clone());
+            let generation = if operation == "append" {
+                let input = parent.join("append.jsonl");
+                fs::write(
+                    &input,
+                    "{\"id\":\"doc-0.md\",\"text\":\"appended replacement body\"}\n",
+                )
+                .unwrap();
+                runtime.cli_input.command = CliCommand::AppendBatch;
+                runtime.cli_input.input_file = Some(input);
+                let (publication, count) =
+                    runtime.append_retained_generation(cx, &root).await.unwrap();
+                assert_eq!(count, 1);
+                let Some(GenerationPublication::Durable(generation)) = publication else {
+                    panic!("append must publish durably"); // ubs:ignore — cfg(test) assertion.
+                };
+                generation
+            } else {
+                publish(&runtime, cx, &root).await
+            };
+            let report = serde_json::json!({
+                "generation": generation.id(),
+                "fast_documents": fast.counts.documents.load(Ordering::SeqCst),
+                "quality_documents": quality.counts.documents.load(Ordering::SeqCst),
+                "fast_probes": fast.counts.probes.load(Ordering::SeqCst),
+                "quality_probes": quality.counts.probes.load(Ordering::SeqCst),
+                "fast_identity": fast.identity.fingerprint(),
+                "quality_identity": quality.identity.fingerprint(),
+                "checkpoint_present": generation.path().join(FSFS_CHECKPOINT_FILE).exists(),
+                "receipt_present": generation.path().join(RECEIPT_FILE).exists(),
+            });
+            if operation != "append" {
+                for (relative, producer) in [
+                    (super::super::super::FSFS_VECTOR_INDEX_FILE, fast.as_ref()),
+                    (
+                        super::super::super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+                        quality.as_ref(),
+                    ),
+                ] {
+                    let index = frankensearch_index::VectorIndex::open_read_only(
+                        &generation.path().join(relative),
+                    )
+                    .unwrap();
+                    assert_eq!(index.embedder_revision(), producer.identity.fingerprint());
+                    assert_eq!(index.live_doc_ids().unwrap().len(), 2);
+                    for row in 0..index.record_count() {
+                        let text =
+                            fs::read_to_string(source.join(index.doc_id_at(row).unwrap())).unwrap();
+                        let expected =
+                            producer.vector(&DefaultCanonicalizer::default().canonicalize(&text));
+                        assert_eq!(index.vector_at_f32(row).unwrap(), expected);
+                    }
+                }
+                let mut reader = runtime.open_retained_search(cx, &root).await.unwrap();
+                let phases = reader.search(cx, "sharedtoken", 10).await.unwrap();
+                assert_eq!(phases.last().unwrap().hits.len(), 2);
+            }
+            report
+        }
+
+        #[test]
+        fn completed_two_tier_final_batch_reuses_and_force_recomputes_all_inputs() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, source, _) = fixture(parent.path(), 2);
+                let first = run_counted(&cx, parent.path(), "index").await;
+                assert_index_calls(&first, 2, 2);
+                let unchanged = run_counted(&cx, parent.path(), "index").await;
+                assert_index_calls(&unchanged, 0, 0);
+                assert_ne!(
+                    first["generation"], unchanged["generation"],
+                    "reuse still publishes an isolated successor"
+                );
+                let forced = run_counted(&cx, parent.path(), "force").await;
+                assert_index_calls(&forced, 2, 2);
+
+                let path = source.join("doc-0.md");
+                let before = fs::metadata(&path).unwrap();
+                fs::write(&path, "sharedtoken revision 0").unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+                    .unwrap();
+                assert_eq!(fs::metadata(&path).unwrap().len(), before.len());
+                assert_eq!(
+                    fs::metadata(&path).unwrap().modified().unwrap(),
+                    before.modified().unwrap()
+                );
+                let changed = run_counted(&cx, parent.path(), "index").await;
+                assert_index_calls(&changed, 1, 1);
+                let warm = run_counted(&cx, parent.path(), "index").await;
+                assert_index_calls(&warm, 0, 0);
+            });
+        }
+
+        #[test]
+        fn independent_producer_drift_and_append_invalidate_completed_reuse() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                fixture(parent.path(), 2);
+                let first = run_counted(&cx, parent.path(), "index").await;
+                let quality_changed = run_counted(&cx, parent.path(), "quality_drift").await;
+                assert_index_calls(&quality_changed, 0, 2);
+                assert_eq!(first["fast_identity"], quality_changed["fast_identity"]);
+                assert_ne!(
+                    first["quality_identity"],
+                    quality_changed["quality_identity"]
+                );
+                // Return to the original quality producer, then change only fast.
+                let restored = run_counted(&cx, parent.path(), "index").await;
+                assert_index_calls(&restored, 0, 2);
+                let fast_changed = run_counted(&cx, parent.path(), "fast_drift").await;
+                assert_index_calls(&fast_changed, 2, 2);
+                assert_ne!(restored["fast_identity"], fast_changed["fast_identity"]);
+                assert_eq!(
+                    restored["quality_identity"],
+                    fast_changed["quality_identity"]
+                );
+                let restored = run_counted(&cx, parent.path(), "index").await;
+                assert_index_calls(&restored, 2, 2);
+                let appended = run_counted(&cx, parent.path(), "append").await;
+                assert_eq!(appended["fast_documents"], 1);
+                assert_eq!(appended["quality_documents"], 1);
+                assert_eq!(
+                    appended["receipt_present"], false,
+                    "explicit mutation must not copy old source evidence"
+                );
+                let rebuilt = run_counted(&cx, parent.path(), "index").await;
+                assert_index_calls(&rebuilt, 2, 2);
+                let reused = run_counted(&cx, parent.path(), "index").await;
+                assert_index_calls(&reused, 0, 0);
+            });
+        }
+    }
+
     async fn publish(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> PublishedGeneration {
         match runtime.rebuild_retained_generation(cx, root).await.unwrap() {
             GenerationPublication::Durable(generation) => generation,
@@ -991,8 +1257,94 @@ mod generation_tests {
         runtime.clone().with_cli_input(input)
     }
 
+    fn publish_receipt_variant(
+        cx: &Cx,
+        runtime: &FsfsRuntime,
+        root: &Path,
+        receipt_bytes: Option<&[u8]>,
+    ) -> PublishedGeneration {
+        let store = CompleteGenerationStore::open(cx, root).unwrap();
+        let build = store.begin(cx).unwrap();
+        let next = candidate(runtime, build.path());
+        copy_selected_generation(cx, &next, &store, build.path()).unwrap();
+        if let Some(bytes) = receipt_bytes {
+            fs::write(build.path().join(RECEIPT_FILE), bytes).unwrap();
+        }
+        // The fixture deliberately seals an unusable optimization receipt in
+        // an otherwise valid generation. It never tampers with a sealed bundle.
+        let publication = build
+            .publish(cx, |_, path| {
+                FsfsRuntime::validate_search_generation_at_root(path, SearchExecutionMode::Full)
+            })
+            .unwrap();
+        let GenerationPublication::Durable(generation) = publication else {
+            panic!("fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
+        };
+        generation
+    }
+
     #[test]
-    fn completed_input_evidence_never_invents_hashes_for_uncheckpointed_tail() {
+    fn missing_or_unsupported_receipts_start_cold_and_malformed_receipts_refuse() {
+        run_test_with_cx(|cx| async move {
+            for (encoded, malformed) in [
+                (None, false),
+                (
+                    Some(&b"{\"version\":1,\"session\":\"historical\"}"[..]),
+                    false,
+                ),
+                (Some(&b"{\"version\":3}"[..]), false),
+                (Some(&b"not json"[..]), true),
+                (Some(&b"{\"version\":2}"[..]), true),
+            ] {
+                let parent = tempfile::tempdir().unwrap();
+                let (runtime, _, root) = fixture(parent.path(), 2);
+                publish(&runtime, &cx, &root).await;
+                let selected = publish_receipt_variant(&cx, &runtime, &root, encoded);
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                let build = store.begin(&cx).unwrap();
+                let next = candidate(&runtime, build.path());
+                let result = seed_candidate(&cx, &next, &store, build.path());
+                if malformed {
+                    assert!(
+                        result.is_err(),
+                        "invalid current evidence must not be accepted"
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), 0, "unsupported evidence grants no reuse");
+                }
+                assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
+                assert_eq!(store.active(&cx).unwrap(), Some(selected));
+            }
+        });
+    }
+
+    #[test]
+    fn cancelled_reuse_and_existing_interruption_checkpoint_never_get_overwritten() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(parent.path(), 2);
+            let selected = publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let build = store.begin(&cx).unwrap();
+            let next = candidate(&runtime, build.path());
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                seed_candidate(&cx, &next, &store, build.path()),
+                Err(SearchError::Cancelled { .. }),
+            ));
+            assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
+            cx.set_cancel_requested(false);
+            let checkpoint = build.path().join(FSFS_CHECKPOINT_FILE);
+            fs::write(&checkpoint, b"existing interrupted work").unwrap();
+            assert!(seed_candidate(&cx, &next, &store, build.path()).is_err());
+            assert_eq!(fs::read(&checkpoint).unwrap(), b"existing interrupted work");
+            assert_eq!(fs::read_dir(build.path()).unwrap().count(), 1);
+            assert_eq!(store.active(&cx).unwrap(), Some(selected));
+        });
+    }
+
+    #[test]
+    fn completed_input_evidence_covers_the_final_uncheckpointed_batch() {
         run_test_with_cx(|cx| async move {
             let parent = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(parent.path(), 2);
@@ -1007,12 +1359,18 @@ mod generation_tests {
                     .values()
                     .filter(|entry| proven(entry))
                     .count(),
-                1
+                2
             );
-            let tail = receipt.checkpoint.files.values().last().unwrap();
-            assert!(tail.content_hash_hex.is_empty());
-            assert!(!tail.semantic_indexed);
-            assert!(!tail.lexical_indexed);
+            for (key, entry) in &receipt.checkpoint.files {
+                assert_eq!(
+                    entry.content_hash_hex,
+                    content_sha256_hex(
+                        &fs::read(Path::new(&receipt.checkpoint.target_root).join(key),).unwrap()
+                    )
+                );
+                assert!(entry.semantic_indexed);
+                assert!(entry.lexical_indexed);
+            }
             assert!(!generation.path().join(FSFS_CHECKPOINT_FILE).exists());
             assert!(
                 FsfsRuntime::read_checkpoint_manifest_generation(
@@ -1113,7 +1471,11 @@ mod generation_tests {
             receipt.executable_sha256 = None;
             assert!(compatible_execution(&receipt, None, &receipt.session));
             assert!(!compatible_execution(&receipt, None, "another process"));
-            assert!(!compatible_execution(&receipt, Some(&digest), &receipt.session));
+            assert!(!compatible_execution(
+                &receipt,
+                Some(&digest),
+                &receipt.session
+            ));
             receipt.version = 1;
             let legacy = serde_json::to_vec(&receipt).unwrap();
             let decoded: ReuseReceipt = serde_json::from_slice(&legacy).unwrap();

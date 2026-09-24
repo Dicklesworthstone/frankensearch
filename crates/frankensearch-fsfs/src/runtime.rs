@@ -1797,6 +1797,11 @@ struct FsfsIndexPayload {
     embedding_failures: usize,
     vector_generation: PublishedVectorGeneration,
     quality_generation: Option<PublishedVectorGeneration>,
+    /// Inputs actually consumed by this run, including its final batch. Kept
+    /// in memory for the retained publisher; never left as a live checkpoint
+    /// in a completed generation or exposed through the CLI payload.
+    #[serde(skip)]
+    input_checkpoint: IndexingCheckpoint,
 }
 
 impl FsfsIndexPayload {
@@ -16073,15 +16078,15 @@ impl FsfsRuntime {
         publication_lease.fence("final generation admission publication")?;
         self.write_index_sentinel(&index_root, &sentinel)?;
         publication_lease.fence("final checkpoint admission transition")?;
+        checkpoint.updated_at_ms = pressure_timestamp_ms();
+        checkpoint.artifacts_durable = true;
+        checkpoint.source_hash_hex = source_hash_hex;
+        checkpoint.reason_codes = reason_codes;
+        checkpoint.discovered_files = stats.discovered_files;
+        checkpoint.skipped_files = skipped_files;
         if generation_complete {
             remove_indexing_checkpoint(&index_root)?;
         } else {
-            checkpoint.updated_at_ms = pressure_timestamp_ms();
-            checkpoint.artifacts_durable = true;
-            checkpoint.source_hash_hex = source_hash_hex;
-            checkpoint.reason_codes = reason_codes;
-            checkpoint.discovered_files = stats.discovered_files;
-            checkpoint.skipped_files = skipped_files;
             write_indexing_checkpoint(&index_root, &checkpoint)?;
         }
 
@@ -16146,6 +16151,7 @@ impl FsfsRuntime {
             embedding_failures,
             vector_generation: published_vector,
             quality_generation: published_quality,
+            input_checkpoint: checkpoint,
         };
         if emit_user_output {
             payload.emit(
@@ -24877,8 +24883,7 @@ const fn indexing_final_stage(
 /// made its artifacts durable: it was interrupted, failed, or is still running.
 /// The files under the root may be half-written, so every search mode refuses.
 fn checkpoint_marks_unfinished_run(checkpoint: &IndexingCheckpoint) -> bool {
-    checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
-        || !checkpoint.artifacts_durable
+    checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION || !checkpoint.artifacts_durable
 }
 
 /// The command that finishes the unfinished run `checkpoint` records.
@@ -25944,7 +25949,10 @@ mod tests {
             let mut foreign_storage = advertised.clone();
             "another-normalization".clone_into(&mut foreign_storage.storage.vector_normalization);
             for (component, identity) in [
-                ("whole identity", test_identity("another-model-2", 2).clone()),
+                (
+                    "whole identity",
+                    test_identity("another-model-2", 2).clone(),
+                ),
                 ("space", foreign_space),
                 ("producer", foreign_producer),
                 ("input", foreign_input),
@@ -25974,10 +25982,8 @@ mod tests {
             let mut drifting = ScriptedBoundEmbedder::new(BoundScript::Values(vec![1.0, 0.0]));
             drifting.drifted = Some(test_identity("drifted-model-2", 2).clone());
             let drifting = Arc::new(drifting);
-            let admission = super::AdmittedEmbedder::admit(
-                Arc::clone(&drifting) as Arc<dyn Embedder>
-            )
-            .unwrap();
+            let admission =
+                super::AdmittedEmbedder::admit(Arc::clone(&drifting) as Arc<dyn Embedder>).unwrap();
             admission.check_current_identity().unwrap();
             drifting.drift.store(true, Ordering::SeqCst);
             assert!(admission.check_current_identity().is_err());
@@ -25988,7 +25994,10 @@ mod tests {
 
             // Provider failure stays a provider failure.
             let (result, _) = query(BoundScript::Fail).await;
-            assert!(matches!(result, Err(SearchError::EmbeddingFailed { .. })), "{result:?}");
+            assert!(
+                matches!(result, Err(SearchError::EmbeddingFailed { .. })),
+                "{result:?}"
+            );
         });
         // Cancellation observed during inference wins over both a good
         // response and a provider error.
@@ -25997,7 +26006,10 @@ mod tests {
                 let result = admitted(ScriptedBoundEmbedder::new(script))
                     .embed_admitted(&cx, "query")
                     .await;
-                assert!(matches!(result, Err(SearchError::Cancelled { .. })), "{result:?}");
+                assert!(
+                    matches!(result, Err(SearchError::Cancelled { .. })),
+                    "{result:?}"
+                );
             });
         }
     }
@@ -26073,7 +26085,10 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                assert!(!response.cached, "attempt {attempt} replayed a failed refinement");
+                assert!(
+                    !response.cached,
+                    "attempt {attempt} replayed a failed refinement"
+                );
                 let phases = response
                     .payloads
                     .iter()
@@ -26166,8 +26181,11 @@ mod tests {
                         test_identity("another-model-2", 2).clone(),
                     ))))
                 };
-                let matching =
-                    || admitted(ScriptedBoundEmbedder::new(BoundScript::Values(vec![1.0, 0.0])));
+                let matching = || {
+                    admitted(ScriptedBoundEmbedder::new(BoundScript::Values(vec![
+                        1.0, 0.0,
+                    ])))
+                };
                 let (fast, quality) = if foreign_tier == "fast" {
                     (foreign(), matching())
                 } else {
@@ -28705,7 +28723,10 @@ mod tests {
             for (behavior, expected_field) in [
                 (BatchProbeBehavior::CountMismatch, "embedder.batch_length"),
                 (BatchProbeBehavior::Empty, "identity_bound_embedding.values"),
-                (BatchProbeBehavior::NonFinite, "identity_bound_embedding.values"),
+                (
+                    BatchProbeBehavior::NonFinite,
+                    "identity_bound_embedding.values",
+                ),
                 (BatchProbeBehavior::ZeroSignal, "semantic.embedding_output"),
             ] {
                 let embedder = Arc::new(BatchProbeEmbedder::new(behavior));
@@ -35443,11 +35464,9 @@ mod tests {
             );
             let rendered = crate::output_schema::output_error_from(&search_error);
             assert!(
-                rendered
-                    .suggestion
-                    .as_deref()
-                    .is_some_and(|text| text.contains(&finish)
-                        && !text.contains("Check the command line")),
+                rendered.suggestion.as_deref().is_some_and(
+                    |text| text.contains(&finish) && !text.contains("Check the command line")
+                ),
                 "suggestion: {:?}",
                 rendered.suggestion
             );
@@ -42877,7 +42896,10 @@ mod tests {
         let payload = super::FsfsDoctorPayload {
             version: "test".to_owned(),
             checks: vec![
-                check("index", "run `fsfs index '/src' --index-dir '/idx'` to finish it"),
+                check(
+                    "index",
+                    "run `fsfs index '/src' --index-dir '/idx'` to finish it",
+                ),
                 check("semantic.quality_generation", "run `fsfs compact`"),
                 check("durability.vector_sidecars", "run `fsfs compact`"),
             ],
