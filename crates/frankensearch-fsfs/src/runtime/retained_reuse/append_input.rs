@@ -71,7 +71,14 @@ pub(in crate::runtime) async fn read_append_documents(
 ) -> SearchResult<BTreeMap<String, AppendDocument>> {
     retained_search_checkpoint(cx)?;
     if let Some(path) = runtime.cli_input.input_file.as_ref() {
-        let mut file = asupersync::fs::File::open(path).await?;
+        // The operator named this file; a bare I/O error would not say which.
+        let mut file = asupersync::fs::File::open(path)
+            .await
+            .map_err(|error| SearchError::InvalidConfig {
+                field: "cli.append_batch.file".to_owned(),
+                value: path.display().to_string(),
+                reason: format!("cannot open the --file input: {error}"),
+            })?;
         read_async(cx, &mut file, INPUT_LIMITS).await
     } else {
         read_sync(cx, &mut io::stdin().lock(), INPUT_LIMITS)
@@ -773,6 +780,27 @@ mod tests {
             assert!(!root.exists());
             std::fs::write(&path, b"{broken\n").unwrap();
             assert!(read_append_documents(&cx, &runtime).await.is_err());
+            assert!(!root.exists());
+
+            // A missing --file names the file and points at the command line.
+            let missing = parent.path().join("missing.jsonl");
+            let runtime = runtime.with_cli_input(crate::CliInput {
+                command: crate::CliCommand::AppendBatch,
+                input_file: Some(missing.clone()),
+                index_dir: Some(root.clone()),
+                ..crate::CliInput::default()
+            });
+            let error = read_append_documents(&cx, &runtime)
+                .await
+                .expect_err("a missing --file must fail");
+            assert!(
+                matches!(
+                    &error,
+                    SearchError::InvalidConfig { field, value, .. }
+                        if field == "cli.append_batch.file" && *value == missing.display().to_string()
+                ),
+                "{error:?}"
+            );
             assert!(!root.exists());
         });
     }
