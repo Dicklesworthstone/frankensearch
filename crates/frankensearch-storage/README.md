@@ -40,6 +40,16 @@ This crate owns the persistent storage layer for frankensearch, backed by Franke
 - `PipelineConfig` / `PipelineMetrics` - pipeline configuration and performance metrics
 - `EmbeddingVectorSink` / `InMemoryVectorSink` - sinks for produced embedding vectors
 
+Persistent jobs require an identity-aware embedder. The runner calls
+`Embedder::embed_bound`, validates the returned vector and complete identity,
+and rejects a producer that changes identity during inference. Custom
+embedders must provide `Embedder::identity`; a model name and dimension alone
+do not authorize persistence. Cancellation after inference leaves the claim
+unfinished for the existing lease-recovery path, without writing a vector or
+recording a job failure. A sink must still admit the producer against its own
+index generation; these checks do not make separate sink and catalog writes
+one atomic transaction.
+
 ### History and Bookmarks
 
 - `record_search` / `list_search_history` - search history recording and retrieval
