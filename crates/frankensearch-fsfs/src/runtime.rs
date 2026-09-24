@@ -26009,6 +26009,8 @@ mod tests {
         gate: Arc<asupersync::sync::Mutex<()>>,
         calls: Arc<AtomicUsize>,
         completed: Arc<AtomicUsize>,
+        /// How long one embed occupies the blocking pool.
+        hold: Duration,
     }
 
     impl Embedder for BlockingQualityFixture {
@@ -26022,12 +26024,13 @@ mod tests {
                     })?;
                 let calls = Arc::clone(&self.calls);
                 let completed = Arc::clone(&self.completed);
+                let hold = self.hold;
                 FsfsRuntime::quality_blocking(cx, move || {
                     let _permit = permit;
                     calls.fetch_add(1, Ordering::SeqCst);
                     // A real blocking pool operation. No timing/quality claim
                     // about the ONNX backend is inferred from this fixture.
-                    thread::sleep(Duration::from_millis(400));
+                    thread::sleep(hold);
                     completed.fetch_add(1, Ordering::SeqCst);
                     vec![1.0, 0.0]
                 })
@@ -26242,6 +26245,7 @@ mod tests {
                 gate: Arc::new(asupersync::sync::Mutex::new(())),
                 calls: Arc::clone(&calls),
                 completed: Arc::clone(&completed),
+                hold: Duration::from_millis(400),
             }));
             let mut config = FsfsConfig::default();
             config.storage.index_dir = temp.path().display().to_string();
@@ -26367,6 +26371,7 @@ mod tests {
             gate,
             calls: Arc::new(AtomicUsize::new(0)),
             completed: Arc::clone(&completed),
+            hold: Duration::from_millis(400),
         }));
         let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
         let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -27004,6 +27009,7 @@ mod tests {
                 gate: Arc::new(asupersync::sync::Mutex::new(())),
                 calls: Arc::new(AtomicUsize::new(0)),
                 completed: Arc::clone(&completed),
+                hold: Duration::from_millis(400),
             }));
             let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
             let server_shared = Arc::clone(&shared);
@@ -27083,6 +27089,7 @@ mod tests {
             gate: Arc::new(asupersync::sync::Mutex::new(())),
             calls: Arc::clone(&calls),
             completed: Arc::clone(&completed),
+            hold: Duration::from_secs(3),
         }));
         let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
         let server_shared = Arc::clone(&shared);
@@ -27097,7 +27104,12 @@ mod tests {
             );
         });
         let mut config = FsfsConfig::default();
-        config.search.quality_timeout_ms = 50;
+        // A 1 s quality deadline against a 3 s backend: the backend has long
+        // started when the deadline fails the refinement (so nothing is
+        // cached), and it is still running, owned, when the daemon finds the
+        // client gone. With 50 ms against 400 ms a loaded host could fire the
+        // deadline before the backend started, leaving nothing to drain.
+        config.search.quality_timeout_ms = 1_000;
         let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
             daemon: true,
             daemon_socket: Some(socket),
@@ -27169,16 +27181,21 @@ mod tests {
         let mut resources = disagreeing_blend_resources(temp.path());
         let completed = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
+        // A 1 s deadline against a 3 s backend: the backend has long started
+        // when the deadline fires, and the response still has 2 s to reach
+        // EOF before the backend completes. With 50 ms against 400 ms a
+        // loaded host missed both windows.
         resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
             gate: Arc::new(asupersync::sync::Mutex::new(())),
             calls: Arc::clone(&calls),
             completed: Arc::clone(&completed),
+            hold: Duration::from_secs(3),
         }));
         let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
         let runtime = FsfsRuntime::new(FsfsConfig::default());
         let (mut client, server) = UnixStream::pair().unwrap();
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let handler = thread::spawn(move || {
             FsfsRuntime::handle_search_serve_socket_client(
@@ -27190,7 +27207,7 @@ mod tests {
             );
         });
         client
-            .write_all(b"{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":50,\"limit\":10}\n")
+            .write_all(b"{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":1000,\"limit\":10}\n")
             .unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
         let mut response = String::new();
@@ -27208,6 +27225,7 @@ mod tests {
             "EOF must precede backend completion"
         );
         handler.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one backend call, no replay");
         assert_eq!(
             completed.load(Ordering::SeqCst),
             1,
