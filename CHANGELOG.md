@@ -258,6 +258,14 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **`fsfs search --compact` for agents.** The compact envelope that
+  `agent_ergonomics` defined but no command emitted is now the output of
+  `--compact` (json, jsonl, toon): hits as `id` (the `R0`-style id
+  `explain` takes), `doc`, `s`, `r`, `snip` and `line`, plus `n`, `ms` and
+  `phase`, without fusion and freshness diagnostics. A 10-hit result on a code
+  repository went from 7,965 to 3,109 bytes of JSON; TOON renders the hits as
+  one tabular row each.
+
 - **Daemon and `fsfs serve` searches no longer re-read the lexical index per
   query.** Each request called Quill's `refresh`, which reopened the published
   snapshot and re-hashed every segment file in full (80 MB per query on a

@@ -18,6 +18,7 @@ use frankensearch_core::{SearchError, SearchResult};
 use serde::Serialize;
 
 use super::cli::OutputFormat;
+use crate::agent_ergonomics::{CompactLevel, compactify};
 use crate::output_schema::{
     CompatibilityMode, OutputEnvelope, OutputMeta, SearchHitPayload, SearchPayload,
     encode_envelope_toon, validate_envelope,
@@ -82,6 +83,56 @@ where
         OutputFormat::Table => emit_table(envelope, writer),
         OutputFormat::Csv => emit_csv(envelope, writer),
     }
+}
+
+/// Emit a search envelope in the compact agent shape
+/// ([`crate::agent_ergonomics::compactify`]) when `format` can carry it.
+///
+/// JSON is written on one line even for `--format json`: the shape exists to
+/// save tokens. Returns `false` for table and CSV, which keep their own shapes.
+///
+/// # Errors
+///
+/// Returns `SearchError::SubsystemError` if serialization or writing fails.
+pub(crate) fn emit_compact_search_envelope<W: Write>(
+    envelope: &OutputEnvelope<SearchPayload>,
+    format: OutputFormat,
+    writer: &mut W,
+) -> SearchResult<bool> {
+    let compact = compactify(envelope, CompactLevel::Compact);
+    let text = match format {
+        OutputFormat::Json | OutputFormat::Jsonl => {
+            serde_json::to_string(&compact).map_err(|source| SearchError::SubsystemError {
+                subsystem: SUBSYSTEM,
+                source: Box::new(io::Error::other(format!(
+                    "failed to serialize compact envelope as JSON: {source}"
+                ))),
+            })?
+        }
+        OutputFormat::Toon => {
+            toon_format::encode_default(&compact).map_err(|source| SearchError::SubsystemError {
+                subsystem: SUBSYSTEM,
+                source: Box::new(io::Error::other(format!(
+                    "failed to encode compact envelope as TOON: {source}"
+                ))),
+            })?
+        }
+        OutputFormat::Table | OutputFormat::Csv => return Ok(false),
+    };
+    writer
+        .write_all(text.as_bytes())
+        .and_then(|()| {
+            if format == OutputFormat::Jsonl {
+                writer.write_all(b"\n")
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(|source| SearchError::SubsystemError {
+            subsystem: SUBSYSTEM,
+            source: Box::new(source),
+        })?;
+    Ok(true)
 }
 
 /// Emit an [`OutputEnvelope`] as a string in the requested format.

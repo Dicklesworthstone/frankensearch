@@ -257,6 +257,9 @@ pub struct CliInput {
     pub no_color: bool,
     /// Whether `--expand` was requested (LLM query expansion for search).
     pub expand: bool,
+    /// Whether `--compact` was requested: the token-lean agent envelope
+    /// (`agent_ergonomics::compactify`) instead of the full search payload.
+    pub compact: bool,
     /// Input file path for append-batch (reads JSONL from file instead of stdin).
     pub input_file: Option<PathBuf>,
     /// Doc IDs to delete (for delete command).
@@ -671,6 +674,17 @@ where
                     });
                 }
                 input.expand = true;
+                idx += 1;
+            }
+            "--compact" => {
+                if command != CliCommand::Search {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--compact".into(),
+                        reason: "--compact is only valid for the search command".into(),
+                    });
+                }
+                input.compact = true;
                 idx += 1;
             }
             "--file" => {
@@ -1144,6 +1158,18 @@ mod tests {
 
         let online = parse_cli_args(["search", "query", "--offline", "--online"]).expect("online");
         assert_eq!(online.overrides.offline, Some(false));
+    }
+
+    #[test]
+    fn compact_flag_is_a_search_option() {
+        let input = parse_cli_args(["search", "query", "--compact"]).expect("search --compact");
+        assert!(input.compact);
+        assert!(!parse_cli_args(["search", "query"]).expect("search").compact);
+        let err = parse_cli_args(["status", "--compact"]).expect_err("status --compact");
+        assert!(
+            err.to_string()
+                .contains("only valid for the search command")
+        );
     }
 
     #[test]

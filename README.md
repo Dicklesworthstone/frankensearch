@@ -1340,6 +1340,10 @@ Search still works using fast-tier and lexical paths; you get `RefinementFailed`
 
 ### Which output format should agents use?
 Use `jsonl` for streaming automation and `toon` if your downstream stack expects TOON semantics.
+Add `--compact` to `fsfs search` for the token-lean shape: each hit is `id` (the `R0`-style id
+`fsfs explain` takes), `doc`, `s` (score), `r` (0-based rank), `snip` and `line`, without the fusion
+and freshness diagnostics. A 10-hit result shrinks from about 8 KB to 3 KB of JSON; with
+`--format toon` the hits become one tabular row each.
 
 ### Is this tied to Tokio?
 No. Async/concurrency is built around `asupersync` and `Cx`.

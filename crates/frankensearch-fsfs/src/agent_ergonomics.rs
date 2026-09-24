@@ -18,7 +18,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::output_schema::{OutputEnvelope, OutputWarning};
+use crate::output_schema::{OutputEnvelope, OutputWarning, SearchPayload};
 
 // ─── Compact Mode ───────────────────────────────────────────────────────────
 
@@ -74,6 +74,9 @@ pub struct CompactHit {
     /// Optional snippet (omitted if absent).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snip: Option<String>,
+    /// 1-based line of the snippet's first query word (omitted if unknown).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub line: Option<u32>,
 }
 
 /// A compact search response wrapping results with minimal metadata.
@@ -86,7 +89,7 @@ pub struct CompactSearchResponse {
     /// Duration in milliseconds (omitted in minimal mode).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ms: Option<u64>,
-    /// Phase indicator: "fast" or "full".
+    /// Search phase of these hits: `initial`, `refined` or `refinement_failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
 }
@@ -389,16 +392,15 @@ fn batch_search_template() -> QueryTemplate {
 
 // ─── Compact Conversion ─────────────────────────────────────────────────────
 
-/// Convert a full output envelope with search results into a compact envelope.
+/// Convert a search output envelope into the compact agent envelope.
 ///
-/// The `hits_extractor` maps the typed data payload to a list of
-/// `(doc_id, score, rank, snippet)` tuples.
+/// Hit ids are the ids `fsfs explain <id>` accepts for the same search
+/// (`R{n}`, `n` the 0-based rank). Minimal mode drops snippets and timing but keeps
+/// each hit's line, which is how an agent opens the match.
 #[must_use]
-pub fn compactify<T>(
-    envelope: &OutputEnvelope<T>,
+pub fn compactify(
+    envelope: &OutputEnvelope<SearchPayload>,
     compact_level: CompactLevel,
-    registry: &mut ResultIdRegistry,
-    hits_extractor: impl Fn(&T) -> Vec<(String, f64, usize, Option<String>)>,
 ) -> CompactEnvelope {
     if !envelope.ok {
         let err = envelope.error.as_ref().map(|e| CompactError {
@@ -415,34 +417,22 @@ pub fn compactify<T>(
         };
     }
 
-    let raw_hits: Vec<(String, f64, usize, Option<String>)> = envelope
+    let hits: Vec<CompactHit> = envelope
         .data
-        .as_ref()
-        .map(hits_extractor)
-        .unwrap_or_default();
-
-    // Register hits and assign stable IDs
-    let ids = registry.register_batch(
-        &raw_hits
-            .iter()
-            .map(|(doc, score, _, _)| (doc.clone(), *score))
-            .collect::<Vec<_>>(),
-    );
-
-    let hits: Vec<CompactHit> = raw_hits
-        .into_iter()
-        .zip(ids)
-        .map(|((doc, score, rank, snippet), id)| {
-            let snip = match compact_level {
-                CompactLevel::Minimal => None,
-                _ => snippet,
-            };
+        .iter()
+        .flat_map(|payload| &payload.hits)
+        .map(|hit| {
+            let rank = hit.rank.saturating_sub(1);
             CompactHit {
-                id,
-                doc,
-                s: score,
+                id: result_id(rank),
+                doc: hit.path.clone(),
+                s: hit.score,
                 r: rank,
-                snip,
+                snip: match compact_level {
+                    CompactLevel::Minimal => None,
+                    _ => hit.snippet.clone(),
+                },
+                line: hit.line,
             }
         })
         .collect();
@@ -458,7 +448,10 @@ pub fn compactify<T>(
             n: hits.len(),
             hits,
             ms,
-            phase: None,
+            phase: envelope
+                .data
+                .as_ref()
+                .map(|payload| payload.phase.to_string()),
         }),
         err: None,
         w: compact_warnings(&envelope.warnings),
@@ -489,6 +482,7 @@ mod tests {
     use super::*;
     use crate::output_schema::{
         OutputEnvelope, OutputError, OutputErrorCode, OutputMeta, OutputWarningCode,
+        SearchHitPayload, SearchOutputPhase,
     };
 
     fn sample_ts() -> &'static str {
@@ -623,22 +617,40 @@ mod tests {
 
     // ─── Compact Conversion ───────────────────────────────────────────
 
+    fn search_envelope(
+        hits: &[(&str, f64, Option<&str>, Option<u32>)],
+        meta: OutputMeta,
+    ) -> OutputEnvelope<SearchPayload> {
+        let hits = hits
+            .iter()
+            .enumerate()
+            .map(|(index, (path, score, snippet, line))| SearchHitPayload {
+                rank: index + 1,
+                path: (*path).to_owned(),
+                line: *line,
+                score: *score,
+                snippet: snippet.map(str::to_owned),
+                lexical_rank: Some(index),
+                semantic_rank: None,
+                hash_rank: None,
+                in_both_sources: false,
+            })
+            .collect::<Vec<_>>();
+        let payload = SearchPayload::new("query", SearchOutputPhase::Refined, hits.len(), hits);
+        OutputEnvelope::success(payload, meta, sample_ts())
+    }
+
     #[test]
     fn compactify_success_envelope() {
-        let meta = OutputMeta::new("search", "json").with_duration_ms(42);
-        let env = OutputEnvelope::success(
-            vec![("doc-a".to_string(), 0.95), ("doc-b".to_string(), 0.80)],
-            meta,
-            sample_ts(),
+        let env = search_envelope(
+            &[
+                ("doc-a", 0.95, Some("matched text"), Some(12)),
+                ("doc-b", 0.80, None, None),
+            ],
+            OutputMeta::new("search", "json").with_duration_ms(42),
         );
 
-        let mut registry = ResultIdRegistry::new();
-        let compact = compactify(&env, CompactLevel::Compact, &mut registry, |data| {
-            data.iter()
-                .enumerate()
-                .map(|(i, (doc, score))| (doc.clone(), *score, i, None))
-                .collect()
-        });
+        let compact = compactify(&env, CompactLevel::Compact);
 
         assert!(compact.ok);
         assert!(compact.err.is_none());
@@ -647,37 +659,35 @@ mod tests {
         assert_eq!(data.hits[0].id, "R0");
         assert_eq!(data.hits[0].doc, "doc-a");
         assert!((data.hits[0].s - 0.95).abs() < f64::EPSILON);
+        assert_eq!(data.hits[0].snip.as_deref(), Some("matched text"));
+        assert_eq!(data.hits[0].line, Some(12));
         assert_eq!(data.hits[1].id, "R1");
+        assert_eq!(data.hits[1].line, None);
         assert_eq!(data.ms, Some(42));
+        assert_eq!(data.phase.as_deref(), Some("refined"));
     }
 
     #[test]
     fn compactify_minimal_strips_optional_fields() {
-        let meta = OutputMeta::new("search", "json").with_duration_ms(42);
-        let env = OutputEnvelope::success(vec![("doc-a".to_string(), 0.95)], meta, sample_ts());
+        let env = search_envelope(
+            &[("doc-a", 0.95, Some("snippet"), Some(7))],
+            OutputMeta::new("search", "json").with_duration_ms(42),
+        );
 
-        let mut registry = ResultIdRegistry::new();
-        let compact = compactify(&env, CompactLevel::Minimal, &mut registry, |data| {
-            data.iter()
-                .enumerate()
-                .map(|(i, (doc, score))| (doc.clone(), *score, i, Some("snippet".into())))
-                .collect()
-        });
-
-        let data = compact.data.unwrap();
-        // Minimal mode strips snippets and duration
+        let data = compactify(&env, CompactLevel::Minimal).data.unwrap();
+        // Minimal mode strips snippets and duration, keeps the location.
         assert!(data.hits[0].snip.is_none());
         assert!(data.ms.is_none());
+        assert_eq!(data.hits[0].line, Some(7));
     }
 
     #[test]
     fn compactify_error_envelope() {
         let err = OutputError::new(OutputErrorCode::SEARCH_TIMEOUT, "timeout after 50ms", 1);
-        let env: OutputEnvelope<Vec<(String, f64)>> =
+        let env: OutputEnvelope<SearchPayload> =
             OutputEnvelope::error(err, OutputMeta::new("search", "json"), sample_ts());
 
-        let mut registry = ResultIdRegistry::new();
-        let compact = compactify(&env, CompactLevel::Compact, &mut registry, |_| Vec::new());
+        let compact = compactify(&env, CompactLevel::Compact);
 
         assert!(!compact.ok);
         assert!(compact.data.is_none());
@@ -689,44 +699,35 @@ mod tests {
 
     #[test]
     fn compactify_with_warnings() {
-        let env = OutputEnvelope::success(
-            Vec::<(String, f64)>::new(),
-            OutputMeta::new("search", "json"),
-            sample_ts(),
-        )
-        .with_warnings(vec![
+        let env = search_envelope(&[], OutputMeta::new("search", "json")).with_warnings(vec![
             OutputWarning::new(OutputWarningCode::DEGRADED_MODE, "quality skipped"),
             OutputWarning::new(OutputWarningCode::FAST_ONLY_RESULTS, "fast only"),
         ]);
 
-        let mut registry = ResultIdRegistry::new();
-        let compact = compactify(&env, CompactLevel::Compact, &mut registry, |_| Vec::new());
+        let compact = compactify(&env, CompactLevel::Compact);
 
         assert_eq!(compact.w, vec!["degraded_mode", "fast_only_results"]);
     }
 
+    /// A compact id is the `R{n}` id `fsfs explain` resolves for the same
+    /// search: `n` is the 0-based rank, not a position in some registry.
     #[test]
-    fn compactify_preserves_registry_state() {
-        let meta = OutputMeta::new("search", "json");
-        let env1 =
-            OutputEnvelope::success(vec![("doc-a".to_string(), 0.95)], meta.clone(), sample_ts());
-        let env2 = OutputEnvelope::success(vec![("doc-b".to_string(), 0.80)], meta, sample_ts());
-
-        let mut registry = ResultIdRegistry::new();
-        let extractor = |data: &Vec<(String, f64)>| {
-            data.iter()
-                .enumerate()
-                .map(|(i, (doc, score))| (doc.clone(), *score, i, None))
-                .collect()
-        };
-
-        let _ = compactify(&env1, CompactLevel::Compact, &mut registry, extractor);
-        let _ = compactify(&env2, CompactLevel::Compact, &mut registry, extractor);
-
-        // Registry accumulated IDs across both calls
-        assert_eq!(registry.len(), 2);
-        assert_eq!(registry.resolve("R0").unwrap().doc_id, "doc-a");
-        assert_eq!(registry.resolve("R1").unwrap().doc_id, "doc-b");
+    fn compactify_ids_are_the_explain_result_ids() {
+        let env = search_envelope(
+            &[
+                ("a", 0.9, None, None),
+                ("b", 0.8, None, None),
+                ("c", 0.7, None, None),
+            ],
+            OutputMeta::new("search", "json"),
+        );
+        let payload = env.data.as_ref().unwrap();
+        let data = compactify(&env, CompactLevel::Compact).data.unwrap();
+        for (compact, hit) in data.hits.iter().zip(&payload.hits) {
+            assert_eq!(parse_result_id(&compact.id), Some(hit.rank - 1));
+            assert_eq!(compact.r, hit.rank - 1);
+            assert_eq!(compact.doc, hit.path);
+        }
     }
 
     // ─── Retryability ─────────────────────────────────────────────────
@@ -752,9 +753,11 @@ mod tests {
             s: 0.95,
             r: 0,
             snip: None,
+            line: None,
         };
         let json = serde_json::to_string(&hit).unwrap();
         assert!(!json.contains("snip"));
+        assert!(!json.contains("line"));
 
         let hit_with_snip = CompactHit {
             id: "R1".into(),
@@ -762,9 +765,11 @@ mod tests {
             s: 0.87,
             r: 1,
             snip: Some("matched text".into()),
+            line: Some(3),
         };
         let json = serde_json::to_string(&hit_with_snip).unwrap();
         assert!(json.contains("\"snip\":\"matched text\""));
+        assert!(json.contains("\"line\":3"));
     }
 
     #[test]
@@ -779,9 +784,10 @@ mod tests {
                     s: 0.95,
                     r: 0,
                     snip: None,
+                    line: None,
                 }],
                 ms: Some(15),
-                phase: Some("fast".into()),
+                phase: Some("initial".into()),
             }),
             err: None,
             w: Vec::new(),

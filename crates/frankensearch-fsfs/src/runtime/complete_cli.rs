@@ -796,7 +796,15 @@ impl FsfsRuntime {
                 iso_timestamp_now(),
             )
             .with_warnings(warnings);
-            emit_envelope(&envelope, self.cli_input.format, writer)?;
+            if !(self.cli_input.compact
+                && crate::adapters::format_emitter::emit_compact_search_envelope(
+                    &envelope,
+                    self.cli_input.format,
+                    writer,
+                )?)
+            {
+                emit_envelope(&envelope, self.cli_input.format, writer)?;
+            }
             if !matches!(
                 self.cli_input.format,
                 OutputFormat::Jsonl | OutputFormat::Csv

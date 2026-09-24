@@ -6423,7 +6423,15 @@ impl FsfsRuntime {
             OutputEnvelope::success(payload, meta, iso_timestamp_now()).with_warnings(warnings);
         let stdout = std::io::stdout();
         let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
-        emit_envelope(&envelope, self.cli_input.format, &mut writer)?;
+        if !(self.cli_input.compact
+            && crate::adapters::format_emitter::emit_compact_search_envelope(
+                &envelope,
+                self.cli_input.format,
+                &mut writer,
+            )?)
+        {
+            emit_envelope(&envelope, self.cli_input.format, &mut writer)?;
+        }
         if !matches!(
             self.cli_input.format,
             OutputFormat::Jsonl | OutputFormat::Csv
@@ -20502,7 +20510,7 @@ fn print_cli_help() {
         "Search flags: --limit/-l <n|all> --filter \"type:rs path:src\" --fast-only --rerank --expand"
     );
     println!(
-        "              --explain/-e --stream --index-dir <dir> --daemon --no-daemon --daemon-socket <path>"
+        "              --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>"
     );
     println!(
         "Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>"
