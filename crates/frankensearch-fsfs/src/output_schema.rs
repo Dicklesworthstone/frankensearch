@@ -950,6 +950,19 @@ pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
     }
 }
 
+/// Whether an `InvalidConfig` field names a setting a config file can set:
+/// it lies under one of `FsfsConfig`'s top-level sections (`search.`, ...).
+fn names_config_setting(field: &str) -> bool {
+    let Some((section, _)) = field.split_once('.') else {
+        return false;
+    };
+    serde_json::to_value(crate::config::FsfsConfig::default()).is_ok_and(|config| {
+        config
+            .get(section)
+            .is_some_and(serde_json::Value::is_object)
+    })
+}
+
 /// Return an actionable fix suggestion for a [`SearchError`].
 ///
 /// Each suggestion tells the user exactly what command to run or
@@ -1028,11 +1041,16 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
                  Run: fsfs help"
             ))
         }
-        SearchError::InvalidConfig { field, reason, .. } => Some(format!(
-            "Check the '{field}' setting in your configuration.\n\
-             {reason}\n\
-             Config files: fsfs.toml (project) or ~/.config/fsfs/config.toml (user)"
-        )),
+        SearchError::InvalidConfig { field, reason, .. } if names_config_setting(field) => {
+            Some(format!(
+                "Check the '{field}' setting in your configuration.\n\
+                 {reason}\n\
+                 Config files: fsfs.toml (project) or ~/.config/fsfs/config.toml (user)"
+            ))
+        }
+        // Inputs and runtime state (an append-batch line, update metadata, an
+        // index generation) are not settings; no config file fixes them.
+        SearchError::InvalidConfig { reason, .. } => Some(reason.clone()),
         SearchError::Io(_) => Some(
             "Check file permissions and available disk space.\n\
              Explicit model downloads require space in the selected model cache; search indices vary by corpus size."
@@ -2196,6 +2214,15 @@ mod tests {
             .suggestion
             .unwrap();
         assert!(config.contains("config.toml"), "{config}");
+        // An input (an append-batch line) is no setting: no config-file advice.
+        let input = output_error_from(&invalid("append_batch.input"))
+            .suggestion
+            .unwrap();
+        assert!(
+            !input.contains("config.toml") && !input.contains("configuration"),
+            "{input}"
+        );
+        assert!(input.contains("unknown flag"), "the reason stays: {input}");
 
         let timeout = output_error_from(&SearchError::SearchTimeout {
             elapsed_ms: 900,
