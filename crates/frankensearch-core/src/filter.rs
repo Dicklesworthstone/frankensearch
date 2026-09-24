@@ -67,6 +67,93 @@ pub trait SearchFilter: Send + Sync {
     fn name(&self) -> &str;
 }
 
+/// A borrowed filter that excludes exact document IDs from another filter.
+///
+/// Hashes only accelerate negative checks. A possible hash collision always
+/// falls back to the full document ID, so excluding one ID cannot hide another.
+/// Nonempty exclusions deliberately do not expose `candidate_hashes`: the
+/// gather contract cannot express exact string exclusions with only hashes.
+/// The inner filter and the excluded strings must outlive this view.
+pub struct ExcludeDocIdsFilter<'a> {
+    inner: Option<&'a dyn SearchFilter>,
+    excluded: HashSet<&'a str>,
+    excluded_hashes: DocIdHashSet,
+}
+
+impl<'a> ExcludeDocIdsFilter<'a> {
+    /// Exclude the supplied exact IDs, optionally retaining an existing filter.
+    #[must_use]
+    pub fn new(
+        inner: Option<&'a dyn SearchFilter>,
+        excluded: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let excluded: HashSet<_> = excluded.into_iter().collect();
+        let excluded_hashes = excluded.iter().map(|id| fnv1a_hash(id.as_bytes())).collect();
+        Self {
+            inner,
+            excluded,
+            excluded_hashes,
+        }
+    }
+}
+
+impl fmt::Debug for ExcludeDocIdsFilter<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExcludeDocIdsFilter")
+            .field("excluded_count", &self.excluded.len())
+            .field("has_inner", &self.inner.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SearchFilter for ExcludeDocIdsFilter<'_> {
+    fn matches(&self, doc_id: &str, metadata: Option<&serde_json::Value>) -> bool {
+        !self.excluded.contains(doc_id)
+            && self.inner.is_none_or(|inner| inner.matches(doc_id, metadata))
+    }
+
+    fn matches_doc_id_hash(
+        &self,
+        doc_id_hash: u64,
+        metadata: Option<&serde_json::Value>,
+    ) -> Option<bool> {
+        let inner = self.inner.map_or(Some(true), |inner| {
+            inner.matches_doc_id_hash(doc_id_hash, metadata)
+        });
+        if inner == Some(false) {
+            return Some(false);
+        }
+        if self.excluded_hashes.contains(&doc_id_hash) {
+            // Even an exact allow-list cannot turn an exclusion hash into an
+            // exclusion identity. Let the scanner perform the string check.
+            None
+        } else {
+            inner
+        }
+    }
+
+    fn candidate_hashes(&self) -> Option<&DocIdHashSet> {
+        if self.excluded.is_empty() {
+            self.inner.and_then(SearchFilter::candidate_hashes)
+        } else {
+            None
+        }
+    }
+
+    fn immutable_candidate_hashes(&self) -> Option<&DocIdHashSet> {
+        if self.excluded.is_empty() {
+            self.inner.and_then(SearchFilter::immutable_candidate_hashes)
+        } else {
+            None
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "exclude_doc_ids"
+    }
+}
+
 /// How multiple filters in a [`FilterChain`] are combined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterMode {
@@ -525,6 +612,93 @@ pub fn fnv1a_hash(data: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct ExclusionMetadataFilter;
+
+    impl SearchFilter for ExclusionMetadataFilter {
+        fn matches(&self, _: &str, metadata: Option<&serde_json::Value>) -> bool {
+            metadata
+                .and_then(|value| value.get("allowed"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        }
+
+        fn name(&self) -> &'static str {
+            "exclusion-metadata-test"
+        }
+    }
+
+    #[test]
+    fn exact_exclusions_compose_with_hash_and_predicate_filters() {
+        let allowed = BitsetFilter::from_doc_ids(["replace", "keep"]);
+        let filter = ExcludeDocIdsFilter::new(Some(&allowed), ["replace", "replace"]);
+        assert!(!filter.matches("replace", None));
+        assert!(filter.matches("keep", None));
+        assert!(!filter.matches("outside", None));
+        assert_eq!(filter.matches_doc_id_hash(fnv1a_hash(b"replace"), None), None);
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"keep"), None),
+            Some(true)
+        );
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"outside"), None),
+            Some(false)
+        );
+        assert!(filter.candidate_hashes().is_none());
+        assert!(filter.immutable_candidate_hashes().is_none());
+        let predicate = PredicateFilter::new("suffix", |id| id.ends_with(".rs"));
+        let filter = ExcludeDocIdsFilter::new(Some(&predicate), ["old.rs"]);
+        assert!(!filter.matches("old.rs", None));
+        assert!(filter.matches("new.rs", None));
+        assert!(!filter.matches("new.txt", None));
+        assert_eq!(filter.matches_doc_id_hash(fnv1a_hash(b"new.rs"), None), None);
+    }
+
+    #[test]
+    fn simulated_hash_collision_requires_exact_id_comparison() {
+        let mut filter = ExcludeDocIdsFilter::new(None, ["excluded"]);
+        // Simulate a collision in the hash pre-screen, not in the exact set.
+        // This proves the fallback; it is not a claim to have found FNV collisions.
+        filter.excluded_hashes.insert(fnv1a_hash(b"different"));
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"different"), None),
+            None
+        );
+        assert!(filter.matches("different", None));
+        assert!(!filter.matches("excluded", None));
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"unrelated"), None),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn empty_exclusions_preserve_enumeration_and_metadata_is_forwarded() {
+        let allowed = BitsetFilter::from_doc_ids(["keep"]);
+        let filter = ExcludeDocIdsFilter::new(Some(&allowed), []);
+        assert_eq!(filter.candidate_hashes(), allowed.candidate_hashes());
+        assert_eq!(
+            filter.immutable_candidate_hashes(),
+            allowed.immutable_candidate_hashes()
+        );
+        assert!(filter.matches("keep", None));
+        assert!(!filter.matches("outside", None));
+
+        let metadata = serde_json::json!({"allowed": true});
+        let inner = ExclusionMetadataFilter;
+        let filter = ExcludeDocIdsFilter::new(Some(&inner), ["excluded"]);
+        assert!(filter.matches("keep", Some(&metadata)));
+        assert!(!filter.matches("excluded", Some(&metadata)));
+        assert!(!filter.matches("keep", None));
+    }
+
+    #[test]
+    fn debug_output_does_not_disclose_excluded_ids() {
+        let filter = ExcludeDocIdsFilter::new(None, ["private-document-canary"]);
+        let debug = format!("{filter:?}");
+        assert!(debug.contains("excluded_count"));
+        assert!(!debug.contains("private-document-canary"));
+    }
 
     // --- DocTypeFilter ---
 
