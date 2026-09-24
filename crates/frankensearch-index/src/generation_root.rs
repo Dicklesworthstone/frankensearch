@@ -4102,11 +4102,11 @@ pub mod generation_reader {
         QualifiedGenerationFile, QualifiedGenerationRoot,
     };
     use frankensearch_core::generation::{
-        ActivationManifestV1, AntiRollbackFloorRecordV1, AuthorityRefV1, AuthoritySlotV1,
+        ActivationManifest, AntiRollbackFloorRecordV1, AuthorityRefV1, AuthoritySlotV1,
         GENERATION_LOCK_FRAME_BYTES_V1, GenerationAuthorityErrorV1, GenerationComponentReceiptV1,
         GenerationComponentRole, GenerationLockFrameKindV1, GenerationLockFrameV1,
         GenerationRootSecurityProfileV1, resolve_authority_slots_with_profile_v1,
-        verify_authority_manifest_reference_v1,
+        verify_authority_manifest_reference,
     };
 
     /// Bounded number of resolve→open→reresolve rounds before a fresh open
@@ -4224,32 +4224,39 @@ pub mod generation_reader {
         ForeignDevice,
     }
 
-    /// The four retained component objects of one generation, each admitted
-    /// descriptor-relatively at the exact length and digest its manifest
-    /// receipt names.
+    /// The retained component objects of one generation.
+    ///
+    /// Each is admitted descriptor-relatively at the exact length and digest
+    /// its manifest receipt names. Vector, lexical and metadata are mandatory.
+    /// ANN is present only when the selected manifest declares it; historical
+    /// ANN objects elsewhere in the root never supply an absent accelerator.
     pub struct GenerationClosureV1 {
         vector: QualifiedGenerationFile,
         lexical: QualifiedGenerationFile,
-        ann: QualifiedGenerationFile,
+        ann: Option<QualifiedGenerationFile>,
         metadata: QualifiedGenerationFile,
     }
 
     impl GenerationClosureV1 {
-        /// Retained object for `role`.
+        /// Retained object for `role`; absent ANN is explicitly `None`.
         #[must_use]
-        pub const fn file(&self, role: GenerationComponentRole) -> &QualifiedGenerationFile {
+        pub const fn file(
+            &self,
+            role: GenerationComponentRole,
+        ) -> Option<&QualifiedGenerationFile> {
             match role {
-                GenerationComponentRole::Vector => &self.vector,
-                GenerationComponentRole::Lexical => &self.lexical,
-                GenerationComponentRole::Ann => &self.ann,
-                GenerationComponentRole::Metadata => &self.metadata,
+                GenerationComponentRole::Vector => Some(&self.vector),
+                GenerationComponentRole::Lexical => Some(&self.lexical),
+                GenerationComponentRole::Ann => self.ann.as_ref(),
+                GenerationComponentRole::Metadata => Some(&self.metadata),
             }
         }
 
-        /// Exact bytes of the object for `role` (shared, immutable).
+        /// Exact bytes of the object for `role` (shared, immutable), or `None`
+        /// when the selected manifest explicitly omits ANN.
         #[must_use]
-        pub fn bytes(&self, role: GenerationComponentRole) -> Arc<[u8]> {
-            self.file(role).bytes()
+        pub fn bytes(&self, role: GenerationComponentRole) -> Option<Arc<[u8]>> {
+            self.file(role).map(QualifiedGenerationFile::bytes)
         }
     }
 
@@ -4259,7 +4266,10 @@ pub mod generation_reader {
                 .debug_struct("GenerationClosureV1")
                 .field("vector", &self.vector.witness())
                 .field("lexical", &self.lexical.witness())
-                .field("ann", &self.ann.witness())
+                .field(
+                    "ann",
+                    &self.ann.as_ref().map(QualifiedGenerationFile::witness),
+                )
                 .field("metadata", &self.metadata.witness())
                 .finish()
         }
@@ -4401,13 +4411,13 @@ pub mod generation_reader {
         head: AuthoritySlotV1,
         floor: Option<AntiRollbackFloorRecordV1>,
         manifest_file: QualifiedGenerationFile,
-        manifest: ActivationManifestV1,
+        manifest: ActivationManifest,
         closure: GenerationClosureV1,
         health: SnapshotHealthV1,
     }
 
     impl OpenedGenerationSnapshotV1 {
-        /// The four retained component objects this generation declares.
+        /// The retained component objects this generation declares.
         #[must_use]
         pub const fn closure(&self) -> &GenerationClosureV1 {
             &self.closure
@@ -4457,7 +4467,7 @@ pub mod generation_reader {
 
         /// Decoded, reference-verified activation manifest.
         #[must_use]
-        pub const fn manifest(&self) -> &ActivationManifestV1 {
+        pub const fn manifest(&self) -> &ActivationManifest {
             &self.manifest
         }
 
@@ -4754,9 +4764,9 @@ pub mod generation_reader {
                     }
                 };
                 let manifest =
-                    match ActivationManifestV1::from_canonical_bytes(manifest_file.as_bytes())
+                    match ActivationManifest::from_canonical_bytes(manifest_file.as_bytes())
                         .and_then(|manifest| {
-                            verify_authority_manifest_reference_v1(&authority, &manifest)
+                            verify_authority_manifest_reference(&authority, &manifest)
                                 .map(|()| manifest)
                         }) {
                         Ok(manifest) => manifest,
@@ -4769,20 +4779,22 @@ pub mod generation_reader {
 
                 // Every declared component object, exact length and digest
                 // from the manifest receipts, descriptor-relative.
-                let receipts = manifest.components;
-                let mut files = Vec::with_capacity(4);
-                for (role, receipt) in [
-                    (GenerationComponentRole::Vector, receipts.vector),
-                    (GenerationComponentRole::Lexical, receipts.lexical),
-                    (GenerationComponentRole::Ann, receipts.ann),
-                    (GenerationComponentRole::Metadata, receipts.metadata),
-                ] {
+                let receipts = manifest.components();
+                let mut vector = None;
+                let mut lexical = None;
+                let mut ann = None;
+                let mut metadata = None;
+                for (role, receipt) in receipts.iter() {
                     match admit_component(self, role, receipt)? {
-                        Ok(file) => files.push(file),
+                        Ok(file) => match role {
+                            GenerationComponentRole::Vector => vector = Some(file),
+                            GenerationComponentRole::Lexical => lexical = Some(file),
+                            GenerationComponentRole::Ann => ann = Some(file),
+                            GenerationComponentRole::Metadata => metadata = Some(file),
+                        },
                         Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
                     }
                 }
-                let mut files = files.into_iter();
                 // Off the native platforms `QualifiedGenerationFile` is
                 // uninhabited (the fallback handle types are empty enums), so
                 // rustc correctly reports every field after the first as
@@ -4794,10 +4806,10 @@ pub mod generation_reader {
                     allow(unreachable_code)
                 )]
                 let closure = GenerationClosureV1 {
-                    vector: files.next().expect("four components admitted"),
-                    lexical: files.next().expect("four components admitted"),
-                    ann: files.next().expect("four components admitted"),
-                    metadata: files.next().expect("four components admitted"),
+                    vector: vector.expect("mandatory vector component admitted"),
+                    lexical: lexical.expect("mandatory lexical component admitted"),
+                    ann,
+                    metadata: metadata.expect("mandatory metadata component admitted"),
                 };
 
                 // Reread under a fresh shared lock: identical or start over.
@@ -4815,30 +4827,18 @@ pub mod generation_reader {
 
                 // Closure over the retained root as it was under that lock.
                 let manifest_name = activation_manifest_name_v1(authority.object_id);
-                let component_names = [
-                    component_object_name_v1(
-                        GenerationComponentRole::Vector,
-                        receipts.vector.sha256,
-                    ),
-                    component_object_name_v1(
-                        GenerationComponentRole::Lexical,
-                        receipts.lexical.sha256,
-                    ),
-                    component_object_name_v1(GenerationComponentRole::Ann, receipts.ann.sha256),
-                    component_object_name_v1(
-                        GenerationComponentRole::Metadata,
-                        receipts.metadata.sha256,
-                    ),
-                ];
-                let declared = [
+                let component_names: Vec<_> = receipts
+                    .iter()
+                    .map(|(role, receipt)| component_object_name_v1(role, receipt.sha256))
+                    .collect();
+                let declared: Vec<_> = [
                     GENERATION_ROOT_LOCK_FILE_NAME,
                     GENERATION_ROOT_AUTHORITY_FILE_NAME,
                     manifest_name.as_str(),
-                    component_names[0].as_str(),
-                    component_names[1].as_str(),
-                    component_names[2].as_str(),
-                    component_names[3].as_str(),
-                ];
+                ]
+                .into_iter()
+                .chain(component_names.iter().map(String::as_str))
+                .collect();
                 if let Err(violation) =
                     check_closure(&inventory, self.witness().device(), &declared)
                 {
@@ -5007,8 +5007,9 @@ pub mod generation_reader {
             GenerationRootStage, platform,
         };
         use frankensearch_core::generation::{
-            ArtifactGenerationIdentityV1, GenerationAuthorityActionV1,
-            GenerationComponentReceiptV1, GenerationComponentReceiptsV1,
+            ActivationManifestV1, ActivationManifestV2, ArtifactGenerationIdentityV1,
+            GenerationAuthorityActionV1, GenerationComponentReceiptV1,
+            GenerationComponentReceiptsV1, GenerationComponentReceiptsV2,
             InMemoryAntiRollbackFloorStoreV1,
         };
         use sha2::{Digest as _, Sha256};
@@ -5136,18 +5137,46 @@ pub mod generation_reader {
             }
         }
 
-        fn manifest(sequence: u64, predecessor: Option<AuthorityRefV1>) -> ActivationManifestV1 {
-            ActivationManifestV1::new(
-                sequence,
-                predecessor,
-                GenerationAuthorityActionV1::Activate,
-                ArtifactGenerationIdentityV1::new(sequence, [0x21; 16]).expect("generation"),
-                [0x31; 32],
-                [0x32; 32],
-                [0x33; 32],
-                component_receipts(sequence),
+        fn manifest(sequence: u64, predecessor: Option<AuthorityRefV1>) -> ActivationManifest {
+            ActivationManifest::V1(
+                ActivationManifestV1::new(
+                    sequence,
+                    predecessor,
+                    GenerationAuthorityActionV1::Activate,
+                    ArtifactGenerationIdentityV1::new(sequence, [0x21; 16]).expect("generation"),
+                    [0x31; 32],
+                    [0x32; 32],
+                    [0x33; 32],
+                    component_receipts(sequence),
+                )
+                .expect("valid v1 activation manifest"),
             )
-            .expect("valid activation manifest")
+        }
+
+        fn manifest_v2(
+            sequence: u64,
+            predecessor: Option<AuthorityRefV1>,
+            with_ann: bool,
+        ) -> ActivationManifest {
+            let receipts = component_receipts(sequence);
+            ActivationManifest::V2(
+                ActivationManifestV2::new(
+                    sequence,
+                    predecessor,
+                    GenerationAuthorityActionV1::Activate,
+                    ArtifactGenerationIdentityV1::new(sequence, [0x21; 16]).expect("generation"),
+                    [0x31; 32],
+                    [0x32; 32],
+                    [0x33; 32],
+                    GenerationComponentReceiptsV2 {
+                        vector: receipts.vector,
+                        lexical: receipts.lexical,
+                        ann: with_ann.then_some(receipts.ann),
+                        metadata: receipts.metadata,
+                    },
+                )
+                .expect("valid v2 activation manifest"),
+            )
         }
 
         /// Write one sealed immutable object (`create_new`, owner read-only,
@@ -5202,19 +5231,39 @@ pub mod generation_reader {
             predecessor: Option<AuthorityRefV1>,
             expected: ExpectedAuthorityPairV1,
             floor: Option<&dyn AntiRollbackFloorProviderV1>,
-        ) -> (AuthorityRefV1, ActivationManifestV1, AuthoritySlotV1) {
+        ) -> (AuthorityRefV1, ActivationManifest, AuthoritySlotV1) {
             let manifest = manifest(sequence, predecessor);
+            let (authority, slot) =
+                publish_manifest(root_path, publisher, &manifest, expected, floor);
+            (authority, manifest, slot)
+        }
+
+        /// Stage precisely the selected manifest's roles. Preexisting objects
+        /// remain untouched so corrupt candidates reach reader-refusal tests.
+        fn publish_manifest(
+            root_path: &Path,
+            publisher: &AuthorityPublisherV1<'_>,
+            manifest: &ActivationManifest,
+            expected: ExpectedAuthorityPairV1,
+            floor: Option<&dyn AntiRollbackFloorProviderV1>,
+        ) -> (AuthorityRefV1, AuthoritySlotV1) {
+            let sequence = manifest.authority_sequence();
             let bytes = manifest.canonical_bytes();
             let (len, sha256) = manifest.object_receipt();
             let id = object_id(sequence);
-            write_component_objects(root_path, sequence);
+            for (role, receipt) in manifest.components().iter() {
+                let name = component_object_name_v1(role, receipt.sha256);
+                if !root_path.join(&name).exists() {
+                    write_sealed_object(root_path, &name, &component_bytes(role, sequence));
+                }
+            }
             write_manifest_object(root_path, id, &bytes);
             let authority = AuthorityRefV1::new(
                 sequence,
                 id,
                 len,
                 sha256,
-                predecessor.map(|p| p.fingerprint()),
+                manifest.predecessor().map(|p| p.fingerprint()),
             )
             .expect("authority reference");
             let outcome = publisher
@@ -5223,7 +5272,7 @@ pub mod generation_reader {
             let PublicationOutcomeV1::Committed { slot, .. } = outcome else {
                 panic!("sequence {sequence} must commit: {outcome:?}");
             };
-            (authority, manifest, slot)
+            (authority, slot)
         }
 
         fn open(
@@ -5553,7 +5602,7 @@ pub mod generation_reader {
 
             // Through all of it the earlier snapshot is exactly what it was.
             assert_eq!(retained.head(), genesis_slot);
-            assert_eq!(retained.manifest().authority_sequence, 1);
+            assert_eq!(retained.manifest().authority_sequence(), 1);
         }
 
         #[test]
@@ -5952,26 +6001,28 @@ pub mod generation_reader {
                 None,
             ));
             assert_eq!(snapshot.head(), slot);
-            let receipts = snapshot.manifest().components;
-            for (role, receipt) in [
-                (GenerationComponentRole::Vector, receipts.vector),
-                (GenerationComponentRole::Lexical, receipts.lexical),
-                (GenerationComponentRole::Ann, receipts.ann),
-                (GenerationComponentRole::Metadata, receipts.metadata),
-            ] {
-                let file = snapshot.closure().file(role);
+            let receipts = snapshot.manifest().components();
+            assert!(matches!(snapshot.manifest(), ActivationManifest::V1(_)));
+            for (role, receipt) in receipts.iter() {
+                let file = snapshot.closure().file(role).expect("declared component");
                 assert_eq!(file.sha256(), receipt.sha256, "{role:?} digest");
                 assert_eq!(
                     u64::try_from(file.as_bytes().len()).expect("len"),
                     receipt.byte_len,
                     "{role:?} length"
                 );
-                assert_eq!(&*snapshot.closure().bytes(role), &*component_bytes(role, 1));
+                assert_eq!(
+                    &*snapshot.closure().bytes(role).expect("declared bytes"),
+                    &*component_bytes(role, 1)
+                );
                 assert_eq!(file.witness().hard_links(), 1);
             }
             assert!(is_retained_object_name_v1(
-                component_object_name_v1(GenerationComponentRole::Ann, receipts.ann.sha256)
-                    .as_bytes()
+                component_object_name_v1(
+                    GenerationComponentRole::Ann,
+                    receipts.ann.expect("v1 requires ANN").sha256
+                )
+                .as_bytes()
             ));
             assert!(is_retained_object_name_v1(
                 activation_manifest_name_v1(object_id(1)).as_bytes()
@@ -5985,6 +6036,207 @@ pub mod generation_reader {
                 "LOCK",
             ] {
                 assert!(!is_retained_object_name_v1(bad.as_bytes()), "{bad}");
+            }
+        }
+
+        #[test]
+        fn ann_and_exact_transitions_preserve_versioned_manifests_and_old_closures() {
+            let root_path = fixture_root("closure-optional-ann");
+            let root = admit(&root_path);
+            let floor = InMemoryAntiRollbackFloorStoreV1::new();
+            let publisher = publisher(&root);
+            let mut predecessor = None;
+            let mut expected = ExpectedAuthorityPairV1::default();
+            let mut retained = Vec::new();
+
+            // V1 ANN -> V2 exact -> V2 ANN -> V2 exact exercises both
+            // directions without deleting any previous graph or manifest.
+            for sequence in 1..=4 {
+                let selected = if sequence == 1 {
+                    manifest(sequence, predecessor)
+                } else {
+                    manifest_v2(sequence, predecessor, sequence == 3)
+                };
+                let (authority, slot) =
+                    publish_manifest(&root_path, &publisher, &selected, expected, Some(&floor));
+                if slot.slot_index == 0 {
+                    expected.first = Some(slot);
+                } else {
+                    expected.second = Some(slot);
+                }
+                predecessor = Some(authority);
+                let floor_before = floor.load(ROOT_ID).expect("floor before read");
+                let authority_before = fs::read(root_path.join("AUTHORITY")).expect("authority");
+                let lock_before = fs::read(root_path.join("LOCK")).expect("lock");
+
+                // Every admission uses independently opened root descriptors.
+                let fresh_root = admit(&root_path);
+                let snapshot = opened(open(
+                    &fresh_root,
+                    GenerationRootSecurityProfileV1::RequiredExternal,
+                    Some(&floor),
+                ));
+                assert_eq!(snapshot.head(), slot);
+                assert_eq!(snapshot.manifest(), &selected);
+                assert_eq!(
+                    snapshot.manifest_bytes().as_ref(),
+                    selected.canonical_bytes().as_slice()
+                );
+                assert_eq!(
+                    snapshot.health(),
+                    SnapshotHealthV1::ExternallyAnchored {
+                        cas_version: sequence
+                    }
+                );
+                assert_eq!(floor.load(ROOT_ID).expect("floor after read"), floor_before);
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    authority_before
+                );
+                assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_before);
+                retained.push(snapshot);
+
+                for snapshot in &retained {
+                    let sequence = snapshot.head().authority.sequence;
+                    for role in ROLES {
+                        match snapshot.manifest().components().get(role) {
+                            Some(receipt) => {
+                                let file = snapshot.closure().file(role).expect("declared role");
+                                assert_eq!(file.sha256(), receipt.sha256);
+                                assert_eq!(
+                                    snapshot.closure().bytes(role).unwrap().as_ref(),
+                                    component_bytes(role, sequence).as_slice()
+                                );
+                            }
+                            None => {
+                                assert_eq!(role, GenerationComponentRole::Ann);
+                                assert!(snapshot.closure().file(role).is_none());
+                                assert!(snapshot.closure().bytes(role).is_none());
+                            }
+                        }
+                    }
+                }
+            }
+
+            for sequence in [1, 3] {
+                assert!(
+                    root_path
+                        .join(component_object_name_v1(
+                            GenerationComponentRole::Ann,
+                            component_receipt(GenerationComponentRole::Ann, sequence).sha256,
+                        ))
+                        .exists(),
+                    "old ANN objects remain retained while exact generations serve"
+                );
+            }
+        }
+
+        #[test]
+        fn declared_v2_ann_failure_never_degrades_or_replaces_an_exact_reader() {
+            for missing in [false, true] {
+                let root_path = fixture_root("closure-declared-v2-ann-failure");
+                let root = admit(&root_path);
+                let floor = InMemoryAntiRollbackFloorStoreV1::new();
+                let publisher = publisher(&root);
+                let exact = manifest_v2(1, None, false);
+                let (genesis, genesis_slot) = publish_manifest(
+                    &root_path,
+                    &publisher,
+                    &exact,
+                    ExpectedAuthorityPairV1::default(),
+                    Some(&floor),
+                );
+                let cell = GenerationSnapshotCellV1::new();
+                let old = opened(
+                    cell.refresh(
+                        &root,
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::RequiredExternal,
+                        Some(&floor),
+                    )
+                    .expect("admit exact genesis"),
+                );
+                assert!(old.closure().file(GenerationComponentRole::Ann).is_none());
+                assert_eq!(
+                    root.inventory().expect("exact inventory").entries().len(),
+                    6,
+                    "exact genesis has two anchors, its manifest, and three components"
+                );
+
+                let selected = manifest_v2(2, Some(genesis), true);
+                let receipt = selected.components().ann.expect("explicit ANN selection");
+                let name = component_object_name_v1(GenerationComponentRole::Ann, receipt.sha256);
+                if !missing {
+                    let mut bytes = component_bytes(GenerationComponentRole::Ann, 2);
+                    bytes[50] ^= 1;
+                    write_sealed_object(&root_path, &name, &bytes);
+                }
+                // The low-level authority publisher does not parse engines;
+                // plant a committed bad closure to exercise fresh admission.
+                publish_manifest(
+                    &root_path,
+                    &publisher,
+                    &selected,
+                    ExpectedAuthorityPairV1 {
+                        first: None,
+                        second: Some(genesis_slot),
+                    },
+                    Some(&floor),
+                );
+                if missing {
+                    fs::rename(
+                        root_path.join(&name),
+                        root_path.join(component_object_name_v1(
+                            GenerationComponentRole::Ann,
+                            [0xe5; 32],
+                        )),
+                    )
+                    .expect("retain graph under a different name");
+                }
+                let floor_before = floor.load(ROOT_ID).expect("committed floor");
+                let authority_before = fs::read(root_path.join("AUTHORITY")).expect("authority");
+                let lock_before = fs::read(root_path.join("LOCK")).expect("lock");
+                let fresh_root = admit(&root_path);
+                let refusal = refused(
+                    cell.refresh(
+                        &fresh_root,
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::RequiredExternal,
+                        Some(&floor),
+                    )
+                    .expect("refresh returns a typed closure refusal"),
+                );
+                // A declared name that is absent never reaches open(2): the
+                // exact-name enumeration (verify_exact_directory_entry) finds
+                // zero entries for it and reports ObjectChanged, 1 expected, 0
+                // observed.
+                assert_eq!(
+                    refusal,
+                    SnapshotRefusalV1::Closure(if missing {
+                        GenerationRootErrorKind::ObjectChanged
+                    } else {
+                        GenerationRootErrorKind::HashMismatch
+                    })
+                );
+                assert!(Arc::ptr_eq(
+                    &cell.load().expect("prior snapshot remains"),
+                    &old
+                ));
+                assert_eq!(old.manifest(), &exact);
+                assert!(old.closure().bytes(GenerationComponentRole::Ann).is_none());
+                assert_eq!(
+                    old.closure()
+                        .bytes(GenerationComponentRole::Vector)
+                        .unwrap()
+                        .as_ref(),
+                    component_bytes(GenerationComponentRole::Vector, 1).as_slice()
+                );
+                assert_eq!(floor.load(ROOT_ID).expect("unchanged floor"), floor_before);
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    authority_before
+                );
+                assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_before);
             }
         }
 
@@ -6189,7 +6441,10 @@ pub mod generation_reader {
             let loaded = cell.load().expect("installed");
             assert!(Arc::ptr_eq(&installed, &loaded));
             assert_eq!(loaded.head(), slot);
-            let bytes_before = loaded.closure().bytes(GenerationComponentRole::Vector);
+            let bytes_before = loaded
+                .closure()
+                .bytes(GenerationComponentRole::Vector)
+                .expect("mandatory vector");
 
             // Plant a violation: the refresh is refused and the cell is untouched.
             write_sealed_object(&root_path, "stray.wal", b"journal");
@@ -6209,7 +6464,10 @@ pub mod generation_reader {
             let still = cell.load().expect("still installed");
             assert!(Arc::ptr_eq(&still, &loaded));
             assert_eq!(
-                &*still.closure().bytes(GenerationComponentRole::Vector),
+                &*still
+                    .closure()
+                    .bytes(GenerationComponentRole::Vector)
+                    .expect("mandatory vector"),
                 &*bytes_before
             );
             assert!(format!("{cell:?}").contains("installed_head_sequence: Some(1)"));
@@ -6303,7 +6561,10 @@ pub mod generation_reader {
                 GenerationRootSecurityProfileV1::CooperativeLocal,
                 None,
             ));
-            let old_bytes = old.closure().bytes(GenerationComponentRole::Vector);
+            let old_bytes = old
+                .closure()
+                .bytes(GenerationComponentRole::Vector)
+                .expect("mandatory vector");
 
             // Exercise a race from both None and an installed generation. In
             // either case the slow thread has already observed the cell before
@@ -6365,7 +6626,10 @@ pub mod generation_reader {
             }
             assert_eq!(old.head().authority.sequence, 1);
             assert_eq!(
-                &*old.closure().bytes(GenerationComponentRole::Vector),
+                &*old
+                    .closure()
+                    .bytes(GenerationComponentRole::Vector)
+                    .expect("mandatory vector"),
                 &*old_bytes
             );
         }
@@ -6452,7 +6716,7 @@ pub mod generation_reader {
             );
             let old_closure: Vec<Arc<[u8]>> = ROLES
                 .iter()
-                .map(|role| old.closure().bytes(*role))
+                .map(|role| old.closure().bytes(*role).expect("v1 component"))
                 .collect();
             let mut pair = ExpectedAuthorityPairV1 {
                 first: None,
@@ -6501,8 +6765,18 @@ pub mod generation_reader {
             assert_eq!(old.head().authority.sequence, 1);
             assert_eq!(old.manifest(), &genesis_manifest);
             for (role, bytes) in ROLES.iter().zip(&old_closure) {
-                assert_eq!(&*old.closure().bytes(*role), &**bytes);
-                assert_eq!(old.closure().file(*role).witness().hard_links(), 1);
+                assert_eq!(
+                    &*old.closure().bytes(*role).expect("v1 component"),
+                    &**bytes
+                );
+                assert_eq!(
+                    old.closure()
+                        .file(*role)
+                        .expect("v1 component")
+                        .witness()
+                        .hard_links(),
+                    1
+                );
             }
             assert_eq!(
                 &*old.manifest_bytes(),
@@ -6626,7 +6900,10 @@ pub mod generation_reader {
                     GenerationRootSecurityProfileV1::RequiredExternal,
                     Some(&floor),
                 ));
-                let old_vector = old.closure().bytes(GenerationComponentRole::Vector);
+                let old_vector = old
+                    .closure()
+                    .bytes(GenerationComponentRole::Vector)
+                    .expect("mandatory vector");
 
                 // Successor objects are sealed first (outside the lock), then
                 // the publication crashes at the boundary under test.
@@ -6698,7 +6975,10 @@ pub mod generation_reader {
                 assert_eq!(old.head(), genesis_slot);
                 assert_eq!(old.manifest(), &genesis_manifest);
                 assert_eq!(
-                    &*old.closure().bytes(GenerationComponentRole::Vector),
+                    &*old
+                        .closure()
+                        .bytes(GenerationComponentRole::Vector)
+                        .expect("mandatory vector"),
                     &*old_vector
                 );
 
@@ -6768,7 +7048,10 @@ pub mod generation_reader {
                     "{crash_at:?}"
                 );
                 assert_eq!(
-                    &*converged.closure().bytes(GenerationComponentRole::Vector),
+                    &*converged
+                        .closure()
+                        .bytes(GenerationComponentRole::Vector)
+                        .expect("mandatory vector"),
                     component_bytes(GenerationComponentRole::Vector, 2).as_slice()
                 );
                 assert_eq!(old.head(), genesis_slot, "{crash_at:?}");

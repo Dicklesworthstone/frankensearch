@@ -6597,7 +6597,10 @@ impl FsfsRuntime {
 
         #[cfg(not(feature = "semantic-support"))]
         {
-            Ok(Some((model_free_semantic_recovery_guidance().to_owned(), true)))
+            Ok(Some((
+                model_free_semantic_recovery_guidance().to_owned(),
+                true,
+            )))
         }
 
         #[cfg(feature = "semantic-support")]
@@ -8635,22 +8638,15 @@ impl FsfsRuntime {
                 ),
             })?;
 
-        let (lexical_terms, lexical_terms_unavailable) =
-            hit.lexical_score
-                .map_or_else(|| (Vec::new(), None), |searched_score| {
-                    match lexical.map_err(String::clone).and_then(|index| {
-                        Self::lexical_term_scores(
-                            cx,
-                            index,
-                            &session.query,
-                            &hit.path,
-                            searched_score,
-                        )
-                    }) {
-                        Ok(terms) => (terms, None),
-                        Err(reason) => (Vec::new(), Some(reason)),
-                    }
-                });
+        let (lexical_terms, lexical_terms_unavailable) = hit.lexical_score.map_or_else(
+            || (Vec::new(), None),
+            |searched_score| match lexical.map_err(String::clone).and_then(|index| {
+                Self::lexical_term_scores(cx, index, &session.query, &hit.path, searched_score)
+            }) {
+                Ok(terms) => (terms, None),
+                Err(reason) => (Vec::new(), Some(reason)),
+            },
+        );
         let source_count = usize::from(hit.lexical_score.is_some())
             .saturating_add(usize::from(hit.hash_score.or(hit.semantic_score).is_some()));
         let shared_weight = if source_count == 0 {
@@ -10055,7 +10051,10 @@ impl FsfsRuntime {
             let (ranked, vector_only): (Vec<_>, Vec<_>) =
                 missing.partition(|candidate| candidate.lexical_rank.is_some());
             (
-                ranked.iter().map(|candidate| candidate.doc_id.as_str()).collect(),
+                ranked
+                    .iter()
+                    .map(|candidate| candidate.doc_id.as_str())
+                    .collect(),
                 vector_only
                     .iter()
                     .map(|candidate| candidate.doc_id.as_str())
@@ -21027,9 +21026,10 @@ fn read_hit_line_source(path: &Path) -> Option<String> {
         .take(FSFS_HIT_LINE_READ_LIMIT)
         .read_to_end(&mut bytes)
         .ok()?;
-    Some(String::from_utf8(bytes).unwrap_or_else(|error| {
-        String::from_utf8_lossy(error.as_bytes()).into_owned()
-    }))
+    Some(
+        String::from_utf8(bytes)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
+    )
 }
 
 /// 1-based line of `text` holding the snippet's first query word (its first
@@ -26046,9 +26046,7 @@ mod tests {
             {
                 let mut writer = VectorIndex::open(&path).unwrap();
                 for row in 0..STALE_ROWS {
-                    writer
-                        .append(&format!("stale-{row}"), &[0.0, 1.0])
-                        .unwrap();
+                    writer.append(&format!("stale-{row}"), &[0.0, 1.0]).unwrap();
                 }
             }
             fs::write(&path, &sealed).unwrap();
@@ -27750,7 +27748,11 @@ mod tests {
             "EOF must precede backend completion"
         );
         handler.join().unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "one backend call, no replay");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one backend call, no replay"
+        );
         assert_eq!(
             completed.load(Ordering::SeqCst),
             1,
@@ -33872,6 +33874,55 @@ mod tests {
         }
     }
 
+    // This provider explicitly binds the storage job's basis-vector output.
+    // Keep it separate from the legacy ranking-only BlendQueryEmbedder fixture.
+    struct StorageRetryEmbedder {
+        id: &'static str,
+        identity: frankensearch_core::EmbeddingIdentityBundleV1,
+    }
+
+    impl StorageRetryEmbedder {
+        fn new(id: &'static str) -> Self {
+            Self {
+                id,
+                identity: frankensearch_core::EmbeddingIdentityBundleV1::explicit_test_model(id, 2),
+            }
+        }
+    }
+
+    impl Embedder for StorageRetryEmbedder {
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            Ok(&self.identity)
+        }
+
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async { Ok(vec![1.0, 0.0]) })
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn model_name(&self) -> &'static str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
     // Explicit basis-vector embedders exercise storage and WAL failure/retry
     // mechanics. Real semantic parity is covered by default_build_quickstart.
     fn assert_live_ingest_recovers_blocked_vector_wal(
@@ -33898,12 +33949,12 @@ mod tests {
                 root,
                 create_test_quill(cx, &temp.path().join("lexical")).await,
                 VectorIndex::open(&fast_path).unwrap(),
-                Arc::new(BlendQueryEmbedder("retry-fast")),
+                Arc::new(StorageRetryEmbedder::new("retry-fast")),
             )
             .with_storage_db_path(temp.path().join("catalog.db"))
             .with_quality_tier(
                 VectorIndex::open(&quality_path).unwrap(),
-                Arc::new(BlendQueryEmbedder("retry-quality")),
+                Arc::new(StorageRetryEmbedder::new("retry-quality")),
             );
             let blocked = if block_quality {
                 &quality_path
@@ -34052,7 +34103,7 @@ mod tests {
                 temp.path().to_path_buf(),
                 create_test_quill(&cx, &temp.path().join("lexical")).await,
                 VectorIndex::open(&vector_path).unwrap(),
-                Arc::new(BlendQueryEmbedder("retry-fast")),
+                Arc::new(StorageRetryEmbedder::new("retry-fast")),
             )
             .with_storage_db_path(temp.path().join("catalog.db"));
             let context = pipeline.build_storage_batch_context().unwrap().unwrap();
@@ -35659,7 +35710,10 @@ mod tests {
         let snippet = "retry with backoff after the network";
         assert_eq!(super::locate_snippet_line(text, snippet, "RETRY"), Some(3));
         // Without a query word in the fragment, its first word anchors it.
-        assert_eq!(super::locate_snippet_line(text, "backoff after", "zzz"), Some(3));
+        assert_eq!(
+            super::locate_snippet_line(text, "backoff after", "zzz"),
+            Some(3)
+        );
     }
 
     #[test]
@@ -35697,7 +35751,10 @@ mod tests {
                     "notes.md",
                     "Project overview for the wombat tracker. More text follows.",
                 ),
-                ("code.rs", "fn helper() {}\n// the quokka lives here & nowhere < else"),
+                (
+                    "code.rs",
+                    "fn helper() {}\n// the quokka lives here & nowhere < else",
+                ),
                 ("kept.rs", "quokka quokka"),
             ] {
                 quill
@@ -35738,8 +35795,10 @@ mod tests {
                 highlight_postfix: String::new(),
                 ..frankensearch_quill::SnippetConfig::default()
             };
-            let mut snippets =
-                HashMap::from([("kept.rs".to_owned(), "an earlier phase's snippet".to_owned())]);
+            let mut snippets = HashMap::from([(
+                "kept.rs".to_owned(),
+                "an earlier phase's snippet".to_owned(),
+            )]);
             FsfsRuntime::fill_hit_snippets(
                 &cx,
                 &lexical,
@@ -41926,7 +41985,13 @@ mod tests {
             } else {
                 super::DoctorVerdict::Fail
             };
-            assert_eq!(check.verdict, expected, "{}: {}", dir.display(), check.detail);
+            assert_eq!(
+                check.verdict,
+                expected,
+                "{}: {}",
+                dir.display(),
+                check.detail
+            );
         }
         fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).expect("unseal dir");
     }

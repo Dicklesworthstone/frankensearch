@@ -6,7 +6,9 @@ use std::sync::atomic::AtomicBool;
 
 use asupersync::Cx;
 use frankensearch_core::traits::{ModelCategory, SearchFuture};
-use frankensearch_core::{Canonicalizer, Embedder, SearchError};
+use frankensearch_core::{
+    Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError, SearchResult,
+};
 use frankensearch_storage::{
     EmbeddingVectorSink, InMemoryVectorSink, IngestAction, IngestRequest, JobQueueConfig,
     PersistentJobQueue, PipelineConfig, Storage, StorageBackedJobRunner,
@@ -18,15 +20,28 @@ struct StubEmbedder {
     id: &'static str,
     dim: usize,
     fill: f32,
+    identity: EmbeddingIdentityBundleV1,
 }
 
 impl StubEmbedder {
-    const fn new(id: &'static str, dim: usize, fill: f32) -> Self {
-        Self { id, dim, fill }
+    fn new(id: &'static str, dim: usize, fill: f32) -> Self {
+        Self {
+            id,
+            dim,
+            fill,
+            identity: EmbeddingIdentityBundleV1::explicit_test_model(
+                id,
+                u32::try_from(dim).expect("test dimension fits u32"),
+            ),
+        }
     }
 }
 
 impl Embedder for StubEmbedder {
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
+    }
+
     fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         let dim = self.dim;
         let fill = self.fill;
@@ -64,25 +79,29 @@ struct SelectiveFailEmbedder {
     dim: usize,
     fill: f32,
     fail_when_contains: &'static str,
+    identity: EmbeddingIdentityBundleV1,
 }
 
 impl SelectiveFailEmbedder {
-    const fn new(
-        id: &'static str,
-        dim: usize,
-        fill: f32,
-        fail_when_contains: &'static str,
-    ) -> Self {
+    fn new(id: &'static str, dim: usize, fill: f32, fail_when_contains: &'static str) -> Self {
         Self {
             id,
             dim,
             fill,
             fail_when_contains,
+            identity: EmbeddingIdentityBundleV1::explicit_test_model(
+                id,
+                u32::try_from(dim).expect("test dimension fits u32"),
+            ),
         }
     }
 }
 
 impl Embedder for SelectiveFailEmbedder {
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
+    }
+
     fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         let dim = self.dim;
         let fill = self.fill;
@@ -124,9 +143,14 @@ impl Embedder for SelectiveFailEmbedder {
 struct CancelledEmbedder {
     id: &'static str,
     dim: usize,
+    identity: EmbeddingIdentityBundleV1,
 }
 
 impl Embedder for CancelledEmbedder {
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
+    }
+
     fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
             Err(SearchError::Cancelled {
@@ -445,6 +469,7 @@ fn cancelled_embedding_propagates_without_failing_or_retrying_the_claimed_job() 
         let fast = Arc::new(CancelledEmbedder {
             id: "cancelled-fast-tier",
             dim: 8,
+            identity: EmbeddingIdentityBundleV1::explicit_test_model("cancelled-fast-tier", 8),
         });
         let (runner, _storage, queue, sink) = make_runner(
             JobQueueConfig {

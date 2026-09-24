@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
+use frankensearch_core::generation::QuantizationFormat;
 use frankensearch_core::{Canonicalizer, Embedder, SearchError, SearchResult};
 use fsqlite::AsyncConnection;
 use fsqlite_types::value::SqliteValue;
@@ -167,6 +168,9 @@ impl PipelineMetrics {
 }
 
 pub trait EmbeddingVectorSink: Send + Sync {
+    /// Persist a vector after the job runner has validated its complete
+    /// producer identity and response. Implementations remain responsible for
+    /// admitting that producer against their own retained index generation.
     fn persist(&self, doc_id: &str, embedder_id: &str, embedding: &[f32]) -> SearchResult<()>;
 }
 
@@ -685,7 +689,9 @@ impl StorageBackedJobRunner {
                     continue;
                 }
             };
-            let embedding = match embedder.embed(cx, text).await {
+            let response = embed_for_persistence(cx, embedder.as_ref(), text).await;
+            pipeline_checkpoint(cx, "storage.pipeline.embedding_admitted")?;
+            let embedding = match response {
                 Ok(embedding) => embedding,
                 Err(error) => {
                     if matches!(error, SearchError::Cancelled { .. }) {
@@ -742,6 +748,7 @@ impl StorageBackedJobRunner {
                 continue;
             }
 
+            pipeline_checkpoint(cx, "storage.pipeline.persist")?;
             let write_result = self
                 .vector_sink
                 .persist(&job.doc_id, &job.embedder_id, &embedding);
@@ -1283,6 +1290,63 @@ fn pipeline_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
     })
 }
 
+/// Admit each real response independently of an embedder's implementation of
+/// `embed_bound`: custom and remote providers may override that method. The
+/// queue's operational model name cannot establish embedding compatibility.
+async fn embed_for_persistence(
+    cx: &Cx,
+    embedder: &dyn Embedder,
+    text: &str,
+) -> SearchResult<Vec<f32>> {
+    pipeline_checkpoint(cx, "storage.pipeline.embed")?;
+    let expected = embedder.identity()?.clone();
+    expected.validate()?;
+    let dimension =
+        usize::try_from(expected.space.dimension).map_err(|_| SearchError::InvalidConfig {
+            field: "storage_pipeline.embedding_identity".to_owned(),
+            value: "dimension".to_owned(),
+            reason: "declared embedding dimension does not fit usize".to_owned(),
+        })?;
+    if dimension != embedder.dimension()
+        || expected.storage.quantization != QuantizationFormat::F32
+        || !expected.storage.format.starts_with("in-memory-")
+        || !matches!(
+            expected.storage.endianness.as_str(),
+            "native-f32-values" | "native-test-only"
+        )
+    {
+        return Err(SearchError::InvalidConfig {
+            field: "storage_pipeline.embedding_identity".to_owned(),
+            value: "output_contract".to_owned(),
+            reason:
+                "provider must declare matching dimensions and an in-memory f32 output contract"
+                    .to_owned(),
+        });
+    }
+
+    let response = embedder.embed_bound(cx, text).await;
+    // Cancellation dominates both a successful response and a provider error.
+    // A cancelled worker must not persist, fail, or complete a claimed job.
+    pipeline_checkpoint(cx, "storage.pipeline.embed_complete")?;
+    let bound = response?;
+    bound.validate()?;
+    if bound.identity != expected {
+        return Err(SearchError::InvalidConfig {
+            field: "storage_pipeline.embedding_identity".to_owned(),
+            value: "response_mismatch".to_owned(),
+            reason: "embedding response belongs to a different space or producer".to_owned(),
+        });
+    }
+    if embedder.identity()? != &expected || embedder.dimension() != dimension {
+        return Err(SearchError::InvalidConfig {
+            field: "storage_pipeline.embedding_identity".to_owned(),
+            value: "producer_changed".to_owned(),
+            reason: "provider changed its declared identity during inference".to_owned(),
+        });
+    }
+    Ok(bound.values)
+}
+
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -1295,11 +1359,12 @@ fn duration_as_u64(value: u128) -> u64 {
 mod tests {
     use std::collections::HashSet;
     use std::io::Write;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
 
     use frankensearch_core::canonicalize::DefaultCanonicalizer;
     use frankensearch_core::traits::{ModelCategory, SearchFuture};
+    use frankensearch_core::{EmbeddingIdentityBundleV1, IdentityBoundEmbedding};
 
     use crate::job_queue::{FailResult, JobQueueConfig};
 
@@ -1309,12 +1374,13 @@ mod tests {
     struct StubEmbedder {
         id: &'static str,
         dim: usize,
+        identity: EmbeddingIdentityBundleV1,
         fail_on_substring: Option<&'static str>,
         fill: f32,
     }
 
     impl StubEmbedder {
-        const fn new(
+        fn new(
             id: &'static str,
             dim: usize,
             fail_on_substring: Option<&'static str>,
@@ -1323,6 +1389,10 @@ mod tests {
             Self {
                 id,
                 dim,
+                identity: EmbeddingIdentityBundleV1::explicit_test_model(
+                    id,
+                    u32::try_from(dim).expect("test dimension fits u32"),
+                ),
                 fail_on_substring,
                 fill,
             }
@@ -1330,6 +1400,10 @@ mod tests {
     }
 
     impl Embedder for StubEmbedder {
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
         fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             let should_fail = self
                 .fail_on_substring
@@ -1371,6 +1445,170 @@ mod tests {
                 ModelCategory::StaticEmbedder
             }
         }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BoundBehavior {
+        Valid,
+        MissingIdentity,
+        ForeignIdentity,
+        WrongDimension,
+        NonFinite,
+        Infinite,
+        ProducerDrift,
+        CancelWithSuccess,
+        CancelWithFailure,
+        CancelWithTypedFailure,
+    }
+
+    struct BoundProbeEmbedder {
+        id: &'static str,
+        identity: EmbeddingIdentityBundleV1,
+        foreign: EmbeddingIdentityBundleV1,
+        behavior: BoundBehavior,
+        drifted: AtomicBool,
+        raw_calls: AtomicUsize,
+        bound_calls: AtomicUsize,
+    }
+
+    impl BoundProbeEmbedder {
+        fn new(id: &'static str, behavior: BoundBehavior) -> Self {
+            Self {
+                id,
+                identity: EmbeddingIdentityBundleV1::explicit_test_model(id, 2),
+                foreign: EmbeddingIdentityBundleV1::explicit_test_model("foreign-producer", 2),
+                behavior,
+                drifted: AtomicBool::new(false),
+                raw_calls: AtomicUsize::new(0),
+                bound_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Embedder for BoundProbeEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.raw_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { panic!("storage persistence must call the actual bound operation") })
+        }
+
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            _text: &'a str,
+        ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+            self.bound_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let mut values = vec![0.6, 0.8];
+                match self.behavior {
+                    BoundBehavior::WrongDimension => {
+                        values.pop();
+                    }
+                    BoundBehavior::NonFinite => values[0] = f32::NAN,
+                    BoundBehavior::Infinite => values[0] = f32::INFINITY,
+                    BoundBehavior::ProducerDrift => self.drifted.store(true, Ordering::SeqCst),
+                    BoundBehavior::CancelWithSuccess
+                    | BoundBehavior::CancelWithFailure
+                    | BoundBehavior::CancelWithTypedFailure => {
+                        cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("bound inference cancelled"),
+                        );
+                        if self.behavior == BoundBehavior::CancelWithFailure {
+                            return Err(SearchError::EmbeddingFailed {
+                                model: self.id.to_owned(),
+                                source: io::Error::other("late non-cancellation inference error")
+                                    .into(),
+                            });
+                        }
+                        if self.behavior == BoundBehavior::CancelWithTypedFailure {
+                            return Err(SearchError::Cancelled {
+                                phase: "test.bound_inference".to_owned(),
+                                reason: "provider returned cancellation".to_owned(),
+                            });
+                        }
+                    }
+                    BoundBehavior::Valid
+                    | BoundBehavior::MissingIdentity
+                    | BoundBehavior::ForeignIdentity => {}
+                }
+                Ok(IdentityBoundEmbedding {
+                    values,
+                    identity: if self.behavior == BoundBehavior::ForeignIdentity {
+                        self.foreign.clone()
+                    } else {
+                        self.identity.clone()
+                    },
+                })
+            })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            if self.behavior == BoundBehavior::MissingIdentity {
+                return Err(SearchError::InvalidConfig {
+                    field: "embedder.identity".to_owned(),
+                    value: self.id.to_owned(),
+                    reason: "test producer has no declared identity".to_owned(),
+                });
+            }
+            Ok(if self.drifted.load(Ordering::SeqCst) {
+                &self.foreign
+            } else {
+                &self.identity
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn model_name(&self) -> &'static str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    fn make_bound_probe_runner(
+        behavior: BoundBehavior,
+        quality: bool,
+    ) -> (
+        StorageBackedJobRunner,
+        Arc<BoundProbeEmbedder>,
+        Arc<InMemoryVectorSink>,
+    ) {
+        let id = if quality { "quality-tier" } else { "fast-tier" };
+        let probe = Arc::new(BoundProbeEmbedder::new(id, behavior));
+        let selected: Arc<dyn Embedder> = probe.clone();
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let (fast, quality) = if quality {
+            // Hash-tier work is intentionally not queued, isolating the
+            // quality job's publication and cancellation side effects.
+            let hash: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("fnv1a-384", 2, None, 1.0));
+            (hash, Some(selected))
+        } else {
+            (selected, None)
+        };
+        let runner = make_runner(
+            JobQueueConfig {
+                max_retries: 0,
+                ..JobQueueConfig::default()
+            },
+            PipelineConfig::default(),
+            fast,
+            quality,
+            Arc::clone(&sink),
+        );
+        (runner, probe, sink)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1611,6 +1849,150 @@ mod tests {
             .queue_depth()
             .expect("queue depth should succeed");
         assert_eq!(depth.pending, 1, "pending job should be deduplicated");
+    }
+
+    #[test]
+    fn process_batch_persists_actual_bound_values_for_both_tiers() {
+        for quality in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (runner, probe, sink) = make_bound_probe_runner(BoundBehavior::Valid, quality);
+                runner
+                    .ingest(IngestRequest::new("doc-bound", "producer-bound document"))
+                    .expect("ingest should enqueue the selected tier");
+
+                let processed = runner
+                    .process_batch(&cx, "worker-bound")
+                    .await
+                    .expect("valid bound output should complete");
+                assert_eq!(processed.jobs_claimed, 1);
+                assert_eq!(processed.jobs_completed, 1);
+                assert_eq!(processed.jobs_failed, 0);
+                assert_eq!(probe.bound_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(probe.raw_calls.load(Ordering::SeqCst), 0);
+                let entries = sink.entries();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].doc_id, "doc-bound");
+                assert_eq!(entries[0].embedder_id, probe.id);
+                assert_eq!(entries[0].embedding, vec![0.6, 0.8]);
+
+                let counts = runner
+                    .storage
+                    .count_by_status(probe.id)
+                    .expect("status counts");
+                assert_eq!(counts.embedded, 1);
+                assert_eq!(counts.failed, 0);
+                let depth = runner.queue.queue_depth().expect("queue depth");
+                assert_eq!(depth.completed, 1);
+                assert_eq!(depth.processing, 0);
+            });
+        }
+    }
+
+    #[test]
+    fn process_batch_rejects_unverified_bound_outputs_without_persisting() {
+        for behavior in [
+            BoundBehavior::MissingIdentity,
+            BoundBehavior::ForeignIdentity,
+            BoundBehavior::WrongDimension,
+            BoundBehavior::NonFinite,
+            BoundBehavior::Infinite,
+            BoundBehavior::ProducerDrift,
+        ] {
+            for quality in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (runner, probe, sink) = make_bound_probe_runner(behavior, quality);
+                    runner
+                        .ingest(IngestRequest::new(
+                            "doc-invalid",
+                            "unverified producer output",
+                        ))
+                        .expect("ingest should enqueue the selected tier");
+
+                    let processed = runner
+                        .process_batch(&cx, "worker-invalid-bound")
+                        .await
+                        .expect("invalid output should fail its job without aborting the worker");
+                    assert_eq!(processed.jobs_claimed, 1, "{behavior:?}, quality={quality}");
+                    assert_eq!(
+                        processed.jobs_completed, 0,
+                        "{behavior:?}, quality={quality}"
+                    );
+                    assert_eq!(processed.jobs_failed, 1, "{behavior:?}, quality={quality}");
+                    assert_eq!(processed.terminal_failures, 1);
+                    assert!(sink.entries().is_empty(), "{behavior:?}, quality={quality}");
+                    assert_eq!(probe.raw_calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(
+                        probe.bound_calls.load(Ordering::SeqCst),
+                        usize::from(behavior != BoundBehavior::MissingIdentity),
+                        "missing declared identity must be rejected before inference"
+                    );
+
+                    let counts = runner
+                        .storage
+                        .count_by_status(probe.id)
+                        .expect("status counts");
+                    assert_eq!(counts.embedded, 0);
+                    assert_eq!(counts.failed, 1);
+                    assert_eq!(counts.pending, 0);
+                    let depth = runner.queue.queue_depth().expect("queue depth");
+                    assert_eq!(depth.failed, 1);
+                    assert_eq!(depth.completed, 0);
+                    assert_eq!(depth.processing, 0);
+                    assert_eq!(depth.pending, 0);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn process_batch_cancellation_during_bound_inference_preserves_claims() {
+        for behavior in [
+            BoundBehavior::CancelWithSuccess,
+            BoundBehavior::CancelWithFailure,
+            BoundBehavior::CancelWithTypedFailure,
+        ] {
+            for quality in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (runner, probe, sink) = make_bound_probe_runner(behavior, quality);
+                    runner
+                        .ingest(IngestRequest::new("doc-cancel", "cancel during inference"))
+                        .expect("ingest should enqueue the selected tier");
+
+                    let error = runner
+                        .process_batch(&cx, "worker-cancel-bound")
+                        .await
+                        .expect_err("cancellation must dominate successful and failed responses");
+                    assert!(
+                        matches!(error, SearchError::Cancelled { .. }),
+                        "{behavior:?}, quality={quality}: {error}"
+                    );
+                    assert!(sink.entries().is_empty());
+                    assert_eq!(probe.bound_calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(probe.raw_calls.load(Ordering::SeqCst), 0);
+
+                    let counts = runner
+                        .storage
+                        .count_by_status(probe.id)
+                        .expect("status counts");
+                    assert_eq!(counts.pending, 1);
+                    assert_eq!(counts.embedded, 0);
+                    assert_eq!(counts.failed, 0);
+                    let depth = runner.queue.queue_depth().expect("queue depth");
+                    assert_eq!(
+                        depth.processing, 1,
+                        "claim must remain recoverable by its lease"
+                    );
+                    assert_eq!(depth.completed, 0);
+                    assert_eq!(depth.failed, 0);
+                    assert_eq!(depth.pending, 0);
+                    assert_eq!(depth.skipped, 0);
+                    let metrics = runner.metrics().snapshot();
+                    assert_eq!(metrics.total_jobs_claimed, 1);
+                    assert_eq!(metrics.total_jobs_completed, 0);
+                    assert_eq!(metrics.total_jobs_failed, 0);
+                });
+            }
+        }
     }
 
     #[test]
@@ -3082,7 +3464,7 @@ mod integration_tests {
 
     use frankensearch_core::canonicalize::DefaultCanonicalizer;
     use frankensearch_core::traits::{ModelCategory, SearchFuture};
-    use frankensearch_core::{Canonicalizer, Embedder, SearchError};
+    use frankensearch_core::{Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError};
     use fsqlite_types::value::SqliteValue;
 
     use crate::connection::Storage;
@@ -3101,12 +3483,13 @@ mod integration_tests {
     struct StubEmbedder {
         id: &'static str,
         dim: usize,
+        identity: EmbeddingIdentityBundleV1,
         fail_on_substring: Option<&'static str>,
         fill: f32,
     }
 
     impl StubEmbedder {
-        const fn new(
+        fn new(
             id: &'static str,
             dim: usize,
             fail_on_substring: Option<&'static str>,
@@ -3115,6 +3498,10 @@ mod integration_tests {
             Self {
                 id,
                 dim,
+                identity: EmbeddingIdentityBundleV1::explicit_test_model(
+                    id,
+                    u32::try_from(dim).expect("test dimension fits u32"),
+                ),
                 fail_on_substring,
                 fill,
             }
@@ -3122,6 +3509,10 @@ mod integration_tests {
     }
 
     impl Embedder for StubEmbedder {
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
         fn embed<'a>(
             &'a self,
             _cx: &'a asupersync::Cx,
@@ -4088,6 +4479,13 @@ mod integration_tests {
                 captured: Arc<Mutex<Option<String>>>,
             }
             impl Embedder for SpyEmbedder {
+                fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+                    static IDENTITY: std::sync::OnceLock<EmbeddingIdentityBundleV1> =
+                        std::sync::OnceLock::new();
+                    Ok(IDENTITY
+                        .get_or_init(|| EmbeddingIdentityBundleV1::explicit_test_model("spy", 4)))
+                }
+
                 fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
                     *self.captured.lock().unwrap() = Some(text.to_owned());
                     Box::pin(async { Ok(vec![0.0; 4]) })
@@ -4172,6 +4570,13 @@ mod integration_tests {
                 captured: Arc<Mutex<Option<String>>>,
             }
             impl Embedder for SpyEmbedder {
+                fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+                    static IDENTITY: std::sync::OnceLock<EmbeddingIdentityBundleV1> =
+                        std::sync::OnceLock::new();
+                    Ok(IDENTITY
+                        .get_or_init(|| EmbeddingIdentityBundleV1::explicit_test_model("spy", 4)))
+                }
+
                 fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
                     *self.captured.lock().unwrap() = Some(text.to_owned());
                     Box::pin(async { Ok(vec![0.0; 4]) })

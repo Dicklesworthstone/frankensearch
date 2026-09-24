@@ -5,7 +5,7 @@
 //! activation manifest from that join, rather than accepting another set of
 //! uncorroborated component hashes. The caller stages the content-addressed
 //! component objects and the candidate's manifest in the qualified root.
-//! [`GenerationPublisherV1::publish`] then admits and durably verifies all five
+//! [`GenerationPublisherV1::publish`] then admits and durably verifies every declared
 //! objects before asking the existing authority publisher to switch the head.
 //!
 //! These operations are synchronous and cancellation-aware BETWEEN bounded
@@ -18,8 +18,10 @@
 //! Producers still own engine validation, generation/embedding identity, and
 //! source-checkpoint provenance. In particular, it does not change the fsfs CLI's
 //! current artifact layout or turn a two-file rename into an atomic generation.
-//! Activation-manifest v1 requires an ANN object; an absent accelerator cannot
-//! be represented by invented bytes or a relabelled vector receipt here.
+//! New candidates use activation-manifest schema 2, which explicitly binds ANN
+//! presence or absence. Exact search generations publish their three mandatory
+//! components without inventing an accelerator. Schema-1 predecessors remain
+//! readable under the same authority, fencing and anti-rollback protocol.
 
 #![forbid(unsafe_code)]
 
@@ -28,12 +30,12 @@ use std::sync::Arc;
 
 use asupersync::Cx;
 use frankensearch_core::generation::{
-    ActivationManifestV1, ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1,
-    ExactGenerationComponentsV1, GENERATION_AUTHORITY_SLOT_BYTES_V1,
+    ActivationManifest, ActivationManifestV2, ArtifactGenerationIdentityV1, AuthorityRefV1,
+    AuthoritySlotV1, ExactGenerationComponentsV1, GENERATION_AUTHORITY_SLOT_BYTES_V1,
     GENERATION_LOCK_FRAME_BYTES_V1, GenerationAuthorityActionV1, GenerationAuthorityErrorV1,
-    GenerationComponentReceiptV1, GenerationComponentReceiptsV1, GenerationComponentRole,
+    GenerationComponentReceiptV1, GenerationComponentReceiptsV2, GenerationComponentRole,
     GenerationLockFrameKindV1, GenerationLockFrameV1, GenerationRootSecurityProfileV1,
-    resolve_authority_slots_v1, verify_authority_manifest_reference_v1,
+    resolve_authority_slots_v1, verify_authority_manifest_reference,
 };
 use frankensearch_index::generation_root::authority_publisher::{
     AUTHORITY_PUBLISHER_LOCK_BYTES_V1, AntiRollbackFloorProviderV1, AttemptPermitV1,
@@ -57,9 +59,7 @@ use frankensearch_index::generation_root::{
 pub enum GenerationPublicationErrorV1 {
     /// A manifest, authority, frame, or predecessor was invalid.
     Authority(GenerationAuthorityErrorV1),
-    /// Activation-manifest v1 has no representation for an absent ANN object.
-    AnnRequiredByActivationV1,
-    /// The sum of the five owned images exceeds the caller's explicit budget.
+    /// The sum of the declared owned images exceeds the caller's explicit budget.
     AdmissionBudget {
         /// Required bytes, or `u64::MAX` when the sum overflowed.
         required: u64,
@@ -113,7 +113,7 @@ impl From<GenerationRootError> for GenerationPublicationErrorV1 {
 #[derive(Debug, Clone)]
 pub struct GenerationCandidateV1 {
     authority: AuthorityRefV1,
-    manifest: ActivationManifestV1,
+    manifest: ActivationManifest,
     manifest_bytes: Vec<u8>,
     owned_image_bytes: u64,
 }
@@ -128,7 +128,7 @@ impl GenerationCandidateV1 {
     ///
     /// # Errors
     ///
-    /// Refuses missing ANN, invalid identities, sequence exhaustion, oversized
+    /// Refuses invalid identities, sequence exhaustion, oversized
     /// objects, or an overflowing aggregate image size.
     pub fn new(
         object_id: [u8; 16],
@@ -138,11 +138,8 @@ impl GenerationCandidateV1 {
         writer_fence_sha256: [u8; 32],
         components: &ExactGenerationComponentsV1,
     ) -> Result<Self, GenerationPublicationErrorV1> {
-        let ann = components
-            .ann()
-            .ok_or(GenerationPublicationErrorV1::AnnRequiredByActivationV1)?;
         let authority_sequence = predecessor.map_or(Ok(1), |head| head.next_sequence())?;
-        let manifest = ActivationManifestV1::new(
+        let manifest = ActivationManifest::V2(ActivationManifestV2::new(
             authority_sequence,
             predecessor,
             action,
@@ -150,13 +147,13 @@ impl GenerationCandidateV1 {
             writer_fence_sha256,
             components.source_checkpoint(),
             components.docset_digest(),
-            GenerationComponentReceiptsV1 {
+            GenerationComponentReceiptsV2 {
                 vector: components.vector().bytes,
                 lexical: components.lexical().bytes,
-                ann: ann.bytes,
+                ann: components.ann().map(|ann| ann.bytes),
                 metadata: components.metadata().bytes,
             },
-        )?;
+        )?);
         let (manifest_len, manifest_sha256) = manifest.object_receipt();
         let authority = AuthorityRefV1::new(
             authority_sequence,
@@ -194,7 +191,7 @@ impl GenerationCandidateV1 {
 
     /// Manifest to stage; its component locators are content-addressed.
     #[must_use]
-    pub const fn manifest(&self) -> &ActivationManifestV1 {
+    pub const fn manifest(&self) -> &ActivationManifest {
         &self.manifest
     }
 
@@ -210,7 +207,7 @@ impl GenerationCandidateV1 {
         activation_manifest_name_v1(self.authority.object_id)
     }
 
-    /// Aggregate byte length of the five images admitted during preflight.
+    /// Aggregate byte length of the declared images admitted during preflight.
     /// This is not a process RSS cap: existing readers and filesystem work have
     /// their own memory requirements. Images are dropped before reopening.
     #[must_use]
@@ -239,7 +236,7 @@ impl GenerationCandidateV1 {
             }
         }
         let head = resolve_authority_slots_v1(pair.first, pair.second)?;
-        if head.map(|slot| slot.authority) != self.manifest.predecessor {
+        if head.map(|slot| slot.authority) != self.manifest.predecessor() {
             return Err(GenerationPublicationErrorV1::ExpectedPredecessorMismatch);
         }
         Ok(())
@@ -247,20 +244,9 @@ impl GenerationCandidateV1 {
 }
 
 fn component_receipts(
-    manifest: &ActivationManifestV1,
-) -> [(GenerationComponentRole, GenerationComponentReceiptV1); 4] {
-    [
-        (GenerationComponentRole::Vector, manifest.components.vector),
-        (
-            GenerationComponentRole::Lexical,
-            manifest.components.lexical,
-        ),
-        (GenerationComponentRole::Ann, manifest.components.ann),
-        (
-            GenerationComponentRole::Metadata,
-            manifest.components.metadata,
-        ),
-    ]
+    manifest: &ActivationManifest,
+) -> impl Iterator<Item = (GenerationComponentRole, GenerationComponentReceiptV1)> {
+    manifest.components().iter()
 }
 
 fn checkpoint(cx: &Cx, phase: &'static str) -> Result<(), GenerationPublicationErrorV1> {
@@ -402,8 +388,8 @@ fn prepare(
             candidate.authority.manifest_sha256,
         )?,
     )?;
-    let manifest = ActivationManifestV1::from_canonical_bytes(manifest_file.as_bytes())?;
-    verify_authority_manifest_reference_v1(&candidate.authority, &manifest)?;
+    let manifest = ActivationManifest::from_canonical_bytes(manifest_file.as_bytes())?;
+    verify_authority_manifest_reference(&candidate.authority, &manifest)?;
 
     let mut files: Vec<QualifiedGenerationFile> = Vec::with_capacity(5);
     files.push(manifest_file);
@@ -527,7 +513,7 @@ impl<'root> GenerationPublisherV1<'root> {
     /// Admit and durably verify a pre-staged complete generation, switch its
     /// authority once, then open the actual published head for serving.
     ///
-    /// `max_owned_image_bytes` bounds the sum of the five preflight images, not
+    /// `max_owned_image_bytes` bounds the sum of the declared preflight images, not
     /// RSS, page cache, or snapshots retained by existing queries. The caller
     /// must stage objects through its trusted writer before calling this method.
     /// No artifact is created, overwritten, deleted, or renamed here.
@@ -653,6 +639,14 @@ mod tests {
     }
 
     fn candidate(generation: u8, predecessor: Option<AuthorityRefV1>) -> GenerationCandidateV1 {
+        candidate_with_ann(generation, predecessor, true)
+    }
+
+    fn candidate_with_ann(
+        generation: u8,
+        predecessor: Option<AuthorityRefV1>,
+        with_ann: bool,
+    ) -> GenerationCandidateV1 {
         GenerationCandidateV1::new(
             [generation; 16],
             predecessor,
@@ -660,7 +654,7 @@ mod tests {
             ArtifactGenerationIdentityV1::new(u64::from(generation), [generation; 16])
                 .expect("artifact generation"),
             [0x33; 32],
-            &joined(generation, true),
+            &joined(generation, with_ann),
         )
         .expect("candidate")
     }
@@ -669,19 +663,22 @@ mod tests {
     fn candidate_derives_manifest_from_the_joined_component_receipts() {
         let joined = joined(1, true);
         let candidate = candidate(1, None);
-        let manifest = ActivationManifestV1::from_canonical_bytes(candidate.manifest_bytes())
+        let manifest = ActivationManifest::from_canonical_bytes(candidate.manifest_bytes())
             .expect("canonical manifest");
-        verify_authority_manifest_reference_v1(&candidate.authority(), &manifest)
+        verify_authority_manifest_reference(&candidate.authority(), &manifest)
             .expect("exact reference");
         assert_eq!(
-            manifest.source_checkpoint_sha256,
+            manifest.source_checkpoint_sha256(),
             joined.source_checkpoint()
         );
-        assert_eq!(manifest.document_set_sha256, joined.docset_digest());
-        assert_eq!(manifest.components.vector, joined.vector().bytes);
-        assert_eq!(manifest.components.lexical, joined.lexical().bytes);
-        assert_eq!(manifest.components.ann, joined.ann().expect("ANN").bytes);
-        assert_eq!(manifest.components.metadata, joined.metadata().bytes);
+        assert_eq!(manifest.document_set_sha256(), joined.docset_digest());
+        assert_eq!(manifest.components().vector, joined.vector().bytes);
+        assert_eq!(manifest.components().lexical, joined.lexical().bytes);
+        assert_eq!(
+            manifest.components().ann,
+            Some(joined.ann().expect("ANN").bytes)
+        );
+        assert_eq!(manifest.components().metadata, joined.metadata().bytes);
         assert_eq!(candidate.authority().sequence, 1);
         assert!(candidate.authority().predecessor.is_none());
     }
@@ -691,7 +688,6 @@ mod tests {
         let candidate = candidate(1, None);
         let expected = candidate.authority().manifest_len
             + component_receipts(candidate.manifest())
-                .iter()
                 .map(|(_, receipt)| receipt.byte_len)
                 .sum::<u64>();
         assert_eq!(candidate.owned_image_bytes(), expected);
@@ -708,18 +704,21 @@ mod tests {
 
     #[test]
     fn absent_ann_is_not_relabelled_as_a_vector_component() {
-        let result = GenerationCandidateV1::new(
-            [1; 16],
-            None,
-            GenerationAuthorityActionV1::Activate,
-            ArtifactGenerationIdentityV1::new(1, [1; 16]).expect("generation"),
-            [1; 32],
-            &joined(1, false),
-        );
-        assert!(matches!(
-            result,
-            Err(GenerationPublicationErrorV1::AnnRequiredByActivationV1)
-        ));
+        let candidate = candidate_with_ann(1, None, false);
+        let manifest = ActivationManifest::from_canonical_bytes(candidate.manifest_bytes())
+            .expect("exact generation is canonical");
+        assert!(matches!(manifest, ActivationManifest::V2(_)));
+        assert!(manifest.components().ann.is_none());
+        assert_eq!(component_receipts(&manifest).count(), 3);
+        let expected = candidate.authority().manifest_len
+            + component_receipts(&manifest)
+                .map(|(_, receipt)| receipt.byte_len)
+                .sum::<u64>();
+        assert_eq!(candidate.owned_image_bytes(), expected);
+        assert!(candidate.check_budget(expected).is_ok());
+        assert!(candidate.check_budget(expected - 1).is_err());
+        verify_authority_manifest_reference(&candidate.authority(), &manifest)
+            .expect("absence is bound by the authority");
     }
 
     #[test]
@@ -985,8 +984,20 @@ mod tests {
                 assert_eq!(new.head().authority, second.authority());
                 assert_eq!(old.head().authority, first.authority());
                 for (role, _) in component_receipts(first.manifest()) {
-                    assert_eq!(old.closure().bytes(role).as_ref(), bytes(role, 1));
-                    assert_eq!(new.closure().bytes(role).as_ref(), bytes(role, 2));
+                    assert_eq!(
+                        old.closure()
+                            .bytes(role)
+                            .expect("declared old role")
+                            .as_ref(),
+                        bytes(role, 1)
+                    );
+                    assert_eq!(
+                        new.closure()
+                            .bytes(role)
+                            .expect("declared new role")
+                            .as_ref(),
+                        bytes(role, 2)
+                    );
                 }
                 let fresh_root = admit(&path);
                 let reopened = fresh_root
@@ -1000,6 +1011,264 @@ mod tests {
                     panic!("fresh admission refused"); // ubs:ignore — cfg(test) assertion: a refused fresh open must fail the publication test.
                 };
                 assert_eq!(reopened.head().authority, second.authority());
+            });
+        }
+
+        #[test]
+        fn exact_publication_reopens_and_queries_the_retained_fsvi_owner() {
+            use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
+            use frankensearch_index::exact_component_adapters::vector_component_receipt;
+            use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
+
+            run_test_with_cx(|cx| async move {
+                let path = root_path();
+                let generation = ArtifactGenerationIdentityV1::new(1, [1; 16]).expect("generation");
+                let mut identity =
+                    EmbeddingIdentityBundleV1::explicit_test_model("exact-publication", 2);
+                "fsvi-v2".clone_into(&mut identity.storage.format);
+                identity.storage.quantization = QuantizationFormat::F16;
+                "little-endian".clone_into(&mut identity.storage.endianness);
+                let binding =
+                    FsviV2IdentityBinding::new(generation, identity.freeze().expect("identity"))
+                        .expect("binding");
+                // Producer staging lives outside the sealed generation root.
+                let source = path.with_extension("source-fsvi");
+                let mut writer = VectorIndex::create_v2(&source, binding.clone()).expect("writer");
+                writer
+                    .write_record("doc-a", &[1.0, 0.0])
+                    .expect("first vector");
+                writer
+                    .write_record("doc-b", &[0.0, 1.0])
+                    .expect("second vector");
+                writer.finish().expect("complete vector image");
+                let vector_bytes: Arc<[u8]> = fs::read(&source).expect("producer image").into();
+                let owner = ValidatedFsviBytes::from_arc(Arc::clone(&vector_bytes), &binding)
+                    .expect("owner");
+                let checkpoint = SourceCheckpointV1::derive(&CommitRange { low: 1, high: 1 });
+                let vector =
+                    vector_component_receipt(owner.witness(), ["doc-a", "doc-b"], checkpoint)
+                        .expect("engine-derived vector receipt");
+                // Lexical and metadata stay opaque publication fixtures here;
+                // this test exercises retained FSVI serving, not their parsers.
+                let peers = joined(1, false);
+                let components = ExactGenerationComponentsV1::admit(
+                    vector,
+                    peers.lexical().clone(),
+                    None,
+                    peers.metadata().clone(),
+                )
+                .expect("same source and ordered documents");
+                let candidate = GenerationCandidateV1::new(
+                    [1; 16],
+                    None,
+                    GenerationAuthorityActionV1::Activate,
+                    generation,
+                    [0x33; 32],
+                    &components,
+                )
+                .expect("exact candidate");
+                stage(&path, &candidate, 1, Some(GenerationComponentRole::Vector));
+                write_new(
+                    &path.join(component_object_name_v1(
+                        GenerationComponentRole::Vector,
+                        candidate.manifest().components().vector.sha256,
+                    )),
+                    &vector_bytes,
+                    0o400,
+                );
+                let root = admit(&path);
+                let mut publisher = session(&root);
+                let result = publish(
+                    &mut publisher,
+                    &cx,
+                    &candidate,
+                    ExpectedAuthorityPairV1::default(),
+                );
+                assert!(matches!(
+                    result.publication,
+                    PublicationOutcomeV1::Committed { .. }
+                ));
+                assert!(matches!(
+                    result.activation,
+                    Some(GenerationActivationV1::Installed(_))
+                ));
+                drop(result);
+                drop(publisher);
+                drop(root);
+                drop(owner);
+                drop(vector_bytes);
+
+                let root = admit(&path);
+                let SnapshotOpenOutcomeV1::Opened(snapshot) = root
+                    .open_generation_snapshot(
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                    )
+                    .expect("fresh authority resolution")
+                else {
+                    panic!("exact generation must reopen"); // ubs:ignore — cfg(test) refusal must fail.
+                };
+                assert!(snapshot.manifest().components().ann.is_none());
+                assert!(
+                    snapshot
+                        .closure()
+                        .bytes(GenerationComponentRole::Ann)
+                        .is_none()
+                );
+                let retained = ValidatedFsviBytes::from_arc(
+                    snapshot
+                        .closure()
+                        .bytes(GenerationComponentRole::Vector)
+                        .expect("retained vector"),
+                    &binding,
+                )
+                .expect("admit exact retained bytes without reopening vector path");
+                assert_eq!(
+                    retained.witness().generation,
+                    snapshot.manifest().generation()
+                );
+                assert_eq!(
+                    retained
+                        .search_top_k(&[1.0, 0.0], 1, None)
+                        .expect("first query")[0]
+                        .doc_id,
+                    "doc-a"
+                );
+                assert_eq!(
+                    retained
+                        .search_top_k(&[0.0, 1.0], 1, None)
+                        .expect("second query")[0]
+                        .doc_id,
+                    "doc-b"
+                );
+                assert!(!fs::read_dir(&path).expect("root inventory").any(|entry| {
+                    entry
+                        .expect("entry")
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "ann")
+                }));
+            });
+        }
+
+        #[test]
+        fn publication_switches_ann_exact_and_ann_without_borrowing_historical_graphs() {
+            run_test_with_cx(|cx| async move {
+                let path = root_path();
+                let root = admit(&path);
+                let mut publisher = session(&root);
+                let mut retained: Vec<Arc<OpenedGenerationSnapshotV1>> = Vec::new();
+                for (generation, with_ann) in [(1, true), (2, false), (3, true)] {
+                    let predecessor = retained.last().map(|old| old.head().authority);
+                    let expected = retained
+                        .last()
+                        .map_or_else(ExpectedAuthorityPairV1::default, |old| old.authority_pair());
+                    let candidate = candidate_with_ann(generation, predecessor, with_ann);
+                    stage(&path, &candidate, generation, None);
+                    let result = publish(&mut publisher, &cx, &candidate, expected);
+                    assert!(matches!(
+                        result.publication,
+                        PublicationOutcomeV1::Committed { .. }
+                    ));
+                    let installed = publisher.snapshot().expect("installed complete generation");
+                    assert_eq!(installed.manifest().components().ann.is_some(), with_ann);
+                    assert_eq!(
+                        installed
+                            .closure()
+                            .bytes(GenerationComponentRole::Ann)
+                            .is_some(),
+                        with_ann
+                    );
+                    let SnapshotOpenOutcomeV1::Opened(fresh) = root
+                        .open_generation_snapshot(
+                            ROOT_ID,
+                            GenerationRootSecurityProfileV1::CooperativeLocal,
+                            None,
+                        )
+                        .expect("fresh open")
+                    else {
+                        panic!("published generation must reopen"); // ubs:ignore — cfg(test) refusal must fail.
+                    };
+                    assert_eq!(fresh.head().authority, candidate.authority());
+                    assert_eq!(
+                        fresh
+                            .closure()
+                            .bytes(GenerationComponentRole::Ann)
+                            .is_some(),
+                        with_ann
+                    );
+                    retained.push(installed);
+                }
+                assert!(
+                    retained[1]
+                        .closure()
+                        .bytes(GenerationComponentRole::Ann)
+                        .is_none()
+                );
+                for (snapshot, generation) in [(&retained[0], 1), (&retained[2], 3)] {
+                    assert_eq!(
+                        snapshot
+                            .closure()
+                            .bytes(GenerationComponentRole::Ann)
+                            .expect("selected graph")
+                            .as_ref(),
+                        bytes(GenerationComponentRole::Ann, generation)
+                    );
+                }
+                assert_ne!(retained[0].head().authority, retained[2].head().authority);
+            });
+        }
+
+        #[test]
+        fn corrupt_declared_ann_never_becomes_an_exact_publication() {
+            run_test_with_cx(|cx| async move {
+                let path = root_path();
+                let first = candidate_with_ann(1, None, false);
+                stage(&path, &first, 1, None);
+                let root = admit(&path);
+                let mut publisher = session(&root);
+                let _ = publish(
+                    &mut publisher,
+                    &cx,
+                    &first,
+                    ExpectedAuthorityPairV1::default(),
+                );
+                let old = publisher.snapshot().expect("exact reader");
+                let second = candidate(2, Some(first.authority()));
+                stage(&path, &second, 2, Some(GenerationComponentRole::Ann));
+                let receipt = second.manifest().components().ann.expect("declared ANN");
+                let mut wrong_graph = bytes(GenerationComponentRole::Ann, 2);
+                wrong_graph[0] ^= 1;
+                write_new(
+                    &path.join(component_object_name_v1(
+                        GenerationComponentRole::Ann,
+                        receipt.sha256,
+                    )),
+                    &wrong_graph,
+                    0o400,
+                );
+                let authority = fs::read(path.join("AUTHORITY")).expect("authority");
+                let lock = fs::read(path.join("LOCK")).expect("lock");
+                let result = publisher.publish(
+                    &cx,
+                    &second,
+                    old.authority_pair(),
+                    None,
+                    [0x74; 16],
+                    second.owned_image_bytes(),
+                );
+                assert!(matches!(result, Err(GenerationPublicationErrorV1::Root(_))));
+                assert_eq!(
+                    fs::read(path.join("AUTHORITY")).expect("authority"),
+                    authority
+                );
+                assert_eq!(fs::read(path.join("LOCK")).expect("lock"), lock);
+                assert!(Arc::ptr_eq(
+                    &old,
+                    &publisher.snapshot().expect("previous reader")
+                ));
+                assert!(old.closure().file(GenerationComponentRole::Ann).is_none());
             });
         }
 
