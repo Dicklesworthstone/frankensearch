@@ -114,7 +114,9 @@ async fn rebuild(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> PublishedGenera
     let publication = runtime.rebuild_retained_generation(cx, root).await.unwrap();
     match publication {
         GenerationPublication::Durable(generation) => generation,
-        other => panic!("fixture publication is not durable: {other:?}"),
+        other @ GenerationPublication::VisibleButDurabilityUncertain { .. } => {
+            panic!("fixture publication is not durable: {other:?}")
+        }
     }
 }
 
@@ -149,7 +151,9 @@ fn restart_child() {
             rebuild(&runtime, &cx, &root).await
         } else {
             if mode == "seed_changed_config" {
-                runtime.config.search.default_limit += 1;
+                // The default limit is unlimited (usize::MAX); any finite value
+                // changes the configuration without overflowing.
+                runtime.config.search.default_limit = 17;
             } else if mode == "seed_full" {
                 runtime.cli_input.full_reindex = true;
             } else {
@@ -293,6 +297,17 @@ fn generation_path(parent: &Path, report: &ChildReport) -> PathBuf {
     parent.join("store/generations").join(&report.generation)
 }
 
+/// Embedded source texts, without the one `"probe"` input every index run
+/// sends to check its embedder (`probe_indexing_embedder_with_backoffs`).
+fn source_inputs(report: &ChildReport) -> Vec<&str> {
+    report
+        .embedded_inputs
+        .iter()
+        .map(String::as_str)
+        .filter(|text| *text != "probe")
+        .collect()
+}
+
 #[test]
 fn restart_same_executable_reuses_proven_inputs_without_reembedding() {
     let directory = tempfile::tempdir().unwrap();
@@ -301,7 +316,18 @@ fn restart_same_executable_reuses_proven_inputs_without_reembedding() {
     let executable = std::env::current_exe().unwrap();
     let first = child(&executable, parent, "rebuild", "first");
     assert_eq!(first.eligible, 4);
-    assert!(!first.embedded_inputs.is_empty());
+    // The probe alone would make the first run's inputs non-empty; the later
+    // "nothing re-embedded" check only means something if every source was.
+    for number in 0..4 {
+        let document = format!("document {number}");
+        assert!(
+            source_inputs(&first)
+                .iter()
+                .any(|text| text.contains(&document)),
+            "first build did not embed {document}: {:?}",
+            first.embedded_inputs
+        );
+    }
     let retained = generation_path(parent, &first);
     let before = snapshot(&retained);
     let seeded = child(&executable, parent, "seed", "seeded");
@@ -316,7 +342,7 @@ fn restart_same_executable_reuses_proven_inputs_without_reembedding() {
     assert_eq!(second.executable, first.executable);
     assert_eq!(second.hits, first.hits);
     assert!(
-        second.embedded_inputs.is_empty(),
+        source_inputs(&second).is_empty(),
         "unchanged sources were embedded again: {:?}",
         second.embedded_inputs
     );
