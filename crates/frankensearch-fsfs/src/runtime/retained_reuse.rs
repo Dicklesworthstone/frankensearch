@@ -5,10 +5,11 @@
 //! to independent files, and feed that existing path rather than introduce a
 //! second embedding cache. No serving artifact is opened for writing.
 //!
-//! Receipts are session-local: a different process starts cold. This binds
-//! reuse to the same compiled extraction/canonicalization implementation, not
-//! merely a package version that can stay unchanged across source edits. The
-//! final uncheckpointed batch has no retained input evidence and is recomputed.
+//! Version-2 receipts can survive a process restart when the actual running
+//! Linux executable is proven byte-identical. Configuration, source hashes and
+//! both producers are still checked independently. Unsupported or unprovable
+//! executable identity retains session-local reuse; version-1 receipts start
+//! cold. The final uncheckpointed batch remains unproven and is recomputed.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -35,9 +36,11 @@ use crate::generation_store::{
 #[path = "retained_reuse/append_input.rs"]
 mod append_input;
 pub(super) use append_input::read_append_documents;
+#[path = "retained_reuse/execution.rs"]
+mod execution;
 
 const RECEIPT_FILE: &str = "FSFS-REUSE.json";
-const RECEIPT_VERSION: u16 = 1;
+const RECEIPT_VERSION: u16 = 2;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_COPY_DEPTH: usize = 64;
 const MAX_COPY_ENTRIES: usize = 200_000;
@@ -48,6 +51,10 @@ static SESSION: OnceLock<String> = OnceLock::new();
 struct ReuseReceipt {
     version: u16,
     session: String,
+    // Optional only so existing version-1 receipts remain readable and become
+    // cold misses. Absence never grants cross-process reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executable_sha256: Option<String>,
     configuration_sha256: String,
     checkpoint: IndexingCheckpoint,
 }
@@ -131,9 +138,23 @@ fn proven(entry: &CheckpointFileEntry) -> bool {
             .all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn compatible_execution(receipt: &ReuseReceipt, executable: Option<&str>, session: &str) -> bool {
+    match (receipt.executable_sha256.as_deref(), executable) {
+        (Some(expected), Some(actual)) => {
+            expected.len() == 64
+                && expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && expected == actual
+        }
+        (None, None) => receipt.session == session,
+        // A failed or newly available proof is not permission to replace the
+        // receipt's scope with a weaker one, even inside the same process.
+        _ => false,
+    }
+}
+
 fn compatible_receipt(runtime: &FsfsRuntime, receipt: &ReuseReceipt) -> SearchResult<bool> {
     Ok(receipt.version == RECEIPT_VERSION
-        && receipt.session == session_id()?
+        && compatible_execution(receipt, execution::fingerprint(), session_id()?)
         && receipt.configuration_sha256 == configuration_digest(runtime)?
         && receipt.checkpoint.target_root == runtime.resolve_target_root()?.display().to_string())
 }
@@ -148,6 +169,7 @@ impl FsfsRuntime {
         store: &CompleteGenerationStore,
         candidate_root: &Path,
     ) -> SearchResult<()> {
+        execution::prepare(cx).await?;
         seed_candidate(cx, self, store, candidate_root)?;
         let mut observed = None;
         let payload = Box::pin(self.run_one_shot_index_scaffold_internal(
@@ -236,6 +258,7 @@ fn completed_receipt(
     Ok(ReuseReceipt {
         version: RECEIPT_VERSION,
         session: session_id()?.to_owned(),
+        executable_sha256: execution::fingerprint().map(str::to_owned),
         configuration_sha256: configuration_digest(runtime)?,
         checkpoint,
     })
@@ -262,6 +285,7 @@ fn write_receipt(cx: &Cx, root: &Path, receipt: &ReuseReceipt) -> SearchResult<(
     file.sync_all()?;
     File::open(root)?.sync_all()?;
     tracing::info!(
+        cross_process_reuse = receipt.executable_sha256.is_some(),
         eligible_semantic_files = receipt
             .checkpoint
             .files
@@ -422,6 +446,7 @@ fn seed_candidate(
     File::open(destination)?.sync_all()?;
     tracing::info!(
         predecessor = predecessor.id(),
+        seeded_across_process = receipt.session != session_id()?,
         eligible_semantic_files = eligible,
         copied_files = stats.files,
         copied_bytes = stats.bytes,
@@ -1032,7 +1057,7 @@ mod generation_tests {
     }
 
     #[test]
-    fn receipt_requires_same_process_configuration_and_source_and_full_bypasses_it() {
+    fn receipt_requires_matching_execution_configuration_and_source_and_full_bypasses_it() {
         run_test_with_cx(|cx| async move {
             let parent = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(parent.path(), 4);
@@ -1040,8 +1065,14 @@ mod generation_tests {
             let mut receipt: ReuseReceipt =
                 read_json(&cx, &predecessor.path().join(RECEIPT_FILE)).unwrap();
             assert!(compatible_receipt(&runtime, &receipt).unwrap());
-            receipt.session.push('x');
+            let executable = receipt.executable_sha256.clone();
+            if let Some(digest) = receipt.executable_sha256.as_mut() {
+                digest.push('x');
+            } else {
+                receipt.session.push('x');
+            }
             assert!(!compatible_receipt(&runtime, &receipt).unwrap());
+            receipt.executable_sha256 = executable;
             session_id().unwrap().clone_into(&mut receipt.session);
             receipt.configuration_sha256.push('x');
             assert!(!compatible_receipt(&runtime, &receipt).unwrap());
@@ -1055,6 +1086,46 @@ mod generation_tests {
             assert_eq!(seed_candidate(&cx, &next, &store, build.path()).unwrap(), 0);
             assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
             assert_eq!(store.active(&cx).unwrap(), Some(predecessor));
+        });
+    }
+
+    #[test]
+    fn execution_scope_never_downgrades_and_old_receipts_are_cold_not_corrupt() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(parent.path(), 4);
+            let predecessor = publish(&runtime, &cx, &root).await;
+            let mut receipt: ReuseReceipt =
+                read_json(&cx, &predecessor.path().join(RECEIPT_FILE)).unwrap();
+            let digest = "a".repeat(64);
+            receipt.executable_sha256 = Some(digest.clone());
+            assert!(compatible_execution(
+                &receipt,
+                Some(&digest),
+                "another process"
+            ));
+            assert!(!compatible_execution(
+                &receipt,
+                Some(&"b".repeat(64)),
+                &receipt.session
+            ));
+            assert!(!compatible_execution(&receipt, None, &receipt.session));
+            receipt.executable_sha256 = None;
+            assert!(compatible_execution(&receipt, None, &receipt.session));
+            assert!(!compatible_execution(&receipt, None, "another process"));
+            assert!(!compatible_execution(&receipt, Some(&digest), &receipt.session));
+            receipt.version = 1;
+            let legacy = serde_json::to_vec(&receipt).unwrap();
+            let decoded: ReuseReceipt = serde_json::from_slice(&legacy).unwrap();
+            assert!(decoded.executable_sha256.is_none());
+            assert!(!compatible_receipt(&runtime, &decoded).unwrap());
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(predecessor)
+            );
         });
     }
 
