@@ -1000,6 +1000,8 @@ The engine is intentionally designed to degrade gracefully:
 | Quality embedder errors | Initial results preserved | `SearchPhase::RefinementFailed { ... }` |
 | `fast_only=true` | Skip quality phase by design | only `Initial` phase + `skip_reason="fast_only"` |
 | No quality embedder configured | Skip quality phase | only `Initial` phase + `skip_reason="no_quality_embedder"` |
+| `fsfs` query over 4,096 characters, or holding a control character | lexical-only, no refinement | only `Initial` phase + `skip_reason="query_too_long"` / `"query_control_characters"` |
+| `fsfs` query the planner reads as low-signal (punctuation, no words) | lexical-biased, no refinement | only `Initial` phase + `skip_reason="query_low_confidence"` |
 | Fast embedder fails but lexical succeeds | lexical-only fallback | valid `Initial` results from lexical path |
 | Fast embedder fails and no lexical fallback | hard failure | search returns error |
 | Lexical backend failure | semantic continues | search continues without lexical contribution |

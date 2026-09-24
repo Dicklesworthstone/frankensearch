@@ -145,7 +145,8 @@ use crate::query_execution::{
 };
 use crate::query_expansion;
 use crate::query_planning::{
-    CapabilityState, QueryExecutionCapabilities, QueryIntentClass, QueryPlanner, StageDirective,
+    CapabilityState, QueryExecutionCapabilities, QueryFallbackPath, QueryIntentClass,
+    QueryIntentDecision, QueryPlanner, StageDirective,
 };
 use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
 use crate::stream_protocol::{
@@ -503,7 +504,9 @@ const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v9: vector top-k no longer lets a WAL-superseded main row take a slot
 // (0dc3df2f); answers cached by the older search are misses, not replays.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v9";
+// v10: a query the planner ran lexical-only or unrefined names why in
+// skip_reason; an older cached answer would replay the silent version.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v10";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -10151,6 +10154,22 @@ impl FsfsRuntime {
         payload
     }
 
+    /// Why the planner ran a query differently from the requested mode: a
+    /// query over the length limit or holding control characters runs
+    /// lexical-only, and a low-confidence one skips refinement. Without this
+    /// the caller received an ordinary-looking Initial phase and nothing more.
+    fn planner_downgrade_skip_reason(intent: &QueryIntentDecision) -> Option<&'static str> {
+        match intent.fallback {
+            QueryFallbackPath::MalformedLexicalOnly => Some(match intent.reason_code {
+                "query.intent.malformed.too_long" => "query_too_long",
+                "query.intent.malformed.control_chars" => "query_control_characters",
+                _ => "query_malformed",
+            }),
+            QueryFallbackPath::LowConfidenceLexicalBias => Some("query_low_confidence"),
+            QueryFallbackPath::None | QueryFallbackPath::EmptyQuery => None,
+        }
+    }
+
     fn attach_search_context(
         payload: SearchPayload,
         freshness: Option<IndexFreshnessPayload>,
@@ -11044,6 +11063,15 @@ impl FsfsRuntime {
             mode,
         );
         hit_lines.annotate(&mut payload);
+        // A planner downgrade outranks the requested fast_only (it removed the
+        // semantic lane that mode promised), but not a missing or hash-control
+        // vector generation, which already explains the whole lane.
+        if !matches!(mode, SearchExecutionMode::LexicalOnly)
+            && matches!(payload.skip_reason.as_deref(), None | Some("fast_only"))
+            && let Some(reason) = Self::planner_downgrade_skip_reason(&plan.intent)
+        {
+            payload.skip_reason = Some(reason.to_owned());
+        }
         if self.config.search.rerank && !plan.quality_stage.enabled {
             // The stage only re-scores a REFINED head. When no quality stage
             // will follow, say so on the phase the caller actually receives.
@@ -26991,6 +27019,75 @@ mod tests {
                     resources.quality_embedder.is_none(),
                     "a new pool must not inherit a model bound to the old pool"
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn planner_downgrades_are_named_on_the_initial_phase() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let request = |query: String| SearchServeRequest {
+                query,
+                limit: Some(10),
+                mode: Some("full".to_owned()),
+                filter: None,
+                rerank: None,
+                quality_weight: None,
+                quality_timeout_ms: None,
+                rrf_k: None,
+                fast_only: None,
+            };
+            let mut cache = std::collections::HashMap::new();
+
+            let ordinary = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("recover failed network requests".to_owned()),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                ordinary.payloads.last().unwrap().phase,
+                SearchOutputPhase::Refined
+            );
+            assert_eq!(ordinary.payloads[0].skip_reason, None);
+
+            for (query, reason) in [
+                ("network ".repeat(700), "query_too_long"),
+                (
+                    "recover failed \u{97}network requests".to_owned(),
+                    "query_control_characters",
+                ),
+                ("???".to_owned(), "query_low_confidence"),
+            ] {
+                let response = runtime
+                    .execute_search_serve_request(
+                        &cx,
+                        request(query),
+                        &mut resources,
+                        &mut cache,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                let phases = response
+                    .payloads
+                    .iter()
+                    .map(|payload| payload.phase)
+                    .collect::<Vec<_>>();
+                assert_eq!(phases, [SearchOutputPhase::Initial], "{reason}");
+                assert_eq!(response.payloads[0].skip_reason.as_deref(), Some(reason));
             }
         });
     }
@@ -44191,6 +44288,8 @@ mod tests {
                 "fsfs.search.cache.v7",
                 // Written by the vector top-k from before the WAL repair.
                 "fsfs.search.cache.v8",
+                // Written before planner downgrades named their skip_reason.
+                "fsfs.search.cache.v9",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

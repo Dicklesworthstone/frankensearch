@@ -258,6 +258,18 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **A query that runs lexical-only says so.** The planner runs a query over
+  4,096 characters, or one holding a control character, lexical-only and
+  without refinement, and a low-signal one without refinement. The answer
+  looked like an ordinary Initial phase (`mode` still `full`), so a caller
+  pasting a long passage, or text with one stray C1 character, could not
+  tell it had lost semantic search. The Initial phase now carries
+  `skip_reason` `query_too_long`, `query_control_characters` or
+  `query_low_confidence`. On BEIR ArguAna this is 7 of 1,406 queries (six
+  over the length limit, one with a mis-decoded U+0097). The answer cache
+  moves to `fsfs.search.cache.v10` so an older silent answer is not
+  replayed (bd-d0dil).
+
 - **`fsfs config set` works on an existing config file.** It read the file as
   a single TOML value rather than a document, so any table header failed to
   parse: the first `config set` created the file and every later one refused
