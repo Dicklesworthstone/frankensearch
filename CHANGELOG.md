@@ -258,6 +258,20 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **An interrupted `fsfs index` is reported, with the command that finishes
+  it.** Stopping a re-index of an existing index (Ctrl-C, SIGTERM) leaves a
+  half-written generation that search refuses until an `fsfs index` run
+  completes. Search already refused, but as a command-line mistake ("Check
+  the command line … Run: fsfs help"), while `fsfs status` still said
+  `ready` and `fsfs doctor` passed the index as up-to-date. Search now names
+  the exact `fsfs index <source> --index-dir <root>` that finishes the run;
+  `status` shows `index run unfinished` with that command (JSON
+  `unfinished_index_run`); doctor fails its `index` check with it. Doctor's
+  combined remedy lists steps in check order rather than alphabetically, so
+  it leads with that run instead of `fsfs compact`. Keeping the previous
+  generation searchable during a re-index remains open under GH #43
+  (bd-2wc7g).
+
 - **A query vector is scored only under the identity its tier was admitted
   under.** Search checked what the fast and quality embedders advertised
   before inference, then scored whatever raw vector `embed` returned. Each

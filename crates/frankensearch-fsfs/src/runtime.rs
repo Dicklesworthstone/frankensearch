@@ -3577,8 +3577,14 @@ struct FsfsIndexStatus {
     quality_generation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quality_generation_dimension: Option<usize>,
+    /// The command that finishes an `fsfs index` run into this root that
+    /// started but never published (interrupted, failed, or still running).
+    /// Search refuses the root until that run finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unfinished_index_run: Option<String>,
     /// Same operator label as the status table / dashboard (`ready`,
-    /// `no vector index`, `hash control (not semantic)`, `missing`).
+    /// `index run unfinished`, `no vector index`, `hash control (not
+    /// semantic)`, `missing`).
     #[serde(default)]
     dashboard_state: String,
 }
@@ -3591,10 +3597,13 @@ impl FsfsIndexStatus {
 
     /// Operator-facing readiness for dashboards and the status table.
     ///
-    /// A present hash/fnv control artifact is not a ready semantic index.
+    /// A present hash/fnv control artifact is not a ready semantic index, and
+    /// a root that search refuses is not ready at all.
     fn dashboard_state_label(&self) -> &'static str {
         if !self.exists {
             "missing"
+        } else if self.unfinished_index_run.is_some() {
+            "index run unfinished"
         } else if self.vector_generation_is_hash {
             "hash control (not semantic)"
         } else if self.vector_generation_id.is_none() {
@@ -3605,7 +3614,10 @@ impl FsfsIndexStatus {
     }
 
     fn dashboard_state_is_healthy(&self) -> bool {
-        self.exists && self.vector_generation_id.is_some() && !self.vector_generation_is_hash
+        self.exists
+            && self.unfinished_index_run.is_none()
+            && self.vector_generation_id.is_some()
+            && !self.vector_generation_is_hash
     }
 }
 
@@ -11720,15 +11732,21 @@ impl FsfsRuntime {
             .map(|check| format!("{}: {}", check.name, check.detail))
             .collect::<Vec<_>>()
             .join(" | ");
-        let recovery = payload
+        // Checks run cause-first (models, then the index, then the artifacts it
+        // produced), so remedies keep check order: the first is the one to take
+        // first, and later ones often clear once it is done.
+        let mut recovery_steps: Vec<&str> = Vec::new();
+        for suggestion in payload
             .checks
             .iter()
             .filter(|check| matches!(check.verdict, DoctorVerdict::Fail))
             .filter_map(|check| check.suggestion.as_deref())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join("; ");
+        {
+            if !recovery_steps.contains(&suggestion) {
+                recovery_steps.push(suggestion);
+            }
+        }
+        let recovery = recovery_steps.join("; ");
 
         let error = OutputError::new(
             "subsystem_error",
@@ -12839,7 +12857,14 @@ impl FsfsRuntime {
         // 4. Index directory
         if index_root.exists() {
             let sentinel = Self::read_index_sentinel(&index_root)?;
-            if let Some(sentinel) = &sentinel {
+            if let Some(command) = unfinished_index_run_command(&index_root) {
+                checks.push(DoctorCheck {
+                    name: "index".to_owned(),
+                    verdict: DoctorVerdict::Fail,
+                    detail: "the last `fsfs index` run into this root did not finish (interrupted, failed, or still running); its files may be half-written, so search refuses the root".to_owned(),
+                    suggestion: Some(format!("run `{command}` to finish it")),
+                });
+            } else if let Some(sentinel) = &sentinel {
                 let stale = Self::count_stale_files(&index_root, Some(sentinel))?;
                 let stale_count = stale.unwrap_or(0);
                 if !sentinel.generation_complete {
@@ -14341,6 +14366,7 @@ impl FsfsRuntime {
                 quality_generation_dimension: published_quality
                     .as_ref()
                     .map(|value| value.dimension),
+                unfinished_index_run: unfinished_index_run_command(&index_root),
                 dashboard_state: String::new(),
             }
             .with_computed_dashboard_state(),
@@ -16235,7 +16261,7 @@ impl FsfsRuntime {
             })?;
         if !sentinel.generation_complete {
             return Err(SearchError::InvalidConfig {
-                field: "cli.index_dir".to_owned(),
+                field: "index.generation".to_owned(),
                 value: index_root.display().to_string(),
                 reason: "Tantivy lexical index detected beside an incomplete generation; resume `fsfs index` before searching".to_owned(),
             });
@@ -17675,7 +17701,7 @@ impl FsfsRuntime {
         let current_fingerprint = Self::search_index_fingerprint_at_root(index_root)?;
         if current_fingerprint != expected_fingerprint {
             return Err(SearchError::InvalidConfig {
-                field: "cli.index_dir".to_owned(),
+                field: "index.generation".to_owned(),
                 value: index_root.display().to_string(),
                 reason: "index generation changed while search results were being computed; retry the request"
                     .to_owned(),
@@ -17821,7 +17847,7 @@ impl FsfsRuntime {
         let generation_fingerprint = Self::search_index_fingerprint_at_root(index_root)?;
         if generation_fingerprint != admitted_generation_fingerprint {
             return Err(SearchError::InvalidConfig {
-                field: "cli.index_dir".to_owned(),
+                field: "index.generation".to_owned(),
                 value: index_root.display().to_string(),
                 reason: "index generation changed while search resources were opening; retry the request"
                     .to_owned(),
@@ -24251,6 +24277,19 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         truncate_middle(&status.index.path, width.saturating_sub(10))
     );
     let _ = writeln!(out, "  state: {index_exists}");
+    if let Some(command) = status.index.unfinished_index_run.as_deref() {
+        let _ = writeln!(
+            out,
+            "  {}",
+            paint(
+                &format!(
+                    "the last `fsfs index` run did not finish (interrupted, failed, or still running); search refuses this root until it does: {command}"
+                ),
+                "33",
+                no_color,
+            )
+        );
+    }
     if let Some(generation_id) = status.index.vector_generation_id.as_deref() {
         let class = if status.index.vector_generation_is_hash {
             paint("hash control", "31", no_color)
@@ -24834,19 +24873,53 @@ const fn indexing_final_stage(
     }
 }
 
+/// True when the checkpoint records an `fsfs index` run that started but never
+/// made its artifacts durable: it was interrupted, failed, or is still running.
+/// The files under the root may be half-written, so every search mode refuses.
+fn checkpoint_marks_unfinished_run(checkpoint: &IndexingCheckpoint) -> bool {
+    checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
+        || !checkpoint.artifacts_durable
+}
+
+/// The command that finishes the unfinished run `checkpoint` records.
+fn finish_index_run_command(checkpoint: &IndexingCheckpoint, index_root: &Path) -> String {
+    format!(
+        "fsfs index {} --index-dir {}",
+        shell_quote(Path::new(&checkpoint.target_root)),
+        shell_quote(index_root),
+    )
+}
+
+/// The command that finishes an unfinished `fsfs index` run into `index_root`,
+/// or `None` when none is recorded. Search refuses the root while this is
+/// `Some`, so `status` and `doctor` report it instead of calling the root ready.
+fn unfinished_index_run_command(index_root: &Path) -> Option<String> {
+    match read_indexing_checkpoint(index_root) {
+        Ok(Some(checkpoint)) if checkpoint_marks_unfinished_run(&checkpoint) => {
+            Some(finish_index_run_command(&checkpoint, index_root))
+        }
+        Ok(_) => None,
+        // Search fails on an unreadable checkpoint too; the source root is unknown.
+        Err(_) => Some(format!(
+            "fsfs index <dir> --index-dir {}",
+            shell_quote(index_root)
+        )),
+    }
+}
+
 fn validate_checkpoint_search_admission(
     index_root: &Path,
     checkpoint: &IndexingCheckpoint,
     mode: SearchExecutionMode,
 ) -> SearchResult<()> {
-    if checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
-        || !checkpoint.artifacts_durable
-    {
+    if checkpoint_marks_unfinished_run(checkpoint) {
         return Err(SearchError::InvalidConfig {
-            field: "cli.index_dir".to_owned(),
+            field: "index.generation".to_owned(),
             value: index_root.display().to_string(),
-            reason: "index generation is incomplete; resume `fsfs index` before searching"
-                .to_owned(),
+            reason: format!(
+                "index generation is incomplete: the last `fsfs index` run into this root did not finish (interrupted, failed, or still running); run `{}` to finish it before searching",
+                finish_index_run_command(checkpoint, index_root),
+            ),
         });
     }
     if !matches!(mode, SearchExecutionMode::LexicalOnly)
@@ -29131,6 +29204,7 @@ mod tests {
                 vector_generation_is_hash: false,
                 quality_generation_id: None,
                 quality_generation_dimension: None,
+                unfinished_index_run: None,
                 dashboard_state: "ready".to_owned(),
                 index_freshness: Some(IndexFreshnessPayload {
                     published_generation: 7,
@@ -35348,6 +35422,69 @@ mod tests {
                     .to_string()
                     .contains("generation is incomplete")
             );
+            // The refusal is runtime state, not a command-line mistake: it names
+            // the run that finishes the generation, and nothing sends the
+            // operator to `fsfs help`.
+            let finish = format!(
+                "fsfs index '{}' --index-dir '{}'",
+                project.display(),
+                index_root.display()
+            );
+            assert!(
+                matches!(
+                    &search_error,
+                    SearchError::InvalidConfig { field, reason, .. }
+                        if field == "index.generation" && reason.contains(&finish)
+                ),
+                "the refusal must name `{finish}`, got {search_error}"
+            );
+            let rendered = crate::output_schema::output_error_from(&search_error);
+            assert!(
+                rendered
+                    .suggestion
+                    .as_deref()
+                    .is_some_and(|text| text.contains(&finish)
+                        && !text.contains("Check the command line")),
+                "suggestion: {:?}",
+                rendered.suggestion
+            );
+
+            // Status and doctor must not call a root ready that search refuses.
+            let mut observer_config = config.clone();
+            observer_config.indexing.model_dir =
+                temp.path().join("no-models").display().to_string();
+            let observer = FsfsRuntime::new(observer_config).with_cli_input(CliInput {
+                command: CliCommand::Status,
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+            let status = observer
+                .collect_status_payload()
+                .expect("status of an unfinished run");
+            assert_eq!(
+                status.index.unfinished_index_run.as_deref(),
+                Some(finish.as_str())
+            );
+            assert_eq!(status.index.dashboard_state, "index run unfinished");
+            assert!(!status.index.dashboard_state_is_healthy());
+            let table = super::render_status_table(&status, true);
+            assert!(
+                table.contains(&finish),
+                "status table must show the finishing command:\n{table}"
+            );
+            let doctor = observer
+                .collect_doctor_payload()
+                .expect("doctor of an unfinished run");
+            let index_check = doctor
+                .checks
+                .iter()
+                .find(|check| check.name == "index")
+                .expect("doctor index check");
+            assert_eq!(index_check.verdict, super::DoctorVerdict::Fail);
+            assert_eq!(
+                index_check.suggestion.as_deref(),
+                Some(format!("run `{finish}` to finish it").as_str())
+            );
 
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 command: CliCommand::Index,
@@ -35394,6 +35531,12 @@ mod tests {
                 .map(|hit| hit.document_id.clone())
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(live_ids, super::BTreeSet::from(["src/live.rs".to_owned()]));
+
+            let finished = observer
+                .collect_status_payload()
+                .expect("status after the run finished");
+            assert_eq!(finished.index.unfinished_index_run, None);
+            assert_ne!(finished.index.dashboard_state, "index run unfinished");
         });
     }
 
@@ -42715,6 +42858,36 @@ mod tests {
         assert_eq!(
             error.suggestion.as_deref(),
             Some("reinstall and verify the fast model")
+        );
+    }
+
+    #[test]
+    fn doctor_recovery_keeps_check_order_and_drops_repeats() {
+        let check = |name: &str, suggestion: &str| super::DoctorCheck {
+            name: name.to_owned(),
+            verdict: super::DoctorVerdict::Fail,
+            detail: "failed".to_owned(),
+            suggestion: Some(suggestion.to_owned()),
+        };
+        // The cause (an unfinished index run) sorts after its symptoms'
+        // remedy alphabetically, so a sorted join would lead with the wrong step.
+        let payload = super::FsfsDoctorPayload {
+            version: "test".to_owned(),
+            checks: vec![
+                check("index", "run `fsfs index '/src' --index-dir '/idx'` to finish it"),
+                check("semantic.quality_generation", "run `fsfs compact`"),
+                check("durability.vector_sidecars", "run `fsfs compact`"),
+            ],
+            pass_count: 0,
+            warn_count: 0,
+            fail_count: 3,
+            overall: super::DoctorVerdict::Fail,
+        };
+
+        let error = FsfsRuntime::doctor_failure_error(&payload);
+        assert_eq!(
+            error.suggestion.as_deref(),
+            Some("run `fsfs index '/src' --index-dir '/idx'` to finish it; run `fsfs compact`")
         );
     }
 
