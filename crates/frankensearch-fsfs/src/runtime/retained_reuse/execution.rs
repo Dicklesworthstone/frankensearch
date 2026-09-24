@@ -12,6 +12,10 @@ use super::retained_search_checkpoint;
 
 static EXECUTABLE: OnceLock<Option<String>> = OnceLock::new();
 
+#[cfg(all(test, target_os = "linux", not(feature = "embedded-models")))]
+#[path = "restart_tests.rs"]
+mod restart_tests;
+
 pub(super) fn fingerprint() -> Option<&'static str> {
     EXECUTABLE.get().and_then(Option::as_deref)
 }

@@ -96,16 +96,56 @@ visible-but-durability-uncertain error is preserved, and no false durable receip
 is emitted. The native watcher is owned by the watch future and released when it
 returns or is dropped; no separate indexing task is left running.
 
+## Restart reuse
+
+The retained builder writes a version-2 `FSFS-REUSE.json` inside each completed
+bundle when it has indexing checkpoint evidence. On Linux, a later process can
+reuse that evidence when the actual running executable, the full resolved
+configuration and the source root match. This applies to retained `index`
+rebuilds and the builder used by `watch`; it does not enable reuse for a legacy
+mutable index. No additional reuse flag is needed. Rerun the same indexing or
+watch command with the same configuration and executable.
+
+The proof hashes the executable opened through `/proc/self/exe`, not a pathname
+that an upgrade may already have replaced, and checks that FSFS code belongs to
+that image. It runs on the caller-owned blocking lane and retains the result
+within the process. The executable read is bounded to 2 GiB and uses a 64 KiB
+buffer; the code-mapping inventory is bounded to 4 MiB. No model is loaded for
+this proof and no extra runtime or worker pool is created. A package version or
+model label alone never authorizes reuse.
+
+The ordinary indexer still checks source-content hashes and the appropriate
+model producer before reusing an entry. Uncheckpointed tails and changed or
+incompatible inputs are recomputed. A changed executable, changed configuration,
+missing proof or old version-1 receipt starts cold; it does not delete the old
+bundle. Platforms other than Linux, unavailable `/proc` access, or hosts loading
+FSFS code outside their main executable retain the process-local policy. This
+is a compiled-code identity check under the existing cooperative deployment
+contract, not attestation of every dynamically loaded system dependency.
+
+Explicit full indexing bypasses the seed:
+
+```sh
+fsfs index /work/source --full --index-dir /work/search-store \
+  --config /work/fsfs.toml --format json
+```
+
+The receipt's `executable_sha256` records the raw executable-file SHA-256 when
+available. `session` remains useful for distinguishing processes; it is not a
+credential. Logs distinguish `cross_process_reuse` eligibility from
+`seeded_across_process`. Neither means that every document was actually reused.
+Never edit a sealed receipt or copy a fingerprint from another binary to force
+a match: it is part of the generation's authenticated inventory.
+
 ## Boundaries
 
-The retained builder can reuse checkpoint-proven embeddings in independently
-copied artifacts from the same process session and resolved configuration.
-Uncovered checkpoint tails and changed or incompatible inputs are recomputed by
-the ordinary indexer. This is not cross-restart caching or delta-only traversal;
-copying artifacts, full discovery and validation still cost work. Pausing hot
-sources bounds repeated candidate creation until quiet observations agree, not
-total lifetime disk use or event-to-visible latency. Retained and abandoned
-generations consume disk space; automatic reclamation is not implemented.
+Reuse saves eligible embedding work, not all rebuild I/O. Artifacts are still
+copied into independent files, full discovery and source hashing still run,
+and the normal validation and publication barriers remain. There are no hard
+links into retained vector, lexical or catalog files and no implicit pruning.
+Pausing hot sources bounds repeated candidate creation until quiet observations
+agree, not total lifetime disk use or event-to-visible latency. Retained and
+abandoned generations consume disk space; automatic reclamation is not implemented.
 
 The observation is not an atomic filesystem snapshot. There remains an ordinary
 cooperative-writer race between the final source check and pointer rename; later
@@ -115,14 +155,15 @@ This is not hostile-directory, anti-rollback, or privileged-adversary protection
 
 Complete-store readers support buffered CLI forwarding and progressive socket
 requests as described in [complete-generation serving](complete-generation-rebuilds.md).
-Legacy watcher migration, cross-restart reuse, and TUI migration remain
-unfinished. Ctrl-C cancellation
-is wired through the existing shutdown coordinator; no hard real-time latency
-is claimed for synchronous native operations or indexing work.
+Legacy watcher migration remains outside this workflow. Restart reuse beyond the
+Linux proof described above remains process-local. Ctrl-C cancellation is wired
+through the existing shutdown coordinator; no hard real-time latency is claimed
+for synchronous native operations or indexing work.
 
 ## Validation
 
 ```sh
+cargo test -p frankensearch-fsfs --no-default-features --lib retained_reuse
 cargo test -p frankensearch-fsfs --no-default-features --lib complete_watch
 cargo test -p frankensearch-fsfs --no-default-features --test complete_generation_watch_cli
 FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR=/verified/model-cache \
@@ -131,18 +172,30 @@ FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR=/verified/model-cache \
   -- --ignored --exact
 ```
 
-The ignored subprocess test requires real verified Potion model files. It keeps
-the production watcher alive across independent search processes while checking
-add/rename/delete visibility and predecessor retention. Its final child kill is
-cleanup, not evidence of graceful signal handling. Library tests exercise the
-owned lifetime, publication guard, missed-notification recovery, source identity,
-mid-listing cancellation and partial-observation refusal. Recovery tests cover
-paused candidate counts, catch-up without another event, old-reader retention,
-hints/backend failures during probes, cancellation and outside publications at
-the idle, settling and precommit boundaries. These are not a real-model
-performance qualification or proof of bounded freshness under continuous churn.
+The Linux `retained_reuse::execution::restart_tests` parent tests launch fresh
+copies of the test executable with caller-owned blocking pools. They verify
+cross-process seed admission, unchanged-input inference counts, changed-source
+and membership reconciliation, configuration/full-reindex invalidation, and a
+negative control with changed executable bytes but unchanged compiled test logic.
+Each child must produce a checked report; a zero-test harness exit is insufficient.
+Child lifetimes are bounded and cleanup reaps only the test's own subprocess.
+The ignored `restart_child` is an internal helper invoked by the parent tests,
+not a separate acceptance test. These use an explicitly counted hash provider;
+they do not establish real-model quality, speedups or watch freshness.
 
-These changes were prepared without Rust compiler, Cargo, rustfmt or RCH access.
-None of these Rust tests were executed in the editing environment; compilation,
-formatting, Clippy, model-quality, performance, and release acceptance remain
-unverified.
+The ignored semantic subprocess test requires real verified Potion model files.
+It keeps the production watcher alive across independent search processes while
+checking add/rename/delete visibility and predecessor retention. Its final child
+kill is cleanup, not evidence of graceful signal handling. Library tests exercise
+the owned lifetime, publication guard, missed-notification recovery, source
+identity, mid-listing cancellation and partial-observation refusal. Recovery
+tests cover paused candidate counts, catch-up without another event, old-reader
+retention, hints/backend failures during probes, cancellation and outside
+publications at the idle, settling and precommit boundaries. These are not a
+real-model performance qualification or proof of bounded freshness under churn.
+
+The restart-reuse additions were prepared without Rust compiler, Cargo, rustfmt,
+Clippy, UBS or RCH execution. The new Rust tests have not been run in the editing
+environment. Earlier execution receipts for watch or serving do not qualify this
+new revision; compilation, formatting, real-model restart qualification and
+performance measurements remain outstanding.
