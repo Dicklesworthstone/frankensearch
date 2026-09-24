@@ -315,9 +315,11 @@ impl FsfsRuntime {
     /// existing readers and directories survive subsequent publications.
     /// The store must be outside the source tree, and the catalog must use the
     /// `{index_dir}` layout so no old-generation database is modified.
-    /// Same-process successors can reuse checkpoint-proven embeddings in an
-    /// independent copy. `full_reindex` disables reuse; unproven inputs are
-    /// recomputed through the ordinary indexer and its producer checks.
+    /// Successors built by the same executable and configuration can reuse
+    /// completed input evidence in an independent copy, including after process
+    /// restart on Linux. Other platforms retain process-scoped reuse.
+    /// `full_reindex` disables reuse; unproven inputs are recomputed through the
+    /// ordinary indexer and its producer checks.
     ///
     /// # Errors
     /// Returns the original indexing/admission error without changing the
