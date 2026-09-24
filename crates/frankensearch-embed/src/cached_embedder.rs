@@ -2,8 +2,9 @@
 //!
 //! `CachedEmbedder` sits between the search pipeline and an inner embedder,
 //! caching raw query embeddings so that repeated raw queries skip inference.
-//! [`Embedder::embed_bound`] calls bypass this raw-vector cache and preserve
-//! the inner provider's complete response, including its producing identity.
+//! [`Embedder::embed_bound`] and [`Embedder::embed_batch_bound`] bypass this
+//! raw-vector cache and preserve the inner provider's complete responses,
+//! including their producing identity. Bound batches are never deduplicated.
 //!
 //! The cache uses FIFO eviction with a bounded capacity (default 128 entries).
 //! Cache hits return a cloned `Vec<f32>`, which is cheap (~1.5 KiB for 384-dim).
@@ -216,11 +217,18 @@ impl CacheState {
 /// Caching wrapper around any [`Embedder`].
 ///
 /// Caches raw `embed()` and `embed_batch()` results for previously seen queries.
-/// `embed_bound()` deliberately bypasses the raw-vector cache: an identity from
-/// `identity()` cannot replace the identity accompanying the provider's response.
+/// Both bound operations deliberately bypass the raw-vector cache: an identity
+/// from `identity()` cannot replace the identity accompanying a response.
+/// Bound batches retain the original input order and duplicate slots and invoke
+/// the provider's bound batch operation once, even for empty input. Responses
+/// are validated all-or-error without relabeling; admission against a stored
+/// generation remains the caller's responsibility. Bound calls do not affect
+/// raw-cache statistics or contents, whether they succeed or fail.
+///
 /// Raw responses are validated before insertion: batches must contain exactly
 /// one finite, correctly sized vector per distinct miss. An invalid batch never
-/// inserts a valid-looking prefix into the cache.
+/// inserts a valid-looking prefix into the cache. Cancellation after inference
+/// takes precedence over either a successful response or a provider error.
 ///
 /// # Construction
 ///
@@ -281,6 +289,15 @@ impl CachedEmbedder {
                 detail.into(),
             )),
         }
+    }
+
+    fn validate_bound_response(response: &IdentityBoundEmbedding) -> SearchResult<()> {
+        response.validate().map_err(|_| SearchError::InvalidConfig {
+            field: "embedding.cache.bound_response".to_owned(),
+            value: String::new(),
+            reason: "provider returned an invalid identity, representation, dimension or non-finite vector"
+                .to_owned(),
+        })
     }
 
     fn validate_vector(&self, values: &[f32]) -> SearchResult<()> {
@@ -380,8 +397,9 @@ impl Embedder for CachedEmbedder {
                 }
                 Arc::clone(&cache.epoch)
             };
-            let vec = self.inner.embed(cx, text).await?;
+            let outcome = self.inner.embed(cx, text).await;
             cache_checkpoint(cx)?;
+            let vec = outcome?;
             self.validate_vector(&vec)?;
             {
                 let mut cache = self.state_lock();
@@ -401,9 +419,52 @@ impl Embedder for CachedEmbedder {
     ) -> SearchFuture<'a, IdentityBoundEmbedding> {
         Box::pin(async move {
             cache_checkpoint(cx)?;
-            let response = self.inner.embed_bound(cx, text).await?;
+            let outcome = self.inner.embed_bound(cx, text).await;
+            cache_checkpoint(cx)?;
+            let response = outcome?;
+            Self::validate_bound_response(&response)?;
             cache_checkpoint(cx)?;
             Ok(response)
+        })
+    }
+
+    fn embed_batch_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+        Box::pin(async move {
+            cache_checkpoint(cx)?;
+            // Never route this through the raw cache or deduplicate its inputs.
+            // The batch provider owns response identity and per-input ordering.
+            let outcome = self.inner.embed_batch_bound(cx, texts).await;
+            cache_checkpoint(cx)?;
+            let responses = outcome?;
+            if responses.len() != texts.len() {
+                return Err(SearchError::InvalidConfig {
+                    field: "embedder.batch_length".to_owned(),
+                    value: responses.len().to_string(),
+                    reason: format!(
+                        "expected exactly {} identity-bound output vectors, one per input",
+                        texts.len(),
+                    ),
+                });
+            }
+            if let Some(first) = responses.first() {
+                for response in &responses {
+                    cache_checkpoint(cx)?;
+                    Self::validate_bound_response(response)?;
+                    if response.identity != first.identity {
+                        return Err(SearchError::UnverifiableRemoteSpace {
+                            producer: "embedding.cache.bound_batch".to_owned(),
+                            reason: "a bound embedding batch must carry one producing identity"
+                                .to_owned(),
+                        });
+                    }
+                }
+            }
+            cache_checkpoint(cx)?;
+            Ok(responses)
         })
     }
 
@@ -459,8 +520,9 @@ impl Embedder for CachedEmbedder {
             if !miss_texts.is_empty() {
                 cache_checkpoint(cx)?;
                 let all_slots_are_distinct_misses = miss_texts.len() == texts.len();
-                let embedded = self.inner.embed_batch(cx, &miss_texts).await?;
+                let outcome = self.inner.embed_batch(cx, &miss_texts).await;
                 cache_checkpoint(cx)?;
+                let embedded = outcome?;
                 self.validate_batch(&embedded, miss_texts.len())?;
                 {
                     let mut cache = self.state_lock();
