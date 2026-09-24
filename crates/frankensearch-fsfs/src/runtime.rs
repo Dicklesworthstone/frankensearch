@@ -27077,10 +27077,11 @@ mod tests {
         let socket = socket_dir.path().join("cancel.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let mut resources = published_blend_resources(temp.path());
+        let calls = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
         resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
             gate: Arc::new(asupersync::sync::Mutex::new(())),
-            calls: Arc::new(AtomicUsize::new(0)),
+            calls: Arc::clone(&calls),
             completed: Arc::clone(&completed),
         }));
         let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
@@ -27118,6 +27119,15 @@ mod tests {
         let mut sink = |payload: &SearchPayload, _cached| {
             assert_eq!(payload.phase, SearchOutputPhase::Initial);
             count += 1;
+            // Leave only once quality inference is running, so the drain of
+            // owned inference is what gets exercised. Leaving earlier lets
+            // the daemon see the disconnect before quality starts, and it
+            // then correctly never starts it.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while calls.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "quality never started");
             cx.cancel_with(
                 asupersync::types::CancelKind::User,
                 Some("cancel after Initial"),
