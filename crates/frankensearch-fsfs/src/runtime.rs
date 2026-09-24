@@ -7321,22 +7321,16 @@ impl FsfsRuntime {
         mut frame_sink: Option<SearchServeFrameSink<'_>>,
     ) -> SearchResult<SearchServeResponse> {
         let mode = parse_search_execution_mode(request.mode.as_deref())?;
+        // The generation fingerprint covers the active Quill MANIFEST's file
+        // identity, and every durable publication renames a new MANIFEST into
+        // place, so a newer publication rebinds all resources here. A per-request
+        // `QuillSearchIndex::refresh` found nothing more: it reopened the
+        // snapshot, re-hashing every segment file, only to report "unchanged".
         if self
             .rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?
         {
             hot_cache.clear();
-        }
-        if let Some(index) = resources.lexical_index.as_ref()
-            && index.refresh(cx).await?
-        {
-            hot_cache.clear();
-            if let Some(observer) = resources.shadow_observer.as_ref() {
-                observer.mark_generation_degraded(
-                    index.keeper_generation(),
-                    "serving generation advanced beyond the retained shadow-oracle snapshot",
-                );
-            }
         }
         let requested_limit = request.limit.unwrap_or_else(|| {
             self.cli_input

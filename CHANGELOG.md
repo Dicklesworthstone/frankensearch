@@ -258,6 +258,16 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **Daemon and `fsfs serve` searches no longer re-read the lexical index per
+  query.** Each request called Quill's `refresh`, which reopened the published
+  snapshot and re-hashed every segment file in full (80 MB per query on a
+  524-file code repository) only to report "unchanged". The generation
+  fingerprint that already rebinds everything on a new publication (it covers
+  the Quill `MANIFEST` file identity) is now the only check. Same repository,
+  warm `fsfs serve`, limit 10: fast-only median 17.7 to 3.9 ms (p90 27.5 to
+  13.7), full 24.0 to 9.6 ms (p90 32.4 to 17.8). A publication between two
+  requests is still served by the second (`search_serve_refreshes_quill_and_invalidates_hot_cache`).
+
 - **Warm searches are about a sixth faster.** Every search generated snippets
   for up to 200 lexical candidates (those hits doubled as fusion input) and
   showed about 10. Candidates now come from the plain ranked search and
