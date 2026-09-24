@@ -321,9 +321,14 @@ mod tests {
             let mut writer = output.clone();
             let released = Arc::new(AtomicBool::new(false));
             let owned = Released(Arc::clone(&released));
+            // run_request polls the deadline before the request, so a 1 ms
+            // deadline could expire before a loaded host first polled the
+            // request, leaving nothing written. The request below writes on
+            // its first poll and then never finishes; the deadline must only
+            // outlast that first poll.
             let result: SearchResult<()> = super::super::run_request(
                 &cx,
-                Duration::from_millis(1),
+                Duration::from_millis(250),
                 drive(&cx, &output, async move {
                     let _owned = owned;
                     writer.write_all(b"{}\n")?;
