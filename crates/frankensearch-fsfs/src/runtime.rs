@@ -4723,6 +4723,11 @@ const FSFS_RERANK_DOCUMENT_READ_LIMIT: u64 = 16 * 1024;
 /// Bytes of a hit's file searched for its snippet's line; covers the default
 /// indexing ceiling (`indexing.max_file_size_mb = 10`).
 const FSFS_HIT_LINE_READ_LIMIT: u64 = 16 << 20;
+/// Stored text scanned for the snippet of a hit the lexical head never saw.
+/// It covers everything the embedders read (2,000 canonical chars), so a
+/// vector-only hit's snippet comes from the text that matched, while the
+/// per-hit cost no longer grows with the file (1.7 MB files are common hits).
+const FSFS_FILL_SNIPPET_SCAN_BYTES: usize = 8 << 10;
 
 /// The process cache retains successful cross-encoder initialization. A query
 /// freezes its own slot, including absence, before cache lookup so a concurrent
@@ -9870,9 +9875,10 @@ impl FsfsRuntime {
     ///
     /// Snippets come from the lexical head, so semantic-only and quality-only
     /// hits (and a lexical tail past the head) would reach the caller as a bare
-    /// path. A document holding none of the query words gets its opening
-    /// fragment — the text the embedders read. A failed lookup leaves the hit
-    /// without a snippet; it never fails the search.
+    /// path. Only the text's opening [`FSFS_FILL_SNIPPET_SCAN_BYTES`] are
+    /// scanned: a query-word window there, else the opening fragment — the
+    /// text the embedders read. A failed lookup leaves the hit without a
+    /// snippet; it never fails the search.
     fn fill_missing_snippets(
         cx: &Cx,
         lexical: &QuillSearchIndex,
@@ -9915,6 +9921,13 @@ impl FsfsRuntime {
                 .and_then(|bytes| String::from_utf8(bytes).ok());
             if let Some(snippet) = content
                 .as_deref()
+                .map(|content| {
+                    let mut end = content.len().min(FSFS_FILL_SNIPPET_SCAN_BYTES);
+                    while !content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &content[..end]
+                })
                 .and_then(|content| generator.snippet_or_prefix(content))
                 && !snippet.trim().is_empty()
             {
@@ -35074,6 +35087,15 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // The query word sits past the scanned opening, so the opening wins.
+            let deep = format!(
+                "Opening words of a long file. {}the quokka hides deep",
+                "filler ".repeat(super::FSFS_FILL_SNIPPET_SCAN_BYTES / 7 + 1)
+            );
+            quill
+                .index_document(&cx, &IndexableDocument::new("deep.md", deep.as_str()))
+                .await
+                .unwrap();
             quill.commit(&cx).await.unwrap();
             let lexical =
                 QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
@@ -35107,10 +35129,17 @@ mod tests {
                     candidate("code.rs"),
                     candidate("kept.rs"),
                     candidate("gone.rs"),
+                    candidate("deep.md"),
                 ],
                 &mut snippets,
             )
             .unwrap();
+            assert!(
+                snippets["deep.md"].starts_with("Opening words of a long file.")
+                    && !snippets["deep.md"].contains("quokka"),
+                "{:?}",
+                snippets["deep.md"]
+            );
             assert_eq!(
                 snippets["notes.md"],
                 "Project overview for the wombat tracker. More text follows."
