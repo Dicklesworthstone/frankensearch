@@ -3590,9 +3590,14 @@ struct FsfsIndexStatus {
     /// Search refuses the root until that run finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unfinished_index_run: Option<String>,
+    /// Another fsfs process (a running watcher, or an index/compact/delete/
+    /// append run) holds the vector files' writer lock, so readers, including
+    /// search from other processes, cannot map them until it stops.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    vector_files_in_use: bool,
     /// Same operator label as the status table / dashboard (`ready`,
-    /// `index run unfinished`, `no vector index`, `hash control (not
-    /// semantic)`, `missing`).
+    /// `index run unfinished`, `in use by another fsfs process`, `no vector
+    /// index`, `hash control (not semantic)`, `missing`).
     #[serde(default)]
     dashboard_state: String,
 }
@@ -3612,6 +3617,8 @@ impl FsfsIndexStatus {
             "missing"
         } else if self.unfinished_index_run.is_some() {
             "index run unfinished"
+        } else if self.vector_files_in_use {
+            "in use by another fsfs process"
         } else if self.vector_generation_is_hash {
             "hash control (not semantic)"
         } else if self.vector_generation_id.is_none() {
@@ -3624,6 +3631,7 @@ impl FsfsIndexStatus {
     fn dashboard_state_is_healthy(&self) -> bool {
         self.exists
             && self.unfinished_index_run.is_none()
+            && !self.vector_files_in_use
             && self.vector_generation_id.is_some()
             && !self.vector_generation_is_hash
     }
@@ -14407,6 +14415,8 @@ impl FsfsRuntime {
                     .as_ref()
                     .map(|value| value.dimension),
                 unfinished_index_run: unfinished_index_run_command(&index_root),
+                vector_files_in_use: published_vector.is_none()
+                    && Self::vector_generation_in_use(&index_root),
                 dashboard_state: String::new(),
             }
             .with_computed_dashboard_state(),
@@ -16544,6 +16554,34 @@ impl FsfsRuntime {
     /// Status and doctor must not fail the whole command when the file is
     /// missing or unreadable; those cases stay `None` and are reported as
     /// absent rather than as a healthy semantic generation.
+    /// True when the fast-tier FSVI exists but another process holds its
+    /// writer lock, so no reader can map it: a running `fsfs watch` keeps that
+    /// lock for its whole life (bd-z2nfa), and index/compact/delete/append runs
+    /// hold it until they finish.
+    fn vector_generation_in_use(index_root: &Path) -> bool {
+        let path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+        path.exists()
+            && matches!(
+                VectorIndex::open_read_only(&path),
+                Err(SearchError::InvalidConfig { ref field, .. }) if field == "fsvi.map_lock"
+            )
+    }
+
+    /// Say who holds the vector files when a search cannot map them, instead
+    /// of the index crate's generic "drop live readers/writers" refusal.
+    fn explain_vector_writer_lock(index_root: &Path, error: SearchError) -> SearchError {
+        match error {
+            SearchError::InvalidConfig { ref field, .. } if field == "fsvi.map_lock" => {
+                SearchError::InvalidConfig {
+                    field: "index.vector_files".to_owned(),
+                    value: index_root.display().to_string(),
+                    reason: "another fsfs process is writing this index's vector files: a running `fsfs watch` holds them until it exits, and `fsfs index`, `compact`, `delete` or `append-batch` until it finishes. Search again once it stops; a watcher's changes become searchable when it exits".to_owned(),
+                }
+            }
+            other => other,
+        }
+    }
+
     fn inspect_published_vector_generation(index_root: &Path) -> Option<PublishedVectorGeneration> {
         let index = VectorIndex::open_read_only(&index_root.join(FSFS_VECTOR_INDEX_FILE)).ok()?;
         let id = index.embedder_id().to_owned();
@@ -17849,7 +17887,10 @@ impl FsfsRuntime {
             !matches!(resource_mode, SearchExecutionMode::LexicalOnly) || lexical_index.is_none();
         let degradation_advice = Vec::new();
         let vector_index = if should_open_vector && vector_path.exists() {
-            Some(VectorIndex::open_read_only(&vector_path)?)
+            Some(
+                VectorIndex::open_read_only(&vector_path)
+                    .map_err(|error| Self::explain_vector_writer_lock(index_root, error))?,
+            )
         } else {
             None
         };
@@ -24331,6 +24372,17 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
             )
         );
     }
+    if status.index.vector_files_in_use {
+        let _ = writeln!(
+            out,
+            "  {}",
+            paint(
+                "another fsfs process is writing the vector files (a running `fsfs watch`, or an index/compact/delete/append run); searches from other processes are refused until it stops",
+                "33",
+                no_color,
+            )
+        );
+    }
     if let Some(generation_id) = status.index.vector_generation_id.as_deref() {
         let class = if status.index.vector_generation_is_hash {
             paint("hash control", "31", no_color)
@@ -24344,6 +24396,12 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         let _ = writeln!(
             out,
             "  vector generation: {generation_id}  dim={dimension}  class={class}"
+        );
+    } else if status.index.vector_files_in_use {
+        let _ = writeln!(
+            out,
+            "  vector generation: {}",
+            paint("(unreadable while another process writes it)", "33", no_color)
         );
     } else {
         let _ = writeln!(
@@ -27133,6 +27191,72 @@ mod tests {
     }
 
     #[test]
+    fn a_held_vector_writer_lock_is_named_by_search_and_status() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join(".frankensearch");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().unwrap()).unwrap();
+            VectorIndex::create(&vector_path, "fnv1a-256", 256)
+                .expect("create FSVI")
+                .finish()
+                .expect("finish FSVI");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            config.indexing.model_dir = temp.path().join("no-models").display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(index_root.clone()),
+                query: Some("anything".to_owned()),
+                ..CliInput::default()
+            });
+
+            // What a running watcher holds for its whole life.
+            let writer = VectorIndex::open_writer(&vector_path).expect("hold the writer lock");
+            let error = runtime
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::Full)
+                .await
+                .map(|_| ())
+                .expect_err("a reader cannot map a writer-locked FSVI");
+            assert!(
+                matches!(
+                    &error,
+                    SearchError::InvalidConfig { field, reason, .. }
+                        if field == "index.vector_files" && reason.contains("fsfs watch")
+                ),
+                "{error}"
+            );
+            let status = runtime.collect_status_payload().expect("status while held");
+            assert!(status.index.vector_files_in_use);
+            assert_eq!(
+                status.index.dashboard_state,
+                "in use by another fsfs process"
+            );
+            assert!(!status.index.dashboard_state_is_healthy());
+            let table = super::render_status_table(&status, true);
+            assert!(
+                table.contains("another fsfs process is writing") && !table.contains("class=missing"),
+                "{table}"
+            );
+
+            drop(writer);
+            let released = runtime.collect_status_payload().expect("status after release");
+            assert!(!released.index.vector_files_in_use);
+            assert_ne!(released.index.dashboard_state, "in use by another fsfs process");
+            if let Err(error) = runtime
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::Full)
+                .await
+                .map(|_| ())
+            {
+                assert!(
+                    !matches!(&error, SearchError::InvalidConfig { field, .. } if field == "index.vector_files"),
+                    "released lock still reported: {error}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn quality_deadline_retries_bound_worker_occupancy_and_do_not_cache_failures() {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
@@ -29348,6 +29472,7 @@ mod tests {
                 quality_generation_id: None,
                 quality_generation_dimension: None,
                 unfinished_index_run: None,
+                vector_files_in_use: false,
                 dashboard_state: "ready".to_owned(),
                 index_freshness: Some(IndexFreshnessPayload {
                     published_generation: 7,

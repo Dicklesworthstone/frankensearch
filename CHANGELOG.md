@@ -258,6 +258,17 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **Searching while a watcher runs says why it cannot.** A running
+  `fsfs watch` holds the vector files' writer lock for its whole life (a
+  known limit, bd-z2nfa), so a search from another process is refused. That
+  refusal read "cannot acquire shared reader lock ... drop live
+  readers/writers before retrying", and `fsfs status` reported `no vector
+  index`. Search now says another fsfs process (a watcher, or an index,
+  compact, delete or append run) is writing the vector files and that a
+  watcher's changes become searchable when it exits; `status` reports
+  `in use by another fsfs process` (JSON `vector_files_in_use`) instead of a
+  missing generation (bd-vht3y).
+
 - **A warm `fsfs search` no longer waits on two fsyncs.** Every search saves
   its hits so `fsfs explain` can name them, and that small file was written
   with an fsync of the file and of its directory: two journal commits on
