@@ -2,6 +2,10 @@
 // search paths. This file is included in the same module as the retained reader.
 // No directory scan, alternate engine or implicit fallback chooses a target.
 
+mod recovery_query {
+    include!("recovery_query.rs");
+}
+
 fn retained_recovery_error(reason: &str) -> SearchError {
     SearchError::InvalidConfig {
         field: "complete_generation.recovery".to_owned(),
@@ -146,6 +150,8 @@ impl FsfsRuntime {
     ///
     /// Unlike ordinary progressive query admission, this eagerly verifies every
     /// present vector tier and its configured producer, even with `fast_only`.
+    /// Every query verifies the provider's identity-bound response against that
+    /// tier's frozen admission before using its values in the shared ranker.
     /// A valid inventory alone does not establish that a bundle is searchable.
     /// Legacy Tantivy migration and shadow writes are refused; no source rescan,
     /// index mutation, daemon forwarding or persistent query cache is performed.
@@ -213,7 +219,7 @@ impl FsfsRuntime {
         if let Some(index) = resources.vector_index.as_ref() {
             let embedder = runtime.resolve_fast_embedder()?;
             Self::admit_vector_generation_for_embedder(index, embedder.as_ref())?;
-            resources.fast_embedder = Some(embedder);
+            resources.fast_embedder = Some(recovery_query::bind(embedder)?);
             resources.fast_embedder_attempted = true;
         }
         let quality_path = generation.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE);
@@ -233,6 +239,9 @@ impl FsfsRuntime {
             runtime
                 .maybe_prepare_quality_embedder(cx, &mut resources)
                 .await?;
+            if let Some(embedder) = resources.quality_embedder.take() {
+                resources.quality_embedder = Some(recovery_query::bind(embedder)?);
+            }
         }
         let reader = RetainedSearchReader {
             runtime,
