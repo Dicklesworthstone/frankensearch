@@ -213,7 +213,7 @@ impl FsfsRuntime {
         if let Some(index) = resources.vector_index.as_ref() {
             let embedder = runtime.resolve_fast_embedder()?;
             Self::admit_vector_generation_for_embedder(index, embedder.as_ref())?;
-            resources.fast_embedder = Some(embedder);
+            resources.fast_embedder = Some(AdmittedEmbedder::admit(embedder)?);
             resources.fast_embedder_attempted = true;
         }
         let quality_path = generation.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE);
@@ -261,16 +261,18 @@ impl RetainedSearchReader {
             SearchExecutionMode::Full,
         )?;
         if let Some(index) = self.resources.vector_index.as_ref() {
-            let embedder = self.resources.fast_embedder.as_ref().ok_or_else(|| {
+            let admitted = self.resources.fast_embedder.as_ref().ok_or_else(|| {
                 retained_recovery_error("the stored fast tier has no admitted producer")
             })?;
-            FsfsRuntime::admit_vector_generation_for_embedder(index, embedder.as_ref())?;
+            FsfsRuntime::admit_vector_generation_for_embedder(index, admitted.embedder())?;
+            admitted.check_current_identity()?;
         }
         if let Some(index) = self.resources.quality_vector_index.as_ref() {
-            let embedder = self.resources.quality_embedder.as_ref().ok_or_else(|| {
+            let admitted = self.resources.quality_embedder.as_ref().ok_or_else(|| {
                 retained_recovery_error("the stored quality tier has no admitted producer")
             })?;
-            FsfsRuntime::admit_quality_generation_for_embedder(index, embedder.as_ref())?;
+            FsfsRuntime::admit_quality_generation_for_embedder(index, admitted.embedder())?;
+            admitted.check_current_identity()?;
         }
         retained_search_checkpoint(cx)
     }

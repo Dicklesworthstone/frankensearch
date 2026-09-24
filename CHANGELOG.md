@@ -258,6 +258,18 @@ qualified; individual results below are narrower than release acceptance.
   embedders read. The on-disk answer cache moves to schema v8, so older
   cached answers are recomputed once.
 
+- **A query vector is scored only under the identity its tier was admitted
+  under.** Search checked what the fast and quality embedders advertised
+  before inference, then scored whatever raw vector `embed` returned. Each
+  tier's embedder now carries the identity it was admitted under, and every
+  query embedding comes from `embed_bound`: the response must validate
+  (identity, exact width, finite values) and carry that same identity, or it
+  is refused before scoring. A cancellation seen during inference wins over
+  the response. A refused fast vector fails the search before Initial; a
+  refused quality vector keeps Initial and reports `RefinementFailed`, which
+  is never cached. Recovery re-admission also refuses a provider whose
+  reported identity changed since admission (GH #55).
+
 - **Answers from before the WAL top-k repair are not replayed.**
   [`0dc3df2f`](https://github.com/Dicklesworthstone/frankensearch/commit/0dc3df2f)
   stopped a WAL-superseded main row from taking a top-k slot (after a crash

@@ -776,11 +776,81 @@ struct SearchExecutionResources {
     /// Quality-tier generation (`vector/quality.fsvi`) from the same index
     /// run; present only when `fsfs index` built it. Drives the REFINED phase.
     quality_vector_index: Option<Arc<VectorIndex>>,
-    fast_embedder: Option<Arc<dyn Embedder>>,
-    quality_embedder: Option<Arc<dyn Embedder>>,
+    fast_embedder: Option<AdmittedEmbedder>,
+    quality_embedder: Option<AdmittedEmbedder>,
     fast_embedder_attempted: bool,
     quality_embedder_attempted: bool,
     degradation_advice: Vec<DegradationAdvice>,
+}
+
+/// A tier's query embedder with the identity it was admitted under.
+///
+/// Admission checks what the embedder advertises; a query vector is scored
+/// only after the identity bound to that very response has been checked too
+/// ([`Self::embed_query`]). Keeping the two together means warm reuse and
+/// generation rebinds carry the original admission rather than whatever the
+/// provider reports later.
+#[derive(Clone)]
+struct AdmittedEmbedder {
+    embedder: Arc<dyn Embedder>,
+    identity: frankensearch_core::EmbeddingIdentityBundleV1,
+}
+
+impl AdmittedEmbedder {
+    /// Capture the identity `embedder` is admitted under. Call only after the
+    /// embedder passed its tier's generation checks.
+    fn admit(embedder: Arc<dyn Embedder>) -> SearchResult<Self> {
+        let identity = embedder.identity()?.clone();
+        identity.validate()?;
+        Ok(Self { embedder, identity })
+    }
+
+    fn embedder(&self) -> &dyn Embedder {
+        self.embedder.as_ref()
+    }
+
+    /// Fail when the provider now reports another identity than the one it
+    /// was admitted under.
+    fn check_current_identity(&self) -> SearchResult<()> {
+        let current = self.embedder.identity()?;
+        if *current != self.identity {
+            return Err(self.identity_mismatch("now reports", current));
+        }
+        Ok(())
+    }
+
+    /// Embed a query and return its values only when the response itself
+    /// carries the admitted identity, the exact width and finite values. A
+    /// cancellation observed after inference takes precedence over a
+    /// provider error.
+    async fn embed_query(&self, cx: &Cx, query: &str) -> SearchResult<Vec<f32>> {
+        let response = self.embedder.embed_bound(cx, query).await;
+        cx.checkpoint().map_err(|_| SearchError::Cancelled {
+            phase: "query_embedding".to_owned(),
+            reason: "runtime cancellation requested".to_owned(),
+        })?;
+        let bound = response?;
+        bound.validate()?;
+        if bound.identity != self.identity {
+            return Err(self.identity_mismatch("returned a query vector from", &bound.identity));
+        }
+        Ok(bound.values)
+    }
+
+    fn identity_mismatch(
+        &self,
+        action: &str,
+        observed: &frankensearch_core::EmbeddingIdentityBundleV1,
+    ) -> SearchError {
+        SearchError::UnverifiableRemoteSpace {
+            producer: format!("fsfs.query_embedding.{}", self.embedder.id()),
+            reason: format!(
+                "the embedder {action} identity {} but its tier was admitted under {}; scores against the stored vectors would compare different embedding spaces",
+                observed.fingerprint(),
+                self.identity.fingerprint()
+            ),
+        }
+    }
 }
 
 struct ShadowPressureSampler {
@@ -10827,7 +10897,7 @@ impl FsfsRuntime {
                 resources.vector_index.as_ref(),
                 resources.fast_embedder.as_ref(),
             ) {
-                match embedder.embed(cx, &normalized_query).await {
+                match embedder.embed_query(cx, &normalized_query).await {
                     Ok(query_embedding) => {
                         // Classified lane (bd-tqhc): an empty vector result
                         // carries a typed ZeroSignalReason instead of being
@@ -11087,11 +11157,15 @@ impl FsfsRuntime {
                         fast_embedder: resources
                             .fast_embedder
                             .as_ref()
-                            .map_or_else(String::new, |embedder| embedder.id().to_owned()),
+                            .map_or_else(String::new, |admitted| {
+                                admitted.embedder().id().to_owned()
+                            }),
                         quality_embedder: resources
                             .quality_embedder
                             .as_ref()
-                            .map_or_else(String::new, |embedder| embedder.id().to_owned()),
+                            .map_or_else(String::new, |admitted| {
+                                admitted.embedder().id().to_owned()
+                            }),
                         hits: blend_hits,
                     });
                     let refined_artifact = SearchPhaseArtifact {
@@ -17960,7 +18034,7 @@ impl FsfsRuntime {
                     dimension = embedder.dimension(),
                     "{message}"
                 );
-                resources.fast_embedder = Some(embedder);
+                resources.fast_embedder = Some(AdmittedEmbedder::admit(embedder)?);
                 Ok(())
             }
             Err(error) => {
@@ -18058,7 +18132,7 @@ impl FsfsRuntime {
         else {
             return Ok(None);
         };
-        let query_embedding = embedder.embed(cx, query).await?;
+        let query_embedding = embedder.embed_query(cx, query).await?;
         let index = Arc::clone(index);
         let filter_expr = filter_expr.cloned();
         let mut fast_ids = fast_candidates
@@ -18179,7 +18253,7 @@ impl FsfsRuntime {
                 if let Some(index) = resources.quality_vector_index.as_ref() {
                     Self::admit_quality_generation_for_embedder(index, embedder.as_ref())?;
                 }
-                resources.quality_embedder = Some(embedder);
+                resources.quality_embedder = Some(AdmittedEmbedder::admit(embedder)?);
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -25554,6 +25628,39 @@ mod tests {
         );
     }
 
+    /// One stable synthetic identity per `(id, dimension)`, for fixtures that
+    /// only need admission to see a valid identity of their own.
+    fn test_identity(
+        id: &str,
+        dimension: usize,
+    ) -> &'static frankensearch_core::EmbeddingIdentityBundleV1 {
+        type Identities = std::sync::Mutex<
+            HashMap<(String, usize), &'static frankensearch_core::EmbeddingIdentityBundleV1>,
+        >;
+        static IDENTITIES: std::sync::OnceLock<Identities> = std::sync::OnceLock::new();
+        let mut identities = IDENTITIES
+            .get_or_init(Identities::default)
+            .lock()
+            .expect("identity registry");
+        let key = (id.to_owned(), dimension);
+        if let Some(identity) = identities.get(&key).copied() {
+            return identity;
+        }
+        let identity: &'static _ = Box::leak(Box::new(
+            frankensearch_core::EmbeddingIdentityBundleV1::explicit_test_model(
+                id,
+                u32::try_from(dimension).expect("test dimension"),
+            ),
+        ));
+        identities.insert(key, identity);
+        identity
+    }
+
+    /// Admit a test embedder the way search admission does.
+    fn admitted(embedder: impl Embedder + 'static) -> super::AdmittedEmbedder {
+        super::AdmittedEmbedder::admit(Arc::new(embedder)).expect("test embedder has an identity")
+    }
+
     /// Query vectors are explicit basis vectors; this is a ranking fixture,
     /// not evidence of semantic quality. Retrieval uses actual FSVI files.
     struct BlendQueryEmbedder(&'static str);
@@ -25561,6 +25668,12 @@ mod tests {
     impl Embedder for BlendQueryEmbedder {
         fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             Box::pin(async { Ok(vec![1.0, 0.0]) })
+        }
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            Ok(test_identity(self.0, 2))
         }
         fn dimension(&self) -> usize {
             2
@@ -25577,6 +25690,283 @@ mod tests {
         fn category(&self) -> ModelCategory {
             ModelCategory::StaticEmbedder
         }
+    }
+
+    /// What a [`ScriptedBoundEmbedder`] answers from `embed_bound`.
+    #[derive(Clone)]
+    enum BoundScript {
+        /// The advertised identity with these values.
+        Values(Vec<f32>),
+        /// `[1.0, 0.0]` bound to another identity.
+        Identity(Box<frankensearch_core::EmbeddingIdentityBundleV1>),
+        /// A provider failure.
+        Fail,
+        /// Cancel the caller, then answer normally.
+        CancelThenRespond,
+        /// Cancel the caller, then fail.
+        CancelThenFail,
+    }
+
+    /// A provider whose raw `embed` always succeeds with `[1.0, 0.0]` while
+    /// its bound response follows a script, so query admission (GH #55) is
+    /// what decides whether the vector is scored. `drifted` switches what
+    /// `identity()` reports after admission.
+    struct ScriptedBoundEmbedder {
+        advertised: frankensearch_core::EmbeddingIdentityBundleV1,
+        drifted: Option<frankensearch_core::EmbeddingIdentityBundleV1>,
+        drift: AtomicBool,
+        script: BoundScript,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedBoundEmbedder {
+        fn new(script: BoundScript) -> Self {
+            Self {
+                advertised: test_identity("scripted-query-2", 2).clone(),
+                drifted: None,
+                drift: AtomicBool::new(false),
+                script,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl Embedder for ScriptedBoundEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async { Ok(vec![1.0, 0.0]) })
+        }
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            _text: &'a str,
+        ) -> SearchFuture<'a, frankensearch_core::IdentityBoundEmbedding> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let bound = |values: Vec<f32>, identity| {
+                    Ok(frankensearch_core::IdentityBoundEmbedding { values, identity })
+                };
+                let failure = || {
+                    Err(SearchError::EmbeddingFailed {
+                        model: "scripted-query-2".to_owned(),
+                        source: "scripted provider failure".into(),
+                    })
+                };
+                match self.script.clone() {
+                    BoundScript::Values(values) => bound(values, self.identity()?.clone()),
+                    BoundScript::Identity(identity) => bound(vec![1.0, 0.0], *identity),
+                    BoundScript::Fail => failure(),
+                    BoundScript::CancelThenRespond => {
+                        cx.cancel_with(asupersync::types::CancelKind::User, Some("test"));
+                        bound(vec![1.0, 0.0], self.advertised.clone())
+                    }
+                    BoundScript::CancelThenFail => {
+                        cx.cancel_with(asupersync::types::CancelKind::User, Some("test"));
+                        failure()
+                    }
+                }
+            })
+        }
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            Ok(match (&self.drifted, self.drift.load(Ordering::SeqCst)) {
+                (Some(drifted), true) => drifted,
+                _ => &self.advertised,
+            })
+        }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn id(&self) -> &'static str {
+            "scripted-query-2"
+        }
+        fn model_name(&self) -> &'static str {
+            "scripted-query-2"
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    /// GH #55: a query vector is scored only when the identity bound to that
+    /// very response is the one its tier was admitted under, and the vector
+    /// itself is well formed. Every other outcome is refused before scoring.
+    #[test]
+    fn query_embedding_admission_holds_each_response_to_the_admitted_identity() {
+        run_test_with_cx(|cx| async move {
+            let query = |script| async {
+                let embedder = ScriptedBoundEmbedder::new(script);
+                let calls = Arc::clone(&embedder.calls);
+                let result = admitted(embedder).embed_query(&cx, "query").await;
+                (result, calls.load(Ordering::SeqCst))
+            };
+
+            // Control: one inference, values untouched.
+            let (result, calls) = query(BoundScript::Values(vec![0.6, 0.8])).await;
+            assert_eq!(result.unwrap(), vec![0.6, 0.8]);
+            assert_eq!(calls, 1);
+
+            // Same width, another identity: each component on its own.
+            let advertised = test_identity("scripted-query-2", 2).clone();
+            let mut foreign_space = test_identity("another-model-2", 2).clone();
+            foreign_space.producer = advertised.producer.clone();
+            let mut foreign_producer = advertised.clone();
+            "another-revision".clone_into(&mut foreign_producer.producer.implementation_revision);
+            let mut foreign_input = advertised.clone();
+            "another-canonicalization".clone_into(&mut foreign_input.input.canonicalization);
+            let mut foreign_storage = advertised.clone();
+            "another-normalization".clone_into(&mut foreign_storage.storage.vector_normalization);
+            for (component, identity) in [
+                ("whole identity", test_identity("another-model-2", 2).clone()),
+                ("space", foreign_space),
+                ("producer", foreign_producer),
+                ("input", foreign_input),
+                ("storage", foreign_storage),
+            ] {
+                assert_ne!(identity, advertised, "{component}");
+                let (result, _) = query(BoundScript::Identity(Box::new(identity))).await;
+                assert!(result.is_err(), "a foreign {component} was scored");
+            }
+            let (result, _) = query(BoundScript::Identity(Box::new(
+                test_identity("another-model-2", 2).clone(),
+            )))
+            .await;
+            assert!(
+                matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })),
+                "{result:?}"
+            );
+
+            // Malformed vectors from an overridden bound response.
+            for values in [vec![1.0], vec![f32::NAN, 0.0], vec![0.0, f32::INFINITY]] {
+                let (result, _) = query(BoundScript::Values(values.clone())).await;
+                assert!(result.is_err(), "{values:?} was scored");
+            }
+
+            // Drift after admission: the provider now reports, and binds its
+            // response to, another identity than it was admitted under.
+            let mut drifting = ScriptedBoundEmbedder::new(BoundScript::Values(vec![1.0, 0.0]));
+            drifting.drifted = Some(test_identity("drifted-model-2", 2).clone());
+            let drifting = Arc::new(drifting);
+            let admission = super::AdmittedEmbedder::admit(
+                Arc::clone(&drifting) as Arc<dyn Embedder>
+            )
+            .unwrap();
+            admission.check_current_identity().unwrap();
+            drifting.drift.store(true, Ordering::SeqCst);
+            assert!(admission.check_current_identity().is_err());
+            assert!(matches!(
+                admission.embed_query(&cx, "query").await,
+                Err(SearchError::UnverifiableRemoteSpace { .. })
+            ));
+
+            // Provider failure stays a provider failure.
+            let (result, _) = query(BoundScript::Fail).await;
+            assert!(matches!(result, Err(SearchError::EmbeddingFailed { .. })), "{result:?}");
+        });
+        // Cancellation observed during inference wins over both a good
+        // response and a provider error.
+        for script in [BoundScript::CancelThenRespond, BoundScript::CancelThenFail] {
+            run_test_with_cx(|cx| async move {
+                let result = admitted(ScriptedBoundEmbedder::new(script))
+                    .embed_query(&cx, "query")
+                    .await;
+                assert!(matches!(result, Err(SearchError::Cancelled { .. })), "{result:?}");
+            });
+        }
+    }
+
+    /// GH #55 through search: a fast tier whose response carries a foreign
+    /// identity emits no phase; a foreign quality response keeps Initial,
+    /// reports `RefinementFailed`, and is not cached.
+    #[test]
+    fn foreign_query_embedding_identities_never_reach_scoring() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let request = |mode: &str| SearchServeRequest {
+                query: "how do semantic policies affect ranking".to_owned(),
+                limit: Some(10),
+                mode: Some(mode.to_owned()),
+                filter: None,
+                rerank: Some(false),
+                quality_weight: None,
+                quality_timeout_ms: Some(5_000),
+                rrf_k: None,
+                fast_only: None,
+            };
+            let foreign = || {
+                admitted(ScriptedBoundEmbedder::new(BoundScript::Identity(Box::new(
+                    test_identity("another-model-2", 2).clone(),
+                ))))
+            };
+
+            let mut resources = disagreeing_blend_resources(temp.path());
+            resources.fast_embedder = Some(foreign());
+            let mut phases = 0_usize;
+            let mut sink = |frame: super::SearchServeFrame| {
+                if matches!(frame, super::SearchServeFrame::Phase { .. }) {
+                    phases += 1;
+                }
+                Ok(())
+            };
+            let mut cache = std::collections::HashMap::new();
+            let refused = runtime
+                .execute_search_serve_request_with_sink(
+                    &cx,
+                    request("full"),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                    Some(&mut sink),
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(SearchError::UnverifiableRemoteSpace { .. })),
+                "{refused:?}"
+            );
+            assert_eq!(phases, 0, "a foreign fast vector must not reach Initial");
+            assert!(cache.is_empty());
+
+            let mut resources = disagreeing_blend_resources(temp.path());
+            resources.quality_embedder = Some(foreign());
+            for attempt in 0..2 {
+                let response = runtime
+                    .execute_search_serve_request(
+                        &cx,
+                        request("full"),
+                        &mut resources,
+                        &mut cache,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!response.cached, "attempt {attempt} replayed a failed refinement");
+                let phases = response
+                    .payloads
+                    .iter()
+                    .map(|payload| payload.phase)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    phases,
+                    [
+                        SearchOutputPhase::Initial,
+                        SearchOutputPhase::RefinementFailed
+                    ],
+                    "attempt {attempt}"
+                );
+                assert_eq!(response.payloads[0].hits[0].path, "a.rs");
+            }
+        });
     }
 
     fn disagreeing_blend_resources(root: &Path) -> SearchExecutionResources {
@@ -25617,8 +26007,8 @@ mod tests {
             shadow_pressure_sampler: None,
             vector_index: Some(fast),
             quality_vector_index: Some(Arc::new(quality)),
-            fast_embedder: Some(Arc::new(BlendQueryEmbedder("blend-fast-2"))),
-            quality_embedder: Some(Arc::new(BlendQueryEmbedder("blend-quality-2"))),
+            fast_embedder: Some(admitted(BlendQueryEmbedder("blend-fast-2"))),
+            quality_embedder: Some(admitted(BlendQueryEmbedder("blend-quality-2"))),
             fast_embedder_attempted: true,
             quality_embedder_attempted: true,
             degradation_advice: Vec::new(),
@@ -25674,7 +26064,7 @@ mod tests {
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open_read_only(&path).unwrap()),
                 quality_vector_index: None,
-                fast_embedder: Some(Arc::new(BlendQueryEmbedder("blend-fast-2"))),
+                fast_embedder: Some(admitted(BlendQueryEmbedder("blend-fast-2"))),
                 quality_embedder: None,
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
@@ -26138,6 +26528,12 @@ mod tests {
     }
 
     impl Embedder for BlockingQualityFixture {
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            Ok(test_identity(self.id(), self.dimension()))
+        }
         fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             Box::pin(async move {
                 let permit = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.gate), cx)
@@ -26306,7 +26702,7 @@ mod tests {
                 .unwrap();
             super::set_test_quality_embedder(None);
             assert!(Arc::ptr_eq(
-                resources.quality_embedder.as_ref().unwrap(),
+                &resources.quality_embedder.as_ref().unwrap().embedder,
                 &embedder
             ));
 
@@ -26330,7 +26726,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(Arc::ptr_eq(
-                resources.quality_embedder.as_ref().unwrap(),
+                &resources.quality_embedder.as_ref().unwrap().embedder,
                 &embedder
             ));
 
@@ -26365,7 +26761,7 @@ mod tests {
             let mut resources = disagreeing_blend_resources(temp.path());
             let calls = Arc::new(AtomicUsize::new(0));
             let completed = Arc::new(AtomicUsize::new(0));
-            resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
+            resources.quality_embedder = Some(admitted(BlockingQualityFixture {
                 gate: Arc::new(asupersync::sync::Mutex::new(())),
                 calls: Arc::clone(&calls),
                 completed: Arc::clone(&completed),
@@ -26491,7 +26887,7 @@ mod tests {
         ))
         .unwrap();
         let completed = Arc::new(AtomicUsize::new(0));
-        resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
+        resources.quality_embedder = Some(admitted(BlockingQualityFixture {
             gate,
             calls: Arc::new(AtomicUsize::new(0)),
             completed: Arc::clone(&completed),
@@ -27134,7 +27530,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let mut resources = disagreeing_blend_resources(temp.path());
             let completed = Arc::new(AtomicUsize::new(0));
-            resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
+            resources.quality_embedder = Some(admitted(BlockingQualityFixture {
                 gate: Arc::new(asupersync::sync::Mutex::new(())),
                 calls: Arc::new(AtomicUsize::new(0)),
                 completed: Arc::clone(&completed),
@@ -27214,7 +27610,7 @@ mod tests {
         let mut resources = published_blend_resources(temp.path());
         let calls = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
-        resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
+        resources.quality_embedder = Some(admitted(BlockingQualityFixture {
             gate: Arc::new(asupersync::sync::Mutex::new(())),
             calls: Arc::clone(&calls),
             completed: Arc::clone(&completed),
@@ -27314,7 +27710,7 @@ mod tests {
         // when the deadline fires, and the response still has 2 s to reach
         // EOF before the backend completes. With 50 ms against 400 ms a
         // loaded host missed both windows.
-        resources.quality_embedder = Some(Arc::new(BlockingQualityFixture {
+        resources.quality_embedder = Some(admitted(BlockingQualityFixture {
             gate: Arc::new(asupersync::sync::Mutex::new(())),
             calls: Arc::clone(&calls),
             completed: Arc::clone(&completed),
@@ -30823,8 +31219,8 @@ mod tests {
                 quality_vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&quality_path).unwrap(),
                 )),
-                fast_embedder: Some(Arc::new(fast_embedder)),
-                quality_embedder: Some(Arc::new(FailedQualityEmbedder)),
+                fast_embedder: Some(admitted(fast_embedder)),
+                quality_embedder: Some(admitted(FailedQualityEmbedder)),
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
                 degradation_advice: Vec::new(),
@@ -37975,6 +38371,12 @@ mod tests {
     }
 
     impl Embedder for BarrierQualityEmbedder {
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            Ok(test_identity(self.id(), self.dimension()))
+        }
         fn embed<'a>(
             &'a self,
             _cx: &'a asupersync::Cx,
@@ -38016,6 +38418,12 @@ mod tests {
     struct FailedQualityEmbedder;
 
     impl Embedder for FailedQualityEmbedder {
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            Ok(test_identity(self.id(), self.dimension()))
+        }
         fn embed<'a>(
             &'a self,
             _cx: &'a asupersync::Cx,
@@ -38142,8 +38550,8 @@ mod tests {
                 quality_vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&vector_path).expect("open quality index"),
                 )),
-                fast_embedder: Some(Arc::new(fast_embedder)),
-                quality_embedder: Some(Arc::new(BarrierQualityEmbedder::new(Arc::clone(&barrier)))),
+                fast_embedder: Some(admitted(fast_embedder)),
+                quality_embedder: Some(admitted(BarrierQualityEmbedder::new(Arc::clone(&barrier)))),
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
                 degradation_advice: Vec::new(),
@@ -38269,8 +38677,8 @@ mod tests {
                 quality_vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&vector_path).expect("open quality index"),
                 )),
-                fast_embedder: Some(Arc::new(fast_embedder)),
-                quality_embedder: Some(Arc::new(FailedQualityEmbedder)),
+                fast_embedder: Some(admitted(fast_embedder)),
+                quality_embedder: Some(admitted(FailedQualityEmbedder)),
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
                 degradation_advice: Vec::new(),
@@ -38315,6 +38723,12 @@ mod tests {
     struct CancelledEmbedder;
 
     impl Embedder for CancelledEmbedder {
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            Ok(test_identity(self.id(), self.dimension()))
+        }
         fn embed<'a>(
             &'a self,
             _cx: &'a asupersync::Cx,
@@ -38509,7 +38923,7 @@ mod tests {
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
                 quality_vector_index: None,
-                fast_embedder: Some(Arc::new(CancelledEmbedder)),
+                fast_embedder: Some(admitted(CancelledEmbedder)),
                 quality_embedder: None,
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
@@ -38598,8 +39012,8 @@ mod tests {
                 quality_vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&vector_path).expect("open quality index"),
                 )),
-                fast_embedder: Some(Arc::new(fast_embedder)),
-                quality_embedder: Some(Arc::new(CancelledEmbedder)),
+                fast_embedder: Some(admitted(fast_embedder)),
+                quality_embedder: Some(admitted(CancelledEmbedder)),
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
                 degradation_advice: Vec::new(),
@@ -40640,7 +41054,7 @@ mod tests {
             shadow_pressure_sampler: None,
             vector_index: Some(VectorIndex::open_read_only(&vector_path).expect("open hash index")),
             quality_vector_index: None,
-            fast_embedder: Some(Arc::new(HashEmbedder::default_256())),
+            fast_embedder: Some(admitted(HashEmbedder::default_256())),
             quality_embedder: None,
             fast_embedder_attempted: true,
             quality_embedder_attempted: true,
