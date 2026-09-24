@@ -97,7 +97,7 @@ pub const WRITER_LOCK_RECORD_BYTES: usize = 36;
 ///
 /// The build-time assertion in this module's tests intentionally forces this
 /// value to change when `Cargo.toml` changes.
-pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 3, 2);
+pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 3, 3);
 
 const MANIFEST_MIN_BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 /// v2 images carry the additional `last_publish_unix_s` word after `flags`.
@@ -17523,13 +17523,13 @@ mod tests {
     fn empty_manifest_has_stable_wire_golden() -> TestResult {
         let manifest = Manifest::empty(1, 0x1122_3344_5566_7788, 0);
         let bytes = manifest.to_bytes()?;
-        // GOLDEN-CHANGE: the 0.3.2 hotfix release advances producer metadata,
+        // GOLDEN-CHANGE: the 0.3.3 hotfix release advances producer metadata,
         // not the wire format. Bytes 36..40 are `CURRENT_ENGINE_VERSION`
-        // (0.3.2 => `02 00 03 00`); the trailing CRC32 covers all prior bytes.
-        // The 0.3.1 image moves to the still-readable list below.
+        // (0.3.3 => `03 00 03 00`); the trailing CRC32 covers all prior bytes.
+        // The 0.3.2 image moves to the still-readable list below.
         let expected = hex_bytes(
             "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
-             0200030000000000000000000000000000000000000000006f23556f",
+             030003000000000000000000000000000000000000000000484670ee",
         );
         assert_eq!(bytes, expected);
         assert_eq!(Manifest::from_bytes(&bytes)?, manifest);
@@ -17537,6 +17537,11 @@ mod tests {
         // Keep previous producers' exact wire images readable and writable;
         // only their engine-version word and the covering CRC differ.
         for (version, wire_hex) in [
+            (
+                pack_engine_version(0, 3, 2),
+                "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
+                 0200030000000000000000000000000000000000000000006f23556f",
+            ),
             (
                 pack_engine_version(0, 3, 1),
                 "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
