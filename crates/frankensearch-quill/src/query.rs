@@ -946,6 +946,10 @@ pub enum CassQueryToken {
     Or { byte_offset: usize },
     /// An explicit or prefix negation.
     Not { byte_offset: usize },
+    /// A group-opening parenthesis.
+    LParen { byte_offset: usize },
+    /// A group-closing parenthesis.
+    RParen { byte_offset: usize },
 }
 
 /// Complete in-memory witness emitted by the real native CASS parser.
@@ -4954,11 +4958,16 @@ impl CassParserFields {
     }
 }
 
-/// Native parser for the intentionally non-standard CASS Boolean grammar.
+/// Native parser for the CASS Boolean grammar.
 ///
-/// OR binds tighter than AND. Negation is idempotent rather than parity-based,
-/// and a negative used as an OR operand or as the complete root is wrapped in
-/// `All + MustNot` so it denotes a complement.
+/// Standard precedence: NOT binds tightest, then AND (explicit, `&&`, or
+/// implied between adjacent operands), then OR (`OR`, `||`). Parentheses
+/// group. A `(` opens a group only at the start of a word and a `)` closes
+/// one only while a group is open, so code such as `foo(bar)` stays a term.
+/// Negation is parity-based (`NOT NOT x` is `x`), and a negative used as an
+/// OR operand or as the complete root is wrapped in `All + MustNot` so it
+/// denotes a complement. Malformed input is recovered with a
+/// [`QueryDiagnosticKind::SyntaxRecovery`] diagnostic rather than an error.
 #[derive(Debug, Clone, Copy)]
 pub struct CassQueryParser {
     fields: CassParserFields,
@@ -5087,6 +5096,8 @@ impl CassQueryParser {
         let mut grammar = CassGrammar {
             parser: *self,
             tokens,
+            position: 0,
+            open_groups: 0,
             diagnostics,
         };
         let parsed = grammar.parse();
@@ -5386,6 +5397,8 @@ enum CassLexToken {
     And { offset: usize },
     Or { offset: usize },
     Not { offset: usize },
+    LParen { offset: usize },
+    RParen { offset: usize },
 }
 
 impl CassLexToken {
@@ -5409,6 +5422,12 @@ impl CassLexToken {
             Self::Not { offset } => CassQueryToken::Not {
                 byte_offset: *offset,
             },
+            Self::LParen { offset } => CassQueryToken::LParen {
+                byte_offset: *offset,
+            },
+            Self::RParen { offset } => CassQueryToken::RParen {
+                byte_offset: *offset,
+            },
         }
     }
 }
@@ -5418,8 +5437,20 @@ fn cass_lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<CassLexT
     let mut chars = query.char_indices().peekable();
     let mut word = String::new();
     let mut word_offset = 0_usize;
+    // Groups currently open. A `(` inside a word and a `)` with no group
+    // open stay word characters, so code terms like `foo(bar)` survive.
+    let mut open_groups = 0_usize;
     while let Some((offset, ch)) = chars.next() {
         match ch {
+            '(' if word.is_empty() => {
+                tokens.push(CassLexToken::LParen { offset });
+                open_groups += 1;
+            }
+            ')' if open_groups > 0 => {
+                cass_flush_word(&mut tokens, &mut word, word_offset);
+                tokens.push(CassLexToken::RParen { offset });
+                open_groups -= 1;
+            }
             '"' => {
                 cass_flush_word(&mut tokens, &mut word, word_offset);
                 let mut phrase = String::new();
@@ -5498,111 +5529,184 @@ struct CassNode {
     negative: bool,
 }
 
+/// Recursive-descent parser over the lexed CASS tokens:
+///
+/// ```text
+/// query   := or
+/// or      := and (OR and)*
+/// and     := unary ([AND] unary)*      adjacent operands are an implied AND
+/// unary   := NOT* primary              an odd count of NOTs negates
+/// primary := TERM | PHRASE | '(' or ')'
+/// ```
 struct CassGrammar {
     parser: CassQueryParser,
     tokens: Vec<CassLexToken>,
+    position: usize,
+    /// Parentheses entered and not yet closed.
+    open_groups: usize,
     diagnostics: Vec<QueryDiagnostic>,
 }
 
 impl CassGrammar {
     fn parse(&mut self) -> Option<CassNode> {
-        let mut clauses = Vec::new();
-        let mut pending_or_group = Vec::new();
-        let mut next_occur = Occur::Must;
-        let mut in_or_sequence = false;
-        let mut just_saw_or = false;
-        let mut saw_operand = false;
-        let mut last_binary_offset = None;
-        let mut dangling_not_offset = None;
+        self.parse_or()
+    }
 
-        for token in std::mem::take(&mut self.tokens) {
-            match token {
-                CassLexToken::And { offset } => {
-                    if !saw_operand || last_binary_offset.is_some() {
-                        self.syntax_diagnostic(
-                            "AND without an adjacent operand was recovered",
-                            offset,
-                        );
-                    }
-                    if let Some(not_offset) = dangling_not_offset.take() {
-                        self.syntax_diagnostic("NOT has no operand before AND", not_offset);
-                    }
-                    cass_flush_native_or_group(&mut pending_or_group, &mut clauses);
-                    in_or_sequence = false;
-                    just_saw_or = false;
-                    next_occur = Occur::Must;
-                    last_binary_offset = Some(offset);
+    fn peek(&self) -> Option<&CassLexToken> {
+        self.tokens.get(self.position)
+    }
+
+    /// A `)` outside any group cannot reach the parser, because the lexer
+    /// emits one only while a group is open; it is recovered, not trusted.
+    fn parse_or(&mut self) -> Option<CassNode> {
+        let mut operands = Vec::new();
+        let mut pending_or = None;
+        loop {
+            match self.peek() {
+                None => break,
+                Some(CassLexToken::RParen { .. }) if self.open_groups > 0 => break,
+                Some(CassLexToken::RParen { offset }) => {
+                    let offset = *offset;
+                    self.position += 1;
+                    self.syntax_diagnostic("unmatched ')' was ignored", offset);
+                    continue;
                 }
-                CassLexToken::Or { offset } => {
-                    if !saw_operand || last_binary_offset.is_some() {
+                Some(CassLexToken::Or { offset }) => {
+                    let offset = *offset;
+                    self.position += 1;
+                    if operands.is_empty() || pending_or.is_some() {
                         self.syntax_diagnostic(
                             "OR without an adjacent operand was recovered",
                             offset,
                         );
                     }
-                    in_or_sequence = true;
-                    just_saw_or = true;
-                    last_binary_offset = Some(offset);
+                    pending_or = Some(offset);
+                    continue;
                 }
-                CassLexToken::Not { offset } => {
-                    if !just_saw_or {
-                        cass_flush_native_or_group(&mut pending_or_group, &mut clauses);
-                        in_or_sequence = false;
-                        just_saw_or = false;
-                    }
-                    next_occur = Occur::MustNot;
-                    dangling_not_offset.get_or_insert(offset);
-                    last_binary_offset = None;
-                }
-                CassLexToken::Term { text, offset } => {
-                    let query = self.parser.lower_term(&text);
-                    if query.is_empty() {
-                        self.syntax_diagnostic("empty term operand was skipped", offset);
-                        continue;
-                    }
-                    cass_apply_native_query(
-                        query,
-                        next_occur,
-                        &mut in_or_sequence,
-                        &mut just_saw_or,
-                        &mut pending_or_group,
-                        &mut clauses,
-                    );
-                    next_occur = Occur::Must;
-                    saw_operand = true;
-                    last_binary_offset = None;
-                    dangling_not_offset = None;
-                }
-                CassLexToken::Phrase { text, offset } => {
-                    let query = self.parser.lower_phrase(&text);
-                    if query.is_empty() {
-                        self.syntax_diagnostic("empty phrase operand was skipped", offset);
-                        continue;
-                    }
-                    cass_apply_native_query(
-                        query,
-                        next_occur,
-                        &mut in_or_sequence,
-                        &mut just_saw_or,
-                        &mut pending_or_group,
-                        &mut clauses,
-                    );
-                    next_occur = Occur::Must;
-                    saw_operand = true;
-                    last_binary_offset = None;
-                    dangling_not_offset = None;
-                }
+                Some(_) => {}
+            }
+            if let Some(node) = self.parse_and() {
+                operands.push(node);
+                pending_or = None;
             }
         }
-
-        cass_flush_native_or_group(&mut pending_or_group, &mut clauses);
-        if let Some(offset) = dangling_not_offset {
-            self.syntax_diagnostic("dangling NOT has no operand", offset);
-        }
-        if let Some(offset) = last_binary_offset {
+        if let Some(offset) = pending_or {
             self.syntax_diagnostic("dangling binary operator has no operand", offset);
         }
-        cass_finish_native_clauses(clauses)
+        cass_combine_or(operands)
+    }
+
+    fn parse_and(&mut self) -> Option<CassNode> {
+        let mut operands = Vec::new();
+        let mut pending_and = None;
+        loop {
+            match self.peek() {
+                None | Some(CassLexToken::Or { .. } | CassLexToken::RParen { .. }) => break,
+                Some(CassLexToken::And { offset }) => {
+                    let offset = *offset;
+                    self.position += 1;
+                    if operands.is_empty() || pending_and.is_some() {
+                        self.syntax_diagnostic(
+                            "AND without an adjacent operand was recovered",
+                            offset,
+                        );
+                    }
+                    pending_and = Some(offset);
+                    continue;
+                }
+                Some(_) => {}
+            }
+            if let Some(node) = self.parse_unary() {
+                operands.push(node);
+            }
+            pending_and = None;
+        }
+        if let Some(offset) = pending_and {
+            self.syntax_diagnostic("dangling binary operator has no operand", offset);
+        }
+        cass_combine_and(operands)
+    }
+
+    fn parse_unary(&mut self) -> Option<CassNode> {
+        let mut negated = false;
+        let mut first_not = None;
+        while let Some(CassLexToken::Not { offset }) = self.peek() {
+            first_not.get_or_insert(*offset);
+            negated = !negated;
+            self.position += 1;
+        }
+        match (self.peek(), first_not) {
+            (
+                Some(
+                    CassLexToken::Term { .. }
+                    | CassLexToken::Phrase { .. }
+                    | CassLexToken::LParen { .. },
+                ),
+                _,
+            ) => {}
+            (Some(CassLexToken::And { .. }), Some(offset)) => {
+                self.syntax_diagnostic("NOT has no operand before AND", offset);
+                return None;
+            }
+            (_, Some(offset)) => {
+                self.syntax_diagnostic("dangling NOT has no operand", offset);
+                return None;
+            }
+            (_, None) => return None,
+        }
+        let mut node = self.parse_primary()?;
+        if negated {
+            node.negative = !node.negative;
+        }
+        Some(node)
+    }
+
+    fn parse_primary(&mut self) -> Option<CassNode> {
+        let token = self.tokens.get(self.position)?.clone();
+        self.position += 1;
+        match token {
+            CassLexToken::Term { text, offset } => {
+                let query = self.parser.lower_term(&text);
+                if query.is_empty() {
+                    self.syntax_diagnostic("empty term operand was skipped", offset);
+                    return None;
+                }
+                Some(CassNode {
+                    query,
+                    negative: false,
+                })
+            }
+            CassLexToken::Phrase { text, offset } => {
+                let query = self.parser.lower_phrase(&text);
+                if query.is_empty() {
+                    self.syntax_diagnostic("empty phrase operand was skipped", offset);
+                    return None;
+                }
+                Some(CassNode {
+                    query,
+                    negative: false,
+                })
+            }
+            CassLexToken::LParen { offset } => {
+                self.open_groups += 1;
+                let inner = self.parse_or();
+                self.open_groups -= 1;
+                if matches!(self.peek(), Some(CassLexToken::RParen { .. })) {
+                    self.position += 1;
+                } else {
+                    self.syntax_diagnostic("unclosed '(' was closed at the end", offset);
+                }
+                if inner.is_none() {
+                    self.syntax_diagnostic("empty group was skipped", offset);
+                }
+                inner
+            }
+            // Operators never reach here: parse_unary admits only operands.
+            CassLexToken::And { .. }
+            | CassLexToken::Or { .. }
+            | CassLexToken::Not { .. }
+            | CassLexToken::RParen { .. } => None,
+        }
     }
 
     fn syntax_diagnostic(&mut self, message: &str, offset: usize) {
@@ -5618,65 +5722,47 @@ impl CassGrammar {
     }
 }
 
-fn cass_flush_native_or_group(pending_or_group: &mut Vec<Query>, clauses: &mut Vec<BooleanClause>) {
-    if pending_or_group.is_empty() {
-        return;
+/// Disjunction of `operands`. A negative operand denotes its complement, so
+/// it is wrapped in `All + MustNot` before joining the disjunction.
+fn cass_combine_or(mut operands: Vec<CassNode>) -> Option<CassNode> {
+    if operands.len() <= 1 {
+        return operands.pop();
     }
-    let query = Query::boolean(
-        std::mem::take(pending_or_group)
-            .into_iter()
-            .map(|query| BooleanClause::new(Occur::Should, query))
-            .collect(),
-        Some(BooleanOperator::Or),
-    );
-    clauses.push(BooleanClause::new(Occur::Must, query));
-}
-
-fn cass_apply_native_query(
-    query: Query,
-    next_occur: Occur,
-    in_or_sequence: &mut bool,
-    just_saw_or: &mut bool,
-    pending_or_group: &mut Vec<Query>,
-    clauses: &mut Vec<BooleanClause>,
-) {
-    if *in_or_sequence && *just_saw_or {
-        if pending_or_group.is_empty()
-            && clauses
-                .last()
-                .is_some_and(|clause| matches!(clause.occur, Occur::Must | Occur::MustNot))
-            && let Some(clause) = clauses.pop()
-        {
-            pending_or_group.push(if clause.occur == Occur::MustNot {
-                cass_complement(clause.query)
+    let clauses = operands
+        .into_iter()
+        .map(|node| {
+            let query = if node.negative {
+                cass_complement(node.query)
             } else {
-                clause.query
-            });
-        }
-        pending_or_group.push(if next_occur == Occur::MustNot {
-            cass_complement(query)
-        } else {
-            query
-        });
-    } else {
-        cass_flush_native_or_group(pending_or_group, clauses);
-        *in_or_sequence = false;
-        clauses.push(BooleanClause::new(next_occur, query));
-    }
-    *just_saw_or = false;
+                node.query
+            };
+            BooleanClause::new(Occur::Should, query)
+        })
+        .collect();
+    Some(CassNode {
+        query: Query::boolean(clauses, Some(BooleanOperator::Or)),
+        negative: false,
+    })
 }
 
-fn cass_finish_native_clauses(mut clauses: Vec<BooleanClause>) -> Option<CassNode> {
-    if clauses.len() == 1 {
-        let clause = clauses.pop()?;
-        return Some(CassNode {
-            query: clause.query,
-            negative: clause.occur == Occur::MustNot,
-        });
+/// Conjunction of `operands`: positives are `Must`, negatives `MustNot`. A
+/// conjunction of negatives alone is anchored on `All`, since exclusions
+/// need a universe to exclude from.
+fn cass_combine_and(mut operands: Vec<CassNode>) -> Option<CassNode> {
+    if operands.len() <= 1 {
+        return operands.pop();
     }
-    if clauses.is_empty() {
-        return None;
-    }
+    let mut clauses: Vec<BooleanClause> = operands
+        .into_iter()
+        .map(|node| {
+            let occur = if node.negative {
+                Occur::MustNot
+            } else {
+                Occur::Must
+            };
+            BooleanClause::new(occur, node.query)
+        })
+        .collect();
     if clauses.iter().all(|clause| clause.occur == Occur::MustNot) {
         if clauses.try_reserve_exact(1).is_err() {
             return None;
@@ -6579,7 +6665,9 @@ mod tests {
                 | CassQueryToken::Phrase { byte_offset, .. }
                 | CassQueryToken::And { byte_offset }
                 | CassQueryToken::Or { byte_offset }
-                | CassQueryToken::Not { byte_offset } => *byte_offset,
+                | CassQueryToken::Not { byte_offset }
+                | CassQueryToken::LParen { byte_offset }
+                | CassQueryToken::RParen { byte_offset } => *byte_offset,
             };
             offset < observed.admitted_query.len()
                 && observed.admitted_query.is_char_boundary(offset)
@@ -6855,6 +6943,10 @@ mod tests {
                     CassLexToken::And { .. } => ("and", ""),
                     CassLexToken::Or { .. } => ("or", ""),
                     CassLexToken::Not { .. } => ("not", ""),
+                    // The shipping adapter has no grouping; none of these
+                    // inputs contains a parenthesis.
+                    CassLexToken::LParen { .. } => ("(", ""),
+                    CassLexToken::RParen { .. } => (")", ""),
                 })
                 .collect::<Vec<_>>();
             let normalized_oracle = oracle
@@ -6924,14 +7016,22 @@ mod tests {
             recovered.query.root(),
             QueryNode::Term { text, .. } if text == "cache"
         ));
+        // The operand-less NOT and the operand-less AND are both dropped with
+        // a diagnostic, leaving `auth OR deprecated`.
         let recovered = parser.parse("auth OR NOT AND deprecated", &CassQueryFilters::default());
         assert!(matches!(
             recovered.query.root(),
             QueryNode::Boolean {
-                operator: Some(BooleanOperator::And),
+                operator: Some(BooleanOperator::Or),
                 ..
             }
         ));
+        assert_eq!(
+            recovered.query,
+            parser
+                .parse("auth OR deprecated", &CassQueryFilters::default())
+                .query
+        );
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -7057,7 +7157,10 @@ mod tests {
         let cases = vec![
             ("auth", CassQueryFilters::default()),
             ("auth token", CassQueryFilters::default()),
-            ("auth OR token AND cache", CassQueryFilters::default()),
+            // Mixed AND/OR is not compared here: the shipping Tantivy
+            // builder binds OR tighter (see
+            // cass_parser_precedence_matches_set_algebra_over_the_oracle).
+            ("auth OR token OR cache", CassQueryFilters::default()),
             ("auth && cache", CassQueryFilters::default()),
             ("auth || search", CassQueryFilters::default()),
             ("\"error handling\"", CassQueryFilters::default()),
@@ -7160,6 +7263,144 @@ mod tests {
                 .collect::<BTreeSet<_>>();
             assert_eq!(native, oracle, "result-set differential for {raw:?}");
         }
+    }
+
+    /// cass#52 grammar: result sets follow standard Boolean algebra (NOT >
+    /// AND > OR, parentheses group, NOT NOT cancels). The corpus separates
+    /// the standard reading from the legacy OR-binds-tighter one on every
+    /// mixed case, so the legacy grammar fails each of them.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn cass_parser_precedence_matches_set_algebra_over_the_oracle() {
+        let doc = |msg_idx: u64, content: &'static str| CassEvalDoc {
+            msg_idx,
+            agent: "claude",
+            workspace: None,
+            created_at: None,
+            title: "",
+            content,
+            source_id: "local",
+            origin_kind: "local",
+        };
+        let docs = [
+            doc(0, "auth"),
+            doc(1, "token cache"),
+            doc(2, "token"),
+            doc(3, "cache"),
+            doc(4, "auth cache"),
+        ];
+        for (raw, expected) in [
+            // auth ∪ (token ∩ cache); legacy: (auth ∪ token) ∩ cache = {1, 4}
+            ("auth OR token AND cache", vec![0, 1, 4]),
+            // (auth ∩ token) ∪ cache; legacy: auth ∩ (token ∪ cache) = {4}
+            ("auth AND token OR cache", vec![1, 3, 4]),
+            ("auth token OR cache", vec![1, 3, 4]),
+            ("(auth OR token) AND cache", vec![1, 4]),
+            ("auth AND (token OR cache)", vec![4]),
+            ("NOT NOT auth", vec![0, 4]),
+            ("-(token OR cache)", vec![0]),
+            ("auth -(token OR cache)", vec![0]),
+            ("((auth))", vec![0, 4]),
+        ] {
+            let parsed = cass_parser().parse(raw, &CassQueryFilters::default());
+            let matched = docs
+                .iter()
+                .copied()
+                .filter(|doc| cass_ast_matches(&parsed.query, *doc))
+                .map(|doc| doc.msg_idx)
+                .collect::<Vec<_>>();
+            assert_eq!(matched, expected, "{raw:?} -> {:?}", parsed.query);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{raw:?}: {:?}",
+                parsed.diagnostics
+            );
+        }
+    }
+
+    /// cass#52 grammar, feature-independent: equivalent spellings lower to
+    /// the same tree, the two groupings of a mixed query differ, code
+    /// parentheses stay inside terms, and malformed groups are recovered.
+    #[test]
+    fn cass_parser_groups_with_parentheses_and_standard_precedence() {
+        let parser = cass_parser();
+        let filters = CassQueryFilters::default();
+        let tree = |raw: &str| parser.parse(raw, &filters).query;
+
+        assert_eq!(
+            tree("auth OR token AND cache"),
+            tree("auth OR (token AND cache)")
+        );
+        assert_ne!(
+            tree("auth OR token AND cache"),
+            tree("(auth OR token) AND cache"),
+            "negative: the legacy grammar read the first as the second"
+        );
+        assert_eq!(
+            tree("auth token OR cache"),
+            tree("(auth AND token) OR cache")
+        );
+        assert_eq!(tree("NOT NOT auth"), tree("auth"));
+        assert_eq!(tree("-(auth OR token)"), tree("NOT (auth OR token)"));
+        assert_eq!(tree("((auth))"), tree("auth"));
+
+        // `(` inside a word and `)` with no open group are term characters.
+        let observed = parser
+            .parse_observed("foo(bar) x)", &filters)
+            .expect("bounded observation");
+        assert_eq!(
+            observed.tokens,
+            vec![
+                CassQueryToken::Term {
+                    text: "foo(bar)".to_owned(),
+                    byte_offset: 0,
+                },
+                CassQueryToken::Term {
+                    text: "x)".to_owned(),
+                    byte_offset: 9,
+                },
+            ]
+        );
+        let grouped = parser
+            .parse_observed("-(a b)", &filters)
+            .expect("bounded observation");
+        assert_eq!(
+            grouped.tokens,
+            vec![
+                CassQueryToken::Not { byte_offset: 0 },
+                CassQueryToken::LParen { byte_offset: 1 },
+                CassQueryToken::Term {
+                    text: "a".to_owned(),
+                    byte_offset: 2,
+                },
+                CassQueryToken::Term {
+                    text: "b".to_owned(),
+                    byte_offset: 4,
+                },
+                CassQueryToken::RParen { byte_offset: 5 },
+            ]
+        );
+
+        let unclosed = parser.parse("(auth OR token", &filters);
+        assert_eq!(unclosed.query, tree("auth OR token"));
+        assert!(
+            unclosed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unclosed '('")),
+            "{:?}",
+            unclosed.diagnostics
+        );
+        let empty = parser.parse("auth ()", &filters);
+        assert_eq!(empty.query, tree("auth"));
+        assert!(
+            empty
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("empty group")),
+            "{:?}",
+            empty.diagnostics
+        );
     }
 
     #[test]
