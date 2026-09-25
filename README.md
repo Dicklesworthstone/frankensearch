@@ -395,6 +395,15 @@ file counts, vector model identities, and `generation_complete`. If embedding
 retries are exhausted, `semantic_deferred_files` and a warning explain why the
 published artifacts still need indexing resumed before semantic search.
 
+Completed ordinary index runs retain evidence for reusing their embeddings on
+later runs. Reuse requires matching executable, configuration, producer
+identities, artifact bytes, and each file's current revision and content hash.
+Changed and newly discovered files are embedded again; removed files leave the
+index. `fsfs index --force` (also `--full`) rebuilds all discovered files and
+clears stale lexical rows. Existing indexes acquire this evidence on their next
+successful build. Cross-process reuse is supported on Linux; other platforms
+keep the existing process-scoped executable evidence policy.
+
 Each search hit carries its `path`, a plain-text `snippet` of the best-matching
 fragment, and `line`: the 1-based line of the file where the snippet's first
 query word sits (the table prints `path:line`). `line` is absent for hits

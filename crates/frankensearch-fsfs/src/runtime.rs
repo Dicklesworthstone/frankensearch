@@ -14939,7 +14939,7 @@ impl FsfsRuntime {
         // Boxed: the one-shot index future carries both tiers' embedding
         // state and would otherwise inflate every caller's future past the
         // `large_futures` budget.
-        Box::pin(self.run_one_shot_index_scaffold_internal(cx, command, on_progress, true))
+        Box::pin(self.run_one_shot_index_scaffold_internal(cx, command, on_progress, true, true))
             .await
             .map(|_| ())
     }
@@ -14951,6 +14951,7 @@ impl FsfsRuntime {
         command: CliCommand,
         mut on_progress: F,
         emit_user_output: bool,
+        retain_legacy_reuse: bool,
     ) -> SearchResult<FsfsIndexPayload>
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
@@ -14967,6 +14968,9 @@ impl FsfsRuntime {
         // boundary below so a substituted lock file aborts the publication.
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
         publication_lease.fence("one-shot index entry")?;
+        if retain_legacy_reuse {
+            retained_reuse::prepare_legacy_reuse(cx).await?;
+        }
 
         let root_decision = self.config.discovery.evaluate_root(&target_root, None);
         if !root_decision.include() {
@@ -15168,7 +15172,7 @@ impl FsfsRuntime {
 
         // 2. Prepare indexes and validate the last durable checkpoint generation.
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
-        let existing_checkpoint = match read_indexing_checkpoint(&index_root) {
+        let mut existing_checkpoint = match read_indexing_checkpoint(&index_root) {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 warn!(error = %error, "ignoring malformed indexing checkpoint");
@@ -15180,16 +15184,18 @@ impl FsfsRuntime {
                 None
             }
         };
+        if !self.cli_input.full_reindex && retain_legacy_reuse && existing_checkpoint.is_none() {
+            existing_checkpoint = retained_reuse::legacy_checkpoint(cx, self, &index_root)?;
+        }
         let target_root_label = target_root.display().to_string();
         let index_root_label = index_root.display().to_string();
         let checkpoint_metadata_valid = existing_checkpoint.as_ref().is_some_and(|checkpoint| {
-            checkpoint.schema_version == INDEXING_CHECKPOINT_SCHEMA_VERSION
+            !self.cli_input.full_reindex
+                && checkpoint.schema_version == INDEXING_CHECKPOINT_SCHEMA_VERSION
                 && checkpoint.artifacts_durable
                 && checkpoint.target_root == target_root_label
                 && checkpoint.index_root == index_root_label
         });
-        let discard_undurable_lexical_generation =
-            existing_checkpoint.is_some() && !checkpoint_metadata_valid;
         let checkpoint_manifests = if checkpoint_metadata_valid {
             match Self::read_checkpoint_manifest_generation(
                 &index_root,
@@ -15206,6 +15212,11 @@ impl FsfsRuntime {
         } else {
             None
         };
+        // Source discovery is the membership authority on a cold rebuild.
+        // Without a proven checkpoint, old Quill rows may include an aborted
+        // batch or an out-of-protocol mutation absent from both manifests.
+        let discard_undurable_lexical_generation =
+            self.cli_input.full_reindex || checkpoint_manifests.is_none();
         let reconciliation_manifests = match Self::read_matching_manifest_generation(&index_root) {
             Ok(manifests) => manifests,
             Err(error) => {
@@ -16360,6 +16371,13 @@ impl FsfsRuntime {
             quality_generation: published_quality,
             input_checkpoint: checkpoint,
         };
+        if retain_legacy_reuse && generation_complete {
+            // Release the Quill writer before hashing the completed artifact
+            // state: releasing its admission record is itself a file change.
+            drop(lexical_index);
+            publication_lease.fence("completed legacy indexing input evidence")?;
+            retained_reuse::retain_legacy_checkpoint(cx, self, &index_root, &payload)?;
+        }
         if emit_user_output {
             payload.emit(
                 self.cli_input.format,
@@ -16513,6 +16531,7 @@ impl FsfsRuntime {
             CliCommand::Index,
             |_| Ok(()),
             false,
+            true,
         ))
         .await?;
 
@@ -45696,7 +45715,13 @@ mod tests {
                     ..CliInput::default()
                 });
                 let payload = runtime
-                    .run_one_shot_index_scaffold_internal(&cx, CliCommand::Index, |_| Ok(()), false)
+                    .run_one_shot_index_scaffold_internal(
+                        &cx,
+                        CliCommand::Index,
+                        |_| Ok(()),
+                        false,
+                        true,
+                    )
                     .await
                     .expect("real publication path with a test-only embedder fault");
                 let sentinel = FsfsRuntime::read_index_sentinel(&index_root)
