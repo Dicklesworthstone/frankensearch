@@ -369,6 +369,19 @@ impl NativeLiveHybridUpdate {
         Ok(self)
     }
 
+    /// Bound successor inference input bytes without holding a selection lock.
+    ///
+    /// This per-update policy has the scope and source-preflight behavior of
+    /// [`NativeIndexUpdate::with_max_batch_input_bytes`]. A rejected oversized
+    /// source cannot produce an installable candidate or change live selection.
+    ///
+    /// # Errors
+    /// Refuses zero without building or installing anything.
+    pub fn with_max_batch_input_bytes(mut self, max_bytes: usize) -> SearchResult<Self> {
+        self.update = self.update.with_max_batch_input_bytes(max_bytes)?;
+        Ok(self)
+    }
+
     /// Override fast precision/retrieval; a precision change re-embeds that tier.
     #[must_use]
     pub fn with_fast_storage(

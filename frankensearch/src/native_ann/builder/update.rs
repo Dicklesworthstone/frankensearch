@@ -130,6 +130,21 @@ impl NativeIndexUpdate {
         Ok(self)
     }
 
+    /// Bound prepared content bytes in each successor inference batch.
+    ///
+    /// This is an explicit per-update setting, not inherited from a completed
+    /// generation. The final source cohort is checked before candidate creation,
+    /// including unchanged survivors; deleted documents are not charged. Actual
+    /// model requests contain only changed inputs eligible for that tier.
+    /// See [`NativeIndexBuilder::with_max_batch_input_bytes`] for exact scope.
+    ///
+    /// # Errors
+    /// Refuses zero before building the successor.
+    pub fn with_max_batch_input_bytes(mut self, max_bytes: usize) -> SearchResult<Self> {
+        self.builder = self.builder.with_max_batch_input_bytes(max_bytes)?;
+        Ok(self)
+    }
+
     /// Override the successor's fast storage or graph policy, not its model.
     /// Changing precision re-embeds all surviving fast documents.
     #[must_use]
