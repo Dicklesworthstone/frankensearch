@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use frankensearch_core::filter::SearchFilter;
+use frankensearch_core::filter::{PredicateFilter, SearchFilter};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use frankensearch_index::{ClassifiedHits, VectorIndex};
 use serde::{Deserialize, Serialize};
@@ -428,6 +428,42 @@ pub(super) fn search_top_k(
     }
 }
 
+/// Exact fast-tier scores for named source documents, each collapsed to its
+/// best live row as [`search_top_k`] does. A source with no live fast row is
+/// absent from the result.
+pub(super) fn score_sources(
+    index: &VectorIndex,
+    query: &[f32],
+    sources: HashSet<String>,
+    mapping: Option<&FastWindowMapping>,
+) -> SearchResult<Vec<VectorHit>> {
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One scan whose budget holds every live row the named sources own (at
+    // most max_windows each; native top-k resolves WAL supersession before
+    // selection). No named row is evicted, so a truncated source is never
+    // mistaken for an absent one.
+    let limit = sources
+        .len()
+        .saturating_mul(mapping.map_or(1, |mapping| mapping.max_windows));
+    let named = PredicateFilter::new("fsfs.fast_windows.named_sources", move |source| {
+        sources.contains(source)
+    });
+    let Some(mapping) = mapping else {
+        return index.search_top_k(query, limit, Some(&named));
+    };
+    let filter = SourceFilter {
+        mapping,
+        inner: Some(&named),
+    };
+    let rows = index.search_top_k(query, limit, Some(&filter))?;
+    Ok(collapse_rows(mapping, rows)?
+        .into_iter()
+        .map(|(hit, _)| hit)
+        .collect())
+}
+
 fn collapse_rows(
     mapping: &FastWindowMapping,
     hits: Vec<VectorHit>,
@@ -467,7 +503,6 @@ fn collapse_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensearch_core::filter::PredicateFilter;
     use frankensearch_core::{Embedder, EmbeddingIdentityBundleV1, ModelCategory, SearchFuture};
     use std::sync::Arc;
 
@@ -646,6 +681,86 @@ mod tests {
         let filtered = search_top_k(&index, &[1.0, 0.0], 2, Some(&none), Some(&mapping)).unwrap();
         assert!(filtered.classified.hits.is_empty());
         assert!(filtered.classified.zero_signal.is_some());
+    }
+
+    #[test]
+    fn score_sources_scores_every_named_source_and_omits_absent_ones() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("named.fsvi");
+        let plan = plan(&"x".repeat(4_000), 3).unwrap();
+        assert_eq!(plan.windows.len(), 3);
+        let mut writer = VectorIndex::create(&path, "test", 2).unwrap();
+        for ordinal in 0..3 {
+            // Every src/b.rs window outranks src/a.rs's best one, so a budget
+            // of one row per named source loses src/a.rs entirely.
+            let a = if ordinal == 2 { 0.4 } else { 0.2 };
+            writer
+                .write_record(&row_id("src/a.rs", ordinal), &[a, 0.0])
+                .unwrap();
+            writer
+                .write_record(&row_id("src/b.rs", ordinal), &[0.5, 0.0])
+                .unwrap();
+            writer
+                .write_record(&row_id("src/unnamed.rs", ordinal), &[1.0, 0.0])
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let index = VectorIndex::open_read_only(&path).unwrap();
+        let mapping = FastWindowMapping::from_plans(
+            3,
+            ["src/a.rs", "src/b.rs", "src/unnamed.rs"]
+                .into_iter()
+                .map(|source| (source, &plan)),
+            &index.live_doc_ids().unwrap(),
+        )
+        .unwrap();
+        let named = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| (*id).to_owned())
+                .collect::<HashSet<_>>()
+        };
+        let scores = |hits: Vec<VectorHit>| {
+            hits.into_iter()
+                .map(|hit| (hit.doc_id.to_string(), (hit.score * 1_000.0).round()))
+                .collect::<Vec<_>>()
+        };
+        let windowed = score_sources(
+            &index,
+            &[1.0, 0.0],
+            named(&["src/a.rs", "src/b.rs", "src/absent.rs"]),
+            Some(&mapping),
+        )
+        .unwrap();
+        assert_eq!(
+            scores(windowed),
+            [("src/b.rs".to_owned(), 500.0), ("src/a.rs".to_owned(), 400.0)]
+        );
+        assert!(
+            score_sources(&index, &[1.0, 0.0], HashSet::new(), Some(&mapping))
+                .unwrap()
+                .is_empty()
+        );
+
+        // A crash between a WAL append and the main-row tombstone leaves both
+        // physical rows live; the named source scores as its WAL replacement.
+        let flat_path = temporary.path().join("flat.fsvi");
+        let mut writer = VectorIndex::create(&flat_path, "test", 2).unwrap();
+        writer.write_record("x.rs", &[1.0, 0.0]).unwrap();
+        writer.write_record("y.rs", &[0.3, 0.0]).unwrap();
+        writer.write_record("z.rs", &[0.9, 0.0]).unwrap();
+        writer.finish().unwrap();
+        let prior_main = std::fs::read(&flat_path).unwrap();
+        let mut writer = VectorIndex::open(&flat_path).unwrap();
+        writer.append("x.rs", &[0.1, 0.0]).unwrap();
+        drop(writer);
+        std::fs::write(&flat_path, prior_main).unwrap();
+        let flat = VectorIndex::open_read_only(&flat_path).unwrap();
+        assert_eq!(flat.wal_record_count(), 1);
+        let flat_scores = score_sources(&flat, &[1.0, 0.0], named(&["x.rs", "y.rs"]), None).unwrap();
+        assert_eq!(
+            scores(flat_scores),
+            [("y.rs".to_owned(), 300.0), ("x.rs".to_owned(), 100.0)]
+        );
     }
 
     struct DeepPassageEmbedder(EmbeddingIdentityBundleV1);

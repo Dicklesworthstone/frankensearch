@@ -506,13 +506,15 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // (0dc3df2f); answers cached by the older search are misses, not replays.
 // v10: a query the planner ran lexical-only or unrefined names why in
 // skip_reason; an older cached answer would replay the silent version.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v10";
+// v11: Refined blends quality-discovered documents with their fast scores.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v11";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
 // v5 / stream v3: the WAL top-k repair (0dc3df2f).
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v5";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v3";
+// v6 / stream v4: fast scores for quality-discovered Refined documents.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v6";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v4";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -11437,6 +11439,7 @@ impl FsfsRuntime {
         }
 
         let mut winning_windows = HashMap::new();
+        let mut fast_query_embedding = None;
         let semantic_candidates = if plan.semantic_stage.enabled && semantic_decision.run_semantic {
             if let (Some(index), Some(embedder)) = (
                 resources.vector_index.as_ref(),
@@ -11449,7 +11452,7 @@ impl FsfsRuntime {
                         // indistinguishable from "no relevant documents".
                         // Availability failures surface as operator advice;
                         // benign reasons stay debug-level.
-                        match semantic_windows::search_top_k(
+                        let windowed = semantic_windows::search_top_k(
                             index,
                             &query_embedding,
                             semantic_budget,
@@ -11457,7 +11460,9 @@ impl FsfsRuntime {
                                 .as_ref()
                                 .map(|filter| filter as &dyn SearchFilter),
                             resources.fast_window_mapping.as_ref(),
-                        ) {
+                        );
+                        fast_query_embedding = Some(query_embedding);
+                        match windowed {
                             Ok(windowed) => {
                                 winning_windows = windowed.winning_windows;
                                 let classified = windowed.classified;
@@ -11650,8 +11655,15 @@ impl FsfsRuntime {
                     return Err(error);
                 }
                 Ok(Some(quality_candidates)) => {
+                    let fast_candidates = Self::complete_fast_candidates(
+                        cx,
+                        resources,
+                        fast_query_embedding.as_deref(),
+                        &semantic_candidates,
+                        &quality_candidates,
+                    )?;
                     let (blended_candidates, mut blend_hits) =
-                        self.blend_semantic_candidates(&semantic_candidates, &quality_candidates);
+                        self.blend_semantic_candidates(&fast_candidates, &quality_candidates);
                     let refined_budget = lexical_head_candidates
                         .len()
                         .saturating_add(blended_candidates.len())
@@ -19229,15 +19241,9 @@ impl FsfsRuntime {
             }
             if !fast_ids.is_empty() {
                 Self::semantic_retry_checkpoint(&work_cx, "fsfs.quality.score_fast_candidates")?;
-                // A crash can leave both an old main row and its lower-scored
-                // WAL replacement live. Native top-k resolves supersession
-                // after heap selection, so reserve room for both physical
-                // rows of these exact IDs before that resolution.
-                let matching_wal_count = index
-                    .wal_records()
-                    .filter(|(id, _)| fast_ids.contains(*id))
-                    .count();
-                let missing_limit = fast_ids.len().saturating_add(matching_wal_count);
+                // Native top-k resolves WAL supersession before selection
+                // (0dc3df2f), so one slot per exact ID holds every live row.
+                let missing_limit = fast_ids.len();
                 let missing_fast =
                     PredicateFilter::new("fsfs.quality.fast_candidates", move |id| {
                         fast_ids.contains(id)
@@ -19262,6 +19268,50 @@ impl FsfsRuntime {
                 .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
                 .collect(),
         ))
+    }
+
+    /// The mirror of the fast-candidate completion in [`Self::quality_candidates`]:
+    /// a quality-discovered ID that the bounded fast head truncated still has a
+    /// live fast score. Without it the blend's single-source rule ranks that ID
+    /// on quality alone at every weight, above fast candidates it trails. Only
+    /// an ID with no live fast row keeps that rule.
+    fn complete_fast_candidates(
+        cx: &Cx,
+        resources: &SearchExecutionResources,
+        query_embedding: Option<&[f32]>,
+        fast_candidates: &[SemanticCandidate],
+        quality_candidates: &[SemanticCandidate],
+    ) -> SearchResult<Vec<SemanticCandidate>> {
+        let mut completed = fast_candidates.to_vec();
+        let (Some(index), Some(query_embedding)) =
+            (resources.vector_index.as_ref(), query_embedding)
+        else {
+            return Ok(completed);
+        };
+        let fast_ids = fast_candidates
+            .iter()
+            .map(|candidate| candidate.doc_id.as_str())
+            .collect::<HashSet<_>>();
+        let discovered = quality_candidates
+            .iter()
+            .filter(|candidate| !fast_ids.contains(candidate.doc_id.as_str()))
+            .map(|candidate| candidate.doc_id.clone())
+            .collect::<HashSet<_>>();
+        if discovered.is_empty() {
+            return Ok(completed);
+        }
+        Self::semantic_retry_checkpoint(cx, "fsfs.refined.score_quality_discoveries")?;
+        completed.extend(
+            semantic_windows::score_sources(
+                index,
+                query_embedding,
+                discovered,
+                resources.fast_window_mapping.as_ref(),
+            )?
+            .into_iter()
+            .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score)),
+        );
+        Ok(completed)
     }
 
     async fn maybe_prepare_quality_embedder(
@@ -27952,6 +28002,11 @@ mod tests {
             super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v5".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that blends quality discoveries without fast scores cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v4".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -28620,8 +28675,13 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-        // v2 predates the WAL top-k repair; v1 an older ranking policy.
-        for version in ["fsfs.search.serve.stream.v2", "fsfs.search.serve.stream.v1"] {
+        // v3 blends quality discoveries without fast scores; v2 predates the
+        // WAL top-k repair; v1 an older ranking policy.
+        for version in [
+            "fsfs.search.serve.stream.v3",
+            "fsfs.search.serve.stream.v2",
+            "fsfs.search.serve.stream.v1",
+        ] {
             let mut outdated = header();
             if let SearchServeFrame::Attested { schema_version, .. } = &mut outdated {
                 version.clone_into(schema_version);
@@ -38262,6 +38322,86 @@ mod tests {
         });
     }
 
+    /// A quality-discovered document the bounded fast head truncated still has
+    /// a fast score, and the blend must use it. At quality weight 0 Refined
+    /// keeps the fast order instead of ranking that document on its quality
+    /// score alone; at weight 1 the quality winner still surfaces.
+    #[test]
+    fn refined_blend_scores_quality_discoveries_on_the_fast_tier() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().expect("fast completion fixture");
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let write = |name: &str, embedder: &str, near: [f32; 2], target: [f32; 2]| {
+                let path = temp.path().join(name);
+                let mut writer = VectorIndex::create(&path, embedder, 2).unwrap();
+                for position in 0..200_u16 {
+                    let vector = [near[0] - f32::from(position) / 1_000.0, near[1]];
+                    writer
+                        .write_record(&format!("near-{position:03}.rs"), &vector)
+                        .unwrap();
+                }
+                // Sorts before every near-* ID: a single-source score tied at
+                // the normalized maximum would rank it first.
+                writer.write_record("a-target.rs", &target).unwrap();
+                writer.finish().unwrap();
+                VectorIndex::open_read_only(&path).unwrap()
+            };
+            resources.vector_index = Some(write(
+                "completion-fast.fsvi",
+                "blend-fast-2",
+                [0.9, 0.0],
+                [0.1, 0.0],
+            ));
+            resources.quality_vector_index = Some(Arc::new(write(
+                "completion-quality.fsvi",
+                "blend-quality-2",
+                [0.0, 1.0],
+                [1.0, 0.0],
+            )));
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let flags = SearchExecutionFlags {
+                include_snippets: false,
+                persist_explain_session: false,
+            };
+            for (weight, winner) in [(0.0, "near-000.rs"), (1.0, "a-target.rs")] {
+                let mut config = FsfsConfig::default();
+                config.search.quality_weight = weight;
+                config.search.quality_timeout_ms = 5_000;
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    index_dir: Some(temp.path().to_path_buf()),
+                    ..CliInput::default()
+                });
+                let phases = runtime
+                    .execute_search_payloads_with_mode_using_resources(
+                        &cx,
+                        "how do semantic policies affect ranking",
+                        1,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                        flags,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(phases[0].hits[0].path, "near-000.rs");
+                let refined = phases.last().unwrap();
+                assert_eq!(refined.phase, SearchOutputPhase::Refined);
+                assert_eq!(refined.hits[0].path, winner, "quality_weight={weight}");
+                let blend = refined
+                    .semantic_blend
+                    .as_ref()
+                    .unwrap()
+                    .hits
+                    .iter()
+                    .find(|hit| hit.path == winner)
+                    .unwrap();
+                let fast_raw = blend.fast.as_ref().unwrap().raw_score.unwrap();
+                let expected = if winner == "a-target.rs" { 0.1 } else { 0.9 };
+                assert!((fast_raw - expected).abs() < 1e-3, "{winner}: {fast_raw}");
+            }
+        });
+    }
+
     #[test]
     fn runtime_search_payload_rejects_invalid_filter_key() {
         run_test_with_cx(|cx| async move {
@@ -45938,6 +46078,8 @@ mod tests {
                 "fsfs.search.cache.v8",
                 // Written before planner downgrades named their skip_reason.
                 "fsfs.search.cache.v9",
+                // Blended quality discoveries without their fast scores.
+                "fsfs.search.cache.v10",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

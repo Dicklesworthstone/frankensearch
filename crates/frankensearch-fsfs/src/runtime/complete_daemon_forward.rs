@@ -34,7 +34,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // generation identity match. The progressive request shares this version.
 // 3: the WAL top-k repair (0dc3df2f).
 // 4: request-scoped, retained-reader inline explanations.
-const VERSION: u32 = 4;
+// 5: fast scores for quality-discovered Refined documents.
+const VERSION: u32 = 5;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -526,8 +527,9 @@ mod tests {
             assert!(decode_request(&serde_json::to_vec(&value_map).unwrap()).is_err());
         }
         let mut value = serde_json::to_value(&request).unwrap();
-        // Earlier versions cannot acknowledge request-scoped explanations.
-        for unsupported in [1, 2, 3, VERSION + 1] {
+        // Earlier versions cannot acknowledge request-scoped explanations,
+        // and 4 ranks quality-discovered documents without fast scores.
+        for unsupported in [1, 2, 3, 4, VERSION + 1] {
             value["fsfs_complete_cli"] = serde_json::json!(unsupported);
             assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
         }

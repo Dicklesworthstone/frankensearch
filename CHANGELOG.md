@@ -243,6 +243,21 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **Refined results score every semantic candidate on both tiers.** A
+  document the quality tier found but the bounded fast head had cut was
+  blended on its quality score alone, as if it had no fast vector, so it
+  outranked fast candidates it trailed at every `search.quality_weight`,
+  even 0. Refined now looks up its fast score (the best window when
+  `indexing.fast_window_max_per_file` > 1). Only a document with no fast
+  vector at all keeps the single-tier score. On BEIR, Refined nDCG@10 rose
+  in all six dataset × window runs (+0.006 to +0.012; significant on
+  ArguAna, +0.0077 and +0.0093, and on NFCorpus with windows, +0.0085).
+  With the fix, fast windows no longer lower Refined on NFCorpus or
+  ArguAna. Initial results do not change. The answer cache moves to
+  `fsfs.search.cache.v11`, the daemon protocols to `fsfs.search.serve.v6`
+  and `fsfs.search.serve.stream.v4`, and complete-generation forwarding to
+  version 5.
+
 - **`(a OR b) AND c` no longer loses matches on merged segments.** A
   disjunction under a conjunction returned a strict subset of the right
   answer once a segment had been built by `concat_merge`, which cass's staged
