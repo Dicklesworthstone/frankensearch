@@ -18788,8 +18788,33 @@ impl FsfsRuntime {
                 (Some(observer), Some(sampler))
             });
 
-        let should_open_vector =
-            !matches!(resource_mode, SearchExecutionMode::LexicalOnly) || lexical_index.is_none();
+        // A daemon keeps both tiers warm, including when a lexical request
+        // triggers a generation rebind. A finished lexical generation may
+        // still have deferred semantic rows, so do not try to admit its
+        // incomplete window mapping merely to serve explicit lexical work.
+        // Semantic requests retain their admission fence before cache lookup;
+        // the next completed generation rebinds all resources normally.
+        let semantic_generation_ready = if matches!(
+            admission_mode,
+            SearchExecutionMode::LexicalOnly
+        ) && lexical_index.is_some()
+        {
+            match Self::validate_search_generation_at_root(index_root, SearchExecutionMode::Full) {
+                Ok(()) => true,
+                Err(SearchError::InvalidConfig { field, value, .. })
+                    if field == "semantic.index_generation"
+                        && matches!(value.as_str(), "incomplete" | "deferred_rows") =>
+                {
+                    false
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            true
+        };
+        let should_open_vector = semantic_generation_ready
+            && (!matches!(resource_mode, SearchExecutionMode::LexicalOnly)
+                || lexical_index.is_none());
         let degradation_advice = Vec::new();
         let vector_index = if should_open_vector && vector_path.exists() {
             Some(

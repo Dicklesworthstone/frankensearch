@@ -806,4 +806,249 @@ mod tests {
             assert_eq!(filtered[0].payload.hits[0].path, "distractor.md");
         });
     }
+
+    #[test]
+    fn fast_window_daemon_rebind_serves_deferred_lexical_and_recovers_semantic_windows() {
+        use super::super::{FsfsRuntime, SearchExecutionMode};
+        use crate::{CliCommand, CliInput, FsfsConfig};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let root = temporary.path().join("windowed");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(
+                source.join("deep.md"),
+                format!(
+                    "{}{}",
+                    "prologue background ".repeat(600),
+                    "orbitalshield ".repeat(160),
+                ),
+            )
+            .unwrap();
+            std::fs::write(source.join("distractor.md"), "planetarium backdrop").unwrap();
+            let _restore = RestoreFast(super::super::test_fast_embedder_override());
+            super::super::set_test_fast_embedder(Some(Arc::new(DeepPassageEmbedder(
+                EmbeddingIdentityBundleV1::explicit_test_model("deep-passage-test", 2),
+            ))));
+            let mut config = FsfsConfig::default();
+            config.indexing.offline = true;
+            config.indexing.quality_model.clear();
+            config.indexing.fast_window_max_per_file = 4;
+            config.search.fast_only = true;
+            config.search.rerank = false;
+            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(source),
+                index_dir: Some(root.clone()),
+                quiet: true,
+                ..CliInput::default()
+            });
+            runtime
+                .run_one_shot_index_scaffold_internal(
+                    &cx,
+                    CliCommand::Index,
+                    |_| Ok(()),
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+            let request = |query: &str, mode: &str| {
+                FsfsRuntime::parse_search_serve_request(
+                    &serde_json::json!({
+                        "query": query, "limit": 2, "mode": mode,
+                    })
+                    .to_string(),
+                )
+                .unwrap()
+            };
+            let mut resources = runtime.prepare_search_serve_resources(&cx).await.unwrap();
+            assert_eq!(
+                resources
+                    .fast_window_mapping
+                    .as_ref()
+                    .unwrap()
+                    .source_count(),
+                2
+            );
+            let mut hot_cache = HashMap::new();
+            let healthy = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("thermal safety", "fast_only"),
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(healthy.payloads[0].hits[0].path, "deep.md");
+            let full_key = runtime
+                .search_cache_key("thermal safety", 2, SearchExecutionMode::Full)
+                .unwrap();
+            let fast_key = runtime
+                .search_cache_key("thermal safety", 2, SearchExecutionMode::FastOnly)
+                .unwrap();
+            assert!(hot_cache.contains_key(&fast_key));
+            let healthy_fingerprint = resources.generation_fingerprint.clone();
+
+            // Model work may be incomplete while its lexical publication is
+            // durable. Remove a required window so strict mapping admission
+            // really fails; changing the completion bit alone is insufficient.
+            let mut sentinel = FsfsRuntime::read_index_sentinel(&root).unwrap().unwrap();
+            sentinel.generation_complete = false;
+            runtime.write_index_sentinel(&root, &sentinel).unwrap();
+            let missing_row = row_id("deep.md", 3);
+            let vector_path = root.join(super::super::FSFS_VECTOR_INDEX_FILE);
+            let vector_wal = frankensearch_index::wal::wal_path_for(&vector_path);
+            let deferred_path = temporary.path().join("deferred.fsvi");
+            let deferred_wal = frankensearch_index::wal::wal_path_for(&deferred_path);
+            std::fs::copy(&vector_path, &deferred_path).unwrap();
+            if vector_wal.exists() {
+                std::fs::copy(&vector_wal, &deferred_wal).unwrap();
+            }
+            let replacement = {
+                // The warm daemon retains a shared mapping lock on its old
+                // inode. Publish a separate replacement, as a generation
+                // transition must, rather than trying to mutate that reader.
+                let mut index = VectorIndex::open(&deferred_path).unwrap();
+                let ordinal = (0..index.record_count())
+                    .find(|ordinal| index.doc_id_at(*ordinal).unwrap() == missing_row)
+                    .unwrap();
+                let vector = index.vector_at_f32(ordinal).unwrap();
+                assert!(index.soft_delete(&missing_row).unwrap());
+                index.compact().unwrap();
+                assert!(load_mapping(&root, &index).is_err());
+                vector
+            };
+            std::fs::rename(&deferred_path, &vector_path).unwrap();
+            if deferred_wal.exists() {
+                std::fs::rename(&deferred_wal, &vector_wal).unwrap();
+            }
+            assert!(
+                resources
+                    .vector_index
+                    .as_ref()
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap()
+                    .contains(&missing_row)
+            );
+            let lexical = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("orbitalshield", "lexical_only"),
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(!lexical.cached);
+            assert_eq!(lexical.payloads[0].hits[0].path, "deep.md");
+            assert!(resources.vector_index.is_none());
+            assert!(resources.fast_window_mapping.is_none());
+            assert!(resources.quality_vector_index.is_none());
+            assert_ne!(resources.generation_fingerprint, healthy_fingerprint);
+            assert!(!hot_cache.contains_key(&fast_key));
+            let deferred_fingerprint = resources.generation_fingerprint.clone();
+
+            // A stale hot entry must never bypass explicit semantic readiness.
+            hot_cache.insert(full_key.clone(), healthy.payloads.clone());
+            hot_cache.insert(fast_key.clone(), healthy.payloads);
+            for mode in ["full", "fast_only"] {
+                let error = runtime
+                    .execute_search_serve_request(
+                        &cx,
+                        request("thermal safety", mode),
+                        &mut resources,
+                        &mut hot_cache,
+                        true,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, value, .. }
+                    if field == "semantic.index_generation"
+                        && matches!(value.as_str(), "incomplete" | "deferred_rows"))
+                );
+            }
+            let mut fresh = runtime.prepare_search_serve_resources(&cx).await.unwrap();
+            assert!(fresh.vector_index.is_none());
+            assert!(fresh.fast_window_mapping.is_none());
+            let fresh_lexical = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("orbitalshield", "lexical_only"),
+                    &mut fresh,
+                    &mut HashMap::new(),
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(fresh_lexical.payloads[0].hits[0].path, "deep.md");
+
+            let repaired_path = temporary.path().join("repaired.fsvi");
+            let repaired_wal = frankensearch_index::wal::wal_path_for(&repaired_path);
+            std::fs::copy(&vector_path, &repaired_path).unwrap();
+            if vector_wal.exists() {
+                std::fs::copy(&vector_wal, &repaired_wal).unwrap();
+            }
+            {
+                let mut index = VectorIndex::open(&repaired_path).unwrap();
+                index.append(&missing_row, &replacement).unwrap();
+                index.compact().unwrap();
+            }
+            std::fs::rename(&repaired_path, &vector_path).unwrap();
+            if repaired_wal.exists() {
+                std::fs::rename(&repaired_wal, &vector_wal).unwrap();
+            }
+            sentinel.generation_complete = true;
+            runtime.write_index_sentinel(&root, &sentinel).unwrap();
+            let recovered_lexical = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("orbitalshield", "lexical_only"),
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(!recovered_lexical.cached);
+            assert_ne!(resources.generation_fingerprint, deferred_fingerprint);
+            assert!(resources.vector_index.is_some());
+            assert_eq!(
+                resources
+                    .fast_window_mapping
+                    .as_ref()
+                    .unwrap()
+                    .source_count(),
+                2
+            );
+            assert!(!hot_cache.contains_key(&full_key));
+            assert!(!hot_cache.contains_key(&fast_key));
+            let recovered = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("thermal safety", "full"),
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(!recovered.cached);
+            assert_eq!(recovered.payloads[0].hits[0].path, "deep.md");
+            assert!(
+                recovered.payloads[0].hits[0]
+                    .snippet
+                    .as_deref()
+                    .unwrap()
+                    .contains("orbitalshield")
+            );
+        });
+    }
 }
