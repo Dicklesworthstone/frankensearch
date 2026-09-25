@@ -24,7 +24,10 @@ pub const QUERY_PLAN_METAMORPHIC_CONTRACT_KIND: &str = "fsfs_query_plan_metamorp
 pub const QUERY_PLAN_METAMORPHIC_REPORT_KIND: &str = "fsfs_query_plan_metamorphic_report";
 pub const QUERY_PLAN_METAMORPHIC_FAILURE_KIND: &str = "fsfs_query_plan_metamorphic_failure";
 
-const MAX_QUERY_CHARS: usize = 4_096;
+/// Longest query the planner accepts. fsfs search cuts longer text to this
+/// before planning (`FsfsRuntime::normalize_search_query`), so a pasted
+/// passage still runs every retrieval stage on its first 4,096 characters.
+pub(crate) const MAX_QUERY_CHARS: usize = 4_096;
 
 /// fsfs intent categories for routing retrieval behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

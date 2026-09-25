@@ -9583,13 +9583,25 @@ impl FsfsRuntime {
     }
 
     #[must_use]
+    /// The one normalization behind search, its cache key, explain and daemon
+    /// replies. Control characters (a mis-decoded dash, a stray escape) become
+    /// spaces and text past the planner's limit is cut: the planner would
+    /// otherwise run either query lexical-only. On the 7 such BEIR `ArguAna`
+    /// queries this raised nDCG@10 from 0.393 to 0.524 (bd-d7jut).
     fn normalize_search_query(query: &str) -> String {
-        query
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim()
-            .to_owned()
+        let cleaned = query
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect::<String>();
+        let mut normalized = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some((cut, _)) = normalized
+            .char_indices()
+            .nth(crate::query_planning::MAX_QUERY_CHARS)
+        {
+            normalized.truncate(cut);
+            normalized.truncate(normalized.trim_end().len());
+        }
+        normalized
     }
 
     /// Config validation admits [0, 1]; this one conversion defines the
@@ -10175,16 +10187,13 @@ impl FsfsRuntime {
     }
 
     /// Why the planner ran a query differently from the requested mode: a
-    /// query over the length limit or holding control characters runs
-    /// lexical-only, and a low-confidence one skips refinement. Without this
-    /// the caller received an ordinary-looking Initial phase and nothing more.
-    fn planner_downgrade_skip_reason(intent: &QueryIntentDecision) -> Option<&'static str> {
+    /// low-confidence query skips refinement, and a malformed one would run
+    /// lexical-only (`normalize_search_query` cleans and cuts queries so fsfs
+    /// never plans one). Without this the caller received an
+    /// ordinary-looking Initial phase and nothing more.
+    const fn planner_downgrade_skip_reason(intent: &QueryIntentDecision) -> Option<&'static str> {
         match intent.fallback {
-            QueryFallbackPath::MalformedLexicalOnly => Some(match intent.reason_code {
-                "query.intent.malformed.too_long" => "query_too_long",
-                "query.intent.malformed.control_chars" => "query_control_characters",
-                _ => "query_malformed",
-            }),
+            QueryFallbackPath::MalformedLexicalOnly => Some("query_malformed"),
             QueryFallbackPath::LowConfidenceLexicalBias => Some("query_low_confidence"),
             QueryFallbackPath::None | QueryFallbackPath::EmptyQuery => None,
         }
@@ -27122,6 +27131,66 @@ mod tests {
     }
 
     #[test]
+    fn long_and_control_character_queries_run_every_stage_on_cleaned_text() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let mut cache = std::collections::HashMap::new();
+            let long = "network ".repeat(700);
+            for (query, expected_query) in [
+                (
+                    "recover failed \u{97}network\u{7}requests".to_owned(),
+                    "recover failed network requests".to_owned(),
+                ),
+                (
+                    long.clone(),
+                    long[..crate::query_planning::MAX_QUERY_CHARS]
+                        .trim_end()
+                        .to_owned(),
+                ),
+            ] {
+                let response = runtime
+                    .execute_search_serve_request(
+                        &cx,
+                        SearchServeRequest {
+                            query,
+                            limit: Some(10),
+                            mode: Some("full".to_owned()),
+                            filter: None,
+                            rerank: None,
+                            quality_weight: None,
+                            quality_timeout_ms: None,
+                            rrf_k: None,
+                            fast_only: None,
+                        },
+                        &mut resources,
+                        &mut cache,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                let phases = response
+                    .payloads
+                    .iter()
+                    .map(|payload| payload.phase)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    phases,
+                    [SearchOutputPhase::Initial, SearchOutputPhase::Refined]
+                );
+                assert_eq!(response.payloads[0].skip_reason, None);
+                assert_eq!(response.payloads[0].query, expected_query);
+            }
+        });
+    }
+
+    #[test]
     fn planner_downgrades_are_named_on_the_initial_phase() {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
@@ -27161,14 +27230,7 @@ mod tests {
             );
             assert_eq!(ordinary.payloads[0].skip_reason, None);
 
-            for (query, reason) in [
-                ("network ".repeat(700), "query_too_long"),
-                (
-                    "recover failed \u{97}network requests".to_owned(),
-                    "query_control_characters",
-                ),
-                ("???".to_owned(), "query_low_confidence"),
-            ] {
+            for (query, reason) in [("???".to_owned(), "query_low_confidence")] {
                 let response = runtime
                     .execute_search_serve_request(
                         &cx,

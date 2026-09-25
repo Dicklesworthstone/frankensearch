@@ -280,17 +280,19 @@ qualified; individual results below are narrower than release acceptance.
   two runs, p90 64.6 -> 27.3 ms; the A/A null moved 1.5 and 0.01 ms
   (bd-fwa96).
 
-- **A query that runs lexical-only says so.** The planner runs a query over
-  4,096 characters, or one holding a control character, lexical-only and
-  without refinement, and a low-signal one without refinement. The answer
-  looked like an ordinary Initial phase (`mode` still `full`), so a caller
-  pasting a long passage, or text with one stray C1 character, could not
-  tell it had lost semantic search. The Initial phase now carries
-  `skip_reason` `query_too_long`, `query_control_characters` or
-  `query_low_confidence`. On BEIR ArguAna this is 7 of 1,406 queries (six
-  over the length limit, one with a mis-decoded U+0097). The answer cache
-  moves to `fsfs.search.cache.v10` so an older silent answer is not
-  replayed (bd-d0dil).
+- **Long queries and queries with a stray control character get the full
+  search.** The planner ran a query over 4,096 characters, or one holding
+  any control character, lexical-only and without refinement, and said
+  nothing: the answer looked like an ordinary Initial phase with `mode`
+  still `full`. fsfs now reads control characters as spaces and cuts a
+  query to its first 4,096 characters before planning (the payload's
+  `query` shows what ran), so a pasted passage or text with one mis-decoded
+  C1 character goes through every stage. On the 7 of 1,406 BEIR ArguAna
+  queries this affected, nDCG@10 went from 0.393 to 0.524 (none lower). A
+  low-signal query that skips refinement now says so with `skip_reason`
+  `query_low_confidence`, and the answer cache moves to
+  `fsfs.search.cache.v10` so an older answer is not replayed (bd-d0dil,
+  bd-d7jut).
 
 - **`fsfs config set` works on an existing config file.** It read the file as
   a single TOML value rather than a document, so any table header failed to
