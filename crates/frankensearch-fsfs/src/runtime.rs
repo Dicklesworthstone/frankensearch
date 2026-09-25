@@ -2445,6 +2445,14 @@ struct ExplainSession {
     rerank_model: Option<String>,
 }
 
+/// One returned hit's `search --explain` output: the `ranking` JSON carries
+/// and the block the table prints (what `fsfs explain` shows for it).
+struct ExplainedSearchHit {
+    path: String,
+    ranking: RankingExplanation,
+    table: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct ExplainSessionHit {
     result_id: String,
@@ -6446,6 +6454,26 @@ impl FsfsRuntime {
             .overrides
             .limit
             .unwrap_or(self.config.search.default_limit);
+        if self.config.search.explain {
+            let unsupported = if self.cli_input.stream {
+                Some("--stream")
+            } else if self.cli_input.compact {
+                Some("--compact")
+            } else if self.cli_input.format == OutputFormat::Csv {
+                Some("--format csv")
+            } else {
+                None
+            };
+            if let Some(option) = unsupported {
+                return Err(SearchError::InvalidConfig {
+                    field: "cli.search.explain".to_owned(),
+                    value: option.to_owned(),
+                    reason: format!(
+                        "--explain cannot be combined with {option}; search without it, then run `fsfs explain R<n>` for a hit"
+                    ),
+                });
+            }
+        }
 
         let mut search_runtime = self.clone();
         if let Some(index_override) = self.ensure_search_index_ready(cx).await? {
@@ -6498,7 +6526,7 @@ impl FsfsRuntime {
                 .execute_search_payloads_cached_for_cli(cx, query, limit)
                 .await?
         };
-        let payload = payloads.last().cloned().unwrap_or_else(|| {
+        let mut payload = payloads.last().cloned().unwrap_or_else(|| {
             SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new())
         });
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -6519,6 +6547,17 @@ impl FsfsRuntime {
             elapsed_ms,
             "fsfs search command completed"
         );
+        // `--explain` (bd-7l7si): what `fsfs explain R<n>` prints, for every
+        // returned hit, from the explanation context this search just saved.
+        let (explained, explain_warnings) = if self.config.search.explain {
+            search_runtime.explain_returned_hits(cx, &payload).await
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        payload.explanations = explained
+            .iter()
+            .map(|hit| (hit.path.clone(), hit.ranking.clone()))
+            .collect();
 
         if self.cli_input.format == OutputFormat::Table {
             if let Some(mode_hint) = search_runtime.search_readiness_warning()? {
@@ -6534,11 +6573,18 @@ impl FsfsRuntime {
                 self.cli_input.no_color,
             );
             print!("{table}");
+            for hit in &explained {
+                println!("\n{}", hit.table);
+            }
+            for warning in &explain_warnings {
+                println!("warning[{}]: {}", warning.code, warning.message);
+            }
             return Ok(());
         }
 
         let meta = meta_for_format("search", self.cli_input.format).with_duration_ms(elapsed_ms);
-        let warnings = Self::search_generation_warnings(&payload);
+        let mut warnings = Self::search_generation_warnings(&payload);
+        warnings.extend(explain_warnings);
         let envelope =
             OutputEnvelope::success(payload, meta, iso_timestamp_now()).with_warnings(warnings);
         let stdout = std::io::stdout();
@@ -8683,7 +8729,138 @@ impl FsfsRuntime {
                     session.preview_ids()
                 ),
             })?;
+        let (payload, warnings) = Self::explain_session_hit(cx, session, hit, lexical);
 
+        if self.cli_input.format == OutputFormat::Table {
+            writeln!(
+                writer,
+                "{}",
+                render_explain_table(
+                    result_id,
+                    &payload,
+                    hit,
+                    session.rrf_k,
+                    session.vector_generation_is_hash,
+                    session.vector_generation_id.as_deref(),
+                )
+            )?;
+            for warning in &warnings {
+                writeln!(writer, "warning[{}]: {}", warning.code, warning.message)?;
+            }
+            return writer.flush().map_err(SearchError::Io);
+        }
+
+        let meta = meta_for_format("explain", self.cli_input.format);
+        let envelope =
+            OutputEnvelope::success(payload, meta, iso_timestamp_now()).with_warnings(warnings);
+        emit_envelope(&envelope, self.cli_input.format, writer)?;
+        if self.cli_input.format != OutputFormat::Jsonl {
+            writer
+                .write_all(b"\n")
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.explain",
+                    source: Box::new(source),
+                })?;
+        }
+
+        writer.flush().map_err(SearchError::Io)
+    }
+
+    /// `search --explain`: what `fsfs explain R<n>` prints for every returned
+    /// hit, built from the explanation context this search just saved, plus
+    /// the warnings that qualify them (each code once). The search's answer
+    /// stands when that context is missing; a warning then says why.
+    #[allow(clippy::future_not_send)]
+    async fn explain_returned_hits(
+        &self,
+        cx: &Cx,
+        payload: &SearchPayload,
+    ) -> (Vec<ExplainedSearchHit>, Vec<OutputWarning>) {
+        let unavailable = |reason: String| {
+            (
+                Vec::new(),
+                vec![OutputWarning::new(
+                    OutputWarningCode::EXPLANATION_UNAVAILABLE,
+                    format!("hits returned without explanations: {reason}"),
+                )],
+            )
+        };
+        let index_root = match self.resolve_status_index_root() {
+            Ok(root) => root,
+            Err(error) => return unavailable(error.to_string()),
+        };
+        let session = match Self::load_explain_session_at_root(&index_root) {
+            Ok(Some(session))
+                if Self::normalize_search_query(&session.query)
+                    == Self::normalize_search_query(&payload.query) =>
+            {
+                session
+            }
+            Ok(Some(_)) => {
+                return unavailable(
+                    "the saved explanation context belongs to another search".to_owned(),
+                );
+            }
+            Ok(None) => return unavailable("this search saved no explanation context".to_owned()),
+            Err(error) => return unavailable(error.to_string()),
+        };
+        if session.unavailable == Some(ExplainUnavailableReason::ExpandedQueryFusion) {
+            return unavailable(
+                "a search fused from expanded queries has no per-query explanation evidence"
+                    .to_owned(),
+            );
+        }
+        let lexical = Self::open_explain_lexical_index(cx, &index_root).await;
+        let mut warnings: Vec<OutputWarning> = Vec::new();
+        let mut explained = Vec::new();
+        for hit in &payload.hits {
+            let Some(session_hit) = session.resolve(&hit.path) else {
+                continue;
+            };
+            let (explanation, hit_warnings) =
+                Self::explain_session_hit(cx, &session, session_hit, lexical.as_ref());
+            for warning in hit_warnings {
+                if !warnings.iter().any(|seen| seen.code == warning.code) {
+                    warnings.push(warning);
+                }
+            }
+            let table = render_explain_table(
+                &session_hit.result_id,
+                &explanation,
+                session_hit,
+                session.rrf_k,
+                session.vector_generation_is_hash,
+                session.vector_generation_id.as_deref(),
+            );
+            explained.push(ExplainedSearchHit {
+                path: hit.path.clone(),
+                ranking: explanation.ranking,
+                table,
+            });
+        }
+        if explained.len() < payload.hits.len() {
+            warnings.push(OutputWarning::new(
+                OutputWarningCode::EXPLANATION_UNAVAILABLE,
+                format!(
+                    "{} of {} hits have no saved explanation context",
+                    payload.hits.len() - explained.len(),
+                    payload.hits.len()
+                ),
+            ));
+        }
+        (explained, warnings)
+    }
+
+    /// The explanation `fsfs explain` prints for one hit of a saved search,
+    /// and the warnings that qualify it. `search --explain` attaches the same
+    /// `ranking` to every hit it returns.
+    #[allow(clippy::too_many_lines)]
+    fn explain_session_hit(
+        cx: &Cx,
+        session: &ExplainSession,
+        hit: &ExplainSessionHit,
+        lexical: Result<&QuillSearchIndex, &String>,
+    ) -> (FsfsExplanationPayload, Vec<OutputWarning>) {
         let (lexical_terms, lexical_terms_unavailable) = hit.lexical_score.map_or_else(
             || (Vec::new(), None),
             |searched_score| match lexical.map_err(String::clone).and_then(|index| {
@@ -8842,40 +9019,7 @@ impl FsfsRuntime {
                 },
             ));
         }
-
-        if self.cli_input.format == OutputFormat::Table {
-            writeln!(
-                writer,
-                "{}",
-                render_explain_table(
-                    result_id,
-                    &payload,
-                    hit,
-                    session.rrf_k,
-                    session.vector_generation_is_hash,
-                    session.vector_generation_id.as_deref(),
-                )
-            )?;
-            for warning in &warnings {
-                writeln!(writer, "warning[{}]: {}", warning.code, warning.message)?;
-            }
-            return writer.flush().map_err(SearchError::Io);
-        }
-
-        let meta = meta_for_format("explain", self.cli_input.format);
-        let envelope =
-            OutputEnvelope::success(payload, meta, iso_timestamp_now()).with_warnings(warnings);
-        emit_envelope(&envelope, self.cli_input.format, writer)?;
-        if self.cli_input.format != OutputFormat::Jsonl {
-            writer
-                .write_all(b"\n")
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.explain",
-                    source: Box::new(source),
-                })?;
-        }
-
-        writer.flush().map_err(SearchError::Io)
+        (payload, warnings)
     }
 
     fn explain_session_path(index_root: &Path) -> PathBuf {
@@ -37000,6 +37144,89 @@ mod tests {
             assert!(
                 error.to_string().contains("unsupported filter key"),
                 "unexpected error: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn search_explain_attaches_what_fsfs_explain_prints_for_each_hit() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::write(
+                project.join("src/auth.rs"),
+                "pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+            )
+            .expect("write auth source");
+            fs::write(
+                project.join("README.md"),
+                "Authentication middleware validates incoming bearer tokens.\n",
+            )
+            .expect("write readme");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+            let search = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("authentication middleware".to_owned()),
+                index_dir: Some(project.join(".frankensearch")),
+                ..CliInput::default()
+            });
+            let payload = search
+                .execute_search_payload(&cx, "authentication middleware", 5)
+                .await
+                .expect("search payload");
+            assert!(!payload.hits.is_empty());
+
+            let (explained, warnings) = search.explain_returned_hits(&cx, &payload).await;
+            assert!(
+                warnings
+                    .iter()
+                    .all(|warning| warning.code != OutputWarningCode::EXPLANATION_UNAVAILABLE),
+                "{warnings:?}"
+            );
+            assert_eq!(explained.len(), payload.hits.len());
+            let mut explain = search.clone();
+            explain.cli_input.command = CliCommand::Explain;
+            explain.cli_input.format = OutputFormat::Json;
+            for (index, hit) in payload.hits.iter().enumerate() {
+                explain.cli_input.result_id = Some(format!("R{index}"));
+                let mut output = Vec::new();
+                explain
+                    .run_explain_command_with_writer(&cx, &mut output)
+                    .await
+                    .expect("explain R<n>");
+                let printed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                let attached = explained
+                    .iter()
+                    .find(|explained| explained.path == hit.path)
+                    .expect("hit explained");
+                // Compare as emitted text parsed the same way: `to_value`
+                // would widen the f32 fusion scores that JSON prints short.
+                let attached: serde_json::Value =
+                    serde_json::from_str(&serde_json::to_string(&attached.ranking).unwrap())
+                        .unwrap();
+                assert_eq!(attached, printed["data"]["ranking"], "hit {index}");
+            }
+
+            // Another search's context is not this search's explanation.
+            let mut other = payload.clone();
+            other.query = "some other query".to_owned();
+            let (none, warnings) = search.explain_returned_hits(&cx, &other).await;
+            assert!(none.is_empty());
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.code == OutputWarningCode::EXPLANATION_UNAVAILABLE)
             );
         });
     }

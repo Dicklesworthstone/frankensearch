@@ -78,7 +78,7 @@ from `frankensearch-embed` 0.2.6 to 0.2.7 changes that revision; rebuild with
 - `rrf_k: number` (`>=1.0`)
 - `quality_timeout_ms: int` (`>=50`)
 - `fast_only: bool`
-- `explain: bool`
+- `explain: bool` (`--explain`/`-e`: JSON, JSONL and TOON output carry `explanations`, the ranking `fsfs explain R<n>` prints, per returned hit path; the table prints each hit's explanation after the results; refused with `--stream`, `--compact`, `--format csv` and complete-generation stores)
 - `rerank: bool` (default `false`; `--rerank` / `FRANKENSEARCH_RERANK`. Re-scores the REFINED head with the `ms-marco-minilm-l-6-v2` cross-encoder when that model is verified in the cache; otherwise the search payload's `rerank` block reports `query.stage.rerank.disabled.unavailable` and the fused order stands)
 - `rerank_timeout_ms: int` (`50..120000`, default `300`; `FRANKENSEARCH_RERANK_TIMEOUT_MS`). Deadline for the rerank stage; when it expires the payload reports `query.stage.rerank.timeout` and the fused order stands. The head is up to 30 documents, so abstract-length documents need seconds; the 300 ms default only fits short documents.
 

@@ -280,6 +280,17 @@ qualified; individual results below are narrower than release acceptance.
   two runs, p90 64.6 -> 27.3 ms; the A/A null moved 1.5 and 0.01 ms
   (bd-fwa96).
 
+- **`fsfs search --explain` explains every hit.** The flag (also `-e`,
+  `search.explain`) was parsed and forwarded but read by nothing: output was
+  identical with and without it. It now attaches, per returned hit path,
+  the ranking `fsfs explain R<n>` would print (components, RRF, and the
+  per-term BM25 split) under `explanations` in JSON, JSONL and TOON, and
+  prints each hit's explanation after a table. Direct and daemon-backed
+  searches agree with `fsfs explain` field for field. It is refused, with a
+  pointer to `fsfs explain`, for `--stream`, `--compact`, `--format csv` and
+  complete-generation stores; the rest of the output is unchanged
+  (bd-7l7si).
+
 - **`fsfs search` returns 10 hits unless asked for more.** The default was
   unlimited, and semantic retrieval has no score floor, so any query, even
   gibberish, printed or serialized the whole corpus (521 rows on a

@@ -532,6 +532,14 @@ impl FsfsRuntime {
                 "stream mode requires --format jsonl or --format toon",
             ));
         }
+        if self.config.search.explain {
+            // Ordinary stores attach per-hit explanations (bd-7l7si); a sealed
+            // bundle keeps its context at the store root, not wired here yet.
+            return Err(complete_cli_error(
+                "explain",
+                "--explain is not available for a complete-generation store yet; search without it, then run `fsfs explain R<n>` for a hit",
+            ));
+        }
         let started = Instant::now();
         if self.cli_input.expand {
             return self

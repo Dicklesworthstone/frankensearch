@@ -2062,6 +2062,7 @@ mod tests {
         "fsfs download-models --model <X> --force",
         "fsfs download-models --model <X> --verify",
         "fsfs explain <X>",
+        "fsfs explain R<n>",
         "fsfs help",
         "fsfs update",
         "fsfs update --check",

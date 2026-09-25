@@ -425,6 +425,11 @@ pub struct SearchPayload {
     pub lexical_fallback_tail: BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub quality_timeout: Option<QualityTimeoutPayload>,
+    /// `search --explain`: per returned hit path, the ranking that
+    /// `fsfs explain R<n>` prints for it. Filled only when asked, never
+    /// cached or served.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub explanations: BTreeMap<String, crate::explanation_payload::RankingExplanation>,
 }
 
 /// A quality deadline expires after Initial. Backend shutdown may take longer
@@ -555,6 +560,7 @@ impl SearchPayload {
             lexical_scores: BTreeMap::new(),
             lexical_fallback_tail: BTreeSet::new(),
             quality_timeout: None,
+            explanations: BTreeMap::new(),
         }
     }
 
@@ -721,6 +727,9 @@ impl OutputWarningCode {
     /// so the lexical component has no `terms`; the raw score and RRF
     /// contribution are real.
     pub const BM25_STATS_UNAVAILABLE: &str = "bm25_stats_unavailable";
+    /// `search --explain` returned its hits without explanations because the
+    /// search saved no explanation context for them (the message says why).
+    pub const EXPLANATION_UNAVAILABLE: &str = "explanation_unavailable";
 }
 
 /// All stable warning codes for enumeration.
@@ -734,6 +743,7 @@ pub const ALL_OUTPUT_WARNING_CODES: &[&str] = &[
     OutputWarningCode::SEMANTIC_INDEX_DEFERRED,
     OutputWarningCode::SCHEMA_NEWER,
     OutputWarningCode::BM25_STATS_UNAVAILABLE,
+    OutputWarningCode::EXPLANATION_UNAVAILABLE,
 ];
 
 // ─── Field Optionality ──────────────────────────────────────────────────────
