@@ -72,13 +72,14 @@ pub(in crate::runtime) async fn read_append_documents(
     retained_search_checkpoint(cx)?;
     if let Some(path) = runtime.cli_input.input_file.as_ref() {
         // The operator named this file; a bare I/O error would not say which.
-        let mut file = asupersync::fs::File::open(path)
-            .await
-            .map_err(|error| SearchError::InvalidConfig {
-                field: "cli.append_batch.file".to_owned(),
-                value: path.display().to_string(),
-                reason: format!("cannot open the --file input: {error}"),
-            })?;
+        let mut file =
+            asupersync::fs::File::open(path)
+                .await
+                .map_err(|error| SearchError::InvalidConfig {
+                    field: "cli.append_batch.file".to_owned(),
+                    value: path.display().to_string(),
+                    reason: format!("cannot open the --file input: {error}"),
+                })?;
         read_async(cx, &mut file, INPUT_LIMITS).await
     } else {
         read_sync(cx, &mut io::stdin().lock(), INPUT_LIMITS)
@@ -229,10 +230,13 @@ impl AppendInput {
             )
         })?;
         retained_search_checkpoint(cx)?;
-        if document.id.trim().is_empty() || document.id.len() > usize::from(u16::MAX) {
+        if document.id.trim().is_empty()
+            || document.id.contains('\0')
+            || document.id.len() > usize::from(u16::MAX)
+        {
             return Err(input_error(
                 location(),
-                "document IDs must be nonblank and fit the vector record's 65535-byte limit",
+                "document IDs must be nonblank, contain no reserved NUL byte, and fit the vector record's 65535-byte limit",
             ));
         }
         let previous = self.documents.get(&document.id);
@@ -601,6 +605,13 @@ mod tests {
             }
             let id = "x".repeat(usize::from(u16::MAX) + 1);
             assert!(parse(&cx, &record(&id, "hello"), 1024, INPUT_LIMITS).is_err());
+            for id in ["private\0source", "alpha.md\0fsfs-window-v1:1"] {
+                let error = parse(&cx, &record(id, "hello"), 1, INPUT_LIMITS).unwrap_err();
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "append_batch.input")
+                );
+                assert!(!error.to_string().contains("private"));
+            }
         });
     }
 

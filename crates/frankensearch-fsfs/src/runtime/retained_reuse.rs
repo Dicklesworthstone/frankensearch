@@ -1260,6 +1260,8 @@ mod generation_tests {
             identity: EmbeddingIdentityBundleV1,
             counts: Arc<InferenceCounts>,
             dimension: usize,
+            fail_after_documents: Option<usize>,
+            cancel_on_failure: bool,
         }
 
         impl CountingEmbedder {
@@ -1280,6 +1282,8 @@ mod generation_tests {
                     identity,
                     counts: Arc::default(),
                     dimension,
+                    fail_after_documents: None,
+                    cancel_on_failure: false,
                 }
             }
 
@@ -1303,7 +1307,19 @@ mod generation_tests {
                     if text == "probe" {
                         self.counts.probes.fetch_add(1, Ordering::SeqCst);
                     } else {
-                        self.counts.documents.fetch_add(1, Ordering::SeqCst);
+                        let previous = self.counts.documents.fetch_add(1, Ordering::SeqCst);
+                        if self
+                            .fail_after_documents
+                            .is_some_and(|limit| previous >= limit)
+                        {
+                            if self.cancel_on_failure {
+                                return Err(SearchError::Cancelled {
+                                    phase: "test.fast_window_batch".to_owned(),
+                                    reason: "cancel after one successful passage".to_owned(),
+                                });
+                            }
+                            return Err(std::io::Error::from(ErrorKind::TimedOut).into());
+                        }
                     }
                     Ok(self.vector(text))
                 })
@@ -1363,7 +1379,17 @@ mod generation_tests {
         }
 
         async fn run_counted_legacy(cx: &Cx, parent: &Path, operation: &str) -> serde_json::Value {
+            run_counted_legacy_windows(cx, parent, operation, 1).await
+        }
+
+        async fn run_counted_legacy_windows(
+            cx: &Cx,
+            parent: &Path,
+            operation: &str,
+            max_windows: usize,
+        ) -> serde_json::Value {
             let (mut runtime, source, root) = fixture(parent, 0);
+            runtime.config.indexing.fast_window_max_per_file = max_windows;
             runtime.config.search.fast_only = false;
             runtime.config.search.quality_timeout_ms = 5_000;
             "reuse-quality".clone_into(&mut runtime.config.indexing.quality_model);
@@ -1392,6 +1418,10 @@ mod generation_tests {
                 )
                 .await
                 .unwrap();
+            let serialized_payload = serde_json::to_value(&payload).unwrap();
+            if max_windows == 1 {
+                assert!(serialized_payload.get("fast_window_coverage").is_none());
+            }
             let report = serde_json::json!({
                 "fast_documents": fast.counts.documents.load(Ordering::SeqCst),
                 "quality_documents": quality.counts.documents.load(Ordering::SeqCst),
@@ -1400,8 +1430,14 @@ mod generation_tests {
                 "checkpoint_present": root.join(FSFS_CHECKPOINT_FILE).exists(),
                 "receipt_present": root.join(LEGACY_RECEIPT_FILE).exists(),
                 "indexed_files": payload.generation.indexed_files,
+                "fast_window_coverage": serialized_payload.get("fast_window_coverage"),
+                "fast_rows": frankensearch_index::VectorIndex::open_read_only(
+                    &root.join(super::super::super::FSFS_VECTOR_INDEX_FILE)
+                ).unwrap().live_doc_ids().unwrap().len(),
             });
             assert!(payload.generation.generation_complete);
+            assert_eq!(payload.generation.fast_window_max_per_file, max_windows);
+            let manifests = FsfsRuntime::read_index_manifest(&root).unwrap().unwrap();
             for (relative, producer) in [
                 (super::super::super::FSFS_VECTOR_INDEX_FILE, fast.as_ref()),
                 (
@@ -1412,21 +1448,39 @@ mod generation_tests {
                 let index =
                     frankensearch_index::VectorIndex::open_read_only(&root.join(relative)).unwrap();
                 assert_eq!(index.embedder_revision(), producer.identity.fingerprint());
+                let mut expected_rows = std::collections::BTreeMap::new();
+                for manifest in &manifests {
+                    let text = fs::read_to_string(source.join(&manifest.file_key)).unwrap();
+                    if relative == super::super::super::FSFS_VECTOR_INDEX_FILE {
+                        if let Some(plan) = manifest.fast_windows.as_ref() {
+                            let lexical =
+                                super::super::super::LEXICAL_CANONICALIZER.canonicalize(&text);
+                            for (id, passage) in plan
+                                .row_ids(&manifest.file_key)
+                                .into_iter()
+                                .zip(plan.texts(&lexical).unwrap())
+                            {
+                                expected_rows.insert(id, producer.vector(passage));
+                            }
+                            continue;
+                        }
+                    }
+                    expected_rows.insert(
+                        manifest.file_key.clone(),
+                        producer.vector(&DefaultCanonicalizer::default().canonicalize(&text)),
+                    );
+                }
                 assert_eq!(
-                    index.live_doc_ids().unwrap().len(),
-                    payload.generation.indexed_files
+                    index.live_doc_ids().unwrap(),
+                    expected_rows.keys().cloned().collect()
                 );
                 for row in 0..index.record_count() {
-                    // A file removed from the tree leaves a tombstoned row;
-                    // only live rows must match their current source.
-                    if index.is_deleted(row) {
-                        continue;
+                    if !index.is_deleted(row) {
+                        assert_eq!(
+                            index.vector_at_f32(row).unwrap(),
+                            expected_rows[index.doc_id_at(row).unwrap()],
+                        );
                     }
-                    let text =
-                        fs::read_to_string(source.join(index.doc_id_at(row).unwrap())).unwrap();
-                    let expected =
-                        producer.vector(&DefaultCanonicalizer::default().canonicalize(&text));
-                    assert_eq!(index.vector_at_f32(row).unwrap(), expected);
                 }
             }
             let lexical = FsfsRuntime::resolve_lexical_engine(&root)
@@ -1447,6 +1501,212 @@ mod generation_tests {
                     .all(|hit| source.join(hit.doc_id.as_str()).is_file())
             );
             report
+        }
+
+        #[test]
+        fn fast_window_index_reopens_reuses_and_reconciles_shrunk_and_removed_sources() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, source, root) = fixture(parent.path(), 2);
+                let long = format!(
+                    "sharedtoken {} subterranean irrigation at the far end",
+                    "ordinary introduction ".repeat(600),
+                );
+                fs::write(source.join("doc-0.md"), &long).unwrap();
+                let first = run_counted_legacy_windows(&cx, parent.path(), "index", 4).await;
+                assert_index_calls(&first, 5, 2);
+                assert_eq!(first["fast_rows"], 5);
+                let coverage = &first["fast_window_coverage"];
+                assert_eq!(coverage["source_files"], 2);
+                assert_eq!(coverage["window_rows"], 5);
+                assert_eq!(coverage["capped_files"], 1);
+                assert!(
+                    coverage["covered_characters"].as_u64().unwrap()
+                        < coverage["total_characters"].as_u64().unwrap()
+                );
+                let receipt: LegacyReuseReceipt =
+                    read_json(&cx, &root.join(LEGACY_RECEIPT_FILE)).unwrap();
+                let plan = receipt.receipt.checkpoint.files["doc-0.md"]
+                    .fast_windows
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(plan.windows.len(), 4);
+                let entry = &receipt.receipt.checkpoint.files["doc-0.md"];
+                let manifest = FsfsRuntime::read_matching_manifest_generation(&root)
+                    .unwrap()
+                    .unwrap()
+                    .remove("doc-0.md")
+                    .unwrap();
+                let probe = IndexCandidate {
+                    file_path: source.join("doc-0.md"),
+                    file_key: "doc-0.md".to_owned(),
+                    modified_ms: u64::try_from(entry.revision).unwrap(),
+                    ingestion_class: IngestionClass::FullSemanticLexical,
+                };
+                let mut live = plan.row_ids("doc-0.md").into_iter().collect::<HashSet<_>>();
+                let reuse = |ids: &HashSet<String>| {
+                    checkpoint_entry_reuse(
+                        &receipt.receipt.checkpoint,
+                        entry,
+                        &manifest,
+                        &probe,
+                        &entry.content_hash_hex,
+                        &receipt.receipt.checkpoint.embedder_id,
+                        receipt.receipt.checkpoint.embedder_dimension,
+                        false,
+                        ids,
+                    )
+                };
+                assert_eq!(reuse(&live), CheckpointReuse::Complete);
+                live.remove(&plan.row_ids("doc-0.md")[1]);
+                assert_eq!(reuse(&live), CheckpointReuse::LexicalOnly);
+                let lexical = super::super::super::LEXICAL_CANONICALIZER.canonicalize(&long);
+                assert!(
+                    plan.texts(&lexical)
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .contains("subterranean")
+                );
+                assert_index_calls(
+                    &run_counted_legacy_windows(&cx, parent.path(), "index", 4).await,
+                    0,
+                    0,
+                );
+                fs::write(source.join("doc-0.md"), "sharedtoken short replacement").unwrap();
+                let shrunk = run_counted_legacy_windows(&cx, parent.path(), "index", 4).await;
+                assert_index_calls(&shrunk, 1, 1);
+                assert_eq!(shrunk["fast_rows"], 2);
+                fs::rename(source.join("doc-0.md"), parent.path().join("removed.md")).unwrap();
+                let removed = run_counted_legacy_windows(&cx, parent.path(), "index", 4).await;
+                assert_index_calls(&removed, 0, 0);
+                assert_eq!(removed["fast_rows"], 1);
+                assert_eq!(removed["indexed_files"], 1);
+            });
+        }
+
+        #[test]
+        fn fast_window_policy_changes_rebuild_and_default_restores_exact_prefix_rows() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, source, root) = fixture(parent.path(), 2);
+                fs::write(
+                    source.join("doc-0.md"),
+                    format!(
+                        "sharedtoken ```rust\n{}\n``` deep tail",
+                        "let x = 1;\n".repeat(900)
+                    ),
+                )
+                .unwrap();
+                assert_index_calls(
+                    &run_counted_legacy_windows(&cx, parent.path(), "index", 4).await,
+                    5,
+                    2,
+                );
+                assert_index_calls(
+                    &run_counted_legacy_windows(&cx, parent.path(), "index", 2).await,
+                    3,
+                    2,
+                );
+                let prefix = run_counted_legacy(&cx, parent.path(), "index").await;
+                assert_index_calls(&prefix, 2, 2);
+                assert_eq!(prefix["fast_rows"], 2);
+                assert!(prefix["fast_window_coverage"].is_null());
+                assert!(
+                    FsfsRuntime::read_index_manifest(&root)
+                        .unwrap()
+                        .unwrap()
+                        .iter()
+                        .all(|entry| entry.fast_windows.is_none())
+                );
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 0, 0);
+            });
+        }
+
+        #[test]
+        fn fast_window_later_batch_failure_never_publishes_a_partial_source() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (mut runtime, source, root) = fixture(parent.path(), 1);
+                runtime.config.indexing.fast_window_max_per_file = 4;
+                fs::write(
+                    source.join("doc-0.md"),
+                    format!("sharedtoken {} deep tail", "long introduction ".repeat(500)),
+                )
+                .unwrap();
+                let mut fast = CountingEmbedder::new("reuse-fast", 4, false);
+                fast.fail_after_documents = Some(1);
+                let _restore = RestoreEmbedders::install(
+                    Arc::new(fast),
+                    Arc::new(CountingEmbedder::new("reuse-quality", 6, false)),
+                );
+                let payload = runtime
+                    .run_one_shot_index_scaffold_internal(
+                        &cx,
+                        CliCommand::Index,
+                        |_| Ok(()),
+                        false,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!payload.generation.generation_complete);
+                assert_eq!(payload.semantic_deferred_files, 1);
+                assert_eq!(payload.semantic_indexed_files, 0);
+                assert!(!payload.input_checkpoint.files["doc-0.md"].semantic_indexed);
+                assert!(!root.join(LEGACY_RECEIPT_FILE).exists());
+                let index = frankensearch_index::VectorIndex::open_read_only(
+                    &root.join(super::super::super::FSFS_VECTOR_INDEX_FILE),
+                )
+                .unwrap();
+                assert!(index.live_doc_ids().unwrap().is_empty());
+            });
+        }
+
+        #[test]
+        fn fast_window_cancelled_batch_keeps_checkpoint_incomplete_and_wal_empty() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (mut runtime, source, root) = fixture(parent.path(), 1);
+                runtime.config.indexing.fast_window_max_per_file = 4;
+                fs::write(
+                    source.join("doc-0.md"),
+                    format!("sharedtoken {} deep tail", "long introduction ".repeat(500)),
+                )
+                .unwrap();
+                let mut fast = CountingEmbedder::new("reuse-fast", 4, false);
+                fast.fail_after_documents = Some(1);
+                fast.cancel_on_failure = true;
+                let _restore = RestoreEmbedders::install(
+                    Arc::new(fast),
+                    Arc::new(CountingEmbedder::new("reuse-quality", 6, false)),
+                );
+                let result = runtime
+                    .run_one_shot_index_scaffold_internal(
+                        &cx,
+                        CliCommand::Index,
+                        |_| Ok(()),
+                        false,
+                        true,
+                    )
+                    .await;
+                assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                let checkpoint: IndexingCheckpoint =
+                    read_json(&cx, &root.join(FSFS_CHECKPOINT_FILE)).unwrap();
+                assert!(!checkpoint.artifacts_durable);
+                assert!(
+                    checkpoint
+                        .files
+                        .values()
+                        .all(|entry| !entry.semantic_indexed)
+                );
+                assert!(!root.join(LEGACY_RECEIPT_FILE).exists());
+                let index = frankensearch_index::VectorIndex::open_read_only(
+                    &root.join(super::super::super::FSFS_VECTOR_INDEX_FILE),
+                )
+                .unwrap();
+                assert!(index.live_doc_ids().unwrap().is_empty());
+            });
         }
 
         #[test]

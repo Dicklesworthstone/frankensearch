@@ -439,6 +439,45 @@ surrounding context to the cross-encoder. When Quill holds the document body,
 this also preserves the indexed version after a source edit or deletion and
 uses extracted PDF text. Vector-only indexes use a bounded source-text read.
 
+### Fast semantic windows (unreleased, opt-in)
+
+To index semantic content beyond each file's opening, set the maximum number
+of fast-tier windows in your project `fsfs.toml` or user configuration:
+
+```toml
+[indexing]
+fast_window_max_per_file = 32
+```
+
+Then run `fsfs index` with that configuration. The accepted range is `1..=128`;
+the default `1` preserves the existing prefix behavior. Larger values embed
+bounded 2,000-character passages from the full lexical text, including code
+blocks. Adjacent windows overlap by 200 characters. The cap retains a final
+window at the end of a long file, but capped files can still have gaps in
+semantic coverage. More windows increase fast-tier embedding work and index
+size. The quality tier keeps one bounded prefix per source file.
+
+The index completion JSON includes `fast_window_coverage`: completed source
+and window counts, covered and total canonical characters, and the number of
+capped files. Overlap is counted once. Use these figures to choose a cap for
+your corpus; a completed publication does not imply every character was
+embedded when a file exceeded its window budget.
+
+Search uses the best-scoring fast window for each source before fusion and
+applies path filters to source IDs. A long file cannot consume the entire
+result budget with duplicate window hits. Semantic-only hits receive context
+from the winning indexed passage; keyword-ranked hits keep their lexical
+fragment. Queries use the window layout saved with the index, so the indexing
+setting is not required merely to search it.
+
+Reindexing verifies every window before reusing a source's embeddings and
+retires obsolete rows when a file shrinks or disappears. Complete-generation
+stores support windowed append and deletion through successor publication.
+Legacy mutable watchers refuse a window-enabled configuration or generation
+before starting writes; use complete-generation watching or repeat one-shot
+indexing for those indexes. Keep the window setting when rebuilding or
+watching if you want to retain that indexing policy.
+
 ### Query syntax
 
 The word-matching (BM25) tier matches query words exactly, ignoring case,
@@ -581,6 +620,7 @@ Common environment variables:
 |---|---|---|
 | `FRANKENSEARCH_INDEX_DIR` | Override index/data directory | `~/.local/share/frankensearch` |
 | `FRANKENSEARCH_MODEL_DIR` | Override model location | `~/.cache/frankensearch/models` |
+| `FRANKENSEARCH_INDEXING_FAST_WINDOW_MAX_PER_FILE` | Maximum fast semantic windows per file; `1` keeps prefix indexing, `2..128` enables passages | `32` |
 | `FRANKENSEARCH_RERANK` | Re-score the refined head with the cross-encoder (same as `--rerank`); needs `fsfs download-models ms-marco-minilm-l-6-v2` once | `1` |
 | `FRANKENSEARCH_RERANK_TIMEOUT_MS` | Rerank-stage deadline (`search.rerank_timeout_ms`, default 300). The head is up to 30 documents, so abstract-length documents need about a second; at 300 ms the stage times out and the fused order stands | `1000` |
 | `FRANKENSEARCH_FAST_ONLY` | Disable quality work; follows CLI > environment > config precedence. `false` requires a profile that permits quality | `true` |
