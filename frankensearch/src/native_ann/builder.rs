@@ -303,7 +303,8 @@ impl NativeIndexBuilder {
         if !self.split_failed_batches {
             self.fast.embedder = batch::wrap(self.fast.embedder, self.fast.identity.clone());
             if let Some(quality) = &mut self.quality {
-                quality.embedder = batch::wrap(Arc::clone(&quality.embedder), quality.identity.clone());
+                quality.embedder =
+                    batch::wrap(Arc::clone(&quality.embedder), quality.identity.clone());
             }
             self.split_failed_batches = true;
         }

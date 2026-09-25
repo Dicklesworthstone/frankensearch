@@ -60,12 +60,17 @@ impl SplittingEmbedder {
         self.admit_producer()?;
         // Keep native empty-batch admission/error behavior. There is no split
         // for an empty input and no manufactured successful empty response.
-        let mut pending = vec![0..texts.len()];
+        // A work stack of index ranges, seeded with the whole batch.
+        let mut pending = Vec::new();
+        pending.push(0..texts.len());
         let mut accepted = Vec::with_capacity(texts.len());
         while let Some(range) = pending.pop() {
             checkpoint(cx, "native_ann.builder.before_batch")?;
             self.admit_producer()?;
-            let outcome = self.inner.embed_batch_bound(cx, &texts[range.clone()]).await;
+            let outcome = self
+                .inner
+                .embed_batch_bound(cx, &texts[range.clone()])
+                .await;
             // Cancellation outranks both a provider failure and late success.
             checkpoint(cx, "native_ann.builder.after_batch")?;
             let outcome = match outcome {
