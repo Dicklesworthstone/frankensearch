@@ -73,7 +73,7 @@ from `frankensearch-embed` 0.2.6 to 0.2.7 changes that revision; rebuild with
 
 ## `[search]`
 
-- `default_limit: int` (`1..200`)
+- `default_limit: int` (`1..200`, default `10`; `0` means every hit, as `--limit all` does; the TUI shows up to 500 rows unless `--limit` is given)
 - `quality_weight: number` (`0.0..1.0`)
 - `rrf_k: number` (`>=1.0`)
 - `quality_timeout_ms: int` (`>=50`)

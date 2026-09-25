@@ -280,6 +280,15 @@ qualified; individual results below are narrower than release acceptance.
   two runs, p90 64.6 -> 27.3 ms; the A/A null moved 1.5 and 0.01 ms
   (bd-fwa96).
 
+- **`fsfs search` returns 10 hits unless asked for more.** The default was
+  unlimited, and semantic retrieval has no score floor, so any query, even
+  gibberish, printed or serialized the whole corpus (521 rows on a
+  521-file index; 100,000 on a large one). The default is now 10 for
+  search, serve and the daemon, as the configuration contract's `1..200`
+  range implies; `--limit N`, `--limit all` and `search.default_limit`
+  (`0` = every hit) are unchanged, and the TUI keeps its 500-row list
+  unless `--limit` is given (bd-og3bm).
+
 - **Long queries and queries with a stray control character get the full
   search.** The planner ran a query over 4,096 characters, or one holding
   any control character, lexical-only and without refinement, and said

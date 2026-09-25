@@ -27,6 +27,8 @@ const CONFIG_FAST_ONLY_WARNING_CODE: &str = "config.search.fast_only_with_qualit
 /// Default rerank-stage deadline, the value the planner hard-coded before the
 /// setting existed. Abstract-length documents need seconds (bd-e25eo).
 pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 300;
+/// Hits a search returns without `--limit` / `search.default_limit`.
+pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MIN_RERANK_TIMEOUT_MS: u64 = 50;
 const MAX_RERANK_TIMEOUT_MS: u64 = 120_000;
 
@@ -913,7 +915,10 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            default_limit: usize::MAX,
+            // The contract range is 1..200; `--limit all` or `default_limit = 0`
+            // asks for every hit. Unlimited used to be the default, so a
+            // gibberish query printed the whole corpus (bd-og3bm).
+            default_limit: DEFAULT_SEARCH_LIMIT,
             quality_weight: 0.7,
             rrf_k: 60.0,
             quality_timeout_ms: 500,
@@ -4569,7 +4574,7 @@ mod tests {
         assert_eq!(result.config.discovery.roots, vec![".".to_string()]);
         assert!(!result.config.discovery.follow_symlinks);
         assert_eq!(result.config.storage.index_dir, ".frankensearch");
-        assert_eq!(result.config.search.default_limit, usize::MAX);
+        assert_eq!(result.config.search.default_limit, 10);
     }
 
     #[test]
@@ -5314,7 +5319,7 @@ mod tests {
         let config = super::FsfsConfig::default();
         assert_eq!(config.discovery.roots, vec![".".to_string()]);
         assert_eq!(config.indexing.fast_model, "potion-multilingual-128M");
-        assert_eq!(config.search.default_limit, usize::MAX);
+        assert_eq!(config.search.default_limit, 10);
         assert_eq!(config.pressure.profile, super::PressureProfile::Performance);
         assert_eq!(config.tui.theme, super::TuiTheme::Dark);
         assert_eq!(config.storage.index_dir, ".frankensearch");
@@ -5338,7 +5343,7 @@ mod tests {
     #[test]
     fn search_config_default_values() {
         let cfg = super::SearchConfig::default();
-        assert_eq!(cfg.default_limit, usize::MAX);
+        assert_eq!(cfg.default_limit, 10);
         assert!((cfg.quality_weight - 0.7).abs() < f64::EPSILON);
         assert!((cfg.rrf_k - 60.0).abs() < f64::EPSILON);
         assert_eq!(cfg.quality_timeout_ms, 500);

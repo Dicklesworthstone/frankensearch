@@ -1687,9 +1687,9 @@ mod tests {
 
     #[test]
     fn config_values_spell_an_unlimited_default_limit_as_zero() {
-        let unlimited = frankensearch_fsfs::FsfsConfig::default();
-        assert_eq!(unlimited.search.default_limit, usize::MAX);
-        let values = flatten_config_values(&unlimited).expect("flatten default config");
+        let mut unlimited = frankensearch_fsfs::FsfsConfig::default();
+        unlimited.search.default_limit = usize::MAX;
+        let values = flatten_config_values(&unlimited).expect("flatten unlimited config");
         assert_eq!(values["search.default_limit"], serde_json::Value::from(0));
 
         let mut limited = frankensearch_fsfs::FsfsConfig::default();
@@ -1699,7 +1699,7 @@ mod tests {
     }
 
     #[test]
-    fn config_init_and_reset_emit_reloadable_unlimited_defaults() {
+    fn config_init_and_reset_emit_reloadable_defaults() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fsfs.toml");
         let cli = CliInput {
@@ -1720,7 +1720,7 @@ mod tests {
                 dir.path(),
             )
             .expect("reload generated config");
-            assert_eq!(loaded.config.search.default_limit, usize::MAX);
+            assert_eq!(loaded.config.search.default_limit, 10);
         }
     }
 

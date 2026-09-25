@@ -19584,15 +19584,11 @@ impl FsfsRuntime {
         let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
         let status_payload = self.collect_status_payload()?;
         let mode_hint = self.search_mode_hint()?;
-        let configured_limit = self
-            .cli_input
-            .overrides
-            .limit
-            .unwrap_or(self.config.search.default_limit);
-        let result_limit = if configured_limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
-            FSFS_TUI_INTERACTIVE_RESULT_LIMIT
-        } else {
-            configured_limit.max(1)
+        // The dashboard is a scrolling list: without an explicit --limit it
+        // keeps its interactive row budget rather than the one-shot default.
+        let result_limit = match self.cli_input.overrides.limit {
+            None | Some(FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL) => FSFS_TUI_INTERACTIVE_RESULT_LIMIT,
+            Some(limit) => limit.max(1),
         };
         let mut state =
             SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color);
