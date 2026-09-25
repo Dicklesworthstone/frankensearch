@@ -84,7 +84,11 @@ pub const SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE: &str = "v1;profile=scalar-g1a;id=
 /// Canonical preimage for the CASS hyphen/prefix analyzer protocol.
 pub const CASS_ANALYZER_CONTRACT_PREIMAGE: &str = "v2;tokenizer=cass_hyphen_normalize;token_runs=ascii_alphanumeric_with_interior_hyphens_or_pinned_cjk;hyphen_tokens=compound_and_parts_same_position;cjk_tokens=overlapping_bigrams_or_singleton;normalize=ascii_lowercase;max_token_bytes=inclusive-256;prefix_tokenizer=cass_prefix_normalize_without_hyphen_decomposition;prefix_source_split=unicode_alphanumeric;prefix_edge_ngrams=2..20-unicode-scalars;prefix_cjk=overlapping-bigrams";
 /// Canonical CASS field, parser, filtering, ranking, and pagination protocol.
-pub const CASS_SCHEMA_CONTRACT_PREIMAGE: &str = "v4;profile=cass;schema=frankensearch-cass-semantic-v1;fields=agent:keyword+stored,workspace:keyword+stored,workspace_original:stored,source_path:stored,msg_idx:u64+indexed+stored,created_at:i64+indexed+fast+stored,title:text+positions+stored,content:text+positions,title_prefix:text+basic,content_prefix:text+basic,preview:stored,source_id:keyword+stored,origin_kind:keyword+stored,origin_host:keyword+stored,conversation_id:i64+stored;derived_title_prefix=edge_ngrams(full_title);derived_content_prefix=edge_ngrams(utf8_boundary_prefix_bytes<=4096);derived_preview=first_400_unicode_scalars_plus_ellipsis_if_truncated;document_identity=source_id#msg_idx;query_parser=cass-or-binds-tighter-than-and;blank_query=match_all;bare_terms=exact_raw_or_bounded_edge-prefix;phrases=title_or_content_positions;cjk_phrases=compound-bigram-and;negation=all-plus-must-not;wildcards=exact-prefix-on-four-search-fields,suffix-substring-complex-regex-on-title-content;filters=agents-or,workspaces-or,created_at-inclusive,local=origin_kind:local,remote=origin_kind:ssh,source_id;bm25=tantivy-0.27.0-default-no-field-boosts;pagination=offset_then_limit;counts=exact;snippets=disabled";
+///
+/// v5 (GH #56): both engines parse the cass#52 grammar, so the parser and
+/// negation clauses changed; v4 (OR binds tighter, idempotent negation) is
+/// retained only as the frozen v2..v8 engine-profile hashes.
+pub const CASS_SCHEMA_CONTRACT_PREIMAGE: &str = "v5;profile=cass;schema=frankensearch-cass-semantic-v1;fields=agent:keyword+stored,workspace:keyword+stored,workspace_original:stored,source_path:stored,msg_idx:u64+indexed+stored,created_at:i64+indexed+fast+stored,title:text+positions+stored,content:text+positions,title_prefix:text+basic,content_prefix:text+basic,preview:stored,source_id:keyword+stored,origin_kind:keyword+stored,origin_host:keyword+stored,conversation_id:i64+stored;derived_title_prefix=edge_ngrams(full_title);derived_content_prefix=edge_ngrams(utf8_boundary_prefix_bytes<=4096);derived_preview=first_400_unicode_scalars_plus_ellipsis_if_truncated;document_identity=source_id#msg_idx;query_parser=cass-standard-not-then-and-then-or;groups=parenthesis-opens-at-word-start-closes-only-while-open;blank_query=match_all;bare_terms=exact_raw_or_bounded_edge-prefix;phrases=title_or_content_positions;cjk_phrases=compound-bigram-and;negation=parity-with-all-plus-must-not-complement;wildcards=exact-prefix-on-four-search-fields,suffix-substring-complex-regex-on-title-content;filters=agents-or,workspaces-or,created_at-inclusive,local=origin_kind:local,remote=origin_kind:ssh,source_id;bm25=tantivy-0.27.0-default-no-field-boosts;pagination=offset_then_limit;counts=exact;snippets=disabled";
 /// Default schema/query/ranking protocol implemented by the shipping Tantivy adapter.
 pub const DEFAULT_SCHEMA_CONTRACT_HASH: &str =
     "afe3ad4998181c98ee26de5c47905e3c9e0623e2e144643a02e19ce697b42c0a";
@@ -10435,9 +10439,11 @@ mod tests {
             SemanticContract::scalar_g1a().schema_contract_hash,
             "ed82305678b4145b83bd48dc605bf3e9c65736ba3c74983f2268f0f8dbf11e59"
         );
+        // GOLDEN-CHANGE (GH #56): CASS schema preimage v5 records the cass#52
+        // grammar; v4's 11057d81... remains the frozen v2..v8 profile hash.
         assert_eq!(
             SemanticContract::cass().schema_contract_hash,
-            "11057d81013ddadc6499674acb23a8b6842d589f4344fa88b3e70fa744fc4ee9"
+            "395b987b98bfc6e0505338cec20591f35ead6910a7be243236e09f98b9a9c88f"
         );
     }
 

@@ -254,8 +254,15 @@ qualified; individual results below are narrower than release acceptance.
   group only at the start of a word and a `)` closes one only while a group
   is open, so `foo(bar)` stays one term. Queries both grammars read alike
   keep their exact query tree and scores. The Quill/oracle differential
-  checks mixed precedence, grouping and parity negation again (GH #56,
-  bd-2ax98).
+  checks mixed precedence, grouping and parity negation again. main's
+  `frankensearch-quill` is now 0.3.4 and `frankensearch-lexical` 0.3.2.
+  crates.io already has quill 0.3.2 and 0.3.3 from the hotfix branch, so a
+  release from main cannot return cass to the legacy grammar. Indexes from
+  0.3.1 through 0.3.3 open unchanged. The gauntlet binds the new versions in
+  built-in engine profile v9 and oracle dependency contract v11. The CASS
+  schema contract preimage moves to v5, which records the new parser and
+  negation. Archived v1 to v8 receipts keep their frozen identities
+  (GH #56, bd-2ax98).
 
 - **`IndexBuilder` embeds each `batch_size` group in one call per tier.**
   `with_batch_size` (default 32) only grouped progress reports: every
