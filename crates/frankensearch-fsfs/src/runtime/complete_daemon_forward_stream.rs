@@ -37,8 +37,6 @@ type Frame = StreamFrame<SearchHitPayload>;
 struct StreamRequest {
     fsfs_complete_cli_stream: u32,
     request: ForwardedSearch,
-    #[serde(default)]
-    explain: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -123,7 +121,8 @@ pub(super) async fn serve(
         query_runtime.cli_input.overrides.limit = Some(request.request.search.limit);
         query_runtime.cli_input.overrides.fast_only = Some(query_runtime.config.search.fast_only);
         query_runtime.cli_input.overrides.rerank = Some(query_runtime.config.search.rerank);
-        query_runtime.cli_input.overrides.explain = request.explain;
+        query_runtime.config.search.explain = request.request.search.explain;
+        query_runtime.cli_input.overrides.explain = Some(request.request.search.explain);
         query_runtime
             .run_search_stream_command_with_writer(
                 cx,
@@ -425,7 +424,6 @@ impl FsfsRuntime {
         let request = StreamRequest {
             fsfs_complete_cli_stream: VERSION,
             request: make_request(self, root, query, limit)?,
-            explain: self.cli_input.overrides.explain,
         };
         let mut bytes = serde_json::to_vec(&request).map_err(codec_error)?;
         bytes.push(b'\n');
@@ -550,20 +548,20 @@ mod tests {
     fn streaming_request_is_versioned_nested_and_preserves_filter_and_explain() {
         let mut request = request();
         request.search.filter = Some("path:src".into());
+        request.search.explain = true;
         let wrapper = StreamRequest {
             fsfs_complete_cli_stream: VERSION,
             request,
-            explain: Some(true),
         };
         let bytes = serde_json::to_vec(&wrapper).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(value.get("query").is_none());
         assert!(is_streamed(&bytes));
         let parsed = parse_request(&bytes).unwrap();
-        assert_eq!(parsed.explain, Some(true));
+        assert!(parsed.request.search.explain);
         assert_eq!(parsed.request.search.filter, wrapper.request.search.filter);
-        // 2 predates the WAL top-k repair; 1 an older ranking policy.
-        for version in [1, 2] {
+        // Earlier versions cannot acknowledge request-scoped explanations.
+        for version in [1, 2, 3] {
             let mut stale = value.clone();
             stale["fsfs_complete_cli_stream"] = serde_json::json!(version);
             assert!(parse_request(&serde_json::to_vec(&stale).unwrap()).is_err());
@@ -987,11 +985,15 @@ mod generation_tests {
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
             let selected = store.active(&cx).unwrap();
             let mut session = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+            let mut requesting = runtime.clone();
+            requesting.config.search.explain = true;
             let request = StreamRequest {
                 fsfs_complete_cli_stream: VERSION,
-                request: make_request(&runtime, &root, "sharedtoken", 10).unwrap(),
-                explain: None,
+                request: make_request(&requesting, &root, "sharedtoken", 10).unwrap(),
             };
+            let buffered = super::super::execute(&cx, &runtime, &mut session, &request.request)
+                .await
+                .unwrap();
             let (mut client, mut peer) = UnixStream::pair().unwrap();
             peer.set_nonblocking(true).unwrap();
             client.set_nonblocking(true).unwrap();
@@ -1043,6 +1045,27 @@ mod generation_tests {
                     .count(),
                 1
             );
+            let explanations = frames
+                .iter()
+                .filter_map(|frame| match &frame.event {
+                    StreamEvent::Explain(event) => Some((
+                        event.explanation.ranking.doc_id.clone(),
+                        event.explanation.ranking.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(explanations, buffered.explanations);
+            assert_eq!(explanations.len(), 1);
+            let last_result = frames
+                .iter()
+                .rposition(|frame| matches!(frame.event, StreamEvent::Result(_)))
+                .unwrap();
+            let first_explain = frames
+                .iter()
+                .position(|frame| matches!(frame.event, StreamEvent::Explain(_)))
+                .unwrap();
+            assert!(last_result < first_explain);
             assert!(
                 matches!(&frames.last().unwrap().event, StreamEvent::Terminal(terminal)
                 if terminal.status == StreamTerminalStatus::Completed)

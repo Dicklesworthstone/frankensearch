@@ -468,6 +468,7 @@ recognize the store automatically:
 ```bash
 FSFS_COMPLETE_GENERATIONS=1 fsfs index ~/projects --index-dir ./search-store
 fsfs search "structured concurrency" --index-dir ./search-store --no-daemon
+fsfs search "structured concurrency" --explain --index-dir ./search-store --format json
 fsfs tui --index-dir ./search-store
 fsfs explain 1 --index-dir ./search-store
 fsfs append-batch --file updates.jsonl --index-dir ./search-store
@@ -510,6 +511,11 @@ original query's normal phases are retained.
 Ordinary direct and forwarded searches save explanation context beside the
 store; `explain` refuses context from a different generation or from a multi-query
 fusion whose component explanations are unavailable.
+`search --explain` also attaches per-hit evidence directly to the returned
+ranking in table, JSON, JSONL, and TOON output, including daemon-forwarded
+queries. Complete-generation streams emit explanation frames for the final
+ranking before the terminal frame. The evidence uses the generation retained
+by the query, so another search cannot replace its explanation context.
 Reranking reads the generation's stored document text, so edits or removals in
 the source tree cannot silently change the content scored for retained results.
 

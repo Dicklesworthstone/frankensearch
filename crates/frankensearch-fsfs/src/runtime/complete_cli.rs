@@ -533,12 +533,21 @@ impl FsfsRuntime {
             ));
         }
         if self.config.search.explain {
-            // Ordinary stores attach per-hit explanations (bd-7l7si); a sealed
-            // bundle keeps its context at the store root, not wired here yet.
-            return Err(complete_cli_error(
-                "explain",
-                "--explain is not available for a complete-generation store yet; search without it, then run `fsfs explain R<n>` for a hit",
-            ));
+            let incompatible = if self.cli_input.compact {
+                Some("--compact")
+            } else if self.cli_input.format == OutputFormat::Csv {
+                Some("--format csv")
+            } else {
+                None
+            };
+            if let Some(option) = incompatible {
+                return Err(complete_cli_error(
+                    "explain",
+                    &format!(
+                        "--explain cannot be combined with {option}; use table, JSON, JSONL, or TOON to include ranking explanations",
+                    ),
+                ));
+            }
         }
         let started = Instant::now();
         if self.cli_input.expand {
@@ -589,9 +598,9 @@ impl FsfsRuntime {
                 )
                 .await;
         }
-        let payloads = reader
+        let mut artifacts = reader
             .runtime
-            .execute_search_payloads_with_mode_using_resources(
+            .execute_search_phase_artifacts_with_mode_using_resources(
                 cx,
                 query,
                 limit,
@@ -601,12 +610,16 @@ impl FsfsRuntime {
                     include_snippets: true,
                     persist_explain_session: true,
                 },
+                None,
             )
             .await?;
-        let payload = payloads.last().cloned().ok_or_else(|| {
+        let last = artifacts.last_mut().ok_or_else(|| {
             complete_cli_error("search", "search completed without an Initial phase")
         })?;
-        self.emit_complete_search_payload(payload, started, writer)
+        reader
+            .runtime
+            .attach_complete_search_explanations(cx, last, &reader.resources)?;
+        self.emit_complete_search_payload(last.payload.clone(), started, writer)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -698,22 +711,30 @@ impl FsfsRuntime {
                         "expanded query rankings fused",
                     )),
                 )?;
+                self.emit_search_stream_explanations(&payload, &stream_id, &mut seq, writer)?;
                 retained_search_checkpoint(cx)?;
                 reader
                     .runtime
                     .invalidate_complete_generation_explanation(query)?;
             } else {
-                let last = original
+                let mut last = original
                     .last()
+                    .cloned()
                     .ok_or_else(|| complete_cli_error("search", "search returned no phase"))?;
+                reader.runtime.attach_complete_search_explanations(
+                    cx,
+                    &mut last,
+                    &reader.resources,
+                )?;
                 if last.phase != crate::output_schema::SearchOutputPhase::Initial {
                     self.emit_search_stream_payload(&last.payload, &stream_id, &mut seq, writer)?;
                 }
+                self.emit_search_stream_explanations(&last.payload, &stream_id, &mut seq, writer)?;
                 retained_search_checkpoint(cx)?;
                 reader.runtime.persist_search_artifact_explanation(
                     &reader.resources.index_root,
                     query,
-                    last,
+                    &last,
                 );
             }
             Ok(())
@@ -737,9 +758,9 @@ impl FsfsRuntime {
     ) -> SearchResult<crate::output_schema::SearchPayload> {
         retained_search_checkpoint(cx)?;
         if queries.len() <= 1 {
-            return reader
+            let mut artifacts = reader
                 .runtime
-                .execute_search_payloads_with_mode_using_resources(
+                .execute_search_phase_artifacts_with_mode_using_resources(
                     cx,
                     query,
                     limit,
@@ -749,10 +770,16 @@ impl FsfsRuntime {
                         include_snippets: true,
                         persist_explain_session: reader.runtime.complete_explain_target.is_some(),
                     },
+                    None,
                 )
-                .await?
+                .await?;
+            let mut last = artifacts
                 .pop()
-                .ok_or_else(|| complete_cli_error("search", "search returned no phase"));
+                .ok_or_else(|| complete_cli_error("search", "search returned no phase"))?;
+            reader
+                .runtime
+                .attach_complete_search_explanations(cx, &mut last, &reader.resources)?;
+            return Ok(last.payload);
         }
         let fingerprint = reader.resources.generation_fingerprint.clone();
         let payloads = reader
@@ -775,12 +802,19 @@ impl FsfsRuntime {
             &fingerprint,
             super::SearchExecutionMode::Full,
         )?;
-        Ok(Self::fuse_expanded_payloads(
+        let mut payload = Self::fuse_expanded_payloads(
             query,
             &payloads,
             limit,
             reader.runtime.config.search.rrf_k,
-        ))
+        );
+        if reader.runtime.config.search.explain {
+            payload.explanation_warnings.push(crate::output_schema::OutputWarning::new(
+                crate::output_schema::OutputWarningCode::EXPLANATION_UNAVAILABLE,
+                "expanded-query fusion has no complete per-query explanation evidence; run the search without --expand for ranking explanations",
+            ));
+        }
+        Ok(payload)
     }
 
     fn emit_complete_search_payload<W: Write>(
@@ -797,6 +831,18 @@ impl FsfsRuntime {
                 self.cli_input.no_color,
             );
             writer.write_all(table.as_bytes())?;
+            for hit in &payload.hits {
+                if let Some(ranking) = payload.explanations.get(&hit.path) {
+                    writeln!(
+                        writer,
+                        "\n{}",
+                        self.render_attached_search_explanation(&payload, hit, ranking),
+                    )?;
+                }
+            }
+            for warning in &payload.explanation_warnings {
+                writeln!(writer, "warning[{}]: {}", warning.code, warning.message)?;
+            }
         } else {
             let warnings = Self::search_generation_warnings(&payload);
             let envelope = OutputEnvelope::success(
@@ -1336,6 +1382,7 @@ mod tests {
                     strategy: crate::query_expansion::ExpansionStrategy::Keyword,
                 },
             ];
+            reader.runtime.config.search.explain = true;
             let old = FsfsRuntime::execute_retained_expanded_queries(
                 &cx,
                 &mut reader,
@@ -1347,6 +1394,12 @@ mod tests {
             .unwrap();
             assert_eq!(old.hits.len(), 1);
             assert_eq!(old.hits[0].path, "alpha.md");
+            assert!(old.explanations.is_empty());
+            assert_eq!(old.explanation_warnings.len(), 1);
+            assert_eq!(
+                old.explanation_warnings[0].code,
+                crate::output_schema::OutputWarningCode::EXPLANATION_UNAVAILABLE
+            );
             assert_eq!(reader.generation(), &predecessor);
             let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
             let new = FsfsRuntime::execute_retained_expanded_queries(
@@ -1360,6 +1413,7 @@ mod tests {
             .unwrap();
             assert_eq!(new.hits.len(), 2);
             assert_eq!(new.query, "sharedtoken");
+            assert!(new.explanation_warnings.is_empty());
             assert_eq!(store.active(&cx).unwrap(), Some(selected));
             assert_eq!(
                 fs::read(predecessor.path().join(COMPLETE_GENERATION_MANIFEST)).unwrap(),
@@ -1739,6 +1793,210 @@ mod tests {
                 second_receipt["data"]["generation_id"].as_str().unwrap()
             );
             assert!(!current.path().join(FSFS_EXPLAIN_SESSION_FILE).exists());
+        });
+    }
+
+    #[test]
+    fn complete_cli_inline_explanations_match_buffered_and_streamed_rankings() {
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        scheduler.block_on(async move {
+            let cx = Cx::current().expect("runtime installs a spawn-capable context");
+            let _embedders = RestoreDashboardEmbedders::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root) = fixture(directory.path());
+            runtime.config.search.fast_only = false;
+            runtime.config.search.quality_timeout_ms = 5_000;
+            "dashboard-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let selected = store.active(&cx).unwrap().unwrap();
+            let sealed = sealed_inventory(selected.path());
+            let mut search = search_runtime(&runtime);
+            search.config.search.explain = true;
+            search.cli_input.query = Some("how to find sharedtoken document content".to_owned());
+            let mut buffered = Vec::new();
+            search
+                .run_complete_generation_search_with_writer(&cx, &root, &mut buffered)
+                .await
+                .unwrap();
+            let envelope: OutputEnvelope<crate::output_schema::SearchPayload> =
+                serde_json::from_slice(&buffered).unwrap();
+            assert!(envelope.ok);
+            let payload = envelope.data.unwrap();
+            assert_eq!(payload.phase, SearchOutputPhase::Refined);
+            assert!(!payload.hits.is_empty());
+            assert_eq!(payload.explanations.len(), payload.hits.len());
+            for hit in &payload.hits {
+                let explanation = &payload.explanations[&hit.path];
+                assert_eq!(explanation.doc_id, hit.path);
+                assert_eq!(explanation.final_score, hit.score);
+                assert_eq!(
+                    explanation.phase,
+                    frankensearch_core::ExplanationPhase::Refined
+                );
+                for source in [
+                    crate::explanation_payload::ScoreComponentSource::SemanticFast,
+                    crate::explanation_payload::ScoreComponentSource::SemanticQuality,
+                ] {
+                    assert!(
+                        explanation
+                            .components
+                            .iter()
+                            .any(|component| component.source == source)
+                    );
+                }
+                assert_eq!(
+                    explanation.fusion.as_ref().unwrap().lexical_rank,
+                    hit.lexical_rank
+                );
+            }
+            assert!(!payload.explanation_warnings.iter().any(|warning| {
+                warning.code == crate::output_schema::OutputWarningCode::BM25_STATS_UNAVAILABLE
+            }));
+
+            search.cli_input.format = OutputFormat::Table;
+            let mut table = Vec::new();
+            search
+                .run_complete_generation_search_with_writer(&cx, &root, &mut table)
+                .await
+                .unwrap();
+            let table = String::from_utf8(table).unwrap();
+            assert!(table.contains("Result ID: R0"));
+            assert!(table.contains("Lexical (BM25):"));
+
+            search.cli_input.format = OutputFormat::Jsonl;
+            search.cli_input.stream = true;
+            let mut streamed = Vec::new();
+            search
+                .run_complete_generation_search_with_writer(&cx, &root, &mut streamed)
+                .await
+                .unwrap();
+            let frames: Vec<StreamFrame<SearchHitPayload>> = streamed
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            let mut explained = BTreeMap::new();
+            let mut result_seen = false;
+            for (sequence, frame) in frames.iter().enumerate() {
+                assert_eq!(frame.seq, u64::try_from(sequence).unwrap());
+                assert!(crate::stream_protocol::validate_stream_frame(frame).valid);
+                match &frame.event {
+                    crate::stream_protocol::StreamEvent::Result(_) => result_seen = true,
+                    crate::stream_protocol::StreamEvent::Explain(event) => {
+                        assert!(result_seen, "Initial must precede explanations");
+                        assert_eq!(event.explanation.query, payload.query);
+                        let ranking = &event.explanation.ranking;
+                        explained.insert(ranking.doc_id.clone(), ranking.clone());
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(explained, payload.explanations);
+            assert!(matches!(frames.last().unwrap().event,
+                crate::stream_protocol::StreamEvent::Terminal(ref terminal)
+                    if terminal.status == crate::stream_protocol::StreamTerminalStatus::Completed));
+            assert_eq!(store.active(&cx).unwrap().unwrap(), selected);
+            assert_eq!(sealed_inventory(selected.path()), sealed);
+
+            search.config.search.explain = false;
+            search.cli_input.stream = false;
+            let mut ordinary = Vec::new();
+            search
+                .run_complete_generation_search_with_writer(&cx, &root, &mut ordinary)
+                .await
+                .unwrap();
+            let ordinary: serde_json::Value = serde_json::from_slice(&ordinary).unwrap();
+            assert!(ordinary["data"].get("explanations").is_none());
+            assert!(ordinary["data"].get("explanation_warnings").is_none());
+        });
+    }
+
+    #[test]
+    fn complete_inline_explanations_keep_the_searched_generation_after_publication() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut search = search_runtime(&runtime);
+            search.config.search.explain = true;
+            let mut reader = search.open_retained_search(&cx, &root).await.unwrap();
+            reader
+                .runtime
+                .enable_complete_generation_explanations(&root, &reader.generation)
+                .unwrap();
+            let sealed = sealed_inventory(reader.generation.path());
+            let mut artifacts = reader
+                .runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    "sharedtoken",
+                    10,
+                    SearchExecutionMode::Full,
+                    &mut reader.resources,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: false,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let last = artifacts.last_mut().unwrap();
+            fs::write(source.join("alpha.md"), "replacement no longer matches").unwrap();
+            fs::write(source.join("beta.md"), "sharedtoken changed population").unwrap();
+            publish(&runtime, &cx, &root).await;
+            fs::create_dir(root.join("explain")).unwrap();
+            fs::write(
+                root.join(FSFS_EXPLAIN_SESSION_FILE),
+                "another query's partial context",
+            )
+            .unwrap();
+
+            reader
+                .runtime
+                .attach_complete_search_explanations(&cx, last, &reader.resources)
+                .unwrap();
+            assert_eq!(last.payload.hits.len(), 1);
+            let hit = &last.payload.hits[0];
+            assert!(hit.path.ends_with("alpha.md"));
+            assert_eq!(last.payload.explanations[&hit.path].final_score, hit.score);
+            assert!(!last.payload.explanation_warnings.iter().any(|warning| {
+                warning.code == crate::output_schema::OutputWarningCode::BM25_STATS_UNAVAILABLE
+                    || warning.code
+                        == crate::output_schema::OutputWarningCode::EXPLANATION_UNAVAILABLE
+            }));
+            assert_eq!(sealed_inventory(reader.generation.path()), sealed);
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            assert_ne!(store.active(&cx).unwrap().unwrap(), reader.generation);
+        });
+    }
+
+    #[test]
+    fn complete_inline_explanation_format_refusal_precedes_store_access() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut search = search_runtime(&runtime);
+            search.config.search.explain = true;
+            for compact in [false, true] {
+                search.cli_input.compact = compact;
+                search.cli_input.format = if compact {
+                    OutputFormat::Json
+                } else {
+                    OutputFormat::Csv
+                };
+                let mut output = Vec::new();
+                assert!(
+                    matches!(search.run_complete_generation_search_with_writer(&cx, &root, &mut output).await,
+                    Err(SearchError::InvalidConfig { field, .. }) if field == "complete_generation.explain")
+                );
+                assert!(output.is_empty());
+                assert!(!root.exists());
+            }
         });
     }
 

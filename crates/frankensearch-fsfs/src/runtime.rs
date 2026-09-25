@@ -6817,11 +6817,16 @@ impl FsfsRuntime {
                     Some(&mut phase_sink),
                 )
                 .await
-                .map(|artifacts| {
-                    artifacts
+                .and_then(|mut artifacts| {
+                    if self.complete_explain_target.is_some()
+                        && let Some(last) = artifacts.last_mut()
+                    {
+                        self.attach_complete_search_explanations(cx, last, resources)?;
+                    }
+                    Ok(artifacts
                         .into_iter()
                         .map(|artifact| artifact.payload)
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>())
                 })
             } else if self.cli_input.daemon {
                 let mut daemon_sink = |payload: &SearchPayload, cached: bool| {
@@ -6879,6 +6884,7 @@ impl FsfsRuntime {
                 let payload = payloads.last().cloned().unwrap_or_else(|| {
                     SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new())
                 });
+                self.emit_search_stream_explanations(&payload, stream_id, &mut seq, writer)?;
                 self.emit_search_stream_terminal_completed(stream_id, &mut seq, writer)?;
                 info!(
                     query = query,
@@ -8459,7 +8465,15 @@ impl FsfsRuntime {
         emit_stream_frame(&progress_frame, self.cli_input.format, writer)?;
         *seq = seq.saturating_add(1);
 
-        for warning in Self::search_generation_warnings(payload) {
+        for warning in Self::search_generation_warnings(payload)
+            .into_iter()
+            .filter(|warning| {
+                !payload
+                    .explanation_warnings
+                    .iter()
+                    .any(|explanation| explanation.code == warning.code)
+            })
+        {
             let warning_frame = StreamFrame::new(
                 stream_id.to_owned(),
                 *seq,
@@ -8516,6 +8530,52 @@ impl FsfsRuntime {
             *seq = seq.saturating_add(1);
         }
 
+        Ok(())
+    }
+
+    /// Inline stream explanations follow the final ranking and precede its
+    /// terminal event. Initial results never wait for quality or explanation.
+    fn emit_search_stream_explanations<W: Write>(
+        &self,
+        payload: &SearchPayload,
+        stream_id: &str,
+        seq: &mut u64,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        for warning in &payload.explanation_warnings {
+            let frame = StreamFrame::new(
+                stream_id.to_owned(),
+                *seq,
+                iso_timestamp_now(),
+                "search",
+                StreamEvent::<SearchHitPayload>::Warning(StreamWarningEvent {
+                    warning: warning.clone(),
+                }),
+            );
+            emit_stream_frame(&frame, self.cli_input.format, writer)?;
+            *seq = seq.saturating_add(1);
+        }
+        for hit in &payload.hits {
+            let Some(ranking) = payload.explanations.get(&hit.path) else {
+                continue;
+            };
+            let frame = StreamFrame::new(
+                stream_id.to_owned(),
+                *seq,
+                iso_timestamp_now(),
+                "search",
+                StreamEvent::<SearchHitPayload>::Explain(Box::new(
+                    crate::stream_protocol::StreamExplainEvent {
+                        explanation: FsfsExplanationPayload::new(
+                            payload.query.clone(),
+                            ranking.clone(),
+                        ),
+                    },
+                )),
+            );
+            emit_stream_frame(&frame, self.cli_input.format, writer)?;
+            *seq = seq.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -9105,6 +9165,19 @@ impl FsfsRuntime {
         fused: &[FusedCandidate],
         payload: Option<&SearchPayload>,
     ) -> SearchResult<()> {
+        let session =
+            self.explain_session_with_payload(index_root, query, phase, fused, payload)?;
+        self.persist_explain_session_value(index_root, session)
+    }
+
+    fn explain_session_with_payload(
+        &self,
+        index_root: &Path,
+        query: &str,
+        phase: SearchOutputPhase,
+        fused: &[FusedCandidate],
+        payload: Option<&SearchPayload>,
+    ) -> SearchResult<ExplainSession> {
         let fused = if let Some(payload) = payload {
             let displayed =
                 fused
@@ -9164,7 +9237,107 @@ impl FsfsRuntime {
         }
         Self::attach_explain_session_generation(&mut session, index_root, payload);
         session.remap_hash_control_ranks();
-        self.persist_explain_session_value(index_root, session)
+        Ok(session)
+    }
+
+    /// Explain the exact returned ranking with its already admitted lexical
+    /// reader. The last-search file is only follow-up convenience state: a
+    /// concurrent query or publication must not change inline explanations.
+    fn attach_complete_search_explanations(
+        &self,
+        cx: &Cx,
+        artifact: &mut SearchPhaseArtifact,
+        resources: &SearchExecutionResources,
+    ) -> SearchResult<()> {
+        if !self.config.search.explain {
+            return Ok(());
+        }
+        retained_search_checkpoint(cx)?;
+        let target = self.complete_explain_target.as_ref().ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "explain_generation",
+                "inline explanations require the admitted complete generation",
+            )
+        })?;
+        if resources.index_root != target.generation.path() {
+            return Err(complete_cli::complete_cli_error(
+                "explain_generation",
+                "explanation resources differ from the searched complete generation",
+            ));
+        }
+        let session = self.explain_session_with_payload(
+            &resources.index_root,
+            &artifact.payload.query,
+            artifact.phase,
+            &artifact.fused,
+            Some(&artifact.payload),
+        )?;
+        let unavailable = "the retained generation has no Quill lexical engine".to_owned();
+        let lexical = resources.lexical_index.as_ref().ok_or(&unavailable);
+        for hit in &session.hits {
+            retained_search_checkpoint(cx)?;
+            let (explanation, warnings) = Self::explain_session_hit(cx, &session, hit, lexical);
+            artifact
+                .payload
+                .explanations
+                .insert(hit.path.clone(), explanation.ranking);
+            for warning in warnings {
+                if !artifact
+                    .payload
+                    .explanation_warnings
+                    .iter()
+                    .any(|existing| existing.code == warning.code)
+                {
+                    artifact.payload.explanation_warnings.push(warning);
+                }
+            }
+        }
+        retained_search_checkpoint(cx)
+    }
+
+    /// Render transported explanations with the ordinary `fsfs explain`
+    /// presentation. All scoring inputs came from the server's retained reader.
+    fn render_attached_search_explanation(
+        &self,
+        payload: &SearchPayload,
+        hit: &SearchHitPayload,
+        ranking: &RankingExplanation,
+    ) -> String {
+        let explanation = FsfsExplanationPayload::new(payload.query.clone(), ranking.clone());
+        let Some(fusion) = &ranking.fusion else {
+            return explanation.to_toon();
+        };
+        let rerank = payload
+            .rerank
+            .as_ref()
+            .and_then(|stage| stage.scores.iter().find(|score| score.path == hit.path));
+        let detail = ExplainSessionHit {
+            result_id: result_id(hit.rank.saturating_sub(1)),
+            rank: hit.rank,
+            path: hit.path.clone(),
+            final_score: ranking.final_score,
+            lexical_rank: fusion.lexical_rank,
+            semantic_rank: fusion.semantic_rank,
+            hash_rank: fusion.hash_rank,
+            lexical_score: fusion.lexical_score,
+            semantic_score: fusion.semantic_score,
+            hash_score: fusion.hash_score,
+            in_both_sources: fusion.in_both_sources,
+            rerank_score: rerank.map(|score| score.score),
+            rerank_logit: rerank.and_then(|score| score.logit),
+            lexical_fallback_tail: payload.lexical_fallback_tail.contains(&hit.path),
+        };
+        render_explain_table(
+            &detail.result_id,
+            &explanation,
+            &detail,
+            fusion
+                .rrf
+                .as_ref()
+                .map_or(self.config.search.rrf_k, |rrf| rrf.k),
+            payload.vector_generation_is_hash,
+            payload.vector_generation_id.as_deref(),
+        )
     }
 
     fn persist_explain_session_value(
@@ -10381,6 +10554,14 @@ impl FsfsRuntime {
                 OutputWarningCode::NO_VECTOR_INDEX,
                 "no published vector generation; this result is not semantic search".to_owned(),
             ));
+        }
+        for warning in &payload.explanation_warnings {
+            if !warnings
+                .iter()
+                .any(|existing| existing.code == warning.code)
+            {
+                warnings.push(warning.clone());
+            }
         }
         warnings
     }
@@ -24679,7 +24860,11 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         let _ = writeln!(
             out,
             "  vector generation: {}",
-            paint("(unreadable while another process writes it)", "33", no_color)
+            paint(
+                "(unreadable while another process writes it)",
+                "33",
+                no_color
+            )
         );
     } else {
         let _ = writeln!(
@@ -27566,14 +27751,20 @@ mod tests {
             assert!(!status.index.dashboard_state_is_healthy());
             let table = super::render_status_table(&status, true);
             assert!(
-                table.contains("another fsfs process is writing") && !table.contains("class=missing"),
+                table.contains("another fsfs process is writing")
+                    && !table.contains("class=missing"),
                 "{table}"
             );
 
             drop(writer);
-            let released = runtime.collect_status_payload().expect("status after release");
+            let released = runtime
+                .collect_status_payload()
+                .expect("status after release");
             assert!(!released.index.vector_files_in_use);
-            assert_ne!(released.index.dashboard_state, "in use by another fsfs process");
+            assert_ne!(
+                released.index.dashboard_state,
+                "in use by another fsfs process"
+            );
             if let Err(error) = runtime
                 .prepare_search_execution_resources(&cx, super::SearchExecutionMode::Full)
                 .await

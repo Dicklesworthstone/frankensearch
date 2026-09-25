@@ -426,10 +426,14 @@ pub struct SearchPayload {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub quality_timeout: Option<QualityTimeoutPayload>,
     /// `search --explain`: per returned hit path, the ranking that
-    /// `fsfs explain R<n>` prints for it. Filled only when asked, never
-    /// cached or served.
+    /// `fsfs explain R<n>` prints for it. Filled only when asked; retained
+    /// daemon replies preserve the explanation from the reader that searched.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub explanations: BTreeMap<String, crate::explanation_payload::RankingExplanation>,
+    /// Why requested explanation details were unavailable. Kept with the
+    /// ranking so forwarding and streaming cannot silently discard a warning.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub explanation_warnings: Vec<OutputWarning>,
 }
 
 /// A quality deadline expires after Initial. Backend shutdown may take longer
@@ -561,6 +565,7 @@ impl SearchPayload {
             lexical_fallback_tail: BTreeSet::new(),
             quality_timeout: None,
             explanations: BTreeMap::new(),
+            explanation_warnings: Vec::new(),
         }
     }
 
