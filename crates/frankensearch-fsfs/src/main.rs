@@ -206,13 +206,13 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     emit_config_loaded(&event);
 
     // Keep rejected overrides visible at the command that requested them,
-    // including profile limits on background indexing (bd-k7x34).
+    // including profile limits on background indexing (bd-k7x34), and
+    // settings whose value changes nothing (bd-tu4yb).
     if !cli_input.quiet {
-        for warning in loaded
-            .warnings
-            .iter()
-            .filter(|warning| warning.reason_code == "override.rejected.locked_field")
-        {
+        for warning in loaded.warnings.iter().filter(|warning| {
+            warning.reason_code == "override.rejected.locked_field"
+                || warning.reason_code == frankensearch_fsfs::config::CONFIG_NO_EFFECT_WARNING_CODE
+        }) {
             eprintln!(
                 "warning: [{}] {} ({})",
                 warning.reason_code, warning.field, warning.message

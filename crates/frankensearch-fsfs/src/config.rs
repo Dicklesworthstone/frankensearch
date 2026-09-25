@@ -24,6 +24,8 @@ const CONFIG_LOADED_EMIT_FIELDS: [&str; 4] = [
 ];
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FAST_ONLY_WARNING_CODE: &str = "config.search.fast_only_with_quality_model";
+/// A setting set to a value that changes nothing (`no_effect_setting_warnings`).
+pub const CONFIG_NO_EFFECT_WARNING_CODE: &str = "config.setting.no_effect";
 /// Default rerank-stage deadline, the value the planner hard-coded before the
 /// setting existed. Abstract-length documents need seconds (bd-e25eo).
 pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 300;
@@ -3149,8 +3151,43 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
     if config.search.fast_only && !config.indexing.quality_model.trim().is_empty() {
         warnings.push(fast_only_quality_model_warning());
     }
+    no_effect_setting_warnings(config, warnings);
 
     Ok(())
+}
+
+/// Settings whose `false` is accepted but changes nothing, because the
+/// behavior they would switch off does not exist (bd-tu4yb). Say so rather
+/// than let an operator believe it took effect.
+fn no_effect_setting_warnings(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) {
+    let settings = [
+        (
+            config.privacy.redact_file_contents_in_logs,
+            "privacy.redact_file_contents_in_logs",
+            "fsfs never writes file contents to logs, so false changes nothing",
+        ),
+        (
+            config.privacy.redact_paths_in_telemetry,
+            "privacy.redact_paths_in_telemetry",
+            "fsfs emits no telemetry, so false changes nothing",
+        ),
+        (
+            config.indexing.reindex_on_change,
+            "indexing.reindex_on_change",
+            "fsfs index and watch always re-index changed files, so false changes nothing",
+        ),
+    ];
+    for (enabled, field, message) in settings {
+        if !enabled {
+            warnings.push(ConfigWarning {
+                severity: ConfigDiagnosticSeverity::Warn,
+                reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
+                field: field.into(),
+                source: ConfigSource::Runtime,
+                message: message.into(),
+            });
+        }
+    }
 }
 
 fn fast_only_quality_model_warning() -> ConfigWarning {
@@ -4001,6 +4038,49 @@ mod tests {
         assert!(result.warnings.iter().any(|warning| {
             warning.reason_code == "config.search.fast_only_with_quality_model"
         }));
+    }
+
+    #[test]
+    fn settings_that_change_nothing_say_so() {
+        let no_effect = |result: &super::ConfigLoadResult| {
+            result
+                .warnings
+                .iter()
+                .filter(|warning| warning.reason_code == super::CONFIG_NO_EFFECT_WARNING_CODE)
+                .map(|warning| warning.field.clone())
+                .collect::<Vec<_>>()
+        };
+        let defaults = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load defaults");
+        assert!(no_effect(&defaults).is_empty());
+
+        let file = "\
+[indexing]\nreindex_on_change = false\n\
+[privacy]\nredact_file_contents_in_logs = false\nredact_paths_in_telemetry = false\n";
+        let turned_off = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load");
+        let mut fields = no_effect(&turned_off);
+        fields.sort();
+        assert_eq!(
+            fields,
+            [
+                "indexing.reindex_on_change",
+                "privacy.redact_file_contents_in_logs",
+                "privacy.redact_paths_in_telemetry",
+            ]
+        );
     }
 
     #[test]

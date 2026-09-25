@@ -63,7 +63,7 @@ Path expansion rule:
 - `embedding_batch_size: int` (`1..4096`, default `64`; bounds document batches in
   one-shot indexing and the watch vector pipeline. Smaller batches reduce working
   memory and the time between batch checkpoints; they do not reduce model size.)
-- `reindex_on_change: bool`
+- `reindex_on_change: bool` (default `true`; `fsfs index` and watch always re-index changed files, so `false` changes nothing and loading it warns `config.setting.no_effect`)
 - `watch_mode: bool`
 
 Model upgrades must pass the stored producer-revision check, even if the
@@ -120,8 +120,8 @@ retried. The previous complete generation is not retained as an atomic snapshot.
 
 ## `[privacy]`
 
-- `redact_file_contents_in_logs: bool` (default MUST be `true`)
-- `redact_paths_in_telemetry: bool` (default MUST be `true`)
+- `redact_file_contents_in_logs: bool` (default MUST be `true`; fsfs writes no file contents to logs, so the guarantee holds either way and `false` warns `config.setting.no_effect`)
+- `redact_paths_in_telemetry: bool` (default MUST be `true`; fsfs emits no telemetry, so `false` changes nothing and warns `config.setting.no_effect`)
 
 ## Validation Rules (Normative)
 
