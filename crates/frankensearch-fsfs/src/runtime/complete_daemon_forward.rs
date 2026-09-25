@@ -33,7 +33,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // Ranking changes invalidate retained peers even when configuration and
 // generation identity match. The progressive request shares this version.
 // 3: the WAL top-k repair (0dc3df2f).
-const VERSION: u32 = 3;
+// 4: request-scoped, retained-reader inline explanations.
+const VERSION: u32 = 4;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -53,6 +54,7 @@ struct SearchRequest {
     query: String,
     limit: usize,
     filter: Option<String>,
+    explain: bool,
     store_root: PathBuf,
     configuration: serde_json::Value,
 }
@@ -89,7 +91,8 @@ fn codec_error(error: serde_json::Error) -> SearchError {
 
 fn configuration_contract(config: &FsfsConfig) -> SearchResult<serde_json::Value> {
     let mut value = serde_json::to_value(config).map_err(codec_error)?;
-    // Limit is an explicit request argument, not a property of warmed models.
+    // Limit and explanations are explicit request arguments, not properties
+    // of warmed models. An ordinary daemon can explain a particular request.
     // Everything else remains exact: in particular, no model, producer,
     // privacy, ranking, or pressure-policy mismatch is silently ignored.
     if let Some(search) = value
@@ -97,6 +100,7 @@ fn configuration_contract(config: &FsfsConfig) -> SearchResult<serde_json::Value
         .and_then(serde_json::Value::as_object_mut)
     {
         search.remove("default_limit");
+        search.remove("explain");
     }
     Ok(value)
 }
@@ -188,6 +192,7 @@ fn make_request(
             query: query.to_owned(),
             limit,
             filter: runtime.cli_input.filter.clone(),
+            explain: runtime.config.search.explain,
             store_root: std::fs::canonicalize(root)?,
             configuration: configuration_contract(runtime.config())?,
         },
@@ -317,6 +322,8 @@ async fn execute(
     query_runtime.cli_input.overrides.limit = Some(request.search.limit);
     query_runtime.cli_input.overrides.fast_only = Some(query_runtime.config.search.fast_only);
     query_runtime.cli_input.overrides.rerank = Some(query_runtime.config.search.rerank);
+    query_runtime.config.search.explain = request.search.explain;
+    query_runtime.cli_input.overrides.explain = Some(request.search.explain);
     let mut phases = Box::pin(
         query_runtime.execute_search_phase_artifacts_with_mode_using_resources(
             cx,
@@ -332,12 +339,14 @@ async fn execute(
         ),
     )
     .await?;
-    phases.pop().map(|phase| phase.payload).ok_or_else(|| {
+    let mut last = phases.pop().ok_or_else(|| {
         complete_cli_error(
             "daemon_response",
             "search completed without an Initial phase",
         )
-    })
+    })?;
+    query_runtime.attach_complete_search_explanations(cx, &mut last, &session.reader.resources)?;
+    Ok(last.payload)
 }
 
 pub(super) async fn serve(
@@ -517,8 +526,8 @@ mod tests {
             assert!(decode_request(&serde_json::to_vec(&value_map).unwrap()).is_err());
         }
         let mut value = serde_json::to_value(&request).unwrap();
-        // 2 predates the WAL top-k repair.
-        for unsupported in [1, 2, VERSION + 1] {
+        // Earlier versions cannot acknowledge request-scoped explanations.
+        for unsupported in [1, 2, 3, VERSION + 1] {
             value["fsfs_complete_cli"] = serde_json::json!(unsupported);
             assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
         }
@@ -742,6 +751,8 @@ mod generation_tests {
                 assert!(endpoint.exists(), "daemon did not become ready");
                 // Exercise the actual CLI dispatch and formatter, not just a
                 // JSON fixture or direct invocation of the server search helper.
+                // Explanation is per request: this daemon started without it.
+                client.config.search.explain = true;
                 let mut output = Vec::new();
                 client
                     .run_complete_generation_search_with_writer(&cx, &root, &mut output)
@@ -749,11 +760,33 @@ mod generation_tests {
                 let envelope: OutputEnvelope<SearchPayload> =
                     serde_json::from_slice(&output).unwrap();
                 assert!(envelope.ok);
+                let forwarded = envelope.data.unwrap();
                 assert_eq!(
-                    envelope.data.unwrap().hits.len(),
+                    forwarded.hits.len(),
                     2,
                     "startup filter leaked into request"
                 );
+                assert_eq!(forwarded.explanations.len(), forwarded.hits.len());
+                let mut direct = client.clone();
+                direct.cli_input.daemon = false;
+                let mut output = Vec::new();
+                direct
+                    .run_complete_generation_search_with_writer(&cx, &root, &mut output)
+                    .await?;
+                let direct: OutputEnvelope<SearchPayload> =
+                    serde_json::from_slice(&output).unwrap();
+                let direct = direct.data.unwrap();
+                assert_eq!(forwarded.explanations, direct.explanations);
+                assert_eq!(forwarded.explanation_warnings, direct.explanation_warnings);
+                client.config.search.explain = false;
+                let ordinary = client
+                    .query_complete_generation_daemon(&cx, &root, "sharedtoken", 10)
+                    .await?;
+                assert!(
+                    ordinary.explanations.is_empty(),
+                    "previous request's explanations leaked"
+                );
+                assert!(ordinary.explanation_warnings.is_empty());
                 client.cli_input.filter = Some("type:rs".to_owned());
                 let filtered = client
                     .query_complete_generation_daemon(&cx, &root, "sharedtoken", 10)

@@ -4844,9 +4844,18 @@ const REASON_RERANK_NO_TEXT: &str = "query.stage.rerank.disabled.no_document_tex
 const REASON_RERANK_APPLIED: &str = "query.stage.rerank.applied";
 const REASON_RERANK_FAILED: &str = "query.stage.rerank.failed";
 const REASON_RERANK_TIMEOUT: &str = "query.stage.rerank.timeout";
-/// Bytes read from a candidate file for reranking. The cross-encoder
-/// truncates at 512 tokens, so this head already covers what it can see.
-const FSFS_RERANK_DOCUMENT_READ_LIMIT: u64 = 16 * 1024;
+/// Source bytes scanned to select one query-relevant passage for reranking.
+/// Covers the default indexing ceiling without admitting an unbounded file.
+const FSFS_RERANK_DOCUMENT_READ_LIMIT: u64 = 16 << 20;
+/// One bounded passage per candidate, keeping inference cost independent of
+/// document length. Quill's snippet window measures bytes; the final character
+/// cap also bounds the exceptional case of one token larger than that window.
+const FSFS_RERANK_PASSAGE_MAX_CHARS: usize = 2_000;
+/// Keep selected evidence near the front even when hundreds of short code
+/// tokens would otherwise precede it and exhaust the model's token budget.
+const FSFS_RERANK_LEADING_CONTEXT_CHARS: usize = 96;
+const FSFS_RERANK_MATCH_START: &str = "<fsfs-rerank-match>";
+const FSFS_RERANK_MATCH_END: &str = "</fsfs-rerank-match>";
 /// Bytes of a hit's file searched for its snippet's line; covers the default
 /// indexing ceiling (`indexing.max_file_size_mb = 10`).
 const FSFS_HIT_LINE_READ_LIMIT: u64 = 16 << 20;
@@ -6808,11 +6817,16 @@ impl FsfsRuntime {
                     Some(&mut phase_sink),
                 )
                 .await
-                .map(|artifacts| {
-                    artifacts
+                .and_then(|mut artifacts| {
+                    if self.complete_explain_target.is_some()
+                        && let Some(last) = artifacts.last_mut()
+                    {
+                        self.attach_complete_search_explanations(cx, last, resources)?;
+                    }
+                    Ok(artifacts
                         .into_iter()
                         .map(|artifact| artifact.payload)
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>())
                 })
             } else if self.cli_input.daemon {
                 let mut daemon_sink = |payload: &SearchPayload, cached: bool| {
@@ -6870,6 +6884,7 @@ impl FsfsRuntime {
                 let payload = payloads.last().cloned().unwrap_or_else(|| {
                     SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new())
                 });
+                self.emit_search_stream_explanations(&payload, stream_id, &mut seq, writer)?;
                 self.emit_search_stream_terminal_completed(stream_id, &mut seq, writer)?;
                 info!(
                     query = query,
@@ -8450,7 +8465,15 @@ impl FsfsRuntime {
         emit_stream_frame(&progress_frame, self.cli_input.format, writer)?;
         *seq = seq.saturating_add(1);
 
-        for warning in Self::search_generation_warnings(payload) {
+        for warning in Self::search_generation_warnings(payload)
+            .into_iter()
+            .filter(|warning| {
+                !payload
+                    .explanation_warnings
+                    .iter()
+                    .any(|explanation| explanation.code == warning.code)
+            })
+        {
             let warning_frame = StreamFrame::new(
                 stream_id.to_owned(),
                 *seq,
@@ -8507,6 +8530,52 @@ impl FsfsRuntime {
             *seq = seq.saturating_add(1);
         }
 
+        Ok(())
+    }
+
+    /// Inline stream explanations follow the final ranking and precede its
+    /// terminal event. Initial results never wait for quality or explanation.
+    fn emit_search_stream_explanations<W: Write>(
+        &self,
+        payload: &SearchPayload,
+        stream_id: &str,
+        seq: &mut u64,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        for warning in &payload.explanation_warnings {
+            let frame = StreamFrame::new(
+                stream_id.to_owned(),
+                *seq,
+                iso_timestamp_now(),
+                "search",
+                StreamEvent::<SearchHitPayload>::Warning(StreamWarningEvent {
+                    warning: warning.clone(),
+                }),
+            );
+            emit_stream_frame(&frame, self.cli_input.format, writer)?;
+            *seq = seq.saturating_add(1);
+        }
+        for hit in &payload.hits {
+            let Some(ranking) = payload.explanations.get(&hit.path) else {
+                continue;
+            };
+            let frame = StreamFrame::new(
+                stream_id.to_owned(),
+                *seq,
+                iso_timestamp_now(),
+                "search",
+                StreamEvent::<SearchHitPayload>::Explain(Box::new(
+                    crate::stream_protocol::StreamExplainEvent {
+                        explanation: FsfsExplanationPayload::new(
+                            payload.query.clone(),
+                            ranking.clone(),
+                        ),
+                    },
+                )),
+            );
+            emit_stream_frame(&frame, self.cli_input.format, writer)?;
+            *seq = seq.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -9096,6 +9165,19 @@ impl FsfsRuntime {
         fused: &[FusedCandidate],
         payload: Option<&SearchPayload>,
     ) -> SearchResult<()> {
+        let session =
+            self.explain_session_with_payload(index_root, query, phase, fused, payload)?;
+        self.persist_explain_session_value(index_root, session)
+    }
+
+    fn explain_session_with_payload(
+        &self,
+        index_root: &Path,
+        query: &str,
+        phase: SearchOutputPhase,
+        fused: &[FusedCandidate],
+        payload: Option<&SearchPayload>,
+    ) -> SearchResult<ExplainSession> {
         let fused = if let Some(payload) = payload {
             let displayed =
                 fused
@@ -9155,7 +9237,107 @@ impl FsfsRuntime {
         }
         Self::attach_explain_session_generation(&mut session, index_root, payload);
         session.remap_hash_control_ranks();
-        self.persist_explain_session_value(index_root, session)
+        Ok(session)
+    }
+
+    /// Explain the exact returned ranking with its already admitted lexical
+    /// reader. The last-search file is only follow-up convenience state: a
+    /// concurrent query or publication must not change inline explanations.
+    fn attach_complete_search_explanations(
+        &self,
+        cx: &Cx,
+        artifact: &mut SearchPhaseArtifact,
+        resources: &SearchExecutionResources,
+    ) -> SearchResult<()> {
+        if !self.config.search.explain {
+            return Ok(());
+        }
+        retained_search_checkpoint(cx)?;
+        let target = self.complete_explain_target.as_ref().ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "explain_generation",
+                "inline explanations require the admitted complete generation",
+            )
+        })?;
+        if resources.index_root != target.generation.path() {
+            return Err(complete_cli::complete_cli_error(
+                "explain_generation",
+                "explanation resources differ from the searched complete generation",
+            ));
+        }
+        let session = self.explain_session_with_payload(
+            &resources.index_root,
+            &artifact.payload.query,
+            artifact.phase,
+            &artifact.fused,
+            Some(&artifact.payload),
+        )?;
+        let unavailable = "the retained generation has no Quill lexical engine".to_owned();
+        let lexical = resources.lexical_index.as_ref().ok_or(&unavailable);
+        for hit in &session.hits {
+            retained_search_checkpoint(cx)?;
+            let (explanation, warnings) = Self::explain_session_hit(cx, &session, hit, lexical);
+            artifact
+                .payload
+                .explanations
+                .insert(hit.path.clone(), explanation.ranking);
+            for warning in warnings {
+                if !artifact
+                    .payload
+                    .explanation_warnings
+                    .iter()
+                    .any(|existing| existing.code == warning.code)
+                {
+                    artifact.payload.explanation_warnings.push(warning);
+                }
+            }
+        }
+        retained_search_checkpoint(cx)
+    }
+
+    /// Render transported explanations with the ordinary `fsfs explain`
+    /// presentation. All scoring inputs came from the server's retained reader.
+    fn render_attached_search_explanation(
+        &self,
+        payload: &SearchPayload,
+        hit: &SearchHitPayload,
+        ranking: &RankingExplanation,
+    ) -> String {
+        let explanation = FsfsExplanationPayload::new(payload.query.clone(), ranking.clone());
+        let Some(fusion) = &ranking.fusion else {
+            return explanation.to_toon();
+        };
+        let rerank = payload
+            .rerank
+            .as_ref()
+            .and_then(|stage| stage.scores.iter().find(|score| score.path == hit.path));
+        let detail = ExplainSessionHit {
+            result_id: result_id(hit.rank.saturating_sub(1)),
+            rank: hit.rank,
+            path: hit.path.clone(),
+            final_score: ranking.final_score,
+            lexical_rank: fusion.lexical_rank,
+            semantic_rank: fusion.semantic_rank,
+            hash_rank: fusion.hash_rank,
+            lexical_score: fusion.lexical_score,
+            semantic_score: fusion.semantic_score,
+            hash_score: fusion.hash_score,
+            in_both_sources: fusion.in_both_sources,
+            rerank_score: rerank.map(|score| score.score),
+            rerank_logit: rerank.and_then(|score| score.logit),
+            lexical_fallback_tail: payload.lexical_fallback_tail.contains(&hit.path),
+        };
+        render_explain_table(
+            &detail.result_id,
+            &explanation,
+            &detail,
+            fusion
+                .rrf
+                .as_ref()
+                .map_or(self.config.search.rrf_k, |rrf| rrf.k),
+            payload.vector_generation_is_hash,
+            payload.vector_generation_id.as_deref(),
+        )
     }
 
     fn persist_explain_session_value(
@@ -10372,6 +10554,14 @@ impl FsfsRuntime {
                 OutputWarningCode::NO_VECTOR_INDEX,
                 "no published vector generation; this result is not semantic search".to_owned(),
             ));
+        }
+        for warning in &payload.explanation_warnings {
+            if !warnings
+                .iter()
+                .any(|existing| existing.code == warning.code)
+            {
+                warnings.push(warning.clone());
+            }
         }
         warnings
     }
@@ -14930,7 +15120,7 @@ impl FsfsRuntime {
         // Boxed: the one-shot index future carries both tiers' embedding
         // state and would otherwise inflate every caller's future past the
         // `large_futures` budget.
-        Box::pin(self.run_one_shot_index_scaffold_internal(cx, command, on_progress, true))
+        Box::pin(self.run_one_shot_index_scaffold_internal(cx, command, on_progress, true, true))
             .await
             .map(|_| ())
     }
@@ -14942,6 +15132,7 @@ impl FsfsRuntime {
         command: CliCommand,
         mut on_progress: F,
         emit_user_output: bool,
+        retain_legacy_reuse: bool,
     ) -> SearchResult<FsfsIndexPayload>
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
@@ -14958,6 +15149,9 @@ impl FsfsRuntime {
         // boundary below so a substituted lock file aborts the publication.
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
         publication_lease.fence("one-shot index entry")?;
+        if retain_legacy_reuse {
+            retained_reuse::prepare_legacy_reuse(cx).await?;
+        }
 
         let root_decision = self.config.discovery.evaluate_root(&target_root, None);
         if !root_decision.include() {
@@ -15159,7 +15353,7 @@ impl FsfsRuntime {
 
         // 2. Prepare indexes and validate the last durable checkpoint generation.
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
-        let existing_checkpoint = match read_indexing_checkpoint(&index_root) {
+        let mut existing_checkpoint = match read_indexing_checkpoint(&index_root) {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 warn!(error = %error, "ignoring malformed indexing checkpoint");
@@ -15171,16 +15365,18 @@ impl FsfsRuntime {
                 None
             }
         };
+        if !self.cli_input.full_reindex && retain_legacy_reuse && existing_checkpoint.is_none() {
+            existing_checkpoint = retained_reuse::legacy_checkpoint(cx, self, &index_root)?;
+        }
         let target_root_label = target_root.display().to_string();
         let index_root_label = index_root.display().to_string();
         let checkpoint_metadata_valid = existing_checkpoint.as_ref().is_some_and(|checkpoint| {
-            checkpoint.schema_version == INDEXING_CHECKPOINT_SCHEMA_VERSION
+            !self.cli_input.full_reindex
+                && checkpoint.schema_version == INDEXING_CHECKPOINT_SCHEMA_VERSION
                 && checkpoint.artifacts_durable
                 && checkpoint.target_root == target_root_label
                 && checkpoint.index_root == index_root_label
         });
-        let discard_undurable_lexical_generation =
-            existing_checkpoint.is_some() && !checkpoint_metadata_valid;
         let checkpoint_manifests = if checkpoint_metadata_valid {
             match Self::read_checkpoint_manifest_generation(
                 &index_root,
@@ -15197,6 +15393,11 @@ impl FsfsRuntime {
         } else {
             None
         };
+        // Source discovery is the membership authority on a cold rebuild.
+        // Without a proven checkpoint, old Quill rows may include an aborted
+        // batch or an out-of-protocol mutation absent from both manifests.
+        let discard_undurable_lexical_generation =
+            self.cli_input.full_reindex || checkpoint_manifests.is_none();
         let reconciliation_manifests = match Self::read_matching_manifest_generation(&index_root) {
             Ok(manifests) => manifests,
             Err(error) => {
@@ -16351,6 +16552,13 @@ impl FsfsRuntime {
             quality_generation: published_quality,
             input_checkpoint: checkpoint,
         };
+        if retain_legacy_reuse && generation_complete {
+            // Release the Quill writer before hashing the completed artifact
+            // state: releasing its admission record is itself a file change.
+            drop(lexical_index);
+            publication_lease.fence("completed legacy indexing input evidence")?;
+            retained_reuse::retain_legacy_checkpoint(cx, self, &index_root, &payload)?;
+        }
         if emit_user_output {
             payload.emit(
                 self.cli_input.format,
@@ -16504,6 +16712,7 @@ impl FsfsRuntime {
             CliCommand::Index,
             |_| Ok(()),
             false,
+            true,
         ))
         .await?;
 
@@ -17524,7 +17733,7 @@ impl FsfsRuntime {
         let score_result = {
             let work = async {
                 let documents = self
-                    .rerank_documents(cx, index_root, &fused[..depth])
+                    .rerank_documents(cx, index_root, query, &fused[..depth])
                     .await?;
                 if documents.is_empty() {
                     return Ok(None);
@@ -17680,36 +17889,38 @@ impl FsfsRuntime {
         &self,
         cx: &Cx,
         index_root: &Path,
+        query: &str,
         candidates: &[FusedCandidate],
     ) -> SearchResult<Vec<RerankDocument>> {
         Self::semantic_retry_checkpoint(cx, "rerank_documents")?;
-        // The indexed source may have changed or disappeared since this
-        // bundle was sealed. Reranking must use the same retained text as
-        // lexical retrieval, never resolve that row back to the live tree.
-        let retained_lexical = match fs::symlink_metadata(
+        // Prefer indexed canonical content in both layouts: source files may
+        // have changed, and PDFs must contribute their extracted text. A sealed
+        // generation must never fall back to a mutable source file.
+        let retained_generation = match fs::symlink_metadata(
             index_root.join(crate::generation_store::COMPLETE_GENERATION_MANIFEST),
         ) {
-            Ok(metadata) if metadata.is_file() => {
-                let layout = Self::resolve_lexical_engine(index_root)?;
-                let (Some(BlueGreenEngine::Quill), Some(path)) =
-                    (layout.engine(), layout.engine_dir())
-                else {
-                    return Err(SearchError::RerankFailed {
-                        model: FSFS_RERANKER_MODEL_ID.to_owned(),
-                        source: "retained generation has no Quill stored content for reranking"
-                            .into(),
-                    });
-                };
-                Some(QuillSearchIndex::open(cx, path, QuillConfig::default()).await?)
-            }
+            Ok(metadata) if metadata.is_file() => true,
             Ok(_) => {
                 return Err(SearchError::RerankFailed {
                     model: FSFS_RERANKER_MODEL_ID.to_owned(),
                     source: "complete generation marker must be a regular file".into(),
                 });
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
+        };
+        let layout = Self::resolve_lexical_engine(index_root)?;
+        let indexed_lexical = match (layout.engine(), layout.engine_dir()) {
+            (Some(BlueGreenEngine::Quill), Some(path)) => {
+                Some(QuillSearchIndex::open(cx, path, QuillConfig::default()).await?)
+            }
+            _ if retained_generation => {
+                return Err(SearchError::RerankFailed {
+                    model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                    source: "retained generation has no Quill stored content for reranking".into(),
+                });
+            }
+            _ => None,
         };
         let worker_cx = cx.clone();
         #[cfg(feature = "rerank")]
@@ -17725,6 +17936,7 @@ impl FsfsRuntime {
             worker_cx
         };
         let index_root = index_root.to_path_buf();
+        let query = query.to_owned();
         let doc_ids = candidates
             .iter()
             .map(|candidate| candidate.doc_id.clone())
@@ -17746,23 +17958,22 @@ impl FsfsRuntime {
                     None
                 }
             };
-            let canonicalizer = DefaultCanonicalizer::default();
             let mut documents = Vec::with_capacity(doc_ids.len());
             for doc_id in doc_ids {
                 Self::semantic_retry_checkpoint(&child, "rerank_documents")?;
                 Self::semantic_retry_checkpoint(&request_cx, "rerank_documents")?;
-                if let Some(index) = &retained_lexical {
-                    let text = read_retained_rerank_document_text(
+                if let Some(index) = &indexed_lexical {
+                    let text = read_indexed_rerank_document_text(
                         &request_cx,
                         index,
                         &doc_id,
-                        &canonicalizer,
+                        &query,
                     )?;
                     documents.push(RerankDocument { doc_id, text });
                     continue;
                 }
                 let path = resolve_manifest_file_path(&doc_id, sentinel.as_ref(), &index_root);
-                if let Some(text) = read_rerank_document_text(&path, &canonicalizer) {
+                if let Some(text) = read_rerank_document_text(&path, &query) {
                     documents.push(RerankDocument { doc_id, text });
                 }
             }
@@ -21370,11 +21581,10 @@ fn alphanumeric_words(text: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
-/// Canonical text of one candidate file for the cross-encoder, or `None` when
-/// the file is unreadable or canonicalizes to nothing. Reads at most
-/// [`FSFS_RERANK_DOCUMENT_READ_LIMIT`] bytes: the model truncates at 512
-/// tokens, so a longer read would only cost I/O.
-fn read_rerank_document_text(path: &Path, canonicalizer: &DefaultCanonicalizer) -> Option<String> {
+/// Query-relevant canonical text for a candidate without a lexical snapshot.
+/// Reads at most [`FSFS_RERANK_DOCUMENT_READ_LIMIT`] bytes and selects a single
+/// bounded passage. PDFs use the same extraction path as indexing.
+fn read_rerank_document_text(path: &Path, query: &str) -> Option<String> {
     use std::io::Read as _;
 
     let file = match fs::File::open(path) {
@@ -21400,22 +21610,89 @@ fn read_rerank_document_text(path: &Path, canonicalizer: &DefaultCanonicalizer) 
         );
         return None;
     }
-    let text = canonicalizer.canonicalize(&String::from_utf8_lossy(&bytes));
-    (!text.trim().is_empty()).then_some(text)
+    let raw_text = if is_pdf_file(path) {
+        try_extract_pdf_text(&bytes, path)?
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let text = LEXICAL_CANONICALIZER.canonicalize(&raw_text);
+    select_rerank_passage(&text, query)
 }
 
-/// Hydrate an exact row from the sealed shipping-schema lexical snapshot.
+fn rerank_passage_config() -> SnippetConfig {
+    SnippetConfig {
+        max_chars: FSFS_RERANK_PASSAGE_MAX_CHARS,
+        highlight_prefix: FSFS_RERANK_MATCH_START.to_owned(),
+        highlight_postfix: FSFS_RERANK_MATCH_END.to_owned(),
+    }
+}
+
+fn bound_rerank_passage(mut text: String) -> String {
+    if let Some((end, _)) = text.char_indices().nth(FSFS_RERANK_PASSAGE_MAX_CHARS) {
+        text.truncate(end);
+    }
+    text
+}
+
+/// Quill escapes source markup before adding these trusted match markers.
+/// Remove markers before decoding entities so identical markup in the source
+/// remains literal text. Trim excess context before the first selected match
+/// so short tokens cannot push all matching evidence past model truncation.
+fn plain_rerank_passage(marked: &str) -> String {
+    let (before, matched) = marked
+        .find(FSFS_RERANK_MATCH_START)
+        .map_or(("", marked), |offset| marked.split_at(offset));
+    let before = decode_basic_html_entities(before);
+    let context_start = before
+        .char_indices()
+        .rev()
+        .nth(FSFS_RERANK_LEADING_CONTEXT_CHARS - 1)
+        .map_or(0, |(offset, _)| offset);
+    let mut passage = before[context_start..].to_owned();
+    let without_markers = matched
+        .replace(FSFS_RERANK_MATCH_START, "")
+        .replace(FSFS_RERANK_MATCH_END, "");
+    passage.push_str(&decode_basic_html_entities(&without_markers));
+    bound_rerank_passage(passage)
+}
+
+/// Source-only fallback when no index snapshot can supply query document
+/// frequencies. Reuses Quill's tokenizer and fragment selection; indexed
+/// callers below use its parsed query and actual document-frequency weights.
+fn select_rerank_passage(text: &str, query: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    if text
+        .chars()
+        .nth(FSFS_RERANK_LEADING_CONTEXT_CHARS)
+        .is_none()
+    {
+        return Some(text.to_owned());
+    }
+    let terms = alphanumeric_words(query)
+        .map(|term| frankensearch_quill::SnippetTerm::new(term.to_lowercase(), 1));
+    let mut generator = frankensearch_quill::SnippetGenerator::new(
+        frankensearch_quill::Analyzer::FrankensearchDefault,
+        terms,
+        rerank_passage_config(),
+    );
+    generator
+        .snippet_or_prefix(text)
+        .map(|passage| plain_rerank_passage(&passage))
+}
+
+/// Hydrate an exact row from the shipping-schema lexical snapshot.
 /// Missing content fails the optional rerank stage; it never licenses a read
 /// from mutable source files or another generation's catalog.
-fn read_retained_rerank_document_text(
+fn read_indexed_document_text(
     cx: &Cx,
     index: &QuillSearchIndex,
     doc_id: &str,
-    canonicalizer: &DefaultCanonicalizer,
 ) -> SearchResult<String> {
     let unavailable = |reason: &str| SearchError::RerankFailed {
         model: FSFS_RERANKER_MODEL_ID.to_owned(),
-        source: format!("retained rerank document {doc_id:?}: {reason}").into(),
+        source: format!("indexed rerank document {doc_id:?}: {reason}").into(),
     };
     let field_id = |name: &str| {
         DEFAULT_SCHEMA
@@ -21425,11 +21702,11 @@ fn read_retained_rerank_document_text(
             .map(|field| field.id)
             .ok_or_else(|| unavailable("shipping schema is missing a required stored field"))
     };
-    let query = frankensearch_quill::Query::set(
+    let identity_query = frankensearch_quill::Query::set(
         field_id("id")?,
         vec![frankensearch_quill::QueryValue::Str(doc_id.to_owned())],
     );
-    let result = index.search_preparsed_paginated(cx, &query, 2, 0, false)?;
+    let result = index.search_preparsed_paginated(cx, &identity_query, 2, 0, false)?;
     let [hit] = result.hits.as_ref() else {
         return Err(unavailable("exact stored document is missing or ambiguous"));
     };
@@ -21441,20 +21718,53 @@ fn read_retained_rerank_document_text(
     let bytes = index
         .stored_field_value(field_id("content")?, hit.global_docid)?
         .ok_or_else(|| unavailable("canonical stored body is unavailable"))?;
-    let mut text = String::from_utf8(bytes)
+    let text = String::from_utf8(bytes)
         .map_err(|_| unavailable("canonical stored body is not valid UTF-8"))?;
-    let mut end = text
-        .len()
-        .min(usize::try_from(FSFS_RERANK_DOCUMENT_READ_LIMIT).unwrap_or(usize::MAX));
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    let text = canonicalizer.canonicalize(&text);
     if text.trim().is_empty() {
         return Err(unavailable("canonical stored body is empty"));
     }
     Ok(text)
+}
+
+fn read_indexed_rerank_document_text(
+    cx: &Cx,
+    index: &QuillSearchIndex,
+    doc_id: &str,
+    query: &str,
+) -> SearchResult<String> {
+    let text = read_indexed_document_text(cx, index, doc_id)?;
+    // Small bodies already fit the model input. Preserve their punctuation
+    // and full text, including fenced code that embedding canonicalization
+    // would have collapsed. Empty queries deterministically use the prefix.
+    if text
+        .chars()
+        .nth(FSFS_RERANK_LEADING_CONTEXT_CHARS)
+        .is_none()
+        || query.trim().is_empty()
+    {
+        return Ok(bound_rerank_passage(text));
+    }
+    // Release the complete hydrated body before Quill materializes it for
+    // passage selection, so only one full body is retained at a time.
+    drop(text);
+    FsfsRuntime::semantic_retry_checkpoint(cx, "rerank_documents")?;
+    let passage = index
+        .snippets_for_documents(
+            cx,
+            query,
+            &[doc_id],
+            &rerank_passage_config(),
+            usize::try_from(FSFS_RERANK_DOCUMENT_READ_LIMIT).unwrap_or(usize::MAX),
+        )?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| SearchError::RerankFailed {
+            model: FSFS_RERANKER_MODEL_ID.to_owned(),
+            source: format!("indexed rerank document {doc_id:?}: query passage is unavailable")
+                .into(),
+        })?;
+    Ok(plain_rerank_passage(&passage))
 }
 
 fn normalize_model_key(value: &str) -> String {
@@ -24550,7 +24860,11 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         let _ = writeln!(
             out,
             "  vector generation: {}",
-            paint("(unreadable while another process writes it)", "33", no_color)
+            paint(
+                "(unreadable while another process writes it)",
+                "33",
+                no_color
+            )
         );
     } else {
         let _ = writeln!(
@@ -27437,14 +27751,20 @@ mod tests {
             assert!(!status.index.dashboard_state_is_healthy());
             let table = super::render_status_table(&status, true);
             assert!(
-                table.contains("another fsfs process is writing") && !table.contains("class=missing"),
+                table.contains("another fsfs process is writing")
+                    && !table.contains("class=missing"),
                 "{table}"
             );
 
             drop(writer);
-            let released = runtime.collect_status_payload().expect("status after release");
+            let released = runtime
+                .collect_status_payload()
+                .expect("status after release");
             assert!(!released.index.vector_files_in_use);
-            assert_ne!(released.index.dashboard_state, "in use by another fsfs process");
+            assert_ne!(
+                released.index.dashboard_state,
+                "in use by another fsfs process"
+            );
             if let Err(error) = runtime
                 .prepare_search_execution_resources(&cx, super::SearchExecutionMode::Full)
                 .await
@@ -30719,6 +31039,15 @@ mod tests {
                     .await
                     .unwrap();
             }
+            let deep_body = format!(
+                "Unrelated introduction. {} Recovery uses café backoff & jitter when attempts < limit; durable recovery remains bounded.",
+                "ordinary background context ".repeat(1_000)
+            );
+            lexical
+                .index_document(&cx, &IndexableDocument::new("deep.pdf", deep_body))
+                .await
+                .unwrap();
+            fs::write(source.join("deep.pdf"), b"%PDF-1.4\n\0live binary bytes").unwrap();
             let mut empty = IndexableDocument::new("empty-body.md", "");
             empty.title = Some("Stored title without canonical body".to_owned());
             lexical.index_document(&cx, &empty).await.unwrap();
@@ -30771,7 +31100,7 @@ mod tests {
             };
             let ordered = [candidate(originals[1].0), candidate(originals[0].0)];
             let documents = runtime
-                .rerank_documents(&cx, generation.path(), &ordered)
+                .rerank_documents(&cx, generation.path(), "retry recovery", &ordered)
                 .await
                 .expect("hydrate reranking from sealed lexical bodies");
             assert_eq!(documents.len(), 2);
@@ -30779,14 +31108,202 @@ mod tests {
                 assert_eq!(actual.doc_id, expected.0);
                 assert_eq!(actual.text, expected.1);
             }
+            let deep_documents = runtime
+                .rerank_documents(
+                    &cx,
+                    generation.path(),
+                    "recovery backoff jitter",
+                    &[candidate("deep.pdf")],
+                )
+                .await
+                .expect("hydrate deep PDF passage from sealed extracted text");
+            let passage = &deep_documents[0].text;
+            assert!(
+                passage.contains("café backoff & jitter when attempts < limit"),
+                "{passage}"
+            );
+            assert!(!passage.contains("Unrelated introduction"));
+            assert!(!passage.contains("%PDF"));
+            assert!(!passage.contains("&amp;") && !passage.contains("&lt;"));
+            assert!(passage.chars().count() <= super::FSFS_RERANK_PASSAGE_MAX_CHARS);
             for missing in ["live-only.md", "empty-body.md"] {
                 let error = runtime
-                    .rerank_documents(&cx, generation.path(), &[candidate(missing)])
+                    .rerank_documents(
+                        &cx,
+                        generation.path(),
+                        "retry recovery",
+                        &[candidate(missing)],
+                    )
                     .await
                     .expect_err("missing retained body must never fall back to live text");
                 assert!(matches!(error, SearchError::RerankFailed { .. }), "{error}");
             }
             assert_eq!(store.active(&cx).unwrap(), Some(generation));
+        });
+    }
+
+    #[test]
+    fn rerank_source_passage_finds_deep_unicode_text_and_bounds_fallbacks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("long.md");
+        let source = format!(
+            "Unrelated opening. {}\n\n## Recovery\n\nUse café retries & backoff when attempts < limit.\n",
+            "背景 context ".repeat(2_000)
+        );
+        fs::write(&path, &source).unwrap();
+        let passage =
+            super::read_rerank_document_text(&path, "CAFÉ backoff").expect("deep source passage");
+        assert!(
+            passage.contains("café retries & backoff when attempts < limit"),
+            "{passage}"
+        );
+        assert!(!passage.contains("Unrelated opening"));
+        assert!(passage.chars().count() <= super::FSFS_RERANK_PASSAGE_MAX_CHARS);
+
+        let prefix = super::read_rerank_document_text(&path, "missingterm").unwrap();
+        assert!(prefix.starts_with("Unrelated opening"));
+        assert!(prefix.chars().count() <= super::FSFS_RERANK_PASSAGE_MAX_CHARS);
+        assert_eq!(super::select_rerank_passage(" \n\t ", "query"), None);
+        let unbroken = "界".repeat(super::FSFS_RERANK_PASSAGE_MAX_CHARS + 20);
+        let bounded = super::select_rerank_passage(&unbroken, "query").unwrap();
+        assert!(bounded.chars().all(|ch| ch == '界'));
+        assert!(bounded.chars().count() <= super::FSFS_RERANK_PASSAGE_MAX_CHARS);
+
+        // The winning 2,000-byte fragment contains 950 short tokens before
+        // its match. A 512-token cross-encoder would otherwise lose the only
+        // evidence even though the passage contains it.
+        let short_tokens = format!(
+            "{}needle evidence {}",
+            "x ".repeat(950),
+            "background ".repeat(40)
+        );
+        let focused = super::select_rerank_passage(&short_tokens, "needle evidence").unwrap();
+        let anchor = focused.find("needle").unwrap();
+        assert!(focused[..anchor].chars().count() <= super::FSFS_RERANK_LEADING_CONTEXT_CHARS);
+        assert!(focused[..anchor].split_whitespace().count() < 64);
+        assert!(!focused.contains(super::FSFS_RERANK_MATCH_START));
+        let below_cap = format!("{}needle evidence", "x ".repeat(950));
+        assert!(below_cap.len() < super::FSFS_RERANK_PASSAGE_MAX_CHARS);
+        let focused = super::select_rerank_passage(&below_cap, "needle evidence").unwrap();
+        assert!(
+            focused[..focused.find("needle").unwrap()]
+                .split_whitespace()
+                .count()
+                < 64
+        );
+
+        let literal_markup = "&lt;fsfs-rerank-match&gt; literal &amp;amp; ".to_owned()
+            + super::FSFS_RERANK_MATCH_START
+            + "needle &amp; value"
+            + super::FSFS_RERANK_MATCH_END;
+        assert_eq!(
+            super::plain_rerank_passage(&literal_markup),
+            "<fsfs-rerank-match> literal &amp; needle & value"
+        );
+    }
+
+    /// This test double makes the model's actual passage input observable in
+    /// the resulting order. It certifies hydration, not model relevance.
+    struct PassageReranker;
+
+    impl frankensearch_core::SyncRerank for PassageReranker {
+        fn rerank_sync(
+            &self,
+            _query: &str,
+            documents: &[frankensearch_core::RerankDocument],
+        ) -> frankensearch_core::SearchResult<Vec<frankensearch_core::RerankScore>> {
+            Ok(documents
+                .iter()
+                .enumerate()
+                .map(|(index, document)| frankensearch_core::RerankScore {
+                    doc_id: document.doc_id.clone(),
+                    score: if document.text.contains("café backoff & jitter") {
+                        0.9
+                    } else {
+                        0.1
+                    },
+                    original_rank: index,
+                    raw_logit: None,
+                })
+                .collect())
+        }
+
+        fn id(&self) -> &'static str {
+            "passage-input-test"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "passage input observer (test double)"
+        }
+    }
+
+    #[test]
+    fn rerank_stage_scores_deep_indexed_passage_instead_of_changed_source_prefix() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let index_root = temp.path().join("legacy");
+            let lexical = create_test_quill(&cx, &index_root.join("lexical")).await;
+            let body = format!(
+                "Introduction about unrelated tasks. {} Recovery uses café backoff & jitter after transient network errors.",
+                "background information ".repeat(1_000)
+            );
+            for (name, content) in [
+                ("short.md", "A short unrelated article about bread."),
+                ("deep.pdf", body.as_str()),
+            ] {
+                lexical
+                    .index_document(&cx, &IndexableDocument::new(name, content))
+                    .await
+                    .unwrap();
+                fs::write(
+                    index_root.join(name),
+                    "Changed live source has no relevant content.",
+                )
+                .unwrap();
+            }
+            lexical.commit(&cx).await.unwrap();
+            drop(lexical);
+            let candidate = |doc_id: &str| FusedCandidate {
+                doc_id: doc_id.to_owned(),
+                fused_score: 1.0,
+                prior_boost: 0.0,
+                lexical_rank: Some(0),
+                semantic_rank: None,
+                hash_rank: None,
+                lexical_score: Some(1.0),
+                semantic_score: None,
+                hash_score: None,
+                in_both_sources: false,
+            };
+            let mut config = FsfsConfig::default();
+            config.search.rerank = true;
+            let runtime = FsfsRuntime::new(config);
+            let reranker = frankensearch_core::SyncRerankerAdapter(PassageReranker);
+            let stage = super::StageDirective {
+                enabled: true,
+                candidate_budget: 2,
+                timeout_ms: 10_000,
+                reason_code: "query.stage.rerank.enabled",
+            };
+            let outcome = runtime
+                .apply_rerank_stage(
+                    &cx,
+                    Some(&reranker),
+                    &stage,
+                    &index_root,
+                    "recovery backoff jitter",
+                    vec![candidate("short.md"), candidate("deep.pdf")],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.payload.status,
+                crate::output_schema::RerankStageStatus::Applied
+            );
+            assert_eq!(outcome.payload.reranked_hits, 2);
+            assert_eq!(outcome.fused[0].doc_id, "deep.pdf");
+            assert_eq!(outcome.payload.scores[0].original_rank, 2);
+            assert!(outcome.payload.scores[0].score > outcome.payload.scores[1].score);
         });
     }
 
@@ -43863,6 +44380,12 @@ mod tests {
         let text = super::try_extract_pdf_text(pdf.as_bytes(), Path::new("two-page-fonts.pdf"))
             .expect("valid digital PDF must extract text");
         assert_eq!(text.split_whitespace().collect::<String>(), "AB");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("two-page-fonts.pdf");
+        fs::write(&path, pdf.as_bytes()).unwrap();
+        let rerank_text = super::read_rerank_document_text(&path, "B")
+            .expect("source-only PDF reranking must extract text");
+        assert_eq!(rerank_text.split_whitespace().collect::<String>(), "AB");
     }
 
     #[test]
@@ -45383,7 +45906,13 @@ mod tests {
                     ..CliInput::default()
                 });
                 let payload = runtime
-                    .run_one_shot_index_scaffold_internal(&cx, CliCommand::Index, |_| Ok(()), false)
+                    .run_one_shot_index_scaffold_internal(
+                        &cx,
+                        CliCommand::Index,
+                        |_| Ok(()),
+                        false,
+                        true,
+                    )
                     .await
                     .expect("real publication path with a test-only embedder fault");
                 let sentinel = FsfsRuntime::read_index_sentinel(&index_root)

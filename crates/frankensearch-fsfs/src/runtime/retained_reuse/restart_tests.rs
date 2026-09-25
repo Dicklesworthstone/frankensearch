@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use super::super::super::set_test_fast_embedder;
 use super::super::{
-    CompleteGenerationStore, FsfsRuntime, RECEIPT_FILE, ReuseReceipt, proven, read_json,
-    seed_candidate, session_id,
+    CompleteGenerationStore, FsfsRuntime, LEGACY_RECEIPT_FILE, LegacyReuseReceipt, RECEIPT_FILE,
+    ReuseReceipt, proven, read_json, seed_candidate, session_id,
 };
 use crate::generation_store::{GenerationPublication, PublishedGeneration};
 use crate::{CliCommand, CliInput, FsfsConfig};
@@ -146,6 +146,54 @@ fn restart_child() {
             .to_owned();
         let mut runtime = configured(&parent);
         let root = parent.join("store");
+        if mode == "legacy_rebuild" {
+            let payload = runtime
+                .run_one_shot_index_scaffold_internal(
+                    &cx,
+                    CliCommand::Index,
+                    |_| Ok(()),
+                    false,
+                    true,
+                )
+                .await
+                .unwrap();
+            let embedded_inputs = inputs.lock().unwrap().clone();
+            let evidence: LegacyReuseReceipt =
+                read_json(&cx, &root.join(LEGACY_RECEIPT_FILE)).unwrap();
+            let layout = FsfsRuntime::resolve_lexical_engine(&root).unwrap();
+            let lexical = frankensearch_quill::QuillSearchIndex::open(
+                &cx,
+                layout.engine_dir().unwrap(),
+                frankensearch_quill::QuillConfig::default(),
+            )
+            .await
+            .unwrap();
+            let mut hits = lexical
+                .search_results(&cx, "sharedtoken", 10)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.doc_id.to_string())
+                .collect::<Vec<_>>();
+            hits.sort();
+            let report = ChildReport {
+                session: session_id().unwrap().to_owned(),
+                executable,
+                generation: payload.generation.source_hash_hex,
+                receipt_session: evidence.receipt.session,
+                eligible: evidence
+                    .receipt
+                    .checkpoint
+                    .files
+                    .values()
+                    .filter(|entry| proven(entry))
+                    .count(),
+                seeded: None,
+                embedded_inputs,
+                hits,
+            };
+            fs::write(report_path, serde_json::to_vec(&report).unwrap()).unwrap();
+            return;
+        }
         let mut seeded = None;
         let generation = if mode == "rebuild" {
             rebuild(&runtime, &cx, &root).await
@@ -174,8 +222,7 @@ fn restart_child() {
         };
         // Capture build-only inference before the verification query below.
         let embedded_inputs = inputs.lock().unwrap().clone();
-        let receipt: ReuseReceipt =
-            read_json(&cx, &generation.path().join(RECEIPT_FILE)).unwrap();
+        let receipt: ReuseReceipt = read_json(&cx, &generation.path().join(RECEIPT_FILE)).unwrap();
         let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
         let phases = reader.search(&cx, "sharedtoken", 10).await.unwrap();
         let mut hits = phases
@@ -309,6 +356,34 @@ fn source_inputs(report: &ChildReport) -> Vec<&str> {
 }
 
 #[test]
+fn restart_completed_legacy_reuses_inputs_and_rejects_changed_executable() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path();
+    source_fixture(parent);
+    let executable = std::env::current_exe().unwrap();
+    let first = child(&executable, parent, "legacy_rebuild", "first");
+    assert_eq!(first.eligible, 4);
+    assert_eq!(source_inputs(&first).len(), 4);
+    let second = child(&executable, parent, "legacy_rebuild", "second");
+    assert_ne!(second.session, first.session);
+    assert_eq!(second.executable, first.executable);
+    assert_eq!(second.hits, first.hits);
+    assert!(source_inputs(&second).is_empty());
+
+    let alternate = parent.join("alternate-legacy-test-image");
+    fs::copy(&executable, &alternate).unwrap();
+    let mut file = OpenOptions::new().append(true).open(&alternate).unwrap();
+    file.write_all(b"\nfsfs legacy restart negative control\n")
+        .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let changed = child(&alternate, parent, "legacy_rebuild", "changed-image");
+    assert_ne!(changed.executable, first.executable);
+    assert_eq!(source_inputs(&changed).len(), 4);
+    assert_eq!(changed.hits, first.hits);
+}
+
+#[test]
 fn restart_same_executable_reuses_proven_inputs_without_reembedding() {
     let directory = tempfile::tempdir().unwrap();
     let parent = directory.path();
@@ -416,7 +491,8 @@ fn restart_changed_executable_bytes_cannot_reuse_a_same_version_receipt() {
         // Trailing ELF data changes the complete image, but not its compiled
         // test logic or package/version strings. Do not touch the real binary.
         let mut file = OpenOptions::new().append(true).open(&alternate).unwrap();
-        file.write_all(b"\nfsfs restart negative control\n").unwrap();
+        file.write_all(b"\nfsfs restart negative control\n")
+            .unwrap();
         file.sync_all().unwrap();
     }
     let refused = child(&alternate, parent, "seed", "different-image");

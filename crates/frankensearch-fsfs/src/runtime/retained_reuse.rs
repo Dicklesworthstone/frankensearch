@@ -9,7 +9,9 @@
 //! running executable bytes and configuration that produced it on Linux. A
 //! fresh Linux process can reuse that work only after the immutable selected
 //! bundle is verified; other platforms retain process-scoped reuse. This
-//! is not a mutable-root cache or an unchanged-tree publication shortcut.
+//! Mutable legacy roots use the same receipt compatibility rule, with a digest
+//! binding the evidence to their actual serving artifacts under the publication
+//! lease. They still pass through ordinary indexing and publication admission.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -41,9 +43,12 @@ mod execution;
 
 const RECEIPT_FILE: &str = "FSFS-REUSE.json";
 const RECEIPT_VERSION: u16 = 2;
+const LEGACY_RECEIPT_FILE: &str = "FSFS-LEGACY-REUSE.json";
+const LEGACY_RECEIPT_VERSION: u16 = 1;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_COPY_DEPTH: usize = 64;
 const MAX_COPY_ENTRIES: usize = 200_000;
+const MAX_LEGACY_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 static SESSION: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +62,16 @@ struct ReuseReceipt {
     executable_sha256: Option<String>,
     configuration_sha256: String,
     checkpoint: IndexingCheckpoint,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyReuseReceipt {
+    version: u16,
+    receipt: ReuseReceipt,
+    // Bind the receipt itself as well as the artifacts: changing a content
+    // hash in otherwise valid JSON must not authorize stale vector reuse.
+    state_sha256: String,
 }
 
 fn reuse_error(reason: &str) -> SearchError {
@@ -176,10 +191,11 @@ impl FsfsRuntime {
             CliCommand::Index,
             |_| Ok(()),
             false,
+            false,
         ))
         .await?;
         Self::validate_search_generation_at_root(candidate_root, SearchExecutionMode::Full)?;
-        let receipt = completed_receipt(self, candidate_root, payload)?;
+        let receipt = completed_receipt(self, candidate_root, &payload)?;
         write_receipt(cx, candidate_root, &receipt)?;
         Ok(())
     }
@@ -188,9 +204,9 @@ impl FsfsRuntime {
 fn completed_receipt(
     runtime: &FsfsRuntime,
     root: &Path,
-    payload: FsfsIndexPayload,
+    payload: &FsfsIndexPayload,
 ) -> SearchResult<ReuseReceipt> {
-    let checkpoint = payload.input_checkpoint;
+    let checkpoint = &payload.input_checkpoint;
     let final_state = &payload.generation;
     if !final_state.generation_complete
         || !checkpoint.artifacts_durable
@@ -226,7 +242,7 @@ fn completed_receipt(
             "completed input evidence does not cover its exact manifest",
         ));
     }
-    if FsfsRuntime::read_checkpoint_manifest_generation(root, &checkpoint)?.is_none() {
+    if FsfsRuntime::read_checkpoint_manifest_generation(root, checkpoint)?.is_none() {
         return Err(reuse_error(
             "retained input evidence disagrees with final generation metadata",
         ));
@@ -236,8 +252,267 @@ fn completed_receipt(
         session: session_id()?.to_owned(),
         executable_sha256: execution::fingerprint().map(str::to_owned),
         configuration_sha256: configuration_digest(runtime)?,
-        checkpoint,
+        checkpoint: checkpoint.clone(),
     })
+}
+
+pub(super) async fn prepare_legacy_reuse(cx: &Cx) -> SearchResult<()> {
+    execution::prepare(cx).await
+}
+
+/// Read only while holding the legacy publication lease, before any artifact
+/// is opened for writing. An interruption checkpoint always wins, including
+/// an unreadable one; old completion evidence must never resurrect its rows.
+pub(super) fn legacy_checkpoint(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    root: &Path,
+) -> SearchResult<Option<IndexingCheckpoint>> {
+    let read = || -> SearchResult<Option<IndexingCheckpoint>> {
+        retained_search_checkpoint(cx)?;
+        if runtime.cli_input.full_reindex {
+            return Ok(None);
+        }
+        for excluded in [FSFS_CHECKPOINT_FILE, COMPLETE_GENERATION_MANIFEST] {
+            match fs::symlink_metadata(root.join(excluded)) {
+                Ok(_) => return Ok(None),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let path = root.join(LEGACY_RECEIPT_FILE);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let evidence: LegacyReuseReceipt = read_json(cx, &path)?;
+        let receipt = &evidence.receipt;
+        if evidence.version != LEGACY_RECEIPT_VERSION
+            || !compatible_receipt(runtime, receipt)?
+            || receipt.checkpoint.index_root != root.display().to_string()
+            || receipt.checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
+            || !receipt.checkpoint.artifacts_durable
+            || super::checkpoint_has_deferred_semantic_rows(&receipt.checkpoint)
+            || legacy_state_digest(cx, root, receipt)? != evidence.state_sha256
+        {
+            return Ok(None);
+        }
+        let Some(sentinel) = FsfsRuntime::read_index_sentinel(root)? else {
+            return Ok(None);
+        };
+        if !sentinel.generation_complete
+            || FsfsRuntime::read_checkpoint_manifest_generation(root, &receipt.checkpoint)?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        FsfsRuntime::validate_search_generation_at_root(root, SearchExecutionMode::Full)?;
+        retained_search_checkpoint(cx)?;
+        tracing::info!(
+            covered_files = receipt.checkpoint.files.len(),
+            "admitted completed legacy inputs; source hashes and active producers decide reuse"
+        );
+        Ok(Some(evidence.receipt.checkpoint))
+    };
+    match read() {
+        Err(error @ SearchError::Cancelled { .. }) => Err(error),
+        Err(error) => {
+            tracing::warn!(%error, "completed legacy reuse evidence is unavailable; indexing starts cold");
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
+/// Optimization evidence is published after successful generation admission,
+/// with no live checkpoint left behind. Failure to save it is a cold next run,
+/// not a reason to retract an already completed generation.
+pub(super) fn retain_legacy_checkpoint(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    root: &Path,
+    payload: &FsfsIndexPayload,
+) -> SearchResult<()> {
+    let write = || -> SearchResult<()> {
+        retained_search_checkpoint(cx)?;
+        crate::generation_store::reject_published_write(root)?;
+        FsfsRuntime::validate_search_generation_at_root(root, SearchExecutionMode::Full)?;
+        let receipt = completed_receipt(runtime, root, payload)?;
+        let state_sha256 = legacy_state_digest(cx, root, &receipt)?;
+        let evidence = LegacyReuseReceipt {
+            version: LEGACY_RECEIPT_VERSION,
+            receipt,
+            state_sha256,
+        };
+        let bytes =
+            serde_json::to_vec(&evidence).map_err(|source| SearchError::SubsystemError {
+                subsystem: "fsfs.index.completed_reuse",
+                source: Box::new(source),
+            })?;
+        if bytes.len() as u64 > MAX_RECEIPT_BYTES {
+            return Err(reuse_error(
+                "completed legacy input evidence exceeds its byte limit",
+            ));
+        }
+        retained_search_checkpoint(cx)?;
+        super::write_durable(root.join(LEGACY_RECEIPT_FILE), bytes)?;
+        Ok(())
+    };
+    match write() {
+        Err(error @ SearchError::Cancelled { .. }) => Err(error),
+        Err(error) => {
+            tracing::warn!(%error, "could not retain completed legacy inputs; next indexing run starts cold");
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+/// An optimization witness for a cooperative mutable root, not an immutable
+/// generation seal. Include all selected lexical and vector bytes (including
+/// WALs), membership manifests, CURRENT pointers, and the completion sentinel.
+/// Cache/catalog/explain files cannot affect checkpoint reuse and are omitted.
+fn legacy_state_digest(cx: &Cx, root: &Path, receipt: &ReuseReceipt) -> SearchResult<String> {
+    retained_search_checkpoint(cx)?;
+    if !fs::symlink_metadata(root)?.file_type().is_dir() {
+        return Err(reuse_error(
+            "legacy index root is not a non-symlink directory",
+        ));
+    }
+    // This inspection path never adopts an orphan directory or repairs CURRENT.
+    let layout = FsfsRuntime::resolve_sealed_lexical_engine(root)?;
+    if layout.engine() != Some(super::BlueGreenEngine::Quill) {
+        return Err(reuse_error(
+            "completed legacy evidence requires a Quill generation",
+        ));
+    }
+    let lexical = layout
+        .engine_dir()
+        .ok_or_else(|| reuse_error("completed legacy generation has no lexical directory"))?;
+    if lexical == root || !lexical.starts_with(root) {
+        return Err(reuse_error(
+            "legacy lexical artifacts escape the index root",
+        ));
+    }
+    if !fs::symlink_metadata(layout.lexical_root())?
+        .file_type()
+        .is_dir()
+    {
+        return Err(reuse_error(
+            "legacy lexical root is not a non-symlink directory",
+        ));
+    }
+    let bytes = serde_json::to_vec(receipt).map_err(|source| SearchError::SubsystemError {
+        subsystem: "fsfs.index.completed_reuse",
+        source: Box::new(source),
+    })?;
+    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
+        return Err(reuse_error(
+            "completed legacy input evidence exceeds its byte limit",
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"fsfs.legacy_completed_reuse.v1\0");
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+    let mut stats = CopyStats::default();
+    for path in [
+        root.join(super::CURRENT_FILE_NAME),
+        root.join("lexical").join(super::CURRENT_FILE_NAME),
+        root.join(super::FSFS_SENTINEL_FILE),
+        root.join(super::FSFS_LEXICAL_MANIFEST_FILE),
+        root.join("vector"),
+        lexical,
+    ] {
+        legacy_hash_artifact(cx, root, &path, 0, &mut stats, &mut digest)?;
+    }
+    retained_search_checkpoint(cx)?;
+    Ok(super::sha256_digest_hex(digest.finalize()))
+}
+
+fn legacy_hash_artifact(
+    cx: &Cx,
+    root: &Path,
+    path: &Path,
+    depth: usize,
+    stats: &mut CopyStats,
+    digest: &mut Sha256,
+) -> SearchResult<()> {
+    retained_search_checkpoint(cx)?;
+    if depth > MAX_COPY_DEPTH {
+        return Err(reuse_error(
+            "legacy artifact inventory exceeds its depth limit",
+        ));
+    }
+    let label = path
+        .strip_prefix(root)
+        .ok()
+        .and_then(Path::to_str)
+        .ok_or_else(|| reuse_error("legacy artifact has an invalid relative path"))?;
+    digest.update((label.len() as u64).to_le_bytes());
+    digest.update(label.as_bytes());
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            digest.update([0]);
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() {
+        digest.update([1]);
+        let mut entries = collect_copy_entries(cx, fs::read_dir(path)?, stats)?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            // Quill's writer admission record is cleared at release and is
+            // not search data. Every other engine artifact participates.
+            if entry.file_name() == "LOCK" && entry.file_type()?.is_file() {
+                continue;
+            }
+            legacy_hash_artifact(cx, root, &entry.path(), depth + 1, stats, digest)?;
+        }
+        digest.update([2]);
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err(reuse_error(
+            "legacy artifacts contain a symlink or special file",
+        ));
+    }
+    digest.update([3]);
+    let mut file = open_regular(path)?;
+    let before = file.metadata()?;
+    let expected = before.len();
+    stats.bytes = stats
+        .bytes
+        .checked_add(expected)
+        .filter(|&bytes| bytes <= MAX_LEGACY_ARTIFACT_BYTES)
+        .ok_or_else(|| reuse_error("legacy artifacts exceed the reuse byte budget"))?;
+    digest.update(expected.to_le_bytes());
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut observed = 0_u64;
+    loop {
+        retained_search_checkpoint(cx)?;
+        let remaining = expected.saturating_sub(observed).saturating_add(1);
+        let width = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| reuse_error("legacy artifact read length overflow"))?;
+        let count = file.read(&mut buffer[..width])?;
+        if count == 0 {
+            break;
+        }
+        observed = observed.saturating_add(count as u64);
+        if observed > expected {
+            return Err(reuse_error("legacy artifact grew while proving reuse"));
+        }
+        digest.update(&buffer[..count]);
+    }
+    let after = file.metadata()?;
+    if observed != expected || after.len() != expected || before.modified()? != after.modified()? {
+        return Err(reuse_error("legacy artifact changed while proving reuse"));
+    }
+    retained_search_checkpoint(cx)?;
+    Ok(())
 }
 
 fn write_receipt(cx: &Cx, root: &Path, receipt: &ReuseReceipt) -> SearchResult<()> {
@@ -507,6 +782,7 @@ fn copy_tree(
             && [
                 COMPLETE_GENERATION_MANIFEST,
                 RECEIPT_FILE,
+                LEGACY_RECEIPT_FILE,
                 FSFS_CHECKPOINT_FILE,
             ]
             .iter()
@@ -1084,6 +1360,288 @@ mod generation_tests {
             );
             assert_eq!(report["checkpoint_present"], false);
             assert_eq!(report["receipt_present"], true);
+        }
+
+        async fn run_counted_legacy(cx: &Cx, parent: &Path, operation: &str) -> serde_json::Value {
+            let (mut runtime, source, root) = fixture(parent, 0);
+            runtime.config.search.fast_only = false;
+            runtime.config.search.quality_timeout_ms = 5_000;
+            "reuse-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            if operation == "config_drift" {
+                runtime.config.indexing.embedding_batch_size = 2;
+            }
+            runtime.cli_input.full_reindex = operation == "force";
+            let fast = Arc::new(CountingEmbedder::new(
+                "reuse-fast",
+                4,
+                operation == "fast_drift",
+            ));
+            let quality = Arc::new(CountingEmbedder::new(
+                "reuse-quality",
+                6,
+                operation == "quality_drift",
+            ));
+            let _restore = RestoreEmbedders::install(fast.clone(), quality.clone());
+            let payload = runtime
+                .run_one_shot_index_scaffold_internal(
+                    cx,
+                    CliCommand::Index,
+                    |_| Ok(()),
+                    false,
+                    true,
+                )
+                .await
+                .unwrap();
+            let report = serde_json::json!({
+                "fast_documents": fast.counts.documents.load(Ordering::SeqCst),
+                "quality_documents": quality.counts.documents.load(Ordering::SeqCst),
+                "fast_probes": fast.counts.probes.load(Ordering::SeqCst),
+                "quality_probes": quality.counts.probes.load(Ordering::SeqCst),
+                "checkpoint_present": root.join(FSFS_CHECKPOINT_FILE).exists(),
+                "receipt_present": root.join(LEGACY_RECEIPT_FILE).exists(),
+                "indexed_files": payload.generation.indexed_files,
+            });
+            assert!(payload.generation.generation_complete);
+            for (relative, producer) in [
+                (super::super::super::FSFS_VECTOR_INDEX_FILE, fast.as_ref()),
+                (
+                    super::super::super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+                    quality.as_ref(),
+                ),
+            ] {
+                let index =
+                    frankensearch_index::VectorIndex::open_read_only(&root.join(relative)).unwrap();
+                assert_eq!(index.embedder_revision(), producer.identity.fingerprint());
+                assert_eq!(
+                    index.live_doc_ids().unwrap().len(),
+                    payload.generation.indexed_files
+                );
+                for row in 0..index.record_count() {
+                    let text =
+                        fs::read_to_string(source.join(index.doc_id_at(row).unwrap())).unwrap();
+                    let expected =
+                        producer.vector(&DefaultCanonicalizer::default().canonicalize(&text));
+                    assert_eq!(index.vector_at_f32(row).unwrap(), expected);
+                }
+            }
+            let lexical = FsfsRuntime::resolve_lexical_engine(&root)
+                .unwrap()
+                .engine_dir()
+                .unwrap();
+            let index = frankensearch_quill::QuillSearchIndex::open(
+                cx,
+                lexical,
+                frankensearch_quill::QuillConfig::default(),
+            )
+            .await
+            .unwrap();
+            let hits = index.search_results(cx, "sharedtoken", 20).unwrap();
+            assert_eq!(hits.len(), payload.generation.indexed_files);
+            assert!(
+                hits.iter()
+                    .all(|hit| source.join(hit.doc_id.as_str()).is_file())
+            );
+            report
+        }
+
+        #[test]
+        fn completed_legacy_reuse_skips_both_tiers_and_reconciles_changed_membership() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, source, _) = fixture(parent.path(), 2);
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 0, 0);
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "force").await, 2, 2);
+
+                let path = source.join("doc-0.md");
+                let before = fs::metadata(&path).unwrap();
+                fs::write(&path, "sharedtoken revision 0").unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+                    .unwrap();
+                assert_eq!(fs::metadata(&path).unwrap().len(), before.len());
+                assert_eq!(
+                    fs::metadata(&path).unwrap().modified().unwrap(),
+                    before.modified().unwrap()
+                );
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 1, 1);
+
+                // Move outside discovery instead of deleting the fixture.
+                fs::rename(&path, parent.path().join("retired.md")).unwrap();
+                let removed = run_counted_legacy(&cx, parent.path(), "index").await;
+                assert_index_calls(&removed, 0, 0);
+                assert_eq!(removed["indexed_files"], 1);
+                fs::write(source.join("added.md"), "sharedtoken newly added content").unwrap();
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 1, 1);
+            });
+        }
+
+        #[test]
+        fn completed_legacy_reuse_revalidates_configuration_and_independent_producers() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                fixture(parent.path(), 2);
+                for (operation, fast, quality) in [
+                    ("index", 2, 2),
+                    ("config_drift", 2, 2),
+                    ("config_drift", 0, 0),
+                    ("index", 2, 2),
+                    ("quality_drift", 0, 2),
+                    ("index", 0, 2),
+                    ("fast_drift", 2, 2),
+                    ("fast_drift", 0, 0),
+                ] {
+                    let report = run_counted_legacy(&cx, parent.path(), operation).await;
+                    assert_index_calls(&report, fast, quality);
+                }
+            });
+        }
+
+        #[test]
+        fn completed_legacy_reuse_rejects_mutated_artifacts_and_input_evidence() {
+            run_test_with_cx(|cx| async move {
+                for mutation in [
+                    "vector",
+                    "lexical",
+                    "lexical_ghost",
+                    "receipt",
+                    "malformed",
+                    "version",
+                    "executable",
+                ] {
+                    let parent = tempfile::tempdir().unwrap();
+                    let (_, source, root) = fixture(parent.path(), 2);
+                    assert_index_calls(
+                        &run_counted_legacy(&cx, parent.path(), "index").await,
+                        2,
+                        2,
+                    );
+                    let evidence_path = root.join(LEGACY_RECEIPT_FILE);
+                    match mutation {
+                        "vector" => {
+                            let mut index = frankensearch_index::VectorIndex::open(
+                                &root.join(super::super::super::FSFS_VECTOR_INDEX_FILE),
+                            )
+                            .unwrap();
+                            index.soft_delete_batch(&["doc-0.md"]).unwrap();
+                        }
+                        "lexical" | "lexical_ghost" => {
+                            let lexical = FsfsRuntime::resolve_lexical_engine(&root)
+                                .unwrap()
+                                .engine_dir()
+                                .unwrap();
+                            let index = frankensearch_quill::QuillIndex::create(
+                                &cx,
+                                lexical,
+                                frankensearch_quill::QuillConfig::default(),
+                            )
+                            .await
+                            .unwrap();
+                            index
+                                .index_document(
+                                    &cx,
+                                    &frankensearch_core::IndexableDocument::new(
+                                        if mutation == "lexical_ghost" {
+                                            "ghost.md"
+                                        } else {
+                                            "doc-0.md"
+                                        },
+                                        "sharedtoken different stored lexical content",
+                                    ),
+                                )
+                                .await
+                                .unwrap();
+                            index.commit(&cx).await.unwrap();
+                        }
+                        "malformed" => fs::write(&evidence_path, b"{truncated").unwrap(),
+                        _ => {
+                            let mut evidence: LegacyReuseReceipt =
+                                read_json(&cx, &evidence_path).unwrap();
+                            match mutation {
+                                "receipt" => {
+                                    let path = source.join("doc-0.md");
+                                    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+                                    let replacement = b"sharedtoken revision 0";
+                                    fs::write(&path, replacement).unwrap();
+                                    File::options()
+                                        .write(true)
+                                        .open(&path)
+                                        .unwrap()
+                                        .set_times(std::fs::FileTimes::new().set_modified(modified))
+                                        .unwrap();
+                                    evidence
+                                        .receipt
+                                        .checkpoint
+                                        .files
+                                        .get_mut("doc-0.md")
+                                        .unwrap()
+                                        .content_hash_hex = content_sha256_hex(replacement);
+                                }
+                                "version" => evidence.version += 1,
+                                "executable" => {
+                                    evidence.receipt.executable_sha256 = Some("0".repeat(64));
+                                    // Even a self-consistent artifact witness cannot
+                                    // grant reuse under another compiled producer.
+                                    evidence.state_sha256 =
+                                        legacy_state_digest(&cx, &root, &evidence.receipt).unwrap();
+                                }
+                                _ => unreachable!(),
+                            }
+                            fs::write(&evidence_path, serde_json::to_vec(&evidence).unwrap())
+                                .unwrap();
+                        }
+                    }
+                    let rebuilt = run_counted_legacy(&cx, parent.path(), "index").await;
+                    assert_index_calls(&rebuilt, 2, 2);
+                    let warm = run_counted_legacy(&cx, parent.path(), "index").await;
+                    assert_index_calls(&warm, 0, 0);
+                }
+            });
+        }
+
+        #[test]
+        fn completed_legacy_force_removes_uncheckpointed_lexical_rows() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, _, root) = fixture(parent.path(), 2);
+                run_counted_legacy(&cx, parent.path(), "index").await;
+                let lexical = FsfsRuntime::resolve_lexical_engine(&root)
+                    .unwrap()
+                    .engine_dir()
+                    .unwrap();
+                let index = frankensearch_quill::QuillIndex::create(
+                    &cx,
+                    lexical,
+                    frankensearch_quill::QuillConfig::default(),
+                )
+                .await
+                .unwrap();
+                index
+                    .index_document(
+                        &cx,
+                        &frankensearch_core::IndexableDocument::new(
+                            "ghost.md",
+                            "sharedtoken ghost",
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                index.commit(&cx).await.unwrap();
+                assert_eq!(
+                    index.search_results(&cx, "sharedtoken", 20).unwrap().len(),
+                    3
+                );
+                drop(index);
+                let evidence: LegacyReuseReceipt =
+                    read_json(&cx, &root.join(LEGACY_RECEIPT_FILE)).unwrap();
+                let mut interrupted = evidence.receipt.checkpoint;
+                interrupted.artifacts_durable = false;
+                write_indexing_checkpoint(&root, &interrupted).unwrap();
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "force").await, 2, 2);
+            });
         }
 
         /// Use fresh producer instances for each run. The execution helper's

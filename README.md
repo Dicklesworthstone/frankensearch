@@ -395,6 +395,15 @@ file counts, vector model identities, and `generation_complete`. If embedding
 retries are exhausted, `semantic_deferred_files` and a warning explain why the
 published artifacts still need indexing resumed before semantic search.
 
+Completed ordinary index runs retain evidence for reusing their embeddings on
+later runs. Reuse requires matching executable, configuration, producer
+identities, artifact bytes, and each file's current revision and content hash.
+Changed and newly discovered files are embedded again; removed files leave the
+index. `fsfs index --force` (also `--full`) rebuilds all discovered files and
+clears stale lexical rows. Existing indexes acquire this evidence on their next
+successful build. Cross-process reuse is supported on Linux; other platforms
+keep the existing process-scoped executable evidence policy.
+
 Each search hit carries its `path`, a plain-text `snippet` of the best-matching
 fragment, and `line`: the 1-based line of the file where the snippet's first
 query word sits (the table prints `path:line`). `line` is absent for hits
@@ -423,6 +432,12 @@ fsfs index ~/projects --watch
 # Health checks
 fsfs doctor
 ```
+
+Reranking selects one bounded, query-relevant passage from each candidate's
+indexed text. A match deep inside a long file can therefore contribute its
+surrounding context to the cross-encoder. When Quill holds the document body,
+this also preserves the indexed version after a source edit or deletion and
+uses extracted PDF text. Vector-only indexes use a bounded source-text read.
 
 ### Query syntax
 
@@ -453,6 +468,7 @@ recognize the store automatically:
 ```bash
 FSFS_COMPLETE_GENERATIONS=1 fsfs index ~/projects --index-dir ./search-store
 fsfs search "structured concurrency" --index-dir ./search-store --no-daemon
+fsfs search "structured concurrency" --explain --index-dir ./search-store --format json
 fsfs tui --index-dir ./search-store
 fsfs explain 1 --index-dir ./search-store
 fsfs append-batch --file updates.jsonl --index-dir ./search-store
@@ -495,6 +511,11 @@ original query's normal phases are retained.
 Ordinary direct and forwarded searches save explanation context beside the
 store; `explain` refuses context from a different generation or from a multi-query
 fusion whose component explanations are unavailable.
+`search --explain` also attaches per-hit evidence directly to the returned
+ranking in table, JSON, JSONL, and TOON output, including daemon-forwarded
+queries. Complete-generation streams emit explanation frames for the final
+ranking before the terminal frame. The evidence uses the generation retained
+by the query, so another search cannot replace its explanation context.
 Reranking reads the generation's stored document text, so edits or removals in
 the source tree cannot silently change the content scored for retained results.
 
