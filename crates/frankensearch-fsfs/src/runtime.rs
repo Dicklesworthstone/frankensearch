@@ -4844,9 +4844,18 @@ const REASON_RERANK_NO_TEXT: &str = "query.stage.rerank.disabled.no_document_tex
 const REASON_RERANK_APPLIED: &str = "query.stage.rerank.applied";
 const REASON_RERANK_FAILED: &str = "query.stage.rerank.failed";
 const REASON_RERANK_TIMEOUT: &str = "query.stage.rerank.timeout";
-/// Bytes read from a candidate file for reranking. The cross-encoder
-/// truncates at 512 tokens, so this head already covers what it can see.
-const FSFS_RERANK_DOCUMENT_READ_LIMIT: u64 = 16 * 1024;
+/// Source bytes scanned to select one query-relevant passage for reranking.
+/// Covers the default indexing ceiling without admitting an unbounded file.
+const FSFS_RERANK_DOCUMENT_READ_LIMIT: u64 = 16 << 20;
+/// One bounded passage per candidate, keeping inference cost independent of
+/// document length. Quill's snippet window measures bytes; the final character
+/// cap also bounds the exceptional case of one token larger than that window.
+const FSFS_RERANK_PASSAGE_MAX_CHARS: usize = 2_000;
+/// Keep selected evidence near the front even when hundreds of short code
+/// tokens would otherwise precede it and exhaust the model's token budget.
+const FSFS_RERANK_LEADING_CONTEXT_CHARS: usize = 96;
+const FSFS_RERANK_MATCH_START: &str = "<fsfs-rerank-match>";
+const FSFS_RERANK_MATCH_END: &str = "</fsfs-rerank-match>";
 /// Bytes of a hit's file searched for its snippet's line; covers the default
 /// indexing ceiling (`indexing.max_file_size_mb = 10`).
 const FSFS_HIT_LINE_READ_LIMIT: u64 = 16 << 20;
@@ -17524,7 +17533,7 @@ impl FsfsRuntime {
         let score_result = {
             let work = async {
                 let documents = self
-                    .rerank_documents(cx, index_root, &fused[..depth])
+                    .rerank_documents(cx, index_root, query, &fused[..depth])
                     .await?;
                 if documents.is_empty() {
                     return Ok(None);
@@ -17680,36 +17689,38 @@ impl FsfsRuntime {
         &self,
         cx: &Cx,
         index_root: &Path,
+        query: &str,
         candidates: &[FusedCandidate],
     ) -> SearchResult<Vec<RerankDocument>> {
         Self::semantic_retry_checkpoint(cx, "rerank_documents")?;
-        // The indexed source may have changed or disappeared since this
-        // bundle was sealed. Reranking must use the same retained text as
-        // lexical retrieval, never resolve that row back to the live tree.
-        let retained_lexical = match fs::symlink_metadata(
+        // Prefer indexed canonical content in both layouts: source files may
+        // have changed, and PDFs must contribute their extracted text. A sealed
+        // generation must never fall back to a mutable source file.
+        let retained_generation = match fs::symlink_metadata(
             index_root.join(crate::generation_store::COMPLETE_GENERATION_MANIFEST),
         ) {
-            Ok(metadata) if metadata.is_file() => {
-                let layout = Self::resolve_lexical_engine(index_root)?;
-                let (Some(BlueGreenEngine::Quill), Some(path)) =
-                    (layout.engine(), layout.engine_dir())
-                else {
-                    return Err(SearchError::RerankFailed {
-                        model: FSFS_RERANKER_MODEL_ID.to_owned(),
-                        source: "retained generation has no Quill stored content for reranking"
-                            .into(),
-                    });
-                };
-                Some(QuillSearchIndex::open(cx, path, QuillConfig::default()).await?)
-            }
+            Ok(metadata) if metadata.is_file() => true,
             Ok(_) => {
                 return Err(SearchError::RerankFailed {
                     model: FSFS_RERANKER_MODEL_ID.to_owned(),
                     source: "complete generation marker must be a regular file".into(),
                 });
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
+        };
+        let layout = Self::resolve_lexical_engine(index_root)?;
+        let indexed_lexical = match (layout.engine(), layout.engine_dir()) {
+            (Some(BlueGreenEngine::Quill), Some(path)) => {
+                Some(QuillSearchIndex::open(cx, path, QuillConfig::default()).await?)
+            }
+            _ if retained_generation => {
+                return Err(SearchError::RerankFailed {
+                    model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                    source: "retained generation has no Quill stored content for reranking".into(),
+                });
+            }
+            _ => None,
         };
         let worker_cx = cx.clone();
         #[cfg(feature = "rerank")]
@@ -17725,6 +17736,7 @@ impl FsfsRuntime {
             worker_cx
         };
         let index_root = index_root.to_path_buf();
+        let query = query.to_owned();
         let doc_ids = candidates
             .iter()
             .map(|candidate| candidate.doc_id.clone())
@@ -17746,23 +17758,22 @@ impl FsfsRuntime {
                     None
                 }
             };
-            let canonicalizer = DefaultCanonicalizer::default();
             let mut documents = Vec::with_capacity(doc_ids.len());
             for doc_id in doc_ids {
                 Self::semantic_retry_checkpoint(&child, "rerank_documents")?;
                 Self::semantic_retry_checkpoint(&request_cx, "rerank_documents")?;
-                if let Some(index) = &retained_lexical {
-                    let text = read_retained_rerank_document_text(
+                if let Some(index) = &indexed_lexical {
+                    let text = read_indexed_rerank_document_text(
                         &request_cx,
                         index,
                         &doc_id,
-                        &canonicalizer,
+                        &query,
                     )?;
                     documents.push(RerankDocument { doc_id, text });
                     continue;
                 }
                 let path = resolve_manifest_file_path(&doc_id, sentinel.as_ref(), &index_root);
-                if let Some(text) = read_rerank_document_text(&path, &canonicalizer) {
+                if let Some(text) = read_rerank_document_text(&path, &query) {
                     documents.push(RerankDocument { doc_id, text });
                 }
             }
@@ -21370,11 +21381,10 @@ fn alphanumeric_words(text: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
-/// Canonical text of one candidate file for the cross-encoder, or `None` when
-/// the file is unreadable or canonicalizes to nothing. Reads at most
-/// [`FSFS_RERANK_DOCUMENT_READ_LIMIT`] bytes: the model truncates at 512
-/// tokens, so a longer read would only cost I/O.
-fn read_rerank_document_text(path: &Path, canonicalizer: &DefaultCanonicalizer) -> Option<String> {
+/// Query-relevant canonical text for a candidate without a lexical snapshot.
+/// Reads at most [`FSFS_RERANK_DOCUMENT_READ_LIMIT`] bytes and selects a single
+/// bounded passage. PDFs use the same extraction path as indexing.
+fn read_rerank_document_text(path: &Path, query: &str) -> Option<String> {
     use std::io::Read as _;
 
     let file = match fs::File::open(path) {
@@ -21400,22 +21410,89 @@ fn read_rerank_document_text(path: &Path, canonicalizer: &DefaultCanonicalizer) 
         );
         return None;
     }
-    let text = canonicalizer.canonicalize(&String::from_utf8_lossy(&bytes));
-    (!text.trim().is_empty()).then_some(text)
+    let raw_text = if is_pdf_file(path) {
+        try_extract_pdf_text(&bytes, path)?
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let text = LEXICAL_CANONICALIZER.canonicalize(&raw_text);
+    select_rerank_passage(&text, query)
 }
 
-/// Hydrate an exact row from the sealed shipping-schema lexical snapshot.
+fn rerank_passage_config() -> SnippetConfig {
+    SnippetConfig {
+        max_chars: FSFS_RERANK_PASSAGE_MAX_CHARS,
+        highlight_prefix: FSFS_RERANK_MATCH_START.to_owned(),
+        highlight_postfix: FSFS_RERANK_MATCH_END.to_owned(),
+    }
+}
+
+fn bound_rerank_passage(mut text: String) -> String {
+    if let Some((end, _)) = text.char_indices().nth(FSFS_RERANK_PASSAGE_MAX_CHARS) {
+        text.truncate(end);
+    }
+    text
+}
+
+/// Quill escapes source markup before adding these trusted match markers.
+/// Remove markers before decoding entities so identical markup in the source
+/// remains literal text. Trim excess context before the first selected match
+/// so short tokens cannot push all matching evidence past model truncation.
+fn plain_rerank_passage(marked: &str) -> String {
+    let (before, matched) = marked
+        .find(FSFS_RERANK_MATCH_START)
+        .map_or(("", marked), |offset| marked.split_at(offset));
+    let before = decode_basic_html_entities(before);
+    let context_start = before
+        .char_indices()
+        .rev()
+        .nth(FSFS_RERANK_LEADING_CONTEXT_CHARS - 1)
+        .map_or(0, |(offset, _)| offset);
+    let mut passage = before[context_start..].to_owned();
+    let without_markers = matched
+        .replace(FSFS_RERANK_MATCH_START, "")
+        .replace(FSFS_RERANK_MATCH_END, "");
+    passage.push_str(&decode_basic_html_entities(&without_markers));
+    bound_rerank_passage(passage)
+}
+
+/// Source-only fallback when no index snapshot can supply query document
+/// frequencies. Reuses Quill's tokenizer and fragment selection; indexed
+/// callers below use its parsed query and actual document-frequency weights.
+fn select_rerank_passage(text: &str, query: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    if text
+        .chars()
+        .nth(FSFS_RERANK_LEADING_CONTEXT_CHARS)
+        .is_none()
+    {
+        return Some(text.to_owned());
+    }
+    let terms = alphanumeric_words(query)
+        .map(|term| frankensearch_quill::SnippetTerm::new(term.to_lowercase(), 1));
+    let mut generator = frankensearch_quill::SnippetGenerator::new(
+        frankensearch_quill::Analyzer::FrankensearchDefault,
+        terms,
+        rerank_passage_config(),
+    );
+    generator
+        .snippet_or_prefix(text)
+        .map(|passage| plain_rerank_passage(&passage))
+}
+
+/// Hydrate an exact row from the shipping-schema lexical snapshot.
 /// Missing content fails the optional rerank stage; it never licenses a read
 /// from mutable source files or another generation's catalog.
-fn read_retained_rerank_document_text(
+fn read_indexed_document_text(
     cx: &Cx,
     index: &QuillSearchIndex,
     doc_id: &str,
-    canonicalizer: &DefaultCanonicalizer,
 ) -> SearchResult<String> {
     let unavailable = |reason: &str| SearchError::RerankFailed {
         model: FSFS_RERANKER_MODEL_ID.to_owned(),
-        source: format!("retained rerank document {doc_id:?}: {reason}").into(),
+        source: format!("indexed rerank document {doc_id:?}: {reason}").into(),
     };
     let field_id = |name: &str| {
         DEFAULT_SCHEMA
@@ -21425,11 +21502,11 @@ fn read_retained_rerank_document_text(
             .map(|field| field.id)
             .ok_or_else(|| unavailable("shipping schema is missing a required stored field"))
     };
-    let query = frankensearch_quill::Query::set(
+    let identity_query = frankensearch_quill::Query::set(
         field_id("id")?,
         vec![frankensearch_quill::QueryValue::Str(doc_id.to_owned())],
     );
-    let result = index.search_preparsed_paginated(cx, &query, 2, 0, false)?;
+    let result = index.search_preparsed_paginated(cx, &identity_query, 2, 0, false)?;
     let [hit] = result.hits.as_ref() else {
         return Err(unavailable("exact stored document is missing or ambiguous"));
     };
@@ -21441,20 +21518,53 @@ fn read_retained_rerank_document_text(
     let bytes = index
         .stored_field_value(field_id("content")?, hit.global_docid)?
         .ok_or_else(|| unavailable("canonical stored body is unavailable"))?;
-    let mut text = String::from_utf8(bytes)
+    let text = String::from_utf8(bytes)
         .map_err(|_| unavailable("canonical stored body is not valid UTF-8"))?;
-    let mut end = text
-        .len()
-        .min(usize::try_from(FSFS_RERANK_DOCUMENT_READ_LIMIT).unwrap_or(usize::MAX));
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    let text = canonicalizer.canonicalize(&text);
     if text.trim().is_empty() {
         return Err(unavailable("canonical stored body is empty"));
     }
     Ok(text)
+}
+
+fn read_indexed_rerank_document_text(
+    cx: &Cx,
+    index: &QuillSearchIndex,
+    doc_id: &str,
+    query: &str,
+) -> SearchResult<String> {
+    let text = read_indexed_document_text(cx, index, doc_id)?;
+    // Small bodies already fit the model input. Preserve their punctuation
+    // and full text, including fenced code that embedding canonicalization
+    // would have collapsed. Empty queries deterministically use the prefix.
+    if text
+        .chars()
+        .nth(FSFS_RERANK_LEADING_CONTEXT_CHARS)
+        .is_none()
+        || query.trim().is_empty()
+    {
+        return Ok(bound_rerank_passage(text));
+    }
+    // Release the complete hydrated body before Quill materializes it for
+    // passage selection, so only one full body is retained at a time.
+    drop(text);
+    FsfsRuntime::semantic_retry_checkpoint(cx, "rerank_documents")?;
+    let passage = index
+        .snippets_for_documents(
+            cx,
+            query,
+            &[doc_id],
+            &rerank_passage_config(),
+            usize::try_from(FSFS_RERANK_DOCUMENT_READ_LIMIT).unwrap_or(usize::MAX),
+        )?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| SearchError::RerankFailed {
+            model: FSFS_RERANKER_MODEL_ID.to_owned(),
+            source: format!("indexed rerank document {doc_id:?}: query passage is unavailable")
+                .into(),
+        })?;
+    Ok(plain_rerank_passage(&passage))
 }
 
 fn normalize_model_key(value: &str) -> String {
@@ -30719,6 +30829,15 @@ mod tests {
                     .await
                     .unwrap();
             }
+            let deep_body = format!(
+                "Unrelated introduction. {} Recovery uses café backoff & jitter when attempts < limit; durable recovery remains bounded.",
+                "ordinary background context ".repeat(1_000)
+            );
+            lexical
+                .index_document(&cx, &IndexableDocument::new("deep.pdf", deep_body))
+                .await
+                .unwrap();
+            fs::write(source.join("deep.pdf"), b"%PDF-1.4\n\0live binary bytes").unwrap();
             let mut empty = IndexableDocument::new("empty-body.md", "");
             empty.title = Some("Stored title without canonical body".to_owned());
             lexical.index_document(&cx, &empty).await.unwrap();
@@ -30771,7 +30890,7 @@ mod tests {
             };
             let ordered = [candidate(originals[1].0), candidate(originals[0].0)];
             let documents = runtime
-                .rerank_documents(&cx, generation.path(), &ordered)
+                .rerank_documents(&cx, generation.path(), "retry recovery", &ordered)
                 .await
                 .expect("hydrate reranking from sealed lexical bodies");
             assert_eq!(documents.len(), 2);
@@ -30779,14 +30898,202 @@ mod tests {
                 assert_eq!(actual.doc_id, expected.0);
                 assert_eq!(actual.text, expected.1);
             }
+            let deep_documents = runtime
+                .rerank_documents(
+                    &cx,
+                    generation.path(),
+                    "recovery backoff jitter",
+                    &[candidate("deep.pdf")],
+                )
+                .await
+                .expect("hydrate deep PDF passage from sealed extracted text");
+            let passage = &deep_documents[0].text;
+            assert!(
+                passage.contains("café backoff & jitter when attempts < limit"),
+                "{passage}"
+            );
+            assert!(!passage.contains("Unrelated introduction"));
+            assert!(!passage.contains("%PDF"));
+            assert!(!passage.contains("&amp;") && !passage.contains("&lt;"));
+            assert!(passage.chars().count() <= super::FSFS_RERANK_PASSAGE_MAX_CHARS);
             for missing in ["live-only.md", "empty-body.md"] {
                 let error = runtime
-                    .rerank_documents(&cx, generation.path(), &[candidate(missing)])
+                    .rerank_documents(
+                        &cx,
+                        generation.path(),
+                        "retry recovery",
+                        &[candidate(missing)],
+                    )
                     .await
                     .expect_err("missing retained body must never fall back to live text");
                 assert!(matches!(error, SearchError::RerankFailed { .. }), "{error}");
             }
             assert_eq!(store.active(&cx).unwrap(), Some(generation));
+        });
+    }
+
+    #[test]
+    fn rerank_source_passage_finds_deep_unicode_text_and_bounds_fallbacks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("long.md");
+        let source = format!(
+            "Unrelated opening. {}\n\n## Recovery\n\nUse café retries & backoff when attempts < limit.\n",
+            "背景 context ".repeat(2_000)
+        );
+        fs::write(&path, &source).unwrap();
+        let passage =
+            super::read_rerank_document_text(&path, "CAFÉ backoff").expect("deep source passage");
+        assert!(
+            passage.contains("café retries & backoff when attempts < limit"),
+            "{passage}"
+        );
+        assert!(!passage.contains("Unrelated opening"));
+        assert!(passage.chars().count() <= super::FSFS_RERANK_PASSAGE_MAX_CHARS);
+
+        let prefix = super::read_rerank_document_text(&path, "missingterm").unwrap();
+        assert!(prefix.starts_with("Unrelated opening"));
+        assert!(prefix.chars().count() <= super::FSFS_RERANK_PASSAGE_MAX_CHARS);
+        assert_eq!(super::select_rerank_passage(" \n\t ", "query"), None);
+        let unbroken = "界".repeat(super::FSFS_RERANK_PASSAGE_MAX_CHARS + 20);
+        let bounded = super::select_rerank_passage(&unbroken, "query").unwrap();
+        assert!(bounded.chars().all(|ch| ch == '界'));
+        assert!(bounded.chars().count() <= super::FSFS_RERANK_PASSAGE_MAX_CHARS);
+
+        // The winning 2,000-byte fragment contains 950 short tokens before
+        // its match. A 512-token cross-encoder would otherwise lose the only
+        // evidence even though the passage contains it.
+        let short_tokens = format!(
+            "{}needle evidence {}",
+            "x ".repeat(950),
+            "background ".repeat(40)
+        );
+        let focused = super::select_rerank_passage(&short_tokens, "needle evidence").unwrap();
+        let anchor = focused.find("needle").unwrap();
+        assert!(focused[..anchor].chars().count() <= super::FSFS_RERANK_LEADING_CONTEXT_CHARS);
+        assert!(focused[..anchor].split_whitespace().count() < 64);
+        assert!(!focused.contains(super::FSFS_RERANK_MATCH_START));
+        let below_cap = format!("{}needle evidence", "x ".repeat(950));
+        assert!(below_cap.len() < super::FSFS_RERANK_PASSAGE_MAX_CHARS);
+        let focused = super::select_rerank_passage(&below_cap, "needle evidence").unwrap();
+        assert!(
+            focused[..focused.find("needle").unwrap()]
+                .split_whitespace()
+                .count()
+                < 64
+        );
+
+        let literal_markup = "&lt;fsfs-rerank-match&gt; literal &amp;amp; ".to_owned()
+            + super::FSFS_RERANK_MATCH_START
+            + "needle &amp; value"
+            + super::FSFS_RERANK_MATCH_END;
+        assert_eq!(
+            super::plain_rerank_passage(&literal_markup),
+            "<fsfs-rerank-match> literal &amp; needle & value"
+        );
+    }
+
+    /// This test double makes the model's actual passage input observable in
+    /// the resulting order. It certifies hydration, not model relevance.
+    struct PassageReranker;
+
+    impl frankensearch_core::SyncRerank for PassageReranker {
+        fn rerank_sync(
+            &self,
+            _query: &str,
+            documents: &[frankensearch_core::RerankDocument],
+        ) -> frankensearch_core::SearchResult<Vec<frankensearch_core::RerankScore>> {
+            Ok(documents
+                .iter()
+                .enumerate()
+                .map(|(index, document)| frankensearch_core::RerankScore {
+                    doc_id: document.doc_id.clone(),
+                    score: if document.text.contains("café backoff & jitter") {
+                        0.9
+                    } else {
+                        0.1
+                    },
+                    original_rank: index,
+                    raw_logit: None,
+                })
+                .collect())
+        }
+
+        fn id(&self) -> &'static str {
+            "passage-input-test"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "passage input observer (test double)"
+        }
+    }
+
+    #[test]
+    fn rerank_stage_scores_deep_indexed_passage_instead_of_changed_source_prefix() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let index_root = temp.path().join("legacy");
+            let lexical = create_test_quill(&cx, &index_root.join("lexical")).await;
+            let body = format!(
+                "Introduction about unrelated tasks. {} Recovery uses café backoff & jitter after transient network errors.",
+                "background information ".repeat(1_000)
+            );
+            for (name, content) in [
+                ("short.md", "A short unrelated article about bread."),
+                ("deep.pdf", body.as_str()),
+            ] {
+                lexical
+                    .index_document(&cx, &IndexableDocument::new(name, content))
+                    .await
+                    .unwrap();
+                fs::write(
+                    index_root.join(name),
+                    "Changed live source has no relevant content.",
+                )
+                .unwrap();
+            }
+            lexical.commit(&cx).await.unwrap();
+            drop(lexical);
+            let candidate = |doc_id: &str| FusedCandidate {
+                doc_id: doc_id.to_owned(),
+                fused_score: 1.0,
+                prior_boost: 0.0,
+                lexical_rank: Some(0),
+                semantic_rank: None,
+                hash_rank: None,
+                lexical_score: Some(1.0),
+                semantic_score: None,
+                hash_score: None,
+                in_both_sources: false,
+            };
+            let mut config = FsfsConfig::default();
+            config.search.rerank = true;
+            let runtime = FsfsRuntime::new(config);
+            let reranker = frankensearch_core::SyncRerankerAdapter(PassageReranker);
+            let stage = super::StageDirective {
+                enabled: true,
+                candidate_budget: 2,
+                timeout_ms: 10_000,
+                reason_code: "query.stage.rerank.enabled",
+            };
+            let outcome = runtime
+                .apply_rerank_stage(
+                    &cx,
+                    Some(&reranker),
+                    &stage,
+                    &index_root,
+                    "recovery backoff jitter",
+                    vec![candidate("short.md"), candidate("deep.pdf")],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.payload.status,
+                crate::output_schema::RerankStageStatus::Applied
+            );
+            assert_eq!(outcome.payload.reranked_hits, 2);
+            assert_eq!(outcome.fused[0].doc_id, "deep.pdf");
+            assert_eq!(outcome.payload.scores[0].original_rank, 2);
+            assert!(outcome.payload.scores[0].score > outcome.payload.scores[1].score);
         });
     }
 
@@ -43863,6 +44170,12 @@ mod tests {
         let text = super::try_extract_pdf_text(pdf.as_bytes(), Path::new("two-page-fonts.pdf"))
             .expect("valid digital PDF must extract text");
         assert_eq!(text.split_whitespace().collect::<String>(), "AB");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("two-page-fonts.pdf");
+        fs::write(&path, pdf.as_bytes()).unwrap();
+        let rerank_text = super::read_rerank_document_text(&path, "B")
+            .expect("source-only PDF reranking must extract text");
+        assert_eq!(rerank_text.split_whitespace().collect::<String>(), "AB");
     }
 
     #[test]

@@ -424,6 +424,12 @@ fsfs index ~/projects --watch
 fsfs doctor
 ```
 
+Reranking selects one bounded, query-relevant passage from each candidate's
+indexed text. A match deep inside a long file can therefore contribute its
+surrounding context to the cross-encoder. When Quill holds the document body,
+this also preserves the indexed version after a source edit or deletion and
+uses extracted PDF text. Vector-only indexes use a bounded source-text read.
+
 ### Query syntax
 
 The word-matching (BM25) tier matches query words exactly, ignoring case,

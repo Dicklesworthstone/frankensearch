@@ -1358,31 +1358,28 @@ mod retained_delete_tests {
             );
             let fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
             assert_eq!(
-                read_retained_rerank_document_text(
+                read_indexed_document_text(
                     &cx,
                     old.resources.lexical_index.as_ref().unwrap(),
                     "alpha.md",
-                    &canonicalizer,
                 )
                 .unwrap(),
                 "sharedtoken document alpha.md"
             );
             assert_eq!(
-                read_retained_rerank_document_text(
+                read_indexed_document_text(
                     &cx,
                     fresh.resources.lexical_index.as_ref().unwrap(),
                     "alpha.md",
-                    &canonicalizer,
                 )
                 .unwrap(),
                 expected
             );
             assert_eq!(
-                read_retained_rerank_document_text(
+                read_indexed_document_text(
                     &cx,
                     fresh.resources.lexical_index.as_ref().unwrap(),
                     "virtual/new.md",
-                    &canonicalizer,
                 )
                 .unwrap(),
                 "appendnovel new body"
@@ -1553,11 +1550,10 @@ mod retained_delete_tests {
                         .any(|hit| hit.path == *id && hit.lexical_rank.is_some())
                 }));
                 assert_eq!(
-                    read_retained_rerank_document_text(
+                    read_indexed_document_text(
                         &cx,
                         fresh.resources.lexical_index.as_ref().unwrap(),
                         id,
-                        &LEXICAL_CANONICALIZER,
                     )
                     .unwrap(),
                     lexical,
