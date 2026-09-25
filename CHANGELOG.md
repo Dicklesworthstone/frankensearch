@@ -243,6 +243,17 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **`(a OR b) AND c` no longer loses matches on merged segments.** A
+  disjunction under a conjunction returned a strict subset of the right
+  answer once a segment had been built by `concat_merge`, which cass's staged
+  rebuild and bounded merges use. `BufferedUnionScorer::seek_danger` did not
+  answer a target at or before its current document from its buffer, so the
+  intersection skipped buffered matches. The published hotfix
+  `frankensearch-quill` 0.3.4 carries the fix, and main now does too. The
+  regression test replays cass's metamorphic corpus in 84 layouts x 120
+  nested queries. Without the fix main gives 2,516 wrong answers; with it,
+  none (GH #58, bd-5iuad).
+
 - **CASS queries use standard Boolean precedence and parentheses on main,
   in Quill and in the Tantivy oracle.** Quill 0.3.3 shipped this grammar
   from a hotfix branch. main now has it too: NOT binds tightest, then AND
@@ -255,10 +266,10 @@ qualified; individual results below are narrower than release acceptance.
   is open, so `foo(bar)` stays one term. Queries both grammars read alike
   keep their exact query tree and scores. The Quill/oracle differential
   checks mixed precedence, grouping and parity negation again. main's
-  `frankensearch-quill` is now 0.3.4 and `frankensearch-lexical` 0.3.2.
-  crates.io already has quill 0.3.2 and 0.3.3 from the hotfix branch, so a
-  release from main cannot return cass to the legacy grammar. Indexes from
-  0.3.1 through 0.3.3 open unchanged. The gauntlet binds the new versions in
+  `frankensearch-quill` is now 0.3.5 and `frankensearch-lexical` 0.3.2.
+  crates.io already has quill 0.3.2, 0.3.3 and 0.3.4 from hotfix branches,
+  so a release from main cannot return cass to the legacy grammar. Indexes
+  from 0.3.1 through 0.3.4 open unchanged. The gauntlet binds the new versions in
   built-in engine profile v9 and oracle dependency contract v11. The CASS
   schema contract preimage moves to v5, which records the new parser and
   negation. Archived v1 to v8 receipts keep their frozen identities

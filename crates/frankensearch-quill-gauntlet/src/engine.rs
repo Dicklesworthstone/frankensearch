@@ -120,11 +120,12 @@ const BUILT_IN_PROFILE_V7_LEXICAL_CRATE_VERSION: &str = "0.3.0";
 // v7 remains an exact archived 0.3.0 identity and cannot create fresh runs.
 const BUILT_IN_PROFILE_V8_QUILL_CRATE_VERSION: &str = "0.3.1";
 const BUILT_IN_PROFILE_V8_LEXICAL_CRATE_VERSION: &str = "0.3.1";
-// v9 (GH #56) binds quill 0.3.4 and lexical 0.3.2, which both parse the cass#52
-// grammar (NOT > AND > OR, parentheses, parity negation). The CASS schema
-// contract therefore moves to preimage v5; the analyzer and every scalar
-// contract stay v2's. v8 remains an exact archived 0.3.1 identity.
-const BUILT_IN_PROFILE_V9_QUILL_CRATE_VERSION: &str = "0.3.4";
+// v9 (GH #56, #58) binds quill 0.3.5 and lexical 0.3.2, which both parse the
+// cass#52 grammar (NOT > AND > OR, parentheses, parity negation). The CASS
+// schema contract therefore moves to preimage v5; the analyzer and every
+// scalar contract stay v2's. v8 remains an exact archived 0.3.1 identity.
+// (0.3.4 is the published hotfix source, which main never shipped as v9.)
+const BUILT_IN_PROFILE_V9_QUILL_CRATE_VERSION: &str = "0.3.5";
 const BUILT_IN_PROFILE_V9_LEXICAL_CRATE_VERSION: &str = "0.3.2";
 const BUILT_IN_PROFILE_V9_CASS_SCHEMA_HASH: &str =
     "395b987b98bfc6e0505338cec20591f35ead6910a7be243236e09f98b9a9c88f";
@@ -7281,7 +7282,7 @@ mod tests {
                 assert!(
                     archived.validate_builtin_contract().is_err(),
                     "schema v{archived_schema} cannot create a run under the release \
-                     dependency contract (quill 0.3.4, lexical 0.3.2)"
+                     dependency contract (quill 0.3.5, lexical 0.3.2)"
                 );
             }
 
