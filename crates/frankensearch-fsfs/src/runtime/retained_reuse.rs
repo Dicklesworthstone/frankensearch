@@ -1417,6 +1417,11 @@ mod generation_tests {
                     payload.generation.indexed_files
                 );
                 for row in 0..index.record_count() {
+                    // A file removed from the tree leaves a tombstoned row;
+                    // only live rows must match their current source.
+                    if index.is_deleted(row) {
+                        continue;
+                    }
                     let text =
                         fs::read_to_string(source.join(index.doc_id_at(row).unwrap())).unwrap();
                     let expected =
@@ -1540,6 +1545,12 @@ mod generation_tests {
                             )
                             .await
                             .unwrap();
+                            if mutation == "lexical" {
+                                // Rewrite a live row: remove it before adding
+                                // different stored content under the same id.
+                                assert!(index.delete_document(&cx, "doc-0.md").await.unwrap());
+                                index.commit(&cx).await.unwrap();
+                            }
                             index
                                 .index_document(
                                     &cx,
