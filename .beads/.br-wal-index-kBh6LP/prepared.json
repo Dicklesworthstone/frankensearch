@@ -1,0 +1,9 @@
+{
+  "schema_version": "br.wal_index.quarantine.v1",
+  "database_path": "/data/projects/frankensearch/.beads/beads.db",
+  "reason": "initialized-zero-page-wal-index",
+  "main_sha256": "a675b1578c374db38ef04443a2446da55cd9f717c96eaa372af2bf57b3958449",
+  "wal_sha256": "20b8050c27a8af00492864c8d0f3858f724e5eebdfbadfc3988bf26697330c90",
+  "shm_sha256": "75f25efbeb8860ba480b4375315a990c7d9d9479412be52e559762623ca5dd53",
+  "retained_index": "/data/projects/frankensearch/.beads/.br-wal-index-kBh6LP/poisoned-shm"
+}
