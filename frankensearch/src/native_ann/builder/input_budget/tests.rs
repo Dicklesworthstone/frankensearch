@@ -19,7 +19,13 @@ fn byte_budget_partitions_utf8_without_truncation_and_combines_with_count_limit(
             let end = batch_end(&cx, &docs, start, 3, Some(5)).unwrap();
             assert!(end > start);
             assert!(end - start <= 3);
-            assert!(docs[start..end].iter().map(|doc| doc.content.len()).sum::<usize>() <= 5);
+            assert!(
+                docs[start..end]
+                    .iter()
+                    .map(|doc| doc.content.len())
+                    .sum::<usize>()
+                    <= 5
+            );
             groups.push(
                 docs[start..end]
                     .iter()
