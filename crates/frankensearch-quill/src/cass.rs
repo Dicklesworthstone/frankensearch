@@ -1014,6 +1014,314 @@ mod tests {
         });
     }
 
+    /// A disjunction under a conjunction must return every match in every
+    /// segment layout. cass's metamorphic oracle (`tests/search_metamorphic.rs`)
+    /// saw `(kiwiword OR limeword) AND mangoword` miss one conversation's
+    /// `limeword AND mangoword` rows in one indexing run and not in another,
+    /// so the answer depended on insertion order or commit boundaries. The
+    /// corpus replays that oracle (eighteen sessions of ten messages, seeded
+    /// terms); every layout re-indexes it, and every nested query's hits must
+    /// equal the set-algebra answer.
+    #[test]
+    fn nested_disjunction_under_conjunction_matches_set_algebra_in_every_layout() {
+        use std::collections::BTreeSet;
+
+        const TERMS: [&str; 5] = ["kiwiword", "limeword", "mangoword", "plumword", "pearword"];
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        // (session, index, term indices), exactly as the cass oracle draws them.
+        let mut messages: Vec<(u64, u64, Vec<usize>)> = Vec::new();
+        for session in 0..18_u64 {
+            let mut rng =
+                0x9E37_79B9_7F4A_7C15_u64 ^ (session + 1).wrapping_mul(0x2545_F491_4F6C_DD1D);
+            for index in 0..10_u64 {
+                let terms = if index == 0 {
+                    Vec::new()
+                } else {
+                    (0..TERMS.len())
+                        .filter(|_| next(&mut rng) % 100 < 40)
+                        .collect()
+                };
+                messages.push((session, index, terms));
+            }
+        }
+        // A revision keeps the message's terms, so every expected answer is
+        // unchanged; it only leaves a tombstone in the sealed segment.
+        let document = |position: usize, revised: bool| {
+            let (session, index, terms) = &messages[position];
+            let words: Vec<&str> = terms.iter().map(|term| TERMS[*term]).collect();
+            let suffix = if revised { " revisedcopy" } else { "" };
+            sample_document(
+                &format!("s{session:02}"),
+                *index,
+                "codex",
+                &format!("msgid{} note", session * 100),
+                &format!(
+                    "msgid{} note {}{suffix}",
+                    session * 100 + index,
+                    words.join(" ")
+                ),
+            )
+            .to_schema_document()
+        };
+
+        // Each layout is a list of commits; each commit a list of positions.
+        let all: Vec<usize> = (0..messages.len()).collect();
+        let session_of = |position: &usize| messages[*position].0;
+        let mut layouts: Vec<(String, Vec<Vec<usize>>)> = vec![
+            ("single".to_owned(), vec![all.clone()]),
+            (
+                "reversed".to_owned(),
+                vec![all.iter().rev().copied().collect()],
+            ),
+            (
+                "per-session".to_owned(),
+                (0..18_u64)
+                    .map(|session| {
+                        all.iter()
+                            .copied()
+                            .filter(|position| session_of(position) == session)
+                            .collect()
+                    })
+                    .collect(),
+            ),
+            (
+                "chunks-64".to_owned(),
+                all.chunks(64).map(<[usize]>::to_vec).collect(),
+            ),
+            (
+                "session16-last".to_owned(),
+                vec![
+                    all.iter()
+                        .copied()
+                        .filter(|p| session_of(p) != 16)
+                        .collect(),
+                    all.iter()
+                        .copied()
+                        .filter(|p| session_of(p) == 16)
+                        .collect(),
+                ],
+            ),
+            (
+                "session16-alone-before-17".to_owned(),
+                vec![
+                    all.iter().copied().filter(|p| session_of(p) < 16).collect(),
+                    all.iter()
+                        .copied()
+                        .filter(|p| session_of(p) == 16)
+                        .collect(),
+                    all.iter()
+                        .copied()
+                        .filter(|p| session_of(p) == 17)
+                        .collect(),
+                ],
+            ),
+        ];
+        for seed in 1..=4_u64 {
+            let mut shuffled = all.clone();
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            for i in (1..shuffled.len()).rev() {
+                let bound = u64::try_from(i + 1).expect("bound");
+                let j = usize::try_from(next(&mut rng) % bound).expect("index");
+                shuffled.swap(i, j);
+            }
+            layouts.push((format!("shuffled-{seed}"), vec![shuffled.clone()]));
+            layouts.push((
+                format!("shuffled-{seed}-chunks-40"),
+                shuffled.chunks(40).map(<[usize]>::to_vec).collect(),
+            ));
+        }
+        // The same layouts again with revisions after the last commit: each
+        // revised position is upserted under its stable identity, which
+        // tombstones its sealed row (cass does this for an edited message and
+        // on some reconcile paths).
+        let session16_head: Vec<usize> = all
+            .iter()
+            .copied()
+            .filter(|p| session_of(p) == 16 && messages[*p].1 < 4)
+            .collect();
+        let revisions: Vec<(&str, Vec<usize>)> = vec![
+            ("first-1", all[..1].to_vec()),
+            ("first-4", all[..4].to_vec()),
+            ("first-10", all[..10].to_vec()),
+            ("session16-head", session16_head),
+            ("every-7th", all.iter().copied().step_by(7).collect()),
+        ];
+        // Each layout also runs with its committed segments concat-merged into
+        // one before any revision, as cass's staged rebuild folds shards.
+        let plain = layouts.clone();
+        /// Name, commits (positions per commit), concat-merge, revisions.
+        type Layout = (String, Vec<Vec<usize>>, bool, Vec<usize>);
+        let mut layouts: Vec<Layout> = Vec::new();
+        for (name, commits) in &plain {
+            let merges: &[bool] = if commits.len() > 1 {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for &merge in merges {
+                let base = if merge {
+                    format!("{name}+merged")
+                } else {
+                    name.clone()
+                };
+                layouts.push((base.clone(), commits.clone(), merge, Vec::new()));
+                for (revision, positions) in &revisions {
+                    layouts.push((
+                        format!("{base}+revise-{revision}"),
+                        commits.clone(),
+                        merge,
+                        positions.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Every `(a OR b) AND c` and `c AND (a OR b)` over distinct terms.
+        let mut queries: Vec<(String, BTreeSet<u64>)> = Vec::new();
+        for c in 0..TERMS.len() {
+            for a in 0..TERMS.len() {
+                for b in (a + 1)..TERMS.len() {
+                    if a == c || b == c {
+                        continue;
+                    }
+                    let expected: BTreeSet<u64> = messages
+                        .iter()
+                        .filter(|(_, _, terms)| {
+                            (terms.contains(&a) || terms.contains(&b)) && terms.contains(&c)
+                        })
+                        .map(|(session, index, _)| session * 100 + index)
+                        .collect();
+                    let (ta, tb, tc) = (TERMS[a], TERMS[b], TERMS[c]);
+                    queries.push((format!("({ta} OR {tb}) AND {tc}"), expected.clone()));
+                    queries.push((format!("{tc} AND ({ta} OR {tb})"), expected));
+                }
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let config = crate::QuillConfig {
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..crate::QuillConfig::default()
+            };
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS query parser");
+            let mut failures = Vec::new();
+            for (name, commits, merge, revised) in &layouts {
+                let directory = tempfile::tempdir().expect("index directory");
+                let index = crate::index::QuillIndex::create_with_schema(
+                    &cx,
+                    directory.path(),
+                    crate::schema::CASS_SEMANTIC_SCHEMA,
+                    config.clone(),
+                )
+                .await
+                .expect("create a CASS-schema index");
+                for commit in commits {
+                    let batch: Vec<_> = commit
+                        .iter()
+                        .map(|position| document(*position, false))
+                        .collect();
+                    index
+                        .index_schema_documents(&cx, &batch)
+                        .await
+                        .expect("ingest a batch");
+                    index.commit(&cx).await.expect("commit a batch");
+                }
+                if *merge {
+                    let inputs: Vec<u64> = index
+                        .snapshot()
+                        .expect("snapshot")
+                        .segments()
+                        .iter()
+                        .map(|segment| segment.manifest().segment_id)
+                        .collect();
+                    let mut output = 0x0C0A_7000_u64;
+                    while inputs.contains(&output) {
+                        output += 1;
+                    }
+                    index
+                        .concat_merge(&cx, &inputs, output, 1_700_000_000)
+                        .await
+                        .expect("concat-merge every committed segment");
+                }
+                if !revised.is_empty() {
+                    let batch: Vec<_> = revised
+                        .iter()
+                        .map(|position| document(*position, true))
+                        .collect();
+                    index
+                        .upsert_schema_documents(&cx, &batch)
+                        .await
+                        .expect("upsert revisions");
+                    index.commit(&cx).await.expect("publish revisions");
+                }
+                let snapshot = index.snapshot().expect("snapshot");
+                let segments = snapshot.segments().len();
+                let tombstones: u64 = snapshot
+                    .segments()
+                    .iter()
+                    .map(|segment| segment.tombstone_count())
+                    .sum();
+                let reader = crate::index::QuillSearchIndex::open_with_schema(
+                    &cx,
+                    directory.path(),
+                    crate::schema::CASS_SEMANTIC_SCHEMA,
+                    config.clone(),
+                )
+                .await
+                .expect("open a CASS-schema reader");
+                // cass fetches limit * 3 / 2 without an exact count first.
+                for ((query, expected), exact) in queries
+                    .iter()
+                    .flat_map(|query| [(query, false), (query, true)])
+                {
+                    let parsed = parser.parse(query, &crate::query::CassQueryFilters::default());
+                    let page = reader
+                        .search_preparsed_paginated(&cx, &parsed.query, 1500, 0, exact)
+                        .expect("search");
+                    let got: BTreeSet<u64> = page
+                        .hits
+                        .iter()
+                        .map(|hit| {
+                            let session: u64 = hit.document_id[1..3].parse().expect("session");
+                            let index: u64 = hit
+                                .document_id
+                                .rsplit('#')
+                                .next()
+                                .and_then(|tail| tail.parse().ok())
+                                .expect("msg_idx");
+                            session * 100 + index
+                        })
+                        .collect();
+                    let expected_count = u64::try_from(expected.len()).expect("count");
+                    let count_ok = !exact || page.total_count == Some(expected_count);
+                    if &got != expected || !count_ok {
+                        failures.push(format!(
+                            "{name} ({segments} segments, {tombstones} tombstones, exact={exact}) {query}: missing {:?}, unexpected {:?}, total_count {:?} vs {}",
+                            expected.difference(&got).collect::<Vec<_>>(),
+                            got.difference(expected).collect::<Vec<_>>(),
+                            page.total_count,
+                            expected.len()
+                        ));
+                    }
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "{} wrong answers:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+        });
+    }
+
     #[test]
     fn preview_is_character_bounded_and_only_ellipsizes_when_truncating() {
         assert_eq!(cass_build_preview("abc", 400), "abc");

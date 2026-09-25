@@ -7227,8 +7227,16 @@ impl<'a> BufferedUnionScorer<'a> {
     }
 
     fn seek_danger(&mut self, target: u32) -> Result<SeekDangerResult, ArgusError> {
-        if self.current.is_none() {
+        let Some(current) = self.current else {
             return Ok(SeekDangerResult::SeekLowerBound(None));
+        };
+        // A target at or before the current document is answered by the
+        // buffer, exactly as `seek` answers it. The children have already been
+        // drained past this window, so their positions are not lower bounds
+        // for the documents still buffered in it: consulting them would skip
+        // every buffered match between `target` and the next child document.
+        if current >= target {
+            return classify_seek_result(target, Some(current));
         }
         if self.window_start.is_some_and(|start| {
             u64::from(target).saturating_sub(u64::from(start)) < UNION_HORIZON_U64
