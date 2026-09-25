@@ -80,9 +80,7 @@ fn open_exact(
     validate_admitted(&index)?;
     // The common index assembler can degrade a mixed publication to fast-only.
     // A caller-selected required tier must never disappear through that path.
-    if index.fast_admitted_binding() != Some(fast)
-        || index.quality_admitted_binding() != quality
-    {
+    if index.fast_admitted_binding() != Some(fast) || index.quality_admitted_binding() != quality {
         return Err(rejected(
             "open",
             "opened resources do not retain every explicitly selected tier and binding",
@@ -95,10 +93,10 @@ fn validate_admitted(index: &TwoTierIndex) -> SearchResult<()> {
     let fast = index
         .fast_admitted_binding()
         .ok_or_else(|| rejected("replace", "the fast tier must retain exact v2 admission"))?;
-    let paths = match index.quality_index_path() {
-        Some(quality) => TwoTierIndexPaths::new(index.fast_index_path()).with_quality_index(quality),
-        None => TwoTierIndexPaths::new(index.fast_index_path()),
-    };
+    let mut paths = TwoTierIndexPaths::new(index.fast_index_path());
+    if let Some(quality) = index.quality_index_path() {
+        paths = paths.with_quality_index(quality);
+    }
     validate_bindings(&paths, fast, index.quality_admitted_binding())?;
     for owner in [index.fast_admitted_owner(), index.quality_admitted_owner()]
         .into_iter()
@@ -187,8 +185,14 @@ pub(super) fn validate_replacement(
         .ok_or_else(|| rejected("replace", "replacement cannot discard v2 admission"))?;
     validate_successor_bindings(current, fast, candidate.quality_admitted_binding())?;
     for (old, new) in [
-        (current.fast_admitted_owner(), candidate.fast_admitted_owner()),
-        (current.quality_admitted_owner(), candidate.quality_admitted_owner()),
+        (
+            current.fast_admitted_owner(),
+            candidate.fast_admitted_owner(),
+        ),
+        (
+            current.quality_admitted_owner(),
+            candidate.quality_admitted_owner(),
+        ),
     ] {
         if let (Some(old), Some(new)) = (old, new)
             && old.witness().generation == new.witness().generation

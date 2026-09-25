@@ -200,12 +200,28 @@ fn full_contract_drift_and_generation_regression_are_refused() {
         write(&path, &original, &["a"], 0);
         let cache = cache(&cx, dir.path(), &original, None);
         let expected = cache.current();
-        for field in ["space", "producer", "input", "storage", "older", "same-sequence"] {
+        for field in [
+            "space",
+            "producer",
+            "input",
+            "storage",
+            "older",
+            "same-sequence",
+        ] {
             let mut identity = original.frozen_identity().identity.clone();
             match field {
-                "space" => identity.space.logical_model_id.push_str("-other"),
+                "space" => {
+                    // A consistent foreign space: the producer rebinds it, so
+                    // the bundle freezes and only the cache can refuse it.
+                    identity.space.logical_model_id.push_str("-other");
+                    identity.producer.space_fingerprint = identity.space.fingerprint();
+                }
                 "producer" => identity.producer.implementation_revision.push_str("-other"),
-                "input" => identity.input.doc_id_semantics.push_str("-other"),
+                "input" => {
+                    identity.input.doc_id_semantics.push_str("-other");
+                    identity.space.input_contract_fingerprint = identity.input.fingerprint();
+                    identity.producer.space_fingerprint = identity.space.fingerprint();
+                }
                 "storage" => identity.storage.quantization = QuantizationFormat::F16,
                 _ => {}
             }
@@ -222,7 +238,9 @@ fn full_contract_drift_and_generation_regression_are_refused() {
             write(&path, &candidate_binding, &["a"], 1);
             let before = fs::read(&path).unwrap();
             assert!(
-                cache.replace(open(&cache, &candidate_binding, None)).is_err(),
+                cache
+                    .replace(open(&cache, &candidate_binding, None))
+                    .is_err(),
                 "{field}"
             );
             assert!(
@@ -288,8 +306,7 @@ fn a_v2_cache_cannot_be_downgraded_to_legacy_or_foreign_paths() {
         let retained = cache.current();
         let staged = dir.path().join("legacy.fsvi");
         let mut writer =
-            VectorIndex::create_with_revision(&staged, "fast", "v1", 2, Quantization::F32)
-                .unwrap();
+            VectorIndex::create_with_revision(&staged, "fast", "v1", 2, Quantization::F32).unwrap();
         writer.write_record("a", &[1.0, 0.0]).unwrap();
         writer.finish().unwrap();
         fs::rename(staged, &path).unwrap();
