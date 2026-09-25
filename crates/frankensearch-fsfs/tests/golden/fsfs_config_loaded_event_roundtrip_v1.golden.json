@@ -33,6 +33,7 @@
     },
     "indexing": {
       "fast_model": "potion-multilingual-128M",
+      "fast_window_max_per_file": 1,
       "quality_model": "all-MiniLM-L6-v2",
       "model_dir": "/home/test/.cache/frankensearch/models",
       "offline": false,
