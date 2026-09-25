@@ -19224,3 +19224,31 @@ A/B with an A/A null). The dependency was never committed.
   shows retained and peak RSS at or below glibc on this same corpus and
   harness, or a workload profiles allocation as a measured share of warm
   query time; Linux results do not cover macOS or Windows.
+
+### 2026-09-25 — REJECT: weighting the vector RRF term by the fraction of a document the embedders saw (bd-yen0x, IcyBay)
+
+The problem is real and stays open. On 253 judged code queries (closed bead
+title -> Rust files changed by commits naming the bead; 579 files), release
+fsfs @65a76f88 through `fsfs serve` scores lexical_only nDCG@10 0.569, full
+Initial 0.308, Refined 0.340: the 2,000-character prefix vectors of long files
+rank near noise and equal-weight RRF lets them displace lexical hits. The lever
+scaled each semantic candidate's RRF term by coverage = min(1, 2000 /
+stored-content bytes), read per candidate from a Quill length accessor, with the
+same weight in explain (patch kept outside the tree). Paired bootstrap, 10,000
+resamples, same indexes, only the change differing (ELF sha256: baseline
+1c350c51…, linear 826450cc…, half d577d073…).
+
+- Same-invocation A/A null: baseline vs itself on SciFact, nDCG@10 delta 0.0000 Initial and 0.0000 Refined.
+- Linear coverage: code Initial 0.308 -> 0.427, Refined 0.340 -> 0.402; ArguAna +0.010 / +0.009; NFCorpus -0.001 / -0.003 (n.s.); SciFact -0.0555 [-0.0762, -0.0363] Initial and -0.0676 [-0.0898, -0.0471] Refined.
+- Full weight while coverage >= 0.5 (all BEIR documents): code Initial 0.334, Refined 0.302, below the 0.340 baseline.
+
+**Decision: REJECT.** Comparison class: QUALITY (same-source paired A/B). A
+prefix vector's value is not a function of the fraction it covered: 80% of an
+abstract is nearly the whole abstract, 3% of a source file is mostly imports.
+The proxy harness put whole-file window max-sim at hybrid parity with BM25
+(potion windows 0.644, MiniLM windows 0.702 vs BM25 0.700), so the fix belongs
+to bd-oowfm.
+
+- **Retry predicate:** none for coverage weighting; revisit hybrid fusion on
+  code only with whole-document semantic representation (bd-oowfm) or a fusion
+  rule validated on this code set and the three BEIR sets without loss.
