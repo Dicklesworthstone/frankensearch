@@ -171,3 +171,6 @@ newfile.txt
 .skill-loop-progress-*.md
 # br doctor per-run artifacts
 .doctor/
+# Python bytecode from importing the gate and harness scripts; an untracked
+# cache makes the quickstart gate's clean-source provenance check fail
+__pycache__/
