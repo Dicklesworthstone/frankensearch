@@ -34,6 +34,7 @@ use super::{NativeAnnIndex, checkpoint, invalid};
 use crate::{Cx, Embedder, IndexableDocument, SearchResult, VectorHit};
 
 mod batch;
+mod input_budget;
 mod snapshot;
 pub use snapshot::NativeReopenLimits;
 
@@ -204,6 +205,7 @@ pub struct NativeIndexBuilder {
     fast: TierPlan,
     quality: Option<TierPlan>,
     batch_size: usize,
+    max_batch_input_bytes: Option<usize>,
     split_failed_batches: bool,
     documents: Vec<IndexableDocument>,
     reuse: Option<ReuseSource>,
@@ -233,6 +235,7 @@ impl NativeIndexBuilder {
             fast,
             quality: None,
             batch_size: 64,
+            max_batch_input_bytes: None,
             split_failed_batches: false,
             documents: Vec::new(),
             reuse: None,
@@ -385,6 +388,7 @@ impl NativeIndexBuilder {
                     "source document IDs must be nonempty and unique",
                 ));
             }
+            input_budget::validate_document_size(doc.content.len(), self.max_batch_input_bytes)?;
         }
         let fast_binding = self.fast.binding(&self.generation)?;
         let quality_binding = self
@@ -409,7 +413,16 @@ impl NativeIndexBuilder {
             .as_ref()
             .map(|binding| VectorIndex::create_v2(&quality_path, binding.clone()))
             .transpose()?;
-        for batch in self.documents.chunks(self.batch_size) {
+        let mut batch_start = 0;
+        while batch_start < self.documents.len() {
+            let batch_end = input_budget::batch_end(
+                cx,
+                &self.documents,
+                batch_start,
+                self.batch_size,
+                self.max_batch_input_bytes,
+            )?;
+            let batch = &self.documents[batch_start..batch_end];
             self.fast
                 .write_batch_reusing(
                     cx,
@@ -425,6 +438,7 @@ impl NativeIndexBuilder {
                     .and_then(|source| source.quality.as_ref().map(|quality| (source, quality)));
                 tier.write_batch_reusing(cx, writer, batch, reuse).await?;
             }
+            batch_start = batch_end;
         }
         checkpoint(cx, "native_ann.builder.finish_vectors")?;
         fast_writer.finish()?;
