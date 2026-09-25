@@ -344,7 +344,7 @@ impl SearchFilter for SourceFilter<'_> {
         })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "fsfs.fast_windows.source_filter"
     }
 }
@@ -557,7 +557,10 @@ mod tests {
         )
         .unwrap();
         let filter = PredicateFilter::new("source.rs", |id| {
-            id.starts_with("src/") && id.ends_with(".rs")
+            id.starts_with("src/")
+                && std::path::Path::new(id)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
         });
         let result = search_top_k(&index, &[1.0, 0.0], 2, Some(&filter), Some(&mapping)).unwrap();
         assert_eq!(
@@ -673,7 +676,7 @@ mod tests {
         fn dimension(&self) -> usize {
             2
         }
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "deep-passage-test"
         }
         fn model_name(&self) -> &str {
@@ -775,7 +778,8 @@ mod tests {
                 .unwrap();
             let hit = &windowed[0].payload.hits[0];
             assert_eq!(hit.path, "deep.md");
-            assert_eq!(hit.semantic_rank, Some(1));
+            // Payload ranks are 0-based: the collapsed deep source is first.
+            assert_eq!(hit.semantic_rank, Some(0));
             assert!(hit.lexical_rank.is_none());
             assert!(hit.snippet.as_deref().unwrap().contains("orbitalshield"));
 

@@ -26176,8 +26176,12 @@ fn checkpoint_entry_reuse(
         return CheckpointReuse::Complete;
     }
 
-    let windows_valid = match entry.fast_windows.as_ref() {
-        Some(plan) => {
+    let windows_valid = entry.fast_windows.as_ref().map_or_else(
+        || {
+            checkpoint.fast_window_max_per_file == 1
+                && live_vector_ids.contains(&candidate.file_key)
+        },
+        |plan| {
             checkpoint.fast_window_max_per_file > 1
                 && plan.max_per_file == checkpoint.fast_window_max_per_file
                 && plan.validate().is_ok()
@@ -26185,12 +26189,8 @@ fn checkpoint_entry_reuse(
                     .row_ids(&candidate.file_key)
                     .iter()
                     .all(|row_id| live_vector_ids.contains(row_id))
-        }
-        None => {
-            checkpoint.fast_window_max_per_file == 1
-                && live_vector_ids.contains(&candidate.file_key)
-        }
-    };
+        },
+    );
 
     if checkpoint.embedder_id == embedder_id
         && checkpoint.embedder_dimension == embedder_dimension
