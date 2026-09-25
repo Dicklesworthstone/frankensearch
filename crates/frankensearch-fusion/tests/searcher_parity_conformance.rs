@@ -205,14 +205,12 @@ impl LexicalRead for StaticLexical {
 }
 
 fn async_index(tag: &str, with_quality: bool) -> Arc<TwoTierIndex> {
-    let dir = std::env::temp_dir().join(format!(
-        "fsx-parity-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    // mkdtemp, not pid + clock nanos, which parallel tests can share.
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("fsx-parity-{tag}-"))
+        .tempdir()
+        .expect("unique parity index directory")
+        .keep();
     let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
     builder.set_fast_embedder_id("parity-fast");
     if with_quality {
@@ -353,14 +351,11 @@ fn seeded_async_search(
     config: &TwoTierConfig,
     k: usize,
 ) -> (Vec<ScoredResult>, TwoTierMetrics) {
-    let dir = std::env::temp_dir().join(format!(
-        "fsx-parity-seeded-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let dir = tempfile::Builder::new()
+        .prefix("fsx-parity-seeded-")
+        .tempdir()
+        .expect("unique parity index directory")
+        .keep();
     let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
     builder.set_fast_embedder_id("parity-fast");
     builder.set_quality_embedder_id("parity-quality");

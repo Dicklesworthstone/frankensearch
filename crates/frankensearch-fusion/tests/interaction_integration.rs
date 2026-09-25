@@ -155,14 +155,14 @@ impl LexicalRead for StubLexical {
 const DIM: usize = 4;
 
 fn build_test_index() -> Arc<TwoTierIndex> {
-    let dir = std::env::temp_dir().join(format!(
-        "frankensearch-integ-interaction-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    // A mkdtemp directory, not pid + clock nanos: parallel tests in this binary
+    // read the same clock value and then built into one directory, and the
+    // second finish met the first one's generation (seen under load).
+    let dir = tempfile::Builder::new()
+        .prefix("frankensearch-integ-interaction-")
+        .tempdir()
+        .expect("unique test index directory")
+        .keep();
     let mut builder =
         TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create test index");
     builder.set_fast_embedder_id("stub-fast");
