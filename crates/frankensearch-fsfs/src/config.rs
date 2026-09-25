@@ -855,6 +855,10 @@ pub struct IndexingConfig {
     #[serde(default)]
     pub offline: bool,
     pub embedding_batch_size: usize,
+    /// Maximum fast-tier passages per source. One preserves prefix embedding;
+    /// larger values opt into bounded overlapping full-document coverage.
+    #[serde(default = "default_fast_window_max_per_file")]
+    pub fast_window_max_per_file: usize,
     pub reindex_on_change: bool,
     pub watch_mode: bool,
 }
@@ -875,10 +879,15 @@ impl Default for IndexingConfig {
             model_dir: "~/.local/share/frankensearch/models".into(),
             offline: false,
             embedding_batch_size: 64,
+            fast_window_max_per_file: default_fast_window_max_per_file(),
             reindex_on_change: true,
             watch_mode: false,
         }
     }
+}
+
+const fn default_fast_window_max_per_file() -> usize {
+    1
 }
 
 // A `[search]` section mirrors its TOML keys one to one; the on/off knobs
@@ -1074,6 +1083,7 @@ struct IndexingConfigPatch {
     model_dir: Option<String>,
     offline: Option<bool>,
     embedding_batch_size: Option<usize>,
+    fast_window_max_per_file: Option<usize>,
     reindex_on_change: Option<bool>,
     watch_mode: Option<bool>,
 }
@@ -1228,6 +1238,8 @@ pub struct ContractIndexingConfig {
     #[serde(default)]
     pub offline: bool,
     pub embedding_batch_size: usize,
+    #[serde(default = "default_fast_window_max_per_file")]
+    pub fast_window_max_per_file: usize,
     pub reindex_on_change: bool,
     pub watch_mode: bool,
 }
@@ -1348,6 +1360,7 @@ impl From<&FsfsConfig> for ConfigContractValues {
                 model_dir: config.indexing.model_dir.clone(),
                 offline: config.indexing.offline,
                 embedding_batch_size: config.indexing.embedding_batch_size,
+                fast_window_max_per_file: config.indexing.fast_window_max_per_file,
                 reindex_on_change: config.indexing.reindex_on_change,
                 watch_mode: config.indexing.watch_mode,
             },
@@ -2257,6 +2270,9 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         if let Some(embedding_batch_size) = indexing.embedding_batch_size {
             config.indexing.embedding_batch_size = embedding_batch_size;
         }
+        if let Some(max_per_file) = indexing.fast_window_max_per_file {
+            config.indexing.fast_window_max_per_file = max_per_file;
+        }
         if let Some(reindex_on_change) = indexing.reindex_on_change {
             config.indexing.reindex_on_change = reindex_on_change;
         }
@@ -2479,6 +2495,16 @@ fn apply_env_overrides(
 
     if let Some((key, value)) = env_override(env, "FRANKENSEARCH_OFFLINE", "FSFS_OFFLINE") {
         config.indexing.offline = parse_bool(value, "indexing.offline")?;
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_INDEXING_FAST_WINDOW_MAX_PER_FILE",
+        "FSFS_INDEXING_FAST_WINDOW_MAX_PER_FILE",
+    ) {
+        config.indexing.fast_window_max_per_file =
+            parse_usize(value, "indexing.fast_window_max_per_file")?;
         keys_used.push(key.into());
     }
 
@@ -2836,6 +2862,7 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
                 "model_dir",
                 "offline",
                 "embedding_batch_size",
+                "fast_window_max_per_file",
                 "reindex_on_change",
                 "watch_mode",
             ]
@@ -2980,6 +3007,14 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
             field: "indexing.embedding_batch_size".into(),
             value: config.indexing.embedding_batch_size.to_string(),
             reason: "must be between 1 and 4096".into(),
+        });
+    }
+
+    if !(1_usize..=128_usize).contains(&config.indexing.fast_window_max_per_file) {
+        return Err(SearchError::InvalidConfig {
+            field: "indexing.fast_window_max_per_file".into(),
+            value: config.indexing.fast_window_max_per_file.to_string(),
+            reason: "must be between 1 (prefix only) and 128".into(),
         });
     }
 
@@ -5416,8 +5451,47 @@ mod tests {
         assert_eq!(cfg.quality_model, "all-MiniLM-L6-v2");
         assert!(!cfg.offline);
         assert_eq!(cfg.embedding_batch_size, 64);
+        assert_eq!(cfg.fast_window_max_per_file, 1);
         assert!(cfg.reindex_on_change);
         assert!(!cfg.watch_mode);
+    }
+
+    #[test]
+    fn fast_window_policy_loads_with_precedence_and_rejects_unbounded_values() {
+        let from_file = load_from_str(
+            Some("[indexing]\nfast_window_max_per_file = 32\n"),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("bounded fast passages load from TOML");
+        assert_eq!(from_file.config.indexing.fast_window_max_per_file, 32);
+        let env = HashMap::from([(
+            "FSFS_INDEXING_FAST_WINDOW_MAX_PER_FILE".to_owned(),
+            "128".to_owned(),
+        )]);
+        let from_env = load_from_str(
+            Some("[indexing]\nfast_window_max_per_file = 32\n"),
+            None,
+            &env,
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("environment overrides the file");
+        assert_eq!(from_env.config.indexing.fast_window_max_per_file, 128);
+        for invalid in [0, 129, 10_000] {
+            assert_invalid_field(
+                &format!("[indexing]\nfast_window_max_per_file = {invalid}\n"),
+                "indexing.fast_window_max_per_file",
+            );
+        }
+        let serialized = serde_json::to_value(super::IndexingConfig::default()).unwrap();
+        let mut old = serialized.as_object().unwrap().clone();
+        old.remove("fast_window_max_per_file");
+        let decoded: super::IndexingConfig =
+            serde_json::from_value(serde_json::Value::Object(old)).unwrap();
+        assert_eq!(decoded.fast_window_max_per_file, 1);
     }
 
     #[test]

@@ -454,6 +454,26 @@ impl FsfsRuntime {
                 )
             })?;
 
+        let window_maximum = Self::fast_window_policy_at_root(predecessor.path())?;
+        let mut window_plans = BTreeMap::new();
+        if window_maximum > 1 {
+            for (id, document) in &documents {
+                semantic_windows::validate_source_id(id)?;
+                let plan = semantic_windows::plan(&document.lexical_text, window_maximum)?;
+                if plan
+                    .row_ids(id)
+                    .iter()
+                    .any(|row| row.len() > usize::from(u16::MAX))
+                {
+                    return Err(complete_cli::complete_cli_error(
+                        "append_id",
+                        "document ID leaves insufficient room for its semantic window row IDs",
+                    ));
+                }
+                window_plans.insert(id.clone(), plan);
+            }
+        }
+
         // Use the same producer-resolution and admission checks as the ordinary
         // appender. Do not borrow a different tier's identity or manufacture
         // vectors from copied producer labels. No mutable mapping spans inference.
@@ -461,6 +481,7 @@ impl FsfsRuntime {
         let fast_identity = {
             let index =
                 VectorIndex::open_read_only(&predecessor.path().join(FSFS_VECTOR_INDEX_FILE))?;
+            semantic_windows::load_mapping(predecessor.path(), &index)?;
             Self::admit_vector_generation_for_embedder(&index, fast_embedder.as_ref())?;
             let identity = fast_embedder.identity()?.clone();
             identity.validate()?;
@@ -503,22 +524,26 @@ impl FsfsRuntime {
         let mut fast_entries = Vec::with_capacity(documents.len());
         let mut quality_entries = Vec::new();
         for (id, document) in &documents {
-            retained_search_checkpoint(cx)?;
-            let response = fast_embedder
-                .embed_bound(cx, &document.embedding_text)
-                .await;
-            retained_search_checkpoint(cx)?;
-            let embedding = response?;
-            embedding.validate()?;
-            if embedding.identity != fast_identity {
-                return Err(SearchError::UnverifiableRemoteSpace {
-                    producer: "fsfs.append_batch.fast".to_owned(),
-                    reason:
-                        "the returned fast embedding does not carry the admitted producer identity"
-                            .to_owned(),
-                });
+            let texts = match window_plans.get(id) {
+                Some(plan) => plan.texts(&document.lexical_text)?,
+                None => vec![document.embedding_text.as_str()],
+            };
+            for (ordinal, text) in texts.into_iter().enumerate() {
+                retained_search_checkpoint(cx)?;
+                let response = fast_embedder.embed_bound(cx, text).await;
+                retained_search_checkpoint(cx)?;
+                let embedding = response?;
+                embedding.validate()?;
+                if embedding.identity != fast_identity {
+                    return Err(SearchError::UnverifiableRemoteSpace {
+                        producer: "fsfs.append_batch.fast".to_owned(),
+                        reason:
+                            "the returned fast embedding does not carry the admitted producer identity"
+                                .to_owned(),
+                    });
+                }
+                fast_entries.push((semantic_windows::row_id(id, ordinal), embedding.values));
             }
-            fast_entries.push((id.clone(), embedding.values));
             if let Some((embedder, identity)) = quality.as_ref() {
                 retained_search_checkpoint(cx)?;
                 let response = embedder.embed_bound(cx, &document.embedding_text).await;
@@ -589,6 +614,23 @@ impl FsfsRuntime {
             // append_batch logs replacement before superseding an older row.
             // Freeze both tiers without pending WALs before sealing the bundle.
             index.append_batch(entries)?;
+            if relative == FSFS_VECTOR_INDEX_FILE && window_maximum > 1 {
+                // Replacing a document with fewer windows must retire every
+                // old trailing row in this private candidate before sealing.
+                let new_rows = entries
+                    .iter()
+                    .map(|(id, _)| id.as_str())
+                    .collect::<HashSet<_>>();
+                let stale = index
+                    .live_doc_ids()?
+                    .into_iter()
+                    .filter(|row| {
+                        documents.contains_key(semantic_windows::source_id(row))
+                            && !new_rows.contains(row.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                index.soft_delete_batch(&stale.iter().map(String::as_str).collect::<Vec<_>>())?;
+            }
             index.compact()?;
             index.vacuum()?;
         }
@@ -632,6 +674,7 @@ impl FsfsRuntime {
                     canonical_bytes: u64::try_from(document.embedding_text.len())
                         .unwrap_or(u64::MAX),
                     reason_code: "append_batch".to_owned(),
+                    fast_windows: window_plans.remove(id),
                 },
             );
         }
@@ -733,6 +776,12 @@ impl FsfsRuntime {
                 "provide at least one document ID or prefix to delete",
             ));
         }
+        if self.cli_input.delete_ids.iter().any(|id| id.contains('\0')) {
+            return Err(complete_cli::complete_cli_error(
+                "delete_ids",
+                "document IDs and prefixes cannot contain the reserved semantic-window NUL byte",
+            ));
+        }
         let store = CompleteGenerationStore::open(cx, store_root)?;
         let build = store.begin(cx)?;
         let predecessor = store.active(cx)?.ok_or_else(|| {
@@ -756,7 +805,15 @@ impl FsfsRuntime {
             let path = predecessor.path().join(relative);
             if path.exists() {
                 let index = VectorIndex::open_read_only(&path)?;
-                live_ids.extend(index.live_doc_ids()?);
+                if relative == FSFS_VECTOR_INDEX_FILE {
+                    semantic_windows::load_mapping(predecessor.path(), &index)?;
+                }
+                live_ids.extend(
+                    index
+                        .live_doc_ids()?
+                        .into_iter()
+                        .map(|row| semantic_windows::source_id(&row).to_owned()),
+                );
             }
         }
         let targets = live_ids
@@ -799,14 +856,19 @@ impl FsfsRuntime {
         candidate
             .apply_one_shot_lexical_mutations(cx, build.path(), &lexical_mutations)
             .await?;
-        let refs = targets.iter().map(String::as_str).collect::<Vec<_>>();
+        let target_sources = targets.iter().map(String::as_str).collect::<HashSet<_>>();
         for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
             retained_search_checkpoint(cx)?;
             candidate_lease.fence("complete-generation delete vector mutation")?;
             let path = build.path().join(relative);
             if path.exists() {
                 let mut index = Self::open_vector_index_for_mutation(&path)?;
-                index.soft_delete_batch(&refs)?;
+                let rows = index
+                    .live_doc_ids()?
+                    .into_iter()
+                    .filter(|row| target_sources.contains(semantic_windows::source_id(row)))
+                    .collect::<Vec<_>>();
+                index.soft_delete_batch(&rows.iter().map(String::as_str).collect::<Vec<_>>())?;
                 // Freeze the candidate without a pending WAL. These ordinary
                 // rewrites also invalidate old repair symbols before fresh
                 // protection, so repair cannot resurrect a deleted document.
@@ -991,6 +1053,16 @@ mod retained_delete_tests {
         with_wal: bool,
         quality_embedder: Option<&dyn Embedder>,
     ) -> (FsfsRuntime, PathBuf, PathBuf, PublishedGeneration) {
+        fixture_with_quality_windows(cx, parent, with_wal, quality_embedder, 1).await
+    }
+
+    async fn fixture_with_quality_windows(
+        cx: &Cx,
+        parent: &Path,
+        with_wal: bool,
+        quality_embedder: Option<&dyn Embedder>,
+        maximum: usize,
+    ) -> (FsfsRuntime, PathBuf, PathBuf, PublishedGeneration) {
         let source = parent.join("source");
         let root = parent.join("store");
         fs::create_dir(&source).unwrap();
@@ -999,6 +1071,7 @@ mod retained_delete_tests {
         }
         let mut config = FsfsConfig::default();
         config.indexing.offline = true;
+        config.indexing.fast_window_max_per_file = maximum;
         config.indexing.quality_model.clear();
         config.search.fast_only = true;
         config.search.rerank = false;
@@ -1038,7 +1111,7 @@ mod retained_delete_tests {
         for name in ["alpha.md", "beta.md", "beta-notes.md"] {
             if let Some(embedder) = quality_embedder {
                 // Preserve a real partial-coverage fixture across append.
-                if name == "beta-notes.md" {
+                if name == "beta-notes.md" && maximum == 1 {
                     continue;
                 }
                 let vector = embedder
@@ -1591,6 +1664,349 @@ mod retained_delete_tests {
                 );
             }
             assert_eq!(file_bytes(predecessor.path()), before);
+        });
+    }
+
+    #[test]
+    fn retained_fast_windows_append_shrink_delete_and_keep_old_reader() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let _restore = RestoreQuality(test_quality_embedder_override());
+            let quality: Arc<dyn Embedder> = Arc::new(AppendQualityEmbedder {
+                changed_revision: false,
+            });
+            set_test_quality_embedder(Some(Arc::clone(&quality)));
+            let (mut runtime, _, root, predecessor) =
+                fixture_with_quality_windows(&cx, parent.path(), false, Some(quality.as_ref()), 4)
+                    .await;
+            // Commands inherit the indexed policy even when a later process
+            // uses its default configuration rather than the original file.
+            runtime.config.indexing.fast_window_max_per_file = 1;
+            let predecessor_bytes = file_bytes(predecessor.path());
+            let body = format!(
+                "Introduction. {} Deep café tail evidence.",
+                "background text ".repeat(1_000)
+            );
+            let input = ["alpha.md", "virtual/deep.md"]
+                .into_iter()
+                .map(|id| serde_json::json!({"id":id,"text":body}).to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (publication, count) = append_input(&runtime, parent.path(), &input)
+                .append_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 2, "one receipt item per source, not per window");
+            let Some(GenerationPublication::Durable(long_generation)) = publication else {
+                panic!("window append must publish durably");
+            };
+            let old_reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let long_bytes = file_bytes(long_generation.path());
+            let manifests = FsfsRuntime::read_matching_manifest_generation(long_generation.path())
+                .unwrap()
+                .unwrap();
+            let canonical = LEXICAL_CANONICALIZER.canonicalize(&body);
+            let fast = runtime.resolve_fast_embedder().unwrap();
+            {
+                let index = VectorIndex::open_read_only(
+                    &long_generation.path().join(FSFS_VECTOR_INDEX_FILE),
+                )
+                .unwrap();
+                for id in ["alpha.md", "virtual/deep.md"] {
+                    let plan = manifests[id].fast_windows.as_ref().unwrap();
+                    assert_eq!(plan.max_per_file, 4);
+                    assert_eq!(plan.windows.len(), 4);
+                    assert!(
+                        plan.texts(&canonical)
+                            .unwrap()
+                            .last()
+                            .unwrap()
+                            .contains("tail evidence")
+                    );
+                    for (row_id, text) in plan
+                        .row_ids(id)
+                        .into_iter()
+                        .zip(plan.texts(&canonical).unwrap())
+                    {
+                        let row = (0..index.record_count())
+                            .find(|row| index.doc_id_at(*row).unwrap() == row_id)
+                            .unwrap();
+                        let expected = fast.embed(&cx, text).await.unwrap();
+                        assert!(
+                            index
+                                .vector_at_f32(row)
+                                .unwrap()
+                                .iter()
+                                .zip(expected)
+                                .all(|(a, b)| (*a - b).abs() < 0.002)
+                        );
+                    }
+                }
+                assert_eq!(index.live_doc_ids().unwrap().len(), 10);
+            }
+            assert_eq!(
+                live_ids(long_generation.path(), FSFS_VECTOR_QUALITY_INDEX_FILE).len(),
+                4
+            );
+            assert_eq!(
+                FsfsRuntime::collect_quality_generation_doctor_check(long_generation.path())
+                    .verdict,
+                DoctorVerdict::Pass
+            );
+
+            let short =
+                serde_json::json!({"id":"alpha.md","text":"short replacement body"}).to_string();
+            let (publication, count) = append_input(&runtime, parent.path(), &short)
+                .append_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+            let Some(GenerationPublication::Durable(short_generation)) = publication else {
+                panic!("shorter replacement must publish durably");
+            };
+            let remaining_alpha = live_ids(short_generation.path(), FSFS_VECTOR_INDEX_FILE)
+                .into_iter()
+                .filter(|row| semantic_windows::source_id(row) == "alpha.md")
+                .collect::<Vec<_>>();
+            assert_eq!(remaining_alpha, ["alpha.md"]);
+            let manifests = FsfsRuntime::read_matching_manifest_generation(short_generation.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                manifests["alpha.md"]
+                    .fast_windows
+                    .as_ref()
+                    .unwrap()
+                    .windows
+                    .len(),
+                1
+            );
+            assert_eq!(old_reader.generation(), &long_generation);
+            assert_eq!(file_bytes(long_generation.path()), long_bytes);
+
+            let (publication, count) = deletion(&runtime, &["virtual/"], true)
+                .delete_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+            let Some(GenerationPublication::Durable(deleted)) = publication else {
+                panic!("window deletion must publish durably");
+            };
+            for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
+                assert!(
+                    !live_ids(deleted.path(), relative)
+                        .iter()
+                        .any(|row| semantic_windows::source_id(row).starts_with("virtual/"))
+                );
+            }
+            let manifests = FsfsRuntime::read_matching_manifest_generation(deleted.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(manifests.len(), 3);
+            assert!(!manifests.contains_key("virtual/deep.md"));
+            assert_eq!(file_bytes(predecessor.path()), predecessor_bytes);
+            assert_eq!(file_bytes(long_generation.path()), long_bytes);
+        });
+    }
+
+    #[test]
+    fn legacy_fast_windows_append_retires_tail_delete_counts_sources_and_watch_refuses() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let _restore = RestoreQuality(test_quality_embedder_override());
+            let quality: Arc<dyn Embedder> = Arc::new(AppendQualityEmbedder {
+                changed_revision: false,
+            });
+            set_test_quality_embedder(Some(Arc::clone(&quality)));
+            let (mut runtime, _, root, predecessor) =
+                fixture_with_quality_windows(&cx, parent.path(), false, Some(quality.as_ref()), 4)
+                    .await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let build = store.begin(&cx).unwrap();
+            runtime.cli_input.index_dir = Some(build.path().to_path_buf());
+            runtime.cli_input.format = OutputFormat::Json;
+            runtime.config.indexing.fast_window_max_per_file = 1;
+            assert_eq!(
+                retained_reuse::copy_selected_generation(&cx, &runtime, &store, build.path())
+                    .unwrap(),
+                predecessor
+            );
+
+            let body =
+                serde_json::json!({"id":"alpha.md","text":"long café source ".repeat(1_000)})
+                    .to_string();
+            let command = append_input(&runtime, parent.path(), &body);
+            let mut receipt = Vec::new();
+            command
+                .run_append_batch_command_with_writer(&cx, &mut receipt)
+                .await
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+            assert_eq!(receipt["data"]["appended"], 1);
+            assert_eq!(live_ids(build.path(), FSFS_VECTOR_INDEX_FILE).len(), 6);
+            assert_eq!(
+                live_ids(build.path(), FSFS_VECTOR_QUALITY_INDEX_FILE).len(),
+                3
+            );
+            let sentinel = FsfsRuntime::read_index_sentinel(build.path())
+                .unwrap()
+                .unwrap();
+            assert!(sentinel.generation_complete);
+            assert_eq!(sentinel.fast_window_max_per_file, 4);
+
+            // Losing the sentinel policy cannot make append or watch silently
+            // reinterpret window rows as ordinary one-vector documents.
+            let mut downgraded = sentinel.clone();
+            downgraded.fast_window_max_per_file = 1;
+            runtime
+                .write_index_sentinel(build.path(), &downgraded)
+                .unwrap();
+            let before_refusal = file_bytes(build.path());
+            assert!(
+                command
+                    .run_append_batch_command_with_writer(&cx, &mut Vec::new())
+                    .await
+                    .is_err()
+            );
+            assert!(runtime.build_live_ingest_pipeline(&cx).await.is_err());
+            // Publication ownership may update its diagnostic lease record;
+            // serving vectors, source plans and sentinel remain byte-exact.
+            for relative in [
+                FSFS_VECTOR_INDEX_FILE,
+                FSFS_VECTOR_QUALITY_INDEX_FILE,
+                FSFS_VECTOR_MANIFEST_FILE,
+            ] {
+                assert_eq!(
+                    fs::read(build.path().join(relative)).unwrap(),
+                    before_refusal[&PathBuf::from(relative)]
+                );
+            }
+            assert_eq!(
+                FsfsRuntime::read_index_sentinel(build.path()).unwrap(),
+                Some(downgraded)
+            );
+            runtime
+                .write_index_sentinel(build.path(), &sentinel)
+                .unwrap();
+
+            let short = serde_json::json!({"id":"alpha.md","text":"short replacement"}).to_string();
+            append_input(&runtime, parent.path(), &short)
+                .run_append_batch_command_with_writer(&cx, &mut Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(live_ids(build.path(), FSFS_VECTOR_INDEX_FILE).len(), 3);
+            let manifests = FsfsRuntime::read_matching_manifest_generation(build.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                manifests["alpha.md"]
+                    .fast_windows
+                    .as_ref()
+                    .unwrap()
+                    .windows
+                    .len(),
+                1
+            );
+            append_input(&runtime, parent.path(), &body)
+                .run_append_batch_command_with_writer(&cx, &mut Vec::new())
+                .await
+                .unwrap();
+            deletion(&runtime, &["alpha.md"], false)
+                .run_delete_command(&cx)
+                .await
+                .unwrap();
+            for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
+                assert!(
+                    !live_ids(build.path(), relative)
+                        .iter()
+                        .any(|row| semantic_windows::source_id(row) == "alpha.md")
+                );
+            }
+            let manifests = FsfsRuntime::read_matching_manifest_generation(build.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(manifests.len(), 2);
+            let sentinel = FsfsRuntime::read_index_sentinel(build.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(sentinel.indexed_files, 2);
+            assert!(sentinel.generation_complete);
+
+            // A genuine lexical writer conflict occurs after append has
+            // begun its mutation protocol. It must leave an incomplete
+            // sentinel instead of making a partial update searchable.
+            let layout = FsfsRuntime::resolve_lexical_engine(build.path()).unwrap();
+            let lexical_path = layout.engine_dir().unwrap();
+            let blocker = QuillIndex::open(&cx, &lexical_path, QuillConfig::default())
+                .await
+                .unwrap();
+            let rows_before = live_ids(build.path(), FSFS_VECTOR_INDEX_FILE);
+            assert!(
+                command
+                    .run_append_batch_command_with_writer(&cx, &mut Vec::new())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !FsfsRuntime::read_index_sentinel(build.path())
+                    .unwrap()
+                    .unwrap()
+                    .generation_complete
+            );
+            assert!(
+                FsfsRuntime::validate_search_generation_at_root(
+                    build.path(),
+                    SearchExecutionMode::Full
+                )
+                .is_err()
+            );
+            assert_eq!(live_ids(build.path(), FSFS_VECTOR_INDEX_FILE), rows_before);
+            drop(blocker);
+        });
+    }
+
+    #[test]
+    fn retained_fast_windows_cancelled_append_keeps_published_rows() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let _restore = RestoreQuality(test_quality_embedder_override());
+            let quality: Arc<dyn Embedder> = Arc::new(AppendQualityEmbedder {
+                changed_revision: false,
+            });
+            set_test_quality_embedder(Some(Arc::clone(&quality)));
+            let (runtime, _, root, predecessor) =
+                fixture_with_quality_windows(&cx, parent.path(), false, Some(quality.as_ref()), 4)
+                    .await;
+            let before = file_bytes(predecessor.path());
+            let body =
+                serde_json::json!({"id":"alpha.md","text":"detailed replacement ".repeat(1_000)})
+                    .to_string();
+            let error = append_input(&runtime, parent.path(), &body)
+                .append_retained_generation_with_precommit(&cx, &root, |cx| {
+                    cx.set_cancel_requested(true);
+                    retained_search_checkpoint(cx)
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(predecessor.clone())
+            );
+            assert_eq!(file_bytes(predecessor.path()), before);
+            let (publication, count) = append_input(&runtime, parent.path(), &body)
+                .append_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+            assert!(matches!(
+                publication,
+                Some(GenerationPublication::Durable(_))
+            ));
         });
     }
 
@@ -2623,3 +3039,6 @@ mod complete_watch;
 
 #[path = "runtime/retained_reuse.rs"]
 mod retained_reuse;
+
+#[path = "runtime/semantic_windows.rs"]
+mod semantic_windows;

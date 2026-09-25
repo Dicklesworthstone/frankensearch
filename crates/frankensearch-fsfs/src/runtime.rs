@@ -776,6 +776,9 @@ struct SearchExecutionResources {
     shadow_pressure_sampler: Option<Arc<ShadowPressureSampler>>,
     /// Fast-tier generation (`vector/index.fsvi`); drives the INITIAL phase.
     vector_index: Option<VectorIndex>,
+    /// Exact persisted source/window correspondence, admitted with the fast
+    /// generation and replaced whenever the resources rebind.
+    fast_window_mapping: Option<semantic_windows::FastWindowMapping>,
     /// Quality-tier generation (`vector/quality.fsvi`) from the same index
     /// run; present only when `fsfs index` built it. Drives the REFINED phase.
     quality_vector_index: Option<Arc<VectorIndex>>,
@@ -1622,6 +1625,7 @@ struct PendingIndexDocument {
     content_hash_hex: String,
     lexical_required: bool,
     semantic_reused: bool,
+    fast_windows: Option<semantic_windows::FastWindowPlan>,
     /// Embedding input: the default canonicalizer's bounded text.
     document: IndexableDocument,
     /// The whole file's text for the lexical index (`LEXICAL_CANONICALIZER`).
@@ -1704,6 +1708,12 @@ struct IndexManifestEntry {
     ingestion_class: String,
     canonical_bytes: u64,
     reason_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fast_windows: Option<semantic_windows::FastWindowPlan>,
+}
+
+const fn default_fast_window_max_per_file() -> usize {
+    1
 }
 
 const FSFS_CHECKPOINT_FILE: &str = "index_checkpoint.json";
@@ -1742,6 +1752,8 @@ struct CheckpointFileEntry {
     lexical_indexed: bool,
     semantic_indexed: bool,
     content_hash_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fast_windows: Option<semantic_windows::FastWindowPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1760,6 +1772,8 @@ struct IndexingCheckpoint {
     files: BTreeMap<String, CheckpointFileEntry>,
     discovered_files: usize,
     skipped_files: usize,
+    #[serde(default = "default_fast_window_max_per_file")]
+    fast_window_max_per_file: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1784,6 +1798,51 @@ struct IndexSentinel {
     reason_codes: Vec<String>,
     total_canonical_bytes: u64,
     source_hash_hex: String,
+    #[serde(default = "default_fast_window_max_per_file")]
+    fast_window_max_per_file: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct FastWindowCoveragePayload {
+    source_files: usize,
+    window_rows: usize,
+    covered_characters: usize,
+    total_characters: usize,
+    capped_files: usize,
+}
+
+impl FastWindowCoveragePayload {
+    fn from_checkpoint(checkpoint: &IndexingCheckpoint) -> Option<Self> {
+        if checkpoint.fast_window_max_per_file == 1 {
+            return None;
+        }
+        let mut coverage = Self {
+            source_files: 0,
+            window_rows: 0,
+            covered_characters: 0,
+            total_characters: 0,
+            capped_files: 0,
+        };
+        for entry in checkpoint
+            .files
+            .values()
+            .filter(|entry| entry.semantic_indexed)
+        {
+            let Some(plan) = entry.fast_windows.as_ref() else {
+                continue;
+            };
+            coverage.source_files = coverage.source_files.saturating_add(1);
+            coverage.window_rows = coverage.window_rows.saturating_add(plan.windows.len());
+            coverage.covered_characters = coverage
+                .covered_characters
+                .saturating_add(plan.covered_chars());
+            coverage.total_characters = coverage.total_characters.saturating_add(plan.source_chars);
+            coverage.capped_files = coverage
+                .capped_files
+                .saturating_add(usize::from(!plan.coverage_complete()));
+        }
+        Some(coverage)
+    }
 }
 
 /// Completion is emitted only after publishing the sentinel and transitioning
@@ -1800,6 +1859,10 @@ struct FsfsIndexPayload {
     embedding_failures: usize,
     vector_generation: PublishedVectorGeneration,
     quality_generation: Option<PublishedVectorGeneration>,
+    /// Union coverage of completed fast-window sources, without double
+    /// counting overlap. A complete generation can intentionally cap a file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fast_window_coverage: Option<FastWindowCoveragePayload>,
     /// Inputs actually consumed by this run, including its final batch. Kept
     /// in memory for the retained publisher; never left as a live checkpoint
     /// in a completed generation or exposed through the CLI payload.
@@ -6441,6 +6504,13 @@ impl FsfsRuntime {
         );
 
         if matches!(command, CliCommand::Index | CliCommand::Watch) {
+            if command == CliCommand::Watch
+                || self.cli_input.watch
+                || self.config.indexing.watch_mode
+            {
+                let target_root = self.resolve_target_root()?;
+                self.refuse_legacy_window_watch(&self.resolve_index_root(&target_root)?)?;
+            }
             let _cancellation_scope = shutdown.map(|shutdown| shutdown.cancellation_scope(cx));
             self.run_one_shot_index_scaffold(cx, command).await?;
         }
@@ -10476,6 +10546,64 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    /// Give semantic-only window hits context from the passage that supplied
+    /// their fast score. Keyword-ranked hits keep their lexical fragment.
+    /// Read the indexed body so a source edit cannot substitute different
+    /// context; the ordinary locator may subsequently find its current line.
+    fn fill_winning_window_snippets(
+        cx: &Cx,
+        lexical: &QuillSearchIndex,
+        query: &str,
+        config: &SnippetConfig,
+        winning_windows: &HashMap<String, semantic_windows::FastWindowRange>,
+        returned: &[FusedCandidate],
+        snippets_by_doc: &mut HashMap<String, String>,
+    ) -> SearchResult<()> {
+        for candidate in returned.iter().take(FSFS_SEARCH_SNIPPET_HEAD_LIMIT) {
+            if candidate.lexical_rank.is_some() {
+                continue;
+            }
+            let Some(window) = winning_windows.get(&candidate.doc_id) else {
+                continue;
+            };
+            Self::semantic_retry_checkpoint(cx, "fsfs.search.window_snippet")?;
+            let text = match read_indexed_document_text(cx, lexical, &candidate.doc_id) {
+                Ok(text) => text,
+                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                Err(error) => {
+                    Self::semantic_retry_checkpoint(cx, "fsfs.search.window_snippet")?;
+                    debug!(error = %error, "fsfs search: indexed window context unavailable");
+                    continue;
+                }
+            };
+            let Some(length) = window.end_char.checked_sub(window.start_char) else {
+                continue;
+            };
+            let passage = text
+                .chars()
+                .skip(window.start_char)
+                .take(length)
+                .collect::<String>();
+            if passage.chars().count() != length || passage.trim().is_empty() {
+                continue;
+            }
+            let terms = alphanumeric_words(query)
+                .map(|term| frankensearch_quill::SnippetTerm::new(term.to_lowercase(), 1));
+            let mut generator = frankensearch_quill::SnippetGenerator::new(
+                frankensearch_quill::Analyzer::FrankensearchDefault,
+                terms,
+                config.clone(),
+            );
+            if let Some(snippet) = generator.snippet_or_prefix(&passage) {
+                snippets_by_doc.insert(
+                    candidate.doc_id.clone(),
+                    decode_basic_html_entities(&snippet),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn attach_index_freshness(
         mut payload: SearchPayload,
         freshness: Option<IndexFreshnessPayload>,
@@ -10957,9 +11085,14 @@ impl FsfsRuntime {
 
         let lexical_doc_count = lexical_stats.map(|stats| stats.live_docs);
         let vector_doc_count = resources.vector_index.as_ref().map(|index| {
-            index
-                .record_count()
-                .saturating_add(index.wal_record_count())
+            resources.fast_window_mapping.as_ref().map_or_else(
+                || {
+                    index
+                        .record_count()
+                        .saturating_add(index.wal_record_count())
+                },
+                semantic_windows::FastWindowMapping::source_count,
+            )
         });
         // Independent generations need not contain identical document IDs.
         // An upper bound on their union avoids truncating `--limit all` before
@@ -11303,6 +11436,7 @@ impl FsfsRuntime {
             }
         }
 
+        let mut winning_windows = HashMap::new();
         let semantic_candidates = if plan.semantic_stage.enabled && semantic_decision.run_semantic {
             if let (Some(index), Some(embedder)) = (
                 resources.vector_index.as_ref(),
@@ -11315,14 +11449,18 @@ impl FsfsRuntime {
                         // indistinguishable from "no relevant documents".
                         // Availability failures surface as operator advice;
                         // benign reasons stay debug-level.
-                        match index.search_top_k_classified(
+                        match semantic_windows::search_top_k(
+                            index,
                             &query_embedding,
                             semantic_budget,
                             filter_expr
                                 .as_ref()
                                 .map(|filter| filter as &dyn SearchFilter),
+                            resources.fast_window_mapping.as_ref(),
                         ) {
-                            Ok(classified) => {
+                            Ok(windowed) => {
+                                winning_windows = windowed.winning_windows;
+                                let classified = windowed.classified;
                                 if let Some(reason) = classified.zero_signal {
                                     if hash_control_lane {
                                         debug!(
@@ -11405,6 +11543,15 @@ impl FsfsRuntime {
                 lexical,
                 &normalized_query,
                 &snippet_config,
+                &fused_initial[..fused_initial.len().min(output_limit)],
+                &mut snippets_by_doc,
+            )?;
+            Self::fill_winning_window_snippets(
+                cx,
+                lexical,
+                &normalized_query,
+                &snippet_config,
+                &winning_windows,
                 &fused_initial[..fused_initial.len().min(output_limit)],
                 &mut snippets_by_doc,
             )?;
@@ -11543,6 +11690,15 @@ impl FsfsRuntime {
                             lexical,
                             &normalized_query,
                             &snippet_config,
+                            &fused_refined[..fused_refined.len().min(output_limit)],
+                            &mut snippets_by_doc,
+                        )?;
+                        Self::fill_winning_window_snippets(
+                            cx,
+                            lexical,
+                            &normalized_query,
+                            &snippet_config,
+                            &winning_windows,
                             &fused_refined[..fused_refined.len().min(output_limit)],
                             &mut snippets_by_doc,
                         )?;
@@ -12160,6 +12316,79 @@ impl FsfsRuntime {
 
     // ─── WAL-based incremental mutation commands ─────────────────────────
 
+    /// Mutation uses the generation's persisted input policy, rather than a
+    /// possibly different policy in the process issuing an append or delete.
+    fn fast_window_policy_at_root(index_root: &Path) -> SearchResult<usize> {
+        let maximum = Self::read_index_sentinel(index_root)?
+            .map_or(1, |sentinel| sentinel.fast_window_max_per_file);
+        if !(1..=128).contains(&maximum) {
+            return Err(SearchError::InvalidConfig {
+                field: "index.fast_window_max_per_file".to_owned(),
+                value: maximum.to_string(),
+                reason: "the persisted fast window policy must be between 1 and 128".to_owned(),
+            });
+        }
+        Ok(maximum)
+    }
+
+    fn refuse_legacy_window_watch(&self, index_root: &Path) -> SearchResult<()> {
+        let manifests_have_windows =
+            Self::read_index_manifest_file(index_root, FSFS_VECTOR_MANIFEST_FILE)?
+                .is_some_and(|entries| entries.iter().any(|entry| entry.fast_windows.is_some()));
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+        let rows_have_windows = if vector_path.exists() {
+            VectorIndex::open_read_only(&vector_path)?
+                .live_doc_ids()?
+                .iter()
+                .any(|row| row.contains('\0'))
+        } else {
+            false
+        };
+        if self.config.indexing.fast_window_max_per_file > 1
+            || Self::fast_window_policy_at_root(index_root)? > 1
+            || manifests_have_windows
+            || rows_have_windows
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "indexing.fast_window_max_per_file".to_owned(),
+                value: String::new(),
+                reason: "legacy watch and its storage queue cannot update fast semantic windows; use complete-generation watch or a one-shot index rebuild".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn write_window_mutation_membership(
+        &self,
+        index_root: &Path,
+        manifests: BTreeMap<String, IndexManifestEntry>,
+        mut sentinel: IndexSentinel,
+        command: &str,
+    ) -> SearchResult<()> {
+        let manifests = manifests.into_values().collect::<Vec<_>>();
+        let layout = Self::resolve_lexical_engine(index_root)?;
+        let lexical_manifest_path = if layout.lexical_root() == index_root {
+            layout
+                .engine_dir()
+                .map(|path| path.join(FSFS_INDEX_MANIFEST_FILE_NAME))
+                .unwrap_or_else(|| index_root.join(FSFS_LEXICAL_MANIFEST_FILE))
+        } else {
+            index_root.join(FSFS_LEXICAL_MANIFEST_FILE)
+        };
+        self.write_index_artifacts(index_root, &lexical_manifest_path, &manifests)?;
+        command.clone_into(&mut sentinel.command);
+        sentinel.generated_at_ms = pressure_timestamp_ms();
+        sentinel.indexed_files = manifests.len();
+        sentinel.discovered_files = sentinel.discovered_files.max(manifests.len());
+        sentinel.skipped_files = sentinel.discovered_files.saturating_sub(manifests.len());
+        sentinel.total_canonical_bytes = manifests.iter().fold(0_u64, |total, entry| {
+            total.saturating_add(entry.canonical_bytes)
+        });
+        sentinel.source_hash_hex = index_source_hash_hex(&manifests);
+        sentinel.generation_complete = true;
+        self.write_index_sentinel(index_root, &sentinel)
+    }
+
     /// Read JSONL documents from stdin or a file and append their embeddings
     /// to the WAL without a full index rebuild.
     ///
@@ -12198,6 +12427,49 @@ impl FsfsRuntime {
             );
         }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+
+        {
+            let index = VectorIndex::open_read_only(&vector_path)?;
+            semantic_windows::load_mapping(&index_root, &index)?;
+        }
+        let window_maximum = Self::fast_window_policy_at_root(&index_root)?;
+        let mut window_membership = if window_maximum > 1 {
+            Self::validate_search_generation_at_root(&index_root, SearchExecutionMode::Full)?;
+            let manifests =
+                Self::read_matching_manifest_generation(&index_root)?.ok_or_else(|| {
+                    complete_cli::complete_cli_error(
+                        "append_membership",
+                        "window generation membership manifests disagree",
+                    )
+                })?;
+            let sentinel = Self::read_index_sentinel(&index_root)?.ok_or_else(|| {
+                complete_cli::complete_cli_error(
+                    "append_membership",
+                    "window generation has no completion sentinel",
+                )
+            })?;
+            Some((manifests, sentinel))
+        } else {
+            None
+        };
+        let mut window_plans = BTreeMap::new();
+        if window_maximum > 1 {
+            for (id, document) in &docs {
+                semantic_windows::validate_source_id(id)?;
+                let plan = semantic_windows::plan(&document.lexical_text, window_maximum)?;
+                if plan
+                    .row_ids(id)
+                    .iter()
+                    .any(|row| row.len() > usize::from(u16::MAX))
+                {
+                    return Err(complete_cli::complete_cli_error(
+                        "append_id",
+                        "document ID leaves insufficient room for its semantic window row IDs",
+                    ));
+                }
+                window_plans.insert(id.clone(), plan);
+            }
+        }
 
         let embedder = self.resolve_fast_embedder()?;
         let fast_identity = {
@@ -12251,20 +12523,26 @@ impl FsfsRuntime {
         let mut quality_entries: Vec<(String, Vec<f32>)> =
             Vec::with_capacity(if quality.is_some() { docs.len() } else { 0 });
         for (id, document) in &docs {
-            retained_search_checkpoint(cx)?;
-            let response = embedder.embed_bound(cx, &document.embedding_text).await;
-            retained_search_checkpoint(cx)?;
-            let embedding = response?;
-            embedding.validate()?;
-            if embedding.identity != fast_identity {
-                return Err(SearchError::UnverifiableRemoteSpace {
-                    producer: "fsfs.append_batch.fast".to_owned(),
-                    reason:
-                        "the returned fast embedding does not carry the admitted producer identity"
-                            .to_owned(),
-                });
+            let texts = match window_plans.get(id) {
+                Some(plan) => plan.texts(&document.lexical_text)?,
+                None => vec![document.embedding_text.as_str()],
+            };
+            for (ordinal, text) in texts.into_iter().enumerate() {
+                retained_search_checkpoint(cx)?;
+                let response = embedder.embed_bound(cx, text).await;
+                retained_search_checkpoint(cx)?;
+                let embedding = response?;
+                embedding.validate()?;
+                if embedding.identity != fast_identity {
+                    return Err(SearchError::UnverifiableRemoteSpace {
+                        producer: "fsfs.append_batch.fast".to_owned(),
+                        reason:
+                            "the returned fast embedding does not carry the admitted producer identity"
+                                .to_owned(),
+                    });
+                }
+                entries.push((semantic_windows::row_id(id, ordinal), embedding.values));
             }
-            entries.push((id.clone(), embedding.values));
             if let Some((quality_embedder, identity)) = quality.as_ref() {
                 let response = quality_embedder
                     .embed_bound(cx, &document.embedding_text)
@@ -12325,6 +12603,12 @@ impl FsfsRuntime {
         // that makes it findable semantically.
         retained_search_checkpoint(cx)?;
         publication_lease.fence("append-batch lexical publication")?;
+        if let Some((_, sentinel)) = window_membership.as_mut() {
+            // A partial multirow replacement cannot advertise complete source
+            // coverage. An ordinary source rebuild recovers an interrupted run.
+            sentinel.generation_complete = false;
+            self.write_index_sentinel(&index_root, sentinel)?;
+        }
         let lexical_revision = pressure_timestamp_ms();
         let lexical_mutations = docs
             .iter()
@@ -12356,7 +12640,46 @@ impl FsfsRuntime {
         Self::admit_vector_generation_for_embedder(&index, embedder.as_ref())?;
         index.append_batch(&entries)?;
 
-        let count = entries.len();
+        if let Some((mut manifests, sentinel)) = window_membership {
+            let current_rows = entries
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<HashSet<_>>();
+            let stale_rows = index
+                .live_doc_ids()?
+                .into_iter()
+                .filter(|row| {
+                    docs.contains_key(semantic_windows::source_id(row))
+                        && !current_rows.contains(row.as_str())
+                })
+                .collect::<Vec<_>>();
+            index.soft_delete_batch(&stale_rows.iter().map(String::as_str).collect::<Vec<_>>())?;
+            let revision = i64::try_from(lexical_revision).unwrap_or(i64::MAX);
+            for (id, document) in &docs {
+                manifests.insert(
+                    id.clone(),
+                    IndexManifestEntry {
+                        file_key: id.clone(),
+                        revision,
+                        ingestion_class: ingestion_class_label(IngestionClass::FullSemanticLexical)
+                            .to_owned(),
+                        canonical_bytes: u64::try_from(document.embedding_text.len())
+                            .unwrap_or(u64::MAX),
+                        reason_code: "append_batch".to_owned(),
+                        fast_windows: window_plans.remove(id),
+                    },
+                );
+            }
+            publication_lease.fence("append-batch window membership publication")?;
+            self.write_window_mutation_membership(
+                &index_root,
+                manifests,
+                sentinel,
+                "append-batch",
+            )?;
+        }
+
+        let count = docs.len();
         info!(
             count,
             wal_total = index.wal_record_count(),
@@ -12535,30 +12858,80 @@ impl FsfsRuntime {
     async fn run_delete_command(&self, cx: &Cx) -> SearchResult<()> {
         let index_root = self.resolve_status_index_root()?;
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+        let ids = &self.cli_input.delete_ids;
+        if ids.iter().any(|id| id.contains('\0')) {
+            return Err(complete_cli::complete_cli_error(
+                "delete_ids",
+                "document IDs and prefixes cannot contain the reserved semantic-window NUL byte",
+            ));
+        }
 
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        {
+            let index = VectorIndex::open_read_only(&vector_path)?;
+            semantic_windows::load_mapping(&index_root, &index)?;
+        }
+        let mut window_membership = if Self::fast_window_policy_at_root(&index_root)? > 1 {
+            Self::validate_search_generation_at_root(&index_root, SearchExecutionMode::Full)?;
+            let manifests =
+                Self::read_matching_manifest_generation(&index_root)?.ok_or_else(|| {
+                    complete_cli::complete_cli_error(
+                        "delete_membership",
+                        "window generation membership manifests disagree",
+                    )
+                })?;
+            let sentinel = Self::read_index_sentinel(&index_root)?.ok_or_else(|| {
+                complete_cli::complete_cli_error(
+                    "delete_membership",
+                    "window generation has no completion sentinel",
+                )
+            })?;
+            Some((manifests, sentinel))
+        } else {
+            None
+        };
 
         publication_lease.fence("delete WAL publication")?;
         #[cfg(unix)]
         self.quiesce_query_daemon("delete")?;
         let mut index = Self::open_vector_index_for_mutation(&vector_path)?;
-        let ids = &self.cli_input.delete_ids;
 
         let mut total_deleted = 0usize;
+        let live_rows = index.live_doc_ids()?;
 
-        let targets: Vec<String> = if self.cli_input.delete_prefix {
+        let targets: Vec<String> = if let Some((manifests, _)) = window_membership.as_ref() {
+            manifests
+                .keys()
+                .cloned()
+                .chain(
+                    live_rows
+                        .iter()
+                        .map(|row| semantic_windows::source_id(row).to_owned()),
+                )
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|source| {
+                    ids.iter().any(|requested| {
+                        if self.cli_input.delete_prefix {
+                            source.starts_with(requested.as_str())
+                        } else {
+                            source == requested
+                        }
+                    })
+                })
+                .collect()
+        } else if self.cli_input.delete_prefix {
             // Prefix matching: scan all live doc IDs (main index + WAL) and
             // collect those matching any prefix. soft_delete_batch handles
             // both main-index tombstones and WAL tombstones idempotently.
-            let live_doc_ids = index.live_doc_ids()?;
             let mut to_delete = Vec::new();
-            for doc_id in live_doc_ids {
+            for doc_id in &live_rows {
                 for prefix in ids {
                     if doc_id.starts_with(prefix.as_str()) {
-                        to_delete.push(doc_id);
+                        to_delete.push(doc_id.clone());
                         break;
                     }
                 }
@@ -12571,7 +12944,20 @@ impl FsfsRuntime {
 
         if !targets.is_empty() {
             let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
-            total_deleted = index.soft_delete_batch(&refs)?;
+            if let Some((_, sentinel)) = window_membership.as_mut() {
+                sentinel.generation_complete = false;
+                self.write_index_sentinel(&index_root, sentinel)?;
+                let sources = refs.iter().copied().collect::<HashSet<_>>();
+                let rows = live_rows
+                    .iter()
+                    .filter(|row| sources.contains(semantic_windows::source_id(row)))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                index.soft_delete_batch(&rows)?;
+                total_deleted = targets.len();
+            } else {
+                total_deleted = index.soft_delete_batch(&refs)?;
+            }
             // Mirror the tombstones into the quality tier so a deleted
             // document cannot resurface in REFINED results.
             let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
@@ -12607,6 +12993,13 @@ impl FsfsRuntime {
                 .collect::<Vec<_>>();
             self.apply_one_shot_lexical_mutations(cx, &index_root, &lexical_mutations)
                 .await?;
+            if let Some((mut manifests, sentinel)) = window_membership {
+                for id in &targets {
+                    manifests.remove(id);
+                }
+                publication_lease.fence("delete window membership publication")?;
+                self.write_window_mutation_membership(&index_root, manifests, sentinel, "delete")?;
+            }
         }
 
         info!(
@@ -13861,9 +14254,29 @@ impl FsfsRuntime {
             };
         }
         let quality_live = index.live_doc_ids().map(|ids| ids.len()).ok();
+        if Self::fast_window_policy_at_root(index_root).is_ok_and(|maximum| maximum > 1)
+            && let Err(error) =
+                Self::validate_search_generation_at_root(index_root, SearchExecutionMode::Full)
+        {
+            return DoctorCheck {
+                name: NAME.to_owned(),
+                verdict: DoctorVerdict::Fail,
+                detail: format!("fast window generation cannot be admitted: {error}"),
+                suggestion: Some("rebuild the source with `fsfs index --full`".to_owned()),
+            };
+        }
         let fast_live = VectorIndex::open_read_only(&fast_path)
             .ok()
-            .and_then(|fast| fast.live_doc_ids().map(|ids| ids.len()).ok());
+            .and_then(|fast| {
+                fast.live_doc_ids()
+                    .map(|ids| {
+                        ids.iter()
+                            .map(|row| semantic_windows::source_id(row))
+                            .collect::<HashSet<_>>()
+                            .len()
+                    })
+                    .ok()
+            });
         if let (Some(quality_live), Some(fast_live)) = (quality_live, fast_live)
             && quality_live != fast_live
         {
@@ -14901,6 +15314,7 @@ impl FsfsRuntime {
             || sentinel.indexed_files != by_key.len()
             || sentinel.skipped_files != checkpoint.skipped_files
             || sentinel.total_canonical_bytes != total_canonical_bytes
+            || sentinel.fast_window_max_per_file != checkpoint.fast_window_max_per_file
         {
             return Ok(None);
         }
@@ -15376,6 +15790,8 @@ impl FsfsRuntime {
                 && checkpoint.artifacts_durable
                 && checkpoint.target_root == target_root_label
                 && checkpoint.index_root == index_root_label
+                && checkpoint.fast_window_max_per_file
+                    == self.config.indexing.fast_window_max_per_file
         });
         let checkpoint_manifests = if checkpoint_metadata_valid {
             match Self::read_checkpoint_manifest_generation(
@@ -15434,6 +15850,7 @@ impl FsfsRuntime {
                     .map_or_else(BTreeMap::new, |previous| previous.files.clone()),
                 discovered_files: stats.discovered_files,
                 skipped_files: stats.skipped_files,
+                fast_window_max_per_file: self.config.indexing.fast_window_max_per_file,
             },
         )?;
 
@@ -15654,7 +16071,9 @@ impl FsfsRuntime {
             .collect::<HashSet<_>>();
         let stale_vector_ids = initial_live_vector_ids
             .iter()
-            .filter(|file_key| !reusable_semantic_ids.contains(file_key.as_str()))
+            .filter(|row_id| {
+                !reusable_semantic_ids.contains(semantic_windows::source_id(row_id.as_str()))
+            })
             .map(String::as_str)
             .collect::<Vec<_>>();
         if !stale_vector_ids.is_empty() {
@@ -15729,6 +16148,7 @@ impl FsfsRuntime {
             files: BTreeMap::new(),
             discovered_files: stats.discovered_files,
             skipped_files: stats.skipped_files,
+            fast_window_max_per_file: self.config.indexing.fast_window_max_per_file,
         };
 
         let canonicalize_start = Instant::now();
@@ -15840,12 +16260,33 @@ impl FsfsRuntime {
                 let ingestion_class = ingestion_class_label(candidate.ingestion_class).to_owned();
                 let reason_code = ingestion_plan_reason(candidate.ingestion_class).to_owned();
                 let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
+                let fast_windows = if self.config.indexing.fast_window_max_per_file > 1
+                    && matches!(
+                        candidate.ingestion_class,
+                        IngestionClass::FullSemanticLexical
+                    ) {
+                    Some(semantic_windows::plan(
+                        &lexical_text,
+                        self.config.indexing.fast_window_max_per_file,
+                    )?)
+                } else {
+                    None
+                };
+                if reuse == CheckpointReuse::Complete
+                    && existing_checkpoint
+                        .as_ref()
+                        .and_then(|previous| previous.files.get(&candidate.file_key))
+                        .is_none_or(|entry| entry.fast_windows != fast_windows)
+                {
+                    reuse = CheckpointReuse::None;
+                }
                 let manifest = IndexManifestEntry {
                     file_key: candidate.file_key.clone(),
                     revision,
                     ingestion_class: ingestion_class.clone(),
                     canonical_bytes,
                     reason_code: reason_code.clone(),
+                    fast_windows: fast_windows.clone(),
                 };
                 if manifests
                     .insert(candidate.file_key.clone(), manifest)
@@ -15890,6 +16331,7 @@ impl FsfsRuntime {
                         IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
                     ),
                     semantic_reused: reuse == CheckpointReuse::Complete,
+                    fast_windows,
                     document: doc,
                     lexical_text,
                 });
@@ -15957,7 +16399,102 @@ impl FsfsRuntime {
 
             let mut semantic_succeeded_this_chunk = HashSet::new();
 
-            if !semantic_docs.is_empty() {
+            if self.config.indexing.fast_window_max_per_file > 1 {
+                for pending in &semantic_docs {
+                    control.checkpoint(cx, "index.fast_window_source", true)?;
+                    let window_plan = pending.fast_windows.as_ref().ok_or_else(|| {
+                        SearchError::InvalidConfig {
+                            field: "indexing.fast_windows".to_owned(),
+                            value: pending.file_key.clone(),
+                            reason: "semantic source is missing its window plan".to_owned(),
+                        }
+                    })?;
+                    let window_texts = window_plan.texts(&pending.lexical_text)?;
+                    let mut source_vectors = Vec::with_capacity(window_texts.len());
+                    let mut exhausted = false;
+                    const WINDOW_RETRY_BACKOFFS_MS: [u64; EMBEDDING_BATCH_MAX_ATTEMPTS - 1] =
+                        [200, 400];
+                    for texts in window_texts.chunks(batch_size) {
+                        control.checkpoint(cx, "index.fast_window_batch", true)?;
+                        let outcome = Self::embed_indexing_batch_with_backoffs(
+                            cx,
+                            &fast_admission,
+                            texts,
+                            &WINDOW_RETRY_BACKOFFS_MS,
+                            |retry_number, retry_budget, backoff_ms, error, _elapsed_ms| {
+                                control.checkpoint(cx, "index.fast_window_retry", true)?;
+                                push_warning(
+                                    &mut recent_warnings,
+                                    IndexingWarningSeverity::Warn,
+                                    format!(
+                                        "Fast passage batch retry {retry_number}/{retry_budget} \
+                                         ({backoff_ms}ms backoff) for {}: {}",
+                                        pending.file_key,
+                                        Self::semantic_runtime_failure_summary(error),
+                                    ),
+                                );
+                                Ok(())
+                            },
+                        )
+                        .await?;
+                        control.checkpoint(cx, "index.fast_window_batch_complete", true)?;
+                        match outcome {
+                            IndexingBatchEmbeddingOutcome::Ready {
+                                embeddings,
+                                embedding_elapsed_ms: elapsed_ms,
+                                retries_executed,
+                            } => {
+                                embedding_elapsed_ms =
+                                    embedding_elapsed_ms.saturating_add(elapsed_ms);
+                                embedding_retries =
+                                    embedding_retries.saturating_add(retries_executed);
+                                source_vectors.extend(embeddings);
+                            }
+                            IndexingBatchEmbeddingOutcome::Exhausted {
+                                error,
+                                embedding_elapsed_ms: elapsed_ms,
+                                retries_executed,
+                            } => {
+                                embedding_elapsed_ms =
+                                    embedding_elapsed_ms.saturating_add(elapsed_ms);
+                                embedding_retries =
+                                    embedding_retries.saturating_add(retries_executed);
+                                embedding_failures = embedding_failures.saturating_add(1);
+                                semantic_deferred_files = semantic_deferred_files.saturating_add(1);
+                                push_warning(
+                                    &mut recent_warnings,
+                                    IndexingWarningSeverity::Error,
+                                    format!(
+                                        "Fast passage embedding deferred for {} after {} attempts: {}",
+                                        pending.file_key,
+                                        retries_executed.saturating_add(1),
+                                        Self::semantic_runtime_failure_summary(&error),
+                                    ),
+                                );
+                                exhausted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !exhausted {
+                        // A source enters the WAL and checkpoint only after every
+                        // bounded passage batch succeeded. Cancellation or a later
+                        // batch failure cannot advertise a partial source as done.
+                        control.checkpoint(cx, "index.fast_window_publish", true)?;
+                        let vector_start = Instant::now();
+                        let vector_batch = window_plan
+                            .row_ids(&pending.file_key)
+                            .into_iter()
+                            .zip(source_vectors)
+                            .collect::<Vec<_>>();
+                        publication_lease.fence("one-shot fast passage WAL append")?;
+                        vector_index.append_batch(&vector_batch)?;
+                        semantic_succeeded_this_chunk.insert(pending.file_key.clone());
+                        vector_elapsed_ms =
+                            vector_elapsed_ms.saturating_add(vector_start.elapsed().as_millis());
+                    }
+                }
+            } else if !semantic_docs.is_empty() {
                 control.checkpoint(cx, "index.semantic_batch", true)?;
                 let semantic_texts = semantic_docs
                     .iter()
@@ -16208,6 +16745,7 @@ impl FsfsRuntime {
                         lexical_indexed,
                         semantic_indexed,
                         content_hash_hex: pending.content_hash_hex.clone(),
+                        fast_windows: pending.fast_windows.clone(),
                     },
                 );
             }
@@ -16228,7 +16766,7 @@ impl FsfsRuntime {
 
                 let vector_compact_start = Instant::now();
                 publication_lease.fence("one-shot incremental vector reconciliation")?;
-                reconcile_vector_generation(&mut vector_index, &checkpoint)?;
+                reconcile_fast_vector_generation(&mut vector_index, &checkpoint)?;
                 if let Some(quality_index) = quality_vector_index.as_mut() {
                     publication_lease
                         .fence("one-shot incremental quality vector reconciliation")?;
@@ -16270,6 +16808,7 @@ impl FsfsRuntime {
                         reason_codes: checkpoint.reason_codes.clone(),
                         total_canonical_bytes: partial_total_canonical_bytes,
                         source_hash_hex: checkpoint.source_hash_hex.clone(),
+                        fast_window_max_per_file: self.config.indexing.fast_window_max_per_file,
                     },
                 )?;
                 checkpoint.artifacts_durable = true;
@@ -16373,7 +16912,7 @@ impl FsfsRuntime {
 
         let vector_finish_start = Instant::now();
         publication_lease.fence("final vector generation reconciliation")?;
-        reconcile_vector_generation(&mut vector_index, &checkpoint)?;
+        reconcile_fast_vector_generation(&mut vector_index, &checkpoint)?;
         if let Some(quality_index) = quality_vector_index.as_mut() {
             publication_lease.fence("final quality vector generation reconciliation")?;
             reconcile_vector_generation(quality_index, &checkpoint)?;
@@ -16437,6 +16976,7 @@ impl FsfsRuntime {
             reason_codes: reason_codes.clone(),
             total_canonical_bytes,
             source_hash_hex: source_hash_hex.clone(),
+            fast_window_max_per_file: self.config.indexing.fast_window_max_per_file,
         };
 
         let mut storage_usage = self.collect_index_storage_usage(&IndexStoragePaths {
@@ -16550,6 +17090,7 @@ impl FsfsRuntime {
             embedding_failures,
             vector_generation: published_vector,
             quality_generation: published_quality,
+            fast_window_coverage: FastWindowCoveragePayload::from_checkpoint(&checkpoint),
             input_checkpoint: checkpoint,
         };
         if retain_legacy_reuse && generation_complete {
@@ -18258,6 +18799,11 @@ impl FsfsRuntime {
         } else {
             None
         };
+        let fast_window_mapping = vector_index
+            .as_ref()
+            .map(|index| semantic_windows::load_mapping(index_root, index))
+            .transpose()?
+            .flatten();
         // The quality tier is an enhancement over a working fast tier: a
         // missing file simply means INITIAL-only search, and an unreadable
         // one degrades to the same rather than refusing the whole search.
@@ -18307,6 +18853,7 @@ impl FsfsRuntime {
             shadow_observer,
             shadow_pressure_sampler,
             vector_index,
+            fast_window_mapping,
             quality_vector_index: quality_vector_index.map(Arc::new),
             fast_embedder: None,
             quality_embedder: None,
@@ -18800,6 +19347,7 @@ impl FsfsRuntime {
     ) -> SearchResult<(LiveIngestPipeline, Arc<std::sync::Mutex<VectorIndex>>)> {
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
+        self.refuse_legacy_window_watch(&index_root)?;
         let storage_db_path = self.resolve_storage_db_path()?;
         if storage_db_path.as_os_str() != ":memory:"
             && let Some(parent) = storage_db_path.parent()
@@ -25517,12 +26065,36 @@ fn reconcile_vector_generation(
     index: &mut VectorIndex,
     checkpoint: &IndexingCheckpoint,
 ) -> SearchResult<()> {
+    reconcile_vector_generation_rows(index, checkpoint, false)
+}
+
+fn reconcile_fast_vector_generation(
+    index: &mut VectorIndex,
+    checkpoint: &IndexingCheckpoint,
+) -> SearchResult<()> {
+    reconcile_vector_generation_rows(index, checkpoint, true)
+}
+
+fn reconcile_vector_generation_rows(
+    index: &mut VectorIndex,
+    checkpoint: &IndexingCheckpoint,
+    include_windows: bool,
+) -> SearchResult<()> {
     index.compact()?;
     let desired = checkpoint
         .files
         .iter()
         .filter(|(_, entry)| entry.semantic_indexed)
-        .map(|(file_key, _)| file_key.as_str())
+        .flat_map(|(file_key, entry)| {
+            if include_windows {
+                entry
+                    .fast_windows
+                    .as_ref()
+                    .map_or_else(|| vec![file_key.clone()], |plan| plan.row_ids(file_key))
+            } else {
+                vec![file_key.clone()]
+            }
+        })
         .collect::<HashSet<_>>();
     let stale = vector_live_doc_ids(index)?
         .into_iter()
@@ -25559,6 +26131,7 @@ fn checkpoint_entry_reuse(
         || manifest.ingestion_class != ingestion_class
         || manifest.canonical_bytes != entry.canonical_bytes
         || manifest.reason_code != reason_code
+        || manifest.fast_windows != entry.fast_windows
     {
         return CheckpointReuse::None;
     }
@@ -25578,11 +26151,27 @@ fn checkpoint_entry_reuse(
         return CheckpointReuse::Complete;
     }
 
+    let windows_valid = match entry.fast_windows.as_ref() {
+        Some(plan) => {
+            checkpoint.fast_window_max_per_file > 1
+                && plan.max_per_file == checkpoint.fast_window_max_per_file
+                && plan.validate().is_ok()
+                && plan
+                    .row_ids(&candidate.file_key)
+                    .iter()
+                    .all(|row_id| live_vector_ids.contains(row_id))
+        }
+        None => {
+            checkpoint.fast_window_max_per_file == 1
+                && live_vector_ids.contains(&candidate.file_key)
+        }
+    };
+
     if checkpoint.embedder_id == embedder_id
         && checkpoint.embedder_dimension == embedder_dimension
         && checkpoint.embedder_is_hash_fallback == embedder_is_hash_fallback
         && entry.semantic_indexed
-        && live_vector_ids.contains(&candidate.file_key)
+        && windows_valid
     {
         CheckpointReuse::Complete
     } else {
@@ -25597,6 +26186,11 @@ fn index_source_hash_hex(manifests: &[IndexManifestEntry]) -> String {
         entry.revision.hash(&mut hasher);
         entry.canonical_bytes.hash(&mut hasher);
         entry.ingestion_class.hash(&mut hasher);
+        // Keep prefix-only source hashes stable, while binding every opted-in
+        // range and policy version to the corresponding manifest generation.
+        if let Some(plan) = entry.fast_windows.as_ref() {
+            plan.hash(&mut hasher);
+        }
     }
     format!("{:016x}", hasher.finish())
 }
@@ -26838,6 +27432,7 @@ mod tests {
             shadow_observer: None,
             shadow_pressure_sampler: None,
             vector_index: Some(fast),
+            fast_window_mapping: None,
             quality_vector_index: Some(Arc::new(quality)),
             fast_embedder: Some(admitted(BlendQueryEmbedder("blend-fast-2"))),
             quality_embedder: Some(admitted(BlendQueryEmbedder("blend-quality-2"))),
@@ -26893,6 +27488,7 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open_read_only(&path).unwrap()),
+                fast_window_mapping: None,
                 quality_vector_index: None,
                 fast_embedder: Some(admitted(BlendQueryEmbedder("blend-fast-2"))),
                 quality_embedder: None,
@@ -28968,6 +29564,7 @@ mod tests {
             embedder_id: "publication-lease-test".to_owned(),
             embedder_dimension: 4,
             embedder_is_hash_fallback: false,
+            fast_window_max_per_file: 1,
             artifacts_durable,
             source_hash_hex: generation.to_owned(),
             reason_codes: vec!["test.publication_lease.paired_generation".to_owned()],
@@ -28984,6 +29581,7 @@ mod tests {
                     lexical_indexed: true,
                     semantic_indexed: true,
                     content_hash_hex: generation.to_owned(),
+                    fast_windows: None,
                 },
             )]),
             discovered_files: 1,
@@ -29012,6 +29610,7 @@ mod tests {
             reason_codes: vec!["test.publication_lease.paired_generation".to_owned()],
             total_canonical_bytes: 16,
             source_hash_hex: generation.to_owned(),
+            fast_window_max_per_file: 1,
         }
     }
 
@@ -30508,6 +31107,7 @@ mod tests {
             shadow_observer: None,
             shadow_pressure_sampler: None,
             vector_index: None,
+            fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: None,
             quality_embedder: None,
@@ -32455,6 +33055,7 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open_read_only(&vector_path).unwrap()),
+                fast_window_mapping: None,
                 quality_vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&quality_path).unwrap(),
                 )),
@@ -32566,6 +33167,7 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: None,
+                fast_window_mapping: None,
                 quality_vector_index: None,
                 fast_embedder: None,
                 quality_embedder: None,
@@ -36366,6 +36968,7 @@ mod tests {
                 embedder_id: "fnv1a-256".to_owned(),
                 embedder_dimension: 256,
                 embedder_is_hash_fallback: false,
+                fast_window_max_per_file: 1,
                 artifacts_durable: false,
                 source_hash_hex: "never-published".to_owned(),
                 reason_codes: Vec::new(),
@@ -36379,6 +36982,7 @@ mod tests {
                         lexical_indexed: true,
                         semantic_indexed: true,
                         content_hash_hex: "apparently-valid".to_owned(),
+                        fast_windows: None,
                     },
                 )]),
                 discovered_files: 1,
@@ -38492,6 +39096,7 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: None,
+                fast_window_mapping: None,
                 quality_vector_index: None,
                 fast_embedder: None,
                 quality_embedder: None,
@@ -39998,6 +40603,7 @@ mod tests {
                 )),
                 fast_embedder: Some(admitted(fast_embedder)),
                 quality_embedder: Some(admitted(BarrierQualityEmbedder::new(Arc::clone(&barrier)))),
+                fast_window_mapping: None,
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
                 degradation_advice: Vec::new(),
@@ -40125,6 +40731,7 @@ mod tests {
                 )),
                 fast_embedder: Some(admitted(fast_embedder)),
                 quality_embedder: Some(admitted(FailedQualityEmbedder)),
+                fast_window_mapping: None,
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
                 degradation_advice: Vec::new(),
@@ -40368,6 +40975,7 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                fast_window_mapping: None,
                 quality_vector_index: None,
                 fast_embedder: Some(admitted(CancelledEmbedder)),
                 quality_embedder: None,
@@ -40460,6 +41068,7 @@ mod tests {
                 )),
                 fast_embedder: Some(admitted(fast_embedder)),
                 quality_embedder: Some(admitted(CancelledEmbedder)),
+                fast_window_mapping: None,
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
                 degradation_advice: Vec::new(),
@@ -41014,6 +41623,7 @@ mod tests {
                 ingestion_class: "full_semantic_lexical".to_owned(),
                 canonical_bytes: 21,
                 reason_code: "test.reason".to_owned(),
+                fast_windows: None,
             }];
             fs::write(
                 index_root.join(super::FSFS_VECTOR_MANIFEST_FILE),
@@ -41044,6 +41654,7 @@ mod tests {
                 reason_codes: vec!["test.reason".to_owned()],
                 total_canonical_bytes: 21,
                 source_hash_hex: "feedface".to_owned(),
+                fast_window_max_per_file: 1,
             };
             fs::write(
                 index_root.join(super::FSFS_SENTINEL_FILE),
@@ -41777,6 +42388,7 @@ mod tests {
                 reason_codes: vec!["test.tantivy_migration".to_owned()],
                 total_canonical_bytes: 33,
                 source_hash_hex: "tantivy-generation".to_owned(),
+                fast_window_max_per_file: 1,
             };
             fs::create_dir_all(&index_root).expect("create index root");
             fs::write(
@@ -42013,6 +42625,7 @@ mod tests {
                 reason_codes: Vec::new(),
                 total_canonical_bytes: 0,
                 source_hash_hex: "old".to_owned(),
+                fast_window_max_per_file: 1,
             };
             fs::write(
                 index_root.join(super::FSFS_SENTINEL_FILE),
@@ -42499,6 +43112,7 @@ mod tests {
             shadow_observer: None,
             shadow_pressure_sampler: None,
             vector_index: Some(VectorIndex::open_read_only(&vector_path).expect("open hash index")),
+            fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: Some(admitted(HashEmbedder::default_256())),
             quality_embedder: None,
@@ -42539,6 +43153,7 @@ mod tests {
             shadow_observer: None,
             shadow_pressure_sampler: None,
             vector_index: None,
+            fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: None,
             quality_embedder: None,
@@ -43319,6 +43934,7 @@ mod tests {
             shadow_observer: None,
             shadow_pressure_sampler: None,
             vector_index: Some(VectorIndex::open_read_only(&vector_path).expect("open hash index")),
+            fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: None,
             quality_embedder: None,
@@ -43703,6 +44319,7 @@ mod tests {
                     reason_codes: Vec::new(),
                     total_canonical_bytes: 128,
                     source_hash_hex: "partial-generation".to_owned(),
+                    fast_window_max_per_file: 1,
                 },
             )
             .expect("write incomplete sentinel");
@@ -45459,6 +46076,7 @@ mod tests {
             embedder_id: "semantic-model".to_owned(),
             embedder_dimension: 4,
             embedder_is_hash_fallback: false,
+            fast_window_max_per_file: 1,
             artifacts_durable: true,
             source_hash_hex: "deferred-generation".to_owned(),
             reason_codes: Vec::new(),
@@ -45472,6 +46090,7 @@ mod tests {
                     lexical_indexed: true,
                     semantic_indexed: false,
                     content_hash_hex: "abc123".to_owned(),
+                    fast_windows: None,
                 },
             )]),
             discovered_files: 1,
@@ -45495,6 +46114,7 @@ mod tests {
                     reason_codes: Vec::new(),
                     total_canonical_bytes: 1_024,
                     source_hash_hex: checkpoint.source_hash_hex,
+                    fast_window_max_per_file: 1,
                 },
             )
             .expect("write deferred generation sentinel");
@@ -45828,6 +46448,7 @@ mod tests {
                 lexical_indexed: true,
                 semantic_indexed: false,
                 content_hash_hex: "abc123".to_owned(),
+                fast_windows: None,
             },
         );
         files.insert(
@@ -45840,6 +46461,7 @@ mod tests {
                 lexical_indexed: true,
                 semantic_indexed: false,
                 content_hash_hex: "def456".to_owned(),
+                fast_windows: None,
             },
         );
 
@@ -45852,6 +46474,7 @@ mod tests {
             embedder_id: "all-MiniLM-L6-v2".to_owned(),
             embedder_dimension: 384,
             embedder_is_hash_fallback: false,
+            fast_window_max_per_file: 1,
             artifacts_durable: true,
             source_hash_hex: "generation-hash".to_owned(),
             reason_codes: vec!["FSFS_CODE_EXTENSION_INCLUDED".to_owned()],
@@ -45974,6 +46597,7 @@ mod tests {
             lexical_indexed: true,
             semantic_indexed: false,
             content_hash_hex: "abc123".to_owned(),
+            fast_windows: None,
         };
         let checkpoint = super::IndexingCheckpoint {
             schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
@@ -45984,6 +46608,7 @@ mod tests {
             embedder_id: "semantic-model".to_owned(),
             embedder_dimension: 4,
             embedder_is_hash_fallback: false,
+            fast_window_max_per_file: 1,
             artifacts_durable: true,
             source_hash_hex: "generation-hash".to_owned(),
             reason_codes: Vec::new(),
@@ -46032,6 +46657,7 @@ mod tests {
             reason_codes: Vec::new(),
             total_canonical_bytes: 1_024,
             source_hash_hex: "generation-hash".to_owned(),
+            fast_window_max_per_file: 1,
         };
         assert!(
             super::validate_sentinel_search_admission(
@@ -46088,6 +46714,7 @@ mod tests {
             ingestion_class: "full_semantic_lexical".to_owned(),
             canonical_bytes: 1_024,
             reason_code: "index.plan.full_semantic_lexical".to_owned(),
+            fast_windows: None,
         };
         let entry = super::CheckpointFileEntry {
             revision: 42,
@@ -46097,6 +46724,7 @@ mod tests {
             lexical_indexed: true,
             semantic_indexed: true,
             content_hash_hex: "abc123".to_owned(),
+            fast_windows: None,
         };
         let checkpoint = super::IndexingCheckpoint {
             schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
@@ -46107,6 +46735,7 @@ mod tests {
             embedder_id: "hash-fnv1a".to_owned(),
             embedder_dimension: 256,
             embedder_is_hash_fallback: false,
+            fast_window_max_per_file: 1,
             artifacts_durable: true,
             source_hash_hex: "generation-hash".to_owned(),
             reason_codes: vec!["FSFS_CODE_EXTENSION_INCLUDED".to_owned()],
@@ -46197,6 +46826,7 @@ mod tests {
             embedder_id: "hash-fnv1a".to_owned(),
             embedder_dimension: 256,
             embedder_is_hash_fallback: true,
+            fast_window_max_per_file: 1,
             artifacts_durable: true,
             source_hash_hex: "generation-hash".to_owned(),
             reason_codes: Vec::new(),
