@@ -1253,6 +1253,7 @@ mod generation_tests {
         struct InferenceCounts {
             probes: AtomicUsize,
             documents: AtomicUsize,
+            batches: AtomicUsize,
         }
 
         struct CountingEmbedder {
@@ -1322,6 +1323,21 @@ mod generation_tests {
                         }
                     }
                     Ok(self.vector(text))
+                })
+            }
+
+            fn embed_batch<'a>(
+                &'a self,
+                cx: &'a Cx,
+                texts: &'a [&'a str],
+            ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+                Box::pin(async move {
+                    self.counts.batches.fetch_add(1, Ordering::SeqCst);
+                    let mut vectors = Vec::with_capacity(texts.len());
+                    for text in texts {
+                        vectors.push(self.embed(cx, text).await?);
+                    }
+                    Ok(vectors)
                 })
             }
 
@@ -1660,6 +1676,91 @@ mod generation_tests {
                 )
                 .unwrap();
                 assert!(index.live_doc_ids().unwrap().is_empty());
+            });
+        }
+
+        #[test]
+        fn fast_windows_of_short_files_share_one_batch() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (mut runtime, _, root) = fixture(parent.path(), 5);
+                runtime.config.indexing.fast_window_max_per_file = 4;
+                runtime.config.indexing.embedding_batch_size = 8;
+                let fast = Arc::new(CountingEmbedder::new("reuse-fast", 4, false));
+                let _restore = RestoreEmbedders::install(
+                    fast.clone(),
+                    Arc::new(CountingEmbedder::new("reuse-quality", 6, false)),
+                );
+                let payload = runtime
+                    .run_one_shot_index_scaffold_internal(
+                        &cx,
+                        CliCommand::Index,
+                        |_| Ok(()),
+                        false,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(payload.semantic_indexed_files, 5);
+                assert_eq!(fast.counts.documents.load(Ordering::SeqCst), 5);
+                assert_eq!(
+                    fast.counts.batches.load(Ordering::SeqCst),
+                    1,
+                    "five one-window files fit one batch"
+                );
+                let index = frankensearch_index::VectorIndex::open_read_only(
+                    &root.join(super::super::super::FSFS_VECTOR_INDEX_FILE),
+                )
+                .unwrap();
+                assert_eq!(index.live_doc_ids().unwrap().len(), 5);
+            });
+        }
+
+        #[test]
+        fn fast_window_batch_failure_defers_every_file_it_touched() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (mut runtime, source, root) = fixture(parent.path(), 3);
+                runtime.config.indexing.fast_window_max_per_file = 4;
+                runtime.config.indexing.embedding_batch_size = 3;
+                // Windows [doc-0: 1][doc-1: 4][doc-2: 1] pack as
+                // [0, 1, 1] [1, 1, 2]: doc-1 spans both batches.
+                fs::write(
+                    source.join("doc-1.md"),
+                    format!("sharedtoken {} deep tail", "long introduction ".repeat(500)),
+                )
+                .unwrap();
+                let mut fast = CountingEmbedder::new("reuse-fast", 4, false);
+                fast.fail_after_documents = Some(3);
+                let _restore = RestoreEmbedders::install(
+                    Arc::new(fast),
+                    Arc::new(CountingEmbedder::new("reuse-quality", 6, false)),
+                );
+                let payload = runtime
+                    .run_one_shot_index_scaffold_internal(
+                        &cx,
+                        CliCommand::Index,
+                        |_| Ok(()),
+                        false,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!payload.generation.generation_complete);
+                assert_eq!(payload.semantic_indexed_files, 1);
+                assert_eq!(payload.semantic_deferred_files, 2);
+                let files = &payload.input_checkpoint.files;
+                assert!(files["doc-0.md"].semantic_indexed);
+                assert!(!files["doc-1.md"].semantic_indexed);
+                assert!(!files["doc-2.md"].semantic_indexed);
+                let index = frankensearch_index::VectorIndex::open_read_only(
+                    &root.join(super::super::super::FSFS_VECTOR_INDEX_FILE),
+                )
+                .unwrap();
+                assert_eq!(
+                    index.live_doc_ids().unwrap(),
+                    HashSet::from(["doc-0.md".to_owned()])
+                );
             });
         }
 

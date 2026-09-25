@@ -16412,8 +16412,11 @@ impl FsfsRuntime {
             let mut semantic_succeeded_this_chunk = HashSet::new();
 
             if self.config.indexing.fast_window_max_per_file > 1 {
+                // The chunk's windows share bounded batches: a short file is a
+                // single window, and embedding and appending it alone costs one
+                // call and one WAL fsync per file.
+                let mut sources = Vec::with_capacity(semantic_docs.len());
                 for pending in &semantic_docs {
-                    control.checkpoint(cx, "index.fast_window_source", true)?;
                     let window_plan = pending.fast_windows.as_ref().ok_or_else(|| {
                         SearchError::InvalidConfig {
                             field: "indexing.fast_windows".to_owned(),
@@ -16421,87 +16424,123 @@ impl FsfsRuntime {
                             reason: "semantic source is missing its window plan".to_owned(),
                         }
                     })?;
-                    let window_texts = window_plan.texts(&pending.lexical_text)?;
-                    let mut source_vectors = Vec::with_capacity(window_texts.len());
-                    let mut exhausted = false;
-                    const WINDOW_RETRY_BACKOFFS_MS: [u64; EMBEDDING_BATCH_MAX_ATTEMPTS - 1] =
-                        [200, 400];
-                    for texts in window_texts.chunks(batch_size) {
-                        control.checkpoint(cx, "index.fast_window_batch", true)?;
-                        let outcome = Self::embed_indexing_batch_with_backoffs(
-                            cx,
-                            &fast_admission,
-                            texts,
-                            &WINDOW_RETRY_BACKOFFS_MS,
-                            |retry_number, retry_budget, backoff_ms, error, _elapsed_ms| {
-                                control.checkpoint(cx, "index.fast_window_retry", true)?;
-                                push_warning(
-                                    &mut recent_warnings,
-                                    IndexingWarningSeverity::Warn,
-                                    format!(
-                                        "Fast passage batch retry {retry_number}/{retry_budget} \
-                                         ({backoff_ms}ms backoff) for {}: {}",
-                                        pending.file_key,
-                                        Self::semantic_runtime_failure_summary(error),
-                                    ),
-                                );
-                                Ok(())
-                            },
-                        )
-                        .await?;
-                        control.checkpoint(cx, "index.fast_window_batch_complete", true)?;
-                        match outcome {
-                            IndexingBatchEmbeddingOutcome::Ready {
-                                embeddings,
-                                embedding_elapsed_ms: elapsed_ms,
-                                retries_executed,
-                            } => {
-                                embedding_elapsed_ms =
-                                    embedding_elapsed_ms.saturating_add(elapsed_ms);
-                                embedding_retries =
-                                    embedding_retries.saturating_add(retries_executed);
-                                source_vectors.extend(embeddings);
-                            }
-                            IndexingBatchEmbeddingOutcome::Exhausted {
-                                error,
-                                embedding_elapsed_ms: elapsed_ms,
-                                retries_executed,
-                            } => {
-                                embedding_elapsed_ms =
-                                    embedding_elapsed_ms.saturating_add(elapsed_ms);
-                                embedding_retries =
-                                    embedding_retries.saturating_add(retries_executed);
-                                embedding_failures = embedding_failures.saturating_add(1);
-                                semantic_deferred_files = semantic_deferred_files.saturating_add(1);
-                                push_warning(
-                                    &mut recent_warnings,
-                                    IndexingWarningSeverity::Error,
-                                    format!(
-                                        "Fast passage embedding deferred for {} after {} attempts: {}",
-                                        pending.file_key,
-                                        retries_executed.saturating_add(1),
-                                        Self::semantic_runtime_failure_summary(&error),
-                                    ),
-                                );
-                                exhausted = true;
-                                break;
+                    sources.push((
+                        *pending,
+                        window_plan,
+                        window_plan.texts(&pending.lexical_text)?,
+                    ));
+                }
+                let windows = sources
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(source, (_, _, texts))| {
+                        texts.iter().map(move |text| (source, *text))
+                    })
+                    .collect::<Vec<_>>();
+                let mut source_vectors = vec![Vec::new(); sources.len()];
+                let mut deferred = vec![false; sources.len()];
+                const WINDOW_RETRY_BACKOFFS_MS: [u64; EMBEDDING_BATCH_MAX_ATTEMPTS - 1] =
+                    [200, 400];
+                for batch in windows.chunks(batch_size) {
+                    control.checkpoint(cx, "index.fast_window_batch", true)?;
+                    let live = batch
+                        .iter()
+                        .filter(|(source, _)| !deferred[*source])
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let Some(&(first, _)) = live.first() else {
+                        continue;
+                    };
+                    let mut touched = live.iter().map(|(source, _)| *source).collect::<Vec<_>>();
+                    touched.dedup();
+                    let batch_files = if touched.len() == 1 {
+                        sources[first].0.file_key.clone()
+                    } else {
+                        format!("{} and {} more files", sources[first].0.file_key, touched.len() - 1)
+                    };
+                    let texts = live.iter().map(|(_, text)| *text).collect::<Vec<_>>();
+                    let outcome = Self::embed_indexing_batch_with_backoffs(
+                        cx,
+                        &fast_admission,
+                        &texts,
+                        &WINDOW_RETRY_BACKOFFS_MS,
+                        |retry_number, retry_budget, backoff_ms, error, _elapsed_ms| {
+                            control.checkpoint(cx, "index.fast_window_retry", true)?;
+                            push_warning(
+                                &mut recent_warnings,
+                                IndexingWarningSeverity::Warn,
+                                format!(
+                                    "Fast passage batch retry {retry_number}/{retry_budget} \
+                                     ({backoff_ms}ms backoff) for {batch_files}: {}",
+                                    Self::semantic_runtime_failure_summary(error),
+                                ),
+                            );
+                            Ok(())
+                        },
+                    )
+                    .await?;
+                    control.checkpoint(cx, "index.fast_window_batch_complete", true)?;
+                    match outcome {
+                        IndexingBatchEmbeddingOutcome::Ready {
+                            embeddings,
+                            embedding_elapsed_ms: elapsed_ms,
+                            retries_executed,
+                        } => {
+                            embedding_elapsed_ms = embedding_elapsed_ms.saturating_add(elapsed_ms);
+                            embedding_retries = embedding_retries.saturating_add(retries_executed);
+                            for ((source, _), embedding) in live.iter().zip(embeddings) {
+                                source_vectors[*source].push(embedding);
                             }
                         }
+                        IndexingBatchEmbeddingOutcome::Exhausted {
+                            error,
+                            embedding_elapsed_ms: elapsed_ms,
+                            retries_executed,
+                        } => {
+                            embedding_elapsed_ms = embedding_elapsed_ms.saturating_add(elapsed_ms);
+                            embedding_retries = embedding_retries.saturating_add(retries_executed);
+                            embedding_failures = embedding_failures.saturating_add(1);
+                            semantic_deferred_files =
+                                semantic_deferred_files.saturating_add(touched.len());
+                            push_warning(
+                                &mut recent_warnings,
+                                IndexingWarningSeverity::Error,
+                                format!(
+                                    "Fast passage embedding deferred for {batch_files} after {} attempts: {}",
+                                    retries_executed.saturating_add(1),
+                                    Self::semantic_runtime_failure_summary(&error),
+                                ),
+                            );
+                            for source in &touched {
+                                deferred[*source] = true;
+                                source_vectors[*source] = Vec::new();
+                            }
+                            continue;
+                        }
                     }
-                    if !exhausted {
-                        // A source enters the WAL and checkpoint only after every
-                        // bounded passage batch succeeded. Cancellation or a later
-                        // batch failure cannot advertise a partial source as done.
+                    // A source enters the WAL and checkpoint only after every
+                    // one of its windows succeeded. Cancellation or a later
+                    // batch failure cannot advertise a partial source as done.
+                    let mut vector_batch = Vec::new();
+                    let mut published = Vec::new();
+                    for source in touched {
+                        let (pending, window_plan, texts) = &sources[source];
+                        if source_vectors[source].len() == texts.len() {
+                            vector_batch.extend(
+                                window_plan
+                                    .row_ids(&pending.file_key)
+                                    .into_iter()
+                                    .zip(std::mem::take(&mut source_vectors[source])),
+                            );
+                            published.push(pending.file_key.clone());
+                        }
+                    }
+                    if !vector_batch.is_empty() {
                         control.checkpoint(cx, "index.fast_window_publish", true)?;
                         let vector_start = Instant::now();
-                        let vector_batch = window_plan
-                            .row_ids(&pending.file_key)
-                            .into_iter()
-                            .zip(source_vectors)
-                            .collect::<Vec<_>>();
                         publication_lease.fence("one-shot fast passage WAL append")?;
                         vector_index.append_batch(&vector_batch)?;
-                        semantic_succeeded_this_chunk.insert(pending.file_key.clone());
+                        semantic_succeeded_this_chunk.extend(published);
                         vector_elapsed_ms =
                             vector_elapsed_ms.saturating_add(vector_start.elapsed().as_millis());
                     }
