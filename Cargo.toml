@@ -297,3 +297,10 @@ opt-level = 2
 # 2 GiB executable-image budget its fresh-process restart-reuse tests hash.
 # First-party crates keep full debug info.
 debug = "line-tables-only"
+
+# Every `fsfs index` hashes its own executable image to bind restart reuse
+# (retained_reuse::execution). Unoptimized, sha2 does not inline its SHA-NI
+# intrinsics: a 1.6 GB debug fsfs spent 36 s there before its first check,
+# past the quickstart gate's 30 s refusal cap (bd-y1amo).
+[profile.dev.package.sha2]
+opt-level = 3
