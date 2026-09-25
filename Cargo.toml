@@ -292,3 +292,8 @@ strip = false
 # opt-level 0 for debuggability.
 [profile.test.package."*"]
 opt-level = 2
+# Dependencies keep file:line for backtraces but not full DWARF. With full
+# dependency debug info the fsfs lib test binary reached 2.26 GiB, past the
+# 2 GiB executable-image budget its fresh-process restart-reuse tests hash.
+# First-party crates keep full debug info.
+debug = "line-tables-only"
