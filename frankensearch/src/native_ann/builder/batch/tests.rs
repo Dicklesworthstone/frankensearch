@@ -426,3 +426,249 @@ fn adaptive_native_build_is_opt_in_and_preserves_both_written_tiers() {
         }
     });
 }
+
+#[test]
+fn late_split_failure_writes_none_of_the_original_batch() {
+    use super::super::TierPlan;
+    use frankensearch_index::{ValidatedFsviBytes, VectorIndex};
+
+    run_test_with_cx(|cx| async move {
+        for fault in [
+            Fault::Foreign,
+            Fault::Short,
+            Fault::NonFinite,
+            Fault::WrongWidth,
+            Fault::InvalidConfig,
+            Fault::TypedCancellation,
+            Fault::CancelSuccess,
+            Fault::CancelFailure,
+            Fault::DriftSuccess,
+            Fault::DriftFailure,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("candidate.fsvi");
+            let mut provider = Provider::new("fast", 2, 2);
+            provider.fault = fault;
+            provider.fault_call = 2; // root fails; left succeeds; right fails
+            let provider = Arc::new(provider);
+            let tier = TierPlan::new(split(&provider)).unwrap();
+            let binding = tier.binding(&generation(1)).unwrap();
+            let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
+            writer.write_record("earlier-batch", &[0.25, 0.0]).unwrap();
+            let documents = ["a", "b", "c", "d"].map(|id| IndexableDocument::new(id, id));
+            let failure = tier.write_batch(&cx, &mut writer, &documents).await;
+            cx.set_cancel_requested(false);
+            assert!(failure.is_err());
+            assert_eq!(provider.calls.lock().unwrap().len(), 3);
+            // Finish this unselected writer solely to inspect what was staged.
+            // No build handle or publication receipt is manufactured by the test.
+            writer.finish().unwrap();
+            let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
+            let owner = ValidatedFsviBytes::from_arc(bytes, &binding).unwrap();
+            assert_eq!(owner.record_count(), 1);
+            assert_eq!(owner.row(0).unwrap().doc_id(), "earlier-batch");
+            assert_eq!(provider.raw_calls.load(Ordering::SeqCst), 0);
+        }
+    });
+}
+
+#[test]
+fn successful_batches_are_not_split_and_empty_builds_do_not_infer() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        for empty in [false, true] {
+            let fast = Arc::new(Provider::new("fast", 2, 2));
+            let quality = Arc::new(Provider::new("quality", 3, 2));
+            let input = if empty { Vec::new() } else { documents() };
+            let built = NativeIndexBuilder::new(
+                directory.path().join(if empty { "empty" } else { "populated" }),
+                generation(1),
+                fast.clone(),
+            )
+            .unwrap()
+            .with_quality_embedder(quality.clone())
+            .unwrap()
+            .with_batch_failure_splitting()
+            .with_batch_failure_splitting() // repeated opt-in is idempotent
+            .with_batch_size(2)
+            .unwrap()
+            .add_documents(input)
+            .build(&cx)
+            .await
+            .unwrap();
+            for provider in [&fast, &quality] {
+                let calls = provider.calls.lock().unwrap();
+                assert_eq!(calls.len(), if empty { 0 } else { 4 });
+                assert!(calls.iter().all(|batch| batch.len() <= 2));
+                assert_eq!(provider.raw_calls.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(built.documents().len(), if empty { 0 } else { 7 });
+            assert_eq!(built.fast().index().live_count(), built.documents().len());
+            assert_eq!(
+                built.quality().unwrap().index().live_count(),
+                built.documents().len()
+            );
+        }
+    });
+}
+
+#[test]
+fn incremental_build_retains_splitting_and_reuses_only_unchanged_inputs() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fast = Arc::new(Provider::new("fast", 2, 2));
+        let quality = Arc::new(Provider::new("quality", 3, 1));
+        let original = NativeIndexBuilder::new(
+            directory.path().join("original"),
+            generation(1),
+            fast.clone(),
+        )
+        .unwrap()
+        .with_quality_embedder(quality.clone())
+        .unwrap()
+        .with_batch_failure_splitting()
+        .add_documents(documents())
+        .build(&cx)
+        .await
+        .unwrap();
+        let old_fast = std::fs::read(original.fast().vector_path()).unwrap();
+        let old_quality = std::fs::read(original.quality().unwrap().vector_path()).unwrap();
+        fast.calls.lock().unwrap().clear();
+        quality.calls.lock().unwrap().clear();
+        let updated = original
+            .begin_update(&cx, directory.path().join("updated"), generation(2))
+            .unwrap()
+            .upsert_document(IndexableDocument::new("doc-0", "changed-0"))
+            .upsert_document(IndexableDocument::new("doc-1", "changed-1"))
+            .upsert_document(
+                IndexableDocument::new("doc-2", "text-2").with_title("new title"),
+            )
+            .delete_document("doc-6")
+            .upsert_document(IndexableDocument::new("doc-8", "new-8"))
+            .build(&cx)
+            .await
+            .unwrap();
+        for (provider, expected_calls) in [(&fast, 3), (&quality, 5)] {
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(calls.len(), expected_calls);
+            assert_eq!(calls[0], ["changed-0", "changed-1", "new-8"]);
+            assert!(calls.iter().flatten().all(|text| {
+                ["changed-0", "changed-1", "new-8"].contains(&text.as_str())
+            }));
+            assert_eq!(provider.raw_calls.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(updated.documents().len(), 7);
+        assert!(updated.document("doc-6").is_none());
+        assert_eq!(updated.document("doc-8").unwrap().content, "new-8");
+        assert_eq!(original.document("doc-0").unwrap().content, "text-0");
+        assert!(original.document("doc-6").is_some());
+        assert_eq!(std::fs::read(original.fast().vector_path()).unwrap(), old_fast);
+        assert_eq!(
+            std::fs::read(original.quality().unwrap().vector_path()).unwrap(),
+            old_quality
+        );
+        let before_failure = std::fs::read(updated.fast().vector_path()).unwrap();
+        let quality_before_failure =
+            std::fs::read(updated.quality().unwrap().vector_path()).unwrap();
+        let result = updated
+            .begin_update(&cx, directory.path().join("failed"), generation(3))
+            .unwrap()
+            .upsert_document(IndexableDocument::new("doc-0", "poison"))
+            .build(&cx)
+            .await;
+        assert!(matches!(result, Err(SearchError::EmbeddingFailed { .. })));
+        assert_eq!(
+            std::fs::read(updated.fast().vector_path()).unwrap(),
+            before_failure
+        );
+        assert_eq!(
+            std::fs::read(updated.quality().unwrap().vector_path()).unwrap(),
+            quality_before_failure
+        );
+        assert_eq!(updated.document("doc-0").unwrap().content, "changed-0");
+    });
+}
+
+#[cfg(all(feature = "quill", any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn split_batches_build_seal_and_reopen_the_complete_hybrid_graph_cohort() {
+    use super::super::{NativeBuildRetrieval, NativeBuiltHybridIndex};
+    use frankensearch_index::native_hnsw::HnswParams;
+
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hybrid");
+        let fast = Arc::new(Provider::new("fast", 2, 2));
+        let quality = Arc::new(Provider::new("quality", 3, 1));
+        let graph = NativeBuildRetrieval::Hnsw {
+            params: HnswParams::default(),
+            seed: 77,
+        };
+        let built = NativeIndexBuilder::new(&path, generation(1), fast.clone())
+            .unwrap()
+            .with_quality_embedder(quality.clone())
+            .unwrap()
+            .with_batch_failure_splitting()
+            .with_fast_storage(NativeBuildPrecision::F16, graph)
+            .with_quality_storage(NativeBuildPrecision::F32, graph)
+            .unwrap()
+            .add_documents(documents())
+            .build_hybrid(&cx)
+            .await
+            .unwrap();
+        let receipt = built.seal_for_reopen(&cx).unwrap();
+        let expected = built.search_refined(&cx, "text-1", 3).await.unwrap();
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|hit| (hit.doc_id.to_string(), hit.score.to_bits()))
+            .collect();
+        assert_eq!(expected.len(), 3);
+        let fast_calls = fast.calls.lock().unwrap().len();
+        let quality_calls = quality.calls.lock().unwrap().len();
+        let fast_witness = built.vectors().fast().index().owner_witness().clone();
+        let quality_witness = built
+            .vectors()
+            .quality()
+            .unwrap()
+            .index()
+            .owner_witness()
+            .clone();
+        drop(built);
+        let reopened = NativeBuiltHybridIndex::open_selected(
+            &cx,
+            &path,
+            &receipt,
+            fast.clone(),
+            Some(quality.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fast.calls.lock().unwrap().len(), fast_calls);
+        assert_eq!(quality.calls.lock().unwrap().len(), quality_calls);
+        assert_eq!(
+            reopened.vectors().fast().index().owner_witness(),
+            &fast_witness
+        );
+        assert_eq!(
+            reopened.vectors().quality().unwrap().index().owner_witness(),
+            &quality_witness
+        );
+        assert!(reopened.vectors().fast().graph_path().is_some());
+        assert!(reopened.vectors().quality().unwrap().graph_path().is_some());
+        assert_eq!(reopened.lexical().doc_count().unwrap(), 7);
+        let actual = reopened.search_refined(&cx, "text-1", 3).await.unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|hit| (hit.doc_id.to_string(), hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let fast_queries = fast.raw_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            reopened.search_quality(&cx, "text-1", 3).await.unwrap().len(),
+            3
+        );
+        assert_eq!(fast.raw_calls.load(Ordering::SeqCst), fast_queries);
+    });
+}
