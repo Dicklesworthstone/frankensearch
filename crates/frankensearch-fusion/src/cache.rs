@@ -19,6 +19,8 @@ use tracing::{debug, warn};
 
 use frankensearch_index::{TwoTierIndex, TwoTierIndexPaths};
 
+mod admitted_v2;
+
 /// Sentinel file name written alongside indices after a successful build.
 pub const SENTINEL_FILENAME: &str = ".frankensearch_index_meta";
 
@@ -632,6 +634,7 @@ impl IndexCache {
             ));
         }
 
+        admitted_v2::validate_replacement(current, candidate)?;
         TierCacheIdentity::fast(current)
             .validate_replacement(TierCacheIdentity::fast(candidate))?;
         TierCacheIdentity::quality(current)
@@ -643,7 +646,9 @@ impl IndexCache {
     ///
     /// Disk I/O occurs outside the cache lock. The snapshot is captured before
     /// opening the candidate, so a slow reload cannot overwrite a replacement
-    /// installed while that I/O was in progress.
+    /// installed while that I/O was in progress. For admitted v2 tiers, this
+    /// reuses the installed bindings and refuses newly discovered generations;
+    /// use [`Self::reload_admitted_v2_if_current`] with trusted successor bindings.
     ///
     /// # Errors
     ///
@@ -652,7 +657,7 @@ impl IndexCache {
     /// `index_cache.reload` and value `superseded`; retry against the current
     /// snapshot. No failure changes the installed cache entry.
     pub fn reload(&self) -> SearchResult<()> {
-        self.reload_with(|_| self.open_spec.open(self.config.clone()))
+        self.reload_with(|current| self.open_for_reload(current))
     }
 
     fn reload_with(
