@@ -6927,6 +6927,12 @@ mod tests {
             "auth\rOR\rcache",
             "NOT AND cache",
             "auth OR NOT AND deprecated",
+            "(auth OR token) cache",
+            "-(auth token)",
+            "foo(bar) x)",
+            "((auth)",
+            "(auth OR)",
+            "auth ()",
         ] {
             assert_eq!(
                 cass_sanitize_query(input),
@@ -6943,8 +6949,6 @@ mod tests {
                     CassLexToken::And { .. } => ("and", ""),
                     CassLexToken::Or { .. } => ("or", ""),
                     CassLexToken::Not { .. } => ("not", ""),
-                    // The shipping adapter has no grouping; none of these
-                    // inputs contains a parenthesis.
                     CassLexToken::LParen { .. } => ("(", ""),
                     CassLexToken::RParen { .. } => (")", ""),
                 })
@@ -6957,6 +6961,8 @@ mod tests {
                     OracleToken::And => ("and", ""),
                     OracleToken::Or => ("or", ""),
                     OracleToken::Not => ("not", ""),
+                    OracleToken::LParen => ("(", ""),
+                    OracleToken::RParen => (")", ""),
                 })
                 .collect::<Vec<_>>();
             assert_eq!(normalized_native, normalized_oracle, "{input:?}");
@@ -7034,15 +7040,84 @@ mod tests {
         );
     }
 
+    /// The `msg_idx` result set of each `(query, filters)` case in the pinned
+    /// Tantivy CASS builder, over an index of `docs`.
     #[cfg(feature = "tantivy-oracle")]
-    #[test]
-    fn cass_parser_result_sets_match_the_shipping_tantivy_builder() {
+    fn cass_oracle_result_sets(
+        docs: &[CassEvalDoc],
+        cases: &[(&str, CassQueryFilters)],
+    ) -> Vec<BTreeSet<u64>> {
         use frankensearch_lexical::tantivy_crate::collector::DocSetCollector;
         use frankensearch_lexical::{
             CassDocumentRef, CassQueryFilters as OracleFilters, CassSourceFilter as OracleSource,
             CassTantivyIndex, TantivyDocument, Value as TantivyValue, cass_build_tantivy_query,
         };
 
+        let directory = tempfile::tempdir().expect("temporary CASS index directory");
+        let mut index = CassTantivyIndex::open_or_create(directory.path()).expect("CASS index");
+        let oracle_documents = docs
+            .iter()
+            .map(|doc| CassDocumentRef {
+                agent: doc.agent,
+                workspace: doc.workspace,
+                workspace_original: doc.workspace,
+                source_path: "/fixture/session.jsonl",
+                msg_idx: doc.msg_idx,
+                created_at: doc.created_at,
+                title: Some(doc.title),
+                content: doc.content,
+                source_id: doc.source_id,
+                origin_kind: doc.origin_kind,
+                origin_host: None,
+                conversation_id: None,
+            })
+            .collect::<Vec<_>>();
+        index
+            .add_cass_document_refs(&oracle_documents)
+            .expect("index CASS oracle documents");
+        index.commit().expect("commit CASS oracle documents");
+        let reader = index.reader().expect("open CASS oracle reader");
+        reader.reload().expect("reload committed CASS oracle");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        cases
+            .iter()
+            .map(|(raw, filters)| {
+                let oracle_filters = OracleFilters {
+                    agents: filters.agents.clone(),
+                    workspaces: filters.workspaces.clone(),
+                    created_from: filters.created_from,
+                    created_to: filters.created_to,
+                    source_filter: match &filters.source_filter {
+                        CassSourceFilter::All => OracleSource::All,
+                        CassSourceFilter::Local => OracleSource::Local,
+                        CassSourceFilter::Remote => OracleSource::Remote,
+                        CassSourceFilter::SourceId(source_id) => {
+                            OracleSource::SourceId(source_id.clone())
+                        }
+                    },
+                };
+                let oracle_query = cass_build_tantivy_query(raw, &oracle_filters, &fields);
+                searcher
+                    .search(&*oracle_query, &DocSetCollector)
+                    .expect("search shipping CASS builder")
+                    .into_iter()
+                    .map(|address| {
+                        let document: TantivyDocument =
+                            searcher.doc(address).expect("load CASS oracle document");
+                        document
+                            .get_first(fields.msg_idx)
+                            .and_then(|value| value.as_u64())
+                            .expect("stored CASS msg_idx")
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn cass_parser_result_sets_match_the_shipping_tantivy_builder() {
         const DOCS: [CassEvalDoc; 8] = [
             CassEvalDoc {
                 msg_idx: 0,
@@ -7126,41 +7201,33 @@ mod tests {
             },
         ];
 
-        let directory = tempfile::tempdir().expect("temporary CASS index directory");
-        let mut index = CassTantivyIndex::open_or_create(directory.path()).expect("CASS index");
-        let oracle_documents = DOCS
-            .iter()
-            .map(|doc| CassDocumentRef {
-                agent: doc.agent,
-                workspace: doc.workspace,
-                workspace_original: doc.workspace,
-                source_path: "/fixture/session.jsonl",
-                msg_idx: doc.msg_idx,
-                created_at: doc.created_at,
-                title: Some(doc.title),
-                content: doc.content,
-                source_id: doc.source_id,
-                origin_kind: doc.origin_kind,
-                origin_host: None,
-                conversation_id: None,
-            })
-            .collect::<Vec<_>>();
-        index
-            .add_cass_document_refs(&oracle_documents)
-            .expect("index CASS oracle documents");
-        index.commit().expect("commit CASS oracle documents");
-        let reader = index.reader().expect("open CASS oracle reader");
-        reader.reload().expect("reload committed CASS oracle");
-        let searcher = reader.searcher();
-        let fields = index.fields();
-
         let cases = vec![
             ("auth", CassQueryFilters::default()),
             ("auth token", CassQueryFilters::default()),
-            // Mixed AND/OR is not compared here: the shipping Tantivy
-            // builder binds OR tighter (see
-            // cass_parser_precedence_matches_set_algebra_over_the_oracle).
             ("auth OR token OR cache", CassQueryFilters::default()),
+            // Both engines read the cass#52 grammar (GH #56); on this corpus
+            // the legacy OR-binds-tighter reading differs from these.
+            ("auth OR token AND cache", CassQueryFilters::default()),
+            ("auth AND token OR cache", CassQueryFilters::default()),
+            ("auth token OR search", CassQueryFilters::default()),
+            (
+                "(auth OR token) AND deprecated",
+                CassQueryFilters::default(),
+            ),
+            (
+                "auth AND (search OR deprecated)",
+                CassQueryFilters::default(),
+            ),
+            ("NOT NOT deprecated", CassQueryFilters::default()),
+            ("-(auth OR search)", CassQueryFilters::default()),
+            ("cache -(token OR search)", CassQueryFilters::default()),
+            (
+                "deprecated OR -(auth OR cache)",
+                CassQueryFilters::default(),
+            ),
+            ("((auth))", CassQueryFilters::default()),
+            ("(auth OR cache", CassQueryFilters::default()),
+            ("auth () OR search", CassQueryFilters::default()),
             ("auth && cache", CassQueryFilters::default()),
             ("auth || search", CassQueryFilters::default()),
             ("\"error handling\"", CassQueryFilters::default()),
@@ -7225,36 +7292,9 @@ mod tests {
             ),
         ];
 
-        for (raw, filters) in cases {
-            let oracle_filters = OracleFilters {
-                agents: filters.agents.clone(),
-                workspaces: filters.workspaces.clone(),
-                created_from: filters.created_from,
-                created_to: filters.created_to,
-                source_filter: match &filters.source_filter {
-                    CassSourceFilter::All => OracleSource::All,
-                    CassSourceFilter::Local => OracleSource::Local,
-                    CassSourceFilter::Remote => OracleSource::Remote,
-                    CassSourceFilter::SourceId(source_id) => {
-                        OracleSource::SourceId(source_id.clone())
-                    }
-                },
-            };
-            let oracle_query = cass_build_tantivy_query(raw, &oracle_filters, &fields);
-            let oracle = searcher
-                .search(&*oracle_query, &DocSetCollector)
-                .expect("search shipping CASS builder")
-                .into_iter()
-                .map(|address| {
-                    let document: TantivyDocument =
-                        searcher.doc(address).expect("load CASS oracle document");
-                    document
-                        .get_first(fields.msg_idx)
-                        .and_then(|value| value.as_u64())
-                        .expect("stored CASS msg_idx")
-                })
-                .collect::<BTreeSet<_>>();
-            let parsed = cass_parser().parse(raw, &filters);
+        let oracle_sets = cass_oracle_result_sets(&DOCS, &cases);
+        for ((raw, filters), oracle) in cases.iter().zip(oracle_sets) {
+            let parsed = cass_parser().parse(raw, filters);
             let native = DOCS
                 .iter()
                 .copied()
@@ -7266,9 +7306,10 @@ mod tests {
     }
 
     /// cass#52 grammar: result sets follow standard Boolean algebra (NOT >
-    /// AND > OR, parentheses group, NOT NOT cancels). The corpus separates
-    /// the standard reading from the legacy OR-binds-tighter one on every
-    /// mixed case, so the legacy grammar fails each of them.
+    /// AND > OR, parentheses group, NOT NOT cancels) in Quill and in the
+    /// pinned Tantivy oracle (GH #56). The corpus separates the standard
+    /// reading from the legacy OR-binds-tighter one on every mixed case, so
+    /// the legacy grammar fails each of them in either engine.
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn cass_parser_precedence_matches_set_algebra_over_the_oracle() {
@@ -7289,7 +7330,7 @@ mod tests {
             doc(3, "cache"),
             doc(4, "auth cache"),
         ];
-        for (raw, expected) in [
+        let cases: [(&str, Vec<u64>); 9] = [
             // auth ∪ (token ∩ cache); legacy: (auth ∪ token) ∩ cache = {1, 4}
             ("auth OR token AND cache", vec![0, 1, 4]),
             // (auth ∩ token) ∪ cache; legacy: auth ∩ (token ∪ cache) = {4}
@@ -7301,7 +7342,20 @@ mod tests {
             ("-(token OR cache)", vec![0]),
             ("auth -(token OR cache)", vec![0]),
             ("((auth))", vec![0, 4]),
-        ] {
+        ];
+        let oracle_sets = cass_oracle_result_sets(
+            &docs,
+            &cases
+                .iter()
+                .map(|(raw, _)| (*raw, CassQueryFilters::default()))
+                .collect::<Vec<_>>(),
+        );
+        for ((raw, expected), oracle) in cases.into_iter().zip(oracle_sets) {
+            assert_eq!(
+                oracle.into_iter().collect::<Vec<_>>(),
+                expected,
+                "oracle {raw:?}"
+            );
             let parsed = cass_parser().parse(raw, &CassQueryFilters::default());
             let matched = docs
                 .iter()

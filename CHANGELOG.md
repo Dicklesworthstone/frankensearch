@@ -243,6 +243,20 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **CASS queries use standard Boolean precedence and parentheses on main,
+  in Quill and in the Tantivy oracle.** Quill 0.3.3 shipped this grammar
+  from a hotfix branch. main now has it too: NOT binds tightest, then AND
+  (explicit, `&&` or implied between words), then OR; parentheses group;
+  two NOTs cancel. `a OR b AND c` used to mean `(a OR b) AND c`, and
+  `(a AND x) OR b` matched nothing. `frankensearch-lexical`'s `cass_compat`
+  query builder, the pinned oracle Quill is checked against, parses the
+  same grammar. Its `CassQueryToken` gains `LParen`/`RParen`. A `(` opens a
+  group only at the start of a word and a `)` closes one only while a group
+  is open, so `foo(bar)` stays one term. Queries both grammars read alike
+  keep their exact query tree and scores. The Quill/oracle differential
+  checks mixed precedence, grouping and parity negation again (GH #56,
+  bd-2ax98).
+
 - **`IndexBuilder` embeds each `batch_size` group in one call per tier.**
   `with_batch_size` (default 32) only grouped progress reports: every
   document was embedded by its own `embed_bound` call, so the library

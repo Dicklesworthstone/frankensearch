@@ -2134,8 +2134,12 @@ pub enum CassQueryToken {
     And,
     /// OR operator.
     Or,
-    /// NOT operator (negates the next term/phrase).
+    /// NOT operator (negates the next term, phrase, or group).
     Not,
+    /// A group-opening parenthesis.
+    LParen,
+    /// A group-closing parenthesis.
+    RParen,
 }
 
 /// In-memory evidence from the real fallible Tantivy CASS query boundary.
@@ -2399,6 +2403,8 @@ impl CassWildcardPattern {
 /// - OR / || (OR)
 /// - NOT / -prefix (negation)
 /// - \"quoted phrases\" (phrase match)
+/// - ( ) grouping: a `(` opens a group only at the start of a word and a `)`
+///   closes one only while a group is open, so `foo(bar)` stays one term
 #[must_use]
 pub fn cass_parse_boolean_query(query: &str) -> Vec<CassQueryToken> {
     match cass_parse_boolean_query_with_sink(query, |tokens, token| {
@@ -2430,9 +2436,24 @@ where
     let mut tokens = Vec::new();
     let mut chars = query.chars().peekable();
     let mut current_word = String::new();
+    // Groups currently open. A `(` inside a word and a `)` with no group
+    // open stay word characters, so code terms like `foo(bar)` survive.
+    let mut open_groups = 0_usize;
 
     while let Some(c) = chars.next() {
         match c {
+            '(' if current_word.is_empty() => {
+                push_token(&mut tokens, CassQueryToken::LParen)?;
+                open_groups += 1;
+            }
+            ')' if open_groups > 0 => {
+                if !current_word.is_empty() {
+                    let token = cass_classify_query_word(std::mem::take(&mut current_word));
+                    push_token(&mut tokens, token)?;
+                }
+                push_token(&mut tokens, CassQueryToken::RParen)?;
+                open_groups -= 1;
+            }
             '"' => {
                 if !current_word.is_empty() {
                     push_token(
@@ -2558,44 +2579,8 @@ fn cass_normalize_phrase_terms(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn cass_flush_pending_or_group(
-    pending_or_group: &mut Vec<Box<dyn Query>>,
-    clauses: &mut Vec<(Occur, Box<dyn Query>)>,
-) {
-    if pending_or_group.is_empty() {
-        return;
-    }
-    let or_clauses: Vec<_> = std::mem::take(pending_or_group)
-        .into_iter()
-        .map(|query| (Occur::Should, query))
-        .collect();
-    clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
-}
-
-fn cass_lift_must_clause_into_or_group(
-    clauses: &mut Vec<(Occur, Box<dyn Query>)>,
-    pending_or_group: &mut Vec<Box<dyn Query>>,
-) {
-    let can_pull = clauses
-        .last()
-        .is_some_and(|(occ, _)| *occ == Occur::Must || *occ == Occur::MustNot);
-    if !can_pull {
-        return;
-    }
-
-    if let Some((occur, last_query)) = clauses.pop() {
-        let lifted_query = if occur == Occur::MustNot {
-            Box::new(BooleanQuery::new(vec![
-                (Occur::Must, Box::new(AllQuery)),
-                (Occur::MustNot, last_query),
-            ]))
-        } else {
-            last_query
-        };
-        pending_or_group.push(lifted_query);
-    }
-}
-
+/// The complement of `query`: Tantivy reads a query of `MustNot` clauses
+/// alone as match-none, so exclusions are anchored on `AllQuery`.
 fn cass_wrap_negated_clause(query: Box<dyn Query>) -> Box<dyn Query> {
     Box::new(BooleanQuery::new(vec![
         (Occur::Must, Box::new(AllQuery)),
@@ -2603,31 +2588,207 @@ fn cass_wrap_negated_clause(query: Box<dyn Query>) -> Box<dyn Query> {
     ]))
 }
 
-fn cass_apply_query_token(
-    query: Box<dyn Query>,
-    next_occur: Occur,
-    in_or_sequence: &mut bool,
-    just_saw_or: &mut bool,
-    pending_or_group: &mut Vec<Box<dyn Query>>,
-    clauses: &mut Vec<(Occur, Box<dyn Query>)>,
-) {
-    if *in_or_sequence && *just_saw_or {
-        if pending_or_group.is_empty() {
-            cass_lift_must_clause_into_or_group(clauses, pending_or_group);
+/// A lowered CASS operand and whether it stands negated.
+struct CassOracleNode {
+    expr: CassOracleExpr,
+    negative: bool,
+}
+
+/// Conjunctions keep their clause list, so a conjunction at the root is
+/// emitted as flat top-level clauses: the query tree, and so the score, of
+/// every query the pre-grouping builder read the same way is unchanged.
+enum CassOracleExpr {
+    Leaf(Box<dyn Query>),
+    /// `Must`/`MustNot` clauses, anchored on `AllQuery` when all are negative.
+    And(Vec<(Occur, Box<dyn Query>)>),
+    /// Disjunction operands, negative ones already complemented.
+    Or(Vec<Box<dyn Query>>),
+}
+
+impl CassOracleExpr {
+    fn into_query(self) -> Box<dyn Query> {
+        match self {
+            Self::Leaf(query) => query,
+            Self::And(clauses) => Box::new(BooleanQuery::new(clauses)),
+            Self::Or(operands) => Box::new(BooleanQuery::new(
+                operands
+                    .into_iter()
+                    .map(|query| (Occur::Should, query))
+                    .collect(),
+            )),
         }
-        let pushed_query = if next_occur == Occur::MustNot {
-            cass_wrap_negated_clause(query)
-        } else {
-            query
-        };
-        pending_or_group.push(pushed_query);
-    } else {
-        cass_flush_pending_or_group(pending_or_group, clauses);
-        *in_or_sequence = false;
-        clauses.push((next_occur, query));
+    }
+}
+
+/// Disjunction of `operands`. A negative operand denotes its complement, so
+/// it is wrapped in `All + MustNot` before joining the disjunction.
+fn cass_combine_or(mut operands: Vec<CassOracleNode>) -> Option<CassOracleNode> {
+    if operands.len() <= 1 {
+        return operands.pop();
+    }
+    let operands = operands
+        .into_iter()
+        .map(|node| {
+            let query = node.expr.into_query();
+            if node.negative {
+                cass_wrap_negated_clause(query)
+            } else {
+                query
+            }
+        })
+        .collect();
+    Some(CassOracleNode {
+        expr: CassOracleExpr::Or(operands),
+        negative: false,
+    })
+}
+
+/// Conjunction of `operands`: positives are `Must`, negatives `MustNot`. A
+/// conjunction of negatives alone is anchored on `AllQuery`, since
+/// exclusions need a universe to exclude from.
+fn cass_combine_and(mut operands: Vec<CassOracleNode>) -> Option<CassOracleNode> {
+    if operands.len() <= 1 {
+        return operands.pop();
+    }
+    let mut clauses = operands
+        .into_iter()
+        .map(|node| {
+            let occur = if node.negative {
+                Occur::MustNot
+            } else {
+                Occur::Must
+            };
+            (occur, node.expr.into_query())
+        })
+        .collect::<Vec<_>>();
+    if clauses.iter().all(|(occur, _)| *occur == Occur::MustNot) {
+        clauses.insert(0, (Occur::Must, Box::new(AllQuery)));
+    }
+    Some(CassOracleNode {
+        expr: CassOracleExpr::And(clauses),
+        negative: false,
+    })
+}
+
+/// Recursive-descent CASS grammar, the one Quill's `CassQueryParser` parses:
+///
+/// ```text
+/// or      := and (OR and)*
+/// and     := unary ([AND] unary)*      adjacent operands are an implied AND
+/// unary   := NOT* primary              an odd count of NOTs negates
+/// primary := TERM | PHRASE | '(' or ')'
+/// ```
+///
+/// Malformed input is recovered the way Quill recovers it: an unclosed `(`
+/// closes at the end, and an empty group, a dangling operator, a NOT with no
+/// operand and an operand that lowers to nothing are skipped. This adapter
+/// has no diagnostic channel, so the recovery is silent.
+struct CassOracleGrammar<'a> {
+    tokens: &'a [CassQueryToken],
+    position: usize,
+    /// Parentheses entered and not yet closed.
+    open_groups: usize,
+    fields: &'a CassFields,
+    regex_query_factory: CassRegexQueryFactory,
+}
+
+impl CassOracleGrammar<'_> {
+    fn peek(&self) -> Option<&CassQueryToken> {
+        self.tokens.get(self.position)
     }
 
-    *just_saw_or = false;
+    fn parse_or(&mut self) -> SearchResult<Option<CassOracleNode>> {
+        let mut operands = Vec::new();
+        loop {
+            match self.peek() {
+                None => break,
+                Some(CassQueryToken::RParen) if self.open_groups > 0 => break,
+                // The lexer emits `)` only inside a group; any other is skipped.
+                Some(CassQueryToken::Or | CassQueryToken::RParen) => {
+                    self.position += 1;
+                    continue;
+                }
+                Some(_) => {}
+            }
+            if let Some(node) = self.parse_and()? {
+                operands.push(node);
+            }
+        }
+        Ok(cass_combine_or(operands))
+    }
+
+    fn parse_and(&mut self) -> SearchResult<Option<CassOracleNode>> {
+        let mut operands = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some(CassQueryToken::Or | CassQueryToken::RParen) => break,
+                Some(CassQueryToken::And) => {
+                    self.position += 1;
+                    continue;
+                }
+                Some(_) => {}
+            }
+            if let Some(node) = self.parse_unary()? {
+                operands.push(node);
+            }
+        }
+        Ok(cass_combine_and(operands))
+    }
+
+    fn parse_unary(&mut self) -> SearchResult<Option<CassOracleNode>> {
+        let mut negated = false;
+        while matches!(self.peek(), Some(CassQueryToken::Not)) {
+            negated = !negated;
+            self.position += 1;
+        }
+        if !matches!(
+            self.peek(),
+            Some(CassQueryToken::Term(_) | CassQueryToken::Phrase(_) | CassQueryToken::LParen)
+        ) {
+            return Ok(None);
+        }
+        Ok(self.parse_primary()?.map(|mut node| {
+            node.negative ^= negated;
+            node
+        }))
+    }
+
+    fn parse_primary(&mut self) -> SearchResult<Option<CassOracleNode>> {
+        let Some(token) = self.tokens.get(self.position) else {
+            return Ok(None);
+        };
+        self.position += 1;
+        let query = match token {
+            CassQueryToken::Term(term) => cass_build_compound_term_query(
+                &cass_normalize_term_parts(term),
+                self.fields,
+                self.regex_query_factory,
+            )?,
+            CassQueryToken::Phrase(phrase) => cass_build_phrase_query(
+                &cass_normalize_phrase_terms(phrase),
+                self.fields,
+                self.regex_query_factory,
+            )?,
+            CassQueryToken::LParen => {
+                self.open_groups += 1;
+                let inner = self.parse_or()?;
+                self.open_groups -= 1;
+                if matches!(self.peek(), Some(CassQueryToken::RParen)) {
+                    self.position += 1;
+                }
+                return Ok(inner);
+            }
+            // Operators never reach here: parse_unary admits only operands.
+            CassQueryToken::And
+            | CassQueryToken::Or
+            | CassQueryToken::Not
+            | CassQueryToken::RParen => None,
+        };
+        Ok(query.map(|query| CassOracleNode {
+            expr: CassOracleExpr::Leaf(query),
+            negative: false,
+        }))
+    }
 }
 
 /// Returns `true` when the string contains at least one CJK character.
@@ -2798,88 +2959,44 @@ fn cass_build_phrase_query(
 
 /// Build Tantivy query clauses from boolean tokens.
 ///
-/// Operator precedence is intentionally non-standard: `OR` binds tighter than `AND`.
+/// Standard precedence, as cass documents it and Quill parses it: NOT binds
+/// tightest, then AND (explicit, `&&`, or implied between adjacent operands),
+/// then OR (`OR`, `||`); parentheses group; negation is parity-based.
 fn cass_build_boolean_query_clauses(
     tokens: &[CassQueryToken],
     fields: &CassFields,
     regex_query_factory: CassRegexQueryFactory,
 ) -> SearchResult<Vec<(Occur, Box<dyn Query>)>> {
-    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-    let mut pending_or_group: Vec<Box<dyn Query>> = Vec::new();
-    let mut next_occur = Occur::Must;
-    let mut in_or_sequence = false;
-    let mut just_saw_or = false;
-
-    for token in tokens {
-        match token {
-            CassQueryToken::And => {
-                cass_flush_pending_or_group(&mut pending_or_group, &mut clauses);
-                in_or_sequence = false;
-                just_saw_or = false;
-                next_occur = Occur::Must;
-            }
-            CassQueryToken::Or => {
-                in_or_sequence = true;
-                just_saw_or = true;
-            }
-            CassQueryToken::Not => {
-                if just_saw_or {
-                    just_saw_or = true;
-                } else {
-                    cass_flush_pending_or_group(&mut pending_or_group, &mut clauses);
-                    in_or_sequence = false;
-                    just_saw_or = false;
-                }
-                next_occur = Occur::MustNot;
-            }
-            CassQueryToken::Term(term) => {
-                let parts = cass_normalize_term_parts(term);
-                let term_query =
-                    cass_build_compound_term_query(&parts, fields, regex_query_factory)?;
-                let Some(term_query) = term_query else {
-                    continue;
-                };
-                cass_apply_query_token(
-                    term_query,
-                    next_occur,
-                    &mut in_or_sequence,
-                    &mut just_saw_or,
-                    &mut pending_or_group,
-                    &mut clauses,
-                );
-                next_occur = Occur::Must;
-            }
-            CassQueryToken::Phrase(phrase) => {
-                let terms = cass_normalize_phrase_terms(phrase);
-                let phrase_query = cass_build_phrase_query(&terms, fields, regex_query_factory)?;
-                let Some(phrase_query) = phrase_query else {
-                    continue;
-                };
-                cass_apply_query_token(
-                    phrase_query,
-                    next_occur,
-                    &mut in_or_sequence,
-                    &mut just_saw_or,
-                    &mut pending_or_group,
-                    &mut clauses,
-                );
-                next_occur = Occur::Must;
-            }
-        }
-    }
-
-    cass_flush_pending_or_group(&mut pending_or_group, &mut clauses);
-
-    // Tantivy deliberately treats a BooleanQuery containing only MustNot
-    // clauses as match-none. At the complete CASS root, however, one or more
-    // negative operands denote the complement of their union. Mixed positive
-    // conjunctions must stay unanchored so `auth AND NOT deprecated` does not
-    // gain an AllQuery score.
-    if !clauses.is_empty() && clauses.iter().all(|(occur, _)| *occur == Occur::MustNot) {
-        clauses.insert(0, (Occur::Must, Box::new(AllQuery)));
-    }
-
-    Ok(clauses)
+    let mut grammar = CassOracleGrammar {
+        tokens,
+        position: 0,
+        open_groups: 0,
+        fields,
+        regex_query_factory,
+    };
+    let Some(root) = grammar.parse_or()? else {
+        return Ok(Vec::new());
+    };
+    Ok(match root {
+        // A negative root denotes the complement of its operand.
+        CassOracleNode {
+            expr,
+            negative: true,
+        } => vec![
+            (Occur::Must, Box::new(AllQuery)),
+            (Occur::MustNot, expr.into_query()),
+        ],
+        // Flat, so a positive conjunction such as `auth AND NOT deprecated`
+        // stays unanchored and gains no AllQuery score.
+        CassOracleNode {
+            expr: CassOracleExpr::And(clauses),
+            negative: false,
+        } => clauses,
+        CassOracleNode {
+            expr,
+            negative: false,
+        } => vec![(Occur::Must, expr.into_query())],
+    })
 }
 
 fn cass_match_none_query() -> Box<dyn Query> {
@@ -3891,6 +4008,83 @@ mod cass_query_tests {
         );
     }
 
+    /// cass#52 grammar (GH #56): NOT > AND (explicit or implied) > OR,
+    /// parentheses group, and malformed groups recover. Each mixed case
+    /// separates the standard reading from the legacy OR-binds-tighter one.
+    #[test]
+    fn cass_boolean_grammar_uses_standard_precedence_and_parentheses() {
+        use CassQueryToken::{LParen, Not, Or, RParen, Term};
+        let term = |text: &str| Term(text.to_owned());
+        // `(` inside a word and `)` with no open group are term characters.
+        assert_eq!(
+            cass_parse_boolean_query("foo(bar) x)"),
+            [term("foo(bar)"), term("x)")]
+        );
+        assert_eq!(
+            cass_parse_boolean_query("-(a b)"),
+            [Not, LParen, term("a"), term("b"), RParen]
+        );
+        assert_eq!(
+            cass_parse_boolean_query("(a OR)"),
+            [LParen, term("a"), Or, RParen]
+        );
+
+        let (_directory, index) = cass_result_fixture();
+        let reader = index.reader().expect("open CASS Boolean reader");
+        reader.reload().expect("reload CASS Boolean reader");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        let matched = |raw_query: &str| {
+            scored_cass_results(&searcher, &fields, raw_query, &CassQueryFilters::default())
+                .into_keys()
+                .collect::<Vec<_>>()
+        };
+        for (raw_query, expected) in [
+            // deprecated ∪ (gamma ∩ active); legacy (deprecated ∪ gamma) ∩ active = {3}
+            ("deprecated OR gamma AND active", vec![1, 3]),
+            // (active ∩ beta) ∪ deprecated; legacy active ∩ (beta ∪ deprecated) = {2}
+            ("active AND beta OR deprecated", vec![1, 2]),
+            ("active beta OR deprecated", vec![1, 2]),
+            ("active && beta || deprecated", vec![1, 2]),
+            ("(deprecated OR gamma) AND active", vec![3]),
+            ("active AND (beta OR deprecated)", vec![2]),
+            ("-(beta OR gamma)", vec![0, 1, 4, 5]),
+            ("alpha -(active OR deprecated)", vec![5]),
+            ("deprecated OR -(alpha OR active)", vec![1, 4]),
+            ("((gamma))", vec![3]),
+            // Recovery: an unclosed group closes at the end; an empty group
+            // and a dangling operator are skipped.
+            ("(deprecated OR gamma", vec![1, 3]),
+            ("gamma ()", vec![3]),
+            ("gamma AND", vec![3]),
+            ("OR gamma", vec![3]),
+        ] {
+            assert_eq!(matched(raw_query), expected, "{raw_query:?}");
+        }
+
+        // A group around a query both grammars read alike changes no score.
+        let flat = scored_cass_results(
+            &searcher,
+            &fields,
+            "alpha AND NOT deprecated",
+            &CassQueryFilters::default(),
+        );
+        for grouped in ["(alpha AND NOT deprecated)", "((alpha) AND -(deprecated))"] {
+            let actual =
+                scored_cass_results(&searcher, &fields, grouped, &CassQueryFilters::default());
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|(msg_idx, score)| (*msg_idx, score.to_bits()))
+                    .collect::<Vec<_>>(),
+                flat.iter()
+                    .map(|(msg_idx, score)| (*msg_idx, score.to_bits()))
+                    .collect::<Vec<_>>(),
+                "{grouped:?}"
+            );
+        }
+    }
+
     #[test]
     fn cass_standalone_negation_matches_complement_and_is_score_neutral() {
         let (_directory, index) = cass_result_fixture();
@@ -3900,7 +4094,22 @@ mod cass_query_tests {
         let fields = index.fields();
 
         let all_scores = scored_cass_results(&searcher, &fields, "", &CassQueryFilters::default());
-        for raw_query in ["NOT deprecated", "-deprecated", "NOT NOT deprecated"] {
+        // Negation is parity-based (cass#52 grammar): two NOTs cancel.
+        assert_eq!(
+            scored_cass_results(
+                &searcher,
+                &fields,
+                "NOT NOT deprecated",
+                &CassQueryFilters::default()
+            ),
+            scored_cass_results(
+                &searcher,
+                &fields,
+                "deprecated",
+                &CassQueryFilters::default()
+            ),
+        );
+        for raw_query in ["NOT deprecated", "-deprecated", "NOT NOT NOT deprecated"] {
             let actual =
                 scored_cass_results(&searcher, &fields, raw_query, &CassQueryFilters::default());
             assert_eq!(

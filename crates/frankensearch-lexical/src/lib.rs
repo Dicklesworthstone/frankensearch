@@ -7191,7 +7191,8 @@ mod benchmark_writer_mode_tests {
         // Tantivy constructor they reach, and the receipt is seeded inside that
         // branch. If the seed were passed in beside the call instead, these two
         // could report the same mode while calling different constructors.
-        let factories: [(&str, fn() -> TantivyIndex, BenchmarkWriterMode); 2] = [
+        type Factory = (&'static str, fn() -> TantivyIndex, BenchmarkWriterMode);
+        let factories: [Factory; 2] = [
             (
                 "Index::writer",
                 || TantivyIndex::in_memory_with_shipping_auto_writer(HEAP, true).expect("auto"),

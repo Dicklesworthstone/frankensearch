@@ -5724,6 +5724,8 @@ pub fn observe_tantivy_cass_profile(
                 CassQueryToken::And => CassProfileTokenKind::And,
                 CassQueryToken::Or => CassProfileTokenKind::Or,
                 CassQueryToken::Not => CassProfileTokenKind::Not,
+                CassQueryToken::LParen => CassProfileTokenKind::LParen,
+                CassQueryToken::RParen => CassProfileTokenKind::RParen,
             },
             byte_offset: CassProfileField::NotExposed {
                 reason: CassProfileNotExposedReason::TantivyParserDoesNotRetainOffsets,
