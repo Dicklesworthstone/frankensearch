@@ -481,7 +481,9 @@ fn successful_batches_are_not_split_and_empty_builds_do_not_infer() {
             let quality = Arc::new(Provider::new("quality", 3, 2));
             let input = if empty { Vec::new() } else { documents() };
             let built = NativeIndexBuilder::new(
-                directory.path().join(if empty { "empty" } else { "populated" }),
+                directory
+                    .path()
+                    .join(if empty { "empty" } else { "populated" }),
                 generation(1),
                 fast.clone(),
             )
@@ -497,7 +499,7 @@ fn successful_batches_are_not_split_and_empty_builds_do_not_infer() {
             .await
             .unwrap();
             for provider in [&fast, &quality] {
-                let calls = provider.calls.lock().unwrap();
+                let calls = provider.calls.lock().unwrap().clone();
                 assert_eq!(calls.len(), if empty { 0 } else { 4 });
                 assert!(calls.iter().all(|batch| batch.len() <= 2));
                 assert_eq!(provider.raw_calls.load(Ordering::SeqCst), 0);
@@ -540,21 +542,22 @@ fn incremental_build_retains_splitting_and_reuses_only_unchanged_inputs() {
             .unwrap()
             .upsert_document(IndexableDocument::new("doc-0", "changed-0"))
             .upsert_document(IndexableDocument::new("doc-1", "changed-1"))
-            .upsert_document(
-                IndexableDocument::new("doc-2", "text-2").with_title("new title"),
-            )
+            .upsert_document(IndexableDocument::new("doc-2", "text-2").with_title("new title"))
             .delete_document("doc-6")
             .upsert_document(IndexableDocument::new("doc-8", "new-8"))
             .build(&cx)
             .await
             .unwrap();
         for (provider, expected_calls) in [(&fast, 3), (&quality, 5)] {
-            let calls = provider.calls.lock().unwrap();
+            let calls = provider.calls.lock().unwrap().clone();
             assert_eq!(calls.len(), expected_calls);
             assert_eq!(calls[0], ["changed-0", "changed-1", "new-8"]);
-            assert!(calls.iter().flatten().all(|text| {
-                ["changed-0", "changed-1", "new-8"].contains(&text.as_str())
-            }));
+            assert!(
+                calls
+                    .iter()
+                    .flatten()
+                    .all(|text| { ["changed-0", "changed-1", "new-8"].contains(&text.as_str()) })
+            );
             assert_eq!(provider.raw_calls.load(Ordering::SeqCst), 0);
         }
         assert_eq!(updated.documents().len(), 7);
@@ -562,7 +565,10 @@ fn incremental_build_retains_splitting_and_reuses_only_unchanged_inputs() {
         assert_eq!(updated.document("doc-8").unwrap().content, "new-8");
         assert_eq!(original.document("doc-0").unwrap().content, "text-0");
         assert!(original.document("doc-6").is_some());
-        assert_eq!(std::fs::read(original.fast().vector_path()).unwrap(), old_fast);
+        assert_eq!(
+            std::fs::read(original.fast().vector_path()).unwrap(),
+            old_fast
+        );
         assert_eq!(
             std::fs::read(original.quality().unwrap().vector_path()).unwrap(),
             old_quality
@@ -650,7 +656,12 @@ fn split_batches_build_seal_and_reopen_the_complete_hybrid_graph_cohort() {
             &fast_witness
         );
         assert_eq!(
-            reopened.vectors().quality().unwrap().index().owner_witness(),
+            reopened
+                .vectors()
+                .quality()
+                .unwrap()
+                .index()
+                .owner_witness(),
             &quality_witness
         );
         assert!(reopened.vectors().fast().graph_path().is_some());
@@ -666,7 +677,11 @@ fn split_batches_build_seal_and_reopen_the_complete_hybrid_graph_cohort() {
         );
         let fast_queries = fast.raw_calls.load(Ordering::SeqCst);
         assert_eq!(
-            reopened.search_quality(&cx, "text-1", 3).await.unwrap().len(),
+            reopened
+                .search_quality(&cx, "text-1", 3)
+                .await
+                .unwrap()
+                .len(),
             3
         );
         assert_eq!(fast.raw_calls.load(Ordering::SeqCst), fast_queries);
