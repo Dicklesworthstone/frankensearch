@@ -31976,7 +31976,7 @@ mod tests {
             Index, TantivyDocument,
             collector::TopDocs,
             doc,
-            query::QueryParser,
+            query::ExistsQuery,
             schema::{FAST, Schema},
         };
 
@@ -32018,7 +32018,6 @@ mod tests {
             drop(writer);
             let reader = tantivy.reader().expect("open Tantivy existence reader");
             let searcher = reader.searcher();
-            let parser = QueryParser::for_index(&tantivy, Vec::new());
 
             let mut quill_hits = quill
                 .search_doc_ids(&cx, "ord:*", corpus.len())
@@ -32026,12 +32025,14 @@ mod tests {
                 .iter()
                 .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
                 .collect::<Vec<_>>();
-            let parsed = parser
-                .parse_query("ord:*")
-                .expect("parse Tantivy fast-field existence query");
+            // Tantivy 0.26's QueryParser parses `ord:*` to an existence leaf
+            // and then refuses it as UnsupportedQuery ("Range query need to
+            // target a specific field"), so the reference is the existence
+            // query that leaf denotes, built directly.
+            let existence = ExistsQuery::new("ord".to_owned(), false);
             let mut tantivy_hits = searcher
                 .search(
-                    parsed.as_ref(),
+                    &existence,
                     &TopDocs::with_limit(corpus.len()).order_by_score(),
                 )
                 .expect("execute Tantivy fast-field existence query")
