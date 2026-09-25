@@ -662,41 +662,36 @@ impl IndexBuilder {
             let batch_count = total.div_ceil(self.batch_size);
             for batch_idx in 0..batch_count {
                 let batch_start = Instant::now();
-                for doc in documents.by_ref().take(self.batch_size) {
-                    match Self::embed_and_add(
-                        cx,
-                        &fast_embedder,
-                        quality_embedder.as_deref(),
-                        &identities,
-                        &mut index_builder,
-                        &doc,
-                        metrics_exporter.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(quality_error) => {
+                let batch = documents.by_ref().take(self.batch_size).collect::<Vec<_>>();
+                let outcomes = Self::embed_and_add_batch(
+                    cx,
+                    &fast_embedder,
+                    quality_embedder.as_deref(),
+                    &identities,
+                    &mut index_builder,
+                    &batch,
+                    metrics_exporter.as_ref(),
+                )
+                .await?;
+                for (doc, outcome) in batch.into_iter().zip(outcomes) {
+                    match outcome {
+                        BatchDocOutcome::Added(quality_error) => {
                             doc_count += 1;
                             if let Some(message) = quality_error {
                                 quality_errors.push((doc.id.clone(), message));
                             } else if quality_embedder.is_some() {
                                 quality_indexed += 1;
                             }
-                            lexical_docs.push(doc);
                         }
-                        Err(
-                            error @ (SearchError::Cancelled { .. }
-                            | SearchError::UnverifiableRemoteSpace { .. }),
-                        ) => return Err(error),
-                        Err(err) => {
-                            tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
-                            errors.push((doc.id.clone(), err.to_string()));
-                            // bd-8nqz.3: lexical admission is independent of
-                            // embedding outcome — the documents most in need
-                            // of lexical fallback must stay lexically
-                            // searchable.
-                            lexical_docs.push(doc);
+                        BatchDocOutcome::Failed(message) => {
+                            tracing::warn!(doc_id = %doc.id, error = %message, "failed to embed document");
+                            errors.push((doc.id.clone(), message));
                         }
                     }
+                    // bd-8nqz.3: lexical admission is independent of embedding
+                    // outcome — the documents most in need of lexical
+                    // fallback must stay lexically searchable.
+                    lexical_docs.push(doc);
                 }
                 embed_ms += batch_start.elapsed().as_secs_f64() * 1000.0;
                 if let Some(ref mut callback) = self.on_progress {
@@ -720,41 +715,36 @@ impl IndexBuilder {
             let batch_count = total.div_ceil(self.batch_size);
             for batch_idx in 0..batch_count {
                 let batch_start = Instant::now();
-                for doc in documents.by_ref().take(self.batch_size) {
-                    match Self::embed_and_add(
-                        cx,
-                        &fast_embedder,
-                        quality_embedder.as_deref(),
-                        &identities,
-                        &mut index_builder,
-                        &doc,
-                        metrics_exporter.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(quality_error) => {
+                let batch = documents.by_ref().take(self.batch_size).collect::<Vec<_>>();
+                let outcomes = Self::embed_and_add_batch(
+                    cx,
+                    &fast_embedder,
+                    quality_embedder.as_deref(),
+                    &identities,
+                    &mut index_builder,
+                    &batch,
+                    metrics_exporter.as_ref(),
+                )
+                .await?;
+                for (doc, outcome) in batch.into_iter().zip(outcomes) {
+                    match outcome {
+                        BatchDocOutcome::Added(quality_error) => {
                             doc_count += 1;
                             if let Some(message) = quality_error {
                                 quality_errors.push((doc.id.clone(), message));
                             } else if quality_embedder.is_some() {
                                 quality_indexed += 1;
                             }
-                            lexical_docs.push(doc);
                         }
-                        Err(
-                            error @ (SearchError::Cancelled { .. }
-                            | SearchError::UnverifiableRemoteSpace { .. }),
-                        ) => return Err(error),
-                        Err(err) => {
-                            tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
-                            errors.push((doc.id.clone(), err.to_string()));
-                            // bd-8nqz.3: lexical admission is independent of
-                            // embedding outcome — the documents most in need
-                            // of lexical fallback must stay lexically
-                            // searchable.
-                            lexical_docs.push(doc);
+                        BatchDocOutcome::Failed(message) => {
+                            tracing::warn!(doc_id = %doc.id, error = %message, "failed to embed document");
+                            errors.push((doc.id.clone(), message));
                         }
                     }
+                    // bd-8nqz.3: lexical admission is independent of embedding
+                    // outcome — the documents most in need of lexical
+                    // fallback must stay lexically searchable.
+                    lexical_docs.push(doc);
                 }
                 embed_ms += batch_start.elapsed().as_secs_f64() * 1000.0;
                 if let Some(ref mut callback) = self.on_progress {
@@ -773,19 +763,19 @@ impl IndexBuilder {
         #[cfg(not(any(feature = "lexical", feature = "quill")))]
         for (batch_idx, batch) in self.documents.chunks(self.batch_size).enumerate() {
             let batch_start = Instant::now();
-            for doc in batch {
-                match Self::embed_and_add(
-                    cx,
-                    &fast_embedder,
-                    quality_embedder.as_deref(),
-                    &identities,
-                    &mut index_builder,
-                    doc,
-                    metrics_exporter.as_ref(),
-                )
-                .await
-                {
-                    Ok(quality_error) => {
+            let outcomes = Self::embed_and_add_batch(
+                cx,
+                &fast_embedder,
+                quality_embedder.as_deref(),
+                &identities,
+                &mut index_builder,
+                batch,
+                metrics_exporter.as_ref(),
+            )
+            .await?;
+            for (doc, outcome) in batch.iter().zip(outcomes) {
+                match outcome {
+                    BatchDocOutcome::Added(quality_error) => {
                         doc_count += 1;
                         if let Some(message) = quality_error {
                             quality_errors.push((doc.id.clone(), message));
@@ -793,13 +783,9 @@ impl IndexBuilder {
                             quality_indexed += 1;
                         }
                     }
-                    Err(
-                        error @ (SearchError::Cancelled { .. }
-                        | SearchError::UnverifiableRemoteSpace { .. }),
-                    ) => return Err(error),
-                    Err(err) => {
-                        tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
-                        errors.push((doc.id.clone(), err.to_string()));
+                    BatchDocOutcome::Failed(message) => {
+                        tracing::warn!(doc_id = %doc.id, error = %message, "failed to embed document");
+                        errors.push((doc.id.clone(), message));
                     }
                 }
             }
@@ -1004,7 +990,12 @@ impl IndexBuilder {
         {
             Ok(fast_vec) => {
                 let duration_ms = fast_start.elapsed().as_secs_f64() * 1000.0;
-                export_embedding_completed(metrics_exporter, fast_embedder.as_ref(), duration_ms);
+                export_embedding_completed(
+                    metrics_exporter,
+                    fast_embedder.as_ref(),
+                    1,
+                    duration_ms,
+                );
                 fast_vec
             }
             Err(error) => {
@@ -1023,7 +1014,7 @@ impl IndexBuilder {
                 Ok(quality_vec) => {
                     build_checkpoint(cx, "quality document embedding completion")?;
                     let duration_ms = quality_start.elapsed().as_secs_f64() * 1000.0;
-                    export_embedding_completed(metrics_exporter, qe, duration_ms);
+                    export_embedding_completed(metrics_exporter, qe, 1, duration_ms);
                     builder.add_quality_record(&doc.id, &quality_vec)?;
                 }
                 Err(
@@ -1047,6 +1038,139 @@ impl IndexBuilder {
 
         Ok(None)
     }
+
+    /// Embed one `batch_size` group and add it to the index builder, with the
+    /// per-document outcomes of [`Self::embed_and_add`] (GH #57).
+    ///
+    /// A tier whose producer batches natively ([`Embedder::bound_batch_is_native`])
+    /// is embedded as one bound batch, the quality tier only for documents
+    /// whose fast embedding succeeded; see [`embed_build_texts`]. When neither
+    /// tier batches, every document takes the per-document path unchanged.
+    /// A terminal failure (cancellation, identity refusal) is returned as `Err`.
+    async fn embed_and_add_batch(
+        cx: &Cx,
+        fast_embedder: &Arc<dyn Embedder>,
+        quality_embedder: Option<&dyn Embedder>,
+        identities: &BuildEmbeddingIdentities,
+        builder: &mut TwoTierIndexBuilder,
+        docs: &[IndexableDocument],
+        metrics_exporter: Option<&Arc<dyn MetricsExporter>>,
+    ) -> SearchResult<Vec<BatchDocOutcome>> {
+        let batches_fast = identities.fast.is_some() && fast_embedder.bound_batch_is_native();
+        let batches_quality = quality_embedder.is_some_and(|embedder| {
+            identities.quality.is_some() && embedder.bound_batch_is_native()
+        });
+        if !batches_fast && !batches_quality {
+            let mut outcomes = Vec::with_capacity(docs.len());
+            for doc in docs {
+                match Self::embed_and_add(
+                    cx,
+                    fast_embedder,
+                    quality_embedder,
+                    identities,
+                    builder,
+                    doc,
+                    metrics_exporter,
+                )
+                .await
+                {
+                    Ok(quality_error) => outcomes.push(BatchDocOutcome::Added(quality_error)),
+                    Err(error) if is_terminal_build_error(&error) => return Err(error),
+                    Err(error) => outcomes.push(BatchDocOutcome::Failed(error.to_string())),
+                }
+            }
+            return Ok(outcomes);
+        }
+
+        let texts = docs
+            .iter()
+            .map(|doc| doc.content.as_str())
+            .collect::<Vec<_>>();
+        build_checkpoint(cx, "fast document embedding")?;
+        let fast = embed_build_texts(
+            cx,
+            fast_embedder.as_ref(),
+            identities.fast.as_ref(),
+            "fast",
+            &texts,
+            metrics_exporter,
+        )
+        .await
+        .inspect_err(|error| export_error(metrics_exporter, error))?;
+        build_checkpoint(cx, "fast document embedding completion")?;
+        let mut outcomes = Vec::with_capacity(docs.len());
+        let mut embedded = Vec::with_capacity(docs.len());
+        for (index, (doc, result)) in docs.iter().zip(fast).enumerate() {
+            let added = match result {
+                Ok(values) => builder.add_fast_record(&doc.id, &values),
+                Err(error) => {
+                    export_error(metrics_exporter, &error);
+                    Err(error)
+                }
+            };
+            match added {
+                Ok(()) => {
+                    outcomes.push(BatchDocOutcome::Added(None));
+                    embedded.push(index);
+                }
+                Err(error) if is_terminal_build_error(&error) => return Err(error),
+                Err(error) => outcomes.push(BatchDocOutcome::Failed(error.to_string())),
+            }
+        }
+
+        let Some(quality) = quality_embedder else {
+            return Ok(outcomes);
+        };
+        build_checkpoint(cx, "quality document embedding")?;
+        let quality_texts = embedded
+            .iter()
+            .map(|&index| texts[index])
+            .collect::<Vec<_>>();
+        let results = embed_build_texts(
+            cx,
+            quality,
+            identities.quality.as_ref(),
+            "quality",
+            &quality_texts,
+            metrics_exporter,
+        )
+        .await
+        .inspect_err(|error| export_error(metrics_exporter, error))?;
+        build_checkpoint(cx, "quality document embedding completion")?;
+        for (&index, result) in embedded.iter().zip(results) {
+            match result {
+                Ok(values) => {
+                    // As on the per-document path, a quality record the
+                    // builder refuses fails the whole document.
+                    if let Err(error) = builder.add_quality_record(&docs[index].id, &values) {
+                        if is_terminal_build_error(&error) {
+                            return Err(error);
+                        }
+                        outcomes[index] = BatchDocOutcome::Failed(error.to_string());
+                    }
+                }
+                Err(error) => {
+                    export_error(metrics_exporter, &error);
+                    tracing::debug!(
+                        doc_id = %docs[index].id,
+                        error = %error,
+                        "quality embedding failed, fast-only for this document"
+                    );
+                    outcomes[index] = BatchDocOutcome::Added(Some(error.to_string()));
+                }
+            }
+        }
+        Ok(outcomes)
+    }
+}
+
+/// What one document's embedding produced in a batch build.
+enum BatchDocOutcome {
+    /// Added to every attempted tier; `Some(message)` when only quality failed
+    /// and the document is fast-only.
+    Added(Option<String>),
+    /// The fast embedding failed: the document enters no vector tier.
+    Failed(String),
 }
 
 struct BuildEmbeddingIdentities {
@@ -1165,6 +1289,143 @@ async fn embed_build_document(
     Ok(values)
 }
 
+/// Build failures that end the whole build rather than one document:
+/// cancellation and any producer or response identity refusal.
+const fn is_terminal_build_error(error: &SearchError) -> bool {
+    matches!(
+        error,
+        SearchError::Cancelled { .. } | SearchError::UnverifiableRemoteSpace { .. }
+    )
+}
+
+/// Embed `texts` for one tier: one vector or one ordinary failure per input,
+/// in input order. A terminal failure is returned as `Err` (GH #57).
+///
+/// A producer whose bound batch binds what its singles would
+/// ([`Embedder::bound_batch_is_native`]) gets the texts as one
+/// `embed_batch_bound` call; a failed batch is split in halves through that
+/// same operation down to single inputs, so one bad input fails alone and at
+/// most `2 * texts.len() - 1` requests are made. Every other producer, and the
+/// explicit legacy unidentified path, keeps one call per input.
+async fn embed_build_texts(
+    cx: &Cx,
+    embedder: &dyn Embedder,
+    identity: Option<&EmbeddingIdentityBundleV1>,
+    tier: &'static str,
+    texts: &[&str],
+    metrics_exporter: Option<&Arc<dyn MetricsExporter>>,
+) -> SearchResult<Vec<SearchResult<Vec<f32>>>> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(expected) = identity.filter(|_| embedder.bound_batch_is_native()) else {
+        let mut results = Vec::with_capacity(texts.len());
+        for text in texts {
+            let started = Instant::now();
+            match embed_build_document(cx, embedder, identity, tier, text).await {
+                Ok(values) => {
+                    let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    export_embedding_completed(metrics_exporter, embedder, 1, duration_ms);
+                    results.push(Ok(values));
+                }
+                Err(error) if is_terminal_build_error(&error) => return Err(error),
+                Err(error) => results.push(Err(error)),
+            }
+        }
+        return Ok(results);
+    };
+    let mut results: Vec<Option<SearchResult<Vec<f32>>>> =
+        std::iter::repeat_with(|| None).take(texts.len()).collect();
+    // A work stack of index ranges; the right half is pushed first so the
+    // left half is embedded first and requests stay in input order.
+    let mut pending = Vec::new();
+    pending.push(0..texts.len());
+    while let Some(range) = pending.pop() {
+        match embed_build_bound_batch(
+            cx,
+            embedder,
+            expected,
+            tier,
+            &texts[range.clone()],
+            metrics_exporter,
+        )
+        .await
+        {
+            Ok(vectors) => {
+                for (slot, values) in range.zip(vectors) {
+                    results[slot] = Some(Ok(values));
+                }
+            }
+            Err(error) if is_terminal_build_error(&error) => return Err(error),
+            Err(error) if range.len() == 1 => results[range.start] = Some(Err(error)),
+            Err(error) => {
+                tracing::debug!(
+                    tier,
+                    batch_size = range.len(),
+                    error = %error,
+                    "bound embedding batch failed; splitting it with the same producer"
+                );
+                let middle = range.start + range.len() / 2;
+                pending.push(middle..range.end);
+                pending.push(range.start..middle);
+            }
+        }
+    }
+    Ok(results
+        .into_iter()
+        .map(|result| result.expect("every input slot resolves exactly once"))
+        .collect())
+}
+
+/// One `embed_batch_bound` call under the admitted identity: the producer is
+/// checked before and after inference (before any retry decision), every
+/// response must carry the admitted identity (else terminal), and the batch
+/// is admitted only when its cardinality and every value validate.
+async fn embed_build_bound_batch(
+    cx: &Cx,
+    embedder: &dyn Embedder,
+    expected: &EmbeddingIdentityBundleV1,
+    tier: &'static str,
+    texts: &[&str],
+    metrics_exporter: Option<&Arc<dyn MetricsExporter>>,
+) -> SearchResult<Vec<Vec<f32>>> {
+    validate_build_producer(embedder, Some(expected), tier)?;
+    let completion_phase = match tier {
+        "fast" => "fast document embedding completion",
+        _ => "quality document embedding completion",
+    };
+    let started = Instant::now();
+    let response = embedder.embed_batch_bound(cx, texts).await;
+    if !matches!(&response, Err(SearchError::Cancelled { .. })) {
+        build_checkpoint(cx, completion_phase)?;
+    }
+    validate_build_producer(embedder, Some(expected), tier)?;
+    let bound = response?;
+    if bound.len() != texts.len() {
+        return Err(SearchError::EmbeddingFailed {
+            model: embedder.id().to_owned(),
+            source: format!(
+                "bound batch returned {} outputs for {} inputs",
+                bound.len(),
+                texts.len()
+            )
+            .into(),
+        });
+    }
+    if bound.iter().any(|response| &response.identity != expected) {
+        return Err(SearchError::UnverifiableRemoteSpace {
+            producer: format!("index_builder.{tier}"),
+            reason: "embedding response does not carry the admitted producer identity".to_owned(),
+        });
+    }
+    for response in &bound {
+        response.validate()?;
+    }
+    let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+    export_embedding_completed(metrics_exporter, embedder, texts.len(), duration_ms);
+    Ok(bound.into_iter().map(|response| response.values).collect())
+}
+
 fn build_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
     cx.checkpoint().map_err(|error| SearchError::Cancelled {
         phase: phase.to_owned(),
@@ -1183,6 +1444,7 @@ fn export_error(metrics_exporter: Option<&Arc<dyn MetricsExporter>>, error: &Sea
 fn export_embedding_completed(
     metrics_exporter: Option<&Arc<dyn MetricsExporter>>,
     embedder: &dyn Embedder,
+    batch_size: usize,
     duration_ms: f64,
 ) {
     let Some(exporter) = metrics_exporter else {
@@ -1190,7 +1452,7 @@ fn export_embedding_completed(
     };
     let payload = EmbeddingMetrics {
         embedder_id: embedder.id().to_owned(),
-        batch_size: 1,
+        batch_size,
         duration_ms,
         dimension: embedder.dimension(),
         is_semantic: embedder.is_semantic(),
@@ -2948,6 +3210,389 @@ mod tests {
                 let reopened = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
                 assert_eq!(reopened.doc_count(), 1);
                 assert!(reopened.has_quality_index());
+            }
+        });
+    }
+
+    /// A producer whose bound batch is its native operation (GH #57). When
+    /// `native`, its single bound path refuses, so a build that embedded one
+    /// document at a time would fail every document. When `faulty`, texts
+    /// steer faults: `reject` fails any batch holding it; `nan`, `short` and
+    /// `surplus` corrupt that row or the batch's cardinality; `foreign`
+    /// answers under another identity; `drift` changes the producer's own
+    /// identity while failing the batch; `cancel` cancels the caller and
+    /// fails, `racing` cancels it and succeeds.
+    struct BatchNativeEmbedder {
+        inner: IdentityStubEmbedder,
+        native: bool,
+        faulty: bool,
+        foreign_identity: EmbeddingIdentityBundleV1,
+        drifted: AtomicBool,
+        single_calls: AtomicUsize,
+        batches: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl BatchNativeEmbedder {
+        fn new(id: &'static str, dim: usize, native: bool, faulty: bool) -> Arc<Self> {
+            let inner = IdentityStubEmbedder::new(id, dim);
+            let mut foreign_identity = inner.identity.clone();
+            foreign_identity
+                .producer
+                .implementation_revision
+                .push_str("-foreign");
+            Arc::new(Self {
+                inner,
+                native,
+                faulty,
+                foreign_identity,
+                drifted: AtomicBool::new(false),
+                single_calls: AtomicUsize::new(0),
+                batches: Mutex::default(),
+            })
+        }
+
+        fn batch_widths(&self) -> Vec<usize> {
+            self.batches.lock().unwrap().iter().map(Vec::len).collect()
+        }
+    }
+
+    impl Embedder for BatchNativeEmbedder {
+        fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.inner.embed(cx, text)
+        }
+
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, frankensearch_core::IdentityBoundEmbedding> {
+            self.single_calls.fetch_add(1, Ordering::SeqCst);
+            if self.native {
+                return Box::pin(async move {
+                    Err(SearchError::EmbeddingFailed {
+                        model: self.id().to_owned(),
+                        source: "a batch-native build must not embed one input at a time".into(),
+                    })
+                });
+            }
+            self.inner.embed_bound(cx, text)
+        }
+
+        fn embed_batch_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<frankensearch_core::IdentityBoundEmbedding>> {
+            Box::pin(async move {
+                self.batches
+                    .lock()
+                    .unwrap()
+                    .push(texts.iter().map(|text| (*text).to_owned()).collect());
+                let faulted = |fault: &str| self.faulty && texts.contains(&fault);
+                if faulted("reject") {
+                    return Err(SearchError::EmbeddingFailed {
+                        model: self.id().to_owned(),
+                        source: "injected batch rejection".into(),
+                    });
+                }
+                if faulted("drift") {
+                    self.drifted.store(true, Ordering::SeqCst);
+                    return Err(SearchError::EmbeddingFailed {
+                        model: self.id().to_owned(),
+                        source: "failed while the producer changed".into(),
+                    });
+                }
+                if faulted("cancel") || faulted("racing") {
+                    cx.set_cancel_requested(true);
+                }
+                if faulted("cancel") {
+                    return Err(SearchError::EmbeddingFailed {
+                        model: self.id().to_owned(),
+                        source: "cancelled provider failure".into(),
+                    });
+                }
+                let mut outputs = Vec::with_capacity(texts.len());
+                for text in texts {
+                    let mut bound = self.inner.embed_bound(cx, text).await?;
+                    if self.faulty && *text == "nan" {
+                        bound.values[0] = f32::NAN;
+                    }
+                    if self.faulty && *text == "foreign" {
+                        bound.identity = self.foreign_identity.clone();
+                    }
+                    outputs.push(bound);
+                }
+                if faulted("short") {
+                    outputs.pop();
+                }
+                if faulted("surplus") {
+                    outputs.push(outputs[0].clone());
+                }
+                Ok(outputs)
+            })
+        }
+
+        fn bound_batch_is_native(&self) -> bool {
+            self.native
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            if self.drifted.load(Ordering::SeqCst) {
+                Ok(&self.foreign_identity)
+            } else {
+                self.inner.identity()
+            }
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            self.inner.category()
+        }
+    }
+
+    fn batch_native_stack(
+        native: [bool; 2],
+        faulty_tier: &str,
+    ) -> (
+        EmbedderStack,
+        Arc<BatchNativeEmbedder>,
+        Arc<BatchNativeEmbedder>,
+    ) {
+        let fast = BatchNativeEmbedder::new("batch-fast", 4, native[0], faulty_tier == "fast");
+        let quality =
+            BatchNativeEmbedder::new("batch-quality", 6, native[1], faulty_tier == "quality");
+        let stack = EmbedderStack::from_parts(
+            Arc::clone(&fast) as Arc<dyn Embedder>,
+            Some(Arc::clone(&quality) as Arc<dyn Embedder>),
+        );
+        (stack, fast, quality)
+    }
+
+    fn indexed_vectors(path: &Path) -> std::collections::BTreeMap<String, Vec<f32>> {
+        let index = frankensearch_index::VectorIndex::open_read_only(path).unwrap();
+        (0..index.record_count())
+            .map(|slot| {
+                (
+                    index.doc_id_at(slot).unwrap().to_owned(),
+                    index.vector_at_f32(slot).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// GH #57: a batch-native producer embeds each `batch_size` group in one
+    /// bound call per tier — tails and `batch_size` 1 included — and writes
+    /// exactly the vectors its single-input path would.
+    #[test]
+    fn batch_native_build_embeds_each_group_in_one_bound_call() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let docs = [
+                ("d1", "alpha"),
+                ("d2", "bravo two"),
+                ("d3", "alpha"),
+                ("d4", "charlie three"),
+                ("d5", "delta"),
+            ];
+            for (batch_size, widths) in [(2, vec![2, 2, 1]), (1, vec![1; 5]), (8, vec![5])] {
+                let dir = tempfile::tempdir().unwrap();
+                let exporter = Arc::new(RecordingExporter::default());
+                let (stack, fast, quality) = batch_native_stack([true, true], "");
+                let mut builder = IndexBuilder::new(dir.path())
+                    .with_config(TwoTierConfig::default().with_metrics_exporter(exporter.clone()))
+                    .with_embedder_stack(stack)
+                    .with_batch_size(batch_size);
+                for (id, text) in docs {
+                    builder = builder.add_document(id, text);
+                }
+                let stats = builder.build(&cx).await.unwrap();
+
+                assert_eq!(stats.doc_count, 5);
+                assert_eq!(stats.quality_indexed, 5);
+                assert!(stats.errors.is_empty() && stats.quality_errors.is_empty());
+                let reported_widths = exporter
+                    .embedding
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|metrics| metrics.batch_size)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    reported_widths,
+                    widths.iter().flat_map(|&w| [w, w]).collect::<Vec<_>>(),
+                    "metrics report the real request width, fast then quality per group"
+                );
+                for (name, embedder) in [
+                    (VECTOR_INDEX_FAST_FILENAME, &fast),
+                    (VECTOR_INDEX_QUALITY_FILENAME, &quality),
+                ] {
+                    assert_eq!(embedder.single_calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(embedder.batch_widths(), widths);
+                    let vectors = indexed_vectors(&dir.path().join(name));
+                    assert_eq!(vectors.len(), docs.len());
+                    for (id, text) in docs {
+                        let single = embedder.inner.embed(&cx, text).await.unwrap();
+                        assert_eq!(vectors[id], single, "{name} vector for {id}");
+                    }
+                }
+            }
+        });
+    }
+
+    /// GH #57: an input that fails its batch is found by bisection with the
+    /// same producer and fails alone — in the fast tier it enters no vector
+    /// tier, in the quality tier it stays fast-only — while its neighbours
+    /// keep their vectors.
+    #[test]
+    fn batch_native_build_isolates_a_bad_document_by_bisection() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tier in ["fast", "quality"] {
+                for fault in ["reject", "nan", "short", "surplus"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let (stack, fast, quality) = batch_native_stack([true, true], tier);
+                    let stats = IndexBuilder::new(dir.path())
+                        .with_embedder_stack(stack)
+                        .with_batch_size(4)
+                        .add_document("a", "first")
+                        .add_document("b", "second")
+                        .add_document("bad", fault)
+                        .add_document("d", "fourth")
+                        .build(&cx)
+                        .await
+                        .unwrap();
+
+                    let case = format!("{tier}/{fault}");
+                    let (faulty, clean) = if tier == "fast" {
+                        (&fast, &quality)
+                    } else {
+                        (&quality, &fast)
+                    };
+                    assert_eq!(faulty.batch_widths(), [4, 2, 2, 1, 1], "{case}");
+                    assert_eq!(faulty.batches.lock().unwrap()[3], [fault], "{case}");
+                    let clean_widths = if tier == "fast" { [3] } else { [4] };
+                    assert_eq!(clean.batch_widths(), clean_widths, "{case}");
+                    let failed = if tier == "fast" {
+                        assert_eq!(stats.doc_count, 3, "{case}");
+                        assert!(stats.quality_errors.is_empty(), "{case}");
+                        &stats.errors
+                    } else {
+                        assert_eq!(stats.doc_count, 4, "{case}");
+                        assert!(stats.errors.is_empty(), "{case}");
+                        &stats.quality_errors
+                    };
+                    assert_eq!(
+                        failed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+                        ["bad"],
+                        "{case}"
+                    );
+                    assert_eq!(stats.quality_indexed, 3, "{case}");
+                    let name = if tier == "fast" {
+                        VECTOR_INDEX_FAST_FILENAME
+                    } else {
+                        VECTOR_INDEX_QUALITY_FILENAME
+                    };
+                    let vectors = indexed_vectors(&dir.path().join(name));
+                    assert_eq!(
+                        vectors.keys().map(String::as_str).collect::<Vec<_>>(),
+                        ["a", "b", "d"],
+                        "{case}"
+                    );
+                    assert!(vectors.values().flatten().all(|value| value.is_finite()));
+                    // bd-8nqz.3: the failed document is still lexically searchable.
+                    #[cfg(feature = "quill")]
+                    {
+                        let receipt = stats.lexical.expect("default Quill receipt");
+                        assert_eq!(receipt.indexed, 4, "{case}");
+                        let lexical = QuillIndex::open(&cx, &receipt.path, QuillConfig::default())
+                            .await
+                            .unwrap();
+                        let hits = lexical.search_results(&cx, fault, 10).unwrap();
+                        assert_eq!(hits.len(), 1, "{case}");
+                        assert_eq!(hits[0].doc_id, "bad", "{case}");
+                    }
+                }
+            }
+        });
+    }
+
+    /// GH #57: a foreign response identity, a producer that changed while its
+    /// batch failed, or a cancellation (failed or racing a success) ends the
+    /// build without splitting the batch, is exported, and writes nothing.
+    #[test]
+    fn batch_native_build_stops_on_foreign_identity_or_cancellation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tier in ["fast", "quality"] {
+                for fault in ["foreign", "drift", "cancel", "racing"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let exporter = Arc::new(RecordingExporter::default());
+                    let (stack, fast, quality) = batch_native_stack([true, true], tier);
+                    let error = IndexBuilder::new(dir.path())
+                        .with_config(
+                            TwoTierConfig::default().with_metrics_exporter(exporter.clone()),
+                        )
+                        .with_embedder_stack(stack)
+                        .with_batch_size(4)
+                        .add_document("a", "first")
+                        .add_document("bad", fault)
+                        .add_document("c", "third")
+                        .build(&cx)
+                        .await
+                        .unwrap_err();
+                    cx.set_cancel_requested(false);
+
+                    let case = format!("{tier}/{fault}");
+                    if matches!(fault, "cancel" | "racing") {
+                        assert!(matches!(error, SearchError::Cancelled { .. }), "{case}");
+                    } else {
+                        assert!(
+                            matches!(&error, SearchError::UnverifiableRemoteSpace { producer, .. }
+                            if *producer == format!("index_builder.{tier}")),
+                            "{case}: {error:?}"
+                        );
+                    }
+                    let faulty = if tier == "fast" { &fast } else { &quality };
+                    assert_eq!(faulty.batch_widths(), [3], "{case}: no split");
+                    assert_eq!(exporter.errors.lock().unwrap().len(), 1, "{case}");
+                    assert!(!dir.path().join(VECTOR_INDEX_FAST_FILENAME).exists());
+                    assert!(!dir.path().join(VECTOR_INDEX_QUALITY_FILENAME).exists());
+                }
+            }
+        });
+    }
+
+    /// GH #57: a producer that does not declare a native bound batch — the
+    /// core default, which a provider overriding only `embed_bound` keeps —
+    /// is embedded one document at a time, beside a tier that does batch.
+    #[test]
+    fn bound_producers_without_native_batches_keep_one_call_per_document() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for native in [[false, false], [true, false], [false, true]] {
+                let dir = tempfile::tempdir().unwrap();
+                let (stack, fast, quality) = batch_native_stack(native, "");
+                let stats = IndexBuilder::new(dir.path())
+                    .with_embedder_stack(stack)
+                    .add_document("a", "first")
+                    .add_document("b", "second")
+                    .add_document("c", "third")
+                    .build(&cx)
+                    .await
+                    .unwrap();
+                assert_eq!((stats.doc_count, stats.quality_indexed), (3, 3));
+                for (embedder, batches) in [(&fast, native[0]), (&quality, native[1])] {
+                    let (widths, singles) = if batches { (vec![3], 0) } else { (vec![], 3) };
+                    assert_eq!(embedder.batch_widths(), widths, "{native:?}");
+                    assert_eq!(embedder.single_calls.load(Ordering::SeqCst), singles);
+                }
             }
         });
     }

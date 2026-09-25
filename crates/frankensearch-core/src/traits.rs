@@ -403,6 +403,20 @@ pub trait Embedder: Send + Sync {
         })
     }
 
+    /// Whether [`Self::embed_batch_bound`] binds, for each input, exactly what
+    /// [`Self::embed_bound`] would: the same producer, identity and checks,
+    /// served as one batch.
+    ///
+    /// Batching callers (the facade `IndexBuilder`) send batches only when
+    /// this is `true` and otherwise keep one `embed_bound` per input. The core
+    /// defaults satisfy it for a producer that overrides neither bound
+    /// operation, so such producers may return `true`. A producer that
+    /// overrides only `embed_bound` must keep the default `false`: the default
+    /// `embed_batch_bound` would bind its raw batch output instead.
+    fn bound_batch_is_native(&self) -> bool {
+        false
+    }
+
     /// Complete immutable identity of this embedder and its output/storage contract.
     ///
     /// Legacy/custom implementations that have not supplied a complete identity

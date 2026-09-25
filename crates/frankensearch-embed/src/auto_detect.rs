@@ -936,6 +936,12 @@ impl Embedder for DimReduceEmbedder {
         })
     }
 
+    /// Both bound operations are the core defaults over this wrapper's own
+    /// `embed`/`embed_batch`, so a bound batch binds what singles would.
+    fn bound_batch_is_native(&self) -> bool {
+        true
+    }
+
     fn dimension(&self) -> usize {
         self.target_dim
     }
@@ -1348,6 +1354,12 @@ impl Embedder for LazyModel2VecEmbedder {
         })
     }
 
+    /// Both bound operations are the core defaults over this wrapper's own
+    /// `embed`/`embed_batch`, so a bound batch binds what singles would.
+    fn bound_batch_is_native(&self) -> bool {
+        true
+    }
+
     fn dimension(&self) -> usize {
         POTION_DIMENSION
     }
@@ -1467,6 +1479,12 @@ impl Embedder for LazyFastEmbedEmbedder {
             let embedder = self.ensure_loaded(cx).await?;
             embedder.embed_batch(cx, texts).await
         })
+    }
+
+    /// Both bound operations are the core defaults over this wrapper's own
+    /// `embed`/`embed_batch`, so a bound batch binds what singles would.
+    fn bound_batch_is_native(&self) -> bool {
+        true
     }
 
     fn dimension(&self) -> usize {

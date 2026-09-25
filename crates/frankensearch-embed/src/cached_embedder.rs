@@ -697,6 +697,12 @@ impl Embedder for CachedEmbedder {
         self.inner.identity()
     }
 
+    /// The cache serves bound batches from the inner producer's bound batch,
+    /// so it is as faithful to single inputs as that producer is.
+    fn bound_batch_is_native(&self) -> bool {
+        self.inner.bound_batch_is_native()
+    }
+
     fn dimension(&self) -> usize {
         self.inner.dimension()
     }

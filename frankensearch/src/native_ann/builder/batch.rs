@@ -154,6 +154,12 @@ impl Embedder for SplittingEmbedder {
         self.inner.identity()
     }
 
+    /// Splitting re-sends the inner producer's own bound batches, so it is as
+    /// faithful to single inputs as that producer is.
+    fn bound_batch_is_native(&self) -> bool {
+        self.inner.bound_batch_is_native()
+    }
+
     fn dimension(&self) -> usize {
         self.inner.dimension()
     }

@@ -243,6 +243,22 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **`IndexBuilder` embeds each `batch_size` group in one call per tier.**
+  `with_batch_size` (default 32) only grouped progress reports: every
+  document was embedded by its own `embed_bound` call, so the library
+  builder never used a provider's batch inference (GH #57). A producer that
+  declares `Embedder::bound_batch_is_native` (potion, MiniLM, the hash and
+  API embedders, the native frankentorch embedder, and the cache and
+  dimension-reduction wrappers over them) now gets each group as one
+  `embed_batch_bound` call. A batch that fails is split in halves with the
+  same producer until the failing document fails alone (at most `2n - 1`
+  calls), so per-document outcomes, `quality_errors` and lexical admission
+  are unchanged; cancellation and identity refusals end the build without a
+  retry, and embedding metrics report the real request width. A provider
+  that overrides only `embed_bound` keeps the default `false` and one call
+  per document, because the core batch default would bind its raw batch
+  output (bd-z8v44).
+
 - **Search results are plain text and say which line matched.** Snippets
   used to reach every format as the engine's escaped HTML
   (`Receipt&gt;, <b>grace</b>_<b>period</b>`); they are now the source text,

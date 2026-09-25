@@ -564,6 +564,12 @@ impl frankensearch_core::traits::Embedder for NativeEmbedder {
         SyncEmbed::identity(self)
     }
 
+    /// Both bound operations are the core defaults over this producer's own
+    /// `embed`/`embed_batch`, so a bound batch binds what singles would.
+    fn bound_batch_is_native(&self) -> bool {
+        true
+    }
+
     fn dimension(&self) -> usize {
         DIM
     }
