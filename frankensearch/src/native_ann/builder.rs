@@ -33,6 +33,7 @@ use frankensearch_index::{
 use super::{NativeAnnIndex, checkpoint, invalid};
 use crate::{Cx, Embedder, IndexableDocument, SearchResult, VectorHit};
 
+mod batch;
 mod snapshot;
 pub use snapshot::NativeReopenLimits;
 
@@ -190,8 +191,9 @@ impl TierPlan {
 /// Build one fast and optional quality tier from exactly the same source cohort.
 ///
 /// Models and their identities are retained from construction through queries.
-/// Each batch is embedded once per tier and written before advancing: the builder
-/// does not retain an additional corpus-sized matrix of f32 model outputs.
+/// Each batch is embedded once per tier unless failure splitting is explicitly
+/// enabled. Outputs are written before advancing: the builder does not retain
+/// an additional corpus-sized matrix of f32 model outputs.
 /// Source documents remain owned because later reranking must use the same text.
 /// The v2 writer and final admitted owners have their own storage requirements.
 /// Batch outputs follow the core Embedder contract's input order; this builder
@@ -202,6 +204,7 @@ pub struct NativeIndexBuilder {
     fast: TierPlan,
     quality: Option<TierPlan>,
     batch_size: usize,
+    split_failed_batches: bool,
     documents: Vec<IndexableDocument>,
     reuse: Option<ReuseSource>,
 }
@@ -230,6 +233,7 @@ impl NativeIndexBuilder {
             fast,
             quality: None,
             batch_size: 64,
+            split_failed_batches: false,
             documents: Vec::new(),
             reuse: None,
         })
@@ -241,7 +245,7 @@ impl NativeIndexBuilder {
     /// # Errors
     /// Returns identity, dimension, document-contract or model-kind disagreement.
     pub fn with_quality_embedder(mut self, embedder: Arc<dyn Embedder>) -> SearchResult<Self> {
-        let quality = TierPlan::new(embedder)?;
+        let mut quality = TierPlan::new(embedder)?;
         if self.fast.identity.input.doc_id_semantics != quality.identity.input.doc_id_semantics
             || self.fast.identity.space.kind != quality.identity.space.kind
         {
@@ -250,6 +254,9 @@ impl NativeIndexBuilder {
                 "incompatible",
                 "both tiers require one document-ID contract and semantic/control kind",
             ));
+        }
+        if self.split_failed_batches {
+            quality.embedder = batch::wrap(quality.embedder, quality.identity.clone());
         }
         self.quality = Some(quality);
         Ok(self)
@@ -269,6 +276,38 @@ impl NativeIndexBuilder {
         }
         self.batch_size = batch_size;
         Ok(self)
+    }
+
+    /// Recover ordinary batch inference failures through smaller bound requests.
+    ///
+    /// Off by default. When enabled, an `EmbeddingFailed` batch with more than
+    /// one input is bisected in input order and retried with the SAME producer.
+    /// Each child is strictly smaller, so a batch of N inputs issues at most
+    /// 2*N-1 requests. A failed singleton aborts the build; no document or required
+    /// tier is skipped. Outputs from successful siblings are held until the
+    /// complete original batch succeeds, before any of its new rows are written.
+    ///
+    /// Cancellation, changed identities, malformed outputs and other error
+    /// classes never trigger splitting. This can recover provider batch-size or
+    /// memory limits but is not an unbounded transient retry or model fallback.
+    /// Providers may see inputs more than once; callers using metered APIs must
+    /// account for the extra requests. The configured batch size remains the
+    /// maximum request size and successful batches are never split speculatively.
+    ///
+    /// Applies to both existing and subsequently configured quality tiers. The
+    /// retained providers carry this policy into `begin_update` builds; it is not
+    /// persisted as model identity and is not inferred when models are reopened.
+    /// Query single-input dispatch is unchanged. No inference or files start here.
+    #[must_use]
+    pub fn with_batch_failure_splitting(mut self) -> Self {
+        if !self.split_failed_batches {
+            self.fast.embedder = batch::wrap(self.fast.embedder, self.fast.identity.clone());
+            if let Some(quality) = &mut self.quality {
+                quality.embedder = batch::wrap(Arc::clone(&quality.embedder), quality.identity.clone());
+            }
+            self.split_failed_batches = true;
+        }
+        self
     }
 
     /// Select fast storage and exact/native retrieval without changing the model.
