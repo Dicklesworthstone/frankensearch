@@ -243,6 +243,23 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **Re-indexing after a search reuses the unchanged index.** `fsfs search`
+  leaves a warm query daemon holding the vector index for up to ten
+  minutes, and the next `fsfs index` could not open it for writing, so it
+  rebuilt both semantic tiers from scratch. On a 579-file code tree an
+  unchanged re-index after a search took 20.5 s and 413 CPU-seconds. It now
+  asks the daemon to exit first, as `append-batch`, `delete` and `compact`
+  already did, and takes 4.4 s and 3.2 CPU-seconds. The next search starts
+  a fresh daemon (bd-jm1dx).
+
+- **Fast semantic windows index short files in shared batches.** With
+  `indexing.fast_window_max_per_file` above 1, each file was embedded and
+  written to the vector log on its own, one call and one fsync per file.
+  Short files now share batches. SciFact (5,183 short documents) indexes in
+  about the same time as without windows (was up to 1.9x slower), and a
+  579-file code tree at 128 windows in 28.0 s instead of 35.6 s. The
+  vectors are unchanged (bd-60a2c).
+
 - **Refined results score every semantic candidate on both tiers.** A
   document the quality tier found but the bounded fast head had cut was
   blended on its quality score alone, as if it had no fast vector, so it

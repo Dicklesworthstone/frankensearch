@@ -15869,7 +15869,13 @@ impl FsfsRuntime {
         let mut vector_generation_compatible = false;
         let embedder_revision = fast_admission.identity.fingerprint();
         let mut vector_index = if checkpoint_manifests.is_some() && vector_path.exists() {
-            match VectorIndex::open(&vector_path) {
+            // Reuse mutates the checkpoint generations in place. A warm query
+            // daemon from any earlier `fsfs search` holds them under the
+            // reader side of the map lock, which refused this open and
+            // rebuilt both tiers from scratch (bd-jm1dx).
+            #[cfg(unix)]
+            self.quiesce_query_daemon("index")?;
+            match Self::open_vector_index_for_mutation(&vector_path) {
                 Ok(index)
                     if vector_checkpoint_reusable(
                         &index,
@@ -15929,7 +15935,7 @@ impl FsfsRuntime {
             let quality_embedder = quality_admission.embedder();
             let quality_revision = quality_admission.identity.fingerprint();
             let reusable = if vector_generation_compatible && quality_vector_path.exists() {
-                match VectorIndex::open(&quality_vector_path) {
+                match Self::open_vector_index_for_mutation(&quality_vector_path) {
                     Ok(index)
                         if vector_checkpoint_reusable(
                             &index,

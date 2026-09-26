@@ -1413,6 +1413,9 @@ mod generation_tests {
                 runtime.config.indexing.embedding_batch_size = 2;
             }
             runtime.cli_input.full_reindex = operation == "force";
+            if operation == "daemon" {
+                runtime.cli_input.daemon_socket = Some(parent.join("daemon.sock"));
+            }
             let fast = Arc::new(CountingEmbedder::new(
                 "reuse-fast",
                 4,
@@ -1807,6 +1810,49 @@ mod generation_tests {
                 )
                 .unwrap();
                 assert!(index.live_doc_ids().unwrap().is_empty());
+            });
+        }
+
+        /// A warm query daemon maps both generations under the reader side of
+        /// the map lock until asked to exit. An unchanged re-index must ask,
+        /// then reuse both tiers, rather than be refused and rebuild them.
+        #[cfg(unix)]
+        #[test]
+        fn completed_legacy_reuse_quiesces_a_query_daemon_holding_the_generations() {
+            use std::io::BufRead;
+            use std::os::unix::net::{UnixListener, UnixStream};
+
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, _, root) = fixture(parent.path(), 2);
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
+
+                let socket = parent.path().join("daemon.sock");
+                let listener = UnixListener::bind(&socket).unwrap();
+                let readers = [
+                    super::super::super::FSFS_VECTOR_INDEX_FILE,
+                    super::super::super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+                ]
+                .map(|relative| {
+                    frankensearch_index::VectorIndex::open_read_only(&root.join(relative)).unwrap()
+                });
+                let daemon = std::thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut request = String::new();
+                    std::io::BufReader::new(stream)
+                        .read_line(&mut request)
+                        .unwrap();
+                    drop(readers);
+                    request
+                });
+
+                let report = run_counted_legacy(&cx, parent.path(), "daemon").await;
+                if !daemon.is_finished() {
+                    // Unblock the stand-in so a refused run fails, not hangs.
+                    let _ = UnixStream::connect(&socket);
+                }
+                assert_eq!(daemon.join().unwrap(), ":shutdown\n");
+                assert_index_calls(&report, 0, 0);
             });
         }
 
