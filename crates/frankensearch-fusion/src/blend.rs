@@ -110,7 +110,39 @@ pub fn blend_two_tier(
     blend_factor: f32,
 ) -> Vec<VectorHit> {
     let alpha = sanitize_blend_factor(blend_factor);
+    blend_with(fast_results, quality_results, |_| alpha)
+}
 
+/// [`blend_two_tier`] with a `blend_factor` per document.
+///
+/// For callers whose tiers saw different fractions of a document. The factor
+/// applies only where both tiers scored the document; normalization and
+/// single-source rules are those of [`blend_two_tier`], and non-finite
+/// factors fall back to `0.7`.
+#[must_use]
+#[instrument(
+    name = "frankensearch::blend_weighted",
+    skip(fast_results, quality_results, blend_factor),
+    fields(
+        fast_count = fast_results.len(),
+        quality_count = quality_results.len(),
+    )
+)]
+pub fn blend_two_tier_weighted(
+    fast_results: &[VectorHit],
+    quality_results: &[VectorHit],
+    blend_factor: impl Fn(&str) -> f32,
+) -> Vec<VectorHit> {
+    blend_with(fast_results, quality_results, |doc_id| {
+        sanitize_blend_factor(blend_factor(doc_id))
+    })
+}
+
+fn blend_with(
+    fast_results: &[VectorHit],
+    quality_results: &[VectorHit],
+    alpha: impl Fn(&str) -> f32,
+) -> Vec<VectorHit> {
     // Compute normalization bounds in one pass per source (no Vec allocation).
     // Then normalize inline during HashMap insertion — eliminates 2 intermediate
     // Vec<f32> allocations and 4 redundant data passes from the old approach.
@@ -155,7 +187,10 @@ pub fn blend_two_tier(
         .into_iter()
         .map(|(doc_id, pair)| {
             let score = match (pair.fast, pair.quality) {
-                (Some(f), Some(q)) => alpha.mul_add(q, (1.0 - alpha) * f),
+                (Some(f), Some(q)) => {
+                    let alpha = alpha(doc_id);
+                    alpha.mul_add(q, (1.0 - alpha) * f)
+                }
                 (Some(f), None) => f,
                 (None, Some(q)) => q,
                 (None, None) => 0.0,
@@ -183,7 +218,6 @@ pub fn blend_two_tier(
     debug!(
         target: "frankensearch.blend",
         blended_count = blended.len(),
-        effective_alpha = %alpha,
         "blending complete"
     );
 
@@ -547,7 +581,8 @@ pub fn build_borrowed_rank_map(hits: &[VectorHit]) -> HashMap<&str, usize> {
 mod tests {
     use super::{
         blend_two_tier, blend_two_tier_aligned, blend_two_tier_aligned_unique,
-        blend_two_tier_aligned_vector_index, compute_rank_changes, kendall_tau,
+        blend_two_tier_aligned_vector_index, blend_two_tier_weighted, compute_rank_changes,
+        kendall_tau,
     };
     use frankensearch_core::VectorHit;
 
@@ -738,6 +773,43 @@ mod tests {
         let blended = blend_two_tier(&fast, &quality, 0.0);
         assert!((score_for("a", &blended) - 1.0).abs() <= EPSILON);
         assert!((score_for("b", &blended) - 0.0).abs() <= EPSILON);
+    }
+
+    #[test]
+    fn weighted_blend_applies_each_documents_factor() {
+        // Normalized fast: a 1.0, b 0.0, c 0.5. Normalized quality: a 0.0,
+        // b 1.0, c 0.5. At one shared 0.7, b outranks a.
+        let fast = vec![hit("a", 3.0, 0), hit("c", 2.0, 2), hit("b", 1.0, 1)];
+        let quality = vec![hit("b", 3.0, 1), hit("c", 2.0, 2), hit("a", 1.0, 0)];
+        let uniform = blend_two_tier(&fast, &quality, 0.7);
+        assert_eq!(
+            uniform
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "c", "a"]
+        );
+        assert_eq!(blend_two_tier_weighted(&fast, &quality, |_| 0.7), uniform);
+
+        // Down-weighting quality for b alone drops it below a; c is untouched.
+        let weighted =
+            blend_two_tier_weighted(
+                &fast,
+                &quality,
+                |doc_id| {
+                    if doc_id == "b" { 0.1 } else { 0.7 }
+                },
+            );
+        assert!((score_for("b", &weighted) - 0.1).abs() <= EPSILON);
+        assert!((score_for("a", &weighted) - 0.3).abs() <= EPSILON);
+        assert!((score_for("c", &weighted) - score_for("c", &uniform)).abs() <= EPSILON);
+        assert_eq!(weighted[0].doc_id, "c");
+        assert_eq!(weighted[2].doc_id, "b");
+        // Non-finite factors fall back to the default, as in blend_two_tier.
+        assert_eq!(
+            blend_two_tier_weighted(&fast, &quality, |_| f32::NAN),
+            blend_two_tier(&fast, &quality, f32::NAN)
+        );
     }
 
     #[test]

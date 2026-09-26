@@ -52,7 +52,7 @@ use frankensearch_embed::{
 };
 #[cfg(not(test))]
 use frankensearch_embed::{DetectOptions, EmbedderStack};
-use frankensearch_fusion::blend_two_tier;
+use frankensearch_fusion::{blend_two_tier, blend_two_tier_weighted};
 use frankensearch_index::VectorIndex;
 use frankensearch_quill::{
     BlueGreenEngine, CURRENT_FILE_NAME, CurrentPointer, DEFAULT_SCHEMA, FSLX_FORMAT_VERSION,
@@ -507,14 +507,16 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v10: a query the planner ran lexical-only or unrefined names why in
 // skip_reason; an older cached answer would replay the silent version.
 // v11: Refined blends quality-discovered documents with their fast scores.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v11";
+// v12: with fast windows, a long source's quality weight scales by coverage.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v12";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
 // v5 / stream v3: the WAL top-k repair (0dc3df2f).
 // v6 / stream v4: fast scores for quality-discovered Refined documents.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v6";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v4";
+// v7 / stream v5: coverage-scaled quality weight for windowed sources.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v7";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v5";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -10011,10 +10013,15 @@ impl FsfsRuntime {
         if weight == 0.0 { 0.0 } else { weight }
     }
 
+    /// With fast windows, a long source keeps only the share of the quality
+    /// weight its one quality prefix covers of what the windows saw
+    /// ([`semantic_windows::FastWindowMapping::quality_weight_share`]).
+    /// Without them both tiers saw the same prefix and the weight is uniform.
     fn blend_semantic_candidates(
         &self,
         fast: &[SemanticCandidate],
         quality: &[SemanticCandidate],
+        fast_windows: Option<&semantic_windows::FastWindowMapping>,
     ) -> (Vec<SemanticCandidate>, Vec<SemanticBlendHit>) {
         let vector_hits = |candidates: &[SemanticCandidate]| {
             candidates
@@ -10031,7 +10038,13 @@ impl FsfsRuntime {
         let fast = vector_hits(fast);
         let quality = vector_hits(quality);
         let weight = self.effective_quality_weight();
-        let blended = blend_two_tier(&fast, &quality, weight);
+        let quality_chars = DefaultCanonicalizer::default().max_length;
+        let weight_for = |doc_id: &str| {
+            fast_windows.map_or(weight, |mapping| {
+                weight * mapping.quality_weight_share(doc_id, quality_chars)
+            })
+        };
+        let blended = blend_two_tier_weighted(&fast, &quality, weight_for);
         // The same library operation with one empty source exposes precisely
         // its normalization/missing-source rules, including constant pools.
         // Keep explanation arithmetic out of the ranking implementation.
@@ -10064,6 +10077,7 @@ impl FsfsRuntime {
                 let mut fast = fast_scores.remove(&hit.doc_id);
                 let mut quality = quality_scores.remove(&hit.doc_id);
                 if let (Some(fast), Some(quality)) = (&mut fast, &mut quality) {
+                    let weight = weight_for(hit.doc_id.as_str());
                     fast.weight = 1.0 - weight;
                     quality.weight = weight;
                 }
@@ -11662,8 +11676,11 @@ impl FsfsRuntime {
                         &semantic_candidates,
                         &quality_candidates,
                     )?;
-                    let (blended_candidates, mut blend_hits) =
-                        self.blend_semantic_candidates(&fast_candidates, &quality_candidates);
+                    let (blended_candidates, mut blend_hits) = self.blend_semantic_candidates(
+                        &fast_candidates,
+                        &quality_candidates,
+                        resources.fast_window_mapping.as_ref(),
+                    );
                     let refined_budget = lexical_head_candidates
                         .len()
                         .saturating_add(blended_candidates.len())
@@ -26903,7 +26920,7 @@ mod tests {
             let mut config = FsfsConfig::default();
             config.search.quality_weight = weight;
             let runtime = FsfsRuntime::new(config);
-            let (hits, details) = runtime.blend_semantic_candidates(&fast, &quality);
+            let (hits, details) = runtime.blend_semantic_candidates(&fast, &quality, None);
             assert_eq!(hits[0].doc_id, winner);
             assert_eq!(hits.len(), 4);
             for (id, score) in [
@@ -26943,7 +26960,7 @@ mod tests {
             SemanticCandidate::new("b", 4.0),
             SemanticCandidate::new("invalid", f32::NAN),
         ];
-        let (hits, details) = runtime.blend_semantic_candidates(&fast, &[]);
+        let (hits, details) = runtime.blend_semantic_candidates(&fast, &[], None);
         assert_eq!(
             hits.iter()
                 .map(|hit| (hit.doc_id.as_str(), hit.score))
@@ -26960,6 +26977,7 @@ mod tests {
                 SemanticCandidate::new("worst", 0.0),
             ],
             &[],
+            None,
         );
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].score, 1.0, "duplicate keeps first best score");
@@ -28047,6 +28065,11 @@ mod tests {
             super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v6".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that gives long windowed sources the whole quality weight cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v5".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -28720,9 +28743,11 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-        // v3 blends quality discoveries without fast scores; v2 predates the
-        // WAL top-k repair; v1 an older ranking policy.
+        // v4 gives long windowed sources the whole quality weight; v3 blends
+        // quality discoveries without fast scores; v2 predates the WAL top-k
+        // repair; v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v4",
             "fsfs.search.serve.stream.v3",
             "fsfs.search.serve.stream.v2",
             "fsfs.search.serve.stream.v1",
@@ -46125,6 +46150,8 @@ mod tests {
                 "fsfs.search.cache.v9",
                 // Blended quality discoveries without their fast scores.
                 "fsfs.search.cache.v10",
+                // Gave long windowed sources the whole quality weight.
+                "fsfs.search.cache.v11",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

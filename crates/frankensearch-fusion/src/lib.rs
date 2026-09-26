@@ -49,8 +49,8 @@ pub use adaptive::{
     SignalSource,
 };
 pub use blend::{
-    blend_two_tier, blend_two_tier_aligned, blend_two_tier_aligned_unique, build_borrowed_rank_map,
-    compute_rank_changes, compute_rank_changes_with_maps, kendall_tau,
+    blend_two_tier, blend_two_tier_aligned, blend_two_tier_aligned_unique, blend_two_tier_weighted,
+    build_borrowed_rank_map, compute_rank_changes, compute_rank_changes_with_maps, kendall_tau,
     kendall_tau_with_refined_rank,
 };
 pub use cache::{

@@ -207,6 +207,7 @@ struct SourceWindow {
 #[derive(Debug)]
 pub(super) struct FastWindowMapping {
     rows: HashMap<String, SourceWindow>,
+    covered_chars: HashMap<String, usize>,
     source_count: usize,
     max_windows: usize,
 }
@@ -216,17 +217,33 @@ impl FastWindowMapping {
         self.source_count
     }
 
+    /// The share of the blend's quality weight a source keeps. The quality
+    /// tier embeds one prefix of at most `quality_chars`, while windows let the
+    /// fast tier see `covered_chars` of the same source, so on a long file the
+    /// quality score speaks for a small part of what the fast score does. A
+    /// source the fast tier saw no more of (every one-window source) keeps the
+    /// whole weight.
+    #[allow(clippy::cast_precision_loss)] // A ratio of character counts.
+    pub fn quality_weight_share(&self, source: &str, quality_chars: usize) -> f32 {
+        self.covered_chars
+            .get(source)
+            .filter(|&&covered| covered > quality_chars)
+            .map_or(1.0, |&covered| quality_chars as f32 / covered as f32)
+    }
+
     fn from_plans<'a>(
         max_per_file: usize,
         plans: impl IntoIterator<Item = (&'a str, &'a FastWindowPlan)>,
         live_rows: &HashSet<String>,
     ) -> SearchResult<Self> {
         let mut rows = HashMap::new();
+        let mut covered_chars = HashMap::new();
         let mut source_count = 0;
         let mut max_windows = 1;
         for (source, plan) in plans {
             validate_source_id(source)?;
             plan.validate()?;
+            covered_chars.insert(source.to_owned(), plan.covered_chars());
             if plan.max_per_file != max_per_file {
                 return Err(invalid(
                     "source window policy disagrees with its generation sentinel",
@@ -271,6 +288,7 @@ impl FastWindowMapping {
         }
         Ok(Self {
             rows,
+            covered_chars,
             source_count,
             max_windows,
         })
@@ -761,6 +779,62 @@ mod tests {
             scores(flat_scores),
             [("y.rs".to_owned(), 300.0), ("x.rs".to_owned(), 100.0)]
         );
+    }
+
+    #[test]
+    fn long_windowed_sources_keep_their_covered_share_of_the_quality_weight() {
+        use super::super::FsfsRuntime;
+        use crate::FsfsConfig;
+        use crate::query_execution::SemanticCandidate;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("share.fsvi");
+        let long = plan(&"x".repeat(20_000), 128).unwrap();
+        let short = plan(&"y".repeat(1_500), 128).unwrap();
+        assert_eq!(long.covered_chars(), 20_000);
+        assert_eq!(short.windows.len(), 1);
+        let mut writer = VectorIndex::create(&path, "test", 2).unwrap();
+        for (source, plan) in [("long.rs", &long), ("short.rs", &short)] {
+            for row in plan.row_ids(source) {
+                writer.write_record(&row, &[1.0, 0.0]).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+        let index = VectorIndex::open_read_only(&path).unwrap();
+        let mapping = FastWindowMapping::from_plans(
+            128,
+            [("long.rs", &long), ("short.rs", &short)],
+            &index.live_doc_ids().unwrap(),
+        )
+        .unwrap();
+        assert!((mapping.quality_weight_share("long.rs", 2_000) - 0.1).abs() < 1e-6);
+        assert_eq!(mapping.quality_weight_share("short.rs", 2_000), 1.0);
+        assert_eq!(mapping.quality_weight_share("unmapped.rs", 2_000), 1.0);
+
+        // The tiers disagree: the windows rank long.rs first, the one prefix
+        // vector ranks short.rs first.
+        let fast = [
+            SemanticCandidate::new("long.rs", 0.9),
+            SemanticCandidate::new("short.rs", 0.1),
+        ];
+        let quality = [
+            SemanticCandidate::new("short.rs", 0.9),
+            SemanticCandidate::new("long.rs", 0.1),
+        ];
+        let mut config = FsfsConfig::default();
+        config.search.quality_weight = 0.7;
+        let runtime = FsfsRuntime::new(config);
+        let (uniform, _) = runtime.blend_semantic_candidates(&fast, &quality, None);
+        assert_eq!(uniform[0].doc_id, "short.rs");
+        let (weighted, details) =
+            runtime.blend_semantic_candidates(&fast, &quality, Some(&mapping));
+        assert_eq!(weighted[0].doc_id, "long.rs");
+        assert!((weighted[0].score - 0.93).abs() < 1e-5);
+        let long_detail = details.iter().find(|hit| hit.path == "long.rs").unwrap();
+        assert!((long_detail.quality.as_ref().unwrap().weight - 0.07).abs() < 1e-6);
+        assert!((long_detail.fast.as_ref().unwrap().weight - 0.93).abs() < 1e-6);
+        let short_detail = details.iter().find(|hit| hit.path == "short.rs").unwrap();
+        assert!((short_detail.quality.as_ref().unwrap().weight - 0.7).abs() < 1e-6);
     }
 
     struct DeepPassageEmbedder(EmbeddingIdentityBundleV1);

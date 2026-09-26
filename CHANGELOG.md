@@ -243,6 +243,22 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **With fast semantic windows, Refined no longer trails Initial on long
+  files.** The quality tier embeds only each file's first 2,000 characters,
+  while windows let the fast tier read the whole file, yet the blend gave
+  the prefix-only quality score 70% of the weight everywhere. On 253 judged
+  code queries at `fast_window_max_per_file = 128`, Refined nDCG@10 was
+  0.415 against Initial's 0.570. The quality weight for a windowed source
+  now scales by 2,000 over the characters its windows cover, so a 20,000-
+  character file keeps a tenth of it and a one-window file all of it.
+  Refined on that code set rises to 0.575 (+0.160, significant), above
+  both Initial and lexical-only search. BEIR at 128 windows moves by
+  -0.0024 (SciFact), -0.0010 (NFCorpus) and -0.0006 (ArguAna), none
+  significant. Indexes without windows (the default) rank exactly as
+  before. The answer cache moves to `fsfs.search.cache.v12`, the daemon
+  protocols to `fsfs.search.serve.v7` and `fsfs.search.serve.stream.v5`,
+  and complete-generation forwarding to version 6.
+
 - **Re-indexing after a search reuses the unchanged index.** `fsfs search`
   leaves a warm query daemon holding the vector index for up to ten
   minutes, and the next `fsfs index` could not open it for writing, so it
