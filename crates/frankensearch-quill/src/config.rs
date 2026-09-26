@@ -132,6 +132,21 @@ pub struct QuillConfig {
     /// it on must couple the resulting degraded snapshot to a freshness audit
     /// and backfill path.
     pub quarantine_on_unrepairable: bool,
+    /// Receipt book for read-only opens ([`crate::QuillSearchIndex`] open and
+    /// refresh). When set, a segment whose exact file an earlier open fully
+    /// verified (whole-file hash and every section checksum), and which has
+    /// not changed since (same device, inode, length, mtime and ctime), skips
+    /// both the whole-file hash and its lazy section checks; every other
+    /// segment is verified as usual and receipted when eligible (local
+    /// filesystem, unchanged for 60 s, every check passed). Bytes that change
+    /// while that identity stays the same (media errors, writes through a
+    /// shared writable mapping) are not seen until a later open finds the
+    /// receipt expired (24 h). Keep the book outside the index directory,
+    /// where only the index's owner can write; readers may replace it, and a
+    /// missing or bad book only costs a full verification. Writers and recovery ignore it.
+    ///
+    /// Off (`None`) by default.
+    pub read_open_receipts: Option<std::path::PathBuf>,
 }
 
 impl Default for QuillConfig {
@@ -152,6 +167,7 @@ impl Default for QuillConfig {
             deterministic_ingest: false,
             max_visibility_lag_ms: DEFAULT_MAX_VISIBILITY_LAG_MS,
             quarantine_on_unrepairable: false,
+            read_open_receipts: None,
         }
     }
 }
@@ -295,6 +311,7 @@ mod tests {
                 deterministic_ingest: false,
                 max_visibility_lag_ms: 1_000,
                 quarantine_on_unrepairable: false,
+                read_open_receipts: None,
             }
         );
         assert!(QuillConfig::default().validate().is_ok());

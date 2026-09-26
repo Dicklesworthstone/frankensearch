@@ -11529,7 +11529,12 @@ impl QuillSearchIndex {
         check_cancel(cx, "read-only index open")?;
         let directory = directory.into();
         let open_directory = directory.clone();
-        let snapshot = spawn_blocking(move || KeeperSnapshot::open(open_directory, schema)).await?;
+        let receipt_book = config.read_open_receipts.clone();
+        let snapshot = spawn_blocking(move || match receipt_book {
+            Some(book) => KeeperSnapshot::open_with_receipts(open_directory, schema, book),
+            None => KeeperSnapshot::open(open_directory, schema),
+        })
+        .await?;
         check_cancel(cx, "read-only index open")?;
         let generation = snapshot.loaded_manifest().manifest.generation;
         let publication_read_state = PublicationReadState::new(generation)?;
@@ -11661,7 +11666,12 @@ impl QuillSearchIndex {
         // default: a reader bound to a wider schema (the CASS profile) would
         // otherwise fail every refresh with a manifest schema mismatch.
         let schema = self.reader.schema;
-        let snapshot = spawn_blocking(move || KeeperSnapshot::open(directory, schema)).await?;
+        let receipt_book = self.reader.config.read_open_receipts.clone();
+        let snapshot = spawn_blocking(move || match receipt_book {
+            Some(book) => KeeperSnapshot::open_with_receipts(directory, schema, book),
+            None => KeeperSnapshot::open(directory, schema),
+        })
+        .await?;
         check_cancel(cx, "read-only index refresh")?;
 
         Ok(self

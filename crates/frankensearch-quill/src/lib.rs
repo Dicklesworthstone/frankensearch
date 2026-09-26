@@ -28,6 +28,7 @@ pub mod error;
 pub mod grimoire;
 pub mod index;
 pub mod keeper;
+mod open_receipts;
 pub mod query;
 pub mod quiver;
 pub mod schema;
