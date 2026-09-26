@@ -1165,6 +1165,27 @@ impl<B: AsRef<[u8]>> SegmentReader<B> {
         }
     }
 
+    /// Mark every section checksum as verified without hashing it.
+    ///
+    /// Only for a reader whose exact file an open receipt vouches for: an
+    /// earlier open compared the whole-file hash and every section checksum,
+    /// and the file has not changed since. [`Self::verify`] still rehashes.
+    pub(crate) fn assume_sections_verified_by_receipt(&self) {
+        for check in &self.section_checks {
+            let _ = check.set(Ok(()));
+        }
+    }
+
+    /// Whether every section matches its section-table checksum. Runs before
+    /// an open receipt is minted, so a receipt never stands in for a checksum
+    /// nobody compared. It leaves the lazy checks of this reader untouched.
+    pub(crate) fn all_sections_match_for_receipt(&self) -> bool {
+        let bytes = self.source.as_ref();
+        self.sections.iter().all(|entry| {
+            section_bytes(bytes, *entry).is_some_and(|payload| xxh3_64(payload) == entry.xxh3)
+        })
+    }
+
     /// Eagerly revalidate the structure, every section, and file-prefix witness.
     ///
     /// Unlike [`Self::section`], this always recomputes hashes so doctor flows

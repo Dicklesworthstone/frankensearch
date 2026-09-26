@@ -41,6 +41,10 @@ use crate::grimoire::{
     ByteSpan, EncodedTermDictionary, OwnedTerm, TermDictionary, TermDictionaryError, TermInput,
     TermMetadata, TermSectionLengths, ValidatedTermDictionaryMetadata,
 };
+use crate::open_receipts::{
+    OpenReceipt, OpenReceiptBook, OpenReceiptPolicy, ReceiptBinding, SegmentFileIdentity,
+    receipts_supported_on,
+};
 use crate::quiver::{
     BlockMaxConcatList, DocLenFieldInput, DocLenSection, EncodedBlockMax, EncodedDocLenSection,
     EncodedIdHashSection, EncodedIdMapSection, EncodedNumericSection, EncodedPositionList,
@@ -56,6 +60,7 @@ use crate::segment::{
     EncodedSegment, PendingSegmentFile, PlannedSection, SectionEntry, SectionKind,
     SegmentAssembler, SegmentHeader, SegmentHeaderInput, SegmentReader,
 };
+use rayon::prelude::*;
 
 pub use crate::stats::{SegmentStats, SegmentStatsProvider};
 
@@ -2737,6 +2742,21 @@ impl AuthenticatedFileWitness {
         Self { file_xxh3 }
     }
 
+    /// A witness vouched for by an open receipt: an earlier open hashed this
+    /// exact, unchanged file (see `crate::open_receipts`).
+    #[cfg(test)]
+    fn mint_from_open_receipt(file_xxh3: u64) -> Self {
+        Self {
+            file_xxh3,
+            full_prefix_hash_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn mint_from_open_receipt(file_xxh3: u64) -> Self {
+        Self { file_xxh3 }
+    }
+
     #[cfg(test)]
     fn mint_from_fresh_owned_encoding(file_xxh3: u64) -> Self {
         Self {
@@ -3573,9 +3593,43 @@ impl KeeperSnapshot {
         directory: impl AsRef<Path>,
         schema: SchemaDescriptor,
     ) -> Result<Self, KeeperError> {
-        let directory = directory.as_ref();
-        match Self::open_once(directory, schema) {
-            Err(error) if recovery_retryable(&error) => Self::open_once(directory, schema),
+        Self::open_with_policy(directory.as_ref(), schema, None)
+    }
+
+    /// Open like [`Self::open`], but let a segment whose exact file an earlier
+    /// open already verified skip the whole-file hash and its lazy section
+    /// checks, using the receipt book at `receipt_book` (see
+    /// [`crate::QuillConfig::read_open_receipts`] for what that trusts).
+    ///
+    /// The index directory is still never written. The receipt book, a file
+    /// the caller places outside the index directory, may be replaced (temp
+    /// file plus rename). The segments are opened in parallel on a dedicated
+    /// thread pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::open`].
+    pub fn open_with_receipts(
+        directory: impl AsRef<Path>,
+        schema: SchemaDescriptor,
+        receipt_book: impl AsRef<Path>,
+    ) -> Result<Self, KeeperError> {
+        Self::open_with_policy(
+            directory.as_ref(),
+            schema,
+            Some((receipt_book.as_ref(), OpenReceiptPolicy::default())),
+        )
+    }
+
+    fn open_with_policy(
+        directory: &Path,
+        schema: SchemaDescriptor,
+        receipts: Option<(&Path, OpenReceiptPolicy)>,
+    ) -> Result<Self, KeeperError> {
+        match Self::open_once(directory, schema, receipts) {
+            Err(error) if recovery_retryable(&error) => {
+                Self::open_once(directory, schema, receipts)
+            }
             result => result,
         }
     }
@@ -3696,7 +3750,11 @@ impl KeeperSnapshot {
         })
     }
 
-    fn open_once(directory: &Path, schema: SchemaDescriptor) -> Result<Self, KeeperError> {
+    fn open_once(
+        directory: &Path,
+        schema: SchemaDescriptor,
+        receipt_policy: Option<(&Path, OpenReceiptPolicy)>,
+    ) -> Result<Self, KeeperError> {
         let expected_schema_id = schema
             .schema_id()
             .map_err(|source| KeeperError::InvalidSchema { source })?;
@@ -3704,6 +3762,8 @@ impl KeeperSnapshot {
         validate_loaded_schema(directory, expected_schema_id, &loaded)?;
         validate_recovery_claims(directory, &loaded)?;
 
+        let mut receipts =
+            receipt_policy.map(|(book, policy)| (book, OpenReceiptBook::load(book, policy)));
         let mut segments = Vec::new();
         segments
             .try_reserve_exact(loaded.manifest.segments.len())
@@ -3712,36 +3772,49 @@ impl KeeperSnapshot {
                 path: directory.to_path_buf(),
                 source: io::Error::other(error.to_string()),
             })?;
-        for manifest_segment in &loaded.manifest.segments {
-            let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
-            let (reader, authenticated_file_witness) = SegmentReader::open_published_checked(
-                &path,
-                schema,
-                crate::segment::SegmentLimits::default(),
-                |reader, file| {
-                    Ok(authenticate_segment_witness(
-                        &path,
-                        manifest_segment,
-                        reader,
-                        file,
-                    ))
-                },
-            )
-            .map_err(|source| KeeperError::SegmentOpen {
-                path: path.clone(),
-                source,
-            })?;
-            let authenticated_file_witness = authenticated_file_witness?;
-            segments.push(RecoveredSegment::bind(
-                path,
-                manifest_segment.clone(),
-                reader,
-                schema,
-                authenticated_file_witness,
-            )?);
+        // Read-only opens with a receipt book open, check and bind their
+        // segments in parallel: each segment is an independent file, and a
+        // large index spends most of an open here. Results are consumed in
+        // MANIFEST order, so the first failing segment in that order is the
+        // error reported. Opens without a book (writers, recovery, GC, strict
+        // readers) stay sequential, so a lock holder never waits on, or steals,
+        // unrelated rayon work.
+        let mut new_receipts = Vec::new();
+        match receipts.as_ref().map(|(_, book)| book) {
+            Some(book) => {
+                let open = |manifest_segment: &ManifestSegment| {
+                    open_recovered_segment(directory, schema, manifest_segment, Some(book))
+                };
+                let segments_to_open = &loaded.manifest.segments;
+                let opened: Vec<Result<(RecoveredSegment, Option<OpenReceipt>), KeeperError>> =
+                    segment_open_pool().map_or_else(
+                        || segments_to_open.iter().map(&open).collect(),
+                        |pool| pool.install(|| segments_to_open.par_iter().map(&open).collect()),
+                    );
+                for result in opened {
+                    let (segment, receipt) = result?;
+                    segments.push(segment);
+                    new_receipts.extend(receipt);
+                }
+            }
+            None => {
+                for manifest_segment in &loaded.manifest.segments {
+                    let (segment, _) =
+                        open_recovered_segment(directory, schema, manifest_segment, None)?;
+                    segments.push(segment);
+                }
+            }
+        }
+        if let Some((_, book)) = receipts.as_mut() {
+            for receipt in new_receipts {
+                book.keep(receipt);
+            }
         }
 
         let snapshot = Self::from_parts(Some(directory.to_path_buf()), schema, loaded, segments)?;
+        if let Some((path, book)) = receipts {
+            book.store(path);
+        }
         if !snapshot.quarantined_segments.is_empty() {
             tracing::warn!(
                 target: crate::tracing_conventions::TARGET,
@@ -11042,6 +11115,129 @@ fn validate_proposed_manifest_segments(
         )?;
     }
     Ok(())
+}
+
+/// Threads that open the segments of a receipt-using open: a dedicated pool,
+/// so the open does not depend on free workers in the caller's rayon pool,
+/// even when every worker there is blocked on opens. (A caller that is itself
+/// a rayon worker may still run its own pool's jobs while it waits.) `None`
+/// (pool could not be built) falls back to a sequential open.
+fn segment_open_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("quill-open-{index}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Open, check and bind one MANIFEST segment for a read-only snapshot.
+fn open_recovered_segment(
+    directory: &Path,
+    schema: SchemaDescriptor,
+    manifest_segment: &ManifestSegment,
+    book: Option<&OpenReceiptBook>,
+) -> Result<(RecoveredSegment, Option<OpenReceipt>), KeeperError> {
+    let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
+    let (reader, checked) = SegmentReader::open_published_checked(
+        &path,
+        schema,
+        crate::segment::SegmentLimits::default(),
+        |reader, file| {
+            Ok(match book {
+                Some(book) => receipted_or_authenticated_segment_witness(
+                    &path,
+                    manifest_segment,
+                    reader,
+                    file,
+                    book,
+                ),
+                None => authenticate_segment_witness(&path, manifest_segment, reader, file)
+                    .map(|witness| (witness, None)),
+            })
+        },
+    )
+    .map_err(|source| KeeperError::SegmentOpen {
+        path: path.clone(),
+        source,
+    })?;
+    let (authenticated_file_witness, receipt) = checked?;
+    let segment = RecoveredSegment::bind(
+        path,
+        manifest_segment.clone(),
+        reader,
+        schema,
+        authenticated_file_witness,
+    )?;
+    Ok((segment, receipt))
+}
+
+/// Authenticate a segment, or accept an open receipt for its exact file.
+///
+/// The identity comes from `fstat` on the descriptor that backs the mapping.
+/// A receipt is used only when [`OpenReceiptBook::admitted`] matches that
+/// identity and the MANIFEST binding; otherwise the full-prefix hash runs, and
+/// a new receipt is returned only if every section checksum also matches and
+/// the identity is unchanged after all that hashing.
+fn receipted_or_authenticated_segment_witness(
+    path: &Path,
+    manifest: &ManifestSegment,
+    reader: &SegmentReader<ReadOnlyMappedFile>,
+    file: &mut File,
+    book: &OpenReceiptBook,
+) -> Result<(AuthenticatedFileWitness, Option<OpenReceipt>), KeeperError> {
+    let binding = ReceiptBinding {
+        segment_id: manifest.segment_id,
+        file_len: manifest.file_len,
+        file_xxh3: manifest.file_xxh3,
+    };
+    let Some(before) = SegmentFileIdentity::of_file(file).filter(|_| receipts_supported_on(file))
+    else {
+        return authenticate_segment_witness(path, manifest, reader, file)
+            .map(|witness| (witness, None));
+    };
+    if let Some(receipt) = book.admitted(binding, &before) {
+        return receipted_segment_witness(path, manifest, reader)
+            .map(|witness| (witness, Some(receipt)));
+    }
+    let witness = authenticate_segment_witness(path, manifest, reader, file)?;
+    // A receipt later stands in for the section checksums too, so mint one
+    // only after every section was compared; a stale section keeps failing
+    // lazily on access exactly as without receipts.
+    let receipt = if book.may_record(&before) && reader.all_sections_match_for_receipt() {
+        book.receipt_for(
+            binding,
+            &before,
+            SegmentFileIdentity::of_file(file).as_ref(),
+        )
+    } else {
+        None
+    };
+    Ok((witness, receipt))
+}
+
+/// Bind a segment whose exact file an open receipt vouches for.
+///
+/// Every cheap MANIFEST check still runs against the parsed reader (header
+/// segment id, file length, trailer witness, docid range, doc count); only the
+/// full-prefix hash and the lazy section checksums are covered by the receipt.
+fn receipted_segment_witness(
+    path: &Path,
+    manifest: &ManifestSegment,
+    reader: &SegmentReader<ReadOnlyMappedFile>,
+) -> Result<AuthenticatedFileWitness, KeeperError> {
+    let declared_file_xxh3 = reader.file_xxh3();
+    validate_segment_witnesses(path, manifest, reader, || Ok(declared_file_xxh3))?;
+    reader.assume_sections_verified_by_receipt();
+    Ok(AuthenticatedFileWitness::mint_from_open_receipt(
+        declared_file_xxh3,
+    ))
 }
 
 /// Authenticate a MANIFEST segment binding against the backing FSLX bytes.
@@ -20108,6 +20304,351 @@ mod tests {
         );
         assert_eq!(seg_a.term_dictionary_metadata_reuse_count(), 0);
         assert_eq!(seg_b.term_dictionary_metadata_reuse_count(), 0);
+        Ok(())
+    }
+
+    /// A durable one-segment index plus a receipt book path outside it.
+    fn receipt_test_index(
+        segment_id: u64,
+    ) -> Result<(tempfile::TempDir, PathBuf, PathBuf, EncodedSegment), Box<dyn std::error::Error>>
+    {
+        let root = tempdir()?;
+        let index = root.path().join("index");
+        std::fs::create_dir(&index)?;
+        let encoded =
+            encoded_identity_test_segment(segment_id, 0, &[Some("r-live"), Some("r-two")])?;
+        std::fs::write(
+            index.join(canonical_segment_name(segment_id)),
+            encoded.as_bytes(),
+        )?;
+        let manifest = durable_test_manifest(1, vec![manifest_segment(&encoded, 1)]);
+        write_manifest(&index.join("MANIFEST"), &manifest)?;
+        let book = root.path().join("open-receipts");
+        Ok((root, index, book, encoded))
+    }
+
+    /// Receipts are used only on known local filesystems. Where the test
+    /// directory is on another one (an overlayfs container, say), every open
+    /// correctly verifies in full and the positive assertions do not apply.
+    fn receipts_usable_in(index: &Path) -> bool {
+        std::fs::read_dir(index)
+            .ok()
+            .and_then(|mut entries| entries.next())
+            .and_then(|entry| std::fs::File::open(entry.ok()?.path()).ok())
+            .is_some_and(|file| receipts_supported_on(&file))
+    }
+
+    /// Receipt policy for tests: no racy window, so a file written a moment
+    /// ago can be receipted (production waits for a 60 s old last change).
+    fn eager_receipts(book: &Path) -> (&Path, OpenReceiptPolicy) {
+        (
+            book,
+            OpenReceiptPolicy {
+                racy_window: Duration::ZERO,
+                ..OpenReceiptPolicy::default()
+            },
+        )
+    }
+
+    fn directory_listing(
+        directory: &Path,
+    ) -> Result<Vec<(OsString, u64)>, Box<dyn std::error::Error>> {
+        let mut listing = std::fs::read_dir(directory)?
+            .map(|entry| {
+                let entry = entry?;
+                Ok((entry.file_name(), entry.metadata()?.len()))
+            })
+            .collect::<Result<Vec<_>, io::Error>>()?;
+        listing.sort();
+        Ok(listing)
+    }
+
+    #[test]
+    fn open_receipt_skips_the_full_prefix_hash_only_for_an_unchanged_verified_file() -> TestResult {
+        let (_root, index, book, _encoded) = receipt_test_index(0xe11)?;
+        if !receipts_usable_in(&index) {
+            return Ok(());
+        }
+        let listing = directory_listing(&index)?;
+
+        let first =
+            KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)))?;
+        assert_eq!(
+            first.segments()[0].authenticated_file_witness_hash_count(),
+            1
+        );
+        assert!(book.exists(), "a fully verified segment must be receipted");
+
+        let second =
+            KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)))?;
+        assert_eq!(
+            second.segments()[0].authenticated_file_witness_hash_count(),
+            0,
+            "an unchanged receipted file must not be rehashed"
+        );
+        assert_eq!(
+            second
+                .resolve_document_id("r-two")?
+                .map(|row| row.global_docid),
+            first
+                .resolve_document_id("r-two")?
+                .map(|row| row.global_docid),
+        );
+        assert_eq!(second.doc_count(), first.doc_count());
+        assert_eq!(
+            directory_listing(&index)?,
+            listing,
+            "receipt-using opens must not write into the index directory"
+        );
+
+        let strict = KeeperSnapshot::open(&index, DEFAULT_SCHEMA)?;
+        assert_eq!(
+            strict.segments()[0].authenticated_file_witness_hash_count(),
+            1,
+            "a plain open ignores receipts and verifies every byte"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_receipt_does_not_vouch_for_a_segment_rewritten_in_place() -> TestResult {
+        let (_root, index, book, encoded) = receipt_test_index(0xe12)?;
+        if !receipts_usable_in(&index) {
+            return Ok(());
+        }
+        KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)))?;
+        assert!(book.exists());
+
+        // Same length, one flipped payload byte written in place, and the
+        // mtime put back: only ctime moves (it cannot be set from user space),
+        // and that alone must void the receipt.
+        std::thread::sleep(Duration::from_millis(50));
+        let segment_path = index.join(canonical_segment_name(0xe12));
+        let termdict_offset = encoded
+            .section_entries()
+            .iter()
+            .find(|entry| entry.kind == SectionKind::TERMDICT)
+            .expect("fixture TERMDICT entry")
+            .offset;
+        let original_mtime = std::fs::metadata(&segment_path)?.modified()?;
+        {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&segment_path)?;
+            let mut byte = [0_u8; 1];
+            file.seek(SeekFrom::Start(termdict_offset))?;
+            file.read_exact(&mut byte)?;
+            byte[0] ^= 0x01;
+            file.seek(SeekFrom::Start(termdict_offset))?;
+            file.write_all(&byte)?;
+            file.set_times(std::fs::FileTimes::new().set_modified(original_mtime))?;
+        }
+        assert_eq!(
+            std::fs::metadata(&segment_path)?.modified()?,
+            original_mtime
+        );
+
+        let Err(error) =
+            KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)))
+        else {
+            panic!("a receipt must not let a rewritten segment skip verification");
+        };
+        assert!(
+            matches!(&error, KeeperError::SegmentOpen { path, .. } if path == &segment_path),
+            "the rewritten segment must fail closed: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_receipt_does_not_follow_a_replaced_or_truncated_segment() -> TestResult {
+        let (_root, index, book, encoded) = receipt_test_index(0xe13)?;
+        if !receipts_usable_in(&index) {
+            return Ok(());
+        }
+        KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)))?;
+        let segment_path = index.join(canonical_segment_name(0xe13));
+
+        // Byte-identical replacement under a new inode: verified again, then
+        // receipted again under the new identity.
+        let staged = index.join("staged-copy");
+        std::fs::write(&staged, encoded.as_bytes())?;
+        std::fs::rename(&staged, &segment_path)?;
+        let replaced =
+            KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)))?;
+        assert_eq!(
+            replaced.segments()[0].authenticated_file_witness_hash_count(),
+            1,
+            "a new inode must be fully verified"
+        );
+        let again =
+            KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)))?;
+        assert_eq!(
+            again.segments()[0].authenticated_file_witness_hash_count(),
+            0
+        );
+
+        // A half-written replacement (the first half of the bytes) fails
+        // closed whatever the book says.
+        let half = &encoded.as_bytes()[..encoded.as_bytes().len() / 2];
+        std::fs::write(&staged, half)?;
+        std::fs::rename(&staged, &segment_path)?;
+        let result =
+            KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)));
+        assert!(
+            matches!(
+                &result,
+                Err(KeeperError::SegmentOpen { .. } | KeeperError::SegmentMetadataMismatch { .. })
+            ),
+            "a truncated segment must fail closed: {:?}",
+            result.as_ref().err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_receipts_are_not_minted_for_a_file_changed_inside_the_racy_window() -> TestResult {
+        let (_root, index, book, _encoded) = receipt_test_index(0xe14)?;
+        let policy = Some((book.as_path(), OpenReceiptPolicy::default()));
+        let first = KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, policy)?;
+        let second = KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, policy)?;
+        assert_eq!(
+            first.segments()[0].authenticated_file_witness_hash_count(),
+            1
+        );
+        assert_eq!(
+            second.segments()[0].authenticated_file_witness_hash_count(),
+            1,
+            "a segment written moments ago must keep being verified"
+        );
+        assert!(
+            !book.exists(),
+            "nothing was receipted, so no book is written"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_receipt_is_never_minted_over_a_stale_section_checksum() -> TestResult {
+        // A self-consistent whole-file witness over a DOCLEN payload whose
+        // section checksum is stale: a plain open succeeds and DOCLEN fails on
+        // first access. A receipt must not turn that into a silent pass.
+        let root = tempdir()?;
+        let index = root.path().join("index");
+        std::fs::create_dir(&index)?;
+        let encoded = encoded_test_segment(0xabc, 10, 20, 1)?;
+        let doclen = encoded
+            .section_entries()
+            .iter()
+            .find(|entry| entry.kind == SectionKind::DOCLEN)
+            .expect("doclen entry");
+        let mut bytes = encoded.as_bytes().to_vec();
+        bytes[usize::try_from(doclen.offset)?] ^= 0x80;
+        let file_xxh3 = reseal_test_segment_file_witness(&mut bytes)?;
+        std::fs::write(index.join(canonical_segment_name(0xabc)), bytes)?;
+        let mut segment = manifest_segment(&encoded, 1);
+        segment.file_xxh3 = file_xxh3;
+        write_manifest(
+            &index.join("MANIFEST"),
+            &durable_test_manifest(1, vec![segment]),
+        )?;
+        let book = root.path().join("open-receipts");
+
+        for _ in 0..2 {
+            let snapshot = KeeperSnapshot::open_with_policy(
+                &index,
+                DEFAULT_SCHEMA,
+                Some(eager_receipts(&book)),
+            )?;
+            assert_eq!(
+                snapshot.segments()[0].authenticated_file_witness_hash_count(),
+                1,
+                "a segment with a stale section checksum must never be receipted"
+            );
+            assert!(matches!(
+                snapshot.segments()[0].section(SectionKind::DOCLEN),
+                Err(QuillError::IndexCorrupted { .. })
+            ));
+        }
+        assert!(!book.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn open_receipt_vouches_only_for_the_identity_it_names_and_plain_open_still_hashes()
+    -> TestResult {
+        // The trust boundary, stated as a test: bytes that change while the
+        // named identity stays the same (media corruption under an unchanged
+        // inode) are what a receipt cannot see. Simulate it by corrupting the
+        // file and then receipting its new identity under the old binding.
+        let (_root, index, book, encoded) = receipt_test_index(0xe16)?;
+        if !receipts_usable_in(&index) {
+            return Ok(());
+        }
+        let segment_path = index.join(canonical_segment_name(0xe16));
+        let mut bytes = std::fs::read(&segment_path)?;
+        let doclen = encoded
+            .section_entries()
+            .iter()
+            .find(|entry| entry.kind == SectionKind::DOCLEN)
+            .expect("doclen entry");
+        bytes[usize::try_from(doclen.offset)?] ^= 0x01;
+        std::fs::write(&segment_path, &bytes)?;
+        let manifest = manifest_segment(&encoded, 1);
+        let binding = ReceiptBinding {
+            segment_id: manifest.segment_id,
+            file_len: manifest.file_len,
+            file_xxh3: manifest.file_xxh3,
+        };
+        let identity = SegmentFileIdentity::of_path_for_test(&segment_path).expect("identity");
+        let mut forged = OpenReceiptBook::load_at(
+            &book,
+            OpenReceiptPolicy {
+                racy_window: Duration::ZERO,
+                ..OpenReceiptPolicy::default()
+            },
+            SystemTime::now(),
+        );
+        forged.record_verified(binding, &identity, Some(&identity));
+        forged.store(&book);
+
+        let trusted =
+            KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)))?;
+        assert_eq!(
+            trusted.segments()[0].authenticated_file_witness_hash_count(),
+            0
+        );
+        let Err(error) = KeeperSnapshot::open(&index, DEFAULT_SCHEMA) else {
+            panic!("a plain open must still hash and reject the corrupted segment");
+        };
+        assert!(
+            matches!(&error, KeeperError::SegmentOpen { path, .. } if path == &segment_path),
+            "{error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_corrupt_receipt_book_only_costs_a_full_verification() -> TestResult {
+        let (_root, index, book, _encoded) = receipt_test_index(0xe15)?;
+        if !receipts_usable_in(&index) {
+            return Ok(());
+        }
+        std::fs::write(&book, b"not a receipt book")?;
+        let snapshot =
+            KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)))?;
+        assert_eq!(
+            snapshot.segments()[0].authenticated_file_witness_hash_count(),
+            1
+        );
+        let again =
+            KeeperSnapshot::open_with_policy(&index, DEFAULT_SCHEMA, Some(eager_receipts(&book)))?;
+        assert_eq!(
+            again.segments()[0].authenticated_file_witness_hash_count(),
+            0,
+            "the rewritten book is valid again"
+        );
         Ok(())
     }
 
