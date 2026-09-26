@@ -74,6 +74,9 @@ request before applying the selected profile's capability ceiling. Project
 config overrides user config within the file layer. Superseded quality requests
 are recorded as `override.superseded.higher_precedence`; they MUST NOT cause a
 rejection or change the effective request.
+An open quality circuit (`pressure.quality_circuit_open`) disables quality work
+the same way as a hard pause, recorded as
+`safety.clamp.quality_circuit_open.quality_enabled`.
 
 The `performance` profile allows either `fast_only` value. The `strict` and
 `degraded` profiles disable quality: `fast_only=true` is accepted, while a winning

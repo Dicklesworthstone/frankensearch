@@ -2113,6 +2113,17 @@ fn resolve_pressure_profile(
         }
     }
 
+    // An open quality circuit means the quality tier must not be called, like
+    // a hard pause for quality work only (bd-pena2).
+    if config.pressure.quality_circuit_open && effective.quality_enabled {
+        effective.quality_enabled = false;
+        safety_clamps.push(PressureProfileSafetyClamp {
+            field: PressureProfileField::QualityEnabled,
+            clamped_to: "false".into(),
+            reason_code: "safety.clamp.quality_circuit_open.quality_enabled".into(),
+        });
+    }
+
     config.search.fast_only = !effective.quality_enabled;
     config.indexing.watch_mode = requested_watch_mode && effective.allow_background_indexing;
 
@@ -3904,6 +3915,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn open_quality_circuit_disables_quality_like_a_hard_pause() {
+        let closed = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .unwrap();
+        assert!(!closed.config.search.fast_only);
+        assert!(closed.pressure_profile_resolution.safety_clamps.is_empty());
+        for fast_only in [None, Some(false)] {
+            let cli = CliOverrides {
+                fast_only,
+                quality_circuit_open: Some(true),
+                ..CliOverrides::default()
+            };
+            let result = load_from_str(None, None, &HashMap::new(), &cli, home()).unwrap();
+            assert!(result.config.search.fast_only);
+            assert!(!result.pressure_profile_resolution.effective.quality_enabled);
+            assert!(
+                result
+                    .pressure_profile_resolution
+                    .safety_clamps
+                    .iter()
+                    .any(|clamp| {
+                        clamp.field == PressureProfileField::QualityEnabled
+                            && clamp.reason_code
+                                == "safety.clamp.quality_circuit_open.quality_enabled"
+                    })
+            );
+        }
+        let file = "[pressure]\nquality_circuit_open = true\n";
+        let from_file = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .unwrap();
+        assert!(from_file.config.search.fast_only);
     }
 
     #[test]
