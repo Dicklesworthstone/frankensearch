@@ -3223,6 +3223,15 @@ fn no_effect_setting_warnings(config: &FsfsConfig, warnings: &mut Vec<ConfigWarn
             });
         }
     }
+    if config.storage.summary_retention_days != StorageConfig::default().summary_retention_days {
+        warnings.push(ConfigWarning {
+            severity: ConfigDiagnosticSeverity::Warn,
+            reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
+            field: "storage.summary_retention_days".into(),
+            source: ConfigSource::Runtime,
+            message: "fsfs stores no summaries to expire, so this changes nothing".into(),
+        });
+    }
 }
 
 fn fast_only_quality_model_warning() -> ConfigWarning {
@@ -4097,7 +4106,8 @@ mod tests {
 
         let file = "\
 [indexing]\nreindex_on_change = false\n\
-[privacy]\nredact_file_contents_in_logs = false\nredact_paths_in_telemetry = false\n";
+[privacy]\nredact_file_contents_in_logs = false\nredact_paths_in_telemetry = false\n\
+[storage]\nsummary_retention_days = 120\n";
         let turned_off = load_from_str(
             Some(file),
             None,
@@ -4114,6 +4124,7 @@ mod tests {
                 "indexing.reindex_on_change",
                 "privacy.redact_file_contents_in_logs",
                 "privacy.redact_paths_in_telemetry",
+                "storage.summary_retention_days",
             ]
         );
     }
