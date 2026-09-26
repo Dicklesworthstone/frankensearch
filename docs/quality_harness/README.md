@@ -12,6 +12,26 @@ searchers after warm-up, but is not wired into `fsfs`'s separate orchestrator.
 Use the existing Rust quality work under `bd-quill-e6-gauntlet-scale-rm3q.7` to
 validate actual serving paths before promoting an experimental default.
 
+## Product evaluation through `fsfs`
+
+Two scripts here drive a built `fsfs` binary through `fsfs serve`, so their
+numbers are the product's (Quill, both vector tiers, fusion, blending). They
+need only the Python standard library.
+
+- `fsfs_beir_product_eval.py`: BEIR prose (SciFact, NFCorpus, ArguAna, ...).
+- `fsfs_code_product_eval.py`: code search judged by this repo's history.
+  `code_queries.jsonl` holds the frozen 253 queries (closed-bead titles; the
+  relevant documents are the Rust files changed by commits naming the bead).
+  Materialize the tree at a revision, index it, then `ablate` (lexical vs
+  Initial vs Refined) or `compare` arms that each name their own binary, index
+  and config. At the default configuration on be75d713: lexical 0.569,
+  Initial 0.305, Refined 0.348 nDCG@10.
+
+Both use the same metrics and paired bootstrap (10,000 resamples, seed
+20260922). Decide a comparison before running it, include a control arm that
+must come out at 0.0000 when a change should be neutral somewhere, and do not
+retune on these judgments.
+
 ## Historical reproduction environment
 
 These scripts require a separate Python research environment with `model2vec`,
