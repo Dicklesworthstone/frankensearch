@@ -455,7 +455,19 @@ bounded 2,000-character passages from the full lexical text, including code
 blocks. Adjacent windows overlap by 200 characters. The cap retains a final
 window at the end of a long file, but capped files can still have gaps in
 semantic coverage. More windows increase fast-tier embedding work and index
-size. The quality tier keeps one bounded prefix per source file.
+size. The quality tier keeps one bounded prefix per source file; for a
+windowed source its blend weight shrinks with the share of the file that
+prefix covers.
+
+For source code, windows are the largest measured ranking gain. On the
+repository's 253 judged code queries
+(`docs/quality_harness/fsfs_code_product_eval.py`), nDCG@10 rises from 0.308
+to 0.570 for Initial and from 0.349 to 0.575 for Refined at
+`fast_window_max_per_file = 128` (32 windows reach 0.499 Initial); keyword-only
+search scores 0.569 there. BEIR SciFact, NFCorpus and ArguAna change by less
+than 0.003 at 128. On that 579-file, 35 MB tree the index grows from 89 to
+106 MB, a cold build takes about 28 s instead of 23 s, and a search answers in
+about 26 ms instead of 21 ms (median, both phases).
 
 The index completion JSON includes `fast_window_coverage`: completed source
 and window counts, covered and total canonical characters, and the number of
