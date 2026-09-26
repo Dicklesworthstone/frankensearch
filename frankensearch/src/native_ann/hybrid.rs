@@ -55,14 +55,8 @@ impl NativeAnnIndex {
             // a provider-failure fallback and still requires lexical success.
             let batch = lexical.search_candidates(cx, text, budget).await?;
             validate_lexical(cx, &batch)?;
-            let hits = rrf_fuse_for_vector_lane(
-                batch.results(),
-                &[],
-                k,
-                0,
-                &RrfConfig::default(),
-                false,
-            );
+            let hits =
+                rrf_fuse_for_vector_lane(batch.results(), &[], k, 0, &RrfConfig::default(), false);
             checkpoint(cx, "native_ann.hybrid_complete")?;
             return Ok((hits, batch));
         }
@@ -101,7 +95,10 @@ impl NativeAnnIndex {
         self.admit_identity(query.identity())?;
         validate_lexical(cx, batch)?;
         let vectors = self.search(cx, query, candidate_count(k, 0, 3), ef)?;
-        let is_hash = matches!(query.identity().space.kind, EmbeddingSpaceKindV1::HashControl);
+        let is_hash = matches!(
+            query.identity().space.kind,
+            EmbeddingSpaceKindV1::HashControl
+        );
         let hits = rrf_fuse_for_vector_lane(batch.results(), &vectors, k, 0, config, is_hash);
         checkpoint(cx, "native_ann.hybrid_complete")?;
         Ok(hits)
@@ -379,7 +376,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+                hits.iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
                 ["beta", "alpha", "gamma"]
             );
             assert!(hits[0].in_both_sources);
@@ -423,9 +422,8 @@ mod tests {
             let provider = Provider::new(true);
             let mut lexical = Lexical::new();
             lexical.pending = true;
-            let mut future = Box::pin(index.search_hybrid_candidates(
-                &cx, &provider, &lexical, "query", 2,
-            ));
+            let mut future =
+                Box::pin(index.search_hybrid_candidates(&cx, &provider, &lexical, "query", 2));
             let waker = Waker::from(Arc::new(NoopWake));
             assert!(matches!(
                 future.as_mut().poll(&mut Context::from_waker(&waker)),
@@ -436,7 +434,11 @@ mod tests {
             assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
             let ready = Provider::new(false);
             assert_eq!(
-                index.search_text(&cx, &ready, "query", 1, None).await.unwrap()[0].doc_id,
+                index
+                    .search_text(&cx, &ready, "query", 1, None)
+                    .await
+                    .unwrap()[0]
+                    .doc_id,
                 "alpha"
             );
         });

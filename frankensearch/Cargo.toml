@@ -9,6 +9,13 @@ repository.workspace = true
 [features]
 default = ["hash"]
 bench-internals = ["frankensearch-core/bench-internals"]
+# Dev-only scorer diagnostics; never enabled by shipping feature bundles.
+pruning-conformance = [
+    "quill",
+    "lexical-tantivy",
+    "frankensearch-quill/pruning-conformance",
+    "frankensearch-lexical/tantivy-oracle",
+]
 hash = ["frankensearch-embed/hash"]
 model2vec = ["frankensearch-embed/model2vec"]
 fastembed = ["frankensearch-embed/fastembed"]
