@@ -22,8 +22,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 mod lease;
-pub use lease::EmbeddingBatch;
 use lease::ActiveLease;
+pub use lease::EmbeddingBatch;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -546,6 +546,7 @@ impl EmbeddingQueue {
         let mut state = self.lock_state();
         self.record_known_hash_locked(&mut state, doc_id, content_hash);
         state.release_leased_job(doc_id);
+        drop(state);
         self.metrics.record(JobOutcome::Succeeded);
     }
 
@@ -908,7 +909,9 @@ mod tests {
         for job in queue.drain_batch() {
             queue.record_embedded(&job.doc_id, &job.content_hash);
         }
-        queue.submit(request("changing", "Replacement text")).unwrap();
+        queue
+            .submit(request("changing", "Replacement text"))
+            .unwrap();
         let _in_flight = queue.drain_batch();
         assert_eq!(
             queue.submit(request("stable", "Stable text")).unwrap(),
