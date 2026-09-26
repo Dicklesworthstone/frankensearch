@@ -3792,6 +3792,13 @@ mod loader_only {
             );
         }
 
+        // The REFINED assertion below is about the quality tier, not a loaded
+        // host's cold-start latency: like the file's other REFINED checks, the
+        // stage gets 5 s (the 500 ms default, which counts cold model loading,
+        // failed one gate run at load ~40 and passed its rerun).
+        let refine_config = temp.path().join("hybrid-refine.toml");
+        fs::write(&refine_config, "[search]\nquality_timeout_ms = 5000\n")
+            .expect("write hybrid search config");
         let hybrid_search_outcome = fsfs.run(
             temp.path(),
             "hybrid-search",
@@ -3800,6 +3807,8 @@ mod loader_only {
                 "How should a network client recover from transient failures using exponential backoff, bounded retries, and random jitter?",
                 "--index-dir",
                 index.to_str().expect("UTF-8 index path"),
+                "--config",
+                refine_config.to_str().expect("UTF-8 config path"),
                 "--limit",
                 SEARCH_LIMIT,
                 "--format",
