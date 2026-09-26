@@ -72,7 +72,7 @@ arc-swap = "=1.9.2"
 
 # Descriptor-relative generation-root admission. Keep the syscall surface
 # explicit so unsupported targets compile without pulling platform code in.
-rustix = { version = "=1.1.4", default-features = false, features = [
+rustix = { version = "=1.1.5", default-features = false, features = [
     "std",
     "fs",
     "process",
@@ -103,7 +103,7 @@ half = "2.4"
 # Floor 1.6.0 is load-bearing: simd.rs/in_memory.rs call `widening_mul`, which only
 # exists in wide >= 1.6.0 (1.5.0 has only the pre-rename `mul_widen`). A lower floor
 # lets a consumer's stale lockfile resolve 1.1.1-1.5.0 and fail mid-compile (bd-efe5y).
-wide = "1.7.0"
+wide = "1.7.1"
 
 # Memory-mapped I/O
 memmap2 = "0.9"
@@ -112,7 +112,7 @@ memmap2 = "0.9"
 # Default features pull in native-tls and network stacks that transitively
 # depend on forbidden Tokio ecosystem crates. Keep only ORT's rustls-backed
 # binary acquisition path; model provisioning is owned by frankensearch.
-fastembed = { version = "=6.0.3", default-features = false, features = [
+fastembed = { version = "=7.0.1", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
 ] }
 safetensors = "0.8.0"
@@ -146,7 +146,7 @@ ndarray = "0.17"
 hnsw_rs = { package = "frankenhnsw", version = "=0.3.5", default-features = false }
 
 # CRC32 checksums for FSVI index integrity
-crc32fast = "1.5.1"
+crc32fast = "1.5.2"
 
 # Fast non-cryptographic hashing for hot-path HashMaps (inspired by fff.nvim)
 ahash = "0.8"
@@ -183,7 +183,7 @@ zeroize = "=1.9.0"
 ed25519-dalek = "=3.0.0"
 
 # PDF text extraction (digital PDFs with selectable text)
-pdf-extract = "0.12.0"
+pdf-extract = "0.12.1"
 
 # Benchmarking
 criterion = { version = "0.8.2", features = ["html_reports"] }
