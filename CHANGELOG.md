@@ -243,6 +243,14 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **File names and contents cannot drive your terminal.** Table output
+  printed file names, snippets and the query as raw text, so a file named or
+  containing an escape sequence could set the terminal title, clear the
+  screen or recolor output when its search result was shown (`fsfs search`
+  and `fsfs explain`, with or without `--no-color`). Control characters are
+  now shown escaped (`\u{1b}`, `\n`). JSON output was already escaped and is
+  unchanged; TOON and CSV still carry the exact text (bd-gb3mu).
+
 - **An excluded word keeps files out of every tier.** `-fusion`,
   `-"rank fusion"` and `NOT "rank fusion"` were honoured only by the word
   (BM25) tier; the vector tiers embedded the whole query, exclusion

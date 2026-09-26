@@ -101,7 +101,9 @@ use sysinfo::Disks;
 use tracing::{debug, info, warn};
 
 use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat, exit_code};
-use crate::adapters::format_emitter::{emit_envelope, emit_stream_frame, meta_for_format};
+use crate::adapters::format_emitter::{
+    emit_envelope, emit_stream_frame, meta_for_format, terminal_safe,
+};
 use crate::adapters::tui::FsfsTuiShellModel;
 use crate::agent_ergonomics::result_id;
 use crate::catalog::cleanup_tombstones_for_path;
@@ -22090,7 +22092,12 @@ fn render_explain_table(
         payload.ranking.final_score
     ));
 
-    lines.join("\n")
+    // The document ID, query and matched terms are indexed or caller text.
+    lines
+        .iter()
+        .map(|line| terminal_safe(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn pressure_timestamp_ms() -> u64 {
@@ -43751,6 +43758,52 @@ mod tests {
             !table.contains("semantic_rank=") && !table.contains("semantic_contrib="),
             "explain RRF line must not keep semantic rank labels for hash: {table}"
         );
+    }
+
+    /// bd-gb3mu: an indexed file name or a query reaches the terminal escaped.
+    #[test]
+    fn explain_table_escapes_control_characters() {
+        let doc_id = "evil\u{1b}]0;pwned\u{7}.rs";
+        let table = render_explain_table(
+            "R0",
+            &FsfsExplanationPayload::new(
+                "quokka\u{1b}[2J",
+                RankingExplanation::from_hit_explanation(
+                    doc_id,
+                    &HitExplanation {
+                        final_score: 0.1,
+                        components: Vec::new(),
+                        phase: ExplanationPhase::Initial,
+                        rank_movement: None,
+                    },
+                    "query.explain.attached",
+                    920,
+                ),
+            ),
+            &ExplainSessionHit {
+                result_id: "R0".to_owned(),
+                rank: 1,
+                path: doc_id.to_owned(),
+                final_score: 0.1,
+                lexical_rank: Some(0),
+                semantic_rank: None,
+                hash_rank: None,
+                lexical_score: Some(1.0),
+                semantic_score: None,
+                hash_score: None,
+                in_both_sources: false,
+                rerank_score: None,
+                rerank_logit: None,
+                lexical_fallback_tail: false,
+            },
+            60.0,
+            false,
+            None,
+        );
+        assert!(!table.contains('\u{1b}') && !table.contains('\u{7}'), "{table:?}");
+        assert!(table.contains(r"Result: evil\u{1b}]0;pwned\u{7}.rs"), "{table}");
+        assert!(table.contains(r"Query: quokka\u{1b}[2J"), "{table}");
+        assert!(table.lines().count() > 3, "line structure survives: {table}");
     }
 
     #[test]

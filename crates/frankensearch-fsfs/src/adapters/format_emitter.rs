@@ -10,6 +10,7 @@
 //! envelope as TOON and decoding it back yields the same `serde_json::Value`
 //! as direct JSON serialization. This is verified by [`verify_json_toon_parity`].
 
+use std::borrow::Cow;
 use std::env;
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
@@ -343,20 +344,40 @@ fn emit_table<T: Serialize, W: Write>(
             write!(writer, "{json}").map_err(write_err)?;
         }
     } else if let Some(error) = &envelope.error {
-        write!(writer, "error: [{}] {}", error.code, error.message).map_err(write_err)?;
+        // Messages can quote file paths; line breaks the message itself
+        // lays out stay readable, other control characters are escaped.
+        let prose = |text: &str| {
+            text.split('\n')
+                .map(|line| terminal_safe(line).into_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        write!(
+            writer,
+            "error: [{}] {}",
+            terminal_safe(&error.code),
+            prose(&error.message)
+        )
+        .map_err(write_err)?;
         if let Some(field) = &error.field {
-            write!(writer, " (field: {field})").map_err(write_err)?;
+            write!(writer, " (field: {})", terminal_safe(field)).map_err(write_err)?;
         }
         if let Some(context) = &error.context {
-            write!(writer, "\n\n  {context}").map_err(write_err)?;
+            write!(writer, "\n\n  {}", prose(context)).map_err(write_err)?;
         }
         if let Some(suggestion) = &error.suggestion {
-            write!(writer, "\n\n  Fix: {suggestion}").map_err(write_err)?;
+            write!(writer, "\n\n  Fix: {}", prose(suggestion)).map_err(write_err)?;
         }
     }
 
     for warning in &envelope.warnings {
-        write!(writer, "\nwarning: [{}] {}", warning.code, warning.message).map_err(write_err)?;
+        write!(
+            writer,
+            "\nwarning: [{}] {}",
+            terminal_safe(&warning.code),
+            terminal_safe(&warning.message)
+        )
+        .map_err(write_err)?;
     }
 
     if let Some(ms) = envelope.meta.duration_ms {
@@ -550,14 +571,15 @@ fn render_search_table_with_options(
 ) -> String {
     let mut out = String::new();
     let query_terms = collect_query_terms(&payload.query);
+    let query = terminal_safe(&payload.query);
     let total_ms = duration_ms.unwrap_or(0);
     let snippet_width = width.saturating_sub(34).max(32);
     let phase = payload.phase.to_string().to_ascii_uppercase();
     let phase_label = paint(&phase, "1;34", color_enabled);
     let _ = writeln!(
         out,
-        "PHASE {phase_label}: {} hit(s) for \"{}\"",
-        payload.returned_hits, payload.query
+        "PHASE {phase_label}: {} hit(s) for \"{query}\"",
+        payload.returned_hits
     );
     if let Some(generation_id) = payload.vector_generation_id.as_deref() {
         let class = if payload.vector_generation_is_hash {
@@ -565,6 +587,7 @@ fn render_search_table_with_options(
         } else {
             paint("semantic", "32", color_enabled)
         };
+        let generation_id = terminal_safe(generation_id);
         let _ = writeln!(out, "vector generation: {generation_id}  class={class}");
     } else {
         let _ = writeln!(
@@ -578,22 +601,21 @@ fn render_search_table_with_options(
         let _ = writeln!(
             out,
             "skip reason: {}",
-            paint(skip_reason, "33", color_enabled)
+            paint(&terminal_safe(skip_reason), "33", color_enabled)
         );
     }
 
     if payload.is_empty() {
         let _ = writeln!(
             out,
-            "No results for \"{}\". Try broadening your search or checking the index with fsfs status.",
-            payload.query
+            "No results for \"{query}\". Try broadening your search or checking the index with fsfs status."
         );
         let _ = writeln!(out, "{} results in {total_ms}ms", payload.returned_hits);
         return out;
     }
 
     for hit in &payload.hits {
-        let path = paint(&hit.path, "1;36", color_enabled);
+        let path = paint(&terminal_safe(&hit.path), "1;36", color_enabled);
         let line_segment = hit
             .line
             .map(|line| format!(":{}", paint(&line.to_string(), "32", color_enabled)))
@@ -628,8 +650,10 @@ fn render_search_table_with_options(
         }
         let _ = writeln!(out);
         if let Some(snippet) = hit.snippet.as_deref() {
+            // The preview already folds newlines and tabs into spaces.
             let clipped = focused_preview(snippet, &query_terms, snippet_width);
-            let highlighted = highlight_query_terms(&clipped, &query_terms, color_enabled);
+            let highlighted =
+                highlight_query_terms(&terminal_safe(&clipped), &query_terms, color_enabled);
             let _ = writeln!(out, "     {highlighted}");
         }
     }
@@ -701,6 +725,26 @@ fn source_badge(hit: &SearchHitPayload, hash_control: bool, color_enabled: bool)
         return paint("[semantic]", "36", color_enabled);
     }
     paint("[unknown]", "90", color_enabled)
+}
+
+/// Text from indexed files (paths, snippets) and from the caller reaches a
+/// terminal in table output. A control character there would let a crafted
+/// file name or body drive that terminal (set its title, clear the screen,
+/// write the clipboard through OSC 52), so it is shown escaped, as `\u{1b}`
+/// or `\n` (bd-gb3mu). Machine formats keep exact text: JSON escapes it.
+pub(crate) fn terminal_safe(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len() + 8);
+    for character in text.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    Cow::Owned(escaped)
 }
 
 fn truncate_for_width(text: &str, max_chars: usize) -> String {
@@ -1128,6 +1172,68 @@ mod tests {
         let output = render_search_table_with_options(&payload, Some(42), true, 80);
         assert!(output.contains("\u{1b}["));
         assert!(output.contains("1 results in 42ms"));
+    }
+
+    #[test]
+    fn render_search_table_escapes_control_characters_from_indexed_text() {
+        let hit = |rank: usize, path: &str, snippet: &str| SearchHitPayload {
+            rank,
+            path: path.to_owned(),
+            line: Some(1),
+            score: 0.5,
+            snippet: Some(snippet.to_owned()),
+            lexical_rank: Some(rank - 1),
+            semantic_rank: None,
+            hash_rank: None,
+            in_both_sources: false,
+        };
+        let payload = SearchPayload::new(
+            "quokka\u{1b}[2J",
+            SearchOutputPhase::Refined,
+            2,
+            vec![
+                hit(
+                    1,
+                    "evil\u{1b}]0;pwned\u{7}\u{1b}[31mRED\u{1b}[0m.md",
+                    "quokka\nnotes",
+                ),
+                hit(
+                    2,
+                    "new\nline.md",
+                    "quokka \u{1b}[2J\u{1b}[31m cleared \u{9b}2J screen",
+                ),
+            ],
+        );
+        for color_enabled in [false, true] {
+            let output = render_search_table_with_options(&payload, Some(3), color_enabled, 120);
+            assert!(!output.contains('\u{7}'), "{output:?}");
+            assert!(!output.contains('\u{9b}'), "{output:?}");
+            assert!(!output.contains("\u{1b}]0;"), "{output:?}");
+            assert!(!output.contains("\u{1b}[2J"), "{output:?}");
+            assert!(output.contains(r"evil\u{1b}]0;pwned\u{7}\u{1b}[31mRED\u{1b}[0m.md"));
+            assert!(output.contains(r"new\nline.md"));
+            if !color_enabled {
+                assert!(output.contains(r"new\nline.md:1"));
+                assert!(!output.contains('\u{1b}'), "{output:?}");
+                // Snippet line breaks still fold into spaces.
+                assert!(output.contains("quokka notes"));
+            }
+        }
+
+        let mut error = OutputError::new(
+            OutputErrorCode::INDEX_NOT_FOUND,
+            "no index at a\u{1b}]0;x\u{7}b\nrun fsfs index",
+            1,
+        );
+        error.suggestion = Some("Fix\u{1b}[2J it".to_owned());
+        let envelope: OutputEnvelope<SearchPayload> =
+            OutputEnvelope::error(error, sample_meta("table"), sample_ts());
+        let output = emit_envelope_string(&envelope, OutputFormat::Table).expect("render error");
+        assert!(
+            !output.contains('\u{1b}') && !output.contains('\u{7}'),
+            "{output:?}"
+        );
+        assert!(output.contains("a\\u{1b}]0;x\\u{7}b\nrun fsfs index"));
     }
 
     #[test]
