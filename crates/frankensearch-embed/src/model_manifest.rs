@@ -69,7 +69,7 @@ pub const MODEL_CONFORMANCE_TEXTS_V1: [&str; 4] = [
     "naive cafe Tokyo",
 ];
 
-/// Pinned adapter-level token budget passed to `FastEmbed` 6.0.0.
+/// Pinned adapter-level token budget passed to `FastEmbed` 6.0.3.
 #[cfg(feature = "fastembed")]
 pub(crate) const FASTEMBED_MAX_LENGTH_V1: usize = 512;
 /// Exact truncation and padding policy imposed by the pinned `FastEmbed` adapter.
@@ -253,7 +253,7 @@ impl ModelArtifactManifestV1 {
                 "frankensearch-embed-{}+model2vec-native-v1",
                 env!("CARGO_PKG_VERSION")
             ),
-            protocol_revision: "tokenizers-0.23.1+safetensors-0.7.0-static-table-v1".to_owned(),
+            protocol_revision: "tokenizers-0.23.2+safetensors-0.7.0-static-table-v1".to_owned(),
             numeric_profile: "f32-row-gather-mean-l2-v1".to_owned(),
             weights_format: "safetensors-f32-matrix-v1".to_owned(),
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
@@ -289,10 +289,10 @@ impl ModelArtifactManifestV1 {
         let execution = ModelExecutionContractV1 {
             backend: "fastembed-onnx".to_owned(),
             implementation_revision: format!(
-                "frankensearch-embed-{}+fastembed-6.0.0",
+                "frankensearch-embed-{}+fastembed-6.0.3",
                 env!("CARGO_PKG_VERSION")
             ),
-            protocol_revision: "fastembed-6.0.0+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
+            protocol_revision: "fastembed-6.0.3+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
             numeric_profile: "ort-2.0.0-rc.13-cpu-f32-host-default-intra-threads-v1".to_owned(),
             weights_format: "onnx-opset-pinned-v1".to_owned(),
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
@@ -340,7 +340,7 @@ impl ModelArtifactManifestV1 {
                 "frankensearch-rerank-native-embedder-v1+frankentorch-c305306b251753099620ad5fe02e78c07c167cf6"
                     .to_owned(),
             protocol_revision:
-                "tokenizers-0.23.1+frankentorch-bert-encoder-v1".to_owned(),
+                "tokenizers-0.23.2+frankentorch-bert-encoder-v1".to_owned(),
             numeric_profile: "f32-weights-int8-linear-f32-accumulate-v2".to_owned(),
             weights_format: "safetensors-f32-runtime-int8-linear-v1".to_owned(),
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
@@ -402,7 +402,7 @@ impl ModelArtifactManifestV1 {
             backend: "frankentorch-native-multilingual-minilm".to_owned(),
             implementation_revision: "frankensearch-rerank-native-embedder-v2+frankentorch-0.1.0"
                 .to_owned(),
-            protocol_revision: "tokenizers-0.23.1-xlmr-unigram+frankentorch-bert-dynamic-layers-v2"
+            protocol_revision: "tokenizers-0.23.2-xlmr-unigram+frankentorch-bert-dynamic-layers-v2"
                 .to_owned(),
             numeric_profile: "f32-weights-int8-linear-f32-accumulate-v2".to_owned(),
             weights_format: "safetensors-f32-runtime-int8-linear-v1".to_owned(),
@@ -1174,10 +1174,10 @@ fn fastembed_execution_contract(
     Ok(ModelExecutionContractV1 {
         backend: "fastembed-onnx".to_owned(),
         implementation_revision: format!(
-            "frankensearch-embed-{}+fastembed-6.0.0:{model_id}",
+            "frankensearch-embed-{}+fastembed-6.0.3:{model_id}",
             env!("CARGO_PKG_VERSION")
         ),
-        protocol_revision: "fastembed-6.0.0+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
+        protocol_revision: "fastembed-6.0.3+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
         numeric_profile: "ort-2.0.0-rc.13-cpu-f32-host-default-intra-threads-v1".to_owned(),
         weights_format: "onnx-opset-pinned-v1".to_owned(),
         tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
@@ -4161,6 +4161,49 @@ mod tests {
         assert_eq!(identity.storage.endianness, "little-endian");
     }
 
+    // Reconstruct the pre-refresh producer without changing any artifact,
+    // numeric contract, preprocessing, or output certificate. The exact
+    // historical hashes below therefore continue to constrain every other
+    // field while the current producer names its actual dependencies.
+    fn before_dependency_refresh(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        let current = manifest.freeze().unwrap().fingerprint;
+        let (current_protocol, previous_protocol) = match manifest.execution.backend.as_str() {
+            "model2vec-native" => (
+                "tokenizers-0.23.2+safetensors-0.7.0-static-table-v1",
+                "tokenizers-0.23.1+safetensors-0.7.0-static-table-v1",
+            ),
+            "fastembed-onnx" => {
+                assert!(
+                    manifest
+                        .execution
+                        .implementation_revision
+                        .contains("+fastembed-6.0.3")
+                );
+                manifest.execution.implementation_revision = manifest
+                    .execution
+                    .implementation_revision
+                    .replacen("+fastembed-6.0.3", "+fastembed-6.0.0", 1);
+                (
+                    "fastembed-6.0.3+ort-2.0.0-rc.13-user-defined-onnx-v1",
+                    "fastembed-6.0.0+ort-2.0.0-rc.13-user-defined-onnx-v1",
+                )
+            }
+            "frankentorch-native-minilm" | "frankentorch-native-minilm-f32" => (
+                "tokenizers-0.23.2+frankentorch-bert-encoder-v1",
+                "tokenizers-0.23.1+frankentorch-bert-encoder-v1",
+            ),
+            "frankentorch-native-multilingual-minilm" => (
+                "tokenizers-0.23.2-xlmr-unigram+frankentorch-bert-dynamic-layers-v2",
+                "tokenizers-0.23.1-xlmr-unigram+frankentorch-bert-dynamic-layers-v2",
+            ),
+            backend => panic!("unclassified registered producer: {backend}"),
+        };
+        assert_eq!(manifest.execution.protocol_revision, current_protocol);
+        previous_protocol.clone_into(&mut manifest.execution.protocol_revision);
+        assert_ne!(manifest.freeze().unwrap().fingerprint, current);
+        manifest
+    }
+
     #[test]
     fn registered_manifest_fingerprints_are_exact_fixtures() {
         // GOLDEN-CHANGE bd-2ba5: the explicit F32 producer and dependency
@@ -4181,6 +4224,8 @@ mod tests {
         // numeric profiles and output certificates differ on that platform.
         // Retain exact Linux fixtures and reconstruct them below before the
         // previous-version check; all artifact and input fields stay frozen.
+        // bd-dsbym: retain every prior fixture verbatim after correcting the
+        // Tokenizers/FastEmbed dependency identity. No vector golden changes.
         let observed = [
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
@@ -4191,7 +4236,7 @@ mod tests {
             ModelArtifactManifestV1::nomic_fastembed().unwrap(),
         ]
         .map(|manifest| {
-            let frozen = manifest.freeze().unwrap();
+            let frozen = before_dependency_refresh(manifest).freeze().unwrap();
             (frozen.manifest.execution.backend, frozen.fingerprint)
         });
         let expected = [
@@ -4241,7 +4286,7 @@ mod tests {
         ];
         assert_eq!(observed, expected);
 
-        for (mut manifest, previous_fingerprint, older_fingerprint, linux_certificate) in [
+        for (manifest, previous_fingerprint, older_fingerprint, linux_certificate) in [
             (
                 ModelArtifactManifestV1::potion_128m_native().unwrap(),
                 "4e997c1e42f4078b723a0043a3ba941ff63bd52e65e8157c5230a2d7a0bc063b",
@@ -4279,6 +4324,7 @@ mod tests {
                 Some("dbb7e33fdb5ccb4864faf9ff425b35a83a2d9dcd4f8d736033d7f819e0c1e851"),
             ),
         ] {
+            let mut manifest = before_dependency_refresh(manifest);
             let adapter = manifest
                 .execution
                 .implementation_revision

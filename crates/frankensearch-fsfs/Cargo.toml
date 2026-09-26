@@ -122,7 +122,7 @@ ignore = "0.4"
 sha2 = { workspace = true }
 pdf-extract = { workspace = true }
 tempfile = "3"
-ureq = { version = "3", features = ["json"] }
+ureq = { version = "3.4.1", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [dev-dependencies]
@@ -133,7 +133,7 @@ frankensearch-lexical = { workspace = true }
 proptest = { workspace = true }
 # Fixtures are in-memory/local; the default HTTP resolver pulls the forbidden
 # reqwest/hyper/Tokio stack without providing any test coverage value.
-jsonschema = { version = "0.50", default-features = false }
+jsonschema = { version = "0.56", default-features = false, features = ["idna"] }
 criterion = { workspace = true }
 
 [[bench]]
