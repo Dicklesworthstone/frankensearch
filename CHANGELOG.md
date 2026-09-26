@@ -243,6 +243,18 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **An excluded word keeps files out of every tier.** `-fusion`,
+  `-"rank fusion"` and `NOT "rank fusion"` were honoured only by the word
+  (BM25) tier; the vector tiers embedded the whole query, exclusion
+  included, and returned the files it named: `reciprocal rank fusion -rrf`
+  put `rrf.rs` at rank 4, with 8 of 20 Initial hits containing `rrf`. The
+  vector tiers now embed the query without its exclusions and skip every
+  file the word tier matches for them. `-"phrase"` is also parsed as a
+  phrase exclusion in the library's `ParsedQuery`. The answer cache moves
+  to `fsfs.search.cache.v13`, the daemon protocols to
+  `fsfs.search.serve.v8` and `fsfs.search.serve.stream.v6`, and
+  complete-generation forwarding to version 7 (bd-ekop5).
+
 - **With fast semantic windows, Refined no longer trails Initial on long
   files.** The quality tier embeds only each file's first 2,000 characters,
   while windows let the fast tier read the whole file, yet the blend gave

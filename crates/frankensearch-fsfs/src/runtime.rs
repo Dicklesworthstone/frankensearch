@@ -26,7 +26,8 @@ use asupersync::fs::remove_file as async_file_remove;
 #[cfg(unix)]
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::spawn_blocking;
-use frankensearch_core::filter::{PredicateFilter, SearchFilter};
+use frankensearch_core::filter::{ExcludeDocIdsFilter, PredicateFilter, SearchFilter};
+use frankensearch_core::parsed_query::ParsedQuery;
 use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
@@ -508,15 +509,17 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // skip_reason; an older cached answer would replay the silent version.
 // v11: Refined blends quality-discovered documents with their fast scores.
 // v12: with fast windows, a long source's quality weight scales by coverage.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v12";
+// v13: query exclusions apply to the vector lanes.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v13";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
 // v5 / stream v3: the WAL top-k repair (0dc3df2f).
 // v6 / stream v4: fast scores for quality-discovered Refined documents.
 // v7 / stream v5: coverage-scaled quality weight for windowed sources.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v7";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v5";
+// v8 / stream v6: query exclusions apply to the vector lanes.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v8";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v6";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -11452,6 +11455,38 @@ impl FsfsRuntime {
             }
         }
 
+        // Exclusions (`-term`, `-"phrase"`, `NOT "phrase"`) reach the lexical
+        // lane through its own parser. The vector lanes embed the rest of the
+        // query and skip every document the lexical engine matches for them;
+        // otherwise an excluded file returned through its vectors (bd-ekop5).
+        let parsed_query = ParsedQuery::parse(&normalized_query);
+        let semantic_query = if parsed_query.has_negations() && !parsed_query.is_positive_empty() {
+            parsed_query.positive.clone()
+        } else {
+            normalized_query.clone()
+        };
+        let excluded_doc_ids = Self::query_exclusions(
+            cx,
+            resources.lexical_index.as_ref(),
+            &parsed_query,
+            lexical_doc_count.unwrap_or(0),
+        )?;
+        let exclusion_filter = excluded_doc_ids.as_deref().map(|excluded| {
+            ExcludeDocIdsFilter::new(
+                filter_expr
+                    .as_ref()
+                    .map(|filter| filter as &dyn SearchFilter),
+                excluded.iter().map(String::as_str),
+            )
+        });
+        let vector_filter = exclusion_filter.as_ref().map_or_else(
+            || {
+                filter_expr
+                    .as_ref()
+                    .map(|filter| filter as &dyn SearchFilter)
+            },
+            |filter| Some(filter as &dyn SearchFilter),
+        );
         let mut winning_windows = HashMap::new();
         let mut fast_query_embedding = None;
         let semantic_candidates = if plan.semantic_stage.enabled && semantic_decision.run_semantic {
@@ -11459,7 +11494,7 @@ impl FsfsRuntime {
                 resources.vector_index.as_ref(),
                 resources.fast_embedder.as_ref(),
             ) {
-                match embedder.embed_admitted(cx, &normalized_query).await {
+                match embedder.embed_admitted(cx, &semantic_query).await {
                     Ok(query_embedding) => {
                         // Classified lane (bd-tqhc): an empty vector result
                         // carries a typed ZeroSignalReason instead of being
@@ -11470,9 +11505,7 @@ impl FsfsRuntime {
                             index,
                             &query_embedding,
                             semantic_budget,
-                            filter_expr
-                                .as_ref()
-                                .map(|filter| filter as &dyn SearchFilter),
+                            vector_filter,
                             resources.fast_window_mapping.as_ref(),
                         );
                         fast_query_embedding = Some(query_embedding);
@@ -11653,9 +11686,10 @@ impl FsfsRuntime {
                     self.quality_candidates(
                         cx,
                         resources,
-                        &normalized_query,
+                        &semantic_query,
                         quality_budget,
                         filter_expr.as_ref(),
+                        excluded_doc_ids.clone(),
                         &semantic_candidates,
                     ),
                 )
@@ -19268,6 +19302,7 @@ impl FsfsRuntime {
         query: &str,
         budget: usize,
         filter_expr: Option<&SearchFilterExpr>,
+        excluded_doc_ids: Option<Arc<HashSet<String>>>,
         fast_candidates: &[SemanticCandidate],
     ) -> SearchResult<Option<Vec<SemanticCandidate>>> {
         self.maybe_prepare_quality_embedder(cx, resources).await?;
@@ -19285,12 +19320,18 @@ impl FsfsRuntime {
             .collect::<HashSet<_>>();
         let work_cx = cx.clone();
         let hits = Self::quality_blocking(cx, move || {
+            let path_filter = filter_expr
+                .as_ref()
+                .map(|filter| filter as &dyn SearchFilter);
+            let exclusion = excluded_doc_ids.as_deref().map(|excluded| {
+                ExcludeDocIdsFilter::new(path_filter, excluded.iter().map(String::as_str))
+            });
             let mut hits = index.search_top_k(
                 &query_embedding,
                 budget,
-                filter_expr
+                exclusion
                     .as_ref()
-                    .map(|filter| filter as &dyn SearchFilter),
+                    .map_or(path_filter, |filter| Some(filter as &dyn SearchFilter)),
             )?;
             // Independent top-k retrieval admits quality-only documents, but
             // omission from that bounded pool does not prove a fast candidate
@@ -19330,6 +19371,36 @@ impl FsfsRuntime {
                 .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
                 .collect(),
         ))
+    }
+
+    /// Every live document the lexical engine matches for the query's
+    /// exclusions, which the vector lanes then skip. `None` when the query has
+    /// no exclusions or no lexical index can evaluate them.
+    fn query_exclusions(
+        cx: &Cx,
+        lexical: Option<&QuillSearchIndex>,
+        parsed: &ParsedQuery,
+        live_docs: usize,
+    ) -> SearchResult<Option<Arc<HashSet<String>>>> {
+        let Some(lexical) = lexical.filter(|_| parsed.has_negations()) else {
+            return Ok(None);
+        };
+        let excluded = parsed
+            .negative_terms
+            .iter()
+            .cloned()
+            .chain(
+                parsed
+                    .negative_phrases
+                    .iter()
+                    .map(|phrase| format!("\"{phrase}\"")),
+            )
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let hits = lexical.search_doc_ids(cx, &excluded, live_docs.max(1))?;
+        Ok(Some(Arc::new(
+            hits.iter().map(|hit| hit.document_id.clone()).collect(),
+        )))
     }
 
     /// The mirror of the fast-candidate completion in [`Self::quality_candidates`]:
@@ -28065,6 +28136,11 @@ mod tests {
             super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v7".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon whose vector lanes ignore exclusions cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v6".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -28743,10 +28819,12 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-        // v4 gives long windowed sources the whole quality weight; v3 blends
-        // quality discoveries without fast scores; v2 predates the WAL top-k
-        // repair; v1 an older ranking policy.
+        // v5 lets excluded documents back through the vector lanes; v4 gives
+        // long windowed sources the whole quality weight; v3 blends quality
+        // discoveries without fast scores; v2 predates the WAL top-k repair;
+        // v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v5",
             "fsfs.search.serve.stream.v4",
             "fsfs.search.serve.stream.v3",
             "fsfs.search.serve.stream.v2",
@@ -38472,6 +38550,138 @@ mod tests {
         });
     }
 
+    /// Embeds text that mentions "banned" toward [0, 1], anything else toward [1, 0].
+    struct ExclusionProbeEmbedder(&'static str);
+
+    impl Embedder for ExclusionProbeEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            let vector = if text.contains("banned") {
+                vec![0.0, 1.0]
+            } else {
+                vec![1.0, 0.0]
+            };
+            Box::pin(async move { Ok(vector) })
+        }
+        fn identity(
+            &self,
+        ) -> frankensearch_core::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1>
+        {
+            Ok(test_identity(self.0, 2))
+        }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn model_name(&self) -> &str {
+            self.0
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    /// `-term` excludes a document from every lane (bd-ekop5): b.rs contains
+    /// "banned" and sits near the query in both vector tiers, and the vector
+    /// lanes embed only "alpha", so the attractor c.rs is not pulled in either.
+    #[test]
+    fn negated_terms_exclude_documents_from_the_vector_lanes() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().expect("exclusion fixture");
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let write = |name: &str, embedder: &str, rows: &[(&str, [f32; 2])]| {
+                let path = temp.path().join(name);
+                let mut writer = VectorIndex::create(&path, embedder, 2).unwrap();
+                for (doc_id, vector) in rows {
+                    writer.write_record(doc_id, vector).unwrap();
+                }
+                writer.finish().unwrap();
+                VectorIndex::open_read_only(&path).unwrap()
+            };
+            resources.vector_index = Some(write(
+                "exclusion-fast.fsvi",
+                "blend-fast-2",
+                &[("a.rs", [1.0, 0.0]), ("b.rs", [0.9, 0.1]), ("c.rs", [0.0, 1.0])],
+            ));
+            resources.quality_vector_index = Some(Arc::new(write(
+                "exclusion-quality.fsvi",
+                "blend-quality-2",
+                &[("b.rs", [1.0, 0.0]), ("a.rs", [0.8, 0.2]), ("c.rs", [0.0, 1.0])],
+            )));
+            resources.fast_embedder = Some(admitted(ExclusionProbeEmbedder("blend-fast-2")));
+            resources.quality_embedder =
+                Some(admitted(ExclusionProbeEmbedder("blend-quality-2")));
+            let quill = create_test_quill(&cx, &temp.path().join("lexical")).await;
+            for (path, text) in [("a.rs", "alpha"), ("b.rs", "alpha banned"), ("c.rs", "gamma")] {
+                quill
+                    .index_document(&cx, &IndexableDocument::new(path, text))
+                    .await
+                    .unwrap();
+            }
+            quill.commit(&cx).await.unwrap();
+            resources.lexical_index = Some(
+                QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap(),
+            );
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let mut config = FsfsConfig::default();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let flags = SearchExecutionFlags {
+                include_snippets: false,
+                persist_explain_session: false,
+            };
+            // Natural-language wording: the planner runs both vector lanes.
+            for exclusion in ["-banned", "NOT \"banned\"", "-\"banned\""] {
+                let query = format!("how do alpha documents rank {exclusion}");
+                let phases = runtime
+                    .execute_search_payloads_with_mode_using_resources(
+                        &cx,
+                        &query,
+                        10,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                        flags,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(phases.last().unwrap().phase, SearchOutputPhase::Refined);
+                for phase in &phases {
+                    let paths = phase
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.as_str())
+                        .collect::<Vec<_>>();
+                    assert!(!paths.contains(&"b.rs"), "{query} {:?}: {paths:?}", phase.phase);
+                }
+                let initial_a = phases[0].hits.iter().find(|hit| hit.path == "a.rs").unwrap();
+                assert_eq!(initial_a.semantic_rank, Some(0), "{query}");
+            }
+            // Without an exclusion b.rs is an ordinary hit.
+            let plain = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    "how do alpha documents rank",
+                    10,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    flags,
+                )
+                .await
+                .unwrap();
+            assert!(plain.last().unwrap().hits.iter().any(|hit| hit.path == "b.rs"));
+        });
+    }
+
     #[test]
     fn runtime_search_payload_rejects_invalid_filter_key() {
         run_test_with_cx(|cx| async move {
@@ -46152,6 +46362,8 @@ mod tests {
                 "fsfs.search.cache.v10",
                 // Gave long windowed sources the whole quality weight.
                 "fsfs.search.cache.v11",
+                // Let excluded documents back through the vector lanes.
+                "fsfs.search.cache.v12",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

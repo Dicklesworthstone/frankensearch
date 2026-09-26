@@ -125,6 +125,24 @@ impl ParsedQuery {
             if chars[i] == '-'
                 && (i == 0 || chars[i - 1].is_whitespace())
                 && i + 1 < len
+                && chars[i + 1] == '"'
+            {
+                // -"exact phrase" excludes the phrase, as NOT "exact phrase".
+                let start = i + 2;
+                let mut j = start;
+                while j < len && chars[j] != '"' {
+                    j += 1;
+                }
+                let phrase: String = chars[start..j].iter().collect();
+                if !phrase.trim().is_empty() {
+                    negative_phrases.push(phrase);
+                }
+                i = (j + 1).min(len);
+                continue;
+            }
+            if chars[i] == '-'
+                && (i == 0 || chars[i - 1].is_whitespace())
+                && i + 1 < len
                 && chars[i + 1] != '-'
                 && !chars[i + 1].is_whitespace()
             {
@@ -260,6 +278,21 @@ mod tests {
         assert_eq!(q.positive, "machine learning");
         assert!(q.negative_terms.is_empty());
         assert_eq!(q.negative_phrases, vec!["deep learning"]);
+    }
+
+    #[test]
+    fn parse_dash_phrase() {
+        let q = ParsedQuery::parse(r#"rrf -"rank fusion" scoring"#);
+        assert_eq!(q.positive, "rrf scoring");
+        assert!(q.negative_terms.is_empty());
+        assert_eq!(q.negative_phrases, vec!["rank fusion"]);
+        // Unclosed and empty forms stay bounded and add nothing positive.
+        let q = ParsedQuery::parse(r#"rrf -"rank fusion"#);
+        assert_eq!(q.positive, "rrf");
+        assert_eq!(q.negative_phrases, vec!["rank fusion"]);
+        let q = ParsedQuery::parse(r#"rrf -"" x"#);
+        assert_eq!(q.positive, "rrf x");
+        assert!(!q.has_negations());
     }
 
     #[test]

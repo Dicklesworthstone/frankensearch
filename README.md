@@ -484,14 +484,16 @@ The word-matching (BM25) tier matches query words exactly, ignoring case,
 without stemming: `quantize` does not match `quantized`. A file needs only
 some of the words; more and rarer matches rank higher, and matches in the
 file name are boosted 2x over the body. The vector tiers read the
-query as plain text, which is how related wording still surfaces. The BM25
-tier also understands:
+query as plain text, which is how related wording still surfaces. An
+exclusion (`-fusion`, `-"rank fusion"` or `NOT "rank fusion"`) applies to
+every tier: the vector tiers read the query without it and skip each file
+the BM25 tier matches for it. The BM25 tier also understands:
 
 | Query | Meaning |
 |---|---|
 | `"rank fusion"` | the words adjacent and in order; `"rank fusion"~2` allows two positions of slack |
 | `title:rrf`, `content:rrf` | match in the file name only, or in the body only |
-| `+rrf -fusion` | `rrf` required, `fusion` excluded |
+| `+rrf -fusion` | `rrf` required in the word match; files containing `fusion` excluded from all results |
 | `quantize AND f16`, `rrf OR fusion` | both words required, or either |
 | `rrf^3 fusion` | count `rrf` three times as much |
 

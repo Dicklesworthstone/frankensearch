@@ -36,7 +36,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 4: request-scoped, retained-reader inline explanations.
 // 5: fast scores for quality-discovered Refined documents.
 // 6: coverage-scaled quality weight for windowed sources.
-const VERSION: u32 = 6;
+// 7: query exclusions apply to the vector lanes.
+const VERSION: u32 = 7;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -529,9 +530,10 @@ mod tests {
         }
         let mut value = serde_json::to_value(&request).unwrap();
         // Earlier versions cannot acknowledge request-scoped explanations,
-        // 4 ranks quality-discovered documents without fast scores and 5
-        // gives long windowed sources the whole quality weight.
-        for unsupported in [1, 2, 3, 4, 5, VERSION + 1] {
+        // 4 ranks quality-discovered documents without fast scores, 5
+        // gives long windowed sources the whole quality weight and 6 lets
+        // excluded documents back through the vector lanes.
+        for unsupported in [1, 2, 3, 4, 5, 6, VERSION + 1] {
             value["fsfs_complete_cli"] = serde_json::json!(unsupported);
             assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
         }
