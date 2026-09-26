@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use super::*;
 
@@ -54,6 +54,7 @@ impl BatchScript {
         let mut calls = self.calls.lock().expect("batch log lock");
         let index = calls.len();
         calls.push(texts.iter().map(|text| (*text).to_owned()).collect());
+        drop(calls);
         self.actions
             .iter()
             .find_map(|(at, action)| (*at == index).then_some(*action))
@@ -181,17 +182,8 @@ impl Embedder for ControlledEmbedder {
     }
 }
 
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
-fn poll_once<T>(
-    future: Pin<&mut impl Future<Output = SearchResult<T>>>,
-) -> Poll<SearchResult<T>> {
-    let waker = Waker::from(Arc::new(NoopWake));
-    future.poll(&mut Context::from_waker(&waker))
+fn poll_once<T>(future: Pin<&mut impl Future<Output = SearchResult<T>>>) -> Poll<SearchResult<T>> {
+    future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
 fn assert_pending_drop_restores_work(quality_pending: bool) {
@@ -290,7 +282,10 @@ fn restored_batch_can_be_published_by_the_next_cycle() {
             Arc::new(StubEmbedder::new("stub-fast", DIMENSION)),
             cache.clone(),
         );
-        assert_eq!(resumed.run_cycle(&cx).await.expect("publish restored work"), 2);
+        assert_eq!(
+            resumed.run_cycle(&cx).await.expect("publish restored work"),
+            2
+        );
         assert_eq!(queue.pending_count(), 0);
         assert_eq!(queue.in_flight_count(), 0);
         assert_eq!(queue.outstanding_count(), 0);
@@ -348,7 +343,10 @@ fn cache_contract_refusal_does_not_acknowledge_or_spend_retries() {
             Arc::new(StubEmbedder::new("stub-fast", DIMENSION)),
             cache.clone(),
         );
-        let error = worker.run_cycle(&cx).await.expect_err("different cache path");
+        let error = worker
+            .run_cycle(&cx)
+            .await
+            .expect_err("different cache path");
         assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
             if field == "index_cache.replace"));
         assert!(Arc::ptr_eq(&cache.current(), &retained));
@@ -513,7 +511,10 @@ fn assert_provider_cancellation_retains_work(quality_cancelled: bool) {
         let fast: Arc<dyn Embedder> = if quality_cancelled {
             Arc::new(StubEmbedder::new("stub-fast", DIMENSION))
         } else {
-            Arc::new(ControlledEmbedder::new("stub-fast", BatchBehavior::Cancelled))
+            Arc::new(ControlledEmbedder::new(
+                "stub-fast",
+                BatchBehavior::Cancelled,
+            ))
         };
         let mut worker = RefreshWorker::new(
             RefreshWorkerConfig::new(&dir),
@@ -535,14 +536,19 @@ fn assert_provider_cancellation_retains_work(quality_cancelled: bool) {
                 .run_cycle(&cx)
                 .await
                 .expect_err("propagate cancellation");
-            assert!(matches!(error, SearchError::Cancelled { ref phase, ref reason, .. }
-                if phase == "lease-test.bound" && reason == "controlled provider cancellation"));
+            assert!(
+                matches!(error, SearchError::Cancelled { ref phase, ref reason, .. }
+                if phase == "lease-test.bound" && reason == "controlled provider cancellation")
+            );
             assert_eq!(queue.pending_count(), 1);
             assert_eq!(queue.in_flight_count(), 0);
             assert_eq!(queue.outstanding_count(), 1);
         }
         assert!(Arc::ptr_eq(&cache.current(), &retained));
-        assert_eq!(std::fs::read(&fast_path).expect("unchanged seed"), fast_before);
+        assert_eq!(
+            std::fs::read(&fast_path).expect("unchanged seed"),
+            fast_before
+        );
         if let Some(before) = quality_before {
             assert_eq!(
                 std::fs::read(&quality_path).expect("unchanged quality"),
@@ -615,7 +621,13 @@ fn cycle_bounds_both_model_calls_without_splitting_publication() {
         assert_eq!(fast.calls(), quality.calls());
         assert_eq!(
             fast.calls().concat(),
-            ["payload a", "payload b", "payload c", "payload d", "payload e"]
+            [
+                "payload a",
+                "payload b",
+                "payload c",
+                "payload d",
+                "payload e"
+            ]
         );
         assert_eq!(cache.current().doc_count(), 5);
         assert_eq!(queue.outstanding_count(), 0);
@@ -886,10 +898,8 @@ fn cancellation_after_a_malformed_chunk_preserves_each_retry_decision() {
         let queue = queue_with_batches(6, 2, 3);
         submit_documents(&queue, &["a", "b", "c", "d", "e", "f"]);
         let cache = make_cache(&dir, DIMENSION);
-        let script = BatchScript::sequence(&[
-            (0, BatchAction::MissingMiddle),
-            (1, BatchAction::Pending),
-        ]);
+        let script =
+            BatchScript::sequence(&[(0, BatchAction::MissingMiddle), (1, BatchAction::Pending)]);
         let worker = RefreshWorker::new(
             RefreshWorkerConfig::new(&dir),
             queue.clone(),
@@ -1065,7 +1075,10 @@ fn strict_staging_bounds_both_model_calls_without_consuming_queued_work() {
             .expect("all strict chunks stage together");
         assert_eq!(batch_sizes(&fast), [2, 2, 1]);
         assert_eq!(fast.calls(), quality.calls());
-        for owner in [staged.fast_admitted_owner(), staged.quality_admitted_owner()] {
+        for owner in [
+            staged.fast_admitted_owner(),
+            staged.quality_admitted_owner(),
+        ] {
             let owner = owner.expect("admitted tier");
             let mut ids = (0..owner.record_count())
                 .map(|index| owner.row(index).expect("row").doc_id().to_owned())
