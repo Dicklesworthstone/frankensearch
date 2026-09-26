@@ -12191,6 +12191,20 @@ impl FsfsRuntime {
     /// non-interactive terminal, or a machine output format leaves the
     /// existing typed readiness error in charge.
     async fn maybe_offer_interactive_model_provisioning(&self, cx: &Cx) -> SearchResult<()> {
+        let offline = self.config.indexing.offline;
+        let interactive_terminal =
+            std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+        let table_format = self.cli_input.format == OutputFormat::Table;
+        // Only an interactive table run can be offered provisioning. Anywhere
+        // else, hashing every registered model's artifacts here (about a
+        // second per `fsfs index`) could not change the outcome.
+        if offline || !interactive_terminal || !table_format {
+            debug!(
+                offline,
+                interactive_terminal, table_format, "no interactive model provisioning offer"
+            );
+            return Ok(());
+        }
         let model_root = self.resolve_download_model_root()?;
         let mut missing = Vec::new();
         for manifest in ModelManifest::builtin_catalog().models {
@@ -12202,12 +12216,10 @@ impl FsfsRuntime {
             }
         }
 
-        let interactive_terminal =
-            std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
         let decision = interactive_model_provisioning_decision(
-            self.config.indexing.offline,
+            offline,
             interactive_terminal,
-            self.cli_input.format == OutputFormat::Table,
+            table_format,
             missing.len(),
         );
         if decision != InteractiveModelProvisioning::Offer {
