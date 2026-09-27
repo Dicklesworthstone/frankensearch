@@ -243,6 +243,19 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **Models are no longer re-hashed on every run after provisioning with
+  the release binary.** The downloadable fsfs is a static musl build, which
+  cannot read file birth times, so the verification receipts it writes carry
+  none; a standard (glibc) fsfs sees a birth time and treated the receipt as
+  stale, re-hashing about 1.3 GB of default models on every index, search or
+  serve start without ever renewing the receipt. A birth time only one side
+  can observe is now ignored; size, modification time, inode and change time
+  still tie the receipt to the files. With receipts written by the musl
+  binary, one index run read 1,355 MB of model files before the fix and
+  111 MB after; a one-shot `fsfs search --no-daemon` took 1.65 s before and
+  0.83 s after, and an unchanged re-index of a 579-file tree 3.27 s before
+  and 2.46 s after (medians of five interleaved runs) (bd-2a4z5).
+
 - **File names and contents cannot drive your terminal.** Table output
   printed file names, snippets and the query as raw text, so a file named or
   containing an escape sequence could set the terminal title, clear the

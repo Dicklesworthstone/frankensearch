@@ -3121,6 +3121,28 @@ pub struct FileVerificationState {
     pub platform_change_stamp: Option<String>,
 }
 
+impl FileVerificationState {
+    /// Whether a freshly captured state still matches this recorded one.
+    ///
+    /// Every field must match, except a creation timestamp that only one side
+    /// could observe: Rust's std reads Linux birth times through `statx` on
+    /// glibc but not on musl, so a receipt minted by the static musl `fsfs`
+    /// records none while a glibc build observes one for the same untouched
+    /// file. Treating that as a mismatch made every glibc load re-hash the
+    /// models forever. Size, mtime and, on Unix, inode and change stamp still
+    /// bind the file.
+    fn still_matches(&self, current: &Self) -> bool {
+        self.size_bytes == current.size_bytes
+            && self.modified_unix_nanos == current.modified_unix_nanos
+            && self.platform_file_id == current.platform_file_id
+            && self.platform_change_stamp == current.platform_change_stamp
+            && match (self.created_unix_nanos, current.created_unix_nanos) {
+                (Some(recorded), Some(observed)) => recorded == observed,
+                _ => true,
+            }
+    }
+}
+
 fn capture_file_verification_state(path: &Path) -> Option<FileVerificationState> {
     let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.file_type().is_file() {
@@ -3326,7 +3348,7 @@ impl VerificationMarker {
             let Some(current_state) = capture_file_verification_state(&path) else {
                 return false;
             };
-            if current_state != *expected_state {
+            if !expected_state.still_matches(&current_state) {
                 return false;
             }
         }
@@ -6592,6 +6614,85 @@ mod tests {
 
         // The consumer operation may then admit the unchanged receipt.
         verify_dir_cached(&manifest, tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn file_state_birth_time_is_compared_only_when_both_sides_observe_it() {
+        let recorded = FileVerificationState {
+            size_bytes: 10,
+            modified_unix_nanos: 5,
+            created_unix_nanos: Some(3),
+            platform_file_id: Some("unix-dev=1;ino=2".to_owned()),
+            platform_change_stamp: Some("unix-ctime=4;nsec=0".to_owned()),
+        };
+        let unobserved = FileVerificationState {
+            created_unix_nanos: None,
+            ..recorded.clone()
+        };
+        assert!(recorded.still_matches(&recorded));
+        assert!(recorded.still_matches(&unobserved));
+        assert!(unobserved.still_matches(&recorded));
+        assert!(!recorded.still_matches(&FileVerificationState {
+            created_unix_nanos: Some(4),
+            ..recorded.clone()
+        }));
+        for changed in [
+            FileVerificationState {
+                size_bytes: 11,
+                ..unobserved.clone()
+            },
+            FileVerificationState {
+                modified_unix_nanos: 6,
+                ..unobserved.clone()
+            },
+            FileVerificationState {
+                platform_file_id: Some("unix-dev=1;ino=3".to_owned()),
+                ..unobserved.clone()
+            },
+            FileVerificationState {
+                platform_change_stamp: Some("unix-ctime=5;nsec=0".to_owned()),
+                ..unobserved.clone()
+            },
+        ] {
+            assert!(!recorded.still_matches(&changed), "{changed:?}");
+            assert!(!unobserved.still_matches(&changed), "{changed:?}");
+        }
+    }
+
+    #[test]
+    fn receipt_minted_without_birth_times_is_admitted_and_still_binds_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"model data minted by a musl build";
+        let manifest = make_test_manifest("model.bin", content);
+        let model = tmp.path().join("model.bin");
+        write_temp_file(&model, content);
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
+
+        let marker_path = tmp.path().join(VERIFIED_MARKER_FILE);
+        let minted: VerificationMarker =
+            serde_json::from_str(&std::fs::read_to_string(&marker_path).unwrap()).unwrap();
+        let rewrite = |created: Option<u64>| {
+            let mut marker = minted.clone();
+            for state in marker.file_states.values_mut() {
+                state.created_unix_nanos = created;
+            }
+            std::fs::write(&marker_path, serde_json::to_string_pretty(&marker).unwrap()).unwrap();
+        };
+
+        // A static musl build cannot read birth times, so its receipt has none.
+        rewrite(None);
+        assert!(is_verification_cached(&manifest, tmp.path()));
+
+        // When both sides observe a birth time, it must still agree.
+        if let Some(observed) = minted.file_states["model.bin"].created_unix_nanos {
+            rewrite(Some(observed ^ 1));
+            assert!(!is_verification_cached(&manifest, tmp.path()));
+        }
+
+        // Without a birth time, a same-size rewrite is still caught.
+        rewrite(None);
+        write_temp_file(&model, b"model data minted by a musl buile");
+        assert!(!is_verification_cached(&manifest, tmp.path()));
     }
 
     /// Build a two-file download manifest plus the native manifest derived
