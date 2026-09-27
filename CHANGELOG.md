@@ -243,6 +243,16 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **A requested rerank that did not run says so.** With the default 300 ms
+  `rerank_timeout_ms`, `fsfs search --rerank` on code files timed out on
+  every query, even with a warm daemon, and table output looked the same as
+  a reranked result. Table output now prints `rerank: not applied
+  (<reason> after <n> ms)` and, for a timeout, points at
+  `search.rerank_timeout_ms`. JSON already carried the `rerank` status.
+  `fsfs serve`'s ready event reported `semantic_admitted: false` for every
+  real semantic index because the fast embedder loads on the first query;
+  it is now false only when that load was attempted and failed.
+
 - **The search dashboard follows its `[tui]` settings.** `density =
   "compact"` selects the compact layout at any terminal size,
   `show_explanations = false` hides the active match's score/source/rank

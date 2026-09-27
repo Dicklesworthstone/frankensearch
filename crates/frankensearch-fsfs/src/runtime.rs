@@ -7868,10 +7868,12 @@ impl FsfsRuntime {
             "format": format.into(),
             "vector_generation_id": generation.as_ref().map(|(id, _)| id.clone()),
             "vector_generation_is_hash": generation.as_ref().is_some_and(|(_, is_hash)| *is_hash),
+            // The fast embedder loads on the first semantic query, so "not yet
+            // loaded" still admits semantic search; only a failed load does not.
             "semantic_admitted": generation
                 .as_ref()
                 .is_some_and(|(_, is_hash)| !*is_hash)
-                && resources.fast_embedder.is_some(),
+                && (resources.fast_embedder.is_some() || !resources.fast_embedder_attempted),
         })
     }
 
@@ -44124,6 +44126,42 @@ mod tests {
             !table.contains("state: ready"),
             "hash control must not share the ready label: {table}"
         );
+    }
+
+    #[test]
+    fn serve_ready_admits_semantic_before_the_lazy_fast_embedder_loads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vector_path = temp.path().join("vector/index.fsvi");
+        fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        VectorIndex::create(&vector_path, "potion-multilingual-128M", 256)
+            .expect("create semantic generation")
+            .finish()
+            .expect("finish semantic generation");
+        let resources = |attempted: bool| SearchExecutionResources {
+            index_root: temp.path().to_path_buf(),
+            generation_fingerprint: "test".to_owned(),
+            lexical_index: None,
+            shadow_observer: None,
+            shadow_pressure_sampler: None,
+            vector_index: Some(
+                VectorIndex::open_read_only(&vector_path).expect("open semantic index"),
+            ),
+            fast_window_mapping: None,
+            quality_vector_index: None,
+            fast_embedder: None,
+            quality_embedder: None,
+            fast_embedder_attempted: attempted,
+            quality_embedder_attempted: attempted,
+            degradation_advice: Vec::new(),
+        };
+        // As prepared for serving: nothing loaded yet, semantic still admitted.
+        let ready = FsfsRuntime::search_serve_ready_event("jsonl", &resources(false));
+        assert_eq!(ready["vector_generation_is_hash"], false);
+        assert_eq!(ready["semantic_admitted"], true);
+        // A load that was attempted and failed admits nothing.
+        let ready = FsfsRuntime::search_serve_ready_event("jsonl", &resources(true));
+        assert_eq!(ready["semantic_admitted"], false);
     }
 
     #[test]

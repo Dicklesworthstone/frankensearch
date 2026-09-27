@@ -21,8 +21,8 @@ use serde::Serialize;
 use super::cli::OutputFormat;
 use crate::agent_ergonomics::{CompactLevel, compactify};
 use crate::output_schema::{
-    CompatibilityMode, OutputEnvelope, OutputMeta, SearchHitPayload, SearchPayload,
-    encode_envelope_toon, validate_envelope,
+    CompatibilityMode, OutputEnvelope, OutputMeta, RerankStageStatus, SearchHitPayload,
+    SearchPayload, encode_envelope_toon, validate_envelope,
 };
 use crate::stream_protocol::{
     StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE, encode_stream_frame_toon, validate_stream_frame,
@@ -602,6 +602,25 @@ fn render_search_table_with_options(
             out,
             "skip reason: {}",
             paint(&terminal_safe(skip_reason), "33", color_enabled)
+        );
+    }
+    // A requested rerank that did not run must not look like one that did.
+    if let Some(rerank) = payload
+        .rerank
+        .as_ref()
+        .filter(|rerank| rerank.status != RerankStageStatus::Applied)
+    {
+        let hint = if rerank.reason_code == "query.stage.rerank.timeout" {
+            "; raise search.rerank_timeout_ms to let it finish"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "rerank: {} ({} after {} ms); results keep their fused order{hint}",
+            paint("not applied", "33", color_enabled),
+            terminal_safe(&rerank.reason_code),
+            rerank.elapsed_ms
         );
     }
 
@@ -1234,6 +1253,54 @@ mod tests {
             "{output:?}"
         );
         assert!(output.contains("a\\u{1b}]0;x\\u{7}b\nrun fsfs index"));
+    }
+
+    #[test]
+    fn render_search_table_says_when_a_requested_rerank_was_not_applied() {
+        use crate::output_schema::RerankStagePayload;
+
+        let hit = SearchHitPayload {
+            rank: 1,
+            path: "src/lib.rs".to_owned(),
+            line: Some(1),
+            score: 0.5,
+            snippet: Some("drain cancelled tasks".to_owned()),
+            lexical_rank: Some(0),
+            semantic_rank: None,
+            hash_rank: None,
+            in_both_sources: false,
+        };
+        let render = |rerank: Option<RerankStagePayload>| {
+            let mut payload =
+                SearchPayload::new("drain", SearchOutputPhase::Refined, 1, vec![hit.clone()]);
+            payload.rerank = rerank;
+            render_search_table_with_options(&payload, Some(5), false, 120)
+        };
+
+        let mut timed_out = RerankStagePayload::skipped("query.stage.rerank.timeout", 15);
+        timed_out.status = RerankStageStatus::Failed;
+        timed_out.elapsed_ms = 300;
+        let output = render(Some(timed_out));
+        assert!(
+            output.contains(
+                "rerank: not applied (query.stage.rerank.timeout after 300 ms); results keep their fused order"
+            ),
+            "{output}"
+        );
+        assert!(output.contains("search.rerank_timeout_ms"), "{output}");
+
+        let unavailable = render(Some(RerankStagePayload::skipped(
+            "query.stage.rerank.disabled.unavailable",
+            15,
+        )));
+        assert!(unavailable.contains("rerank: not applied"), "{unavailable}");
+        assert!(!unavailable.contains("rerank_timeout_ms"), "{unavailable}");
+
+        let mut applied = RerankStagePayload::skipped("query.stage.rerank.applied", 15);
+        applied.status = RerankStageStatus::Applied;
+        applied.reranked_hits = 1;
+        assert!(!render(Some(applied)).contains("rerank:"));
+        assert!(!render(None).contains("rerank:"));
     }
 
     #[test]
