@@ -599,6 +599,8 @@ const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v7";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
+const FSFS_DAEMON_SOCKET_VARIANT_LEN: usize = 8;
+#[cfg(unix)]
 const FSFS_DAEMON_REQUEST_MAX_BYTES: usize = 1 << 20; // 1 MiB
 const FSFS_DAEMON_RESPONSE_MAX_BYTES: usize = 4 << 20; // 4 MiB
 // Each search publishes an attestation and at most two phases. The socket
@@ -8500,8 +8502,57 @@ impl FsfsRuntime {
         self.default_daemon_socket_path()
     }
 
+    /// `fsfs-query-<index>-<variant>.sock`: one daemon per index, quality model
+    /// and serve protocol. The protocol is part of the name so an upgraded
+    /// client whose results changed spawns its own daemon instead of being
+    /// refused by a warm older one until that one idles out.
     #[cfg(unix)]
     fn default_daemon_socket_path(&self) -> SearchResult<PathBuf> {
+        let (socket_dir, index_stem) = self.default_daemon_socket_stem()?;
+        let variant = Self::daemon_socket_variant(
+            &self.config.indexing.quality_model,
+            FSFS_SEARCH_SERVE_SCHEMA_VERSION,
+            FSFS_SEARCH_SERVE_STREAM_VERSION,
+        );
+        Ok(socket_dir.join(format!("{index_stem}-{variant}.sock")))
+    }
+
+    /// Socket name suffix that separates daemons by quality model and serve
+    /// protocol.
+    #[cfg(unix)]
+    fn daemon_socket_variant(
+        quality_model: &str,
+        serve_version: &str,
+        stream_version: &str,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(normalize_model_key(quality_model).as_bytes());
+        hasher.update([0]);
+        hasher.update(serve_version.as_bytes());
+        hasher.update([0]);
+        hasher.update(stream_version.as_bytes());
+        sha256_digest_hex(hasher.finalize())[..FSFS_DAEMON_SOCKET_VARIANT_LEN].to_owned()
+    }
+
+    /// Daemon directory and the `fsfs-query-<index>` stem every default daemon
+    /// socket for this index starts with.
+    #[cfg(unix)]
+    fn default_daemon_socket_stem(&self) -> SearchResult<(PathBuf, String)> {
+        let index_root = self
+            .resolve_status_index_root()
+            .or_else(|_| std::env::current_dir().map_err(SearchError::Io))?;
+        let digest = sha256_digest_hex(Sha256::digest(index_root.display().to_string()));
+        let prefix_len = FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN.min(digest.len());
+        Ok((
+            Self::default_daemon_socket_dir(),
+            format!("fsfs-query-{}", &digest[..prefix_len]),
+        ))
+    }
+
+    /// The socket name binaries before protocol-versioned names used for this
+    /// index and quality model, so a quiesce also reaches their daemons.
+    #[cfg(unix)]
+    fn legacy_daemon_socket_path(&self) -> SearchResult<PathBuf> {
         let index_root = self
             .resolve_status_index_root()
             .or_else(|_| std::env::current_dir().map_err(SearchError::Io))?;
@@ -8511,11 +8562,16 @@ impl FsfsRuntime {
         hasher.update(normalize_model_key(&self.config.indexing.quality_model).as_bytes());
         let digest = sha256_digest_hex(hasher.finalize());
         let prefix_len = FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN.min(digest.len());
+        Ok(Self::default_daemon_socket_dir()
+            .join(format!("fsfs-query-{}.sock", &digest[..prefix_len])))
+    }
+
+    #[cfg(unix)]
+    fn default_daemon_socket_dir() -> PathBuf {
         let runtime_base = frankensearch_core::platform_dirs::runtime_dir()
             .or_else(|| frankensearch_core::platform_dirs::cache_dir().map(|dir| dir.join("run")))
             .unwrap_or_else(std::env::temp_dir);
-        let socket_dir = runtime_base.join("frankensearch").join("daemon");
-        Ok(socket_dir.join(format!("fsfs-query-{}.sock", &digest[..prefix_len])))
+        runtime_base.join("frankensearch").join("daemon")
     }
 
     fn search_stream_started_event(&self, query: &str, stream_id: &str) -> StreamStartedEvent {
@@ -13607,27 +13663,35 @@ impl FsfsRuntime {
     /// map lock, so every in-place mutation would be refused with
     /// `fsvi.map_lock` for minutes. Ask it to exit over its socket and wait
     /// for the socket to go away; the next search respawns it. No daemon is
-    /// the common case and not an error.
+    /// the common case and not an error. Without an explicit `--daemon-socket`
+    /// every default daemon of this index is asked, whatever quality model or
+    /// protocol version (including pre-versioned names) it was started with.
     #[cfg(unix)]
     fn quiesce_query_daemon(&self, reason: &str) -> SearchResult<()> {
         const QUIESCE_BUDGET: Duration = Duration::from_secs(5);
         const QUIESCE_POLL: Duration = Duration::from_millis(25);
 
-        let socket_path = self.resolve_daemon_socket_path()?;
-        let Ok(mut stream) = UnixStream::connect(&socket_path) else {
-            return Ok(());
-        };
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(
-            FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS,
-        )));
-        if let Err(error) = stream.write_all(b":shutdown\n") {
-            debug!(error = %error, reason, "query daemon shutdown request not delivered");
+        let mut stopping = Vec::new();
+        for socket_path in self.quiesce_daemon_socket_paths()? {
+            let Ok(mut stream) = UnixStream::connect(&socket_path) else {
+                continue;
+            };
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(
+                FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS,
+            )));
+            if let Err(error) = stream.write_all(b":shutdown\n") {
+                debug!(error = %error, reason, "query daemon shutdown request not delivered");
+                continue;
+            }
+            stopping.push(socket_path);
+        }
+        if stopping.is_empty() {
             return Ok(());
         }
-        drop(stream);
         let started = Instant::now();
         while started.elapsed() < QUIESCE_BUDGET {
-            if UnixStream::connect(&socket_path).is_err() {
+            stopping.retain(|socket_path| UnixStream::connect(socket_path).is_ok());
+            if stopping.is_empty() {
                 info!(
                     reason,
                     elapsed_ms = started.elapsed().as_millis(),
@@ -13642,6 +13706,32 @@ impl FsfsRuntime {
             "query daemon did not exit within the quiesce budget; the mutation may be refused by the map lock"
         );
         Ok(())
+    }
+
+    /// Sockets a quiesce asks to shut down: the explicit `--daemon-socket`, or
+    /// the legacy name plus every `fsfs-query-<index>-*.sock` in the daemon
+    /// directory.
+    #[cfg(unix)]
+    fn quiesce_daemon_socket_paths(&self) -> SearchResult<Vec<PathBuf>> {
+        if let Some(path) = self.cli_input.daemon_socket.as_deref() {
+            return Ok(vec![absolutize_path(path)?]);
+        }
+        let mut paths = vec![self.legacy_daemon_socket_path()?];
+        let (socket_dir, index_stem) = self.default_daemon_socket_stem()?;
+        let prefix = format!("{index_stem}-");
+        if let Ok(entries) = fs::read_dir(&socket_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".sock"))
+                {
+                    paths.push(entry.path());
+                }
+            }
+        }
+        paths.sort();
+        Ok(paths)
     }
 
     /// Writer open that tolerates the brief window between a quiesced
@@ -33664,6 +33754,116 @@ mod tests {
         assert!(
             rendered.ends_with(".sock"),
             "daemon socket path should end with .sock: {rendered}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_socket_variant_changes_with_the_serve_protocol() {
+        use super::{
+            FSFS_DAEMON_SOCKET_VARIANT_LEN, FSFS_SEARCH_SERVE_SCHEMA_VERSION,
+            FSFS_SEARCH_SERVE_STREAM_VERSION,
+        };
+        let current = FsfsRuntime::daemon_socket_variant(
+            "all-MiniLM-L6-v2",
+            FSFS_SEARCH_SERVE_SCHEMA_VERSION,
+            FSFS_SEARCH_SERVE_STREAM_VERSION,
+        );
+        assert_eq!(current.len(), FSFS_DAEMON_SOCKET_VARIANT_LEN);
+        for (model, serve, stream) in [
+            (
+                "all-MiniLM-L6-v2",
+                "fsfs.search.serve.v8",
+                FSFS_SEARCH_SERVE_STREAM_VERSION,
+            ),
+            (
+                "all-MiniLM-L6-v2",
+                FSFS_SEARCH_SERVE_SCHEMA_VERSION,
+                "fsfs.search.serve.stream.v6",
+            ),
+            (
+                "all-MiniLM-L6-v2-native",
+                FSFS_SEARCH_SERVE_SCHEMA_VERSION,
+                FSFS_SEARCH_SERVE_STREAM_VERSION,
+            ),
+        ] {
+            assert_ne!(
+                FsfsRuntime::daemon_socket_variant(model, serve, stream),
+                current,
+                "{model} {serve} {stream}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quiesce_stops_every_default_daemon_of_the_index_and_no_other() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        // A fake daemon that exits (unlinks its socket) on `:shutdown` and
+        // reports whether it was asked to.
+        fn fake_daemon(path: PathBuf, deadline: Instant) -> std::thread::JoinHandle<bool> {
+            let _ = fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("bind fake daemon");
+            listener.set_nonblocking(true).expect("nonblocking listener");
+            std::thread::spawn(move || {
+                while Instant::now() < deadline {
+                    if let Ok((stream, _)) = listener.accept() {
+                        stream.set_nonblocking(false).expect("blocking stream");
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(200)))
+                            .expect("read timeout");
+                        let mut line = String::new();
+                        let _ = std::io::BufReader::new(stream).read_line(&mut line);
+                        if line.trim() == ":shutdown" {
+                            let _ = fs::remove_file(&path);
+                            return true;
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                let _ = fs::remove_file(&path);
+                false
+            })
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_for = |root: &Path| {
+            fs::create_dir_all(root).expect("index root");
+            FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                index_dir: Some(root.to_path_buf()),
+                ..CliInput::default()
+            })
+        };
+        let runtime = runtime_for(&temp.path().join("index"));
+        let current = runtime.default_daemon_socket_path().unwrap();
+        let legacy = runtime.legacy_daemon_socket_path().unwrap();
+        let (socket_dir, stem) = runtime.default_daemon_socket_stem().unwrap();
+        let older_protocol = socket_dir.join(format!("{stem}-00000000.sock"));
+        let other_index = runtime_for(&temp.path().join("other"))
+            .default_daemon_socket_path()
+            .unwrap();
+        let current_name = current.file_name().unwrap().to_str().unwrap();
+        assert!(current_name.starts_with(&format!("{stem}-")), "{current_name}");
+        assert_ne!(current, legacy);
+        assert_ne!(current, older_protocol);
+        assert!(!other_index.to_str().unwrap().contains(&stem));
+
+        fs::create_dir_all(&socket_dir).expect("daemon dir");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let asked = [&current, &legacy, &older_protocol]
+            .map(|path| fake_daemon(path.clone(), deadline));
+        let unrelated = fake_daemon(other_index.clone(), deadline);
+
+        runtime.quiesce_query_daemon("test").expect("quiesce");
+        for (handle, path) in asked.into_iter().zip([&current, &legacy, &older_protocol]) {
+            assert!(handle.join().unwrap(), "{} was not stopped", path.display());
+            assert!(UnixStream::connect(path).is_err(), "{}", path.display());
+        }
+        assert!(
+            !unrelated.join().unwrap(),
+            "a daemon of another index must not be stopped"
         );
     }
 

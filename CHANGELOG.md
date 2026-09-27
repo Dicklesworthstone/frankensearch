@@ -243,6 +243,17 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **Searching right after an upgrade works.** A query daemon left running
+  by the previous fsfs kept its socket, so when the new version's results
+  differed (any cache or protocol version change), every `fsfs search`
+  failed with "daemon did not acknowledge requested search policy" until
+  that daemon idled out — and each refused search kept it alive. The
+  default daemon socket name now includes the search protocol version, so
+  an upgraded fsfs starts its own daemon; `fsfs index` and the other
+  in-place mutations stop every query daemon of the index, including ones
+  started by older versions. An explicit `--daemon-socket` still refuses a
+  daemon that answers with a different policy (bd-uri3x).
+
 - **`--filter lang:rust` works.** `type:` and `lang:` compared the value
   with file extensions only, so `lang:rust`, `type:python` or `lang:cpp`
   silently returned no results. Both keys now accept a language name
