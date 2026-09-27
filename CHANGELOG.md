@@ -273,7 +273,11 @@ qualified; individual results below are narrower than release acceptance.
   mismatch", even `fsfs index --force`. Until then `fsfs status` reports
   "keyword index rebuild pending" (`lexical_rebuild_required` in JSON)
   instead of failing. Parallel bulk ingest applies to the new analyzer as it
-  did to the old one.
+  did to the old one. **Library users:** an index built with Quill's
+  `DEFAULT_SCHEMA` by an earlier release now opens with
+  `KeeperError::SchemaMismatch` (a `SearchError::SubsystemError` through the
+  facade) and must be rebuilt; `CASS_SEMANTIC_SCHEMA` and
+  `FSFS_CHUNK_SCHEMA` did not change.
 
 - **Searching right after an upgrade works.** A query daemon left running
   by the previous fsfs kept its socket, so when the new version's results
