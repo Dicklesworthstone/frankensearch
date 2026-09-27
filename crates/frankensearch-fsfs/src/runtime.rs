@@ -13721,12 +13721,15 @@ impl FsfsRuntime {
         let prefix = format!("{index_stem}-");
         if let Ok(entries) = fs::read_dir(&socket_dir) {
             for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".sock"))
+                let path = entry.path();
+                let is_socket_name = path.extension().is_some_and(|ext| ext == "sock");
+                if is_socket_name
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(&prefix))
                 {
-                    paths.push(entry.path());
+                    paths.push(path);
                 }
             }
         }
