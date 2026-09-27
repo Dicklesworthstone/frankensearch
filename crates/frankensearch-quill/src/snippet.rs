@@ -72,6 +72,7 @@ impl SnippetTerm {
 #[derive(Debug, Clone)]
 enum BuiltInAnalyzer {
     FrankensearchDefault(FrankensearchTokenizer),
+    FrankensearchCjkBigrams(FrankensearchTokenizer),
     CassHyphenNormalize(CassAnalyzer),
     CassPrefixNormalize(CassAnalyzer),
 }
@@ -82,6 +83,7 @@ impl BuiltInAnalyzer {
             Analyzer::FrankensearchDefault => {
                 Self::FrankensearchDefault(FrankensearchTokenizer::default())
             }
+            Analyzer::FrankensearchCjkBigrams => Self::FrankensearchCjkBigrams(FrankensearchTokenizer::default()),
             Analyzer::CassHyphenNormalize => Self::CassHyphenNormalize(CassAnalyzer::default()),
             Analyzer::CassPrefixNormalize => Self::CassPrefixNormalize(CassAnalyzer::default()),
         }
@@ -91,6 +93,9 @@ impl BuiltInAnalyzer {
         match self {
             Self::FrankensearchDefault(analyzer) => {
                 analyzer.analyze(Analyzer::FrankensearchDefault, text, sink);
+            }
+            Self::FrankensearchCjkBigrams(analyzer) => {
+                analyzer.analyze(Analyzer::FrankensearchCjkBigrams, text, sink);
             }
             Self::CassHyphenNormalize(analyzer) => {
                 analyzer.analyze(Analyzer::CassHyphenNormalize, text, sink);

@@ -16,8 +16,10 @@ const CANONICAL_VERSION: u16 = 1;
 /// Analyzer pipelines compiled into Quill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Analyzer {
-    /// Shipping `SimpleTokenizer + LowerCaser`-compatible analyzer.
+    /// Legacy `SimpleTokenizer + LowerCaser`-compatible analyzer.
     FrankensearchDefault,
+    /// Default fsfs analyzer: legacy tokenization plus overlapping CJK bigrams.
+    FrankensearchCjkBigrams,
     /// CASS hyphen/CJK normalization analyzer.
     CassHyphenNormalize,
     /// CASS pre-expanded prefix-field analyzer.
@@ -30,6 +32,7 @@ impl Analyzer {
             Self::FrankensearchDefault => 0,
             Self::CassHyphenNormalize => 1,
             Self::CassPrefixNormalize => 2,
+            Self::FrankensearchCjkBigrams => 3,
         }
     }
 }
@@ -260,7 +263,7 @@ const DEFAULT_FIELDS: [FieldDescriptor; 5] = [
         id: 1,
         name: "content",
         kind: FieldKind::Text {
-            analyzer: Analyzer::FrankensearchDefault,
+            analyzer: Analyzer::FrankensearchCjkBigrams,
             positions: true,
         },
         stored: true,
@@ -269,7 +272,7 @@ const DEFAULT_FIELDS: [FieldDescriptor; 5] = [
         id: 2,
         name: "title",
         kind: FieldKind::Text {
-            analyzer: Analyzer::FrankensearchDefault,
+            analyzer: Analyzer::FrankensearchCjkBigrams,
             positions: true,
         },
         stored: true,
@@ -350,7 +353,7 @@ const FSFS_CHUNK_FIELDS: [FieldDescriptor; 8] = [
         id: 6,
         name: "content",
         kind: FieldKind::Text {
-            analyzer: Analyzer::FrankensearchDefault,
+            analyzer: Analyzer::FrankensearchCjkBigrams,
             positions: true,
         },
         stored: false,
@@ -500,8 +503,8 @@ pub const CASS_SEMANTIC_SCHEMA: SchemaDescriptor = SchemaDescriptor {
 mod tests {
     use super::*;
 
-    const PINNED_DEFAULT_SCHEMA_ID: u64 = 0xa312_ebf6_d136_07a5;
-    const PINNED_FSFS_CHUNK_SCHEMA_ID: u64 = 0xe1c8_4ac7_e5e0_c4a1;
+    const PINNED_DEFAULT_SCHEMA_ID: u64 = 0x7ede_512c_b74b_df17;
+    const PINNED_FSFS_CHUNK_SCHEMA_ID: u64 = 0x6372_40bb_8a8b_fd42;
     const PINNED_CASS_SEMANTIC_SCHEMA_ID: u64 = 0xc2a2_d236_2aa9_e14f;
 
     #[test]
