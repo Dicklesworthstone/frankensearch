@@ -243,6 +243,20 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **Ruby, PHP, C#, Scala, Vue, Elixir, Lua and other common languages get
+  semantic search.** Only 31 extensions (Rust, Python, TypeScript/JavaScript,
+  Go, Java, Kotlin, Swift, C/C++ and configuration or prose files) were
+  embedded; every other source file was indexed for keywords only, so a
+  paraphrased query could not find it. With the same comment in seven
+  languages, a query sharing no words with it ranked only the Python file.
+  Mainstream source languages (Ruby, PHP, C#, F#, Scala, Groovy, Dart, Lua,
+  R, Julia, Haskell, OCaml, Elixir, Erlang, Clojure, Elm, Perl, Zig, Nim,
+  Objective-C, Vue, Svelte, Solidity, CUDA, PowerShell, Terraform, Nix,
+  GraphQL, CMake, more C++ spellings) and prose markup (MDX, AsciiDoc, Org,
+  TeX, R Markdown, Quarto) are now embedded as well; `allowlist` mode admits
+  the same list plus its existing lexical-only extras. Existing indexes pick
+  the files up on the next `fsfs index` (bd-hhf2d).
+
 - **Models are no longer re-hashed on every run after provisioning with
   the release binary.** The downloadable fsfs is a static musl build, which
   cannot read file birth times, so the verification receipts it writes carry

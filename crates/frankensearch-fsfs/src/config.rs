@@ -224,17 +224,24 @@ pub enum Density {
     Expanded,
 }
 
+/// Source code and prose formats that get both lexical and semantic indexing.
+/// An extension missing here scores as lexical-only, so a language left out
+/// is invisible to every semantic query.
 const HIGH_UTILITY_EXTENSIONS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "kt", "swift", "c", "cpp", "h", "hpp",
-    "toml", "yaml", "yml", "json", "md", "markdown", "txt", "rst", "sql", "proto", "ini", "cfg",
-    "conf", "sh", "bash", "zsh", "fish",
+    // Source code.
+    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts", "swift", "c",
+    "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "m", "mm", "cs", "fs", "fsx", "rb", "php",
+    "scala", "groovy", "gradle", "dart", "lua", "r", "jl", "hs", "ml", "mli", "ex", "exs", "erl",
+    "clj", "cljs", "elm", "pl", "pm", "zig", "nim", "vue", "svelte", "sol", "cu", "ps1", "tf",
+    "nix", "graphql", "cmake", "sql", "proto", "sh", "bash", "zsh", "fish",
+    // Prose and configuration.
+    "md", "markdown", "mdx", "txt", "rst", "adoc", "org", "tex", "rmd", "qmd", "toml", "yaml",
+    "yml", "json", "ini", "cfg", "conf",
 ];
 
-const TEXT_ALLOWLIST_EXTENSIONS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "kt", "swift", "c", "cpp", "h", "hpp",
-    "toml", "yaml", "yml", "json", "md", "markdown", "txt", "rst", "sql", "proto", "ini", "cfg",
-    "conf", "sh", "bash", "zsh", "fish", "xml", "html", "css", "scss", "csv", "log",
-];
+/// Text formats that `text_selection_mode = "allowlist"` admits beyond
+/// [`HIGH_UTILITY_EXTENSIONS`] (at lexical-only utility).
+const TEXT_ALLOWLIST_EXTRA_EXTENSIONS: &[&str] = &["xml", "html", "css", "scss", "csv", "log"];
 
 const LOW_UTILITY_PATH_COMPONENTS: &[&str] = &[
     "node_modules",
@@ -735,9 +742,10 @@ impl DiscoveryConfig {
         }
 
         if self.text_selection_mode == TextSelectionMode::Allowlist
-            && extension
-                .as_deref()
-                .is_none_or(|ext| !TEXT_ALLOWLIST_EXTENSIONS.contains(&ext))
+            && extension.as_deref().is_none_or(|ext| {
+                !HIGH_UTILITY_EXTENSIONS.contains(&ext)
+                    && !TEXT_ALLOWLIST_EXTRA_EXTENSIONS.contains(&ext)
+            })
         {
             utility_score -= 35;
         }
@@ -5816,6 +5824,66 @@ mod tests {
         assert_eq!(
             decision.ingestion_class,
             IngestionClass::FullSemanticLexical
+        );
+    }
+
+    #[test]
+    fn evaluate_candidate_embeds_mainstream_languages_in_both_selection_modes() {
+        let blocklist = super::DiscoveryConfig::default();
+        let allowlist = super::DiscoveryConfig {
+            text_selection_mode: super::TextSelectionMode::Allowlist,
+            ..super::DiscoveryConfig::default()
+        };
+        let class = |config: &super::DiscoveryConfig, path: &str| {
+            config
+                .evaluate_candidate(&DiscoveryCandidate::new(Path::new(path), 2_048))
+                .ingestion_class
+        };
+        for path in [
+            "/home/user/app/models/user.rb",
+            "/home/user/site/index.php",
+            "/home/user/Service/Program.cs",
+            "/home/user/core/Engine.scala",
+            "/home/user/web/App.vue",
+            "/home/user/lib/fetcher.ex",
+            "/home/user/engine/render.cc",
+            "/home/user/game/init.lua",
+            "/home/user/paper/main.tex",
+            "/home/user/notes/todo.org",
+            "/home/user/src/Main.RB",
+        ] {
+            assert_eq!(
+                class(&blocklist, path),
+                IngestionClass::FullSemanticLexical,
+                "{path}"
+            );
+            assert_eq!(
+                class(&allowlist, path),
+                IngestionClass::FullSemanticLexical,
+                "{path}"
+            );
+        }
+        // Allowlist extras stay lexical-only, and an unknown extension is not
+        // promoted to semantic indexing.
+        for path in ["/home/user/site/page.html", "/home/user/data/rows.csv"] {
+            assert_eq!(
+                class(&allowlist, path),
+                IngestionClass::LexicalOnly,
+                "{path}"
+            );
+            assert_eq!(
+                class(&blocklist, path),
+                IngestionClass::LexicalOnly,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            class(&blocklist, "/home/user/data/blob.xyz"),
+            IngestionClass::LexicalOnly
+        );
+        assert_eq!(
+            class(&allowlist, "/home/user/data/blob.xyz"),
+            IngestionClass::Skip
         );
     }
 
