@@ -2531,7 +2531,9 @@ fn validate_parallel_source_len(field_ord: u16, bytes: usize) -> Result<(), Quil
 /// retaining the exact configured analyzer, normalized term bytes, positions
 /// width, stored bytes, and per-document column rows. `None` means the schema
 /// is not the five-field shipping shape or an arithmetic bound overflowed, so
-/// the caller must retain the scalar route.
+/// the caller must retain the scalar route. Both Frankensearch analyzers are
+/// admitted: the bound runs the field's own analyzer, so every CJK bigram the
+/// accumulator will intern is charged here too.
 fn parallel_document_logical_upper_bound(
     schema: SchemaDescriptor,
     analyzer: &mut FrankensearchTokenizer,
@@ -2553,7 +2555,7 @@ fn parallel_document_logical_upper_bound(
         || !matches!(
             content_field.kind,
             FieldKind::Text {
-                analyzer: Analyzer::FrankensearchDefault,
+                analyzer: Analyzer::FrankensearchDefault | Analyzer::FrankensearchCjkBigrams,
                 ..
             }
         )
@@ -2561,7 +2563,7 @@ fn parallel_document_logical_upper_bound(
         || !matches!(
             title_field.kind,
             FieldKind::Text {
-                analyzer: Analyzer::FrankensearchDefault,
+                analyzer: Analyzer::FrankensearchDefault | Analyzer::FrankensearchCjkBigrams,
                 ..
             }
         )

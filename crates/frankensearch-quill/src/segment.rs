@@ -1931,6 +1931,55 @@ mod tests {
         bytes: Vec<u8>,
     }
 
+    /// The shipping schema as it was before its text fields moved to CJK
+    /// bigrams (fba273fb). The committed v1 golden was encoded with it, so it
+    /// keeps pinning the wire format byte for byte.
+    const LEGACY_DEFAULT_FIELDS: [FieldDescriptor; 5] = [
+        FieldDescriptor {
+            id: 0,
+            name: "id",
+            kind: crate::schema::FieldKind::Keyword,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "content",
+            kind: crate::schema::FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 2,
+            name: "title",
+            kind: crate::schema::FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 3,
+            name: "metadata_json",
+            kind: crate::schema::FieldKind::StoredOnly,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 4,
+            name: "ord",
+            kind: crate::schema::FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            },
+            stored: true,
+        },
+    ];
+    const LEGACY_DEFAULT_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "frankensearch-default-v1",
+        fields: &LEGACY_DEFAULT_FIELDS,
+    };
+
     fn fixture_header(schema: SchemaDescriptor) -> SegmentHeaderInput {
         SegmentHeaderInput {
             segment_id: 0x0123_4567_89ab_cdef,
@@ -2103,7 +2152,7 @@ mod tests {
     #[test]
     fn reader_accepts_committed_pinned_v1_fixture() -> TestResult {
         let bytes = pinned_v1_fixture()?;
-        let reader = SegmentReader::from_bytes(&bytes, DEFAULT_SCHEMA)?;
+        let reader = SegmentReader::from_bytes(&bytes, LEGACY_DEFAULT_SCHEMA)?;
 
         assert_eq!(
             reader.header(),
@@ -2133,9 +2182,9 @@ mod tests {
 
     #[test]
     fn pinned_wire_oracle_and_roundtrip_preserve_header_table_and_payloads() -> TestResult {
-        let owned = fixture_sections(DEFAULT_SCHEMA, false);
-        let first = encode_owned(fixture_header(DEFAULT_SCHEMA), &owned)?;
-        let second = encode_owned(fixture_header(DEFAULT_SCHEMA), &owned)?;
+        let owned = fixture_sections(LEGACY_DEFAULT_SCHEMA, false);
+        let first = encode_owned(fixture_header(LEGACY_DEFAULT_SCHEMA), &owned)?;
+        let second = encode_owned(fixture_header(LEGACY_DEFAULT_SCHEMA), &owned)?;
         let header_len = usize::try_from(read_u32_at(first.as_bytes(), 12).expect("header len"))?;
         let header_crc =
             read_u32_at(first.as_bytes(), FILE_PREFIX_LEN + header_len).expect("header crc");
@@ -2158,7 +2207,7 @@ mod tests {
         assert_eq!(first.source_xxh3(), xxh3_64(first.as_bytes()));
         assert_eq!(first.source_xxh3(), second.source_xxh3());
 
-        let reader = SegmentReader::from_owned(first.as_bytes().to_vec(), DEFAULT_SCHEMA)?;
+        let reader = SegmentReader::from_owned(first.as_bytes().to_vec(), LEGACY_DEFAULT_SCHEMA)?;
         assert_eq!(reader.header(), first.header());
         assert_eq!(reader.section_entries(), first.section_entries());
         assert_eq!(reader.file_len(), first.file_len());
@@ -2171,9 +2220,22 @@ mod tests {
         }
         reader.verify()?;
 
-        let borrowed = SegmentReader::from_bytes(first.as_bytes(), DEFAULT_SCHEMA)?;
+        let borrowed = SegmentReader::from_bytes(first.as_bytes(), LEGACY_DEFAULT_SCHEMA)?;
         assert_eq!(borrowed.header(), reader.header());
         borrowed.verify()?;
+
+        // The shipping schema's analyzer change moves only the header's schema
+        // identity: same length, section table and payloads.
+        let shipping_owned = fixture_sections(DEFAULT_SCHEMA, false);
+        let shipping = encode_owned(fixture_header(DEFAULT_SCHEMA), &shipping_owned)?;
+        assert_eq!(shipping.header().schema_id, DEFAULT_SCHEMA.schema_id()?);
+        assert_ne!(shipping.header().schema_id, first.header().schema_id);
+        assert_eq!(shipping.file_len(), first.file_len());
+        assert_eq!(shipping.section_entries(), first.section_entries());
+        for (legacy, current) in owned.iter().zip(&shipping_owned) {
+            assert_eq!(legacy.bytes, current.bytes);
+        }
+        SegmentReader::from_bytes(shipping.as_bytes(), DEFAULT_SCHEMA)?.verify()?;
         Ok(())
     }
 

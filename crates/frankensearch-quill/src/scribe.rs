@@ -5905,8 +5905,13 @@ mod tests {
     impl sealed::Sealed for SamePositionAnalyzer {}
 
     impl TokenAnalyzer for SamePositionAnalyzer {
+        // Covers both Frankensearch analyzers so it can stand in for the
+        // shipping schema whichever of them its text fields select.
         fn supports(&self, analyzer: AnalyzerKind) -> bool {
-            analyzer == AnalyzerKind::FrankensearchDefault
+            matches!(
+                analyzer,
+                AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams
+            )
         }
 
         fn analyze(
@@ -5915,7 +5920,7 @@ mod tests {
             text: &str,
             sink: &mut dyn FnMut(&AnalyzedToken),
         ) {
-            assert_eq!(analyzer, AnalyzerKind::FrankensearchDefault);
+            assert!(self.supports(analyzer), "{analyzer:?}");
             for token_text in ["compound", "part"] {
                 sink(&AnalyzedToken {
                     text: token_text.to_owned(),

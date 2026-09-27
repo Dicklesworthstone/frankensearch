@@ -708,7 +708,7 @@ const WITNESS_POSITIONLESS_FIELDS: [frankensearch_quill::FieldDescriptor; 5] = [
         id: 1,
         name: "content",
         kind: frankensearch_quill::FieldKind::Text {
-            analyzer: frankensearch_quill::Analyzer::FrankensearchDefault,
+            analyzer: frankensearch_quill::Analyzer::FrankensearchCjkBigrams,
             positions: false,
         },
         stored: true,
@@ -717,7 +717,7 @@ const WITNESS_POSITIONLESS_FIELDS: [frankensearch_quill::FieldDescriptor; 5] = [
         id: 2,
         name: "title",
         kind: frankensearch_quill::FieldKind::Text {
-            analyzer: frankensearch_quill::Analyzer::FrankensearchDefault,
+            analyzer: frankensearch_quill::Analyzer::FrankensearchCjkBigrams,
             positions: false,
         },
         stored: true,
