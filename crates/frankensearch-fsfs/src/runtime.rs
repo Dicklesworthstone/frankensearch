@@ -288,7 +288,70 @@ type SearchPhaseSink<'a> = &'a mut (dyn FnMut(&SearchPayload) -> SearchResult<()
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SearchFilterClause {
     PathContains(String),
-    Extension(String),
+    /// Lowercase extensions, any of which satisfies the clause.
+    Extension(Vec<String>),
+}
+
+/// Language names a `type:` or `lang:` filter accepts, with the extensions each
+/// selects. Without them `lang:rust` compared file extensions against "rust"
+/// and silently matched nothing. `ext:` stays a literal extension.
+const FILTER_LANGUAGE_EXTENSIONS: &[(&str, &[&str])] = &[
+    ("rust", &["rs"]),
+    ("python", &["py", "pyi"]),
+    ("typescript", &["ts", "tsx", "mts", "cts"]),
+    ("javascript", &["js", "jsx", "mjs", "cjs"]),
+    ("go", &["go"]),
+    ("golang", &["go"]),
+    ("java", &["java"]),
+    ("kotlin", &["kt", "kts"]),
+    ("swift", &["swift"]),
+    ("c", &["c", "h"]),
+    ("cpp", &["cc", "cpp", "cxx", "h", "hh", "hpp", "hxx"]),
+    ("c++", &["cc", "cpp", "cxx", "h", "hh", "hpp", "hxx"]),
+    ("csharp", &["cs"]),
+    ("c#", &["cs"]),
+    ("fsharp", &["fs", "fsx"]),
+    ("objc", &["m", "mm", "h"]),
+    ("ruby", &["rb"]),
+    ("php", &["php"]),
+    ("scala", &["scala", "sc"]),
+    ("dart", &["dart"]),
+    ("lua", &["lua"]),
+    ("haskell", &["hs"]),
+    ("elixir", &["ex", "exs"]),
+    ("erlang", &["erl", "hrl"]),
+    ("clojure", &["clj", "cljs", "cljc"]),
+    ("ocaml", &["ml", "mli"]),
+    ("perl", &["pl", "pm"]),
+    ("julia", &["jl"]),
+    ("zig", &["zig"]),
+    ("shell", &["sh", "bash", "zsh", "fish"]),
+    ("bash", &["sh", "bash"]),
+    ("markdown", &["md", "markdown", "mdx"]),
+    ("yaml", &["yaml", "yml"]),
+    ("html", &["html", "htm"]),
+    ("css", &["css", "scss"]),
+    ("latex", &["tex"]),
+    ("text", &["txt"]),
+    ("protobuf", &["proto"]),
+    ("terraform", &["tf"]),
+];
+
+/// Extensions a `type:`/`lang:` value selects: the value itself as a literal
+/// extension, plus the extensions of the language it names.
+fn filter_language_extensions(value: &str) -> Vec<String> {
+    let mut extensions = vec![value.to_owned()];
+    if let Some((_, language)) = FILTER_LANGUAGE_EXTENSIONS
+        .iter()
+        .find(|(name, _)| *name == value)
+    {
+        for extension in *language {
+            if !extensions.iter().any(|known| known == extension) {
+                extensions.push((*extension).to_owned());
+            }
+        }
+    }
+    extensions
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,7 +396,12 @@ impl SearchFilterExpr {
                                     .to_owned(),
                             });
                         }
-                        clauses.push(SearchFilterClause::Extension(normalized));
+                        let extensions = if matches!(key.as_str(), "type" | "lang") {
+                            filter_language_extensions(&normalized)
+                        } else {
+                            vec![normalized]
+                        };
+                        clauses.push(SearchFilterClause::Extension(extensions));
                     }
                     _ => {
                         return Err(SearchError::InvalidConfig {
@@ -376,7 +444,11 @@ impl SearchFilterExpr {
             SearchFilterClause::Extension(expected) => Path::new(doc_id)
                 .extension()
                 .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case(expected)),
+                .is_some_and(|ext| {
+                    expected
+                        .iter()
+                        .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+                }),
         })
     }
 }
@@ -512,7 +584,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v11: Refined blends quality-discovered documents with their fast scores.
 // v12: with fast windows, a long source's quality weight scales by coverage.
 // v13: query exclusions apply to the vector lanes.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v13";
+// v14: `type:`/`lang:` filters accept language names (`lang:rust`).
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v14";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -520,8 +593,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v6 / stream v4: fast scores for quality-discovered Refined documents.
 // v7 / stream v5: coverage-scaled quality weight for windowed sources.
 // v8 / stream v6: query exclusions apply to the vector lanes.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v8";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v6";
+// v9 / stream v7: `type:`/`lang:` filters accept language names.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v9";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v7";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -21937,7 +22011,7 @@ fn print_cli_help() {
         "Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --online"
     );
     println!(
-        "Search flags: --limit/-l <n|all> --filter \"type:rs path:src\" --fast-only --rerank --expand"
+        "Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --rerank --expand"
     );
     println!(
         "              --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>"
@@ -28155,6 +28229,11 @@ mod tests {
             super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v8".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that reads `lang:rust` as an extension cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v7".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -28838,11 +28917,12 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-        // v5 lets excluded documents back through the vector lanes; v4 gives
-        // long windowed sources the whole quality weight; v3 blends quality
-        // discoveries without fast scores; v2 predates the WAL top-k repair;
-        // v1 an older ranking policy.
+        // v6 reads `lang:rust` as an extension; v5 lets excluded documents
+        // back through the vector lanes; v4 gives long windowed sources the
+        // whole quality weight; v3 blends quality discoveries without fast
+        // scores; v2 predates the WAL top-k repair; v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v6",
             "fsfs.search.serve.stream.v5",
             "fsfs.search.serve.stream.v4",
             "fsfs.search.serve.stream.v3",
@@ -34224,6 +34304,39 @@ mod tests {
             .map(|candidate| candidate.doc_id.as_str())
             .collect();
         assert_eq!(ordered_ids, vec!["src/head.rs", "src/tail.rs"]);
+    }
+
+    #[test]
+    fn search_filter_language_names_select_their_extensions() {
+        let parse = |raw: &str| {
+            super::SearchFilterExpr::parse(raw)
+                .expect("filter should parse")
+                .expect("filter should be present")
+        };
+        for raw in ["lang:rust", "type:rust", "type:Rust", "type:rs", "lang:RS"] {
+            let filter = parse(raw);
+            assert!(filter.matches_doc_id("src/lib.rs"), "{raw}");
+            assert!(!filter.matches_doc_id("src/lib.py"), "{raw}");
+        }
+        let cpp = parse("lang:cpp");
+        for path in ["a.cc", "b.cpp", "c.hpp", "d.h"] {
+            assert!(cpp.matches_doc_id(path), "{path}");
+        }
+        assert!(!cpp.matches_doc_id("e.c"));
+        let python = parse("lang:python");
+        assert!(python.matches_doc_id("tool.py") && python.matches_doc_id("stubs.pyi"));
+        assert!(!python.matches_doc_id("notes.md"));
+        // `ext:` stays a literal extension.
+        assert!(!parse("ext:rust").matches_doc_id("src/lib.rs"));
+        assert!(!parse("ext:c").matches_doc_id("include/api.h"));
+        assert!(parse("type:c").matches_doc_id("include/api.h"));
+        // A value that names no language is still a literal extension.
+        assert!(parse("type:xyz").matches_doc_id("blob.xyz"));
+        assert!(!parse("type:xyz").matches_doc_id("blob.rs"));
+        // With a path clause, both must hold.
+        let both = parse("lang:rust path:src");
+        assert!(both.matches_doc_id("src/lib.rs"));
+        assert!(!both.matches_doc_id("tests/lib.rs"));
     }
 
     #[test]
@@ -46429,6 +46542,8 @@ mod tests {
                 "fsfs.search.cache.v11",
                 // Let excluded documents back through the vector lanes.
                 "fsfs.search.cache.v12",
+                // Read `lang:rust` as a file extension.
+                "fsfs.search.cache.v13",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

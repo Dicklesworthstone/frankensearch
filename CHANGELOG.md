@@ -243,6 +243,17 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **`--filter lang:rust` works.** `type:` and `lang:` compared the value
+  with file extensions only, so `lang:rust`, `type:python` or `lang:cpp`
+  silently returned no results. Both keys now accept a language name
+  (`rust`, `python`, `typescript`, `cpp`, `csharp`, `ruby`, `shell`,
+  `markdown` and more) as well as an extension; `type:c` and `lang:cpp` also
+  include header files. `ext:` still matches one literal extension. The
+  answer cache moves to `fsfs.search.cache.v14` and the daemon protocols to
+  `fsfs.search.serve.v9` and `fsfs.search.serve.stream.v7`, so an older
+  cached answer or warm daemon cannot answer with the old meaning
+  (bd-2d3nq).
+
 - **Ruby, PHP, C#, Scala, Vue, Elixir, Lua and other common languages get
   semantic search.** Only 31 extensions (Rust, Python, TypeScript/JavaScript,
   Go, Java, Kotlin, Swift, C/C++ and configuration or prose files) were
