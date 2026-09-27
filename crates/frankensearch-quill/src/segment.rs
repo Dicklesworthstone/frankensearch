@@ -922,6 +922,9 @@ impl<'a> SegmentReader<&'a [u8]> {
     }
 }
 
+/// Read size for the same-descriptor streamed prefix hash.
+const STREAMED_WITNESS_READ_BYTES: usize = 1 << 20;
+
 impl SegmentReader<ReadOnlyMappedFile> {
     /// Used only inside the same-descriptor open callback, after MANIFEST checks.
     pub(crate) fn verify_streamed_file_witness(
@@ -937,7 +940,9 @@ impl SegmentReader<ReadOnlyMappedFile> {
             .ok_or_else(|| corrupted(&self.path, "file is shorter than its trailer"))?;
         let mut hasher = Xxh3::new();
         let mut remaining = prefix_len;
-        let mut buffer = [0_u8; 16 * 1024];
+        // One heap buffer of up to 1 MiB: 64x fewer read syscalls than the
+        // former 16 KiB stack buffer on multi-GB segments.
+        let mut buffer = vec![0_u8; STREAMED_WITNESS_READ_BYTES.min(prefix_len.max(1))];
         while remaining != 0 {
             let count = remaining.min(buffer.len());
             file.read_exact(&mut buffer[..count])?;

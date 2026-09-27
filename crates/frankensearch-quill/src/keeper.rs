@@ -17,7 +17,7 @@ use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "bench-internals")]
 use std::sync::atomic::AtomicU8;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -3704,42 +3704,7 @@ impl KeeperSnapshot {
         validate_loaded_schema(directory, expected_schema_id, &loaded)?;
         validate_recovery_claims(directory, &loaded)?;
 
-        let mut segments = Vec::new();
-        segments
-            .try_reserve_exact(loaded.manifest.segments.len())
-            .map_err(|error| KeeperError::Io {
-                operation: "allocate recovered segment table",
-                path: directory.to_path_buf(),
-                source: io::Error::other(error.to_string()),
-            })?;
-        for manifest_segment in &loaded.manifest.segments {
-            let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
-            let (reader, authenticated_file_witness) = SegmentReader::open_published_checked(
-                &path,
-                schema,
-                crate::segment::SegmentLimits::default(),
-                |reader, file| {
-                    Ok(authenticate_segment_witness(
-                        &path,
-                        manifest_segment,
-                        reader,
-                        file,
-                    ))
-                },
-            )
-            .map_err(|source| KeeperError::SegmentOpen {
-                path: path.clone(),
-                source,
-            })?;
-            let authenticated_file_witness = authenticated_file_witness?;
-            segments.push(RecoveredSegment::bind(
-                path,
-                manifest_segment.clone(),
-                reader,
-                schema,
-                authenticated_file_witness,
-            )?);
-        }
+        let segments = open_manifest_segments(directory, &loaded.manifest.segments, schema)?;
 
         let snapshot = Self::from_parts(Some(directory.to_path_buf()), schema, loaded, segments)?;
         if !snapshot.quarantined_segments.is_empty() {
@@ -11042,6 +11007,129 @@ fn validate_proposed_manifest_segments(
         )?;
     }
     Ok(())
+}
+
+/// Upper bound on threads for one snapshot open, so a single open over a
+/// many-segment index does not claim every core of a large host.
+const MAX_SEGMENT_OPEN_THREADS: usize = 8;
+
+/// Open, authenticate, and bind one MANIFEST segment for a read-only snapshot.
+fn open_manifest_segment(
+    directory: &Path,
+    manifest_segment: &ManifestSegment,
+    schema: SchemaDescriptor,
+) -> Result<RecoveredSegment, KeeperError> {
+    let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
+    let (reader, authenticated_file_witness) = SegmentReader::open_published_checked(
+        &path,
+        schema,
+        crate::segment::SegmentLimits::default(),
+        |reader, file| {
+            Ok(authenticate_segment_witness(
+                &path,
+                manifest_segment,
+                reader,
+                file,
+            ))
+        },
+    )
+    .map_err(|source| KeeperError::SegmentOpen {
+        path: path.clone(),
+        source,
+    })?;
+    let authenticated_file_witness = authenticated_file_witness?;
+    RecoveredSegment::bind(
+        path,
+        manifest_segment.clone(),
+        reader,
+        schema,
+        authenticated_file_witness,
+    )
+}
+
+/// Open every MANIFEST segment, verifying independent segments concurrently.
+///
+/// Every segment still gets the full same-descriptor prefix hash and witness
+/// checks; only the wall-clock cost changes from the sum over segments to
+/// roughly the largest one. Scoped OS threads are used rather than the rayon
+/// pool so a caller holding a lock (writer open, recovery) never waits on, or
+/// steals, unrelated pool work. Results are consumed in MANIFEST order, so the
+/// reported error is the first failing segment in that order, exactly as the
+/// sequential open reported it. If a helper thread cannot be spawned, the
+/// calling thread does the remaining work itself.
+fn open_manifest_segments(
+    directory: &Path,
+    manifest_segments: &[ManifestSegment],
+    schema: SchemaDescriptor,
+) -> Result<Vec<RecoveredSegment>, KeeperError> {
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(manifest_segments.len())
+        .map_err(|error| KeeperError::Io {
+            operation: "allocate recovered segment table",
+            path: directory.to_path_buf(),
+            source: io::Error::other(error.to_string()),
+        })?;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_SEGMENT_OPEN_THREADS)
+        .min(manifest_segments.len());
+    if workers <= 1 {
+        for manifest_segment in manifest_segments {
+            segments.push(open_manifest_segment(directory, manifest_segment, schema)?);
+        }
+        return Ok(segments);
+    }
+
+    let slots: Vec<OnceLock<Result<RecoveredSegment, KeeperError>>> =
+        manifest_segments.iter().map(|_| OnceLock::new()).collect();
+    let next = AtomicUsize::new(0);
+    // Lowest MANIFEST index that failed so far; later segments are skipped
+    // because their result can no longer be reported.
+    let first_failure = AtomicUsize::new(usize::MAX);
+    let work = || {
+        loop {
+            let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+            let Some(manifest_segment) = manifest_segments.get(index) else {
+                break;
+            };
+            if index > first_failure.load(AtomicOrdering::Relaxed) {
+                continue;
+            }
+            let result = open_manifest_segment(directory, manifest_segment, schema);
+            if result.is_err() {
+                first_failure.fetch_min(index, AtomicOrdering::Relaxed);
+            }
+            let _ = slots[index].set(result);
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..workers {
+            if std::thread::Builder::new()
+                .name("quill-segment-open".to_owned())
+                .spawn_scoped(scope, work)
+                .is_err()
+            {
+                break;
+            }
+        }
+        work();
+    });
+
+    for (index, slot) in slots.into_iter().enumerate() {
+        match slot.into_inner() {
+            Some(Ok(segment)) => segments.push(segment),
+            Some(Err(error)) => return Err(error),
+            None => {
+                return Err(KeeperError::InvalidTransition {
+                    detail: format!(
+                        "segment open skipped MANIFEST entry {index} without an earlier failure"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(segments)
 }
 
 /// Authenticate a MANIFEST segment binding against the backing FSLX bytes.
@@ -20178,6 +20266,89 @@ mod tests {
             matches!(&error, KeeperError::SegmentOpen { path, .. } if path == &segment_path),
             "fresh open must fail closed on the corrupted segment: {error:?}"
         );
+        Ok(())
+    }
+
+    /// Write `count` single-document segments with contiguous docid ranges
+    /// and a MANIFEST naming them in order; returns each path and encoding.
+    fn write_multi_segment_index(
+        directory: &Path,
+        count: u64,
+    ) -> Result<Vec<(PathBuf, EncodedSegment)>, Box<dyn std::error::Error>> {
+        let mut written = Vec::new();
+        let mut manifest_segments = Vec::new();
+        for ordinal in 0..count {
+            let segment_id = 0xf00 + ordinal;
+            let document = format!("doc-{ordinal}");
+            let encoded =
+                encoded_identity_test_segment(segment_id, ordinal, &[Some(document.as_str())])?;
+            let path = directory.join(canonical_segment_name(segment_id));
+            std::fs::write(&path, encoded.as_bytes())?;
+            manifest_segments.push(manifest_segment(&encoded, ordinal + 1));
+            written.push((path, encoded));
+        }
+        write_manifest(
+            &directory.join("MANIFEST"),
+            &durable_test_manifest(1, manifest_segments),
+        )?;
+        Ok(written)
+    }
+
+    fn flip_termdict_byte(path: &Path, encoded: &EncodedSegment) -> TestResult {
+        let offset = usize::try_from(
+            encoded
+                .section_entries()
+                .iter()
+                .find(|entry| entry.kind == SectionKind::TERMDICT)
+                .expect("fixture TERMDICT entry")
+                .offset,
+        )?;
+        let mut bytes = std::fs::read(path)?;
+        bytes[offset] ^= 0x01;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_segment_open_keeps_manifest_order_and_hashes_each_segment_once() -> TestResult {
+        let directory = tempdir()?;
+        let written = write_multi_segment_index(directory.path(), 6)?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(snapshot.segments().len(), written.len());
+        for (segment, (path, encoded)) in snapshot.segments().iter().zip(&written) {
+            assert_eq!(segment.manifest().segment_id, encoded.header().segment_id);
+            assert_eq!(&segment.path, path);
+            assert_eq!(
+                segment.authenticated_file_witness_hash_count(),
+                1,
+                "every segment still gets exactly one full-prefix hash"
+            );
+        }
+        assert_eq!(snapshot.live_doc_count, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_segment_open_reports_the_first_corrupt_segment_in_manifest_order() -> TestResult {
+        let directory = tempdir()?;
+        let written = write_multi_segment_index(directory.path(), 6)?;
+        // Corrupt a later segment as well, so a worker that reaches it first
+        // cannot change which failure is reported.
+        for index in [2, 5] {
+            let (path, encoded) = &written[index];
+            flip_termdict_byte(path, encoded)?;
+        }
+
+        for _ in 0..8 {
+            let Err(error) = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA) else {
+                panic!("an open over corrupted segments must fail closed");
+            };
+            assert!(
+                matches!(&error, KeeperError::SegmentOpen { path, .. } if path == &written[2].0),
+                "the first corrupt segment in MANIFEST order must be reported: {error:?}"
+            );
+        }
         Ok(())
     }
 
