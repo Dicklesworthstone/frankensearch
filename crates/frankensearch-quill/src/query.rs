@@ -3730,17 +3730,18 @@ impl Grammar {
                 analyzer: AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams,
                 ..
             } => {
-                let FieldKind::Text { analyzer: analyzer_kind, .. } = descriptor.kind else {
+                let FieldKind::Text {
+                    analyzer: analyzer_kind,
+                    ..
+                } = descriptor.kind
+                else {
                     return None;
                 };
                 let mut analyzer = FrankensearchTokenizer::default();
                 let mut terms = Vec::new();
-                let report = analyze_admitted(
-                    &mut analyzer,
-                    analyzer_kind,
-                    raw,
-                    &mut |token| terms.push(token.text.clone()),
-                )
+                let report = analyze_admitted(&mut analyzer, analyzer_kind, raw, &mut |token| {
+                    terms.push(token.text.clone())
+                })
                 .ok()?;
                 if report.oversized_tokens == 0 && terms.len() == 1 {
                     terms.pop().map(QueryValue::Str)
@@ -3775,19 +3776,20 @@ impl Grammar {
                 analyzer: AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams,
                 ..
             } => {
-                let FieldKind::Text { analyzer: analyzer_kind, .. } = descriptor.kind else {
+                let FieldKind::Text {
+                    analyzer: analyzer_kind,
+                    ..
+                } = descriptor.kind
+                else {
                     return None;
                 };
                 let mut analyzer = FrankensearchTokenizer::default();
                 let mut terms = Vec::new();
-                let Ok(report) = analyze_admitted(
-                    &mut analyzer,
-                    analyzer_kind,
-                    &atom.raw,
-                    &mut |token| {
+                let Ok(report) =
+                    analyze_admitted(&mut analyzer, analyzer_kind, &atom.raw, &mut |token| {
                         terms.push(PositionedTerm::new(token.position, token.text.clone()));
-                    },
-                ) else {
+                    })
+                else {
                     self.drop_with_diagnostic(
                         QueryDiagnosticKind::UnsupportedField,
                         "default analyzer implementation is unavailable",

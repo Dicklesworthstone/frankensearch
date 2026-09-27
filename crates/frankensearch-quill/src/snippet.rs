@@ -83,7 +83,9 @@ impl BuiltInAnalyzer {
             Analyzer::FrankensearchDefault => {
                 Self::FrankensearchDefault(FrankensearchTokenizer::default())
             }
-            Analyzer::FrankensearchCjkBigrams => Self::FrankensearchCjkBigrams(FrankensearchTokenizer::default()),
+            Analyzer::FrankensearchCjkBigrams => {
+                Self::FrankensearchCjkBigrams(FrankensearchTokenizer::default())
+            }
             Analyzer::CassHyphenNormalize => Self::CassHyphenNormalize(CassAnalyzer::default()),
             Analyzer::CassPrefixNormalize => Self::CassPrefixNormalize(CassAnalyzer::default()),
         }

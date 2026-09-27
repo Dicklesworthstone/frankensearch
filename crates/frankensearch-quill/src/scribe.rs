@@ -719,12 +719,22 @@ impl FrankensearchTokenizer {
 
 impl TokenAnalyzer for FrankensearchTokenizer {
     fn supports(&self, analyzer: AnalyzerKind) -> bool {
-        matches!(analyzer, AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams)
+        matches!(
+            analyzer,
+            AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams
+        )
     }
 
-    fn analyze(&mut self, analyzer: AnalyzerKind, text: &str, sink: &mut dyn FnMut(&AnalyzedToken)) {
+    fn analyze(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn FnMut(&AnalyzedToken),
+    ) {
         #[cfg(test)]
-        { self.owned_bridge_calls += 1; }
+        {
+            self.owned_bridge_calls += 1;
+        }
         let mut owned = AnalyzedToken::default();
         self.analyze_borrowed(analyzer, text, &mut |token| {
             owned.text.clear();
@@ -752,20 +762,33 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         self.analyze_default_borrowed(text, &mut |token| {
             if token.text.is_empty() || !token.text.chars().all(is_cass_cjk) {
                 let mut out = token;
-                out.position = out.position.checked_add(delta).expect("analyzed token position exceeds the u32 contract");
+                out.position = out
+                    .position
+                    .checked_add(delta)
+                    .expect("analyzed token position exceeds the u32 contract");
                 sink(out);
                 return;
             }
-            let bounds = token.text.char_indices().map(|(i, _)| i).chain(std::iter::once(token.text.len())).collect::<Vec<_>>();
+            let bounds = token
+                .text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(token.text.len()))
+                .collect::<Vec<_>>();
             if bounds.len() <= 2 {
                 let mut out = token;
-                out.position = out.position.checked_add(delta).expect("analyzed token position exceeds the u32 contract");
+                out.position = out
+                    .position
+                    .checked_add(delta)
+                    .expect("analyzed token position exceeds the u32 contract");
                 sink(out);
                 return;
             }
             let pairs = bounds.len() - 2;
             for pair in 0..pairs {
-                let pos = token.position.checked_add(delta)
+                let pos = token
+                    .position
+                    .checked_add(delta)
                     .and_then(|v| v.checked_add(u32::try_from(pair).ok()?))
                     .expect("analyzed token position exceeds the u32 contract");
                 sink(AnalyzedTokenRef {
@@ -776,12 +799,15 @@ impl TokenAnalyzer for FrankensearchTokenizer {
                     position_length: 1,
                 });
             }
-            delta = delta.checked_add(u32::try_from(pairs - 1).expect("CJK run exceeds u32"))
+            delta = delta
+                .checked_add(u32::try_from(pairs - 1).expect("CJK run exceeds u32"))
                 .expect("analyzed token position exceeds the u32 contract");
         });
     }
 
-    fn bytes_reserved(&self) -> usize { self.token.text.capacity() }
+    fn bytes_reserved(&self) -> usize {
+        self.token.text.capacity()
+    }
     fn reset(&mut self) {
         self.token.text.clear();
         self.token.position = 0;
@@ -906,7 +932,9 @@ impl sealed::Sealed for CompiledAnalyzerFamily {}
 impl TokenAnalyzer for CompiledAnalyzerFamily {
     fn supports(&self, analyzer: AnalyzerKind) -> bool {
         match analyzer {
-            AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams => self.default.supports(analyzer),
+            AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams => {
+                self.default.supports(analyzer)
+            }
             AnalyzerKind::CassHyphenNormalize | AnalyzerKind::CassPrefixNormalize => {
                 self.cass.supports(analyzer)
             }
@@ -920,7 +948,9 @@ impl TokenAnalyzer for CompiledAnalyzerFamily {
         sink: &mut dyn FnMut(&AnalyzedToken),
     ) {
         match analyzer {
-            AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams => self.default.analyze(analyzer, text, sink),
+            AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams => {
+                self.default.analyze(analyzer, text, sink)
+            }
             AnalyzerKind::CassHyphenNormalize | AnalyzerKind::CassPrefixNormalize => {
                 self.cass.analyze(analyzer, text, sink);
             }
@@ -6018,8 +6048,22 @@ mod tests {
     fn default_cjk_bigrams_split_unspaced_runs() {
         let mut analyzer = FrankensearchTokenizer::default();
         let mut terms = Vec::new();
-        analyzer.analyze(AnalyzerKind::FrankensearchCjkBigrams, "Rust 日本語 搜索引擎", &mut |t| terms.push((t.text.clone(), t.position)));
-        assert_eq!(terms, vec![("rust".into(), 0), ("日本".into(), 1), ("本語".into(), 2), ("搜索".into(), 3), ("索引".into(), 4), ("引擎".into(), 5)]);
+        analyzer.analyze(
+            AnalyzerKind::FrankensearchCjkBigrams,
+            "Rust 日本語 搜索引擎",
+            &mut |t| terms.push((t.text.clone(), t.position)),
+        );
+        assert_eq!(
+            terms,
+            vec![
+                ("rust".into(), 0),
+                ("日本".into(), 1),
+                ("本語".into(), 2),
+                ("搜索".into(), 3),
+                ("索引".into(), 4),
+                ("引擎".into(), 5)
+            ]
+        );
     }
 
     #[test]
