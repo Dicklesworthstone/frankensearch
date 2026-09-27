@@ -243,6 +243,18 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **Keyword search finds Chinese and Japanese words inside running text.**
+  The default analyzer kept each unspaced CJK run as a single token, so
+  `日本語` or `搜索引擎` never matched a sentence containing them; only the
+  semantic tiers could find such a file. The shipping schema now also
+  indexes overlapping CJK bigrams (bd-ahqg0). The keyword index format
+  changes with it: the first `fsfs index` or `fsfs search` on an existing
+  index rebuilds the keyword index from the indexed source directory into a
+  new directory and keeps the previous one for rollback, where the new
+  analyzer previously made every existing index fail with "Quill schema
+  mismatch", even `fsfs index --force`. Parallel bulk ingest applies to the
+  new analyzer as it did to the old one.
+
 - **Searching right after an upgrade works.** A query daemon left running
   by the previous fsfs kept its socket, so when the new version's results
   differed (any cache or protocol version change), every `fsfs search`

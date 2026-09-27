@@ -1097,8 +1097,31 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
              Or use --no-rerank to skip reranking."
                 .to_owned(),
         ),
+        SearchError::SubsystemError { source, .. } if is_stale_lexical_schema(source.as_ref()) => {
+            Some(
+                "This index was written by an older fsfs whose keyword index format differs.\n\
+                 Run: fsfs index <directory> to rebuild it."
+                    .to_owned(),
+            )
+        }
         _ => None,
     }
+}
+
+/// Whether an error chain carries Quill's schema mismatch: a keyword index
+/// published by an fsfs whose lexical schema (analyzers) differs from this one.
+fn is_stale_lexical_schema(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if matches!(
+            error.downcast_ref::<frankensearch_quill::KeeperError>(),
+            Some(frankensearch_quill::KeeperError::SchemaMismatch { .. })
+        ) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 fn bounded_public_producer(producer: &str) -> &str {
@@ -2208,6 +2231,34 @@ mod tests {
         assert!(
             suggestion.contains("fsfs index"),
             "should tell user to create index: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn suggestion_for_a_keyword_index_from_an_older_schema() {
+        use frankensearch_core::SearchError;
+
+        let stale = SearchError::from(frankensearch_quill::KeeperError::SchemaMismatch {
+            path: PathBuf::from("/idx/lexical/quill-v1/MANIFEST"),
+            expected: 0x7ede_512c_b74b_df17,
+            found: 0xa312_ebf6_d136_07a5,
+        });
+        let suggestion = output_error_from(&stale).suggestion.expect("suggestion");
+        assert!(suggestion.contains("older fsfs"), "{suggestion}");
+        assert!(
+            suggestion.contains("fsfs index <directory>"),
+            "{suggestion}"
+        );
+
+        // Another subsystem failure gets no rebuild advice.
+        let other = SearchError::SubsystemError {
+            subsystem: "quill",
+            source: Box::new(std::io::Error::other("disk quota exceeded")),
+        };
+        assert!(
+            output_error_from(&other)
+                .suggestion
+                .is_none_or(|text| !text.contains("older fsfs"))
         );
     }
 

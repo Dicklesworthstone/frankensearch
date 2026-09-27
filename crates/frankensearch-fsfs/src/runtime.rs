@@ -12944,7 +12944,7 @@ impl FsfsRuntime {
 
     async fn run_flush_command(&self, cx: &Cx) -> SearchResult<()> {
         let index_root = self.resolve_status_index_root()?;
-        self.rebuild_tantivy_lexical_index_if_needed(cx, &index_root)
+        self.rebuild_legacy_lexical_index_if_needed(cx, &index_root)
             .await?;
         let lexical_layout = Self::resolve_lexical_engine(&index_root)?;
         let (Some(BlueGreenEngine::Quill), Some(lexical_path)) =
@@ -15215,14 +15215,44 @@ impl FsfsRuntime {
         })
     }
 
+    /// Whether the Quill engine in `engine_dir` was published with a schema
+    /// other than the one this build writes (an fsfs from before a lexical
+    /// analyzer change). Such an engine cannot be reopened, so `fsfs index`
+    /// rebuilds it into a fresh sibling like a legacy engine. A missing or
+    /// unreadable manifest is left to the existing open path and its errors.
+    fn quill_engine_schema_is_stale(engine_dir: &Path) -> SearchResult<bool> {
+        let current = frankensearch_quill::DEFAULT_SCHEMA
+            .schema_id()
+            .map_err(|source| SearchError::SubsystemError {
+                subsystem: "fsfs.lexical.schema",
+                source: Box::new(source),
+            })?;
+        Ok(frankensearch_quill::load_manifest_pair(engine_dir)
+            .is_ok_and(|loaded| loaded.manifest.schema_id != current))
+    }
+
     fn plan_lexical_build(index_root: &Path) -> SearchResult<LexicalBuildPlan> {
         let layout = Self::resolve_lexical_engine(index_root)?;
+        let stale_quill = match &layout {
+            LexicalEngineLayout::LegacyDirect {
+                engine: BlueGreenEngine::Quill,
+                engine_dir,
+                ..
+            } => Self::quill_engine_schema_is_stale(engine_dir)?,
+            LexicalEngineLayout::BlueGreen {
+                lexical_root,
+                pointer,
+            } if pointer.engine() == BlueGreenEngine::Quill => {
+                Self::quill_engine_schema_is_stale(&pointer.engine_dir(lexical_root))?
+            }
+            _ => false,
+        };
         match layout {
             LexicalEngineLayout::LegacyDirect {
                 lexical_root,
                 engine: BlueGreenEngine::Quill,
                 engine_dir,
-            } => Ok(LexicalBuildPlan {
+            } if !stale_quill => Ok(LexicalBuildPlan {
                 lexical_root,
                 engine_dir,
                 publish_pointer: None,
@@ -15231,7 +15261,7 @@ impl FsfsRuntime {
             LexicalEngineLayout::BlueGreen {
                 lexical_root,
                 pointer,
-            } if pointer.engine() == BlueGreenEngine::Quill => Ok(LexicalBuildPlan {
+            } if pointer.engine() == BlueGreenEngine::Quill && !stale_quill => Ok(LexicalBuildPlan {
                 lexical_root: lexical_root.clone(),
                 engine_dir: pointer.engine_dir(&lexical_root),
                 publish_pointer: None,
@@ -15253,9 +15283,10 @@ impl FsfsRuntime {
                     previous_engine: None,
                 })
             }
+            // A legacy Tantivy engine, or a Quill engine with a stale schema.
             LexicalEngineLayout::LegacyDirect {
                 lexical_root,
-                engine: BlueGreenEngine::Tantivy,
+                engine: previous_engine,
                 engine_dir: previous_dir,
             } => {
                 let (dir_name, engine_dir) = Self::next_quill_engine_dir(&lexical_root)?;
@@ -15269,7 +15300,7 @@ impl FsfsRuntime {
                     lexical_root,
                     engine_dir,
                     publish_pointer: Some(pointer),
-                    previous_engine: Some((BlueGreenEngine::Tantivy, previous_dir)),
+                    previous_engine: Some((previous_engine, previous_dir)),
                 })
             }
             LexicalEngineLayout::BlueGreen {
@@ -17481,31 +17512,44 @@ impl FsfsRuntime {
         absolutize_path(Path::new(raw))
     }
 
-    async fn rebuild_tantivy_lexical_index_if_needed(
+    /// Rebuild, at open, a lexical index this build cannot read: a legacy
+    /// Tantivy engine, or a Quill engine whose schema predates a lexical
+    /// analyzer change. Both rebuild blue-green from the recorded source root
+    /// and keep the previous directory for rollback.
+    async fn rebuild_legacy_lexical_index_if_needed(
         &self,
         cx: &Cx,
         index_root: &Path,
     ) -> SearchResult<()> {
         let layout = Self::resolve_lexical_engine(index_root)?;
-        if layout.engine() != Some(BlueGreenEngine::Tantivy) {
+        let (Some(previous_engine), Some(previous_dir)) = (layout.engine(), layout.engine_dir())
+        else {
             return Ok(());
-        }
+        };
+        let found = match previous_engine {
+            BlueGreenEngine::Tantivy => "Tantivy lexical index",
+            BlueGreenEngine::Quill if Self::quill_engine_schema_is_stale(&previous_dir)? => {
+                "keyword index written by an older fsfs"
+            }
+            BlueGreenEngine::Quill => return Ok(()),
+        };
         crate::generation_store::reject_published_write(index_root)?;
 
-        let previous_dir = layout
-            .engine_dir()
-            .expect("Tantivy layout always has an engine directory");
         let sentinel =
             Self::read_index_sentinel(index_root)?.ok_or_else(|| SearchError::InvalidConfig {
                 field: "cli.index_dir".to_owned(),
                 value: index_root.display().to_string(),
-                reason: "Tantivy lexical index detected, but its canonical source root is unknown; run `fsfs index <source-dir>` to rebuild with Quill".to_owned(),
+                reason: format!(
+                    "{found} detected, but its canonical source root is unknown; run `fsfs index <source-dir>` to rebuild it"
+                ),
             })?;
         if !sentinel.generation_complete {
             return Err(SearchError::InvalidConfig {
                 field: "index.generation".to_owned(),
                 value: index_root.display().to_string(),
-                reason: "Tantivy lexical index detected beside an incomplete generation; resume `fsfs index` before searching".to_owned(),
+                reason: format!(
+                    "{found} detected beside an incomplete generation; resume `fsfs index` before searching"
+                ),
             });
         }
 
@@ -17514,20 +17558,22 @@ impl FsfsRuntime {
             return Err(SearchError::InvalidConfig {
                 field: "cli.index.target".to_owned(),
                 value: target_root.display().to_string(),
-                reason: "Tantivy lexical index requires rebuild, but the canonical source root is unavailable".to_owned(),
+                reason: format!(
+                    "{found} requires a rebuild, but the canonical source root is unavailable"
+                ),
             });
         }
 
         let retained_bytes = Self::path_bytes(&previous_dir)?;
         warn!(
             event = "fsfs.lexical_engine_migration",
-            from_engine = BlueGreenEngine::Tantivy.label(),
+            from_engine = previous_engine.label(),
             from_dir = %previous_dir.display(),
             to_engine = BlueGreenEngine::Quill.label(),
             strategy = "rebuild_from_canonical_storage",
             retained_bytes,
             old_dir_retained = true,
-            "fsfs detected a Tantivy lexical index at open; starting blue-green rebuild"
+            "fsfs detected a {found} at open; starting blue-green rebuild"
         );
 
         let mut migration_input = self.cli_input.clone();
@@ -17547,17 +17593,19 @@ impl FsfsRuntime {
         .await?;
 
         let migrated = Self::resolve_lexical_engine(index_root)?;
-        if migrated.engine() != Some(BlueGreenEngine::Quill) {
+        let active_dir = migrated
+            .engine_dir()
+            .filter(|_| migrated.engine() == Some(BlueGreenEngine::Quill));
+        let Some(active_dir) = active_dir.filter(|dir| {
+            !Self::quill_engine_schema_is_stale(dir).unwrap_or(true) && *dir != previous_dir
+        }) else {
             return Err(SearchError::InvalidConfig {
                 field: "cli.index_dir".to_owned(),
                 value: index_root.display().to_string(),
-                reason: "lexical rebuild completed without publishing a Quill CURRENT pointer"
+                reason: "lexical rebuild completed without publishing a current Quill CURRENT pointer"
                     .to_owned(),
             });
-        }
-        let active_dir = migrated
-            .engine_dir()
-            .expect("Quill layout always has an engine directory");
+        };
         let active_bytes = Self::path_bytes(&active_dir)?;
         info!(
             event = "fsfs.lexical_engine_migration_completed",
@@ -17567,7 +17615,7 @@ impl FsfsRuntime {
             retained_bytes,
             active_bytes,
             transient_double_disk_bytes = retained_bytes.saturating_add(active_bytes),
-            rollback = "publish CURRENT to the retained Tantivy directory",
+            rollback = "publish CURRENT to the retained directory",
             "fsfs blue-green lexical rebuild completed; retained directory remains available"
         );
         Ok(())
@@ -19055,7 +19103,7 @@ impl FsfsRuntime {
         admission_mode: SearchExecutionMode,
         resource_mode: SearchExecutionMode,
     ) -> SearchResult<SearchExecutionResources> {
-        self.rebuild_tantivy_lexical_index_if_needed(cx, index_root)
+        self.rebuild_legacy_lexical_index_if_needed(cx, index_root)
             .await?;
         Self::validate_search_generation_at_root(index_root, admission_mode)?;
         let admitted_generation_fingerprint = Self::search_index_fingerprint_at_root(index_root)?;
@@ -43134,6 +43182,91 @@ mod tests {
                 .any(|entry| { entry.target == "index_dir" && entry.status == "removed" })
         );
         assert!(!index_root.exists(), "index dir should be removed");
+    }
+
+    #[test]
+    fn stale_quill_schema_rebuilds_blue_green_at_open_and_retains_the_old_engine() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            fs::write(
+                project.join("migration.md"),
+                "schema upgrade witness 日本語テキスト\n",
+            )
+            .expect("write source");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("initial index");
+            let index_root = project.join(".frankensearch");
+            let lexical_root = index_root.join("lexical");
+
+            // An engine published under another schema stands in for one an
+            // older fsfs wrote before its lexical analyzers changed.
+            let stale_dir = lexical_root.join("quill-stale");
+            let stale = QuillIndex::create_with_schema(
+                &cx,
+                &stale_dir,
+                frankensearch_quill::FSFS_CHUNK_SCHEMA,
+                QuillConfig::default(),
+            )
+            .await
+            .expect("create stale-schema engine");
+            stale.commit(&cx).await.expect("publish stale-schema engine");
+            drop(stale);
+            let stale_pointer =
+                CurrentPointer::new(BlueGreenEngine::Quill, "quill-stale", super::FSLX_FORMAT_VERSION)
+                    .expect("stale pointer");
+            publish_current(&lexical_root, &stale_pointer).expect("point CURRENT at stale engine");
+            assert!(FsfsRuntime::quill_engine_schema_is_stale(&stale_dir).unwrap());
+            let stale_before = snapshot_directory(&stale_dir);
+
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("upgrade witness".to_owned()),
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+            let resources = runtime
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::LexicalOnly)
+                .await
+                .expect("open rebuilds the stale engine");
+            let active = resolve_current(&lexical_root)
+                .expect("resolve rebuilt CURRENT")
+                .pointer()
+                .expect("rebuilt pointer")
+                .clone();
+            assert_eq!(active.engine(), BlueGreenEngine::Quill);
+            assert_ne!(active.dir_name(), "quill-stale");
+            assert!(!FsfsRuntime::quill_engine_schema_is_stale(&active.engine_dir(&lexical_root)).unwrap());
+            assert_eq!(
+                snapshot_directory(&stale_dir),
+                stale_before,
+                "the previous engine is retained untouched for rollback"
+            );
+            let lexical = resources
+                .lexical_index
+                .as_ref()
+                .expect("rebuilt lexical index");
+            for query in ["upgrade witness", "日本語"] {
+                let hits = lexical
+                    .search_doc_ids(&cx, query, 10)
+                    .expect("search rebuilt index");
+                assert_eq!(
+                    hits.first().map(|hit| hit.document_id.as_str()),
+                    Some("migration.md"),
+                    "{query}"
+                );
+            }
+        });
     }
 
     #[test]
