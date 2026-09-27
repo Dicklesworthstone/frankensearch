@@ -76,13 +76,15 @@ impl Default for DefaultCanonicalizer {
     }
 }
 
-/// NFC-normalize with a fast path for ASCII text.
+/// NFC-normalize, borrowing the input whenever it is already NFC.
 ///
 /// ASCII is always already in NFC (no codepoint has a decomposition/composition),
 /// so for ASCII input — the common case for code and English prose — this skips
-/// the unicode-normalization state machine and copies the bytes directly. This
-/// mirrors the ASCII fast paths in Lucene/Tantivy's analysis chains. Output is
-/// byte-identical to `text.nfc().collect()` for every input.
+/// the unicode-normalization state machine entirely. This mirrors the ASCII fast
+/// paths in Lucene/Tantivy's analysis chains. Non-ASCII text runs the UAX #15
+/// quick check and is only decomposed and recomposed when that check cannot
+/// prove it normalized. Output is byte-identical to `text.nfc().collect()` for
+/// every input.
 #[inline]
 fn nfc_normalize(text: &str) -> Cow<'_, str> {
     if text.is_ascii() {
@@ -90,6 +92,13 @@ fn nfc_normalize(text: &str) -> Cow<'_, str> {
         // next pipeline stage (`strip_markdown_and_code`) only needs a `&str` and
         // allocates its own buffer, so the prior `to_owned()` here was pure waste
         // on the common (ASCII) path.
+        Cow::Borrowed(text)
+    } else if unicode_normalization::is_nfc_quick(text.chars())
+        == unicode_normalization::IsNormalized::Yes
+    {
+        // A UAX #15 quick-check "Yes" means the text is already NFC, which holds
+        // for most non-ASCII prose and code (one arrow in a comment used to send
+        // the whole file through decomposition and recomposition).
         Cow::Borrowed(text)
     } else {
         Cow::Owned(text.nfc().collect())
@@ -998,6 +1007,53 @@ mod tests {
             if c.is_ascii() {
                 assert_eq!(nfc_normalize(c), c.to_owned(), "ascii fast path {c:?}");
             }
+        }
+    }
+
+    #[test]
+    fn nfc_normalize_borrows_already_normalized_text_and_fixes_the_rest() {
+        use unicode_normalization::UnicodeNormalization;
+        // Already NFC: borrowed, and equal to the reference.
+        for text in [
+            "// maps a → b (naïve café, 日本語, Ω, 한국어)",
+            "emoji 🚀 ✅ ok",
+            "Straße",
+        ] {
+            assert!(matches!(nfc_normalize(text), Cow::Borrowed(_)), "{text:?}");
+            assert_eq!(nfc_normalize(text), text.nfc().collect::<String>());
+        }
+        // Not NFC: decomposed accents, combining marks out of canonical order,
+        // Hangul jamo and a singleton (U+212B ANGSTROM SIGN -> U+00C5).
+        for text in [
+            "cafe\u{301} → x",
+            "a\u{323}\u{302}b → ",
+            "a\u{302}\u{323}b → ",
+            "\u{1100}\u{1161}\u{11A8} 한",
+            "\u{212B} unit",
+        ] {
+            let normalized = nfc_normalize(text);
+            assert_eq!(normalized, text.nfc().collect::<String>(), "{text:?}");
+            assert!(matches!(normalized, Cow::Owned(_)), "{text:?}");
+        }
+        // A deterministic sweep over mixed scripts and combining marks.
+        let alphabet: Vec<char> = "aeoAÅé→ñ日本한\u{301}\u{302}\u{323}\u{308}\u{1161}\u{212B} \n"
+            .chars()
+            .collect();
+        let mut state = 0x9E37_79B9_u32;
+        for _ in 0..2_000 {
+            let text: String = (0..12)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    alphabet[state as usize % alphabet.len()]
+                })
+                .collect();
+            assert_eq!(
+                nfc_normalize(&text),
+                text.nfc().collect::<String>(),
+                "{text:?}"
+            );
         }
     }
 
