@@ -3740,7 +3740,7 @@ impl Grammar {
                 let mut analyzer = FrankensearchTokenizer::default();
                 let mut terms = Vec::new();
                 let report = analyze_admitted(&mut analyzer, analyzer_kind, raw, &mut |token| {
-                    terms.push(token.text.clone())
+                    terms.push(token.text.clone());
                 })
                 .ok()?;
                 if report.oversized_tokens == 0 && terms.len() == 1 {

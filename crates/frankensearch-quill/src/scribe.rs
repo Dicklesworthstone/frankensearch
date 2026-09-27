@@ -949,7 +949,7 @@ impl TokenAnalyzer for CompiledAnalyzerFamily {
     ) {
         match analyzer {
             AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams => {
-                self.default.analyze(analyzer, text, sink)
+                self.default.analyze(analyzer, text, sink);
             }
             AnalyzerKind::CassHyphenNormalize | AnalyzerKind::CassPrefixNormalize => {
                 self.cass.analyze(analyzer, text, sink);
@@ -5950,8 +5950,8 @@ mod tests {
             let (token_text, position) = match analyzer {
                 AnalyzerKind::CassHyphenNormalize => ("hyphen-dispatch", 7),
                 AnalyzerKind::CassPrefixNormalize => ("prefix-dispatch", 11),
-                AnalyzerKind::FrankensearchDefault => {
-                    unreachable!("fixture does not advertise the default analyzer")
+                AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams => {
+                    unreachable!("fixture does not advertise the default analyzers")
                 }
             };
             sink(&AnalyzedToken {
