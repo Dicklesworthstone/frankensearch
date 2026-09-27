@@ -409,6 +409,16 @@ fragment, and `line`: the 1-based line of the file where the snippet's first
 query word sits (the table prints `path:line`). `line` is absent for hits
 without a snippet and when the file on disk no longer holds the fragment.
 
+Source code in mainstream languages (Rust, Python, TypeScript/JavaScript, Go,
+Java, Kotlin, Swift, C/C++, C#, Ruby, PHP, Scala, Elixir, Haskell, Lua, Vue,
+Svelte and others) and prose or configuration files (Markdown, MDX, reStructuredText,
+AsciiDoc, Org, TeX, TOML, YAML, JSON) get keyword and semantic search. Other
+text files get keyword search only, as do files larger than
+`discovery.max_file_size_mb` (10 MB by default). Log, lock, temporary and
+backup files, and files between two and four times that size limit, are
+counted in the index but cannot be found yet; larger and binary files are
+skipped.
+
 ```bash
 # Basic search
 fsfs search "structured concurrency" --limit 10
@@ -418,6 +428,10 @@ fsfs search "query" --stream --format jsonl
 
 # TOON mode
 fsfs search "query" --stream --format toon
+
+# Narrow results: lang:/type: take a language name or an extension,
+# ext: one literal extension, path: (or a bare word) a path fragment
+fsfs search "retry backoff" --filter "lang:rust path:src"
 
 # Explain one result of the last search: by rank, R0-style id, or path
 fsfs explain 1
