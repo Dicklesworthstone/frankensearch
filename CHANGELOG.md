@@ -263,9 +263,6 @@ qualified; individual results below are narrower than release acceptance.
   a reranked result. Table output now prints `rerank: not applied
   (<reason> after <n> ms)` and, for a timeout, points at
   `search.rerank_timeout_ms`. JSON already carried the `rerank` status.
-  `fsfs serve`'s ready event reported `semantic_admitted: false` for every
-  real semantic index because the fast embedder loads on the first query;
-  it is now false only when that load was attempted and failed.
 
 - **The search dashboard follows its `[tui]` settings.** `density =
   "compact"` selects the compact layout at any terminal size,

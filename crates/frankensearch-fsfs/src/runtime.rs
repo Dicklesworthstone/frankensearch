@@ -7933,12 +7933,10 @@ impl FsfsRuntime {
             "format": format.into(),
             "vector_generation_id": generation.as_ref().map(|(id, _)| id.clone()),
             "vector_generation_is_hash": generation.as_ref().is_some_and(|(_, is_hash)| *is_hash),
-            // The fast embedder loads on the first semantic query, so "not yet
-            // loaded" still admits semantic search; only a failed load does not.
             "semantic_admitted": generation
                 .as_ref()
                 .is_some_and(|(_, is_hash)| !*is_hash)
-                && (resources.fast_embedder.is_some() || !resources.fast_embedder_attempted),
+                && resources.fast_embedder.is_some(),
         })
     }
 
@@ -44331,7 +44329,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_ready_admits_semantic_before_the_lazy_fast_embedder_loads() {
+    fn serve_ready_admits_semantic_only_after_the_fast_embedder_loads() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vector_path = temp.path().join("vector/index.fsvi");
         fs::create_dir_all(vector_path.parent().expect("vector parent"))
@@ -44340,7 +44338,7 @@ mod tests {
             .expect("create semantic generation")
             .finish()
             .expect("finish semantic generation");
-        let resources = |attempted: bool| SearchExecutionResources {
+        let resources = |loaded: bool, attempted: bool| SearchExecutionResources {
             index_root: temp.path().to_path_buf(),
             generation_fingerprint: "test".to_owned(),
             lexical_index: None,
@@ -44351,19 +44349,22 @@ mod tests {
             ),
             fast_window_mapping: None,
             quality_vector_index: None,
-            fast_embedder: None,
+            fast_embedder: loaded.then(|| admitted(HashEmbedder::default_256())),
             quality_embedder: None,
             fast_embedder_attempted: attempted,
             quality_embedder_attempted: attempted,
             degradation_advice: Vec::new(),
         };
-        // As prepared for serving: nothing loaded yet, semantic still admitted.
-        let ready = FsfsRuntime::search_serve_ready_event("jsonl", &resources(false));
+        // Readiness precedes lazy model initialization: admission means a
+        // verified model was loaded, which the real-model e2e checks again
+        // after queries. Neither "not yet loaded" nor a failed load admits.
+        let ready = FsfsRuntime::search_serve_ready_event("jsonl", &resources(false, false));
         assert_eq!(ready["vector_generation_is_hash"], false);
-        assert_eq!(ready["semantic_admitted"], true);
-        // A load that was attempted and failed admits nothing.
-        let ready = FsfsRuntime::search_serve_ready_event("jsonl", &resources(true));
         assert_eq!(ready["semantic_admitted"], false);
+        let ready = FsfsRuntime::search_serve_ready_event("jsonl", &resources(false, true));
+        assert_eq!(ready["semantic_admitted"], false);
+        let ready = FsfsRuntime::search_serve_ready_event("jsonl", &resources(true, true));
+        assert_eq!(ready["semantic_admitted"], true);
     }
 
     #[test]
