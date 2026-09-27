@@ -3251,6 +3251,72 @@ fn no_effect_setting_warnings(config: &FsfsConfig, warnings: &mut Vec<ConfigWarn
             message: "fsfs stores no summaries to expire, so this changes nothing".into(),
         });
     }
+    // The pressure state machine that would read these ceilings has no
+    // production caller; the shadow oracle samples CPU and I/O on its own.
+    let defaults = PressureConfig::default();
+    let ceilings = [
+        (
+            config.pressure.cpu_ceiling_pct != defaults.cpu_ceiling_pct
+                && !cfg!(feature = "shadow-oracle"),
+            "pressure.cpu_ceiling_pct",
+        ),
+        (
+            config.pressure.io_ceiling_bytes_per_sec != defaults.io_ceiling_bytes_per_sec
+                && !cfg!(feature = "shadow-oracle"),
+            "pressure.io_ceiling_bytes_per_sec",
+        ),
+        (
+            config.pressure.load_ceiling_per_mille != defaults.load_ceiling_per_mille,
+            "pressure.load_ceiling_per_mille",
+        ),
+    ];
+    for (changed, field) in ceilings {
+        if changed {
+            warnings.push(ConfigWarning {
+                severity: ConfigDiagnosticSeverity::Warn,
+                reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
+                field: field.into(),
+                source: ConfigSource::Runtime,
+                message: "no fsfs component reads this ceiling yet, so it changes nothing".into(),
+            });
+        }
+    }
+    // A profile's quality ceiling applies (search.fast_only); its resolved
+    // concurrency and scheduler limits have no reader yet.
+    if config.pressure.profile != PressureProfile::Performance {
+        warnings.push(ConfigWarning {
+            severity: ConfigDiagnosticSeverity::Warn,
+            reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
+            field: "pressure.profile".into(),
+            source: ConfigSource::Runtime,
+            message: "this profile disables quality search, but its embedding/indexing concurrency and scheduler limits are not applied yet".into(),
+        });
+    }
+    // Searches and writes follow the override's stage contract; deferring
+    // embedding during indexing is not implemented yet.
+    let unwired_indexing = match config.pressure.degradation_override {
+        DegradationOverrideMode::ForceEmbedDeferred => Some(
+            "embedding is not deferred yet and search stays hybrid under force_embed_deferred, so this changes nothing",
+        ),
+        DegradationOverrideMode::ForceLexicalOnly => Some(
+            "search is lexical-only, but indexing still embeds: deferred embedding is not implemented yet",
+        ),
+        DegradationOverrideMode::ForceMetadataOnly => Some(
+            "search is refused, but indexing still reads and embeds content: metadata-only indexing is not implemented yet",
+        ),
+        DegradationOverrideMode::Auto
+        | DegradationOverrideMode::ForceFull
+        | DegradationOverrideMode::ForcePaused => None,
+    };
+    if let Some(message) = unwired_indexing {
+        warnings.push(ConfigWarning {
+            severity: ConfigDiagnosticSeverity::Warn,
+            reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
+            field: "pressure.degradation_override".into(),
+            source: ConfigSource::Runtime,
+            message: message.into(),
+        });
+    }
     if config.tui.theme != TuiTheme::Dark {
         warnings.push(ConfigWarning {
             severity: ConfigDiagnosticSeverity::Warn,
@@ -4159,6 +4225,33 @@ mod tests {
     }
 
     #[test]
+    fn degradation_overrides_without_an_indexing_effect_say_so() {
+        for (value, warns) in [
+            ("auto", false),
+            ("force_full", false),
+            ("force_embed_deferred", true),
+            ("force_lexical_only", true),
+            ("force_metadata_only", true),
+            ("force_paused", false),
+        ] {
+            let file = format!("[pressure]\ndegradation_override = \"{value}\"\n");
+            let loaded = load_from_str(
+                Some(&file),
+                None,
+                &HashMap::new(),
+                &CliOverrides::default(),
+                home(),
+            )
+            .expect("load");
+            let warned = loaded.warnings.iter().any(|warning| {
+                warning.reason_code == super::CONFIG_NO_EFFECT_WARNING_CODE
+                    && warning.field == "pressure.degradation_override"
+            });
+            assert_eq!(warned, warns, "{value}");
+        }
+    }
+
+    #[test]
     fn settings_that_change_nothing_say_so() {
         let no_effect = |result: &super::ConfigLoadResult| {
             result
@@ -4182,7 +4275,8 @@ mod tests {
 [indexing]\nreindex_on_change = false\n\
 [privacy]\nredact_file_contents_in_logs = false\nredact_paths_in_telemetry = false\n\
 [storage]\nsummary_retention_days = 120\n\
-[tui]\ntheme = \"light\"\n";
+[tui]\ntheme = \"light\"\n\
+[pressure]\nload_ceiling_per_mille = 1500\nprofile = \"strict\"\n";
         let turned_off = load_from_str(
             Some(file),
             None,
@@ -4197,6 +4291,8 @@ mod tests {
             fields,
             [
                 "indexing.reindex_on_change",
+                "pressure.load_ceiling_per_mille",
+                "pressure.profile",
                 "privacy.redact_file_contents_in_logs",
                 "privacy.redact_paths_in_telemetry",
                 "storage.summary_retention_days",

@@ -817,6 +817,43 @@ impl SearchExecutionMode {
     }
 }
 
+/// `pressure.degradation_override` applied to a search, per the stage
+/// contracts in `pressure.rs`: lexical-only drops the semantic lanes, and
+/// metadata-only or paused refuse search. `auto`, `full` and `embed_deferred`
+/// keep the requested mode (their query contract is hybrid).
+fn degraded_search_mode(
+    override_mode: crate::config::DegradationOverrideMode,
+    requested: SearchExecutionMode,
+) -> SearchResult<SearchExecutionMode> {
+    use crate::config::DegradationOverrideMode;
+    match override_mode {
+        DegradationOverrideMode::ForceLexicalOnly => Ok(SearchExecutionMode::LexicalOnly),
+        DegradationOverrideMode::ForceMetadataOnly | DegradationOverrideMode::ForcePaused => {
+            Err(degradation_refusal(override_mode, "search"))
+        }
+        DegradationOverrideMode::Auto
+        | DegradationOverrideMode::ForceFull
+        | DegradationOverrideMode::ForceEmbedDeferred => Ok(requested),
+    }
+}
+
+fn degradation_refusal(
+    override_mode: crate::config::DegradationOverrideMode,
+    what: &str,
+) -> SearchError {
+    let value = serde_json::to_value(override_mode)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    SearchError::InvalidConfig {
+        field: "pressure.degradation_override".to_owned(),
+        value: value.clone(),
+        reason: format!(
+            "{what} is disabled while pressure.degradation_override is {value}; set it back to auto to resume"
+        ),
+    }
+}
+
 fn parse_search_execution_mode(raw: Option<&str>) -> SearchResult<SearchExecutionMode> {
     match raw {
         None | Some("full") => Ok(SearchExecutionMode::Full),
@@ -6507,6 +6544,26 @@ impl FsfsRuntime {
         shutdown: Option<&ShutdownCoordinator>,
     ) -> SearchResult<()> {
         self.validate_command_inputs(command)?;
+        // A paused stage halts writes (pressure.rs contract); stopping the
+        // compaction daemon sheds work and stays allowed.
+        let writes = matches!(
+            command,
+            CliCommand::Index
+                | CliCommand::Watch
+                | CliCommand::AppendBatch
+                | CliCommand::Delete
+                | CliCommand::Compact
+                | CliCommand::Flush
+        ) || (command == CliCommand::Daemon && !self.cli_input.daemon_stop);
+        if writes
+            && self.config.pressure.degradation_override
+                == crate::config::DegradationOverrideMode::ForcePaused
+        {
+            return Err(degradation_refusal(
+                self.config.pressure.degradation_override,
+                "writing to the index",
+            ));
+        }
         if command == CliCommand::Search {
             self.run_search_command(cx).await?;
             return Ok(());
@@ -6982,11 +7039,15 @@ impl FsfsRuntime {
                 self.emit_search_stream_payload(stage_payload, stream_id, &mut seq, writer)
             };
             if let Some((resources, flags)) = resources_override.as_mut() {
+                let mode = degraded_search_mode(
+                    self.config.pressure.degradation_override,
+                    SearchExecutionMode::Full,
+                )?;
                 self.execute_search_phase_artifacts_with_mode_using_resources(
                     cx,
                     query,
                     limit,
-                    SearchExecutionMode::Full,
+                    mode,
                     resources,
                     *flags,
                     Some(&mut phase_sink),
@@ -7705,7 +7766,11 @@ impl FsfsRuntime {
         hot_cache_enabled: bool,
         mut frame_sink: Option<SearchServeFrameSink<'_>>,
     ) -> SearchResult<SearchServeResponse> {
-        let mode = parse_search_execution_mode(request.mode.as_deref())?;
+        // The server applies its own degradation override to every client.
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            parse_search_execution_mode(request.mode.as_deref())?,
+        )?;
         // The generation fingerprint covers the active Quill MANIFEST's file
         // identity, and every durable publication renames a new MANIFEST into
         // place, so a newer publication rebinds all resources here. A per-request
@@ -8118,6 +8183,10 @@ impl FsfsRuntime {
     ) -> SearchResult<Vec<SearchPayload>> {
         #[cfg(unix)]
         {
+            let mode = degraded_search_mode(
+                self.config.pressure.degradation_override,
+                SearchExecutionMode::Full,
+            )?;
             let socket_path = self.resolve_daemon_socket_path()?;
             let mut stream = if let Ok(stream) = UnixStream::connect(&socket_path) {
                 stream
@@ -8131,7 +8200,7 @@ impl FsfsRuntime {
             let request = SearchServeRequest {
                 query: query.to_owned(),
                 limit: Some(limit),
-                mode: Some("full".to_owned()),
+                mode: Some(mode.label().to_owned()),
                 filter: self.cli_input.filter.clone(),
                 rerank: Some(self.config.search.rerank),
                 quality_weight: Some(self.config.search.quality_weight),
@@ -8211,11 +8280,7 @@ impl FsfsRuntime {
             if !state.terminal {
                 return Err(Self::search_daemon_error("daemon stream missing terminal"));
             }
-            Self::validate_search_generation_fingerprint(
-                &index_root,
-                &fingerprint,
-                SearchExecutionMode::Full,
-            )?;
+            Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
             Self::semantic_retry_checkpoint(cx, "fsfs.search.finalize")?;
             if let Err(error) = self.persist_explain_session_for_cached_payloads(query, &payloads) {
                 warn!(
@@ -8317,7 +8382,7 @@ impl FsfsRuntime {
                 if schema_version != FSFS_SEARCH_SERVE_STREAM_VERSION
                     || *policy != self.search_serve_policy()?
                     || query != request.query
-                    || mode != "full"
+                    || Some(mode.as_str()) != request.mode.as_deref()
                     || Some(limit) != request.limit
                     || filter != request.filter
                     || Some(rerank) != request.rerank
@@ -8338,7 +8403,7 @@ impl FsfsRuntime {
                 Self::validate_search_generation_fingerprint(
                     index_root,
                     fingerprint,
-                    SearchExecutionMode::Full,
+                    parse_search_execution_mode(request.mode.as_deref())?,
                 )?;
                 state.attested = true;
                 state.cached = cached;
@@ -8378,7 +8443,7 @@ impl FsfsRuntime {
                 Self::validate_search_generation_fingerprint(
                     index_root,
                     fingerprint,
-                    SearchExecutionMode::Full,
+                    parse_search_execution_mode(request.mode.as_deref())?,
                 )?;
                 state.phase = Some(payload.phase);
                 Ok(Some(*payload))
@@ -8533,6 +8598,7 @@ impl FsfsRuntime {
         let (socket_dir, index_stem) = self.default_daemon_socket_stem()?;
         let variant = Self::daemon_socket_variant(
             &self.config.indexing.quality_model,
+            self.config.pressure.degradation_override,
             FSFS_SEARCH_SERVE_SCHEMA_VERSION,
             FSFS_SEARCH_SERVE_STREAM_VERSION,
         );
@@ -8544,11 +8610,16 @@ impl FsfsRuntime {
     #[cfg(unix)]
     fn daemon_socket_variant(
         quality_model: &str,
+        degradation_override: crate::config::DegradationOverrideMode,
         serve_version: &str,
         stream_version: &str,
     ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(normalize_model_key(quality_model).as_bytes());
+        hasher.update([0]);
+        // A daemon applies its own degradation override to every request, so
+        // clients with a different override must not share it.
+        hasher.update(format!("{degradation_override:?}").as_bytes());
         hasher.update([0]);
         hasher.update(serve_version.as_bytes());
         hasher.update([0]);
@@ -9798,7 +9869,10 @@ impl FsfsRuntime {
         limit: usize,
         mut phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPayload>> {
-        let mode = SearchExecutionMode::Full;
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )?;
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         if !cache_enabled {
             return self
@@ -9907,9 +9981,11 @@ impl FsfsRuntime {
         // Gather payloads from each expanded query. Use a larger internal limit
         // to get enough candidates for meaningful fusion.
         let expansion_limit = (limit.saturating_mul(2)).max(20);
-        let mut resources = self
-            .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
-            .await?;
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )?;
+        let mut resources = self.prepare_search_execution_resources(cx, mode).await?;
         let expansion_fingerprint = resources.generation_fingerprint.clone();
         let all_payloads = self
             .execute_expanded_query_variants(
@@ -9931,7 +10007,7 @@ impl FsfsRuntime {
         Self::validate_search_generation_fingerprint(
             &resources.index_root,
             &expansion_fingerprint,
-            SearchExecutionMode::Full,
+            mode,
         )?;
 
         Ok(vec![fused_payload])
@@ -9972,6 +10048,10 @@ impl FsfsRuntime {
         expansion_fingerprint: &str,
         flags: SearchExecutionFlags,
     ) -> SearchResult<Vec<SearchPayload>> {
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )?;
         let mut payloads = Vec::new();
         for expanded in queries {
             cx.checkpoint().map_err(|_| SearchError::Cancelled {
@@ -9981,7 +10061,7 @@ impl FsfsRuntime {
             Self::validate_search_generation_fingerprint(
                 &resources.index_root,
                 expansion_fingerprint,
-                SearchExecutionMode::Full,
+                mode,
             )?;
             info!(
                 strategy = expanded.strategy.label(),
@@ -9993,7 +10073,7 @@ impl FsfsRuntime {
                     cx,
                     &expanded.text,
                     expansion_limit,
-                    SearchExecutionMode::Full,
+                    mode,
                     resources,
                     flags,
                 )
@@ -10001,7 +10081,7 @@ impl FsfsRuntime {
             Self::validate_search_generation_fingerprint(
                 &resources.index_root,
                 expansion_fingerprint,
-                SearchExecutionMode::Full,
+                mode,
             )?;
             // Initial and Refined are successive rankings of the same query,
             // not independent votes. A failed refinement likewise replays its
@@ -20952,6 +21032,10 @@ impl FsfsRuntime {
     }
 
     async fn run_search_dashboard_tui(&self, cx: &Cx) -> SearchResult<()> {
+        degraded_search_mode(
+            self.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )?;
         let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
         let status_payload = self.collect_status_payload()?;
         let mode_hint = self.search_mode_hint()?;
@@ -21399,7 +21483,7 @@ impl FsfsRuntime {
         // For this lane we split work across two timescales:
         // 1) fast lexical refresh (no snippet hydration)
         // 2) delayed snippet hydration on the quality idle gate.
-        if Self::tui_prefers_lexical_only_query(&query) {
+        if self.tui_lexical_only_lane(&query) {
             // Keep the interactive fast lane bounded to the visible lexical head.
             // Full-limit hydration is deferred to the delayed quality gate.
             let fast_limit = state.result_limit.clamp(1, FSFS_SEARCH_SNIPPET_HEAD_LIMIT);
@@ -21469,6 +21553,14 @@ impl FsfsRuntime {
     }
 
     #[must_use]
+    /// The dashboard's lexical-only lane: single-token queries, and every query
+    /// while `pressure.degradation_override` forces lexical-only search.
+    fn tui_lexical_only_lane(&self, query: &str) -> bool {
+        Self::tui_prefers_lexical_only_query(query)
+            || self.config.pressure.degradation_override
+                == crate::config::DegradationOverrideMode::ForceLexicalOnly
+    }
+
     fn tui_prefers_lexical_only_query(query: &str) -> bool {
         let normalized = query.trim();
         if normalized.is_empty() {
@@ -21492,7 +21584,7 @@ impl FsfsRuntime {
         }
         // Single-token interactive lane runs lexical-only for ranking, then hydrates
         // snippets on this delayed phase to keep keystroke latency low.
-        if Self::tui_prefers_lexical_only_query(&query) {
+        if self.tui_lexical_only_lane(&query) {
             let full_limit = state.result_limit.max(1);
             if let Ok(payloads) = self
                 .refresh_search_dashboard_mode_with_limit(
@@ -21567,9 +21659,15 @@ impl FsfsRuntime {
             state.clear_search_results();
             return;
         }
+        // Dashboard entry already refused a paused or metadata-only override.
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )
+        .unwrap_or(SearchExecutionMode::LexicalOnly);
 
         if let Ok(payloads) = self
-            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::Full, resources)
+            .refresh_search_dashboard_mode(cx, state, mode, resources)
             .await
         {
             let last = payloads.last();
@@ -33918,33 +34016,44 @@ mod tests {
             FSFS_DAEMON_SOCKET_VARIANT_LEN, FSFS_SEARCH_SERVE_SCHEMA_VERSION,
             FSFS_SEARCH_SERVE_STREAM_VERSION,
         };
+        use crate::config::DegradationOverrideMode::{Auto, ForceLexicalOnly};
         let current = FsfsRuntime::daemon_socket_variant(
             "all-MiniLM-L6-v2",
+            Auto,
             FSFS_SEARCH_SERVE_SCHEMA_VERSION,
             FSFS_SEARCH_SERVE_STREAM_VERSION,
         );
         assert_eq!(current.len(), FSFS_DAEMON_SOCKET_VARIANT_LEN);
-        for (model, serve, stream) in [
+        for (model, degradation, serve, stream) in [
             (
                 "all-MiniLM-L6-v2",
+                Auto,
                 "fsfs.search.serve.v8",
                 FSFS_SEARCH_SERVE_STREAM_VERSION,
             ),
             (
                 "all-MiniLM-L6-v2",
+                Auto,
                 FSFS_SEARCH_SERVE_SCHEMA_VERSION,
                 "fsfs.search.serve.stream.v6",
             ),
             (
                 "all-MiniLM-L6-v2-native",
+                Auto,
+                FSFS_SEARCH_SERVE_SCHEMA_VERSION,
+                FSFS_SEARCH_SERVE_STREAM_VERSION,
+            ),
+            (
+                "all-MiniLM-L6-v2",
+                ForceLexicalOnly,
                 FSFS_SEARCH_SERVE_SCHEMA_VERSION,
                 FSFS_SEARCH_SERVE_STREAM_VERSION,
             ),
         ] {
             assert_ne!(
-                FsfsRuntime::daemon_socket_variant(model, serve, stream),
+                FsfsRuntime::daemon_socket_variant(model, degradation, serve, stream),
                 current,
-                "{model} {serve} {stream}"
+                "{model} {degradation:?} {serve} {stream}"
             );
         }
     }
@@ -38590,6 +38699,99 @@ mod tests {
                     .collect::<Vec<_>>();
                 found.sort_unstable();
                 assert_eq!(found, expected, "lexical hits for {query:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn degradation_override_caps_search_and_pauses_writes() {
+        use crate::config::DegradationOverrideMode;
+
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create project");
+            fs::write(
+                project.join("otters.md"),
+                "river otters hold hands while sleeping\n",
+            )
+            .expect("write source");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index");
+            let index_dir = project.join(".frankensearch");
+            let runtime = |mode: DegradationOverrideMode, command: CliCommand| {
+                let mut config = config.clone();
+                config.pressure.degradation_override = mode;
+                FsfsRuntime::new(config).with_cli_input(CliInput {
+                    command,
+                    query: Some("otters".to_owned()),
+                    target_path: Some(project.clone()),
+                    index_dir: Some(index_dir.clone()),
+                    ..CliInput::default()
+                })
+            };
+
+            let auto = runtime(DegradationOverrideMode::Auto, CliCommand::Search)
+                .execute_search_payloads_cached_for_cli(&cx, "otters", 10)
+                .await
+                .expect("auto search");
+            assert_ne!(
+                auto.last().and_then(|payload| payload.skip_reason.as_deref()),
+                Some("lexical_only")
+            );
+            let lexical = runtime(DegradationOverrideMode::ForceLexicalOnly, CliCommand::Search)
+                .execute_search_payloads_cached_for_cli(&cx, "otters", 10)
+                .await
+                .expect("lexical-only search");
+            let last = lexical.last().expect("payload");
+            assert_eq!(last.skip_reason.as_deref(), Some("lexical_only"));
+            assert_eq!(
+                last.hits.first().map(|hit| hit.path.as_str()),
+                Some("otters.md")
+            );
+            assert!(last.hits.iter().all(|hit| hit.semantic_rank.is_none()));
+
+            for mode in [
+                DegradationOverrideMode::ForceMetadataOnly,
+                DegradationOverrideMode::ForcePaused,
+            ] {
+                let error = runtime(mode, CliCommand::Search)
+                    .execute_search_payloads_cached_for_cli(&cx, "otters", 10)
+                    .await
+                    .expect_err("search refused");
+                assert!(
+                    matches!(&error, SearchError::InvalidConfig { field, .. } if field == "pressure.degradation_override"),
+                    "{mode:?}: {error:?}"
+                );
+            }
+
+            for command in [CliCommand::Index, CliCommand::Delete] {
+                let error = runtime(DegradationOverrideMode::ForcePaused, command)
+                    .run_mode(&cx, InterfaceMode::Cli)
+                    .await
+                    .expect_err("paused writes refused");
+                assert!(
+                    matches!(&error, SearchError::InvalidConfig { field, .. } if field == "pressure.degradation_override"),
+                    "{command:?}: {error:?}"
+                );
+            }
+            // Stopping the compaction daemon sheds work and stays allowed.
+            let mut stop = runtime(DegradationOverrideMode::ForcePaused, CliCommand::Daemon);
+            stop.cli_input.daemon_stop = true;
+            if let Err(error) = stop.run_mode(&cx, InterfaceMode::Cli).await {
+                assert!(
+                    !matches!(&error, SearchError::InvalidConfig { field, .. } if field == "pressure.degradation_override"),
+                    "{error:?}"
+                );
             }
         });
     }

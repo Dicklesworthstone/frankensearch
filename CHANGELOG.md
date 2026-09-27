@@ -243,6 +243,20 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **`pressure.degradation_override` does what its stage promises for
+  search.** It was parsed and only logged. Now `force_lexical_only` runs
+  every search lexical-only (CLI, `--stream`, `--expand`, the query daemon,
+  `fsfs serve`, the dashboard), `force_metadata_only` and `force_paused`
+  refuse search, and `force_paused` also refuses `index`, `watch`,
+  `append-batch`, `delete`, `compact`, `flush` and the compaction daemon
+  (`daemon --stop` still works). The query daemon's socket name includes
+  the override, so a search never reaches a daemon started with a
+  different one. Indexing does not defer embedding yet: `force_embed_deferred`
+  and the indexing half of `force_lexical_only` / `force_metadata_only` raise
+  a `config.setting.no_effect` warning, as do non-default
+  `pressure.cpu_ceiling_pct`, `io_ceiling_bytes_per_sec` and
+  `load_ceiling_per_mille`, which nothing reads yet (bd-pena2).
+
 - **A requested rerank that did not run says so.** With the default 300 ms
   `rerank_timeout_ms`, `fsfs search --rerank` on code files timed out on
   every query, even with a warm daemon, and table output looked the same as

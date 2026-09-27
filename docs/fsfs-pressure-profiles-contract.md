@@ -78,6 +78,24 @@ An open quality circuit (`pressure.quality_circuit_open`) disables quality work
 the same way as a hard pause, recorded as
 `safety.clamp.quality_circuit_open.quality_enabled`.
 
+`pressure.degradation_override` applies its stage's query contract
+(`pressure.rs`) to every search entry point (CLI, `--stream`, `--expand`, the
+query daemon, `fsfs serve` and the dashboard): `force_lexical_only` runs
+searches lexical-only, and `force_metadata_only` and `force_paused` refuse
+search with `SearchError::InvalidConfig` on `pressure.degradation_override`.
+`force_paused` also refuses `index`, `watch`, `append-batch`, `delete`,
+`compact`, `flush` and the compaction daemon; `daemon --stop` stays allowed.
+The query daemon's socket name includes the override, so clients with
+different overrides never share a daemon. Indexing does not yet defer
+embedding or index metadata only, so `force_embed_deferred` changes nothing
+and `force_lexical_only` / `force_metadata_only` still embed while indexing;
+each raises a `config.setting.no_effect` warning saying so. The same warning
+covers a `strict` or `degraded` profile (its quality ceiling applies; its
+resolved concurrency and scheduler limits are not read yet) and non-default
+`cpu_ceiling_pct`, `io_ceiling_bytes_per_sec` and `load_ceiling_per_mille`,
+which no fsfs component reads yet (the shadow oracle samples CPU and I/O with
+its own thresholds).
+
 The `performance` profile allows either `fast_only` value. The `strict` and
 `degraded` profiles disable quality: `fast_only=true` is accepted, while a winning
 `fast_only=false` MUST return `SearchError::InvalidConfig` with field
