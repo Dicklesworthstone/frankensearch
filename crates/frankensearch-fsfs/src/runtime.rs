@@ -3702,6 +3702,8 @@ struct FsfsStatusPayload {
     runtime: FsfsRuntimeStatus,
 }
 
+// Each flag is an independent field of the serialized status contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct FsfsIndexStatus {
     path: String,
@@ -3746,6 +3748,10 @@ struct FsfsIndexStatus {
     /// Search refuses the root until that run finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unfinished_index_run: Option<String>,
+    /// The keyword index was written by an fsfs with a different lexical
+    /// schema (analyzers); the next `fsfs index` or search rebuilds it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    lexical_rebuild_required: bool,
     /// Another fsfs process (a running watcher, or an index/compact/delete/
     /// append run) holds the vector files' writer lock, so readers, including
     /// search from other processes, cannot map them until it stops.
@@ -3773,6 +3779,8 @@ impl FsfsIndexStatus {
             "missing"
         } else if self.unfinished_index_run.is_some() {
             "index run unfinished"
+        } else if self.lexical_rebuild_required {
+            "keyword index rebuild pending"
         } else if self.vector_files_in_use {
             "in use by another fsfs process"
         } else if self.vector_generation_is_hash {
@@ -3787,6 +3795,7 @@ impl FsfsIndexStatus {
     fn dashboard_state_is_healthy(&self) -> bool {
         self.exists
             && self.unfinished_index_run.is_none()
+            && !self.lexical_rebuild_required
             && !self.vector_files_in_use
             && self.vector_generation_id.is_some()
             && !self.vector_generation_is_hash
@@ -15366,14 +15375,22 @@ impl FsfsRuntime {
         };
         let mut usage = self.collect_index_storage_usage(&storage_paths)?;
         let lexical_layout = Self::resolve_lexical_engine(&index_root)?;
-        let lexical_stats =
-            if lexical_stats.is_some() || lexical_layout.engine() != Some(BlueGreenEngine::Quill) {
-                lexical_stats
-            } else if let Some(engine_dir) = lexical_layout.engine_dir() {
-                Some(KeeperSnapshot::open(&engine_dir, DEFAULT_SCHEMA)?.segment_stats()?)
-            } else {
-                None
-            };
+        let lexical_rebuild_required = lexical_layout.engine() == Some(BlueGreenEngine::Quill)
+            && lexical_layout
+                .engine_dir()
+                .map(|dir| Self::quill_engine_schema_is_stale(&dir))
+                .transpose()?
+                .unwrap_or(false);
+        let lexical_stats = if lexical_stats.is_some()
+            || lexical_rebuild_required
+            || lexical_layout.engine() != Some(BlueGreenEngine::Quill)
+        {
+            lexical_stats
+        } else if let Some(engine_dir) = lexical_layout.engine_dir() {
+            Some(KeeperSnapshot::open(&engine_dir, DEFAULT_SCHEMA)?.segment_stats()?)
+        } else {
+            None
+        };
         if let Some(stats) = lexical_stats {
             usage.lexical_index_bytes = stats.managed_disk_bytes;
         }
@@ -15446,6 +15463,7 @@ impl FsfsRuntime {
                     .as_ref()
                     .map(|value| value.dimension),
                 unfinished_index_run: unfinished_index_run_command(&index_root),
+                lexical_rebuild_required,
                 vector_files_in_use: published_vector.is_none()
                     && Self::vector_generation_in_use(&index_root),
                 dashboard_state: String::new(),
@@ -25821,6 +25839,17 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
             )
         );
     }
+    if status.index.lexical_rebuild_required {
+        let _ = writeln!(
+            out,
+            "  {}",
+            paint(
+                "the keyword index was written by an older fsfs; the next `fsfs index` or search rebuilds it",
+                "33",
+                no_color,
+            )
+        );
+    }
     if status.index.vector_files_in_use {
         let _ = writeln!(
             out,
@@ -31066,6 +31095,7 @@ mod tests {
                 quality_generation_id: None,
                 quality_generation_dimension: None,
                 unfinished_index_run: None,
+                lexical_rebuild_required: false,
                 vector_files_in_use: false,
                 dashboard_state: "ready".to_owned(),
                 index_freshness: Some(IndexFreshnessPayload {
@@ -43235,6 +43265,16 @@ mod tests {
                 index_dir: Some(index_root.clone()),
                 ..CliInput::default()
             });
+            // Status observes without rebuilding and does not fail.
+            let status = runtime
+                .collect_status_payload()
+                .expect("status reports a stale keyword index");
+            assert!(status.index.lexical_rebuild_required);
+            assert_eq!(
+                status.index.dashboard_state,
+                "keyword index rebuild pending"
+            );
+            assert_eq!(snapshot_directory(&stale_dir), stale_before);
             let resources = runtime
                 .prepare_search_execution_resources(&cx, super::SearchExecutionMode::LexicalOnly)
                 .await
@@ -43266,6 +43306,13 @@ mod tests {
                     "{query}"
                 );
             }
+            assert!(
+                !runtime
+                    .collect_status_payload()
+                    .expect("status after rebuild")
+                    .index
+                    .lexical_rebuild_required
+            );
         });
     }
 

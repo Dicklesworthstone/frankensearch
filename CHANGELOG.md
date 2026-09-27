@@ -252,8 +252,10 @@ qualified; individual results below are narrower than release acceptance.
   index rebuilds the keyword index from the indexed source directory into a
   new directory and keeps the previous one for rollback, where the new
   analyzer previously made every existing index fail with "Quill schema
-  mismatch", even `fsfs index --force`. Parallel bulk ingest applies to the
-  new analyzer as it did to the old one.
+  mismatch", even `fsfs index --force`. Until then `fsfs status` reports
+  "keyword index rebuild pending" (`lexical_rebuild_required` in JSON)
+  instead of failing. Parallel bulk ingest applies to the new analyzer as it
+  did to the old one.
 
 - **Searching right after an upgrade works.** A query daemon left running
   by the previous fsfs kept its socket, so when the new version's results
