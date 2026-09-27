@@ -715,8 +715,6 @@ impl FrankensearchTokenizer {
             );
         }
     }
-
-    }
 }
 
 impl TokenAnalyzer for FrankensearchTokenizer {
