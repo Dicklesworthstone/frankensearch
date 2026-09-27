@@ -102,10 +102,13 @@ retried. The previous complete generation is not retained as an atomic snapshot.
 
 ## `[tui]`
 
-- `theme: "auto" | "light" | "dark"`
-- `frame_budget_ms: int` (`8..200`)
-- `show_explanations: bool`
-- `density: "compact" | "normal" | "expanded"`
+- `theme: "auto" | "light" | "dark"` — the search dashboard currently draws a fixed
+  dark palette; a value other than `dark` raises a `config.setting.no_effect` warning.
+- `frame_budget_ms: int` (`8..200`) — minimum interval between dashboard redraws.
+- `show_explanations: bool` — the active match's `score`/`source`/rank line.
+- `density: "compact" | "normal" | "expanded"` — `compact` selects the compact
+  dashboard layout at every terminal size; `normal` and `expanded` use the full
+  layout, which falls back to compact below 92x22.
 
 ## `[storage]`
 

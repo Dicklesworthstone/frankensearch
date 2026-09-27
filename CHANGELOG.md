@@ -243,6 +243,14 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **The search dashboard follows its `[tui]` settings.** `density =
+  "compact"` selects the compact layout at any terminal size,
+  `show_explanations = false` hides the active match's score/source/rank
+  line, and `frame_budget_ms` sets the minimum interval between redraws
+  (previously a fixed 16 ms). The dashboard still draws one dark palette, so
+  `theme = "light"` or `"auto"` now raises a `config.setting.no_effect`
+  warning instead of silently doing nothing (bd-kph9k).
+
 - **Keyword search finds Chinese and Japanese words inside running text.**
   The default analyzer kept each unspaced CJK run as a single token, so
   `日本語` or `搜索引擎` never matched a sentence containing them; only the

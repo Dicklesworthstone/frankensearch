@@ -3251,6 +3251,16 @@ fn no_effect_setting_warnings(config: &FsfsConfig, warnings: &mut Vec<ConfigWarn
             message: "fsfs stores no summaries to expire, so this changes nothing".into(),
         });
     }
+    if config.tui.theme != TuiTheme::Dark {
+        warnings.push(ConfigWarning {
+            severity: ConfigDiagnosticSeverity::Warn,
+            reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
+            field: "tui.theme".into(),
+            source: ConfigSource::Runtime,
+            message: "the search dashboard draws a fixed dark palette, so this changes nothing yet"
+                .into(),
+        });
+    }
 }
 
 fn fast_only_quality_model_warning() -> ConfigWarning {
@@ -4171,7 +4181,8 @@ mod tests {
         let file = "\
 [indexing]\nreindex_on_change = false\n\
 [privacy]\nredact_file_contents_in_logs = false\nredact_paths_in_telemetry = false\n\
-[storage]\nsummary_retention_days = 120\n";
+[storage]\nsummary_retention_days = 120\n\
+[tui]\ntheme = \"light\"\n";
         let turned_off = load_from_str(
             Some(file),
             None,
@@ -4189,6 +4200,7 @@ mod tests {
                 "privacy.redact_file_contents_in_logs",
                 "privacy.redact_paths_in_telemetry",
                 "storage.summary_retention_days",
+                "tui.theme",
             ]
         );
     }

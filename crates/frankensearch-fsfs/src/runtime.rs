@@ -509,7 +509,6 @@ const INDEXING_TUI_SPARKLINE_WIDTH: usize = 28;
 const INDEXING_TUI_EMA_ALPHA: f64 = 0.24;
 const FSFS_TUI_POLL_INTERVAL_MS: u64 = 120;
 const FSFS_TUI_SEARCH_POLL_INTERVAL_MS: u64 = 8;
-const FSFS_TUI_SEARCH_RENDER_MIN_INTERVAL_MS: u64 = 16;
 const FSFS_TUI_SEARCH_RENDER_IDLE_HEARTBEAT_MS: u64 = 180;
 const FSFS_TUI_STATUS_REFRESH_MS: u64 = 15_000;
 const FSFS_TUI_STATUS_REFRESH_ACTIVE_GRACE_MS: u64 = 2_500;
@@ -1331,9 +1330,19 @@ struct SearchDashboardState {
     typing_cadence_ewma_ms: Option<u64>,
     last_query_edit_at: Option<Instant>,
     result_limit: usize,
+    /// `tui.show_explanations`: the active match's score/source/rank line.
+    show_explanations: bool,
+    /// `tui.density = "compact"`: the compact layout at every terminal size.
+    compact_density: bool,
 }
 
 impl SearchDashboardState {
+    fn with_view_settings(mut self, tui: &crate::config::TuiConfig) -> Self {
+        self.show_explanations = tui.show_explanations;
+        self.compact_density = tui.density == crate::config::Density::Compact;
+        self
+    }
+
     fn new(
         status_payload: FsfsStatusPayload,
         mode_hint: Option<String>,
@@ -1378,6 +1387,8 @@ impl SearchDashboardState {
             typing_cadence_ewma_ms: None,
             last_query_edit_at: None,
             result_limit: result_limit.max(1),
+            show_explanations: true,
+            compact_density: false,
         }
     }
 
@@ -20949,7 +20960,8 @@ impl FsfsRuntime {
             Some(limit) => limit.max(1),
         };
         let mut state =
-            SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color);
+            SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color)
+                .with_view_settings(&self.config.tui);
         let mut resources = self
             .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
             .await?;
@@ -20985,11 +20997,11 @@ impl FsfsRuntime {
         resources: &mut SearchExecutionResources,
         no_color: bool,
     ) -> SearchResult<()> {
+        // `tui.frame_budget_ms`: the minimum interval between redraws.
+        let min_render_interval = Duration::from_millis(u64::from(self.config.tui.frame_budget_ms));
         let mut last_status_refresh = Instant::now();
         let mut last_render = Instant::now()
-            .checked_sub(Duration::from_millis(
-                FSFS_TUI_SEARCH_RENDER_MIN_INTERVAL_MS,
-            ))
+            .checked_sub(min_render_interval)
             .unwrap_or_else(Instant::now);
         let mut render_pending = true;
 
@@ -21151,7 +21163,6 @@ impl FsfsRuntime {
             }
 
             let elapsed_since_render = last_render.elapsed();
-            let min_render_interval = Duration::from_millis(FSFS_TUI_SEARCH_RENDER_MIN_INTERVAL_MS);
             let idle_heartbeat_interval =
                 Duration::from_millis(FSFS_TUI_SEARCH_RENDER_IDLE_HEARTBEAT_MS);
             let should_render = (render_pending && elapsed_since_render >= min_render_interval)
@@ -23858,7 +23869,7 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
     if area.is_empty() {
         return;
     }
-    if area.width < 92 || area.height < 22 {
+    if state.compact_density || area.width < 92 || area.height < 22 {
         render_search_dashboard_compact(frame, state, no_color);
         return;
     }
@@ -23988,22 +23999,23 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
         let vector_rank_label = if hash_control { "hash#" } else { "semantic#" };
         let vector_rank = search_hit_vector_rank(hit, hash_control)
             .map_or_else(|| "–".to_owned(), |rank| format_count_usize(rank + 1));
-        vec![
-            Line::from(Span::styled(
-                truncate_middle(
-                    &hit.path,
-                    usize::from(left[2].width).saturating_sub(10).max(24),
-                ),
-                ui_fg(no_color, PackedRgba::rgb(224, 238, 255)).bold(),
-            )),
-            Line::from(Span::styled(
+        let mut lines = vec![Line::from(Span::styled(
+            truncate_middle(
+                &hit.path,
+                usize::from(left[2].width).saturating_sub(10).max(24),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(224, 238, 255)).bold(),
+        ))];
+        if state.show_explanations {
+            lines.push(Line::from(Span::styled(
                 format!(
                     "score={:.3}  source={}  lexical#={}  {vector_rank_label}={}",
                     hit.score, source, lexical_rank, vector_rank
                 ),
                 ui_fg(no_color, PackedRgba::rgb(173, 194, 229)),
-            )),
-            Line::from_spans(hit.snippet.as_deref().map_or_else(
+            )));
+        }
+        lines.push(Line::from_spans(hit.snippet.as_deref().map_or_else(
                 || {
                     vec![Span::styled(
                         "No snippet available for this match.".to_owned(),
@@ -24023,8 +24035,8 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
                         ui_fg(no_color, PackedRgba::rgb(152, 174, 211)).bold(),
                     )
                 },
-            )),
-        ]
+            )));
+        lines
     } else if let Some(error) = state.last_error.as_deref() {
         vec![
             Line::from(Span::styled(
@@ -31153,6 +31165,65 @@ mod tests {
             state.quality_debounce_window_ms,
             FSFS_TUI_QUALITY_DEBOUNCE_MS
         );
+    }
+
+    #[test]
+    fn dashboard_honours_show_explanations_and_compact_density() {
+        fn rendered(tui: &crate::config::TuiConfig) -> String {
+            let mut state =
+                SearchDashboardState::new(test_dashboard_status_payload(), None, 10, true)
+                    .with_view_settings(tui);
+            state.phase_payloads.push(SearchPayload::new(
+                "otters".to_owned(),
+                SearchOutputPhase::Initial,
+                1,
+                vec![SearchHitPayload {
+                    rank: 1,
+                    path: "notes/otters.md".to_owned(),
+                    line: Some(1),
+                    score: 0.5,
+                    snippet: Some("river otters".to_owned()),
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(0),
+                    hash_rank: None,
+                    in_both_sources: true,
+                }],
+            ));
+            let (width, height) = (140, 40);
+            let mut pool = super::GraphemePool::new();
+            let mut frame = super::Frame::new(width, height, &mut pool);
+            super::render_search_dashboard_frame(&mut frame, &state, true);
+            let mut text = String::new();
+            for y in 0..height {
+                for x in 0..width {
+                    text.push(
+                        frame
+                            .buffer
+                            .get(x, y)
+                            .and_then(|cell| cell.content.as_char())
+                            .unwrap_or(' '),
+                    );
+                }
+                text.push('\n');
+            }
+            text
+        }
+
+        let mut tui = crate::config::TuiConfig::default();
+        let full = rendered(&tui);
+        assert!(full.contains("lexical#="), "{full}");
+        assert!(full.contains("corpus health"), "{full}");
+
+        tui.show_explanations = false;
+        let quiet = rendered(&tui);
+        assert!(!quiet.contains("lexical#="), "{quiet}");
+        assert!(quiet.contains("otters.md"), "{quiet}");
+
+        tui.show_explanations = true;
+        tui.density = crate::config::Density::Compact;
+        let compact = rendered(&tui);
+        assert!(!compact.contains("corpus health"), "{compact}");
+        assert!(compact.contains("fsfs search"), "{compact}");
     }
 
     #[test]
