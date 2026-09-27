@@ -1285,7 +1285,7 @@ fn required_default_field(
     if !matches!(
         field.kind,
         FieldKind::Text {
-            analyzer: AnalyzerKind::FrankensearchDefault,
+            analyzer: AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams,
             ..
         }
     ) {
@@ -3669,7 +3669,7 @@ impl Grammar {
         let queryable = match descriptor.kind {
             FieldKind::Keyword => true,
             FieldKind::Text {
-                analyzer: AnalyzerKind::FrankensearchDefault,
+                analyzer: AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams,
                 ..
             } => true,
             FieldKind::I64 { indexed, fast } | FieldKind::U64 { indexed, fast } => indexed || fast,
@@ -3727,14 +3727,17 @@ impl Grammar {
             }
             FieldKind::Keyword => Some(QueryValue::Str(raw.to_owned())),
             FieldKind::Text {
-                analyzer: AnalyzerKind::FrankensearchDefault,
+                analyzer: AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams,
                 ..
             } => {
+                let FieldKind::Text { analyzer: analyzer_kind, .. } = descriptor.kind else {
+                    return None;
+                };
                 let mut analyzer = FrankensearchTokenizer::default();
                 let mut terms = Vec::new();
                 let report = analyze_admitted(
                     &mut analyzer,
-                    AnalyzerKind::FrankensearchDefault,
+                    analyzer_kind,
                     raw,
                     &mut |token| terms.push(token.text.clone()),
                 )
@@ -3769,14 +3772,17 @@ impl Grammar {
     ) -> Option<Query> {
         match descriptor.kind {
             FieldKind::Text {
-                analyzer: AnalyzerKind::FrankensearchDefault,
+                analyzer: AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams,
                 ..
             } => {
+                let FieldKind::Text { analyzer: analyzer_kind, .. } = descriptor.kind else {
+                    return None;
+                };
                 let mut analyzer = FrankensearchTokenizer::default();
                 let mut terms = Vec::new();
                 let Ok(report) = analyze_admitted(
                     &mut analyzer,
-                    AnalyzerKind::FrankensearchDefault,
+                    analyzer_kind,
                     &atom.raw,
                     &mut |token| {
                         terms.push(PositionedTerm::new(token.position, token.text.clone()));
