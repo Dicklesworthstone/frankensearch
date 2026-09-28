@@ -15968,6 +15968,7 @@ impl FsfsRuntime {
             retained_reuse::prepare_legacy_reuse(cx).await?;
         }
 
+        self.refuse_foreign_target_root(&target_root)?;
         let root_decision = self.config.discovery.evaluate_root(&target_root, None);
         if !root_decision.include() {
             return Err(SearchError::InvalidConfig {
@@ -17549,6 +17550,43 @@ impl FsfsRuntime {
         }
 
         Ok(payload)
+    }
+
+    /// The scope-privacy contract limits default discovery to directories the
+    /// user owns. `/`, `/etc` or another user's home is indexed only when it
+    /// lies under a root listed explicitly in `discovery.roots`.
+    #[cfg(unix)]
+    fn refuse_foreign_target_root(&self, target_root: &Path) -> SearchResult<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let owner = fs::metadata(target_root)?.uid();
+        if owner == rustix::process::geteuid().as_raw() {
+            return Ok(());
+        }
+        let opted_in = self
+            .config
+            .discovery
+            .roots
+            .iter()
+            .filter(|root| root.as_str() != ".")
+            .filter_map(|root| absolutize_path(Path::new(root)).ok())
+            .any(|root| target_root.starts_with(root));
+        if opted_in {
+            return Ok(());
+        }
+        Err(SearchError::InvalidConfig {
+            field: "discovery.roots".to_owned(),
+            value: target_root.display().to_string(),
+            reason: format!(
+                "fsfs indexes directories you own; this one belongs to uid {owner}. To index it anyway, list it under discovery.roots in your config file"
+            ),
+        })
+    }
+
+    #[cfg(not(unix))]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn refuse_foreign_target_root(&self, _target_root: &Path) -> SearchResult<()> {
+        Ok(())
     }
 
     fn resolve_target_root(&self) -> SearchResult<PathBuf> {
@@ -43867,6 +43905,35 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexing_a_root_owned_by_another_user_needs_an_explicit_opt_in() {
+        use std::os::unix::fs::MetadataExt;
+
+        let foreign = Path::new("/");
+        if fs::metadata(foreign).expect("stat /").uid() == rustix::process::geteuid().as_raw() {
+            return; // running as the owner of `/` (root in a container): nothing is foreign
+        }
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let SearchError::InvalidConfig { field, reason, .. } = runtime
+            .refuse_foreign_target_root(foreign)
+            .expect_err("`/` belongs to another user")
+        else {
+            panic!("expected a configuration refusal");
+        };
+        assert_eq!(field, "discovery.roots");
+        assert!(reason.contains("discovery.roots"), "{reason}");
+        let own = tempfile::tempdir().expect("tempdir");
+        runtime
+            .refuse_foreign_target_root(own.path())
+            .expect("a directory the user owns needs no opt-in");
+        let mut config = FsfsConfig::default();
+        config.discovery.roots = vec![".".to_owned(), "/".to_owned()];
+        FsfsRuntime::new(config)
+            .refuse_foreign_target_root(foreign)
+            .expect("a root listed in discovery.roots is opted in");
     }
 
     #[test]

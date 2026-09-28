@@ -306,6 +306,13 @@ qualified; individual results below are narrower than release acceptance.
   them first: `server`, next to 200 `server-*.log` files, returned only logs
   in a stress test. Multi-word queries still ranked the matching content first.
 
+- **`fsfs index /` no longer walks the whole machine.** Indexing `/`, `/etc`
+  or another user's home scanned whatever the process could read, including
+  `/proc`, `/sys` and other users' files. The privacy contract limits default
+  discovery to directories the user owns. A target owned by another user is
+  now refused with its owner's uid, unless it lies under a root listed in
+  `discovery.roots` in the config file (bd-39q1b).
+
 - **Private keys stay out of the index, and snippets mask credentials.** Dot
   directories such as `.ssh` were already skipped, but a key file elsewhere
   (`deploy/server.pem`) was indexed, and search printed its key material. So
