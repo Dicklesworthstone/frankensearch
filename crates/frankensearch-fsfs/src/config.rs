@@ -1826,12 +1826,15 @@ fn apply_file_patch(
     warnings: &mut Vec<ConfigWarning>,
     file_profile_overrides: &mut ProfileSourceOverrides,
     config_toml: &str,
+    config_path: Option<&Path>,
 ) -> SearchResult<()> {
-    warnings.extend(collect_unknown_key_warnings(config_toml)?);
+    // Name the file that failed: user, project and explicit files layer.
+    let source = config_path.map_or_else(|| "<toml>".to_owned(), |path| path.display().to_string());
+    warnings.extend(collect_unknown_key_warnings(config_toml, &source)?);
     let patch: FsfsConfigPatch =
         toml::from_str(config_toml).map_err(|error| SearchError::InvalidConfig {
             field: "config_file".into(),
-            value: "<toml>".into(),
+            value: source.clone(),
             reason: error.to_string(),
         })?;
     merge_profile_overrides(
@@ -1925,6 +1928,7 @@ where
             &mut warnings,
             &mut file_profile_overrides,
             config_toml,
+            user_config_path,
         )?;
         if let Some(path) = user_config_path {
             resolve_relative_config_paths(&mut config, path);
@@ -1937,6 +1941,7 @@ where
             &mut warnings,
             &mut file_profile_overrides,
             config_toml,
+            project_config_path,
         )?;
         if let Some(path) = project_config_path {
             resolve_relative_config_paths(&mut config, path);
@@ -2818,17 +2823,20 @@ fn apply_cli_overrides(config: &mut FsfsConfig, cli: &CliOverrides) -> ProfileSo
 }
 
 #[allow(clippy::too_many_lines)]
-fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWarning>> {
+fn collect_unknown_key_warnings(
+    config_toml: &str,
+    source: &str,
+) -> SearchResult<Vec<ConfigWarning>> {
     let value: toml::Value =
         toml::from_str(config_toml).map_err(|error| SearchError::InvalidConfig {
             field: "config_file".into(),
-            value: "<toml>".into(),
+            value: source.to_owned(),
             reason: error.to_string(),
         })?;
 
     let root = value.as_table().ok_or_else(|| SearchError::InvalidConfig {
         field: "config_file".into(),
-        value: "<toml>".into(),
+        value: source.to_owned(),
         reason: "expected table at root".into(),
     })?;
 
@@ -4552,6 +4560,33 @@ mod tests {
 
         assert_eq!(result.config.search.default_limit, 42);
         assert_eq!(result.config_file_used, Some(config_file));
+    }
+
+    #[test]
+    fn a_malformed_config_layer_is_named_in_the_error() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let user = directory.path().join("user.toml");
+        let project = directory.path().join("project.toml");
+        fs::write(&user, "[search]\ndefault_limit = 42\n").expect("write user");
+        for (broken, reason) in [
+            ("[search\ndefault_limit = 42\n", "unclosed table"),
+            ("[search]\ndefault_limit = \"many\"\n", "invalid type"),
+        ] {
+            fs::write(&project, broken).expect("write project");
+            let error = load_from_layered_sources(
+                Some(&project),
+                Some(&user),
+                &HashMap::new(),
+                &CliOverrides::default(),
+                directory.path(),
+            )
+            .expect_err("a malformed project layer fails");
+            let SearchError::InvalidConfig { field, value, .. } = error else {
+                panic!("expected a configuration error, got {error:?}");
+            };
+            assert_eq!(field, "config_file", "{reason}");
+            assert_eq!(value, project.display().to_string(), "{reason}");
+        }
     }
 
     #[test]

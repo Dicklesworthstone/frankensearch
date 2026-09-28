@@ -306,6 +306,11 @@ qualified; individual results below are narrower than release acceptance.
   them first: `server`, next to 200 `server-*.log` files, returned only logs
   in a stress test. Multi-word queries still ranked the matching content first.
 
+- **A malformed config file is named in the error.** A TOML syntax or type
+  error reported the file as `config_file = "<toml>"`. With explicit, project
+  and user files layered, users could not tell which file to fix. The error now
+  names the file's path (bd-b3mwi).
+
 - **Keyword search finds `HashMap::new`, `std::io` and URLs.** The keyword
   parser reads `word:` at the start of a term as a field name and drops the
   fragment when no such field exists. So a Rust path, a URL or `TODO:` lost its
