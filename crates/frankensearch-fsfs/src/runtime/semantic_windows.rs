@@ -910,6 +910,8 @@ mod tests {
             let mut config = FsfsConfig::default();
             config.indexing.offline = true;
             config.indexing.quality_model.clear();
+            // The prefix arm: one fast vector per file.
+            config.indexing.fast_window_max_per_file = 1;
             config.search.fast_only = true;
             config.search.rerank = false;
             "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);

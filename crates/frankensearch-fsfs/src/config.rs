@@ -863,8 +863,9 @@ pub struct IndexingConfig {
     #[serde(default)]
     pub offline: bool,
     pub embedding_batch_size: usize,
-    /// Maximum fast-tier passages per source. One preserves prefix embedding;
-    /// larger values opt into bounded overlapping full-document coverage.
+    /// Maximum fast-tier passages per source: overlapping windows cover up to
+    /// this many 2,000-character spans of each file. One embeds only the
+    /// prefix, which on long source files ranks below keyword search.
     #[serde(default = "default_fast_window_max_per_file")]
     pub fast_window_max_per_file: usize,
     pub reindex_on_change: bool,
@@ -894,8 +895,11 @@ impl Default for IndexingConfig {
     }
 }
 
+/// Windows by default: on 253 judged code queries a prefix-only fast tier put
+/// hybrid search far below keyword search (nDCG@10 0.35 vs 0.59). With 128
+/// windows it matches keyword search there, and the BEIR sets are unchanged.
 const fn default_fast_window_max_per_file() -> usize {
-    1
+    128
 }
 
 // A `[search]` section mirrors its TOML keys one to one; the on/off knobs
@@ -5669,7 +5673,7 @@ mod tests {
         assert_eq!(cfg.quality_model, "all-MiniLM-L6-v2");
         assert!(!cfg.offline);
         assert_eq!(cfg.embedding_batch_size, 64);
-        assert_eq!(cfg.fast_window_max_per_file, 1);
+        assert_eq!(cfg.fast_window_max_per_file, 128);
         assert!(cfg.reindex_on_change);
         assert!(!cfg.watch_mode);
     }
@@ -5707,9 +5711,11 @@ mod tests {
         let serialized = serde_json::to_value(super::IndexingConfig::default()).unwrap();
         let mut old = serialized.as_object().unwrap().clone();
         old.remove("fast_window_max_per_file");
+        // A config file that predates the key gets today's default; indexes
+        // it built keep their own policy in their sentinel.
         let decoded: super::IndexingConfig =
             serde_json::from_value(serde_json::Value::Object(old)).unwrap();
-        assert_eq!(decoded.fast_window_max_per_file, 1);
+        assert_eq!(decoded.fast_window_max_per_file, 128);
     }
 
     #[test]

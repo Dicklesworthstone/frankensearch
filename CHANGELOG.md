@@ -306,6 +306,21 @@ qualified; individual results below are narrower than release acceptance.
   them first: `server`, next to 200 `server-*.log` files, returned only logs
   in a stress test. Multi-word queries still ranked the matching content first.
 
+- **Hybrid search no longer ranks code below keyword search.** The fast tier
+  embedded only the first 2,000 characters of each file. On long source files
+  those vectors are near noise, and fusing them pushed real keyword hits out
+  of the top ten. On the repository's 253 judged code queries, hybrid scored
+  nDCG@10 0.349 against keyword-only 0.590. `indexing.fast_window_max_per_file`
+  now defaults to 128 overlapping windows per file. Hybrid then matches
+  keyword-only on code (0.581, within the confidence interval) and recalls
+  more (R@100 0.93 against 0.89). On BEIR SciFact, NFCorpus and ArguAna,
+  Refined still beats keyword-only by 0.03 to 0.05, as it did before. `fsfs
+  watch` used to refuse any windowed index. It now keeps a changed file's
+  windows exact, retires a deleted file's rows, and republishes the window
+  membership after each batch. Each existing index is rebuilt once, on its next
+  `fsfs index`. Set the option to `1` to keep prefix-only vectors (bd-hg0uq,
+  bd-oowfm, bd-yen0x).
+
 - **`fsfs index /` no longer walks the whole machine.** Indexing `/`, `/etc`
   or another user's home scanned whatever the process could read, including
   `/proc`, `/sys` and other users' files. The privacy contract limits default

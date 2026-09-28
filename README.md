@@ -455,35 +455,38 @@ surrounding context to the cross-encoder. When Quill holds the document body,
 this also preserves the indexed version after a source edit or deletion and
 uses extracted PDF text. Vector-only indexes use a bounded source-text read.
 
-### Fast semantic windows (unreleased, opt-in)
+### Fast semantic windows (unreleased, on by default)
 
-To index semantic content beyond each file's opening, set the maximum number
-of fast-tier windows in your project `fsfs.toml` or user configuration:
+The fast tier embeds up to 128 overlapping windows of each file, not just its
+opening. The cap is `indexing.fast_window_max_per_file` in your project
+`fsfs.toml` or user configuration; `1` restores prefix-only embedding:
 
 ```toml
 [indexing]
-fast_window_max_per_file = 32
+fast_window_max_per_file = 1
 ```
 
-Then run `fsfs index` with that configuration. The accepted range is `1..=128`;
-the default `1` preserves the existing prefix behavior. Larger values embed
-bounded 2,000-character passages from the full lexical text, including code
-blocks. Adjacent windows overlap by 200 characters. The cap retains a final
+The accepted range is `1..=128`. An index keeps the policy it was built with
+until the next `fsfs index`, which rebuilds it under the configured one.
+Windows are bounded 2,000-character passages of the full lexical text,
+including code blocks. Adjacent windows overlap by 200 characters. The cap retains a final
 window at the end of a long file, but capped files can still have gaps in
 semantic coverage. More windows increase fast-tier embedding work and index
 size. The quality tier keeps one bounded prefix per source file; for a
 windowed source its blend weight shrinks with the share of the file that
 prefix covers.
 
-For source code, windows are the largest measured ranking gain. On the
-repository's 253 judged code queries
-(`docs/quality_harness/fsfs_code_product_eval.py`), nDCG@10 rises from 0.308
-to 0.570 for Initial and from 0.349 to 0.575 for Refined at
-`fast_window_max_per_file = 128` (32 windows reach 0.499 Initial); keyword-only
-search scores 0.569 there. BEIR SciFact, NFCorpus and ArguAna change by less
-than 0.003 at 128. On that 579-file, 35 MB tree the index grows from 89 to
-106 MB, a cold build takes about 28 s instead of 23 s, and a search answers in
-about 26 ms instead of 21 ms (median, both phases).
+Windows are why hybrid search is the default. On the repository's 253 judged
+code queries (`docs/quality_harness/fsfs_code_product_eval.py`), prefix-only
+vectors put hybrid search far below keyword-only search: nDCG@10 0.310
+Initial and 0.349 Refined against 0.590. With 128 windows hybrid matches it
+(0.577 and 0.581, within the confidence interval) and recalls more (R@100
+0.93 against 0.89). On BEIR SciFact, NFCorpus and ArguAna, Refined beats
+keyword-only search either way (0.690, 0.339 and 0.365 against 0.653, 0.305
+and 0.314), and windows change it by less than 0.002. On that 579-file,
+35 MB tree the index grows from 89 to 106 MB, a cold build takes about 28 s
+instead of 23 s, and a search answers in about 26 ms instead of 21 ms
+(median, both phases).
 
 The index completion JSON includes `fast_window_coverage`: completed source
 and window counts, covered and total canonical characters, and the number of
@@ -499,12 +502,10 @@ fragment. Queries use the window layout saved with the index, so the indexing
 setting is not required merely to search it.
 
 Reindexing verifies every window before reusing a source's embeddings and
-retires obsolete rows when a file shrinks or disappears. Complete-generation
-stores support windowed append and deletion through successor publication.
-Legacy mutable watchers refuse a window-enabled configuration or generation
-before starting writes; use complete-generation watching or repeat one-shot
-indexing for those indexes. Keep the window setting when rebuilding or
-watching if you want to retain that indexing policy.
+retires obsolete rows when a file shrinks or disappears. `fsfs watch` keeps
+the windows of a changed file current the same way, and a deleted file loses
+all of its rows. Complete-generation stores support windowed append and
+deletion through successor publication.
 
 ### Query syntax
 

@@ -2863,6 +2863,67 @@ struct LiveIngestPipeline {
     quality_tier: Option<LiveQualityTier>,
     canonicalizer: DefaultCanonicalizer,
     storage_db_path: Option<PathBuf>,
+    /// Present when the watched generation was built with fast windows.
+    windows: Option<LiveWindowMembership>,
+}
+
+/// The membership a generation built with fast windows must keep exact for
+/// search: each semantic source's window plan, its rows, and the sentinel
+/// that counts them. Loaded when watch starts, marked incomplete while a batch
+/// mutates rows, and republished after the batch's lexical commit.
+struct LiveWindowMembership {
+    runtime: FsfsRuntime,
+    index_root: PathBuf,
+    max_per_file: usize,
+    state: std::sync::Mutex<(BTreeMap<String, IndexManifestEntry>, IndexSentinel)>,
+}
+
+impl LiveWindowMembership {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, (BTreeMap<String, IndexManifestEntry>, IndexSentinel)> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Every row the current plan of `source` owns (row zero is the source ID).
+    fn rows_of(&self, source: &str) -> Vec<String> {
+        self.lock()
+            .0
+            .get(source)
+            .and_then(|entry| entry.fast_windows.as_ref())
+            .map_or_else(|| vec![source.to_owned()], |plan| plan.row_ids(source))
+    }
+
+    fn record(&self, entry: IndexManifestEntry) {
+        self.lock().0.insert(entry.file_key.clone(), entry);
+    }
+
+    fn forget(&self, source: &str) {
+        self.lock().0.remove(source);
+    }
+
+    /// A partial multirow update cannot advertise complete coverage.
+    fn mark_incomplete(&self) -> SearchResult<()> {
+        let mut state = self.lock();
+        state.1.generation_complete = false;
+        self.runtime.write_index_sentinel(&self.index_root, &state.1)
+    }
+
+    fn publish(&self) -> SearchResult<()> {
+        let (manifests, sentinel) = self.lock().clone();
+        self.runtime
+            .write_window_mutation_membership(&self.index_root, manifests, sentinel, "watch")?;
+        let refreshed = FsfsRuntime::read_index_sentinel(&self.index_root)?.ok_or_else(|| {
+            SearchError::IndexCorrupted {
+                path: self.index_root.join(FSFS_SENTINEL_FILE),
+                detail: "window membership publication left no sentinel".to_owned(),
+            }
+        })?;
+        self.lock().1 = refreshed;
+        Ok(())
+    }
 }
 
 struct LiveQualityTier {
@@ -3058,7 +3119,13 @@ impl LiveIngestPipeline {
             quality_tier: None,
             canonicalizer: DefaultCanonicalizer::default(),
             storage_db_path: None,
+            windows: None,
         }
+    }
+
+    fn with_window_membership(mut self, windows: LiveWindowMembership) -> Self {
+        self.windows = Some(windows);
+        self
     }
 
     fn with_storage_db_path(mut self, storage_db_path: PathBuf) -> Self {
@@ -3154,7 +3221,122 @@ impl LiveIngestPipeline {
             "watch_delete",
         )];
         self.apply_lexical_mutations(cx, &mutations).await?;
-        self.soft_delete_vector(rel_key)?;
+        self.windows.as_ref().map_or_else(
+            || self.soft_delete_vector(rel_key),
+            |windows| self.retire_window_source(windows, rel_key),
+        )
+    }
+
+    /// Tombstone fast rows of a windowed generation, invalidating the sidecar
+    /// the in-place tombstones make stale.
+    fn soft_delete_window_rows(&self, rows: &[&str]) -> SearchResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut vi = self
+            .vector_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = vi.path().to_path_buf();
+        let removed = vi.soft_delete_batch(rows)?;
+        drop(vi);
+        if removed > 0 {
+            invalidate_vector_sidecars([path.as_path()], "watch window retire");
+        }
+        Ok(())
+    }
+
+    /// Remove a source from a windowed generation: every window row its plan
+    /// owned, its quality row, and its membership.
+    fn retire_window_source(
+        &self,
+        windows: &LiveWindowMembership,
+        rel_key: &str,
+    ) -> SearchResult<()> {
+        let rows = windows.rows_of(rel_key);
+        self.soft_delete_window_rows(&rows.iter().map(String::as_str).collect::<Vec<_>>())?;
+        windows.forget(rel_key);
+        self.soft_delete_vector(rel_key)
+    }
+
+    /// Apply one watched file to a windowed generation, as one-shot indexing
+    /// plans it: a semantic source embeds every window of its lexical text,
+    /// other classes keep no fast rows. New rows are appended before the rows
+    /// only the previous plan owned are retired, so a failure keeps the old
+    /// rows searchable.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_window_upsert(
+        &self,
+        cx: &Cx,
+        windows: &LiveWindowMembership,
+        rel_key: &str,
+        revision: i64,
+        ingestion_class: IngestionClass,
+        lexical_text: &str,
+        canonical: &str,
+    ) -> SearchResult<()> {
+        let semantic = ingestion_class == IngestionClass::FullSemanticLexical;
+        let plan = if semantic {
+            semantic_windows::validate_source_id(rel_key)?;
+            Some(semantic_windows::plan(lexical_text, windows.max_per_file)?)
+        } else {
+            None
+        };
+        let mut rows = Vec::new();
+        if let Some(plan) = plan.as_ref() {
+            for (ordinal, text) in plan.texts(lexical_text)?.into_iter().enumerate() {
+                let embedding = self.embedder.embed_admitted(cx, text).await?;
+                rows.push((semantic_windows::row_id(rel_key, ordinal), embedding));
+            }
+        }
+        if !rows.is_empty() {
+            self.vector_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .append_batch(&rows)?;
+        }
+        let current = rows
+            .iter()
+            .map(|(row, _)| row.as_str())
+            .collect::<HashSet<_>>();
+        let previous = windows.rows_of(rel_key);
+        let stale = previous
+            .iter()
+            .map(String::as_str)
+            .filter(|row| !current.contains(row))
+            .collect::<Vec<_>>();
+        self.soft_delete_window_rows(&stale)?;
+        if let Some(tier) = self.quality_tier.as_ref() {
+            if semantic {
+                self.append_quality_vector(
+                    cx,
+                    tier,
+                    rel_key,
+                    canonical,
+                    "vector.plan.fast_and_quality",
+                )
+                .await?;
+            } else {
+                let mut quality = tier
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let path = quality.path().to_path_buf();
+                let removed = quality.soft_delete(rel_key)?;
+                drop(quality);
+                if removed {
+                    invalidate_vector_sidecars([path.as_path()], "watch window retire");
+                }
+            }
+        }
+        windows.record(IndexManifestEntry {
+            file_key: rel_key.to_owned(),
+            revision,
+            ingestion_class: ingestion_class_label(ingestion_class).to_owned(),
+            canonical_bytes: u64::try_from(canonical.len()).unwrap_or(u64::MAX),
+            reason_code: ingestion_plan_reason(ingestion_class).to_owned(),
+            fast_windows: plan,
+        });
         Ok(())
     }
 
@@ -3518,6 +3700,7 @@ impl LiveIngestPipeline {
         if let Some(classification) = classification_metadata.as_ref() {
             doc = attach_file_classification_metadata(doc, classification);
         }
+        let window_text = self.windows.as_ref().map(|_| lexical_text.clone());
         let mut mutation = LexicalMutation::upsert(
             rel_key.clone(),
             u64::try_from(revision).unwrap_or(0),
@@ -3528,6 +3711,22 @@ impl LiveIngestPipeline {
         mutation.title.clone_from(&doc.title);
         mutation.metadata.clone_from(&doc.metadata);
         self.apply_lexical_mutations(cx, &[mutation]).await?;
+        // A windowed generation's fast rows are written inline: the storage
+        // queue embeds one whole-file row per document, which the window
+        // membership would reject.
+        if let (Some(windows), Some(window_text)) = (self.windows.as_ref(), window_text) {
+            self.apply_window_upsert(
+                cx,
+                windows,
+                &rel_key,
+                revision,
+                ingestion_class,
+                &window_text,
+                &canonical,
+            )
+            .await?;
+            return Ok(true);
+        }
 
         if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
             if let Some(storage_ctx) = storage_ctx {
@@ -3648,6 +3847,7 @@ impl LiveIngestPipeline {
         if let Some(classification) = classification_metadata.as_ref() {
             doc = attach_file_classification_metadata(doc, classification);
         }
+        let window_text = self.windows.as_ref().map(|_| lexical_text.clone());
         let mut mutation = LexicalMutation::upsert(
             rel_key.clone(),
             u64::try_from(revision).unwrap_or(0),
@@ -3659,7 +3859,18 @@ impl LiveIngestPipeline {
         mutation.metadata = doc.metadata;
         self.apply_lexical_mutations(cx, &[mutation]).await?;
 
-        if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
+        if let (Some(windows), Some(window_text)) = (self.windows.as_ref(), window_text) {
+            self.apply_window_upsert(
+                cx,
+                windows,
+                &rel_key,
+                revision,
+                ingestion_class,
+                &window_text,
+                &canonical,
+            )
+            .await?;
+        } else if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
             let vector_plan = Self::plan_live_vector_upsert(
                 self.quality_tier.is_some(),
                 &rel_key,
@@ -3700,6 +3911,10 @@ impl LiveIngestPipeline {
         // acknowledge the vector work: every operation still runs below.
         if self.lexical_index.has_uncommitted_changes() {
             self.lexical_index.commit(cx).await?;
+        }
+        let windows = self.windows.as_ref().filter(|_| !batch.is_empty());
+        if let Some(windows) = windows {
+            windows.mark_incomplete()?;
         }
         let storage_ctx = self.build_storage_batch_context()?;
         let mut count = 0_usize;
@@ -3743,6 +3958,11 @@ impl LiveIngestPipeline {
                 reindexed = count,
                 "watcher ingest batch committed"
             );
+        }
+        // The window rows and the lexical commit agree now; republish the
+        // membership that makes the generation complete again.
+        if let Some(windows) = windows {
+            windows.publish()?;
         }
 
         Ok(count)
@@ -6681,13 +6901,6 @@ impl FsfsRuntime {
         );
 
         if matches!(command, CliCommand::Index | CliCommand::Watch) {
-            if command == CliCommand::Watch
-                || self.cli_input.watch
-                || self.config.indexing.watch_mode
-            {
-                let target_root = self.resolve_target_root()?;
-                self.refuse_legacy_window_watch(&self.resolve_index_root(&target_root)?)?;
-            }
             let _cancellation_scope = shutdown.map(|shutdown| shutdown.cancellation_scope(cx));
             self.run_one_shot_index_scaffold(cx, command).await?;
         }
@@ -12655,31 +12868,36 @@ impl FsfsRuntime {
         Ok(maximum)
     }
 
-    fn refuse_legacy_window_watch(&self, index_root: &Path) -> SearchResult<()> {
-        let manifests_have_windows =
-            Self::read_index_manifest_file(index_root, FSFS_VECTOR_MANIFEST_FILE)?
-                .is_some_and(|entries| entries.iter().any(|entry| entry.fast_windows.is_some()));
+    /// The window membership legacy watch keeps exact, or `None` for a
+    /// generation without fast windows. The published rows must already match
+    /// their plans: watch edits a consistent generation and never repairs one.
+    fn load_watch_window_membership(
+        &self,
+        index_root: &Path,
+    ) -> SearchResult<Option<LiveWindowMembership>> {
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
-        let rows_have_windows = if vector_path.exists() {
-            VectorIndex::open_read_only(&vector_path)?
-                .live_doc_ids()?
-                .iter()
-                .any(|row| row.contains('\0'))
-        } else {
-            false
-        };
-        if self.config.indexing.fast_window_max_per_file > 1
-            || Self::fast_window_policy_at_root(index_root)? > 1
-            || manifests_have_windows
-            || rows_have_windows
-        {
-            return Err(SearchError::InvalidConfig {
-                field: "indexing.fast_window_max_per_file".to_owned(),
-                value: String::new(),
-                reason: "legacy watch and its storage queue cannot update fast semantic windows; use complete-generation watch or a one-shot index rebuild".to_owned(),
-            });
+        if vector_path.exists() {
+            semantic_windows::load_mapping(index_root, &VectorIndex::open_read_only(&vector_path)?)?;
         }
-        Ok(())
+        let max_per_file = Self::fast_window_policy_at_root(index_root)?;
+        if max_per_file == 1 {
+            return Ok(None);
+        }
+        let rebuild = |what: &str| SearchError::InvalidConfig {
+            field: "indexing.fast_window_max_per_file".to_owned(),
+            value: index_root.display().to_string(),
+            reason: format!("a windowed generation has no {what}; rebuild it with `fsfs index`"),
+        };
+        let manifests = Self::read_matching_manifest_generation(index_root)?
+            .ok_or_else(|| rebuild("matching source manifests"))?;
+        let sentinel =
+            Self::read_index_sentinel(index_root)?.ok_or_else(|| rebuild("completion sentinel"))?;
+        Ok(Some(LiveWindowMembership {
+            runtime: self.clone(),
+            index_root: index_root.to_path_buf(),
+            max_per_file,
+            state: std::sync::Mutex::new((manifests, sentinel)),
+        }))
     }
 
     fn write_window_mutation_membership(
@@ -19952,7 +20170,7 @@ impl FsfsRuntime {
     ) -> SearchResult<(LiveIngestPipeline, Arc<std::sync::Mutex<VectorIndex>>)> {
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
-        self.refuse_legacy_window_watch(&index_root)?;
+        let window_membership = self.load_watch_window_membership(&index_root)?;
         let storage_db_path = self.resolve_storage_db_path()?;
         if storage_db_path.as_os_str() != ":memory:"
             && let Some(parent) = storage_db_path.parent()
@@ -20035,6 +20253,9 @@ impl FsfsRuntime {
         .with_storage_db_path(storage_db_path);
         if let Some((quality_index, quality_embedder)) = quality_tier {
             pipeline = pipeline.with_quality_tier(quality_index, quality_embedder);
+        }
+        if let Some(windows) = window_membership {
+            pipeline = pipeline.with_window_membership(windows);
         }
         self.repair_quarantined_lexical_gap(cx, &index_root, &pipeline)
             .await?;
@@ -43934,6 +44155,102 @@ mod tests {
         FsfsRuntime::new(config)
             .refuse_foreign_target_root(foreign)
             .expect("a root listed in discovery.roots is opted in");
+    }
+
+    #[test]
+    fn legacy_watch_keeps_fast_window_membership_exact() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            let long = |word: &str| format!("{word} window text about capybara habitats. ").repeat(400);
+            fs::write(project.join("alpha.md"), long("alpha")).expect("write alpha");
+            fs::write(project.join("beta.md"), "short beta note\n").expect("write beta");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            config.indexing.fast_window_max_per_file = 4;
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("windowed index");
+            let index_root = project.join(".frankensearch");
+            let (pipeline, _) = FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Watch,
+                    target_path: Some(project.clone()),
+                    index_dir: Some(index_root.clone()),
+                    watch: true,
+                    ..CliInput::default()
+                })
+                .build_live_ingest_pipeline(&cx)
+                .await
+                .expect("watch a windowed generation");
+            let rows_of = |source: &str| {
+                let vi = pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                vi.live_doc_ids()
+                    .expect("live rows")
+                    .into_iter()
+                    .filter(|row| super::semantic_windows::source_id(row) == source)
+                    .count()
+            };
+            // What search admits: a complete sentinel whose manifests match
+            // every live row exactly.
+            let assert_searchable = |sources: usize| {
+                let sentinel = FsfsRuntime::read_index_sentinel(&index_root)
+                    .expect("read sentinel")
+                    .expect("sentinel");
+                assert!(sentinel.generation_complete);
+                assert_eq!(sentinel.indexed_files, sources);
+                let vi = pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                super::semantic_windows::load_mapping(&index_root, &vi)
+                    .expect("rows match their plans")
+                    .expect("windowed mapping");
+            };
+            let upsert = |revision| WatchIngestOp::Upsert {
+                file_key: project.join("alpha.md").display().to_string(),
+                revision,
+                ingestion_class: IngestionClass::FullSemanticLexical,
+            };
+            assert_eq!(rows_of("alpha.md"), 4);
+
+            // Shrinking a long file retires its tail windows.
+            fs::write(project.join("alpha.md"), "alpha is short now\n").expect("shrink");
+            pipeline.apply_batch(&cx, &[upsert(20)]).await.expect("shrink batch");
+            assert_eq!(rows_of("alpha.md"), 1);
+            assert_searchable(2);
+
+            // Growing it back plans its windows again.
+            fs::write(project.join("alpha.md"), long("gamma")).expect("grow");
+            pipeline.apply_batch(&cx, &[upsert(21)]).await.expect("grow batch");
+            assert_eq!(rows_of("alpha.md"), 4);
+            assert_searchable(2);
+
+            // A deleted file loses every row and its membership.
+            fs::remove_file(project.join("beta.md")).expect("delete beta");
+            pipeline
+                .apply_batch(
+                    &cx,
+                    &[WatchIngestOp::Delete {
+                        file_key: project.join("beta.md").display().to_string(),
+                        revision: 22,
+                    }],
+                )
+                .await
+                .expect("delete batch");
+            assert_eq!(rows_of("beta.md"), 0);
+            assert_searchable(1);
+        });
     }
 
     #[test]
