@@ -59,7 +59,11 @@ impl Fixture {
             .env("XDG_CACHE_HOME", self.directory.path().join("cache"))
             .env("FRANKENSEARCH_CHECK_UPDATES", "0")
             .args([
-                "live-search", "--hybrid", "--query", "sharedtoken", "--config",
+                "live-search",
+                "--hybrid",
+                "--query",
+                "sharedtoken",
+                "--config",
             ])
             .arg(&self.config)
             .arg("--watch-source")
@@ -174,7 +178,7 @@ fn a_missing_source_is_not_replaced_with_default_discovery() {
     let missing = fixture.directory.path().join("missing-source");
     let output = Process::start(fixture.command(&missing, &fixture.store).arg("--once"))
         .finish(Duration::from_secs(15));
-    assert_preflight_failure(&output, "I/O");
+    assert_preflight_failure(&output, "index target path does not exist");
     assert!(!missing.exists());
     assert!(!fixture.store.exists());
 }
@@ -182,8 +186,12 @@ fn a_missing_source_is_not_replaced_with_default_discovery() {
 #[test]
 fn shadow_policy_is_rejected_before_a_store_is_created() {
     let fixture = Fixture::new(None, true);
-    let output = Process::start(fixture.command(&fixture.source, &fixture.store).arg("--once"))
-        .finish(Duration::from_secs(15));
+    let output = Process::start(
+        fixture
+            .command(&fixture.source, &fixture.store)
+            .arg("--once"),
+    )
+    .finish(Duration::from_secs(15));
     assert_preflight_failure(&output, "shadow");
     assert!(!fixture.store.exists());
 }
@@ -221,11 +229,12 @@ fn native_watcher_publishes_and_streams_a_renamed_file_then_stops_at_the_limit()
     )
     .unwrap();
     let fixture = Fixture::new(Some(&models), false);
-    let mut process = Process::start(
-        fixture
-            .command(&fixture.source, &fixture.store)
-            .args(["--max-updates", "2", "--timeout-ms", "300000"]),
-    );
+    let mut process = Process::start(fixture.command(&fixture.source, &fixture.store).args([
+        "--max-updates",
+        "2",
+        "--timeout-ms",
+        "300000",
+    ]));
     let first = process.wait_for_first_frame();
     assert_eq!(first["schema_version"], "fsfs.stream.live_search.hybrid.v1");
     assert_eq!(first["phase"], "initial");
@@ -269,9 +278,11 @@ fn native_watcher_publishes_and_streams_a_renamed_file_then_stops_at_the_limit()
         first["update"]["generation"]
     );
     let changes = second["update"]["changes"].as_array().unwrap();
-    assert!(changes.iter().any(|change| {
-        change["change"] == "removed" && change["doc_id"] == old_id
-    }));
+    assert!(
+        changes
+            .iter()
+            .any(|change| { change["change"] == "removed" && change["doc_id"] == old_id })
+    );
     assert!(changes.iter().any(|change| {
         change["change"] == "added"
             && Path::new(change["result"]["doc_id"].as_str().unwrap())
@@ -284,7 +295,11 @@ fn native_watcher_publishes_and_streams_a_renamed_file_then_stops_at_the_limit()
         manifest
     );
     let selected = fs::read(fixture.store.join("FSFS-CURRENT")).unwrap();
-    fs::write(fixture.source.join("after-exit.md"), "sharedtoken after exit").unwrap();
+    fs::write(
+        fixture.source.join("after-exit.md"),
+        "sharedtoken after exit",
+    )
+    .unwrap();
     std::thread::sleep(Duration::from_millis(750));
     assert_eq!(
         fs::read(fixture.store.join("FSFS-CURRENT")).unwrap(),

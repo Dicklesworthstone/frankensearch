@@ -40,6 +40,7 @@ impl ReceiptSlot {
             return Err(watch_error("watcher produced a second undelivered receipt"));
         }
         *slot = Some(generation.clone());
+        drop(slot);
         Ok(())
     }
 
@@ -71,10 +72,9 @@ where
             Poll::Ready(Ok(())) => Poll::Ready(Err(watch_error(
                 "watcher ended without a publication; no empty result is synthesized",
             ))),
-            Poll::Pending => match receipts.take()? {
-                Some(generation) => Poll::Ready(Ok(generation)),
-                None => Poll::Pending,
-            },
+            Poll::Pending => receipts
+                .take()?
+                .map_or_else(|| Poll::Pending, |generation| Poll::Ready(Ok(generation))),
         }
     })
     .await
@@ -96,8 +96,7 @@ fn emit_receipted_frame<W: Write>(
     frame: &RetainedLiveSearchFrame,
     writer: &mut W,
 ) -> SearchResult<()> {
-    if frame.generation_id != expected.id() || frame.manifest_sha256 != expected.manifest_sha256()
-    {
+    if frame.generation_id != expected.id() || frame.manifest_sha256 != expected.manifest_sha256() {
         return Err(watch_error(
             "query admission selected a different publication; the watched generation remains published",
         ));
@@ -355,9 +354,9 @@ mod tests {
     fn producer_failure_preserves_its_original_error_without_a_snapshot() {
         run_test_with_cx(|cx| async move {
             let slot = ReceiptSlot::default();
-            let mut producer = pin!(std::future::ready(Err(SearchError::Io(
-                io::Error::from(io::ErrorKind::PermissionDenied),
-            ))));
+            let mut producer = pin!(std::future::ready(Err(SearchError::Io(io::Error::from(
+                io::ErrorKind::PermissionDenied
+            ),))));
             let error = next_publication(&cx, &budget(), producer.as_mut(), &slot)
                 .await
                 .unwrap_err();

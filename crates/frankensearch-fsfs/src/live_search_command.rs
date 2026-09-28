@@ -530,19 +530,18 @@ mod tests {
     fn watch_requires_explicit_indexing_and_model_policy() {
         assert!(Options::parse(args(&["--watch-source", "/source"])).is_err());
         assert!(Options::parse(args(&["--watch-source", "/source", "--hybrid"])).is_err());
-        let options = Options::parse(args(&[
-            "--watch-source",
-            "/source",
-            "--hybrid",
-            "--once",
-        ]))
-        .unwrap();
+        let options =
+            Options::parse(args(&["--watch-source", "/source", "--hybrid", "--once"])).unwrap();
         assert_eq!(options.watch_source, Some(PathBuf::from("/source")));
         assert_eq!(options.max_updates, Some(1));
         assert!(Options::parse(args(&["--hybrid", "--watch-source"])).is_err());
         assert!(
             Options::parse(args(&[
-                "--hybrid", "--watch-source", "/a", "--watch-source", "/b",
+                "--hybrid",
+                "--watch-source",
+                "/a",
+                "--watch-source",
+                "/b",
             ]))
             .is_err()
         );
@@ -554,7 +553,12 @@ mod tests {
         for flag in ["--poll-ms", "--debounce-ms", "--max-wait-ms"] {
             assert!(
                 Options::parse(args(&[
-                    "--hybrid", "--watch-source", "/source", "--once", flag, "100",
+                    "--hybrid",
+                    "--watch-source",
+                    "/source",
+                    "--once",
+                    flag,
+                    "100",
                 ]))
                 .is_err(),
                 "{flag}"
