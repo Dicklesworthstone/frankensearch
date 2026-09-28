@@ -176,7 +176,7 @@ impl LiveSearchSource for QuillSource {
         Ok(results
             .into_iter()
             .map(|hit| LiveSearchHit {
-                doc_id: hit.doc_id,
+                doc_id: hit.doc_id.into(),
                 score: f64::from(hit.score),
                 item: hit.metadata.as_deref().cloned(),
             })
@@ -346,12 +346,25 @@ mod tests {
             publish(&cx, &store, &[IndexableDocument::new("a", "alpha")]).await;
             let mut session = session(store);
             session.poll(&cx, Instant::now()).await.unwrap();
-            let reader =
-                Arc::clone(&session.session.source_mut().admitted.as_ref().unwrap().reader);
+            let reader = Arc::clone(
+                &session
+                    .session
+                    .source_mut()
+                    .admitted
+                    .as_ref()
+                    .unwrap()
+                    .reader,
+            );
             assert!(session.poll(&cx, Instant::now()).await.unwrap().is_none());
             assert!(Arc::ptr_eq(
                 &reader,
-                &session.session.source_mut().admitted.as_ref().unwrap().reader,
+                &session
+                    .session
+                    .source_mut()
+                    .admitted
+                    .as_ref()
+                    .unwrap()
+                    .reader,
             ));
         });
     }

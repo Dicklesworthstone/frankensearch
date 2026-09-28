@@ -80,8 +80,12 @@ pub enum LiveSearchChange<T> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum LiveSearchEvent<T> {
-    Snapshot { results: Vec<RankedLiveSearchHit<T>> },
-    Delta { changes: Vec<LiveSearchChange<T>> },
+    Snapshot {
+        results: Vec<RankedLiveSearchHit<T>>,
+    },
+    Delta {
+        changes: Vec<LiveSearchChange<T>>,
+    },
 }
 
 /// A complete, independently framed committed-generation notification.
@@ -166,7 +170,9 @@ impl<T: Clone + PartialEq> LiveSearchTracker<T> {
             return Err(LiveSearchError::InvalidConfig("query must not be blank"));
         }
         if config.max_results == 0 {
-            return Err(LiveSearchError::InvalidConfig("max_results must be positive"));
+            return Err(LiveSearchError::InvalidConfig(
+                "max_results must be positive",
+            ));
         }
         if !config.min_score_delta.is_finite() || config.min_score_delta < 0.0 {
             return Err(LiveSearchError::InvalidConfig(
@@ -303,10 +309,10 @@ impl<T: Clone + PartialEq> LiveSearchTracker<T> {
                 .map_err(|_| LiveSearchError::InvalidSnapshot("rank exceeds protocol range"))?;
             let result = RankedLiveSearchHit { rank, hit };
             if let Some(old) = previous.get(result.hit.doc_id.as_str()) {
-                let changed = old.rank != result.rank
+                let differs = old.rank != result.rank
                     || old.hit.item != result.hit.item
                     || (old.hit.score - result.hit.score).abs() > self.config.min_score_delta;
-                if changed {
+                if differs {
                     changes.push(LiveSearchChange::Updated {
                         previous_rank: old.rank,
                         result: result.clone(),
@@ -528,24 +534,28 @@ mod tests {
     #[test]
     fn invalid_configuration_is_rejected() {
         for threshold in [-1.0, f64::NAN, f64::INFINITY] {
-            assert!(LiveSearchTracker::<String>::new(
+            assert!(
+                LiveSearchTracker::<String>::new(
+                    "query",
+                    LiveSearchConfig {
+                        min_score_delta: threshold,
+                        ..LiveSearchConfig::default()
+                    },
+                )
+                .is_err()
+            );
+        }
+        assert!(LiveSearchTracker::<String>::new(" \n", LiveSearchConfig::default()).is_err());
+        assert!(
+            LiveSearchTracker::<String>::new(
                 "query",
                 LiveSearchConfig {
-                    min_score_delta: threshold,
+                    max_results: 0,
                     ..LiveSearchConfig::default()
                 },
             )
-            .is_err());
-        }
-        assert!(LiveSearchTracker::<String>::new(" \n", LiveSearchConfig::default()).is_err());
-        assert!(LiveSearchTracker::<String>::new(
-            "query",
-            LiveSearchConfig {
-                max_results: 0,
-                ..LiveSearchConfig::default()
-            },
-        )
-        .is_err());
+            .is_err()
+        );
     }
 
     struct FailingWriter {
@@ -571,11 +581,8 @@ mod tests {
         for fail_flush in [false, true] {
             let mut tracker = tracker();
             tracker.apply("g1", vec![hit("a", 1.0)]).unwrap();
-            let result = tracker.emit_ndjson(
-                "g2",
-                vec![hit("b", 2.0)],
-                &mut FailingWriter { fail_flush },
-            );
+            let result =
+                tracker.emit_ndjson("g2", vec![hit("b", 2.0)], &mut FailingWriter { fail_flush });
             assert!(matches!(result, Err(LiveSearchError::Output(_))));
             assert_eq!(tracker.sequence(), 1);
             assert_eq!(tracker.generation(), Some("g1"));
@@ -593,7 +600,8 @@ mod tests {
             .emit_ndjson("g1", vec![item], &mut bytes)
             .unwrap()
             .unwrap();
-        assert_eq!(bytes.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        assert_eq!(bytes.split(|&byte| byte == b'\n').count(), 2);
+        assert_eq!(bytes.last(), Some(&b'\n'));
         let decoded: LiveSearchFrame<String> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, frame);
         let length = bytes.len();
@@ -634,7 +642,9 @@ mod tests {
 
     impl Serialize for CannotSerialize {
         fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
-            Err(serde::ser::Error::custom("intentional serialization failure"))
+            Err(serde::ser::Error::custom(
+                "intentional serialization failure",
+            ))
         }
     }
 

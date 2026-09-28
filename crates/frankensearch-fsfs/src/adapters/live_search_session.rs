@@ -511,7 +511,12 @@ mod tests {
                 session
                     .source_mut()
                     .select(&milliseconds.to_string(), "changing");
-                assert!(session.poll(&cx, tick(start, milliseconds)).unwrap().is_none());
+                assert!(
+                    session
+                        .poll(&cx, tick(start, milliseconds))
+                        .unwrap()
+                        .is_none()
+                );
             }
             session.source_mut().select("last", "newest");
             let frame = session.poll(&cx, tick(start, 60)).unwrap().unwrap();
@@ -583,7 +588,11 @@ mod tests {
             assert_eq!(session.tracker().results()[0].hit.doc_id, "old");
             session.source_mut().fail_admission = false;
             assert_eq!(
-                session.poll(&cx, tick(start, 2)).unwrap().unwrap().generation,
+                session
+                    .poll(&cx, tick(start, 2))
+                    .unwrap()
+                    .unwrap()
+                    .generation,
                 "b"
             );
         });
@@ -700,7 +709,12 @@ mod tests {
     #[cfg(unix)]
     fn write_bundle(path: &Path, value: &str) {
         fs::create_dir(path.join("lexical")).unwrap();
-        for relative in ["lexical/MANIFEST", "vector.idx", "catalog.db", "content.txt"] {
+        for relative in [
+            "lexical/MANIFEST",
+            "vector.idx",
+            "catalog.db",
+            "content.txt",
+        ] {
             fs::write(path.join(relative), value).unwrap();
         }
     }
