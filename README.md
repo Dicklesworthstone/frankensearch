@@ -430,8 +430,10 @@ fsfs search "query" --stream --format jsonl
 fsfs search "query" --stream --format toon
 
 # Narrow results: lang:/type: take a language name or an extension,
-# ext: one literal extension, path: (or a bare word) a path fragment
+# ext: one literal extension, path: (or a bare word) a path fragment.
+# Extension clauses widen each other; every path clause must match.
 fsfs search "retry backoff" --filter "lang:rust path:src"
+fsfs search "retry backoff" --filter "ext:rs ext:md"
 
 # Explain one result of the last search: by rank, R0-style id, or path
 fsfs explain 1

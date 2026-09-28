@@ -371,6 +371,9 @@ impl SearchFilterExpr {
         }
 
         let mut clauses = Vec::new();
+        // A file has one extension, so extension clauses widen one another:
+        // `ext:rs ext:md` selects either kind. Path clauses still all apply.
+        let mut extensions: Vec<String> = Vec::new();
         for token in trimmed.split_whitespace() {
             if let Some((key, value)) = token.split_once(':') {
                 let key = key.trim().to_ascii_lowercase();
@@ -396,12 +399,16 @@ impl SearchFilterExpr {
                                     .to_owned(),
                             });
                         }
-                        let extensions = if matches!(key.as_str(), "type" | "lang") {
+                        let selected = if matches!(key.as_str(), "type" | "lang") {
                             filter_language_extensions(&normalized)
                         } else {
                             vec![normalized]
                         };
-                        clauses.push(SearchFilterClause::Extension(extensions));
+                        for extension in selected {
+                            if !extensions.contains(&extension) {
+                                extensions.push(extension);
+                            }
+                        }
                     }
                     _ => {
                         return Err(SearchError::InvalidConfig {
@@ -416,6 +423,9 @@ impl SearchFilterExpr {
             } else {
                 clauses.push(SearchFilterClause::PathContains(token.to_ascii_lowercase()));
             }
+        }
+        if !extensions.is_empty() {
+            clauses.push(SearchFilterClause::Extension(extensions));
         }
 
         if clauses.is_empty() {
@@ -585,7 +595,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v12: with fast windows, a long source's quality weight scales by coverage.
 // v13: query exclusions apply to the vector lanes.
 // v14: `type:`/`lang:` filters accept language names (`lang:rust`).
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v14";
+// v15: extension filter clauses widen each other (`ext:rs ext:md`).
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v15";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -594,8 +605,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v7 / stream v5: coverage-scaled quality weight for windowed sources.
 // v8 / stream v6: query exclusions apply to the vector lanes.
 // v9 / stream v7: `type:`/`lang:` filters accept language names.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v9";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v7";
+// v10 / stream v8: extension filter clauses widen each other.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v10";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v8";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -28524,6 +28536,11 @@ mod tests {
             super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v9".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that requires every extension clause at once cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v8".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -29212,11 +29229,13 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-        // v6 reads `lang:rust` as an extension; v5 lets excluded documents
-        // back through the vector lanes; v4 gives long windowed sources the
-        // whole quality weight; v3 blends quality discoveries without fast
-        // scores; v2 predates the WAL top-k repair; v1 an older ranking policy.
+        // v7 requires every extension clause at once; v6 reads `lang:rust` as
+        // an extension; v5 lets excluded documents back through the vector
+        // lanes; v4 gives long windowed sources the whole quality weight; v3
+        // blends quality discoveries without fast scores; v2 predates the WAL
+        // top-k repair; v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v7",
             "fsfs.search.serve.stream.v6",
             "fsfs.search.serve.stream.v5",
             "fsfs.search.serve.stream.v4",
@@ -34041,14 +34060,14 @@ mod tests {
             (
                 "all-MiniLM-L6-v2",
                 Auto,
-                "fsfs.search.serve.v8",
+                "fsfs.search.serve.v9",
                 FSFS_SEARCH_SERVE_STREAM_VERSION,
             ),
             (
                 "all-MiniLM-L6-v2",
                 Auto,
                 FSFS_SEARCH_SERVE_SCHEMA_VERSION,
-                "fsfs.search.serve.stream.v6",
+                "fsfs.search.serve.stream.v7",
             ),
             (
                 "all-MiniLM-L6-v2-native",
@@ -34813,6 +34832,14 @@ mod tests {
         let both = parse("lang:rust path:src");
         assert!(both.matches_doc_id("src/lib.rs"));
         assert!(!both.matches_doc_id("tests/lib.rs"));
+        // A file has one extension: repeated extension clauses select any of
+        // them, while every path clause must still hold.
+        let either = parse("ext:rs lang:markdown path:src");
+        assert!(either.matches_doc_id("src/lib.rs"));
+        assert!(either.matches_doc_id("src/guide.md"));
+        assert!(!either.matches_doc_id("src/tool.py"));
+        assert!(!either.matches_doc_id("docs/guide.md"));
+        assert!(!parse("path:src path:tests").matches_doc_id("src/lib.rs"));
     }
 
     #[test]
@@ -47457,6 +47484,8 @@ mod tests {
                 "fsfs.search.cache.v12",
                 // Read `lang:rust` as a file extension.
                 "fsfs.search.cache.v13",
+                // Required every extension clause at once.
+                "fsfs.search.cache.v14",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

@@ -306,6 +306,14 @@ qualified; individual results below are narrower than release acceptance.
   them first: `server`, next to 200 `server-*.log` files, returned only logs
   in a stress test. Multi-word queries still ranked the matching content first.
 
+- **`--filter "ext:rs ext:md"` selects either extension.** Every clause had
+  to hold, and a file has only one extension, so any two `ext:`, `type:` or
+  `lang:` clauses silently matched nothing. Extension clauses now widen each
+  other, and every `path:` clause must still match. The answer cache moves to
+  `fsfs.search.cache.v15`, the daemon protocols to `fsfs.search.serve.v10` and
+  `fsfs.search.serve.stream.v8`, and complete-generation forwarding to version
+  9, so an older cached answer or daemon cannot replay the empty result.
+
 - **Files whose names are not valid UTF-8 are skipped, not mangled.** Such a
   file was indexed under a lossy key (`latin1-�t�.md`), so the path fsfs
   printed could not be opened. Two such names could also collapse onto one key
