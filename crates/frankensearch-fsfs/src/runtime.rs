@@ -499,6 +499,7 @@ const FSFS_FLUSH_POLL_MS: u64 = 25;
 const EXPLAIN_SESSION_SCHEMA_VERSION: &str = "fsfs.explain.session.v1";
 const REASON_DISCOVERY_FILE_EXCLUDED: &str = "discovery.file.excluded";
 const REASON_DISCOVERY_FILE_PERMISSION_DENIED: &str = "discovery.file.permission_denied";
+const REASON_DISCOVERY_FILE_NON_UTF8_PATH: &str = "discovery.file.non_utf8_path";
 const ROOT_PROBE_MAX_DEPTH: usize = 2;
 const ROOT_PROBE_MAX_ENTRIES_PER_DIR: usize = 512;
 const ROOT_PROBE_MAX_TOTAL_ENTRIES: usize = 10_000;
@@ -20204,6 +20205,23 @@ impl FsfsRuntime {
             };
 
             discovered_files = discovered_files.saturating_add(1);
+            // File keys are UTF-8. A lossy key would print a path nobody can
+            // open, and two such names could collapse onto one document.
+            if entry_path
+                .strip_prefix(target_root)
+                .unwrap_or(&entry_path)
+                .to_str()
+                .is_none()
+            {
+                warn!(
+                    path = %entry_path.display(),
+                    reason_code = REASON_DISCOVERY_FILE_NON_UTF8_PATH,
+                    "fsfs skips a file whose name is not valid UTF-8; rename it to index it"
+                );
+                skipped_files = skipped_files.saturating_add(1);
+                reason_codes.insert(REASON_DISCOVERY_FILE_NON_UTF8_PATH.to_owned());
+                continue;
+            }
             let mut candidate =
                 DiscoveryCandidate::new(&entry_path, metadata.len()).with_symlink(path_is_symlink);
             if let Some((mount_entry, _policy)) = mount_table.lookup(&entry_path) {
@@ -43733,6 +43751,59 @@ mod tests {
                     None => assert!(!found.contains(&"logs/server.log"), "{query}: {found:?}"),
                 }
             }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_file_names_are_skipped_with_a_reason_instead_of_a_lossy_key() {
+        use std::os::unix::ffi::OsStrExt;
+
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            fs::write(project.join("café.md"), "utf8 name about wombats\n").expect("write utf8");
+            // Latin-1 é and è: to_string_lossy maps both to the same key.
+            for (name, body) in [
+                (&b"caf\xe9.md"[..], "latin1 acute about numbats\n"),
+                (&b"caf\xe8.md"[..], "latin1 grave about quolls\n"),
+            ] {
+                fs::write(project.join(std::ffi::OsStr::from_bytes(name)), body)
+                    .expect("write non-UTF-8 name");
+            }
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index");
+            let index_root = project.join(".frankensearch");
+            let keys = FsfsRuntime::read_index_manifest(&index_root)
+                .expect("read manifest")
+                .expect("manifest")
+                .into_iter()
+                .map(|entry| entry.file_key)
+                .collect::<Vec<_>>();
+            assert_eq!(keys, ["café.md"]);
+            let sentinel = FsfsRuntime::read_index_sentinel(&index_root)
+                .expect("read sentinel")
+                .expect("sentinel");
+            assert_eq!(sentinel.discovered_files, 3);
+            assert_eq!(sentinel.indexed_files, 1);
+            assert!(
+                sentinel
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == super::REASON_DISCOVERY_FILE_NON_UTF8_PATH),
+                "{:?}",
+                sentinel.reason_codes
+            );
         });
     }
 

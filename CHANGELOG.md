@@ -301,7 +301,16 @@ qualified; individual results below are narrower than release acceptance.
   so no query could return them, not even their file name. Each now has a
   keyword row made of its relative path and file name, never its content.
   One-shot indexing and watch both write it (bd-kcx5v). Indexes built
-  earlier gain these rows on the next `fsfs index`.
+  earlier gain these rows on the next `fsfs index`. Keyword ranking favors
+  short documents, so a one-word query that names many such files now lists
+  them first: `server`, next to 200 `server-*.log` files, returned only logs
+  in a stress test. Multi-word queries still ranked the matching content first.
+
+- **Files whose names are not valid UTF-8 are skipped, not mangled.** Such a
+  file was indexed under a lossy key (`latin1-�t�.md`), so the path fsfs
+  printed could not be opened. Two such names could also collapse onto one key
+  and replace each other's document. They are now skipped with reason code
+  `discovery.file.non_utf8_path` and a warning naming the file (bd-pdkhg).
 
 - **`FSFS_COMPLETE_GENERATIONS=1` no longer hides existing indexes.** The
   opt-in chooses the layout of the next build, but it used to route every
