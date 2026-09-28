@@ -343,20 +343,31 @@ impl GenerationBuild {
     }
 }
 
+/// Whether `root` carries a sealed-generation marker (a symlink marker counts).
+///
+/// # Errors
+/// Returns an error when the marker cannot be inspected.
+pub(crate) fn is_sealed(root: &Path) -> SearchResult<bool> {
+    match fs::symlink_metadata(root.join(COMPLETE_GENERATION_MANIFEST)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Refuse mutation of a sealed generation, including attempts through the
 /// ordinary fsfs publication-lease entry point.
 ///
 /// # Errors
 /// Returns an error whenever a sealed marker exists, including a symlink marker.
 pub(crate) fn reject_published_write(root: &Path) -> SearchResult<()> {
-    match fs::symlink_metadata(root.join(COMPLETE_GENERATION_MANIFEST)) {
-        Ok(_) => Err(invalid(
+    if is_sealed(root)? {
+        return Err(invalid(
             root,
             "sealed complete generation is read-only; build a successor",
-        )),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        ));
     }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]

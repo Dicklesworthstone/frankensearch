@@ -17642,7 +17642,17 @@ impl FsfsRuntime {
             }
             BlueGreenEngine::Quill => return Ok(()),
         };
-        crate::generation_store::reject_published_write(index_root)?;
+        if crate::generation_store::is_sealed(index_root)? {
+            let source = Self::read_index_sentinel(index_root)?
+                .map_or_else(|| "<source-dir>".to_owned(), |sentinel| sentinel.target_root);
+            return Err(SearchError::InvalidConfig {
+                field: "index.generation".to_owned(),
+                value: index_root.display().to_string(),
+                reason: format!(
+                    "{found} detected in a sealed complete generation, which is never rebuilt in place; run `fsfs index {source}` to publish a successor generation"
+                ),
+            });
+        }
 
         let sentinel =
             Self::read_index_sentinel(index_root)?.ok_or_else(|| SearchError::InvalidConfig {
@@ -43585,6 +43595,95 @@ mod tests {
                     .expect("status after rebuild")
                     .index
                     .lexical_rebuild_required
+            );
+        });
+    }
+
+    #[test]
+    fn stale_quill_schema_in_a_sealed_generation_names_the_successor_rebuild() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            fs::write(project.join("sealed.md"), "sealed generation witness\n")
+                .expect("write source");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("initial index");
+            let index_root = project.join(".frankensearch");
+            let lexical_root = index_root.join("lexical");
+            let stale_dir = lexical_root.join("quill-stale");
+            let stale = QuillIndex::create_with_schema(
+                &cx,
+                &stale_dir,
+                frankensearch_quill::FSFS_CHUNK_SCHEMA,
+                QuillConfig::default(),
+            )
+            .await
+            .expect("create stale-schema engine");
+            stale.commit(&cx).await.expect("publish stale-schema engine");
+            drop(stale);
+            let stale_pointer =
+                CurrentPointer::new(BlueGreenEngine::Quill, "quill-stale", super::FSLX_FORMAT_VERSION)
+                    .expect("stale pointer");
+            publish_current(&lexical_root, &stale_pointer).expect("point CURRENT at stale engine");
+            // The marker is all `is_sealed` inspects; a real store seals
+            // each published generation with it.
+            fs::write(
+                index_root.join(crate::generation_store::COMPLETE_GENERATION_MANIFEST),
+                "{}",
+            )
+            .expect("seal the generation");
+            let lexical_entries = || {
+                let mut names = fs::read_dir(&lexical_root)
+                    .expect("list lexical root")
+                    .map(|entry| entry.expect("lexical entry").file_name())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            };
+            let entries_before = lexical_entries();
+            let stale_before = snapshot_directory(&stale_dir);
+            let source = FsfsRuntime::read_index_sentinel(&index_root)
+                .expect("read sentinel")
+                .expect("sentinel")
+                .target_root;
+
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("witness".to_owned()),
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+            let error = runtime
+                .rebuild_legacy_lexical_index_if_needed(&cx, &index_root)
+                .await
+                .expect_err("a sealed generation is never rebuilt in place");
+            let SearchError::InvalidConfig { field, reason, .. } = error else {
+                panic!("expected a configuration refusal, got {error:?}");
+            };
+            assert_eq!(field, "index.generation");
+            assert!(
+                reason.contains(&format!("run `fsfs index {source}`")),
+                "{reason}"
+            );
+            assert_eq!(lexical_entries(), entries_before, "no successor engine is built");
+            assert_eq!(snapshot_directory(&stale_dir), stale_before);
+            assert_eq!(
+                resolve_current(&lexical_root)
+                    .expect("resolve CURRENT")
+                    .pointer()
+                    .expect("pointer")
+                    .dir_name(),
+                "quill-stale"
             );
         });
     }

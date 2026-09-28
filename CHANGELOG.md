@@ -283,7 +283,11 @@ qualified; individual results below are narrower than release acceptance.
   analyzer previously made every existing index fail with "Quill schema
   mismatch", even `fsfs index --force`. Until then `fsfs status` reports
   "keyword index rebuild pending" (`lexical_rebuild_required` in JSON)
-  instead of failing. Parallel bulk ingest applies to the new analyzer as it
+  instead of failing. A sealed complete generation (`FSFS_COMPLETE_GENERATIONS`)
+  is never rebuilt in place: `fsfs search` there names the
+  `fsfs index <source-dir>` run that publishes a successor, where it
+  previously reported the read-only generation as a corrupted vector index.
+  Parallel bulk ingest applies to the new analyzer as it
   did to the old one. **Library users:** an index built with Quill's
   `DEFAULT_SCHEMA` by an earlier release now opens with
   `KeeperError::SchemaMismatch` (a `SearchError::SubsystemError` through the
