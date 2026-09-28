@@ -3,6 +3,8 @@
 // root, so lib.rs's limit does not apply.
 #![recursion_limit = "512"]
 
+mod live_search_command;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -106,6 +108,14 @@ fn allow_missing_explicit_config(command: CliCommand, action: Option<&ConfigActi
 }
 
 fn main() {
+    // Live subscriptions have a dedicated read-only process boundary. Handle
+    // it before UTF-8 conversion, model/config loading and ordinary output
+    // envelopes, which must never be appended to the live NDJSON stream.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "live-search") {
+        std::process::exit(live_search_command::entry(
+            std::env::args_os().skip(2).collect(),
+        ));
+    }
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let error_context = ProcessErrorContext::from_args(&args, stdout_is_tty);
