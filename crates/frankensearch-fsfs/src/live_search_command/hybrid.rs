@@ -164,7 +164,10 @@ fn encode_frame(frame: &RetainedLiveSearchFrame, limit: usize) -> SearchResult<V
     Ok(output.bytes)
 }
 
-fn emit_frame<W: Write>(frame: &RetainedLiveSearchFrame, writer: &mut W) -> SearchResult<()> {
+pub(super) fn emit_frame<W: Write>(
+    frame: &RetainedLiveSearchFrame,
+    writer: &mut W,
+) -> SearchResult<()> {
     // Finish serialization (including its size check) before exposing any bytes.
     // The caller's GuardedOutput checks cancellation/budget before each syscall.
     let bytes = encode_frame(frame, MAX_FRAME_BYTES)?;

@@ -1,11 +1,13 @@
-//! Read-only `fsfs live-search` process boundary.
+//! `fsfs live-search` process boundary with explicit source-watch opt-in.
 //!
 //! Keep this outside the ordinary CLI dispatcher: live subscriptions require an
-//! explicitly selected complete store, never auto-discovery, migration, indexing,
-//! configuration-driven index writes, or an update check. Models/configuration
-//! are loaded only when the caller explicitly chooses `--hybrid`.
+//! explicitly selected complete store, never auto-discovery, migration or an
+//! update check. Models/configuration require `--hybrid`; only `--watch-source`
+//! authorizes indexing and complete-generation publication.
 
 mod hybrid;
+#[cfg(unix)]
+mod watch;
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -29,14 +31,15 @@ const MAX_QUERY_BYTES: usize = 64 * 1024;
 const HELP: &str = "fsfs live-search --index-dir STORE --query TEXT [OPTIONS]
 
 Subscribe to committed complete generations; native Quill lexical search is default.
-The existing store must contain FSFS-CURRENT when a snapshot is requested.
-No indexing, downloads, or root discovery is performed. Sealed indexes are never migrated.
-Run your complete-generation publisher separately; this command only reads.
+Without --watch-source, the existing store must contain FSFS-CURRENT for a snapshot.
+Read-only by default. No downloads, root discovery, or sealed-index migration.
+Run a publisher separately, or explicitly opt into indexing with --watch-source.
 
   --index-dir STORE       Explicit complete-generation store root (required)
   --query TEXT            Nonblank UTF-8 query, at most 64 KiB (required)
   --hybrid                Use the retained progressive hybrid pipeline and local models
   --config FILE           Hybrid configuration/model policy; requires --hybrid
+  --watch-source DIR      Index and watch DIR, publishing successors; requires --hybrid
   --limit N               Result window, 1..=10000 (default 20)
   --poll-ms N             Selection probe interval, 10..=60000 (default 100)
   --debounce-ms N         Quiet period before a refresh, 0..=60000 (default 100)
@@ -70,6 +73,17 @@ Initial is flushed before refinement. A failed refinement preserves its Initial
 window; it is not a successful Refined update. --once/--max-updates never split
 that phase sequence. Each hybrid record is bounded to 16 MiB before output.
 --filter, --rerank, and --semantic CLI flags are refused rather than ignored.
+
+--watch-source is supported on Unix and requires disjoint source/store trees.
+It builds the initial generation, then streams each durable publication through
+the same hybrid pipeline. Models must already be available. Because complete
+generations are retained, --once or --max-updates is REQUIRED in this mode.
+--once builds and queries once; --max-updates counts published generations, not
+phases. These limits are not a disk quota or automatic garbage collection.
+The native watcher owns source debounce/reconciliation; --poll-ms, --debounce-ms
+and --max-wait-ms are therefore refused in this mode. Query/output backpressure
+pauses new builds, not native change registration. Failed query/output or timeout
+can follow a successful publication: they never roll it back or delete its files.
 ";
 
 #[derive(Debug, Clone)]
@@ -84,6 +98,7 @@ struct Options {
     once: bool,
     hybrid: bool,
     config_path: Option<PathBuf>,
+    watch_source: Option<PathBuf>,
 }
 
 impl Options {
@@ -99,6 +114,7 @@ impl Options {
         let mut once = false;
         let mut hybrid = false;
         let mut config_path = None;
+        let mut watch_source = None;
         let mut seen = HashSet::new();
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
@@ -118,6 +134,7 @@ impl Options {
                     | "--format"
                     | "--hybrid"
                     | "--config"
+                    | "--watch-source"
             ) {
                 return Err(invalid("unknown argument; run fsfs live-search --help"));
             }
@@ -139,6 +156,7 @@ impl Options {
             match flag.as_str() {
                 "--index-dir" => root = Some(PathBuf::from(value)),
                 "--config" => config_path = Some(PathBuf::from(value)),
+                "--watch-source" => watch_source = Some(PathBuf::from(value)),
                 "--query" => query = Some(text(value)?),
                 "--limit" => {
                     limits.max_results = usize::try_from(number(value, &flag, 1, 10_000)?)
@@ -189,6 +207,31 @@ impl Options {
                 "--config requires --hybrid; lexical mode never loads configuration",
             ));
         }
+        if watch_source.is_some() {
+            if !cfg!(unix) {
+                return Err(invalid(
+                    "--watch-source requires a Unix complete-generation watcher",
+                ));
+            }
+            if !hybrid {
+                return Err(invalid(
+                    "--watch-source requires --hybrid and already available models",
+                ));
+            }
+            if !once && max_updates.is_none() {
+                return Err(invalid(
+                    "--watch-source requires --once or --max-updates; retained generations are not garbage-collected",
+                ));
+            }
+            if ["--poll-ms", "--debounce-ms", "--max-wait-ms"]
+                .iter()
+                .any(|flag| seen.contains(*flag))
+            {
+                return Err(invalid(
+                    "--watch-source uses native source debounce/reconciliation, not selection-poll timing flags",
+                ));
+            }
+        }
         Ok(Self {
             root: root.ok_or_else(|| invalid("--index-dir is required; no store is guessed"))?,
             query,
@@ -200,6 +243,7 @@ impl Options {
             once,
             hybrid,
             config_path,
+            watch_source,
         })
     }
 }
@@ -293,6 +337,12 @@ async fn execute_with_runtime<W: Write + Send>(
         timeout: options.timeout,
     };
     budget.check(cx)?;
+    if options.watch_source.is_some() {
+        #[cfg(unix)]
+        return watch::execute(cx, &budget, options, writer, runtime).await;
+        #[cfg(not(unix))]
+        return Err(invalid("--watch-source is unsupported on this platform"));
+    }
     // Opening an explicit existing root never creates a generation or writer lease.
     let store = CompleteGenerationStore::open(cx, &options.root)?;
     if options.once && store.active(cx)?.is_none() {
@@ -432,12 +482,17 @@ pub fn entry(args: Vec<OsString>) -> i32 {
             return exit_code::USAGE_ERROR;
         }
     };
+    let phase = if options.watch_source.is_some() {
+        "watch_subscription"
+    } else {
+        "subscription"
+    };
     let result = run(options);
     let code = result_exit_code(&result);
     if code != exit_code::OK
         && let Err(error) = &result
     {
-        let _ = report_error(&mut io::stderr(), "subscription", code, error);
+        let _ = report_error(&mut io::stderr(), phase, code, error);
     }
     code
 }
@@ -467,6 +522,67 @@ mod tests {
         assert!(!options.once);
         assert!(!options.hybrid);
         assert!(options.config_path.is_none());
+        assert!(options.watch_source.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_requires_explicit_indexing_and_model_policy() {
+        assert!(Options::parse(args(&["--watch-source", "/source"])).is_err());
+        assert!(Options::parse(args(&["--watch-source", "/source", "--hybrid"])).is_err());
+        let options = Options::parse(args(&[
+            "--watch-source",
+            "/source",
+            "--hybrid",
+            "--once",
+        ]))
+        .unwrap();
+        assert_eq!(options.watch_source, Some(PathBuf::from("/source")));
+        assert_eq!(options.max_updates, Some(1));
+        assert!(Options::parse(args(&["--hybrid", "--watch-source"])).is_err());
+        assert!(
+            Options::parse(args(&[
+                "--hybrid", "--watch-source", "/a", "--watch-source", "/b",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_does_not_silently_ignore_selection_poll_tuning() {
+        for flag in ["--poll-ms", "--debounce-ms", "--max-wait-ms"] {
+            assert!(
+                Options::parse(args(&[
+                    "--hybrid", "--watch-source", "/source", "--once", flag, "100",
+                ]))
+                .is_err(),
+                "{flag}"
+            );
+        }
+        let options = Options::parse(args(&[
+            "--hybrid",
+            "--watch-source",
+            "/source",
+            "--min-score-delta",
+            "0.1",
+            "--limit",
+            "5",
+            "--max-updates",
+            "2",
+            "--timeout-ms",
+            "10000",
+        ]))
+        .unwrap();
+        assert_eq!(options.limits.max_results, 5);
+        assert_eq!(options.max_updates, Some(2));
+        assert_eq!(options.timeout, Some(Duration::from_secs(10)));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn watch_is_refused_on_unsupported_platforms_before_startup() {
+        assert!(Options::parse(args(&["--hybrid", "--watch-source", "source"])).is_err());
     }
 
     #[test]
