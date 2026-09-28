@@ -28,6 +28,7 @@
 //! forward-compatible replay: a newer engine can detect that an artifact
 //! was redacted under an older policy and adjust interpretation accordingly.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -998,9 +999,185 @@ pub struct RedactionResult {
     pub policy_version: String,
 }
 
+/// A credential token shape precise enough to mask in displayed text without
+/// touching ordinary identifiers: a vendor prefix, then the token alphabet.
+struct SecretTokenShape {
+    prefix: &'static str,
+    min_tail: usize,
+    /// The tail must be exactly `min_tail` bytes (AWS key ids, Google API keys).
+    exact: bool,
+    tail: fn(u8) -> bool,
+}
+
+const fn upper_alnum(byte: u8) -> bool {
+    byte.is_ascii_uppercase() || byte.is_ascii_digit()
+}
+
+const fn alnum(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
+const fn token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+const fn shape(
+    prefix: &'static str,
+    min_tail: usize,
+    exact: bool,
+    tail: fn(u8) -> bool,
+) -> SecretTokenShape {
+    SecretTokenShape {
+        prefix,
+        min_tail,
+        exact,
+        tail,
+    }
+}
+
+const SECRET_TOKEN_SHAPES: &[SecretTokenShape] = &[
+    shape("AKIA", 16, true, upper_alnum),
+    shape("ASIA", 16, true, upper_alnum),
+    shape("ghp_", 36, false, alnum),
+    shape("gho_", 36, false, alnum),
+    shape("ghu_", 36, false, alnum),
+    shape("ghs_", 36, false, alnum),
+    shape("ghr_", 36, false, alnum),
+    shape("github_pat_", 22, false, token),
+    shape("xoxb-", 10, false, token),
+    shape("xoxa-", 10, false, token),
+    shape("xoxp-", 10, false, token),
+    shape("xoxr-", 10, false, token),
+    shape("xoxs-", 10, false, token),
+    shape("sk_live_", 16, false, alnum),
+    shape("rk_live_", 16, false, alnum),
+    shape("GOCSPX-", 20, false, token),
+    shape("AIza", 35, true, token),
+    shape("sk-proj-", 20, false, token),
+    shape("sk-ant-", 20, false, token),
+];
+
+const REDACTED: &str = "[REDACTED]";
+
+/// Mask credential tokens and private-key material in displayed text.
+///
+/// Search snippets reach users and agents, and the scope-privacy contract
+/// forbids displaying secret-bearing spans. A token keeps its vendor prefix,
+/// so the reader can tell what was hidden. From a private-key header on, the
+/// rest of the text is masked.
+#[must_use]
+pub fn mask_secret_tokens(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    for shape in SECRET_TOKEN_SHAPES {
+        for (start, _) in text.match_indices(shape.prefix) {
+            if start > 0 && bytes.get(start - 1).is_some_and(|&byte| token(byte)) {
+                continue;
+            }
+            let tail_start = start + shape.prefix.len();
+            let tail_len = bytes
+                .get(tail_start..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|&&byte| (shape.tail)(byte))
+                .count();
+            let tail_end = tail_start + tail_len;
+            let matched = if shape.exact {
+                tail_len == shape.min_tail
+                    && bytes
+                        .get(tail_end)
+                        .is_none_or(|byte| !byte.is_ascii_alphanumeric())
+            } else {
+                tail_len >= shape.min_tail
+            };
+            if matched {
+                spans.push((tail_start, tail_end));
+            }
+        }
+    }
+    for (start, _) in text.match_indices("-----BEGIN ") {
+        let header = text.get(start..).unwrap_or_default();
+        let header_line = header.get(..header.len().min(48)).unwrap_or(header);
+        if header_line.contains("PRIVATE KEY") {
+            spans.push((start, text.len()));
+            break;
+        }
+    }
+    if spans.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    spans.sort_unstable();
+    let mut masked = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in spans {
+        if start < cursor {
+            cursor = cursor.max(end);
+            continue;
+        }
+        masked.push_str(text.get(cursor..start).unwrap_or_default());
+        masked.push_str(REDACTED);
+        cursor = end;
+    }
+    masked.push_str(text.get(cursor..).unwrap_or_default());
+    Cow::Owned(masked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Displayed-text secret masking ──────────────────────────────────
+
+    #[test]
+    fn mask_secret_tokens_hides_credentials_and_keeps_their_prefix() {
+        let aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let cases = [
+            (format!("key = \"{aws}\";"), "key = \"AKIA[REDACTED]\";"),
+            (
+                format!("token ghp_{} end", "a".repeat(36)),
+                "token ghp_[REDACTED] end",
+            ),
+            (
+                "slack xoxb-1234567890-abcdefghij".to_owned(),
+                "slack xoxb-[REDACTED]",
+            ),
+            (
+                format!("{{\"client_secret\": \"GOCSPX-{}\"}}", "x".repeat(24)),
+                "{\"client_secret\": \"GOCSPX-[REDACTED]\"}",
+            ),
+            (
+                format!("STRIPE=sk_live_{}", "9".repeat(24)),
+                "STRIPE=sk_live_[REDACTED]",
+            ),
+            (
+                format!("google AIza{} ok", "b".repeat(35)),
+                "google AIza[REDACTED] ok",
+            ),
+            (
+                "header -----BEGIN RSA PRIVATE KEY----- MIIEowIBAAKCAQEA".to_owned(),
+                "header [REDACTED]",
+            ),
+        ];
+        for (text, expected) in &cases {
+            assert_eq!(mask_secret_tokens(text), *expected, "{text}");
+        }
+        // Lookalikes stay: a prefix inside a longer identifier, an AKIA run of
+        // the wrong length, short tails and ordinary prose.
+        for text in [
+            format!("X{aws}"),
+            format!("{aws}Z"),
+            "AKIA1234".to_owned(),
+            "ghp_short".to_owned(),
+            "the sk_live_ prefix marks production keys".to_owned(),
+            "-----BEGIN CERTIFICATE----- MIIC".to_owned(),
+        ] {
+            assert_eq!(mask_secret_tokens(&text), text.as_str(), "{text}");
+        }
+        assert!(matches!(
+            mask_secret_tokens("plain prose"),
+            Cow::Borrowed("plain prose")
+        ));
+    }
 
     // ─── Data Class ─────────────────────────────────────────────────────
 

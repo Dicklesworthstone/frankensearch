@@ -599,7 +599,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v14: `type:`/`lang:` filters accept language names (`lang:rust`).
 // v15: extension filter clauses widen each other (`ext:rs ext:md`).
 // v16: `HashMap::new`, `std::io` and URLs reach the lexical lane.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v16";
+// v17: snippets mask credential tokens and private-key material.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v17";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -610,8 +611,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v9 / stream v7: `type:`/`lang:` filters accept language names.
 // v10 / stream v8: extension filter clauses widen each other.
 // v11 / stream v9: colons that name no field reach the lexical lane.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v11";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v9";
+// v12 / stream v10: snippets mask credential tokens and private-key material.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v12";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v10";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -10806,7 +10808,7 @@ impl FsfsRuntime {
         }
         for (doc_id, snippet) in found {
             if let Some(snippet) = snippet.filter(|snippet| !snippet.trim().is_empty()) {
-                snippets_by_doc.insert(doc_id.to_owned(), decode_basic_html_entities(&snippet));
+                snippets_by_doc.insert(doc_id.to_owned(), displayable_snippet(&snippet));
             }
         }
         Ok(())
@@ -10861,10 +10863,7 @@ impl FsfsRuntime {
                 config.clone(),
             );
             if let Some(snippet) = generator.snippet_or_prefix(&passage) {
-                snippets_by_doc.insert(
-                    candidate.doc_id.clone(),
-                    decode_basic_html_entities(&snippet),
-                );
+                snippets_by_doc.insert(candidate.doc_id.clone(), displayable_snippet(&snippet));
             }
         }
         Ok(())
@@ -24992,6 +24991,12 @@ fn strip_html_tags(source: &str) -> String {
     out
 }
 
+/// A snippet as users and agents see it: decoded entities, credentials masked.
+fn displayable_snippet(snippet: &str) -> String {
+    let decoded = decode_basic_html_entities(snippet);
+    crate::redaction::mask_secret_tokens(&decoded).into_owned()
+}
+
 fn decode_basic_html_entities(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut rest = source;
@@ -28545,6 +28550,11 @@ mod tests {
             super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v11".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that prints credentials in snippets cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v10".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -29243,13 +29253,14 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-        // v8 drops `HashMap::new` from the lexical lane; v7 requires every
-        // extension clause at once; v6 reads `lang:rust` as an extension; v5
-        // lets excluded documents back through the vector lanes; v4 gives long
-        // windowed sources the whole quality weight; v3 blends quality
-        // discoveries without fast scores; v2 predates the WAL top-k repair;
-        // v1 an older ranking policy.
+        // v9 prints credentials in snippets; v8 drops `HashMap::new` from the
+        // lexical lane; v7 requires every extension clause at once; v6 reads
+        // `lang:rust` as an extension; v5 lets excluded documents back through
+        // the vector lanes; v4 gives long windowed sources the whole quality
+        // weight; v3 blends quality discoveries without fast scores; v2
+        // predates the WAL top-k repair; v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v9",
             "fsfs.search.serve.stream.v8",
             "fsfs.search.serve.stream.v7",
             "fsfs.search.serve.stream.v6",
@@ -34076,14 +34087,14 @@ mod tests {
             (
                 "all-MiniLM-L6-v2",
                 Auto,
-                "fsfs.search.serve.v10",
+                "fsfs.search.serve.v11",
                 FSFS_SEARCH_SERVE_STREAM_VERSION,
             ),
             (
                 "all-MiniLM-L6-v2",
                 Auto,
                 FSFS_SEARCH_SERVE_SCHEMA_VERSION,
-                "fsfs.search.serve.stream.v8",
+                "fsfs.search.serve.stream.v9",
             ),
             (
                 "all-MiniLM-L6-v2-native",
@@ -38496,6 +38507,67 @@ mod tests {
             for markup in ["&lt;", "&amp;", "&quot;", "&#x27;", "<b>", "</b>"] {
                 assert!(!snippet.contains(markup), "{markup} in {snippet:?}");
             }
+        });
+    }
+
+    #[test]
+    fn private_keys_are_not_indexed_and_snippets_mask_credentials() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("deploy")).expect("create project dir");
+            let aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
+            fs::write(
+                project.join("deploy/server.pem"),
+                "-----BEGIN RSA PRIVATE KEY-----\n\
+                 MIIEowIBAAKCAQEAwl8KX2rUqbD9Qm2p0xa7Ubq3Qjp8Ksb3S4DbBqvAbRTsrMpk\n\
+                 -----END RSA PRIVATE KEY-----\n",
+            )
+            .expect("write key");
+            fs::write(
+                project.join("uploader.rs"),
+                format!("const KEY: &str = \"{aws}\"; // quokka uploader credentials\n"),
+            )
+            .expect("write source");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index");
+            let index_root = project.join(".frankensearch");
+            let keys = FsfsRuntime::read_index_manifest(&index_root)
+                .expect("read manifest")
+                .expect("manifest")
+                .into_iter()
+                .map(|entry| entry.file_key)
+                .collect::<Vec<_>>();
+            assert_eq!(keys, ["uploader.rs"]);
+
+            let payloads = FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Search,
+                    index_dir: Some(index_root),
+                    ..CliInput::default()
+                })
+                .execute_search_payloads_with_mode(
+                    &cx,
+                    "quokka uploader",
+                    5,
+                    SearchExecutionMode::LexicalOnly,
+                )
+                .await
+                .expect("lexical search");
+            let hit = &payloads[0].hits[0];
+            assert_eq!(hit.path, "uploader.rs");
+            let snippet = hit.snippet.as_deref().expect("snippet");
+            assert!(!snippet.contains(aws), "{snippet}");
+            assert!(snippet.contains("AKIA[REDACTED]"), "{snippet}");
         });
     }
 
@@ -47560,6 +47632,8 @@ mod tests {
                 "fsfs.search.cache.v14",
                 // Dropped `HashMap::new` from the lexical lane.
                 "fsfs.search.cache.v15",
+                // Printed credentials in snippets.
+                "fsfs.search.cache.v16",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

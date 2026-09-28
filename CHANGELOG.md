@@ -306,6 +306,20 @@ qualified; individual results below are narrower than release acceptance.
   them first: `server`, next to 200 `server-*.log` files, returned only logs
   in a stress test. Multi-word queries still ranked the matching content first.
 
+- **Private keys stay out of the index, and snippets mask credentials.** Dot
+  directories such as `.ssh` were already skipped, but a key file elsewhere
+  (`deploy/server.pem`) was indexed, and search printed its key material. So
+  did credential tokens in ordinary files, such as a hardcoded AWS key id or a
+  Google `client_secret`, in every output format and to agents. The privacy
+  contract forbids displaying such spans. Files holding PEM or PGP private-key
+  material are now skipped with reason code `FSFS_SENSITIVE_PRIVATE_KEY`. A
+  file that only names the header, such as a PEM parser, stays indexed.
+  Snippets mask AWS, GitHub, Slack, Stripe, Google, OpenAI and Anthropic
+  token shapes behind their prefix (`AKIA[REDACTED]`). Run `fsfs index` once
+  to drop key files indexed earlier (bd-1r57y). Cached answers and daemons
+  move to `fsfs.search.cache.v17`, `fsfs.search.serve.v12` / `stream.v10` and
+  complete-generation forwarding 11.
+
 - **A malformed config file is named in the error.** A TOML syntax or type
   error reported the file as `config_file = "<toml>"`. With explicit, project
   and user files layered, users could not tell which file to fix. The error now

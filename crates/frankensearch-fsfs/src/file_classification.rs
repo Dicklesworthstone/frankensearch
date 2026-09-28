@@ -35,6 +35,7 @@ const FSFS_PARTIAL_HEURISTIC_QUARANTINE: &str = "FSFS_PARTIAL_HEURISTIC_QUARANTI
 const FSFS_CORRUPT_CHECKSUM_MISMATCH: &str = "FSFS_CORRUPT_CHECKSUM_MISMATCH";
 const FSFS_CORRUPT_DECODE_ERROR: &str = "FSFS_CORRUPT_DECODE_ERROR";
 const FSFS_CORRUPT_IO_SHORT_READ: &str = "FSFS_CORRUPT_IO_SHORT_READ";
+pub const FSFS_SENSITIVE_PRIVATE_KEY: &str = "FSFS_SENSITIVE_PRIVATE_KEY";
 const CONFIDENCE_SIGNAL_FIELD_CLASSIFICATION_CONFIDENCE: &str = "classification_confidence";
 const CONFIDENCE_SIGNAL_FIELD_ENCODING_CONFIDENCE: &str = "encoding_confidence";
 const CONFIDENCE_SIGNAL_FIELD_REASON_CODE: &str = "reason_code";
@@ -584,6 +585,27 @@ impl FileClassificationContractDefinition {
                     FSFS_BINARY_HEURISTIC_THRESHOLD.to_string()
                 },
                 downstream_signals: downstream(0.9, true, false),
+            };
+        }
+
+        // Private keys are a sensitive class: the scope-privacy contract
+        // forbids persisting, emitting or displaying their content.
+        if contains_private_key_armor(capped_probe) {
+            return FileClassificationDecision {
+                kind: FILE_CLASSIFICATION_DECISION_KIND.to_string(),
+                v: FILE_CLASSIFICATION_SCHEMA_VERSION,
+                path: input.path.to_string(),
+                size_bytes: input.size_bytes,
+                probe_bytes: probe_len,
+                sniff_features,
+                detected_type: DetectedType::Text,
+                detected_encoding: if utf8_valid { "utf-8" } else { "8bit" }.to_string(),
+                normalization_applied: NORMALIZATION_NONE.to_string(),
+                ingest_action: IngestAction::Skip,
+                classification_confidence: 0.99,
+                encoding_confidence: if utf8_valid { 1.0 } else { 0.5 },
+                reason_code: FSFS_SENSITIVE_PRIVATE_KEY.to_string(),
+                downstream_signals: downstream(1.0, true, false),
             };
         }
 
@@ -1208,6 +1230,44 @@ fn is_allowed_detected_encoding(value: &str) -> bool {
 }
 
 #[must_use]
+/// Whether the bytes hold PEM or PGP private-key material: a line starting
+/// with `-----BEGIN … PRIVATE KEY` followed, after at most a few armor header
+/// lines, by a base64 body line. Source code that only names the header (a
+/// PEM parser's constant) is not key material and stays indexable.
+fn contains_private_key_armor(probe: &[u8]) -> bool {
+    const BEGIN: &[u8] = b"-----BEGIN ";
+    const PRIVATE_KEY: &[u8] = b"PRIVATE KEY";
+    const MIN_BODY_LINE: usize = 32;
+    let mut lines = probe.split(|&byte| byte == b'\n');
+    while let Some(line) = lines.next() {
+        let line = line.trim_ascii();
+        let is_header = line.starts_with(BEGIN)
+            && line
+                .windows(PRIVATE_KEY.len())
+                .any(|window| window == PRIVATE_KEY);
+        if !is_header {
+            continue;
+        }
+        // PEM `Proc-Type:`/`DEK-Info:` and PGP `Version:`/`Comment:` headers
+        // and a blank separator may precede the body.
+        for body in lines.by_ref().take(4) {
+            let body = body.trim_ascii();
+            if body.is_empty() || body.contains(&b':') {
+                continue;
+            }
+            if body.len() >= MIN_BODY_LINE
+                && body
+                    .iter()
+                    .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+            {
+                return true;
+            }
+            break;
+        }
+    }
+    false
+}
+
 fn is_archive_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     if [
@@ -1252,9 +1312,9 @@ mod tests {
     use super::{
         ChecksumMismatchAction, DetectedType, ErrorClass, FILE_CLASSIFICATION_CONTRACT_KIND,
         FILE_CLASSIFICATION_CORRUPT_EVENT_KIND, FILE_CLASSIFICATION_DECISION_KIND,
-        FILE_CLASSIFICATION_SCHEMA_VERSION, FileClassificationContractDefinition,
-        FileClassificationDecision, IngestAction, IntegrityState, NormalizationPolicy,
-        TruncatedAction,
+        FILE_CLASSIFICATION_SCHEMA_VERSION, FSFS_SENSITIVE_PRIVATE_KEY,
+        FileClassificationContractDefinition, FileClassificationDecision, IngestAction,
+        IntegrityState, NormalizationPolicy, TruncatedAction,
     };
 
     use super::{SniffFeatures, is_non_printable};
@@ -1366,6 +1426,37 @@ mod tests {
         assert_eq!(decision.ingest_action, IngestAction::Index);
         assert_eq!(decision.reason_code, "FSFS_TEXT_UTF8_HIGH_CONFIDENCE");
         assert!(decision.satisfies_contract());
+    }
+
+    #[test]
+    fn classify_private_key_material_skips_but_pem_parsers_index() {
+        let contract = FileClassificationContractDefinition::default();
+        let body = "MIIEowIBAAKCAQEAwl8KX2rUqbD9Qm2p0xa7Ubq3Qjp8Ksb3S4DbBqvAbRTsrMpk\n";
+        let keys = [
+            format!("-----BEGIN RSA PRIVATE KEY-----\n{body}-----END RSA PRIVATE KEY-----\n"),
+            format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{body}"),
+            format!(
+                "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\n{body}"
+            ),
+            format!("notes\n  -----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: GnuPG\n\n{body}"),
+        ];
+        for key in &keys {
+            let decision = contract.classify_bytes("/workspace/deploy/server.pem", key.as_bytes());
+            assert_eq!(decision.ingest_action, IngestAction::Skip, "{key}");
+            assert_eq!(decision.reason_code, FSFS_SENSITIVE_PRIVATE_KEY, "{key}");
+            assert!(decision.satisfies_contract(), "{key}");
+        }
+        // Naming the header is not key material: a PEM parser, a certificate
+        // and prose about private keys stay indexable.
+        for text in [
+            "const HEADER: &str = \"-----BEGIN PRIVATE KEY-----\";\nfn parse() {}\n".to_owned(),
+            format!("-----BEGIN CERTIFICATE-----\n{body}-----END CERTIFICATE-----\n"),
+            "-----BEGIN RSA PRIVATE KEY-----\n(paste your key here)\n".to_owned(),
+            "Rotate the private key yearly.\n".to_owned(),
+        ] {
+            let decision = contract.classify_bytes("/workspace/src/pem.rs", text.as_bytes());
+            assert_eq!(decision.ingest_action, IngestAction::Index, "{text}");
+        }
     }
 
     #[test]
