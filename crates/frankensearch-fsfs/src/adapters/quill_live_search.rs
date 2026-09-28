@@ -172,7 +172,11 @@ impl LiveSearchSource for QuillSource {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<LiveSearchHit<Option<Value>>>> {
-        let results = snapshot.reader.search_results(cx, query, limit)?;
+        let results = snapshot.reader.search_results(
+            cx,
+            &crate::lexical_pipeline::lexical_query_text(query),
+            limit,
+        )?;
         Ok(results
             .into_iter()
             .map(|hit| LiveSearchHit {

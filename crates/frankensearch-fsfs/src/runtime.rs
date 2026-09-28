@@ -126,7 +126,9 @@ use crate::incremental_change::{
     IndexFreshnessAuditReport, IndexFreshnessFindingKind, IndexFreshnessRepairActionKind,
     IndexMembershipEntry, WatcherCheckpointSnapshot,
 };
-use crate::lexical_pipeline::{LexicalMutation, LexicalPipeline, QuillLexicalBackend};
+use crate::lexical_pipeline::{
+    LexicalMutation, LexicalPipeline, QuillLexicalBackend, lexical_query_text,
+};
 use crate::lifecycle::{
     DiskBudgetAction, DiskBudgetSnapshot, DiskBudgetStage, IndexStorageBreakdown, LifecycleTracker,
     ResourceLimits, ResourceUsage, WatchdogConfig,
@@ -596,7 +598,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v13: query exclusions apply to the vector lanes.
 // v14: `type:`/`lang:` filters accept language names (`lang:rust`).
 // v15: extension filter clauses widen each other (`ext:rs ext:md`).
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v15";
+// v16: `HashMap::new`, `std::io` and URLs reach the lexical lane.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v16";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -606,8 +609,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v8 / stream v6: query exclusions apply to the vector lanes.
 // v9 / stream v7: `type:`/`lang:` filters accept language names.
 // v10 / stream v8: extension filter clauses widen each other.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v10";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v8";
+// v11 / stream v9: colons that name no field reach the lexical lane.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v11";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v9";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -10681,8 +10685,9 @@ impl FsfsRuntime {
         }
         let ceiling = live_docs.max(1);
         let mut fetch_limit = output_limit.min(ceiling);
+        let query = lexical_query_text(query);
         loop {
-            let hits = lexical.search_doc_ids(cx, query, fetch_limit)?;
+            let hits = lexical.search_doc_ids(cx, &query, fetch_limit)?;
             let enough_matches = filter_expr.is_none_or(|filter| {
                 hits.iter()
                     .filter(|hit| filter.matches_doc_id(&hit.document_id))
@@ -10783,6 +10788,7 @@ impl FsfsRuntime {
             )
         };
         let mut found = Vec::new();
+        let query = lexical_query_text(query);
         for (ids, max_source_bytes) in [
             (lexical_ids, usize::MAX),
             (vector_ids, FSFS_FILL_SNIPPET_SCAN_BYTES),
@@ -10790,7 +10796,7 @@ impl FsfsRuntime {
             if ids.is_empty() {
                 continue;
             }
-            match lexical.snippets_for_documents(cx, query, &ids, config, max_source_bytes) {
+            match lexical.snippets_for_documents(cx, &query, &ids, config, max_source_bytes) {
                 Ok(snippets) => found.extend(ids.into_iter().zip(snippets)),
                 Err(error) => {
                     Self::semantic_retry_checkpoint(cx, "fsfs.search.snippets")?;
@@ -11446,8 +11452,11 @@ impl FsfsRuntime {
                     // Ranked like `search_with_snippets`, but snippets are made
                     // later for the returned hits only (`fill_hit_snippets`).
                     let snippet_limit = lexical_budget.clamp(1, FSFS_SEARCH_SNIPPET_HEAD_LIMIT);
-                    let snippet_hits =
-                        lexical.search_doc_ids(cx, &normalized_query, snippet_limit)?;
+                    let snippet_hits = lexical.search_doc_ids(
+                        cx,
+                        &lexical_query_text(&normalized_query),
+                        snippet_limit,
+                    )?;
 
                     let needs_full_lexical = output_limit > snippet_limit
                         || filter_expr.is_some()
@@ -19739,7 +19748,7 @@ impl FsfsRuntime {
         let excluded = parsed
             .negative_terms
             .iter()
-            .cloned()
+            .map(|term| lexical_query_text(term).into_owned())
             .chain(
                 parsed
                     .negative_phrases
@@ -22898,7 +22907,7 @@ fn read_indexed_rerank_document_text(
     let passage = index
         .snippets_for_documents(
             cx,
-            query,
+            &lexical_query_text(query),
             &[doc_id],
             &rerank_passage_config(),
             usize::try_from(FSFS_RERANK_DOCUMENT_READ_LIMIT).unwrap_or(usize::MAX),
@@ -28536,6 +28545,11 @@ mod tests {
             super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v10".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that drops `HashMap::new` from the lexical lane cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v9".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -29229,12 +29243,14 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-        // v7 requires every extension clause at once; v6 reads `lang:rust` as
-        // an extension; v5 lets excluded documents back through the vector
-        // lanes; v4 gives long windowed sources the whole quality weight; v3
-        // blends quality discoveries without fast scores; v2 predates the WAL
-        // top-k repair; v1 an older ranking policy.
+        // v8 drops `HashMap::new` from the lexical lane; v7 requires every
+        // extension clause at once; v6 reads `lang:rust` as an extension; v5
+        // lets excluded documents back through the vector lanes; v4 gives long
+        // windowed sources the whole quality weight; v3 blends quality
+        // discoveries without fast scores; v2 predates the WAL top-k repair;
+        // v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v8",
             "fsfs.search.serve.stream.v7",
             "fsfs.search.serve.stream.v6",
             "fsfs.search.serve.stream.v5",
@@ -34060,14 +34076,14 @@ mod tests {
             (
                 "all-MiniLM-L6-v2",
                 Auto,
-                "fsfs.search.serve.v9",
+                "fsfs.search.serve.v10",
                 FSFS_SEARCH_SERVE_STREAM_VERSION,
             ),
             (
                 "all-MiniLM-L6-v2",
                 Auto,
                 FSFS_SEARCH_SERVE_SCHEMA_VERSION,
-                "fsfs.search.serve.stream.v7",
+                "fsfs.search.serve.stream.v8",
             ),
             (
                 "all-MiniLM-L6-v2-native",
@@ -43781,6 +43797,62 @@ mod tests {
         });
     }
 
+    #[test]
+    fn rust_paths_and_urls_reach_the_lexical_lane() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            fs::write(
+                project.join("cache.rs"),
+                "fn build() { let seen = HashMap::new(); std::io::stdout(); }\n",
+            )
+            .expect("write rust");
+            fs::write(project.join("notes.md"), "Report bugs at https://sqlite.org/forum\n")
+                .expect("write notes");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index");
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("HashMap::new".to_owned()),
+                index_dir: Some(project.join(".frankensearch")),
+                ..CliInput::default()
+            });
+            let resources = runtime
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::LexicalOnly)
+                .await
+                .expect("open index");
+            let lexical = resources.lexical_index.as_ref().expect("lexical index");
+            for (query, expected) in [
+                ("HashMap::new", Some("cache.rs")),
+                ("std::io", Some("cache.rs")),
+                ("https://sqlite.org", Some("notes.md")),
+                // A real field keeps its meaning: the title is the file name.
+                ("title:notes", Some("notes.md")),
+                ("title:HashMap", None),
+            ] {
+                let found = FsfsRuntime::gather_lexical_candidates(&cx, lexical, query, 10, None, 10)
+                    .expect("lexical candidates")
+                    .into_iter()
+                    .map(|candidate| candidate.doc_id)
+                    .collect::<Vec<_>>();
+                match expected {
+                    Some(doc) => assert!(found.iter().any(|id| id == doc), "{query}: {found:?}"),
+                    None => assert!(found.is_empty(), "{query}: {found:?}"),
+                }
+            }
+        });
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn non_utf8_file_names_are_skipped_with_a_reason_instead_of_a_lossy_key() {
@@ -47486,6 +47558,8 @@ mod tests {
                 "fsfs.search.cache.v13",
                 // Required every extension clause at once.
                 "fsfs.search.cache.v14",
+                // Dropped `HashMap::new` from the lexical lane.
+                "fsfs.search.cache.v15",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

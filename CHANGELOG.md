@@ -306,6 +306,17 @@ qualified; individual results below are narrower than release acceptance.
   them first: `server`, next to 200 `server-*.log` files, returned only logs
   in a stress test. Multi-word queries still ranked the matching content first.
 
+- **Keyword search finds `HashMap::new`, `std::io` and URLs.** The keyword
+  parser reads `word:` at the start of a term as a field name and drops the
+  fragment when no such field exists. So a Rust path, a URL or `TODO:` lost its
+  keyword match entirely. `lexical_only` returned nothing, hybrid search ranked
+  on the semantic tiers alone, and `-std::io` excluded nothing. fsfs now
+  escapes every colon except one ending a real field name (`title:notes` still
+  searches titles) before a query reaches the keyword index (bd-06o8o). Cached
+  answers and daemons move to `fsfs.search.cache.v16`, `fsfs.search.serve.v11`
+  / `stream.v9` and complete-generation forwarding 10. Library callers of
+  `LexicalRead` still pass their text unchanged (bd-3gslf).
+
 - **`--filter "ext:rs ext:md"` selects either extension.** Every clause had
   to hold, and a file has only one extension, so any two `ext:`, `type:` or
   `lang:` clauses silently matched nothing. Extension clauses now widen each

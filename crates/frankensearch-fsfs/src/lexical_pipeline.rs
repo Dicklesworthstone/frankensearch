@@ -6,18 +6,60 @@
 //! - explicit update/delete behavior on change and reclassification
 //! - measurable throughput/latency target contracts
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use asupersync::Cx;
 use compact_str::CompactString;
 use frankensearch_core::{IndexableDocument, LexicalWrite, SearchError, SearchResult};
-use frankensearch_quill::{QuillIndex, indexable_document_content_hash};
+use frankensearch_quill::{DEFAULT_SCHEMA, QuillIndex, indexable_document_content_hash};
 use tracing::debug;
 
 use crate::config::IngestionClass;
 
 mod flush_queue;
 use flush_queue::FlushProgress;
+
+/// Query text for the Quill lexical lane.
+///
+/// Quill's parser reads `word:` at the start of a term as a field prefix and
+/// drops the fragment when no such field exists, so `HashMap::new`, `std::io`,
+/// `https://…` or `TODO:` matched nothing at all. Every colon is escaped except
+/// one that ends a real field name at the start of a term (`title:rust`);
+/// quoted phrases are already literal.
+#[must_use]
+pub fn lexical_query_text(query: &str) -> Cow<'_, str> {
+    if !query.contains(':') {
+        return Cow::Borrowed(query);
+    }
+    let mut escaped_query = String::with_capacity(query.len() + 8);
+    let mut term_start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, ch) in query.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            in_quotes = !in_quotes;
+        } else if ch == ':' && !in_quotes {
+            let name = query.get(term_start..index).unwrap_or_default();
+            let doubled = query
+                .get(index + 1..)
+                .is_some_and(|rest| rest.starts_with(':'));
+            let field = !doubled && DEFAULT_SCHEMA.fields.iter().any(|field| field.name == name);
+            if !field {
+                escaped_query.push('\\');
+            }
+        }
+        escaped_query.push(ch);
+        if ch.is_whitespace() || matches!(ch, '(' | ')' | '+' | '-') {
+            term_start = index + ch.len_utf8();
+        }
+    }
+    Cow::Owned(escaped_query)
+}
 
 /// Default expected throughput for initial lexical indexing (docs/sec).
 pub const TARGET_INITIAL_DOCS_PER_SECOND: u32 = 20_000;
@@ -994,6 +1036,31 @@ mod tests {
             assert!(chunks.len() > 1);
             assert_eq!(chunks_into_index_content(chunks), multibyte);
         }
+    }
+
+    #[test]
+    fn lexical_query_text_escapes_colons_that_name_no_field() {
+        for (query, expected) in [
+            ("HashMap::new", r"HashMap\:\:new"),
+            ("std::io::Result", r"std\:\:io\:\:Result"),
+            ("https://sqlite.org", r"https\://sqlite.org"),
+            ("TODO: flaky", r"TODO\: flaky"),
+            ("lang:rust", r"lang\:rust"),
+            // A real field keeps its prefix, also after a group or negation.
+            ("title:rust", "title:rust"),
+            ("(title:rust) -content:beta", "(title:rust) -content:beta"),
+            // `title::x` is not a field prefix; a quoted phrase is literal.
+            ("title::x", r"title\:\:x"),
+            ("\"std::io\" error", "\"std::io\" error"),
+            // An escape the user already wrote is kept as is.
+            (r"a\:b", r"a\:b"),
+        ] {
+            assert_eq!(super::lexical_query_text(query), expected, "{query}");
+        }
+        assert!(matches!(
+            super::lexical_query_text("plain query"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
