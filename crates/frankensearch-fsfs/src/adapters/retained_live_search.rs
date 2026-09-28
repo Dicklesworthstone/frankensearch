@@ -466,7 +466,10 @@ mod tests {
                 .with_skip_reason("fixture-policy");
             delivery.publish(&cx, &refined, &mut sink).unwrap();
             assert_eq!(delivery.count, 2);
-            assert_eq!(frames[0].annotations["vector_generation_id"], "fixture-space");
+            assert_eq!(
+                frames[0].annotations["vector_generation_id"],
+                "fixture-space"
+            );
             assert_eq!(frames[1].annotations["skip_reason"], "fixture-policy");
             assert!(
                 frames
@@ -553,7 +556,9 @@ mod tests {
             assert_eq!(delivery.last_phase, None);
             cx.set_cancel_requested(true);
             assert!(matches!(
-                delivery.publish(&cx, &initial, &mut |_| panic!("cancelled phase reached sink")),
+                delivery.publish(&cx, &initial, &mut |_| panic!(
+                    "cancelled phase reached sink"
+                )),
                 Err(SearchError::Cancelled { .. })
             ));
             cx.set_cancel_requested(false);
