@@ -822,10 +822,7 @@ impl<B: LexicalIndexBackend> LexicalPipeline<B> {
             });
         }
 
-        if matches!(
-            mutation.ingestion_class,
-            IngestionClass::MetadataOnly | IngestionClass::Skip
-        ) {
+        if mutation.ingestion_class == IngestionClass::Skip {
             return Ok(LexicalAction::Delete {
                 doc_id: mutation.doc_id.clone(),
                 revision: mutation.revision,
@@ -833,7 +830,13 @@ impl<B: LexicalIndexBackend> LexicalPipeline<B> {
             });
         }
 
-        let body = mutation.text.as_deref().unwrap_or_default();
+        // A metadata-only file stays findable by its path and, through the
+        // title, its name; its content is never indexed.
+        let body = if mutation.ingestion_class == IngestionClass::MetadataOnly {
+            mutation.doc_id.as_str()
+        } else {
+            mutation.text.as_deref().unwrap_or_default()
+        };
         if body.trim().is_empty() {
             return Ok(LexicalAction::Delete {
                 doc_id: mutation.doc_id.clone(),
@@ -994,17 +997,36 @@ mod tests {
     }
 
     #[test]
-    fn reclassification_to_non_lexical_emits_delete_action() {
+    fn reclassification_to_skip_emits_delete_action() {
         let pipeline = LexicalPipeline::new(InMemoryLexicalBackend::default());
         let mutation = LexicalMutation::upsert(
             "doc-a",
             2,
-            IngestionClass::MetadataOnly,
+            IngestionClass::Skip,
             "still has text",
             "policy downgrade",
         );
         let action = pipeline.plan_action(&mutation).expect("plan action");
         assert!(matches!(action, LexicalAction::Delete { .. }));
+    }
+
+    #[test]
+    fn metadata_only_indexes_the_path_never_the_content() {
+        let pipeline = LexicalPipeline::new(InMemoryLexicalBackend::default());
+        let mutation = LexicalMutation::upsert(
+            "dist/vendor/minified.js",
+            2,
+            IngestionClass::MetadataOnly,
+            "var quokka=1;",
+            "policy downgrade",
+        )
+        .with_title("minified.js");
+        let action = pipeline.plan_action(&mutation).expect("plan action");
+        let LexicalAction::Upsert { title, chunks, .. } = action else {
+            panic!("a metadata-only file keeps a lexical row, got {action:?}");
+        };
+        assert_eq!(title.as_deref(), Some("minified.js"));
+        assert_eq!(chunks_into_index_content(chunks), "dist/vendor/minified.js");
     }
 
     #[test]

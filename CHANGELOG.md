@@ -294,6 +294,15 @@ qualified; individual results below are narrower than release acceptance.
   facade) and must be rebuilt; `CASS_SEMANTIC_SCHEMA` and
   `FSFS_CHUNK_SCHEMA` did not change.
 
+- **Metadata-only files can be found by name.** Files fsfs indexes as
+  `metadata_only` (for example `.log`, `.tmp`, `.bak` and `.map` files, lock
+  files, and files between two and four times `max_file_size_mb`) counted
+  toward `indexed_files`, yet had no keyword row,
+  so no query could return them, not even their file name. Each now has a
+  keyword row made of its relative path and file name, never its content.
+  One-shot indexing and watch both write it (bd-kcx5v). Indexes built
+  earlier gain these rows on the next `fsfs index`.
+
 - **Searching right after an upgrade works.** A query daemon left running
   by the previous fsfs kept its socket, so when the new version's results
   differed (any cache or protocol version change), every `fsfs search`

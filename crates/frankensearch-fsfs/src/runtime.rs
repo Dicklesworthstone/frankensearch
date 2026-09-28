@@ -2921,10 +2921,7 @@ impl LiveIngestPipeline {
 
         for manifest in manifests.values() {
             let ingestion_class = ingestion_class_from_label(&manifest.ingestion_class)?;
-            if !matches!(
-                ingestion_class,
-                IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
-            ) {
+            if ingestion_class == IngestionClass::Skip {
                 continue;
             }
 
@@ -2956,8 +2953,10 @@ impl LiveIngestPipeline {
                 deleted_at_ms: None,
             });
 
-            if matches!(ingestion_class, IngestionClass::LexicalOnly)
-                || vector_ids.contains(&manifest.file_key)
+            if matches!(
+                ingestion_class,
+                IngestionClass::LexicalOnly | IngestionClass::MetadataOnly
+            ) || vector_ids.contains(&manifest.file_key)
             {
                 vector_index.push(IndexMembershipEntry {
                     doc_id: format!("vector:{}", manifest.file_key),
@@ -3429,10 +3428,7 @@ impl LiveIngestPipeline {
     ) -> frankensearch_core::SearchResult<bool> {
         let (abs_path, rel_key) = self.resolve_paths(file_key)?;
 
-        if matches!(
-            ingestion_class,
-            IngestionClass::MetadataOnly | IngestionClass::Skip
-        ) {
+        if ingestion_class == IngestionClass::Skip {
             self.prune_indexes(cx, &rel_key).await?;
             Self::purge_storage_document(storage_ctx, &rel_key)?;
             return Ok(true);
@@ -16718,7 +16714,9 @@ impl FsfsRuntime {
                     content_hash_hex,
                     lexical_required: matches!(
                         candidate.ingestion_class,
-                        IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
+                        IngestionClass::FullSemanticLexical
+                            | IngestionClass::LexicalOnly
+                            | IngestionClass::MetadataOnly
                     ),
                     semantic_reused: reuse == CheckpointReuse::Complete,
                     fast_windows,
@@ -16731,30 +16729,25 @@ impl FsfsRuntime {
             control.checkpoint(cx, "index.lexical_batch", true)?;
             let lexical_start = Instant::now();
             for pending in &chunk_docs {
-                if pending.lexical_required
-                    && !matches!(
-                        pending.ingestion_class,
-                        IngestionClass::MetadataOnly | IngestionClass::Skip
-                    )
-                {
+                if pending.lexical_required {
                     lexical_reconciliation_ids.remove(&pending.file_key);
                 }
             }
             let lexical_batch = chunk_docs
                 .iter()
-                .filter(|pending| {
-                    pending.lexical_required
-                        && !matches!(
-                            pending.ingestion_class,
-                            IngestionClass::MetadataOnly | IngestionClass::Skip
-                        )
-                })
+                .filter(|pending| pending.lexical_required)
                 .map(|pending| {
+                    // The planner indexes a metadata-only file's path, not its text.
+                    let text = if pending.ingestion_class == IngestionClass::MetadataOnly {
+                        String::new()
+                    } else {
+                        pending.lexical_text.clone()
+                    };
                     let mut mutation = LexicalMutation::upsert(
                         pending.file_key.clone(),
                         u64::try_from(pending.revision).unwrap_or(0),
                         pending.ingestion_class,
-                        pending.lexical_text.clone(),
+                        text,
                         pending.reason_code.clone(),
                     );
                     mutation.title.clone_from(&pending.document.title);
@@ -17156,10 +17149,7 @@ impl FsfsRuntime {
 
             // Update checkpoint entries for this batch
             for pending in &chunk_docs {
-                let lexical_indexed = matches!(
-                    pending.ingestion_class,
-                    IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
-                );
+                let lexical_indexed = pending.lexical_required;
                 let semantic_indexed =
                     matches!(pending.ingestion_class, IngestionClass::FullSemanticLexical)
                         && (pending.semantic_reused
@@ -26727,10 +26717,7 @@ fn checkpoint_entry_reuse(
         return CheckpointReuse::None;
     }
 
-    let requires_lexical = matches!(
-        candidate.ingestion_class,
-        IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
-    );
+    let requires_lexical = candidate.ingestion_class != IngestionClass::Skip;
     if entry.lexical_indexed != requires_lexical {
         return CheckpointReuse::None;
     }
@@ -37253,7 +37240,7 @@ mod tests {
     }
 
     #[test]
-    fn live_ingest_upsert_metadata_only_prunes_lexical_and_vector_entries() {
+    fn live_ingest_upsert_metadata_only_keeps_a_path_row_and_drops_content_and_vectors() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let temp_root = fs::canonicalize(temp.path()).expect("canonicalize tempdir");
@@ -37305,18 +37292,21 @@ mod tests {
                     }],
                 )
                 .await
-                .expect("metadata-only upsert should prune stale index entries");
+                .expect("metadata-only upsert replaces the stale row");
 
             assert_eq!(applied, 1);
-            let lexical_hits = pipeline
-                .lexical_index
-                .search(&cx, "metadata", 5)
-                .await
-                .expect("search lexical index");
-            assert!(
-                lexical_hits.iter().all(|hit| hit.doc_id != "src/meta.json"),
-                "metadata-only ingest should remove lexical entries"
-            );
+            for (query, findable) in [("meta", true), ("json", true), ("stale", false), ("true", false)] {
+                let lexical_hits = pipeline
+                    .lexical_index
+                    .search(&cx, query, 5)
+                    .await
+                    .expect("search lexical index");
+                assert_eq!(
+                    lexical_hits.iter().any(|hit| hit.doc_id == "src/meta.json"),
+                    findable,
+                    "{query}: a metadata-only file is found by its path, never by its text"
+                );
+            }
 
             let query = vec![0.0_f32; 256];
             let vector_hits = {
@@ -43685,6 +43675,64 @@ mod tests {
                     .dir_name(),
                 "quill-stale"
             );
+        });
+    }
+
+    #[test]
+    fn metadata_only_files_are_found_by_path_and_name_but_not_by_content() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("logs")).expect("create source root");
+            fs::write(project.join("guide.md"), "ordinary guide about badgers\n")
+                .expect("write guide");
+            fs::write(project.join("logs/server.log"), "quokka request served\n")
+                .expect("write log");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index");
+            let index_root = project.join(".frankensearch");
+            let manifests = FsfsRuntime::read_index_manifest(&index_root)
+                .expect("read manifest")
+                .expect("manifest");
+            assert!(
+                manifests.iter().any(|entry| entry.file_key == "logs/server.log"
+                    && entry.ingestion_class == "metadata_only"),
+                "{manifests:?}"
+            );
+
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("server".to_owned()),
+                index_dir: Some(index_root),
+                ..CliInput::default()
+            });
+            let resources = runtime
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::LexicalOnly)
+                .await
+                .expect("open index");
+            let lexical = resources.lexical_index.as_ref().expect("lexical index");
+            for (query, expected) in [
+                ("server", Some("logs/server.log")),
+                ("logs", Some("logs/server.log")),
+                ("quokka", None),
+                ("badgers", Some("guide.md")),
+            ] {
+                let hits = lexical.search_doc_ids(&cx, query, 10).expect("search");
+                let found = hits.iter().map(|hit| hit.document_id.as_str()).collect::<Vec<_>>();
+                match expected {
+                    Some(doc) => assert!(found.contains(&doc), "{query}: {found:?}"),
+                    None => assert!(!found.contains(&"logs/server.log"), "{query}: {found:?}"),
+                }
+            }
         });
     }
 
