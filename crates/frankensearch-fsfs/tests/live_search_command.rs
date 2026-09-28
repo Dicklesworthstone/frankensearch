@@ -46,10 +46,17 @@ fn run(root: &Path, args: &[OsString]) -> io::Result<Output> {
     loop {
         let running = child.0.as_mut().expect("test child retained");
         if running.try_wait()?.is_some() {
-            return child.0.take().expect("completed child retained").wait_with_output();
+            return child
+                .0
+                .take()
+                .expect("completed child retained")
+                .wait_with_output();
         }
         if started.elapsed() > Duration::from_secs(20) {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "live-search child exceeded test watchdog"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "live-search child exceeded test watchdog",
+            ));
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -118,11 +125,18 @@ mod native {
         run_test_with_cx(|cx| async move {
             let store = CompleteGenerationStore::create(&cx, &fixture_root).unwrap();
             let build = store.begin(&cx).unwrap();
-            let config = QuillConfig { deterministic_ingest: true, ..QuillConfig::default() };
-            let index = QuillIndex::create(&cx, &build.path().join("lexical"), config).await.unwrap();
+            let config = QuillConfig {
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            };
+            let index = QuillIndex::create(&cx, &build.path().join("lexical"), config)
+                .await
+                .unwrap();
             let documents = [IndexableDocument::new("doc-a", "alpha searchable body")
                 .with_metadata("path", "/fixture/doc-a.rs")];
-            LexicalWrite::index_documents(&index, &cx, &documents).await.unwrap();
+            LexicalWrite::index_documents(&index, &cx, &documents)
+                .await
+                .unwrap();
             LexicalWrite::commit(&index, &cx).await.unwrap();
             drop(index);
             assert!(matches!(
@@ -132,7 +146,11 @@ mod native {
         });
         let pointer = store_root.join(COMPLETE_GENERATION_POINTER);
         let before = std::fs::read(&pointer).unwrap();
-        let output = run(root.path(), &live_args(&store_root, &["--once", "--timeout-ms", "5000"])).unwrap();
+        let output = run(
+            root.path(),
+            &live_args(&store_root, &["--once", "--timeout-ms", "5000"]),
+        )
+        .unwrap();
         assert!(output.status.success(), "{:?}", output);
         let frame: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(frame["schema_version"], "fsfs.stream.live_search.v1");
@@ -143,7 +161,10 @@ mod native {
         assert_eq!(frame["results"][0]["item"]["path"], "/fixture/doc-a.rs");
         assert_eq!(std::fs::read(&pointer).unwrap(), before);
         for directory in ["no-models", "data", "cache", "config"] {
-            assert!(!root.path().join(directory).exists(), "unexpected startup side effect: {directory}");
+            assert!(
+                !root.path().join(directory).exists(),
+                "unexpected startup side effect: {directory}"
+            );
         }
     }
 
@@ -165,9 +186,21 @@ mod native {
         let root = tempfile::tempdir().unwrap();
         let store = root.path().join("store");
         std::fs::create_dir(&store).unwrap();
-        let output = run(root.path(), &live_args(&store, &[
-            "--max-updates", "1", "--timeout-ms", "50", "--poll-ms", "60000",
-        ])).unwrap();
+        let output = run(
+            root.path(),
+            &live_args(
+                &store,
+                &[
+                    "--max-updates",
+                    "1",
+                    "--timeout-ms",
+                    "50",
+                    "--poll-ms",
+                    "60000",
+                ],
+            ),
+        )
+        .unwrap();
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         let error: Value = serde_json::from_slice(&output.stderr).unwrap();
@@ -183,9 +216,18 @@ mod native {
         std::fs::create_dir(&store).unwrap();
         let config = root.path().join("explicit.toml");
         std::fs::write(&config, "[indexing]\nwatch_mode = true\noffline = false\n").unwrap();
-        let mut args = live_args(&store, &[
-            "--hybrid", "--max-updates", "1", "--timeout-ms", "50", "--poll-ms", "60000",
-        ]);
+        let mut args = live_args(
+            &store,
+            &[
+                "--hybrid",
+                "--max-updates",
+                "1",
+                "--timeout-ms",
+                "50",
+                "--poll-ms",
+                "60000",
+            ],
+        );
         args.push("--config".into());
         args.push(config.as_os_str().to_owned());
         let output = run(root.path(), &args).unwrap();
@@ -210,7 +252,12 @@ mod native {
         assert!(output.stdout.is_empty());
         let error: Value = serde_json::from_slice(&output.stderr).unwrap();
         assert_eq!(error["phase"], "arguments");
-        assert!(error["message"].as_str().unwrap().contains("--config requires --hybrid"));
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("--config requires --hybrid")
+        );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 }

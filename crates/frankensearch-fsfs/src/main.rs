@@ -111,7 +111,10 @@ fn main() {
     // Live subscriptions have a dedicated read-only process boundary. Handle
     // it before UTF-8 conversion, model/config loading and ordinary output
     // envelopes, which must never be appended to the live NDJSON stream.
-    if std::env::args_os().nth(1).is_some_and(|arg| arg == "live-search") {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "live-search")
+    {
         std::process::exit(live_search_command::entry(
             std::env::args_os().skip(2).collect(),
         ));

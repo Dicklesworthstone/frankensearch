@@ -53,7 +53,9 @@ impl Subscription {
                 options.refresh,
                 QuillConfig::default(),
             )?))),
-            _ => Err(invalid("subscription mode does not match its admitted runtime")),
+            _ => Err(invalid(
+                "subscription mode does not match its admitted runtime",
+            )),
         }
     }
 
@@ -238,10 +240,19 @@ mod tests {
             let decoded: RetainedLiveSearchFrame = serde_json::from_value(record.clone()).unwrap();
             assert_eq!(&decoded, expected);
         }
-        assert!(matches!(&frames[0].update.as_ref().unwrap().event, LiveSearchEvent::Snapshot { .. }));
-        assert_eq!(records[1]["update"]["previous_generation"], records[0]["update"]["generation"]);
+        assert!(matches!(
+            &frames[0].update.as_ref().unwrap().event,
+            LiveSearchEvent::Snapshot { .. }
+        ));
+        assert_eq!(
+            records[1]["update"]["previous_generation"],
+            records[0]["update"]["generation"]
+        );
         assert_eq!(records[0]["generation_id"], records[1]["generation_id"]);
-        assert_ne!(records[0]["update"]["generation"], records[1]["update"]["generation"]);
+        assert_ne!(
+            records[0]["update"]["generation"],
+            records[1]["update"]["generation"]
+        );
     }
 
     #[test]
@@ -345,8 +356,11 @@ mod tests {
     fn explicit_hybrid_configuration_preserves_search_policy_and_disables_indexing() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("fsfs.toml");
-        std::fs::write(&path, "[search]\nfast_only = true\n[indexing]\nwatch_mode = true\noffline = false\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "[search]\nfast_only = true\n[indexing]\nwatch_mode = true\noffline = false\n",
+        )
+        .unwrap();
         let mut options = options(root.path());
         options.config_path = Some(path);
         let runtime = configured_runtime(&options).unwrap().unwrap();
@@ -379,7 +393,12 @@ mod tests {
             )
             .unwrap();
             let mut bytes = Vec::new();
-            assert!(!session.poll_ndjson(&cx, Instant::now(), &mut bytes).await.unwrap());
+            assert!(
+                !session
+                    .poll_ndjson(&cx, Instant::now(), &mut bytes)
+                    .await
+                    .unwrap()
+            );
             cx.set_cancel_requested(true);
             assert!(matches!(
                 session.poll_ndjson(&cx, Instant::now(), &mut bytes).await,
@@ -431,8 +450,13 @@ mod tests {
 
         let path = OsString::from_vec(b"config-\xff.toml".to_vec());
         let args = vec![
-            "--hybrid".into(), "--config".into(), path.clone(),
-            "--index-dir".into(), "/store".into(), "--query".into(), "alpha".into(),
+            "--hybrid".into(),
+            "--config".into(),
+            path.clone(),
+            "--index-dir".into(),
+            "/store".into(),
+            "--query".into(),
+            "alpha".into(),
         ];
         let options = Options::parse(args).unwrap();
         assert_eq!(options.config_path, Some(PathBuf::from(path)));

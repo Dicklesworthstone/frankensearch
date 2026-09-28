@@ -2069,6 +2069,11 @@ mod tests {
         "fsfs uninstall --yes --dry-run --purge",
     ];
 
+    /// Commands `main` dispatches before `parse_cli_args` ever sees argv. The
+    /// binary's own tests prove them (`tests/live_search_command.rs`); the
+    /// source scan checks that `main.rs` still dispatches each one.
+    const PRE_DISPATCH_COMMANDS: &[(&str, &str)] = &[("fsfs live-search", "\"live-search\"")];
+
     /// Advertised forms that must NEVER parse: the fictional dry-run flags
     /// this contract retired, the nonexistent profile/repro/trace
     /// subcommands, and the nonexistent fsfsctl binary's grammar.
@@ -2297,8 +2302,22 @@ mod tests {
             }
         }
         assert!(!found.is_empty(), "the scan itself must not be vacuous");
+        let main_source =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"))
+                .expect("read main.rs");
+        for (command, dispatch) in PRE_DISPATCH_COMMANDS {
+            assert!(
+                main_source.contains(dispatch),
+                "main.rs no longer dispatches `{command}` before the CLI parser"
+            );
+        }
         for (path, command) in found {
             let normalized = normalize_advertised(&command);
+            if PRE_DISPATCH_COMMANDS.iter().any(|(prefix, _)| {
+                normalized == *prefix || normalized.starts_with(&format!("{prefix} "))
+            }) {
+                continue;
+            }
             assert!(
                 ADVERTISED_COMMAND_CENSUS.contains(&normalized.as_str()),
                 "{} advertises uncensused command `{command}` (normalized `{normalized}`); \

@@ -164,12 +164,7 @@ impl Options {
                 }
                 "--max-updates" => max_updates = Some(number(value, &flag, 1, u64::MAX)?),
                 "--timeout-ms" => {
-                    timeout = Some(Duration::from_millis(number(
-                        value,
-                        &flag,
-                        1,
-                        86_400_000,
-                    )?));
+                    timeout = Some(Duration::from_millis(number(value, &flag, 1, 86_400_000)?));
                 }
                 "--format" => {
                     if text(value)? != "jsonl" {
@@ -190,7 +185,9 @@ impl Options {
             return Err(invalid("--once cannot be combined with --max-updates"));
         }
         if config_path.is_some() && !hybrid {
-            return Err(invalid("--config requires --hybrid; lexical mode never loads configuration"));
+            return Err(invalid(
+                "--config requires --hybrid; lexical mode never loads configuration",
+            ));
         }
         Ok(Self {
             root: root.ok_or_else(|| invalid("--index-dir is required; no store is guessed"))?,
@@ -251,8 +248,7 @@ impl Budget {
             .is_some_and(|remaining| remaining.is_zero())
         {
             return Err(SearchError::SearchTimeout {
-                elapsed_ms: u64::try_from(self.started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX),
+                elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 budget_ms: u64::try_from(self.timeout.unwrap_or_default().as_millis())
                     .unwrap_or(u64::MAX),
             });
@@ -282,11 +278,7 @@ impl<W: Write> Write for GuardedOutput<'_, W> {
 }
 
 #[cfg(test)]
-async fn execute<W: Write + Send>(
-    cx: &Cx,
-    options: &Options,
-    writer: &mut W,
-) -> SearchResult<u64> {
+async fn execute<W: Write + Send>(cx: &Cx, options: &Options, writer: &mut W) -> SearchResult<u64> {
     execute_with_runtime(cx, options, writer, None).await
 }
 
@@ -339,9 +331,11 @@ async fn execute_with_runtime<W: Write + Send>(
                 path: options.root.join("FSFS-CURRENT"),
             });
         }
-        let delay = budget.remaining().map_or(options.poll_interval, |remaining| {
-            remaining.min(options.poll_interval)
-        });
+        let delay = budget
+            .remaining()
+            .map_or(options.poll_interval, |remaining| {
+                remaining.min(options.poll_interval)
+            });
         // Bound signal responsiveness independently of a long user poll period.
         let mut remaining = delay;
         while !remaining.is_zero() {
@@ -374,8 +368,8 @@ fn run(options: Options) -> SearchResult<u64> {
     let request_shutdown = Arc::clone(&shutdown);
     let request_pool = Arc::clone(&pool);
     let task = scheduler.handle().spawn(async move {
-        let current = Cx::current()
-            .ok_or_else(|| invalid("runtime did not install a request context"))?;
+        let current =
+            Cx::current().ok_or_else(|| invalid("runtime did not install a request context"))?;
         let cx = request_pool.context(current);
         let scope = request_shutdown.cancellation_scope(&cx);
         // Stdout (rather than its non-Send lock guard) lives across admission awaits.
@@ -392,9 +386,7 @@ fn run(options: Options) -> SearchResult<u64> {
 fn result_exit_code(result: &SearchResult<u64>) -> i32 {
     match result {
         Ok(_) => exit_code::OK,
-        Err(SearchError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
-            exit_code::OK
-        }
+        Err(SearchError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe => exit_code::OK,
         Err(SearchError::Cancelled { .. }) => exit_code::INTERRUPTED,
         Err(error) => exit_code_for(error),
     }
@@ -420,7 +412,7 @@ fn report_error<W: Write>(
 
 /// Called before ordinary argument/config processing so live errors never append
 /// a normal command envelope to an already-started snapshot/delta stream.
-pub(super) fn entry(args: Vec<OsString>) -> i32 {
+pub fn entry(args: Vec<OsString>) -> i32 {
     if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
         let result = io::stdout()
             .write_all(HELP.as_bytes())
@@ -431,7 +423,12 @@ pub(super) fn entry(args: Vec<OsString>) -> i32 {
     let options = match Options::parse(args) {
         Ok(options) => options,
         Err(error) => {
-            let _ = report_error(&mut io::stderr(), "arguments", exit_code::USAGE_ERROR, &error);
+            let _ = report_error(
+                &mut io::stderr(),
+                "arguments",
+                exit_code::USAGE_ERROR,
+                &error,
+            );
             return exit_code::USAGE_ERROR;
         }
     };
@@ -450,8 +447,11 @@ mod tests {
     use super::*;
 
     fn args(extra: &[&str]) -> Vec<OsString> {
-        ["--index-dir", "/explicit/store", "--query", "alpha"].into_iter()
-            .chain(extra.iter().copied()).map(OsString::from).collect()
+        ["--index-dir", "/explicit/store", "--query", "alpha"]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(OsString::from)
+            .collect()
     }
 
     #[test]
@@ -471,10 +471,18 @@ mod tests {
 
     #[test]
     fn hybrid_and_configuration_are_explicit_and_order_independent() {
-        let options = Options::parse(args(&["--config", "/models/fsfs.toml", "--hybrid", "--once"]))
-            .unwrap();
+        let options = Options::parse(args(&[
+            "--config",
+            "/models/fsfs.toml",
+            "--hybrid",
+            "--once",
+        ]))
+        .unwrap();
         assert!(options.hybrid);
-        assert_eq!(options.config_path, Some(PathBuf::from("/models/fsfs.toml")));
+        assert_eq!(
+            options.config_path,
+            Some(PathBuf::from("/models/fsfs.toml"))
+        );
         assert_eq!(options.max_updates, Some(1));
         assert!(Options::parse(args(&["--config", "/not-opened"])).is_err());
         assert!(Options::parse(args(&["--hybrid", "--hybrid"])).is_err());
@@ -484,12 +492,29 @@ mod tests {
     #[test]
     fn explicit_options_reach_the_session_configuration() {
         let options = Options::parse(args(&[
-            "--limit", "100", "--poll-ms", "25", "--debounce-ms", "50",
-            "--max-wait-ms", "500", "--min-score-delta", "0.025",
-            "--max-updates", "3", "--timeout-ms", "2000", "--format", "jsonl",
-        ])).unwrap();
+            "--limit",
+            "100",
+            "--poll-ms",
+            "25",
+            "--debounce-ms",
+            "50",
+            "--max-wait-ms",
+            "500",
+            "--min-score-delta",
+            "0.025",
+            "--max-updates",
+            "3",
+            "--timeout-ms",
+            "2000",
+            "--format",
+            "jsonl",
+        ]))
+        .unwrap();
         assert_eq!(options.limits.max_results, 100);
-        assert_eq!(options.limits.min_score_delta.to_bits(), 0.025_f64.to_bits());
+        assert_eq!(
+            options.limits.min_score_delta.to_bits(),
+            0.025_f64.to_bits()
+        );
         assert_eq!(options.refresh.debounce, Duration::from_millis(50));
         assert_eq!(options.refresh.max_wait, Duration::from_millis(500));
         assert_eq!(options.poll_interval, Duration::from_millis(25));
@@ -499,7 +524,14 @@ mod tests {
 
     #[test]
     fn flags_cannot_silently_enable_unsupported_search_modes() {
-        for flag in ["--rerank", "--filter", "--semantic", "--daemon", "--config", "--watch"] {
+        for flag in [
+            "--rerank",
+            "--filter",
+            "--semantic",
+            "--daemon",
+            "--config",
+            "--watch",
+        ] {
             assert!(Options::parse(args(&[flag])).is_err(), "{flag}");
         }
         for format in ["json", "table", "csv", "toon"] {
@@ -510,34 +542,59 @@ mod tests {
     #[test]
     fn invalid_limits_durations_and_score_thresholds_are_refused() {
         for (flag, value) in [
-            ("--limit", "0"), ("--limit", "10001"), ("--poll-ms", "0"),
-            ("--poll-ms", "60001"), ("--debounce-ms", "-1"), ("--max-wait-ms", "0"),
-            ("--max-updates", "0"), ("--max-updates", "18446744073709551616"),
-            ("--timeout-ms", "0"), ("--timeout-ms", "86400001"),
-            ("--min-score-delta", "NaN"), ("--min-score-delta", "inf"),
-            ("--min-score-delta", "-0.01"), ("--limit", "one"),
+            ("--limit", "0"),
+            ("--limit", "10001"),
+            ("--poll-ms", "0"),
+            ("--poll-ms", "60001"),
+            ("--debounce-ms", "-1"),
+            ("--max-wait-ms", "0"),
+            ("--max-updates", "0"),
+            ("--max-updates", "18446744073709551616"),
+            ("--timeout-ms", "0"),
+            ("--timeout-ms", "86400001"),
+            ("--min-score-delta", "NaN"),
+            ("--min-score-delta", "inf"),
+            ("--min-score-delta", "-0.01"),
+            ("--limit", "one"),
         ] {
-            assert!(Options::parse(args(&[flag, value])).is_err(), "{flag} {value}");
+            assert!(
+                Options::parse(args(&[flag, value])).is_err(),
+                "{flag} {value}"
+            );
         }
         assert!(Options::parse(args(&["--debounce-ms", "501", "--max-wait-ms", "500"])).is_err());
         assert!(Options::parse(args(&["--once", "--max-updates", "1"])).is_err());
-        assert_eq!(Options::parse(args(&["--once"])).unwrap().max_updates, Some(1));
+        assert_eq!(
+            Options::parse(args(&["--once"])).unwrap().max_updates,
+            Some(1)
+        );
     }
 
     #[test]
     fn duplicate_missing_and_blank_arguments_are_refused() {
-        for extra in [vec!["--query", "beta"], vec!["--limit"], vec!["--once", "--once"]] {
+        for extra in [
+            vec!["--query", "beta"],
+            vec!["--limit"],
+            vec!["--once", "--once"],
+        ] {
             assert!(Options::parse(args(&extra)).is_err());
         }
         assert!(Options::parse(Vec::new()).is_err());
         assert!(Options::parse(vec!["--query".into(), "alpha".into()]).is_err());
-        for query in ["".to_owned(), "   ".to_owned(), "x".repeat(MAX_QUERY_BYTES + 1)] {
-            assert!(Options::parse(vec![
-                "--index-dir".into(),
-                "/store".into(),
-                "--query".into(),
-                query.into(),
-            ]).is_err());
+        for query in [
+            String::new(),
+            "   ".to_owned(),
+            "x".repeat(MAX_QUERY_BYTES + 1),
+        ] {
+            assert!(
+                Options::parse(vec![
+                    "--index-dir".into(),
+                    "/store".into(),
+                    "--query".into(),
+                    query.into(),
+                ])
+                .is_err()
+            );
         }
     }
 
@@ -551,21 +608,31 @@ mod tests {
             path.clone(),
             "--query".into(),
             "alpha".into(),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(options.root.into_os_string(), path);
-        assert!(Options::parse(vec![
-            "--index-dir".into(),
-            "/store".into(),
-            "--query".into(),
-            OsString::from_vec(vec![255]),
-        ]).is_err());
+        assert!(
+            Options::parse(vec![
+                "--index-dir".into(),
+                "/store".into(),
+                "--query".into(),
+                OsString::from_vec(vec![255]),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
     fn error_output_is_one_json_record_even_with_control_characters() {
         let mut bytes = Vec::new();
-        report_error(&mut bytes, "arguments", 2, &invalid("bad\n\u{1b}[2J\"query")).unwrap();
-        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        report_error(
+            &mut bytes,
+            "arguments",
+            2,
+            &invalid("bad\n\u{1b}[2J\"query"),
+        )
+        .unwrap();
+        assert_eq!(bytes.split(|&byte| byte == b'\n').count(), 2);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["command"], "live-search");
         assert_eq!(value["exit_code"], 2);
@@ -588,17 +655,34 @@ mod tests {
     #[test]
     fn expired_budget_and_cancellation_block_output_before_any_bytes() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let budget = Budget { started: Instant::now(), timeout: Some(Duration::ZERO) };
+            let budget = Budget {
+                started: Instant::now(),
+                timeout: Some(Duration::ZERO),
+            };
             let mut bytes = Vec::new();
-            let mut writer = GuardedOutput { writer: &mut bytes, cx: &cx, budget: &budget };
+            let mut writer = GuardedOutput {
+                writer: &mut bytes,
+                cx: &cx,
+                budget: &budget,
+            };
             assert!(writer.write_all(b"must not escape").is_err());
             assert!(bytes.is_empty());
             cx.set_cancel_requested(true);
-            let budget = Budget { started: Instant::now(), timeout: None };
-            let mut writer = GuardedOutput { writer: &mut bytes, cx: &cx, budget: &budget };
+            let budget = Budget {
+                started: Instant::now(),
+                timeout: None,
+            };
+            let mut writer = GuardedOutput {
+                writer: &mut bytes,
+                cx: &cx,
+                budget: &budget,
+            };
             assert!(writer.write_all(b"also refused").is_err());
             assert!(bytes.is_empty());
-            assert!(matches!(budget.check(&cx), Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                budget.check(&cx),
+                Err(SearchError::Cancelled { .. })
+            ));
         });
     }
 
@@ -617,11 +701,16 @@ mod tests {
 
         fn options(root: &std::path::Path, extra: &[&str]) -> Options {
             let mut values = vec![
-                OsString::from("--index-dir"), root.as_os_str().to_owned(),
-                OsString::from("--query"), OsString::from("alpha"),
-                OsString::from("--poll-ms"), OsString::from("10"),
-                OsString::from("--debounce-ms"), OsString::from("0"),
-                OsString::from("--timeout-ms"), OsString::from("2000"),
+                OsString::from("--index-dir"),
+                root.as_os_str().to_owned(),
+                OsString::from("--query"),
+                OsString::from("alpha"),
+                OsString::from("--poll-ms"),
+                OsString::from("10"),
+                OsString::from("--debounce-ms"),
+                OsString::from("0"),
+                OsString::from("--timeout-ms"),
+                OsString::from("2000"),
             ];
             values.extend(extra.iter().map(OsString::from));
             Options::parse(values).unwrap()
@@ -629,11 +718,18 @@ mod tests {
 
         async fn staged(cx: &Cx, store: &CompleteGenerationStore, id: &str) -> GenerationBuild {
             let build = store.begin(cx).unwrap();
-            let config = QuillConfig { deterministic_ingest: true, ..QuillConfig::default() };
-            let index = QuillIndex::create(cx, &build.path().join("lexical"), config).await.unwrap();
+            let config = QuillConfig {
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            };
+            let index = QuillIndex::create(cx, &build.path().join("lexical"), config)
+                .await
+                .unwrap();
             let document = IndexableDocument::new(id, "alpha immutable search result")
                 .with_metadata("path", format!("/{id}.rs"));
-            LexicalWrite::index_documents(&index, cx, &[document]).await.unwrap();
+            LexicalWrite::index_documents(&index, cx, &[document])
+                .await
+                .unwrap();
             LexicalWrite::commit(&index, cx).await.unwrap();
             drop(index);
             build
@@ -647,8 +743,11 @@ mod tests {
         }
 
         fn frames(bytes: &[u8]) -> Vec<QuillLiveSearchFrame> {
-            bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty())
-                .map(|line| serde_json::from_slice(line).unwrap()).collect()
+            bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect()
         }
 
         #[test]
@@ -659,7 +758,12 @@ mod tests {
                 publish(&cx, staged(&cx, &store, "old").await);
                 let pointer = std::fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap();
                 let mut output = Vec::new();
-                assert_eq!(execute(&cx, &options(root.path(), &["--once"]), &mut output).await.unwrap(), 1);
+                assert_eq!(
+                    execute(&cx, &options(root.path(), &["--once"]), &mut output)
+                        .await
+                        .unwrap(),
+                    1
+                );
                 let frames = frames(&output);
                 assert_eq!(frames.len(), 1);
                 assert_eq!(frames[0].sequence, 1);
@@ -671,7 +775,10 @@ mod tests {
                 assert_eq!(results[0].rank, 1);
                 assert_eq!(results[0].hit.doc_id, "old");
                 assert_eq!(results[0].hit.item.as_ref().unwrap()["path"], "/old.rs");
-                assert_eq!(std::fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+                assert_eq!(
+                    std::fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    pointer
+                );
                 // Querying never retained the publisher lease.
                 drop(store.begin(&cx).unwrap());
             });
@@ -691,7 +798,10 @@ mod tests {
 
             fn flush(&mut self) -> io::Result<()> {
                 if let Some(successor) = self.successor.take() {
-                    match successor.publish(&self.cx, |_, _| Ok(())).map_err(io::Error::other)? {
+                    match successor
+                        .publish(&self.cx, |_, _| Ok(()))
+                        .map_err(io::Error::other)?
+                    {
                         GenerationPublication::Durable(_) => {}
                         GenerationPublication::VisibleButDurabilityUncertain { source, .. } => {
                             return Err(source);
@@ -712,15 +822,25 @@ mod tests {
                 // Only publish after the first frame is delivered. This tests
                 // the actual long-lived command, not two independent searches.
                 let mut output = PublishAfterSnapshot {
-                    bytes: Vec::new(), successor: Some(successor), cx: cx.clone(),
+                    bytes: Vec::new(),
+                    successor: Some(successor),
+                    cx: cx.clone(),
                 };
-                let count = execute(&cx, &options(root.path(), &["--max-updates", "2"]), &mut output)
-                    .await.unwrap();
+                let count = execute(
+                    &cx,
+                    &options(root.path(), &["--max-updates", "2"]),
+                    &mut output,
+                )
+                .await
+                .unwrap();
                 assert_eq!(count, 2);
                 let frames = frames(&output.bytes);
                 assert_eq!(frames.len(), 2);
                 assert_eq!(frames[1].sequence, 2);
-                assert_eq!(frames[1].previous_generation.as_deref(), Some(frames[0].generation.as_str()));
+                assert_eq!(
+                    frames[1].previous_generation.as_deref(),
+                    Some(frames[0].generation.as_str())
+                );
                 assert_ne!(frames[0].generation, frames[1].generation);
                 assert_eq!(frames[1].result_count, 1);
                 let LiveSearchEvent::Delta { changes } = &frames[1].event else {
@@ -740,8 +860,10 @@ mod tests {
                 let root = tempfile::tempdir().unwrap();
                 let _store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
                 let mut output = Vec::new();
-                assert!(matches!(execute(&cx, &options(root.path(), &["--once"]), &mut output).await,
-                    Err(SearchError::IndexNotFound { .. })));
+                assert!(matches!(
+                    execute(&cx, &options(root.path(), &["--once"]), &mut output).await,
+                    Err(SearchError::IndexNotFound { .. })
+                ));
                 assert!(output.is_empty());
                 assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
             });
@@ -753,7 +875,11 @@ mod tests {
                 let parent = tempfile::tempdir().unwrap();
                 let root = parent.path().join("absent");
                 let mut output = Vec::new();
-                assert!(execute(&cx, &options(&root, &["--once"]), &mut output).await.is_err());
+                assert!(
+                    execute(&cx, &options(&root, &["--once"]), &mut output)
+                        .await
+                        .is_err()
+                );
                 assert!(!root.exists());
                 assert!(output.is_empty());
             });
@@ -767,11 +893,18 @@ mod tests {
                 publish(&cx, staged(&cx, &store, "retained").await);
                 cx.set_cancel_requested(true);
                 let mut output = Vec::new();
-                assert!(matches!(execute(&cx, &options(root.path(), &["--once"]), &mut output).await,
-                    Err(SearchError::Cancelled { .. })));
+                assert!(matches!(
+                    execute(&cx, &options(root.path(), &["--once"]), &mut output).await,
+                    Err(SearchError::Cancelled { .. })
+                ));
                 assert!(output.is_empty());
                 cx.set_cancel_requested(false);
-                assert_eq!(execute(&cx, &options(root.path(), &["--once"]), &mut output).await.unwrap(), 1);
+                assert_eq!(
+                    execute(&cx, &options(root.path(), &["--once"]), &mut output)
+                        .await
+                        .unwrap(),
+                    1
+                );
             });
         }
 
@@ -798,8 +931,13 @@ mod tests {
                 let root = tempfile::tempdir().unwrap();
                 let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
                 publish(&cx, staged(&cx, &store, "old").await);
-                let mut output = FailFlush { bytes: Vec::new(), flushes: 0 };
-                let error = execute(&cx, &options(root.path(), &[]), &mut output).await.unwrap_err();
+                let mut output = FailFlush {
+                    bytes: Vec::new(),
+                    flushes: 0,
+                };
+                let error = execute(&cx, &options(root.path(), &[]), &mut output)
+                    .await
+                    .unwrap_err();
                 assert!(matches!(error, SearchError::Io(_)));
                 assert_eq!(output.flushes, 1);
                 // Full bytes may have escaped before a flush failure, but are
@@ -818,9 +956,16 @@ mod tests {
                 let pointer = root.path().join(COMPLETE_GENERATION_POINTER);
                 std::fs::write(&pointer, b"fault injection: malformed selection").unwrap();
                 let mut output = Vec::new();
-                assert!(execute(&cx, &options(root.path(), &[]), &mut output).await.is_err());
+                assert!(
+                    execute(&cx, &options(root.path(), &[]), &mut output)
+                        .await
+                        .is_err()
+                );
                 assert!(output.is_empty());
-                assert_eq!(std::fs::read(&pointer).unwrap(), b"fault injection: malformed selection");
+                assert_eq!(
+                    std::fs::read(&pointer).unwrap(),
+                    b"fault injection: malformed selection"
+                );
             });
         }
     }
