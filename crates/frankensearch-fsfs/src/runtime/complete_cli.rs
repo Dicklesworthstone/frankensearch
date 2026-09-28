@@ -123,11 +123,15 @@ impl FsfsRuntime {
             CliCommand::Daemon => self.run_complete_generation_daemon(cx, &root).await,
             CliCommand::Status | CliCommand::Doctor => {
                 let store = CompleteGenerationStore::open(cx, &root)?;
-                let selected = store.active(cx)?.ok_or_else(|| {
-                    complete_cli_error("selection", "no complete generation has been published")
-                })?;
+                // A first build that failed (say, on a missing model) leaves
+                // only staging behind. Status and doctor exist to diagnose
+                // exactly that, so they report the models and the absent index
+                // instead of refusing.
+                let described = store
+                    .active(cx)?
+                    .map_or_else(|| root.clone(), |selected| selected.path().to_path_buf());
                 let mut input = self.cli_input.clone();
-                input.index_dir = Some(selected.path().to_path_buf());
+                input.index_dir = Some(described);
                 let reader_runtime = self.clone().with_cli_input(input);
                 if self.cli_input.command == CliCommand::Status {
                     reader_runtime.run_status_command()
@@ -274,7 +278,14 @@ impl FsfsRuntime {
         // or after the active descriptor has been removed out of protocol.
         let selected = complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
             || complete_entry_exists(&root.join("generations"))?;
-        Ok((initialize_store || selected).then_some(root))
+        // The opt-in chooses the layout of a build. Every other command
+        // follows the layout on disk, so before the first complete build it
+        // neither fails on the absent store nor hides an existing legacy index.
+        let builds = matches!(
+            self.cli_input.command,
+            CliCommand::Index | CliCommand::Watch
+        );
+        Ok((selected || (initialize_store && builds)).then_some(root))
     }
 
     /// Confirm durability of the selected immutable bundle without rescanning
@@ -347,6 +358,13 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         if self.cli_input.format == OutputFormat::Table {
+            if let Some(sentinel) = Self::read_index_sentinel(generation.path())? {
+                writeln!(
+                    writer,
+                    "Indexed {} file(s) (discovered {}, skipped {})",
+                    sentinel.indexed_files, sentinel.discovered_files, sentinel.skipped_files,
+                )?;
+            }
             writeln!(
                 writer,
                 "Published complete generation {} at {} (durable; predecessors retained)",
@@ -354,14 +372,34 @@ impl FsfsRuntime {
                 generation.path().display(),
             )?;
         } else {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "generation_id": generation.id(),
                 "generation_path": generation.path(),
                 "store_root": root,
                 "manifest_sha256": generation.manifest_sha256(),
                 "publication": "durable",
                 "generation_complete": true,
+                "vector_generation": Self::inspect_published_vector_generation(generation.path()),
+                "quality_generation": Self::inspect_published_quality_generation(generation.path()),
             });
+            // The build summary a legacy index reports (file counts, bytes,
+            // reason codes), read back from the sealed generation. Its
+            // index_root named the staging directory, not a readable index.
+            if let (Some(sentinel), Some(fields)) = (
+                Self::read_index_sentinel(generation.path())?,
+                payload.as_object_mut(),
+            ) && let serde_json::Value::Object(summary) =
+                serde_json::to_value(sentinel).map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.complete_generation.receipt",
+                    source: Box::new(source),
+                })?
+            {
+                for (key, value) in summary {
+                    if key != "index_root" {
+                        fields.entry(key).or_insert(value);
+                    }
+                }
+            }
             let envelope = OutputEnvelope::success(
                 payload,
                 meta_for_format(command, self.cli_input.format),
@@ -1681,11 +1719,23 @@ mod tests {
             runtime.complete_generation_command_root(true).unwrap(),
             Some(root.clone())
         );
+        // The opt-in only chooses what a build creates: a search or status
+        // before the first complete build stays on the legacy route, which
+        // reports the missing index instead of an I/O error.
+        let search = search_runtime(&runtime);
+        assert!(search.complete_generation_command_root(true).unwrap().is_none());
+        let mut status = runtime.clone();
+        status.cli_input.command = CliCommand::Status;
+        assert!(status.complete_generation_command_root(true).unwrap().is_none());
         assert!(!root.exists(), "route selection is read-only");
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("generations")).unwrap();
         assert_eq!(
             runtime.complete_generation_command_root(false).unwrap(),
+            Some(root.clone())
+        );
+        assert_eq!(
+            search.complete_generation_command_root(false).unwrap(),
             Some(root)
         );
     }
@@ -1997,6 +2047,53 @@ mod tests {
                 assert!(output.is_empty());
                 assert!(!root.exists());
             }
+        });
+    }
+
+    #[test]
+    fn complete_status_describes_a_store_whose_first_build_never_published() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let store = CompleteGenerationStore::create(&cx, &root).unwrap();
+            drop(store.begin(&cx).unwrap());
+            assert!(store.active(&cx).unwrap().is_none());
+            // Doctor shares the fallback but exits the process on a failing
+            // check, so only status runs in-process.
+            let mut input = runtime.cli_input.clone();
+            input.command = CliCommand::Status;
+            runtime
+                .clone()
+                .with_cli_input(input)
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await
+                .expect("status describes the unpublished store");
+        });
+    }
+
+    #[test]
+    fn complete_index_receipt_reports_the_build_summary() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            fs::write(source.join("beta.md"), "sharedtoken beta document").unwrap();
+            let receipt = publish(&runtime, &cx, &root).await;
+            let data = &receipt["data"];
+            assert_eq!(data["indexed_files"], 2, "{data}");
+            assert_eq!(data["discovered_files"], 2, "{data}");
+            assert_eq!(data["skipped_files"], 0, "{data}");
+            assert_eq!(data["generation_complete"], true);
+            assert!(
+                data["vector_generation"]["dimension"]
+                    .as_u64()
+                    .is_some_and(|dimension| dimension > 0),
+                "{data}"
+            );
+            assert!(data["quality_generation"].is_null(), "the fixture is fast-only");
+            assert!(
+                data.get("index_root").is_none(),
+                "the build's staging directory is not a readable index"
+            );
         });
     }
 

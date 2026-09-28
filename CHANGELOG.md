@@ -303,6 +303,22 @@ qualified; individual results below are narrower than release acceptance.
   One-shot indexing and watch both write it (bd-kcx5v). Indexes built
   earlier gain these rows on the next `fsfs index`.
 
+- **`FSFS_COMPLETE_GENERATIONS=1` no longer hides existing indexes.** The
+  opt-in chooses the layout of the next build, but it used to route every
+  command to the complete-generation store. Before the first complete build,
+  `fsfs status` and `fsfs search` failed with a bare "No such file or
+  directory". On a root holding a legacy index, they refused with "no complete
+  generation has been published" until the next `fsfs index` migrated it. Only
+  `index` and `watch` follow the opt-in now; other commands use the layout
+  already on disk. A first complete build can also fail before publishing, for
+  example on a missing model. `status` and `doctor` then report the models and
+  the missing index instead of refusing. The complete route's `index` and
+  `watch` receipts also report
+  the build summary a legacy index prints: `indexed_files`, `discovered_files`,
+  `skipped_files`, `total_canonical_bytes`, `vector_generation` and
+  `quality_generation`. The table form now leads with the "Indexed N file(s)"
+  line.
+
 - **Searching right after an upgrade works.** A query daemon left running
   by the previous fsfs kept its socket, so when the new version's results
   differed (any cache or protocol version change), every `fsfs search`
