@@ -175,4 +175,42 @@ mod native {
         assert!(error["message"].as_str().unwrap().contains("timed out"));
         assert_eq!(std::fs::read_dir(&store).unwrap().count(), 0);
     }
+
+    #[test]
+    fn hybrid_waits_for_publication_without_loading_missing_models_or_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let config = root.path().join("explicit.toml");
+        std::fs::write(&config, "[indexing]\nwatch_mode = true\noffline = false\n").unwrap();
+        let mut args = live_args(&store, &[
+            "--hybrid", "--max-updates", "1", "--timeout-ms", "50", "--poll-ms", "60000",
+        ]);
+        args.push("--config".into());
+        args.push(config.as_os_str().to_owned());
+        let output = run(root.path(), &args).unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["phase"], "subscription");
+        assert!(error["message"].as_str().unwrap().contains("timed out"));
+        assert_eq!(std::fs::read_dir(&store).unwrap().count(), 0);
+        for directory in ["no-models", "data", "cache", "config"] {
+            assert!(!root.path().join(directory).exists());
+        }
+    }
+
+    #[test]
+    fn hybrid_configuration_requires_explicit_hybrid_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let mut args = live_args(&root.path().join("not-created"), &["--once"]);
+        args.extend(strings(&["--config", "not-opened.toml"]));
+        let output = run(root.path(), &args).unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["phase"], "arguments");
+        assert!(error["message"].as_str().unwrap().contains("--config requires --hybrid"));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 }

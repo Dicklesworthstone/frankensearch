@@ -2,7 +2,10 @@
 //!
 //! Keep this outside the ordinary CLI dispatcher: live subscriptions require an
 //! explicitly selected complete store, never auto-discovery, migration, indexing,
-//! model initialization, configuration-driven writes, or an update check.
+//! configuration-driven index writes, or an update check. Models/configuration
+//! are loaded only when the caller explicitly chooses `--hybrid`.
+
+mod hybrid;
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -16,47 +19,57 @@ use asupersync::runtime::RuntimeBuilder;
 use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_fsfs::adapters::live_search::LiveSearchConfig;
 use frankensearch_fsfs::adapters::live_search_session::LiveSearchRefreshConfig;
-use frankensearch_fsfs::adapters::quill_live_search::QuillLiveSearchSession;
 use frankensearch_fsfs::generation_store::CompleteGenerationStore;
 use frankensearch_fsfs::runtime::SearchBlockingPool;
-use frankensearch_fsfs::{ShutdownCoordinator, exit_code, exit_code_for};
+use frankensearch_fsfs::{FsfsRuntime, ShutdownCoordinator, exit_code, exit_code_for};
+#[cfg(all(test, unix))]
 use frankensearch_quill::QuillConfig;
 
 const MAX_QUERY_BYTES: usize = 64 * 1024;
 const HELP: &str = "fsfs live-search --index-dir STORE --query TEXT [OPTIONS]
 
-Subscribe to committed complete generations using native Quill lexical search.
+Subscribe to committed complete generations; native Quill lexical search is default.
 The existing store must contain FSFS-CURRENT when a snapshot is requested.
-No indexing, model loading, downloads, migration, or root discovery is performed.
+No indexing, downloads, or root discovery is performed. Sealed indexes are never migrated.
 Run your complete-generation publisher separately; this command only reads.
 
   --index-dir STORE       Explicit complete-generation store root (required)
   --query TEXT            Nonblank UTF-8 query, at most 64 KiB (required)
+  --hybrid                Use the retained progressive hybrid pipeline and local models
+  --config FILE           Hybrid configuration/model policy; requires --hybrid
   --limit N               Result window, 1..=10000 (default 20)
   --poll-ms N             Selection probe interval, 10..=60000 (default 100)
   --debounce-ms N         Quiet period before a refresh, 0..=60000 (default 100)
   --max-wait-ms N         Churn coalescing bound, 1..=60000 (default 1000)
   --min-score-delta N     Finite, non-negative score-only threshold (default 0)
-  --max-updates N         Exit after N delivered generation frames
-  --once                 Emit one immediate snapshot and exit; fail if unselected
+  --max-updates N         Exit after N completed generation updates (all phases)
+  --once                 Deliver one generation, including refinement, then exit
   --timeout-ms N         Overall cooperative deadline, 1..=86400000
   --format jsonl         NDJSON is the only supported output format
   --help                 Print this help (use alone)
 
-Stdout contains only fsfs.stream.live_search.v1 frames: an initial snapshot,
+Default stdout contains only fsfs.stream.live_search.v1 frames: an initial snapshot,
 then atomic deltas. Empty deltas still identify committed generation changes.
 Apply every delta in full before rendering. The window is top-k, not all matches.
 Generation IDs are opaque; an explicitly restored predecessor is a new update.
 Each connection starts at sequence 1 with a full snapshot; there is no replay log.
 
 The default waits for an initial selection in an EXISTING store. A later absent
-selection preserves the visible baseline, not synthetic removals. Corruption,
+selection never creates synthetic removals (hybrid mode fails closed). Corruption,
 unreadable descriptors, query failures, and output failures stop the subscription.
 Errors are JSON on stderr; no error envelope is appended to the result stream.
 Ctrl-C/SIGTERM exits 130. A closed output pipe exits successfully without retry.
 The timeout and cancellation are cooperative; they cannot preempt an already
 running filesystem syscall, synchronous query, or blocked output syscall.
-This stream is lexical-only. --filter, --rerank, and semantic options are refused.
+The default is lexical-only and never loads models or configuration. --hybrid
+loads normal fsfs configuration (or --config) and uses already available models,
+with downloads disabled. Configure ranking, fast-only and rerank policy there.
+Hybrid stdout uses fsfs.stream.live_search.hybrid.v1, preserving Initial,
+Refined and RefinementFailed annotations and a generation-pinned result delta.
+Initial is flushed before refinement. A failed refinement preserves its Initial
+window; it is not a successful Refined update. --once/--max-updates never split
+that phase sequence. Each hybrid record is bounded to 16 MiB before output.
+--filter, --rerank, and --semantic CLI flags are refused rather than ignored.
 ";
 
 #[derive(Debug, Clone)]
@@ -69,6 +82,8 @@ struct Options {
     max_updates: Option<u64>,
     timeout: Option<Duration>,
     once: bool,
+    hybrid: bool,
+    config_path: Option<PathBuf>,
 }
 
 impl Options {
@@ -82,6 +97,8 @@ impl Options {
         let mut max_updates = None;
         let mut timeout = None;
         let mut once = false;
+        let mut hybrid = false;
+        let mut config_path = None;
         let mut seen = HashSet::new();
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
@@ -99,6 +116,8 @@ impl Options {
                     | "--once"
                     | "--timeout-ms"
                     | "--format"
+                    | "--hybrid"
+                    | "--config"
             ) {
                 return Err(invalid("unknown argument; run fsfs live-search --help"));
             }
@@ -109,12 +128,17 @@ impl Options {
                 once = true;
                 continue;
             }
+            if flag == "--hybrid" {
+                hybrid = true;
+                continue;
+            }
             let value = args
                 .next()
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| invalid(format!("missing or empty value for {flag}")))?;
             match flag.as_str() {
                 "--index-dir" => root = Some(PathBuf::from(value)),
+                "--config" => config_path = Some(PathBuf::from(value)),
                 "--query" => query = Some(text(value)?),
                 "--limit" => {
                     limits.max_results = usize::try_from(number(value, &flag, 1, 10_000)?)
@@ -165,6 +189,9 @@ impl Options {
         if once && max_updates.is_some() {
             return Err(invalid("--once cannot be combined with --max-updates"));
         }
+        if config_path.is_some() && !hybrid {
+            return Err(invalid("--config requires --hybrid; lexical mode never loads configuration"));
+        }
         Ok(Self {
             root: root.ok_or_else(|| invalid("--index-dir is required; no store is guessed"))?,
             query,
@@ -174,6 +201,8 @@ impl Options {
             max_updates: if once { Some(1) } else { max_updates },
             timeout,
             once,
+            hybrid,
+            config_path,
         })
     }
 }
@@ -252,10 +281,20 @@ impl<W: Write> Write for GuardedOutput<'_, W> {
     }
 }
 
+#[cfg(test)]
 async fn execute<W: Write + Send>(
     cx: &Cx,
     options: &Options,
     writer: &mut W,
+) -> SearchResult<u64> {
+    execute_with_runtime(cx, options, writer, None).await
+}
+
+async fn execute_with_runtime<W: Write + Send>(
+    cx: &Cx,
+    options: &Options,
+    writer: &mut W,
+    runtime: Option<FsfsRuntime>,
 ) -> SearchResult<u64> {
     let budget = Budget {
         started: Instant::now(),
@@ -269,13 +308,7 @@ async fn execute<W: Write + Send>(
             path: options.root.join("FSFS-CURRENT"),
         });
     }
-    let mut session = QuillLiveSearchSession::new(
-        store,
-        options.query.clone(),
-        options.limits,
-        options.refresh,
-        QuillConfig::default(),
-    )?;
+    let mut session = hybrid::Subscription::new(store, options, runtime)?;
     let mut delivered = 0_u64;
     loop {
         budget.check(cx)?;
@@ -290,10 +323,10 @@ async fn execute<W: Write + Send>(
         // Cancellation and timeout stay typed even when the output guard was
         // the first boundary to observe them. No retry can extend a torn frame.
         budget.check(cx)?;
-        if result?.is_some() {
+        if result? {
             delivered = delivered
                 .checked_add(1)
-                .ok_or_else(|| invalid("delivered frame counter exhausted"))?;
+                .ok_or_else(|| invalid("delivered generation counter exhausted"))?;
             if options
                 .max_updates
                 .is_some_and(|maximum| delivered >= maximum)
@@ -326,6 +359,9 @@ fn run(options: Options) -> SearchResult<u64> {
     // filesystem/query/output lane. Quill's async admission uses this same
     // runtime and the established host-owned blocking pool; no nested runtime.
     let pool = Arc::new(SearchBlockingPool::default());
+    let app_runtime = hybrid::configured_runtime(&options)?;
+    #[cfg(feature = "rerank")]
+    let app_runtime = app_runtime.map(|runtime| runtime.with_native_blocking_pool(pool.handle()));
     let scheduler = RuntimeBuilder::current_thread()
         .blocking_threads(0, 2)
         .build()
@@ -344,7 +380,7 @@ fn run(options: Options) -> SearchResult<u64> {
         let scope = request_shutdown.cancellation_scope(&cx);
         // Stdout (rather than its non-Send lock guard) lives across admission awaits.
         // Only this task writes stdout, so frames cannot interleave in this process.
-        execute(&scope, &options, &mut io::stdout()).await
+        execute_with_runtime(&scope, &options, &mut io::stdout(), app_runtime).await
     });
     let result = scheduler.block_on(task);
     shutdown.stop_signal_listener();
@@ -429,6 +465,20 @@ mod tests {
         assert_eq!(options.max_updates, None);
         assert_eq!(options.timeout, None);
         assert!(!options.once);
+        assert!(!options.hybrid);
+        assert!(options.config_path.is_none());
+    }
+
+    #[test]
+    fn hybrid_and_configuration_are_explicit_and_order_independent() {
+        let options = Options::parse(args(&["--config", "/models/fsfs.toml", "--hybrid", "--once"]))
+            .unwrap();
+        assert!(options.hybrid);
+        assert_eq!(options.config_path, Some(PathBuf::from("/models/fsfs.toml")));
+        assert_eq!(options.max_updates, Some(1));
+        assert!(Options::parse(args(&["--config", "/not-opened"])).is_err());
+        assert!(Options::parse(args(&["--hybrid", "--hybrid"])).is_err());
+        assert!(Options::parse(args(&["--hybrid", "--config"])).is_err());
     }
 
     #[test]
