@@ -259,6 +259,20 @@ qualified; individual results below are narrower than release acceptance.
   91 MB, each edit adding one small segment. Watched files keep the same
   keyword metadata as indexed ones (bd-78o0n).
 
+- **Restarting `fsfs watch` no longer rebuilds the whole index.** The
+  evidence that lets a start reuse finished work binds the index files, so
+  the first watched edit invalidated it. Every later `fsfs watch` or
+  `fsfs index` then discarded the keyword index and re-embedded every file
+  with both models. A watch that stops cleanly (Ctrl-C or SIGTERM) now leaves
+  fresh evidence for the index it leaves behind. Files it never changed keep
+  their proof. A file it changed carries the hash of the bytes it actually
+  indexed, so a file restored to its pre-watch content and modification time
+  is re-embedded rather than served the watched version's vectors. On a
+  2,019-file Rust tree, the restart after a watch with one edit went from an
+  83 s startup pass to 5.5 s, and `fsfs index` afterwards from 68 s to
+  6.4 s. A watch that crashes or fails a batch still leaves the next start
+  cold (bd-oikhm).
+
 - **`fsfs watch`, `delete` and `append-batch` work on large repositories.**
   They open the keyword index with repair protection, which writes a
   RaptorQ sidecar for every segment. A sidecar encodes a single source block

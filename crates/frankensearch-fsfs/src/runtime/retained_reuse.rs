@@ -13,9 +13,10 @@
 //! binding the evidence to their actual serving artifacts under the publication
 //! lease. They still pass through ordinary indexing and publication admission.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -272,11 +273,21 @@ pub(super) fn legacy_checkpoint(
     runtime: &FsfsRuntime,
     root: &Path,
 ) -> SearchResult<Option<IndexingCheckpoint>> {
+    retained_search_checkpoint(cx)?;
+    if runtime.cli_input.full_reindex {
+        return Ok(None);
+    }
+    admitted_legacy_checkpoint(cx, runtime, root)
+}
+
+/// The completed checkpoint whose receipt still binds the root's artifacts.
+fn admitted_legacy_checkpoint(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    root: &Path,
+) -> SearchResult<Option<IndexingCheckpoint>> {
     let read = || -> SearchResult<Option<IndexingCheckpoint>> {
         retained_search_checkpoint(cx)?;
-        if runtime.cli_input.full_reindex {
-            return Ok(None);
-        }
         for excluded in [FSFS_CHECKPOINT_FILE, COMPLETE_GENERATION_MANIFEST] {
             match fs::symlink_metadata(root.join(excluded)) {
                 Ok(_) => return Ok(None),
@@ -338,32 +349,15 @@ pub(super) fn retain_legacy_checkpoint(
     root: &Path,
     payload: &FsfsIndexPayload,
 ) -> SearchResult<()> {
-    let write = || -> SearchResult<()> {
-        retained_search_checkpoint(cx)?;
-        crate::generation_store::reject_published_write(root)?;
-        FsfsRuntime::validate_search_generation_at_root(root, SearchExecutionMode::Full)?;
-        let receipt = completed_receipt(runtime, root, payload)?;
-        let state_sha256 = legacy_state_digest(cx, root, &receipt)?;
-        let evidence = LegacyReuseReceipt {
-            version: LEGACY_RECEIPT_VERSION,
-            receipt,
-            state_sha256,
-        };
-        let bytes =
-            serde_json::to_vec(&evidence).map_err(|source| SearchError::SubsystemError {
-                subsystem: "fsfs.index.completed_reuse",
-                source: Box::new(source),
-            })?;
-        if bytes.len() as u64 > MAX_RECEIPT_BYTES {
-            return Err(reuse_error(
-                "completed legacy input evidence exceeds its byte limit",
-            ));
-        }
-        retained_search_checkpoint(cx)?;
-        super::write_durable(root.join(LEGACY_RECEIPT_FILE), bytes)?;
-        Ok(())
-    };
-    match write() {
+    retain_or_start_cold(write_legacy_evidence(
+        cx,
+        root,
+        || completed_receipt(runtime, root, payload),
+    ))
+}
+
+fn retain_or_start_cold(result: SearchResult<()>) -> SearchResult<()> {
+    match result {
         Err(error @ SearchError::Cancelled { .. }) => Err(error),
         Err(error) => {
             tracing::warn!(%error, "could not retain completed legacy inputs; next indexing run starts cold");
@@ -371,6 +365,167 @@ pub(super) fn retain_legacy_checkpoint(
         }
         result => result,
     }
+}
+
+/// Bind `receipt` to the root's current serving artifacts and publish it.
+/// The receipt is built only after the generation passed validation.
+fn write_legacy_evidence(
+    cx: &Cx,
+    root: &Path,
+    receipt: impl FnOnce() -> SearchResult<ReuseReceipt>,
+) -> SearchResult<()> {
+    retained_search_checkpoint(cx)?;
+    crate::generation_store::reject_published_write(root)?;
+    FsfsRuntime::validate_search_generation_at_root(root, SearchExecutionMode::Full)?;
+    let receipt = receipt()?;
+    let state_sha256 = legacy_state_digest(cx, root, &receipt)?;
+    let evidence = LegacyReuseReceipt {
+        version: LEGACY_RECEIPT_VERSION,
+        receipt,
+        state_sha256,
+    };
+    let bytes = serde_json::to_vec(&evidence).map_err(|source| SearchError::SubsystemError {
+        subsystem: "fsfs.index.completed_reuse",
+        source: Box::new(source),
+    })?;
+    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
+        return Err(reuse_error(
+            "completed legacy input evidence exceeds its byte limit",
+        ));
+    }
+    retained_search_checkpoint(cx)?;
+    super::write_durable(root.join(LEGACY_RECEIPT_FILE), bytes)?;
+    Ok(())
+}
+
+/// What a windowed watch session keeps so a clean exit leaves warm reuse
+/// evidence. Every committed batch changes the artifacts the completed receipt
+/// digests, so the next `fsfs watch` or `fsfs index` used to re-embed every
+/// file (bd-oikhm).
+pub(super) struct WatchReuseLedger {
+    index_root: PathBuf,
+    /// The completed checkpoint admitted before the session mutated anything.
+    admitted: IndexingCheckpoint,
+    /// Sources whose rows the session replaced or removed: the SHA-256 of the
+    /// bytes it indexed, or `None` from the first row change until that is
+    /// known. A source left at `None` in the final membership blocks the
+    /// evidence, since its rows may describe neither version.
+    replaced: std::sync::Mutex<BTreeMap<String, Option<String>>>,
+}
+
+impl WatchReuseLedger {
+    pub(super) fn index_root(&self) -> &Path {
+        &self.index_root
+    }
+
+    fn replaced(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Option<String>>> {
+        self.replaced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Call before changing any row of `source`.
+    pub(super) fn begin(&self, source: &str) {
+        self.replaced().insert(source.to_owned(), None);
+    }
+
+    /// Call once every tier holds rows of the bytes hashed as `content_hash_hex`.
+    pub(super) fn indexed(&self, source: &str, content_hash_hex: String) {
+        self.replaced()
+            .insert(source.to_owned(), Some(content_hash_hex));
+    }
+}
+
+/// Admit the completed evidence a windowed watch session starts from. The
+/// startup pass has just written it, so `--full` no longer applies. Hold the
+/// publication lease from this call until the session owns its writers.
+pub(super) fn watch_reuse_ledger(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    root: &Path,
+) -> SearchResult<Option<WatchReuseLedger>> {
+    Ok(
+        admitted_legacy_checkpoint(cx, runtime, root)?.map(|admitted| WatchReuseLedger {
+            index_root: root.to_path_buf(),
+            admitted,
+            replaced: std::sync::Mutex::new(BTreeMap::new()),
+        }),
+    )
+}
+
+/// Leave completed evidence for the membership a watch session published.
+/// Sources it never touched keep their admitted entries; replaced ones carry
+/// the hash of the bytes it indexed. Call holding the publication lease, after
+/// every writer of the session has been released.
+pub(super) fn retain_watched_checkpoint(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    ledger: &WatchReuseLedger,
+) -> SearchResult<()> {
+    let root = ledger.index_root();
+    retain_or_start_cold(write_legacy_evidence(cx, root, || {
+        let manifests = FsfsRuntime::read_matching_manifest_generation(root)?
+            .ok_or_else(|| reuse_error("watched generation has no matching manifests"))?;
+        let sentinel = FsfsRuntime::read_index_sentinel(root)?
+            .filter(|sentinel| sentinel.generation_complete)
+            .ok_or_else(|| reuse_error("watched generation is not complete"))?;
+        let replaced = ledger.replaced();
+        let mut checkpoint = ledger.admitted.clone();
+        checkpoint.files = BTreeMap::new();
+        for (key, manifest) in &manifests {
+            let entry = match replaced.get(key) {
+                Some(Some(content_hash_hex)) => CheckpointFileEntry {
+                    revision: manifest.revision,
+                    ingestion_class: manifest.ingestion_class.clone(),
+                    canonical_bytes: manifest.canonical_bytes,
+                    reason_code: manifest.reason_code.clone(),
+                    lexical_indexed: true,
+                    semantic_indexed: manifest.ingestion_class
+                        == super::ingestion_class_label(super::IngestionClass::FullSemanticLexical),
+                    content_hash_hex: content_hash_hex.clone(),
+                    fast_windows: manifest.fast_windows.clone(),
+                },
+                Some(None) => {
+                    return Err(reuse_error(
+                        "a watched source was left between two versions",
+                    ));
+                }
+                None => ledger
+                    .admitted
+                    .files
+                    .get(key)
+                    .filter(|entry| {
+                        entry.revision == manifest.revision
+                            && entry.ingestion_class == manifest.ingestion_class
+                            && entry.canonical_bytes == manifest.canonical_bytes
+                            && entry.reason_code == manifest.reason_code
+                            && entry.fast_windows == manifest.fast_windows
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        reuse_error("watched membership changed outside the session's record")
+                    })?,
+            };
+            checkpoint.files.insert(key.clone(), entry);
+        }
+        drop(replaced);
+        checkpoint.source_hash_hex.clone_from(&sentinel.source_hash_hex);
+        checkpoint.discovered_files = sentinel.discovered_files;
+        checkpoint.skipped_files = sentinel.skipped_files;
+        checkpoint.updated_at_ms = super::pressure_timestamp_ms();
+        if FsfsRuntime::read_checkpoint_manifest_generation(root, &checkpoint)?.is_none() {
+            return Err(reuse_error(
+                "watched evidence disagrees with its generation metadata",
+            ));
+        }
+        Ok(ReuseReceipt {
+            version: RECEIPT_VERSION,
+            session: session_id()?.to_owned(),
+            executable_sha256: execution::fingerprint().map(str::to_owned),
+            configuration_sha256: configuration_digest(runtime)?,
+            checkpoint,
+        })
+    }))
 }
 
 /// An optimization witness for a cooperative mutable root, not an immutable
@@ -1402,17 +1557,23 @@ mod generation_tests {
             run_counted_legacy_windows(cx, parent, operation, 1).await
         }
 
+        /// The two-tier legacy runtime every counted run and watch session shares.
+        fn two_tier_fixture(parent: &Path, max_windows: usize) -> (FsfsRuntime, PathBuf, PathBuf) {
+            let (mut runtime, source, root) = fixture(parent, 0);
+            runtime.config.indexing.fast_window_max_per_file = max_windows;
+            runtime.config.search.fast_only = false;
+            runtime.config.search.quality_timeout_ms = 5_000;
+            "reuse-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            (runtime, source, root)
+        }
+
         async fn run_counted_legacy_windows(
             cx: &Cx,
             parent: &Path,
             operation: &str,
             max_windows: usize,
         ) -> serde_json::Value {
-            let (mut runtime, source, root) = fixture(parent, 0);
-            runtime.config.indexing.fast_window_max_per_file = max_windows;
-            runtime.config.search.fast_only = false;
-            runtime.config.search.quality_timeout_ms = 5_000;
-            "reuse-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            let (mut runtime, source, root) = two_tier_fixture(parent, max_windows);
             if operation == "config_drift" {
                 runtime.config.indexing.embedding_batch_size = 2;
             }
@@ -1857,6 +2018,99 @@ mod generation_tests {
                 }
                 assert_eq!(daemon.join().unwrap(), ":shutdown\n");
                 assert_index_calls(&report, 0, 0);
+            });
+        }
+
+        /// One windowed watch session that rewrites `name` to `text`, observed
+        /// at the file's pre-edit mtime so only its content hash can tell the
+        /// two versions apart. `retain` selects a clean exit's evidence.
+        #[allow(clippy::future_not_send)]
+        async fn watch_edit(cx: &Cx, parent: &Path, name: &str, text: &str, retain: bool) {
+            let (mut runtime, source, _) = two_tier_fixture(parent, 2);
+            runtime.cli_input.command = CliCommand::Watch;
+            let fast = Arc::new(CountingEmbedder::new("reuse-fast", 4, false));
+            let quality = Arc::new(CountingEmbedder::new("reuse-quality", 6, false));
+            let _restore = RestoreEmbedders::install(fast.clone(), quality.clone());
+            let (pipeline, vector_index) = runtime.build_live_ingest_pipeline(cx).await.unwrap();
+            let reuse = pipeline.reuse_ledger();
+            assert!(reuse.is_some(), "the completed generation's evidence is admitted");
+            let path = source.join(name);
+            let revision = i64::try_from(super::super::super::system_time_to_ms(
+                fs::metadata(&path).unwrap().modified().unwrap(),
+            ))
+            .unwrap();
+            fs::write(&path, text).unwrap();
+            let edit = [crate::watcher::WatchIngestOp::Upsert {
+                file_key: path.display().to_string(),
+                revision,
+                ingestion_class: IngestionClass::FullSemanticLexical,
+            }];
+            assert_eq!(
+                crate::watcher::WatchIngestPipeline::apply_batch(&pipeline, cx, &edit)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(fast.counts.documents.load(Ordering::SeqCst), 1);
+            assert_eq!(quality.counts.documents.load(Ordering::SeqCst), 1);
+            let session = super::super::super::LiveWatchSession {
+                quality_vector_index: pipeline.quality_vector_handle(),
+                watcher: crate::watcher::FsWatcher::new(
+                    vec![source],
+                    runtime.config.discovery.clone(),
+                    Arc::new(pipeline),
+                ),
+                vector_index,
+                reuse,
+            };
+            // The production exit order: stop, compact both WALs, then evidence.
+            runtime
+                .finalize_shutdown(
+                    cx,
+                    crate::shutdown::ShutdownReason::UserRequest,
+                    Some(&session.vector_index),
+                    session.quality_vector_index.as_ref(),
+                )
+                .await
+                .unwrap();
+            if retain {
+                runtime.retain_watch_session_reuse(cx, session).unwrap();
+            }
+        }
+
+        #[test]
+        fn clean_watch_exit_leaves_warm_evidence_for_what_it_did_not_change() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, source, _) = fixture(parent.path(), 3);
+                let index = || run_counted_legacy_windows(&cx, parent.path(), "index", 2);
+                assert_index_calls(&index().await, 3, 3);
+
+                // Without evidence, one watched edit costs the next start
+                // every file (bd-oikhm).
+                Box::pin(watch_edit(&cx, parent.path(), "doc-1.md", "sharedtoken watched one", false)).await;
+                assert_index_calls(&index().await, 3, 3);
+
+                Box::pin(watch_edit(&cx, parent.path(), "doc-2.md", "sharedtoken watched two", true)).await;
+                assert_index_calls(&index().await, 1, 1);
+
+                // Restoring the pre-watch bytes and mtime must re-embed: the
+                // rows hold the watched version, which has the same length and
+                // window plan. The counted run checks every row against the
+                // text on disk.
+                let path = source.join("doc-0.md");
+                let before = fs::read(&path).unwrap();
+                let modified = fs::metadata(&path).unwrap().modified().unwrap();
+                Box::pin(watch_edit(&cx, parent.path(), "doc-0.md", "sharedtoken documenu 0", true)).await;
+                fs::write(&path, &before).unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+                assert_index_calls(&index().await, 1, 1);
+                assert_index_calls(&index().await, 0, 0);
             });
         }
 

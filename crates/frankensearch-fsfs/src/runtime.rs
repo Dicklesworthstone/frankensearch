@@ -2878,6 +2878,9 @@ struct LiveIngestPipeline {
     storage_db_path: Option<PathBuf>,
     /// Present when the watched generation was built with fast windows.
     windows: Option<LiveWindowMembership>,
+    /// Present when a windowed session started from completed reuse evidence;
+    /// records what it changed so a clean exit can leave that evidence warm.
+    reuse: Option<Arc<retained_reuse::WatchReuseLedger>>,
     /// How long a retired lexical file must age before the post-batch sweep
     /// may unlink it: Quill's reader grace window.
     lexical_garbage_grace: Duration,
@@ -2956,6 +2959,15 @@ impl LiveWindowMembership {
 struct LiveQualityTier {
     vector_index: Arc<std::sync::Mutex<VectorIndex>>,
     embedder: AdmittedEmbedder,
+}
+
+/// One CLI watch session: the watcher, the vector handles its shutdown
+/// compacts, and the reuse record a clean exit turns into warm evidence.
+struct LiveWatchSession {
+    watcher: FsWatcher,
+    vector_index: Arc<std::sync::Mutex<VectorIndex>>,
+    quality_vector_index: Option<Arc<std::sync::Mutex<VectorIndex>>>,
+    reuse: Option<Arc<retained_reuse::WatchReuseLedger>>,
 }
 
 #[derive(Debug)]
@@ -3147,6 +3159,7 @@ impl LiveIngestPipeline {
             canonicalizer: DefaultCanonicalizer::default(),
             storage_db_path: None,
             windows: None,
+            reuse: None,
             lexical_garbage_grace: frankensearch_quill::DEFAULT_GARBAGE_GRACE,
         }
     }
@@ -3154,6 +3167,15 @@ impl LiveIngestPipeline {
     fn with_window_membership(mut self, windows: LiveWindowMembership) -> Self {
         self.windows = Some(windows);
         self
+    }
+
+    fn with_reuse_ledger(mut self, ledger: retained_reuse::WatchReuseLedger) -> Self {
+        self.reuse = Some(Arc::new(ledger));
+        self
+    }
+
+    fn reuse_ledger(&self) -> Option<Arc<retained_reuse::WatchReuseLedger>> {
+        self.reuse.clone()
     }
 
     fn with_storage_db_path(mut self, storage_db_path: PathBuf) -> Self {
@@ -3242,6 +3264,9 @@ impl LiveIngestPipeline {
     }
 
     async fn prune_indexes(&self, cx: &Cx, rel_key: &str) -> frankensearch_core::SearchResult<()> {
+        if let Some(ledger) = self.reuse.as_deref() {
+            ledger.begin(rel_key);
+        }
         let mutations = [LexicalMutation::delete(
             rel_key,
             0,
@@ -3763,6 +3788,9 @@ impl LiveIngestPipeline {
             if lexical_unchanged && recorded_windows_current && windows.records(&rel_key) {
                 return Ok(false);
             }
+            if let Some(ledger) = self.reuse.as_deref() {
+                ledger.begin(&rel_key);
+            }
             self.apply_window_upsert(
                 cx,
                 windows,
@@ -3773,6 +3801,9 @@ impl LiveIngestPipeline {
                 &canonical,
             )
             .await?;
+            if let Some(ledger) = self.reuse.as_deref() {
+                ledger.indexed(&rel_key, content_sha256_hex(&bytes));
+            }
             return Ok(true);
         }
 
@@ -20299,6 +20330,17 @@ impl FsfsRuntime {
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
         let window_membership = self.load_watch_window_membership(&index_root)?;
+        // Reuse evidence a clean exit leaves behind extends the admission made
+        // here, so no other mutator may land between proving it and owning
+        // the writers. A busy lease only costs the next start its warm reuse.
+        let reuse_lease = window_membership
+            .as_ref()
+            .and_then(|_| crate::lifecycle::PublicationLease::acquire(&index_root).ok());
+        let reuse_ledger = if reuse_lease.is_some() {
+            retained_reuse::watch_reuse_ledger(cx, self, &index_root)?
+        } else {
+            None
+        };
         let storage_db_path = self.resolve_storage_db_path()?;
         if storage_db_path.as_os_str() != ":memory:"
             && let Some(parent) = storage_db_path.parent()
@@ -20385,6 +20427,10 @@ impl FsfsRuntime {
         if let Some(windows) = window_membership {
             pipeline = pipeline.with_window_membership(windows);
         }
+        if let Some(ledger) = reuse_ledger {
+            pipeline = pipeline.with_reuse_ledger(ledger);
+        }
+        drop(reuse_lease);
         self.repair_quarantined_lexical_gap(cx, &index_root, &pipeline)
             .await?;
         let vi_handle = Arc::clone(&pipeline.vector_index);
@@ -20399,37 +20445,61 @@ impl FsfsRuntime {
     /// finalize_shutdown` path explicit. The test-only factory changes only
     /// the owned ingest fixture; production always builds the durable ingest
     /// pipeline directly.
-    async fn build_live_watcher_shutdown(
-        &self,
-        cx: &Cx,
-    ) -> SearchResult<(
-        FsWatcher,
-        Arc<std::sync::Mutex<VectorIndex>>,
-        Option<Arc<std::sync::Mutex<VectorIndex>>>,
-    )> {
+    async fn build_live_watcher_shutdown(&self, cx: &Cx) -> SearchResult<LiveWatchSession> {
         let target_root = self.resolve_target_root()?;
 
         #[cfg(test)]
         if let Some(factory) = take_watcher_shutdown_test_session_factory() {
             let (ingest, vector_index) = factory(self)?;
-            return Ok((
-                FsWatcher::new(vec![target_root], self.config.discovery.clone(), ingest),
+            return Ok(LiveWatchSession {
+                watcher: FsWatcher::new(vec![target_root], self.config.discovery.clone(), ingest),
                 vector_index,
-                None,
-            ));
+                quality_vector_index: None,
+                reuse: None,
+            });
         }
 
         let (pipeline, vector_index) = self.build_live_ingest_pipeline(cx).await?;
         let quality_vector_index = pipeline.quality_vector_handle();
-        Ok((
-            FsWatcher::new(
+        let reuse = pipeline.reuse_ledger();
+        Ok(LiveWatchSession {
+            watcher: FsWatcher::new(
                 vec![target_root],
                 self.config.discovery.clone(),
                 Arc::new(pipeline),
             ),
             vector_index,
             quality_vector_index,
-        ))
+            reuse,
+        })
+    }
+
+    /// Leave warm reuse evidence behind a cleanly stopped windowed session
+    /// (bd-oikhm). Publication exclusion is taken before the session releases
+    /// its writers, so nothing lands between its last batch and the evidence.
+    fn retain_watch_session_reuse(&self, cx: &Cx, session: LiveWatchSession) -> SearchResult<()> {
+        let LiveWatchSession {
+            watcher,
+            vector_index,
+            quality_vector_index,
+            reuse,
+        } = session;
+        let Some(reuse) = reuse else {
+            return Ok(());
+        };
+        let lease = match crate::lifecycle::PublicationLease::acquire(reuse.index_root()) {
+            Ok(lease) => lease,
+            Err(error) => {
+                warn!(%error, "another fsfs process holds publication; the next start re-indexes cold");
+                return Ok(());
+            }
+        };
+        drop((watcher, vector_index, quality_vector_index));
+        if let Err(error) = lease.fence("watched legacy reuse evidence") {
+            warn!(%error, "publication ownership changed; the next start re-indexes cold");
+            return Ok(());
+        }
+        retained_reuse::retain_watched_checkpoint(cx, self, &reuse)
     }
 
     async fn repair_quarantined_lexical_gap(
@@ -22223,7 +22293,8 @@ impl FsfsRuntime {
 
         if watch_enabled_for_command {
             match self.build_live_watcher_shutdown(cx).await {
-                Ok((watcher, vi_handle, quality_handle)) => {
+                Ok(session) => {
+                    let watcher = &session.watcher;
                     watcher.start(cx).await?;
                     #[cfg(test)]
                     WATCHER_SHUTDOWN_TEST_STARTED.with(|slot| {
@@ -22246,7 +22317,7 @@ impl FsfsRuntime {
                         .await_shutdown(
                             cx,
                             shutdown,
-                            Some(&watcher),
+                            Some(watcher),
                             Some((&lifecycle_tracker, &storage_paths)),
                         )
                         .await;
@@ -22255,11 +22326,12 @@ impl FsfsRuntime {
                         self.finalize_shutdown(
                             cx,
                             reason,
-                            Some(&vi_handle),
-                            quality_handle.as_ref(),
+                            Some(&session.vector_index),
+                            session.quality_vector_index.as_ref(),
                         ),
                     )
                     .await?;
+                    self.retain_watch_session_reuse(cx, session)?;
                 }
                 Err(ref error)
                     if matches!(
