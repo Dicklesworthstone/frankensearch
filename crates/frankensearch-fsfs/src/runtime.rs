@@ -17672,6 +17672,28 @@ impl FsfsRuntime {
         let lexical_commit_start = Instant::now();
         publication_lease.fence("final lexical bulk-load publication")?;
         lexical_index.finish_bulk_load(cx).await?;
+        if lexical_plan.publish_pointer.is_some() || discard_undurable_lexical_generation {
+            // A fresh engine directory, or a generation rewritten from scratch,
+            // just had its last Quill publication of this build. A reader that
+            // read an earlier MANIFEST retries its snapshot open once and lands
+            // on the final one; one that already opened its segments keeps
+            // them. Unlinking the retired inputs now keeps an indexed-once
+            // root from holding 2-3x its keyword bytes until some later writer
+            // opens (bd-ipfih). Incremental in-place runs keep Quill's grace.
+            let options = frankensearch_quill::GarbageCollectionOptions {
+                grace_period: Duration::ZERO,
+            };
+            match lexical_index.collect_garbage_with(cx, options).await {
+                Ok(report) => debug!(
+                    removed = report.removed.len(),
+                    "reclaimed the fresh engine's retired bulk inputs"
+                ),
+                Err(error) => warn!(
+                    error = %error,
+                    "could not reclaim retired bulk inputs; the next writer open retries"
+                ),
+            }
+        }
         lexical_elapsed_ms =
             lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
@@ -44622,6 +44644,89 @@ mod tests {
             let found = FsfsRuntime::gather_lexical_candidates(&cx, lexical, "revision", 10, None, 10)
                 .expect("lexical candidates");
             assert_eq!(found.len(), 1);
+        });
+    }
+
+    #[test]
+    fn first_index_leaves_no_retired_bulk_inputs() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            for number in 0..64 {
+                fs::write(
+                    project.join(format!("note{number:02}.md")),
+                    format!("capybara habitat note {number} with wetland details\n"),
+                )
+                .expect("write note");
+            }
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            // Eight chunks publish eight bulk segments for the final concat.
+            config.indexing.embedding_batch_size = 8;
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("first index");
+            let index_root = project.join(".frankensearch");
+            let engine = FsfsRuntime::resolve_lexical_engine(&index_root)
+                .expect("lexical layout")
+                .engine_dir()
+                .expect("Quill engine");
+            let names = fs::read_dir(&engine)
+                .expect("engine directory")
+                .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let segments = names
+                .iter()
+                .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "fslx"))
+                .count();
+            let live = KeeperSnapshot::open(&engine, DEFAULT_SCHEMA)
+                .expect("snapshot")
+                .segment_stats()
+                .expect("segment stats")
+                .sealed_segments;
+            assert_eq!(segments, live, "only live segments remain: {names:?}");
+
+            // A full rebuild in place retires the whole previous generation.
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    full_reindex: true,
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("full rebuild");
+            let retired = fs::read_dir(&engine)
+                .expect("engine directory")
+                .filter(|entry| {
+                    Path::new(&entry.as_ref().expect("entry").file_name())
+                        .extension()
+                        .is_some_and(|ext| ext == "retired")
+                })
+                .count();
+            assert_eq!(retired, 0, "a full rebuild leaves no retired generation");
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(index_root),
+                ..CliInput::default()
+            });
+            let resources = runtime
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::LexicalOnly)
+                .await
+                .expect("open index");
+            let lexical = resources.lexical_index.as_ref().expect("lexical index");
+            let found =
+                FsfsRuntime::gather_lexical_candidates(&cx, lexical, "capybara", 100, None, 100)
+                    .expect("lexical candidates");
+            assert_eq!(found.len(), 64);
         });
     }
 

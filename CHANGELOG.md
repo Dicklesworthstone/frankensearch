@@ -259,6 +259,16 @@ qualified; individual results below are narrower than release acceptance.
   91 MB, each edit adding one small segment. Watched files keep the same
   keyword metadata as indexed ones (bd-78o0n).
 
+- **A first index no longer keeps a second copy of its keyword index.** The
+  keyword engine builds a new index as many segments and then concatenates
+  them. The inputs stayed on disk until a later writer opened more than five
+  minutes afterwards, which never happens for a repository that is indexed
+  once and then only searched. A first `fsfs index` of an 8,475-file
+  repository used 557 MB, of which 188 MB were those leftovers; it now uses
+  369 MB, with no change in indexing time. `fsfs index --full` and the one
+  full rebuild each existing index gets on upgrade also reclaim the previous
+  generation right away (bd-ipfih).
+
 - **A running `fsfs watch` reclaims retired keyword segments.** The keyword
   engine deletes segments that merges retired only when a writer opens, and
   only once they are five minutes old; `fsfs watch` keeps one writer open,
