@@ -260,6 +260,15 @@ qualified; individual results below are narrower than release acceptance.
   `QuillIndex::collect_garbage_with` and `KeeperWriter::collect_garbage_with`
   take an explicit grace window.
 
+- **`fsfs search` works on a complete-generation store with no query
+  daemon.** On Unix a plain `fsfs search` uses the daemon transport by
+  default. The legacy layout falls back to searching in process when no
+  daemon runs; a complete-generation store did not, so it failed with
+  "I/O error: No such file or directory ... Check file permissions and disk
+  space" unless `--no-daemon` was given. It now searches in process when no
+  daemon serves the store. An explicit `--daemon-socket` still fails when
+  nothing listens there (bd-q6fwf).
+
 - **`pressure.degradation_override` does what its stage promises for
   search.** It was parsed and only logged. Now `force_lexical_only` runs
   every search lexical-only (CLI, `--stream`, `--expand`, the query daemon,

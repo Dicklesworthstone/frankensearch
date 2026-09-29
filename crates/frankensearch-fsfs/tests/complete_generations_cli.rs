@@ -163,6 +163,30 @@ fn complete_cli_binary_rejects_corrupt_selection_without_legacy_fallback() {
 }
 
 #[test]
+fn complete_cli_binary_default_search_without_a_daemon_runs_in_process() {
+    let fixture = Fixture::new();
+    fs::create_dir(&fixture.store).unwrap();
+    let pointer = fixture.store.join(COMPLETE_GENERATION_POINTER);
+    fs::write(&pointer, "corrupt complete selection").unwrap();
+    // No --no-daemon and no daemon running: the default transport used to turn
+    // the absent socket into "I/O error: No such file or directory". The
+    // store's own admission must answer instead, without repairing anything.
+    let output = execute(&mut fixture.command("search", "json"));
+    let value = json_output(&output, false);
+    assert!(
+        value["error"]
+            .to_string()
+            .contains("complete-generation pointer"),
+        "{value}"
+    );
+    assert_eq!(
+        fs::read_to_string(pointer).unwrap(),
+        "corrupt complete selection"
+    );
+    assert_eq!(fs::read_dir(&fixture.store).unwrap().count(), 1);
+}
+
+#[test]
 fn complete_cli_binary_retains_interrupted_store_without_selection() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.store.join("generations/unfinished")).unwrap();
@@ -257,17 +281,22 @@ fn complete_cli_binary_semantic_rebuild_search_and_stream() {
     );
     assert!(first_path.is_dir());
     assert_eq!(fs::read(manifest).unwrap(), first_manifest);
-    let result = json_output(
-        &execute(fixture.command("search", "json").arg("--no-daemon")),
-        true,
-    );
-    let hits = result["data"]["hits"].as_array().expect("search hits");
-    assert_eq!(hits.len(), 2);
-    for filename in ["alpha.md", "beta.md"] {
-        assert!(
-            hits.iter()
-                .any(|hit| hit["path"].as_str().unwrap().ends_with(filename))
-        );
+    // Plain search defaults to daemon transport; with none serving the store
+    // it must answer in process exactly like --no-daemon.
+    for plain in [false, true] {
+        let mut command = fixture.command("search", "json");
+        if !plain {
+            command.arg("--no-daemon");
+        }
+        let result = json_output(&execute(&mut command), true);
+        let hits = result["data"]["hits"].as_array().expect("search hits");
+        assert_eq!(hits.len(), 2);
+        for filename in ["alpha.md", "beta.md"] {
+            assert!(
+                hits.iter()
+                    .any(|hit| hit["path"].as_str().unwrap().ends_with(filename))
+            );
+        }
     }
     let stream = execute(
         fixture

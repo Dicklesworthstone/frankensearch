@@ -596,15 +596,26 @@ impl FsfsRuntime {
         if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
             #[cfg(unix)]
             {
-                if self.cli_input.stream {
+                // A plain search defaults to daemon transport. With no
+                // query daemon serving this store, search in process as the
+                // legacy layout does. A named --daemon-socket still fails closed.
+                let serving = self.cli_input.daemon_socket.is_some()
+                    || match fs::symlink_metadata(self.complete_generation_socket_path(root)?) {
+                        Ok(_) => true,
+                        Err(error) if error.kind() == ErrorKind::NotFound => false,
+                        Err(error) => return Err(error.into()),
+                    };
+                if serving && self.cli_input.stream {
                     return self
                         .stream_complete_generation_daemon(cx, root, query, limit, writer)
                         .await;
                 }
-                let payload = self
-                    .query_complete_generation_daemon(cx, root, query, limit)
-                    .await?;
-                return self.emit_complete_search_payload(payload, started, writer);
+                if serving {
+                    let payload = self
+                        .query_complete_generation_daemon(cx, root, query, limit)
+                        .await?;
+                    return self.emit_complete_search_payload(payload, started, writer);
+                }
             }
             #[cfg(not(unix))]
             return Err(complete_cli_error(
