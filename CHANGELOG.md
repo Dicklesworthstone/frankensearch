@@ -259,6 +259,18 @@ qualified; individual results below are narrower than release acceptance.
   91 MB, each edit adding one small segment. Watched files keep the same
   keyword metadata as indexed ones (bd-78o0n).
 
+- **Library searches for code identifiers and URLs use the keyword lane.**
+  Quill's parser reads `HashMap::new` or `https://example.org` as a
+  `field:value` query on an unknown field and drops it, so a
+  `TwoTierSearcher` (and the native ANN hybrid and sync searchers) over a
+  Quill index searched for nothing and relied on the semantic lane alone.
+  `fsfs` already escaped such colons. `LexicalRead` gains a `query_text` hook
+  that search consumers apply once to user text; Quill escapes every colon
+  that does not end one of its own schema's field names (so CASS fields keep
+  their syntax), and `frankensearch_quill::escape_unknown_field_colons` is
+  public. `search` itself, and the Tantivy conformance comparisons built on
+  it, are unchanged (bd-3gslf).
+
 - **A first index no longer keeps a second copy of its keyword index.** The
   keyword engine builds a new index as many segments and then concatenates
   them. The inputs stayed on disk until a later writer opened more than five

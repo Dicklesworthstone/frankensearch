@@ -5,6 +5,7 @@
 //! their composite statistics, scorer adapters, and seal transaction are
 //! assembled here; later mixed-state beads wire them into the public writer loop.
 
+use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -13348,6 +13349,10 @@ fn quill_hydrate_candidates<'a>(
 }
 
 impl LexicalRead for QuillIndex {
+    fn query_text<'q>(&self, query: &'q str) -> Cow<'q, str> {
+        crate::query::escape_unknown_field_colons(query, self.reader.schema)
+    }
+
     fn search<'a>(
         &'a self,
         cx: &'a Cx,
@@ -13448,6 +13453,10 @@ impl LexicalWrite for QuillIndex {
 /// The read-only reader implements ONLY [`LexicalRead`] — no writer lease is
 /// ever acquired on a read-only open (bd-8nqz.1).
 impl LexicalRead for QuillSearchIndex {
+    fn query_text<'q>(&self, query: &'q str) -> Cow<'q, str> {
+        crate::query::escape_unknown_field_colons(query, self.reader.schema)
+    }
+
     fn search<'a>(
         &'a self,
         cx: &'a Cx,
@@ -13492,6 +13501,10 @@ impl LexicalRead for QuillSearchIndex {
 /// future. A blue-green refresh may replace `CURRENT` concurrently, but that
 /// cannot redirect an already-admitted search to a different engine.
 impl LexicalRead for RootBoundQuillSearchIndex {
+    fn query_text<'q>(&self, query: &'q str) -> Cow<'q, str> {
+        LexicalRead::query_text(self.state.load_full().reader.as_ref(), query)
+    }
+
     fn search<'a>(
         &'a self,
         cx: &'a Cx,

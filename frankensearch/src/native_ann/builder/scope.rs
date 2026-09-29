@@ -260,6 +260,10 @@ struct ScopedLexical<'a> {
 }
 
 impl LexicalRead for ScopedLexical<'_> {
+    fn query_text<'q>(&self, query: &'q str) -> std::borrow::Cow<'q, str> {
+        self.index.lexical().query_text(query)
+    }
+
     fn search<'a>(
         &'a self,
         cx: &'a Cx,

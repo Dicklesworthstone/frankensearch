@@ -88,7 +88,7 @@ pub use query::{
     Occur, ParsedQuery, PositionedTerm, Query, QueryCanonicalizationReport, QueryDiagnostic,
     QueryDiagnosticKind, QueryExplanation, QueryField, QueryParserConfigError, QueryValue,
     canonicalize_query, cass_has_boolean_operators, cass_sanitize_query, classify_query,
-    truncate_query,
+    escape_unknown_field_colons, truncate_query,
 };
 pub use schema::{
     Analyzer, CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor, FieldKind,

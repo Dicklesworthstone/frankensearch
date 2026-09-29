@@ -95,10 +95,11 @@ impl NativeAnnIndex {
             return Ok((Vec::new(), LexicalCandidateBatch::eager(Vec::new())));
         }
         let budget = candidate_count(k, 0, 3);
+        let lexical_text = lexical.query_text(text);
         if self.live_count() == 0 {
             // The admitted owner proves there is no vector work. This is not
             // a provider-failure fallback and still requires lexical success.
-            let batch = lexical.search_candidates(cx, text, budget).await?;
+            let batch = lexical.search_candidates(cx, &lexical_text, budget).await?;
             validate_lexical(cx, &batch)?;
             let hits =
                 rrf_fuse_for_vector_lane(batch.results(), &[], k, 0, &RrfConfig::default(), false);
@@ -108,7 +109,7 @@ impl NativeAnnIndex {
         let (query, batch) = join_sources(
             cx,
             self.embed_query(cx, embedder, text),
-            lexical.search_candidates(cx, text, budget),
+            lexical.search_candidates(cx, &lexical_text, budget),
         )
         .await?;
         let hits = self.fuse_candidates(cx, &query, &batch, k, None, &RrfConfig::default())?;

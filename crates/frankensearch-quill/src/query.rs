@@ -5,6 +5,7 @@
 //! user input is recovered or dropped with diagnostics rather than promoted to
 //! a search error.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::ops::Bound;
 
@@ -1134,6 +1135,49 @@ pub fn validate_index_capabilities(
         }
     }
     Ok(())
+}
+
+/// Escape every colon in free text that does not end one of `schema`'s field
+/// names, so code identifiers and URLs stay literal.
+///
+/// The lenient parser reads `HashMap::new` or `https://x` as `field:value`
+/// with an unknown field and drops the fragment. A real field prefix keeps
+/// its meaning (`title:rust`, also after a group or negation), `name::x` is
+/// never a field prefix, quoted phrases are left alone, and an escape the
+/// caller already wrote is kept, so applying this twice changes nothing.
+/// Search consumers call it on user text; the parser itself is unchanged.
+#[must_use]
+pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow<'_, str> {
+    if !query.contains(':') {
+        return Cow::Borrowed(query);
+    }
+    let mut escaped_query = String::with_capacity(query.len() + 8);
+    let mut term_start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, ch) in query.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            in_quotes = !in_quotes;
+        } else if ch == ':' && !in_quotes {
+            let name = query.get(term_start..index).unwrap_or_default();
+            let doubled = query
+                .get(index + 1..)
+                .is_some_and(|rest| rest.starts_with(':'));
+            let field = !doubled && schema.fields.iter().any(|field| field.name == name);
+            if !field {
+                escaped_query.push('\\');
+            }
+        }
+        escaped_query.push(ch);
+        if ch.is_whitespace() || matches!(ch, '(' | ')' | '+' | '-') {
+            term_start = index + ch.len_utf8();
+        }
+    }
+    Cow::Owned(escaped_query)
 }
 
 /// Shipping lenient parser for the default `[content, title^2]` expansion.
@@ -6532,6 +6576,48 @@ mod tests {
             values.push(value);
         }
         values.pop().unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn escape_unknown_field_colons_keeps_identifiers_and_urls_literal() {
+        for (query, expected) in [
+            ("HashMap::new", r"HashMap\:\:new"),
+            ("std::io::Result", r"std\:\:io\:\:Result"),
+            ("https://sqlite.org", r"https\://sqlite.org"),
+            ("TODO: flaky", r"TODO\: flaky"),
+            ("lang:rust", r"lang\:rust"),
+            // A real field keeps its prefix, also after a group or negation.
+            ("title:rust", "title:rust"),
+            ("(title:rust) -content:beta", "(title:rust) -content:beta"),
+            // `title::x` is not a field prefix; a quoted phrase is literal.
+            ("title::x", r"title\:\:x"),
+            ("\"std::io\" error", "\"std::io\" error"),
+            // An escape the caller already wrote is kept, so it is idempotent.
+            (r"a\:b", r"a\:b"),
+            ("plain words", "plain words"),
+        ] {
+            let escaped = escape_unknown_field_colons(query, crate::DEFAULT_SCHEMA);
+            assert_eq!(escaped, expected, "{query}");
+            assert_eq!(
+                escape_unknown_field_colons(&escaped, crate::DEFAULT_SCHEMA),
+                expected,
+                "{query} twice"
+            );
+        }
+        // Field names come from the schema at hand.
+        assert_eq!(
+            escape_unknown_field_colons("agent:claude HashMap::new", crate::CASS_SEMANTIC_SCHEMA),
+            r"agent:claude HashMap\:\:new"
+        );
+        assert_eq!(
+            escape_unknown_field_colons("agent:claude", crate::DEFAULT_SCHEMA),
+            r"agent\:claude"
+        );
+        // The parser drops the raw identifier and keeps the escaped one.
+        let parser = DefaultQueryParser::new(crate::DEFAULT_SCHEMA).expect("parser");
+        assert!(parser.parse_lenient("HashMap::new").query.is_empty());
+        let escaped = escape_unknown_field_colons("HashMap::new", crate::DEFAULT_SCHEMA);
+        assert!(!parser.parse_lenient(&escaped).query.is_empty());
     }
 
     #[test]

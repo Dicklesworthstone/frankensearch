@@ -29,36 +29,7 @@ use flush_queue::FlushProgress;
 /// quoted phrases are already literal.
 #[must_use]
 pub fn lexical_query_text(query: &str) -> Cow<'_, str> {
-    if !query.contains(':') {
-        return Cow::Borrowed(query);
-    }
-    let mut escaped_query = String::with_capacity(query.len() + 8);
-    let mut term_start = 0;
-    let mut in_quotes = false;
-    let mut escaped = false;
-    for (index, ch) in query.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            in_quotes = !in_quotes;
-        } else if ch == ':' && !in_quotes {
-            let name = query.get(term_start..index).unwrap_or_default();
-            let doubled = query
-                .get(index + 1..)
-                .is_some_and(|rest| rest.starts_with(':'));
-            let field = !doubled && DEFAULT_SCHEMA.fields.iter().any(|field| field.name == name);
-            if !field {
-                escaped_query.push('\\');
-            }
-        }
-        escaped_query.push(ch);
-        if ch.is_whitespace() || matches!(ch, '(' | ')' | '+' | '-') {
-            term_start = index + ch.len_utf8();
-        }
-    }
-    Cow::Owned(escaped_query)
+    frankensearch_quill::escape_unknown_field_colons(query, DEFAULT_SCHEMA)
 }
 
 /// Default expected throughput for initial lexical indexing (docs/sec).

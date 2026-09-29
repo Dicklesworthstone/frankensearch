@@ -1885,9 +1885,16 @@ impl TwoTierSearcher {
             tiebreak: self.rrf_tiebreak,
         };
 
+        // Colons in identifiers and URLs stay literal for the lexical lane.
+        let lexical_query = self
+            .lexical
+            .as_ref()
+            .map_or(std::borrow::Cow::Borrowed(semantic_query), |lex| {
+                lex.query_text(semantic_query)
+            });
         if lexical_short_circuit && let Some(lex) = self.lexical.as_ref() {
             let start_lex = Instant::now();
-            let lex_res = lex.search(cx, semantic_query, lexical_budget).await;
+            let lex_res = lex.search(cx, &lexical_query, lexical_budget).await;
             match lex_res {
                 Ok(results) => {
                     metrics.lexical_search_ms = start_lex.elapsed().as_secs_f64() * 1000.0;
@@ -1952,7 +1959,7 @@ impl TwoTierSearcher {
             } else if let Some(lex) = self.lexical.as_ref() {
                 let start_lex = Instant::now();
                 let res = lex
-                    .search_candidates(cx, semantic_query, lexical_budget)
+                    .search_candidates(cx, &lexical_query, lexical_budget)
                     .await;
                 (Some(res), start_lex.elapsed())
             } else {
@@ -1983,7 +1990,7 @@ impl TwoTierSearcher {
                             let start = Instant::now();
                             let result = poll_immediate(lex.search_candidates(
                                 cx,
-                                semantic_query,
+                                &lexical_query,
                                 lexical_budget,
                             ))
                             .unwrap_or_else(|| {
@@ -4958,6 +4965,64 @@ mod tests {
     }
 
     // ─── Test Helpers ───────────────────────────────────────────────────
+
+    /// bd-3gslf probe: a facade searcher over a Quill index finds the code
+    /// that contains `HashMap::new` for that query. Quill's parser drops an
+    /// unknown `field:` fragment, so without the backend's `query_text` the
+    /// lexical lane searched for nothing.
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_lexical_lane_keeps_code_identifiers_literal() {
+        use frankensearch_core::traits::LexicalWrite;
+        use frankensearch_core::types::IndexableDocument;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().expect("quill dir");
+            let quill = frankensearch_quill::QuillIndex::create(
+                &cx,
+                dir.path(),
+                frankensearch_quill::QuillConfig::default(),
+            )
+            .await
+            .expect("create quill index");
+            let docs = [
+                IndexableDocument::new("lex-code", "fn build() { let seen = HashMap::new(); }"),
+                IndexableDocument::new("lex-note", "a new idea for the garden"),
+            ];
+            LexicalWrite::index_documents(&quill, &cx, &docs)
+                .await
+                .expect("index documents");
+            LexicalWrite::commit(&quill, &cx).await.expect("commit");
+            let lexical: Arc<dyn LexicalRead> = Arc::new(quill);
+            assert!(
+                lexical
+                    .search(&cx, "HashMap::new", 5)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the raw query names an unknown field"
+            );
+            let searcher = TwoTierSearcher::new(
+                build_test_index(4),
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig::default(),
+            )
+            .with_lexical(lexical);
+            let (results, metrics) = searcher
+                .search_collect(&cx, "HashMap::new", 5)
+                .await
+                .expect("search");
+            assert!(metrics.lexical_candidates > 0, "{metrics:?}");
+            assert_eq!(
+                results
+                    .iter()
+                    .find(|hit| hit.doc_id.starts_with("lex-"))
+                    .map(|hit| hit.doc_id.as_str()),
+                Some("lex-code"),
+                "{results:?}"
+            );
+        });
+    }
 
     fn build_test_index(dimension: usize) -> Arc<TwoTierIndex> {
         let dir = std::env::temp_dir().join(format!(

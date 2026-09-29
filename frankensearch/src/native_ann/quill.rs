@@ -394,6 +394,10 @@ impl FencedQuillRead {
 }
 
 impl LexicalRead for FencedQuillRead {
+    fn query_text<'q>(&self, query: &'q str) -> std::borrow::Cow<'q, str> {
+        self.index.query_text(query)
+    }
+
     fn search<'a>(
         &'a self,
         cx: &'a Cx,

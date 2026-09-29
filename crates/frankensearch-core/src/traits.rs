@@ -9,6 +9,7 @@
 //! dyn-compatible for runtime polymorphism (`Box<dyn Embedder>`, etc.).
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -1128,6 +1129,19 @@ impl LexicalCandidateBatch {
 /// callers) depend on this trait alone, so a read-only reader never needs a
 /// writer-capable backend or a writer lease.
 pub trait LexicalRead: Send + Sync {
+    /// The text a search consumer hands to [`Self::search`] or
+    /// [`Self::search_candidates`] for a free-text user query.
+    ///
+    /// Code identifiers and URLs contain colons (`HashMap::new`,
+    /// `https://x`) that a field-aware parser reads as `field:value` and
+    /// drops when no such field exists. A backend whose parser does that
+    /// escapes every colon that does not end one of its own field names.
+    /// Consumers apply this once to user text; `search` keeps the parser's raw
+    /// syntax. The default returns the query unchanged.
+    fn query_text<'q>(&self, query: &'q str) -> Cow<'q, str> {
+        Cow::Borrowed(query)
+    }
+
     /// Search for documents matching the query, returning up to `limit`
     /// results sorted by BM25 relevance, with full metadata attached.
     ///

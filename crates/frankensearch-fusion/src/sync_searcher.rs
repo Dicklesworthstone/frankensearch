@@ -153,8 +153,10 @@ impl QuillSyncLexicalSearch {
 #[cfg(feature = "quill")]
 impl SyncLexicalSearch for QuillSyncLexicalSearch {
     fn search_sync(&self, _query_vec: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
+        let query =
+            frankensearch_core::traits::LexicalRead::query_text(self.index.as_ref(), &self.query);
         self.index
-            .search_results(&self.cx, &self.query, limit)
+            .search_results(&self.cx, &query, limit)
             .map_err(SearchError::from)
     }
 }

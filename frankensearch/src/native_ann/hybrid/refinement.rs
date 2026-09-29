@@ -163,7 +163,8 @@ pub(super) async fn checked_lexical(
     text: &str,
     budget: usize,
 ) -> SearchResult<LexicalCandidateBatch> {
-    let response = lexical.search_candidates(cx, text, budget).await;
+    let text = lexical.query_text(text);
+    let response = lexical.search_candidates(cx, &text, budget).await;
     checkpoint(cx, "native_ann.tiered_lexical")?;
     let batch = response?;
     validate_lexical(cx, &batch)?;
