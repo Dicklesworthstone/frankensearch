@@ -285,6 +285,20 @@ qualified; individual results below are narrower than release acceptance.
   time. Each later writer session (`fsfs watch`, `delete`, `append-batch`)
   still starts a new block (bd-k07zw).
 
+- **`fsfs watch` indexes the same files as `fsfs index`.** `fsfs index` skips
+  hidden files and directories and honors `.gitignore`, `.ignore`,
+  `.git/info/exclude` and the global gitignore. The watcher applied only the
+  configured exclude patterns, so both its startup pass over the tree and its
+  live events added everything else: `.env` files, virtualenvs and tool caches
+  in dot-directories, gitignored build output. Each extra file was embedded
+  with both models, and the next `fsfs index` deleted it again. In a git repo
+  with 40 source files, a hidden 120-file virtualenv, `.env` and a gitignored
+  `artifacts/` directory, a watch grew the index from 40 to 176 files. It now
+  stays at 40 and adds only the source file created while watching. Two
+  repositories on the development host held 17,900 and 1,800 files that only
+  the watcher's walk reached, most of the first in a hidden Python virtualenv
+  (bd-9kgdd).
+
 - **`fsfs watch`, `delete` and `append-batch` work on large repositories.**
   They open the keyword index with repair protection, which writes a
   RaptorQ sidecar for every segment. A sidecar encodes a single source block

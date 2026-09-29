@@ -19,6 +19,8 @@ use asupersync::Cx;
 use asupersync::runtime::TaskHandle;
 use asupersync::types::CancelReason;
 use frankensearch_core::{SearchError, SearchResult};
+use ignore::Match;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{debug, info, warn};
@@ -1883,7 +1885,7 @@ impl FsWatcher {
             // Runs on the caller's executor under the caller's `Cx`: this path
             // builds no runtime of its own and therefore cannot strand ingest work
             // on a private one that the caller cannot cancel.
-            let prepared = prepare_event_batch(&self.discovery, events);
+            let prepared = prepare_event_batch(&self.discovery, &self.roots, events);
             if prepared.ops.is_empty() {
                 let outcome = prepared.outcome(0);
                 self.stats.add_skipped(outcome.skipped);
@@ -2812,7 +2814,7 @@ fn run_ingest_loop<'a>(
                 continue;
             };
 
-            let prepared = prepare_event_batch(discovery, lease.events());
+            let prepared = prepare_event_batch(discovery, roots, lease.events());
             if prepared.ops.is_empty() {
                 stats.add_skipped(prepared.skipped);
                 lease.commit();
@@ -2980,7 +2982,7 @@ fn drain_final_batches<'a>(
             let Some(mut lease) = PendingBatchLease::acquire(ready_batches, reconciliation) else {
                 return Ok(());
             };
-            let prepared = prepare_event_batch(discovery, lease.events());
+            let prepared = prepare_event_batch(discovery, roots, lease.events());
             if prepared.ops.is_empty() {
                 stats.add_skipped(prepared.skipped);
                 lease.commit();
@@ -3302,7 +3304,7 @@ fn run_authoritative_reconciliation<'a>(
                     )),
                 });
             }
-            let prepared = prepare_event_batch(discovery, event_batch);
+            let prepared = prepare_event_batch(discovery, roots, event_batch);
             if prepared.ops.is_empty() {
                 staged_skipped = staged_skipped.saturating_add(prepared.skipped);
                 continue;
@@ -3623,12 +3625,17 @@ fn process_notify_result(
     Ok(())
 }
 
-fn prepare_event_batch(discovery: &DiscoveryConfig, events: &[WatchEvent]) -> PreparedWatchBatch {
+fn prepare_event_batch(
+    discovery: &DiscoveryConfig,
+    roots: &[PathBuf],
+    events: &[WatchEvent],
+) -> PreparedWatchBatch {
     let mut ops = Vec::new();
     let mut skipped = 0_usize;
+    let mut ignore_rules = IgnoreRules::new();
 
     for event in events {
-        if let Some(op) = event_to_ingest_op(discovery, event) {
+        if let Some(op) = event_to_ingest_op(discovery, roots, &mut ignore_rules, event) {
             ops.push(op);
         } else {
             skipped = skipped.saturating_add(1);
@@ -3642,12 +3649,26 @@ fn prepare_event_batch(discovery: &DiscoveryConfig, events: &[WatchEvent]) -> Pr
     }
 }
 
-fn event_to_ingest_op(discovery: &DiscoveryConfig, event: &WatchEvent) -> Option<WatchIngestOp> {
+fn event_to_ingest_op(
+    discovery: &DiscoveryConfig,
+    roots: &[PathBuf],
+    ignore_rules: &mut IgnoreRules,
+    event: &WatchEvent,
+) -> Option<WatchIngestOp> {
     let revision = i64::try_from(event.observed_at_ms).unwrap_or(i64::MAX);
     let file_key = normalize_file_key(&event.path);
 
     if matches!(event.kind, WatchEventKind::Deleted) {
         return Some(WatchIngestOp::Delete { file_key, revision });
+    }
+    // Judge the path from the innermost root that holds it, as the walk that
+    // `fsfs index` runs from that root would.
+    let root = roots
+        .iter()
+        .filter(|root| event.path.starts_with(root))
+        .max_by_key(|root| root.components().count());
+    if root.is_some_and(|root| ignore_rules.skips_under(root, &event.path, false)) {
+        return None;
     }
 
     let byte_len = event.byte_len.unwrap_or_else(|| {
@@ -3933,6 +3954,164 @@ fn scan_interrupted_error() -> SearchError {
     }
 }
 
+/// The ignore-file and hidden-entry rules `fsfs index` discovers with
+/// (`ignore::WalkBuilder` under standard filters), answered one entry at a
+/// time.
+///
+/// The watcher walks and admits events itself and applied only the discovery
+/// configuration, so it indexed what `fsfs index` never sees: a virtualenv in
+/// a dot-directory, agent state, gitignored build output, `.env` files. The
+/// next `fsfs index` deleted them again. This keeps the walker's precedence:
+/// the deepest `.ignore` match, then, inside a git or jj repository, the
+/// deepest `.gitignore` and `.git/info/exclude` at or below the repository
+/// root, then the global gitignore. An entry no rule matches is skipped when
+/// its name starts with a dot.
+struct IgnoreRules {
+    global: Gitignore,
+    directories: HashMap<PathBuf, DirectoryIgnoreFiles>,
+}
+
+/// One directory's ignore files, read as the walker reads them.
+struct DirectoryIgnoreFiles {
+    dot_ignore: Gitignore,
+    gitignore: Gitignore,
+    git_exclude: Gitignore,
+    has_git: bool,
+}
+
+impl DirectoryIgnoreFiles {
+    fn read(directory: &Path) -> Self {
+        let git_type = fs::metadata(directory.join(".git"))
+            .ok()
+            .map(|metadata| metadata.file_type());
+        let git_exclude = match git_type {
+            Some(file_type) if file_type.is_file() => git_common_dir(directory)
+                .map_or_else(Gitignore::empty, |common| {
+                    gitignore_at(directory, &common.join("info/exclude"))
+                }),
+            Some(_) => gitignore_at(directory, &directory.join(".git/info/exclude")),
+            None => Gitignore::empty(),
+        };
+        Self {
+            dot_ignore: gitignore_at(directory, &directory.join(".ignore")),
+            gitignore: gitignore_at(directory, &directory.join(".gitignore")),
+            git_exclude,
+            has_git: git_type.is_some() || directory.join(".jj").exists(),
+        }
+    }
+}
+
+/// A missing or unreadable file, or one whose patterns fail to compile, is
+/// an empty matcher, as it is for the walker.
+fn gitignore_at(root: &Path, file: &Path) -> Gitignore {
+    if !file.exists() {
+        return Gitignore::empty();
+    }
+    let mut builder = GitignoreBuilder::new(root);
+    if let Some(error) = builder.add(file) {
+        debug!(path = %file.display(), %error, "ignore file read partially");
+    }
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+/// The common directory of a linked worktree whose `.git` is a file.
+fn git_common_dir(directory: &Path) -> Option<PathBuf> {
+    let first_line = |path: &Path| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.lines().next().map(str::to_owned))
+    };
+    let git_dir = PathBuf::from(first_line(&directory.join(".git"))?.strip_prefix("gitdir: ")?);
+    let common = first_line(&git_dir.join("commondir"))?;
+    Some(if common.starts_with('.') {
+        git_dir.join(common)
+    } else {
+        PathBuf::from(common)
+    })
+}
+
+impl IgnoreRules {
+    fn new() -> Self {
+        // The walker resolves global patterns relative to the working directory.
+        let global = std::env::current_dir().map_or_else(
+            |_| Gitignore::empty(),
+            |cwd| GitignoreBuilder::new(cwd).build_global().0,
+        );
+        Self {
+            global,
+            directories: HashMap::new(),
+        }
+    }
+
+    /// Whether a walk that reached `path` would skip it.
+    fn skips_entry(&mut self, path: &Path, is_dir: bool) -> bool {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        match self.matched(parent, path, is_dir) {
+            Match::Ignore(()) => true,
+            Match::Whitelist(()) => false,
+            Match::None => path
+                .file_name()
+                .is_some_and(|name| name.as_encoded_bytes().starts_with(b".")),
+        }
+    }
+
+    /// Whether a walk from `root` would skip `path` or a directory on the
+    /// way to it. A path outside `root` is not this walk's to judge.
+    fn skips_under(&mut self, root: &Path, path: &Path, is_dir: bool) -> bool {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return false;
+        };
+        let mut current = root.to_path_buf();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            current.push(component);
+            if self.skips_entry(&current, components.peek().is_some() || is_dir) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn matched(&mut self, parent: &Path, path: &Path, is_dir: bool) -> Match<()> {
+        for directory in parent.ancestors() {
+            if !self.directories.contains_key(directory) {
+                let files = DirectoryIgnoreFiles::read(directory);
+                self.directories.insert(directory.to_path_buf(), files);
+            }
+        }
+        let chain = parent
+            .ancestors()
+            .filter_map(|directory| self.directories.get(directory))
+            .collect::<Vec<_>>();
+        let any_git = chain.iter().any(|files| files.has_git);
+        let (mut dot_ignore, mut gitignore, mut git_exclude) =
+            (Match::None, Match::None, Match::None);
+        let mut saw_git = false;
+        for files in chain {
+            if dot_ignore.is_none() {
+                dot_ignore = files.dot_ignore.matched(path, is_dir).map(|_| ());
+            }
+            if any_git && !saw_git {
+                if gitignore.is_none() {
+                    gitignore = files.gitignore.matched(path, is_dir).map(|_| ());
+                }
+                if git_exclude.is_none() {
+                    git_exclude = files.git_exclude.matched(path, is_dir).map(|_| ());
+                }
+            }
+            saw_git |= files.has_git;
+        }
+        let global = if any_git {
+            self.global.matched(path, is_dir).map(|_| ())
+        } else {
+            Match::None
+        };
+        dot_ignore.or(gitignore).or(git_exclude).or(global)
+    }
+}
+
 fn collect_snapshot_for_root(
     root: &Path,
     discovery: &DiscoveryConfig,
@@ -4017,6 +4196,7 @@ fn collect_snapshot_for_root(
         return Ok(());
     }
 
+    let mut ignore_rules = IgnoreRules::new();
     let mut stack = vec![root.to_path_buf()];
     let mut visited_dirs = HashSet::new();
     while let Some(dir_path) = stack.pop() {
@@ -4095,6 +4275,9 @@ fn collect_snapshot_for_root(
 
             let is_symlink = file_type.is_symlink();
             if is_symlink && !discovery.follow_symlinks {
+                continue;
+            }
+            if ignore_rules.skips_entry(&path, metadata.is_dir()) {
                 continue;
             }
 
@@ -4383,7 +4566,7 @@ mod tests {
         catchup: &'a CatchupEvents,
     ) -> WatchIngestFuture<'a, ()> {
         Box::pin(async move {
-            let prepared = super::prepare_event_batch(discovery, catchup.events());
+            let prepared = super::prepare_event_batch(discovery, &[], catchup.events());
             if !prepared.ops.is_empty() {
                 pipeline.apply_batch(cx, &prepared.ops).await?;
             }
@@ -5113,6 +5296,149 @@ mod tests {
         assert!(!snapshot.contains_key(&root.join("image.png")));
     }
 
+    /// A tree exercising every ignore source the index walk reads: an
+    /// `.ignore` above the root, `.ignore`, nested `.gitignore` with
+    /// whitelists, `.git/info/exclude`, a nested repository, hidden entries
+    /// and a whitelisted hidden directory.
+    fn ignore_rules_fixture(parent: &Path) -> PathBuf {
+        let root = parent.join("project");
+        for dir in [
+            ".git/info",
+            "ignored_dir",
+            "sub",
+            ".hidden_dir",
+            ".github",
+            "nested/.git",
+            "deep/a/b",
+        ] {
+            fs::create_dir_all(root.join(dir)).expect("fixture dir");
+        }
+        for (path, text) in [
+            ("../.ignore", "above_ignored.md\n"),
+            (".git/info/exclude", "excluded_by_git_exclude.txt\n"),
+            (".gitignore", "ignored_dir/\n*.log\n!keep.log\n!.github/\n"),
+            (".ignore", "dot_ignored.md\n"),
+            ("sub/.gitignore", "local.txt\n!important.log\n"),
+            ("normal.md", "kept\n"),
+            ("app.log", "ignored\n"),
+            ("keep.log", "whitelisted\n"),
+            ("above_ignored.md", "ignored from above the root\n"),
+            ("dot_ignored.md", "ignored\n"),
+            ("excluded_by_git_exclude.txt", "ignored\n"),
+            ("ignored_dir/a.md", "ignored\n"),
+            ("sub/local.txt", "ignored\n"),
+            ("sub/important.log", "whitelisted below a parent ignore\n"),
+            ("sub/other.log", "ignored by the parent\n"),
+            ("sub/fine.md", "kept\n"),
+            (".hidden.md", "hidden\n"),
+            (".hidden_dir/inner.md", "hidden parent\n"),
+            (".github/workflow.yml", "whitelisted hidden parent\n"),
+            ("nested/x.log", "outside the outer repository's rules\n"),
+            ("deep/a/b/c.md", "kept\n"),
+        ] {
+            fs::write(root.join(path), text).expect("fixture file");
+        }
+        root
+    }
+
+    fn every_file_under(dir: &Path, out: &mut BTreeSet<PathBuf>) {
+        for entry in fs::read_dir(dir).expect("list fixture") {
+            let path = entry.expect("fixture entry").path();
+            if path.is_dir() {
+                every_file_under(&path, out);
+            } else {
+                out.insert(path);
+            }
+        }
+    }
+
+    /// The watcher must admit exactly the files `fsfs index` discovers: the
+    /// `ignore` crate's walker is the oracle, run with the settings
+    /// `collect_index_candidates` uses.
+    #[test]
+    fn ignore_rules_admit_exactly_what_the_index_walk_admits() {
+        let temp = tempdir().expect("tempdir");
+        let root = ignore_rules_fixture(temp.path());
+        let mut walker = ignore::WalkBuilder::new(&root);
+        walker.follow_links(false);
+        walker.git_ignore(true);
+        walker.git_global(true);
+        walker.git_exclude(true);
+        walker.hidden(false);
+        walker.standard_filters(true);
+        let index_discovers = walker
+            .build()
+            .map(|entry| entry.expect("walk entry"))
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .map(ignore::DirEntry::into_path)
+            .collect::<BTreeSet<_>>();
+
+        let mut every = BTreeSet::new();
+        every_file_under(&root, &mut every);
+        let mut rules = super::IgnoreRules::new();
+        let admitted = every
+            .into_iter()
+            .filter(|path| !rules.skips_under(&root, path, false))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(admitted, index_discovers);
+        let relative = admitted
+            .iter()
+            .map(|path| path.strip_prefix(&root).expect("under root").to_path_buf())
+            .collect::<BTreeSet<_>>();
+        let expected = [
+            ".github/workflow.yml",
+            "deep/a/b/c.md",
+            "keep.log",
+            "nested/x.log",
+            "normal.md",
+            "sub/fine.md",
+            "sub/important.log",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>();
+        assert_eq!(relative, expected);
+    }
+
+    #[test]
+    fn watcher_scan_and_events_skip_what_the_index_walk_skips() {
+        let temp = tempdir().expect("tempdir");
+        let root = ignore_rules_fixture(temp.path());
+        let watcher = FsWatcher::new(
+            vec![root.clone()],
+            DiscoveryConfig::default(),
+            Arc::new(NoopWatchIngestPipeline),
+        );
+        let (snapshot, completeness) = watcher.collect_snapshot().expect("collect snapshot");
+        assert!(completeness.is_complete());
+        assert!(snapshot.contains_key(&root.join("normal.md")));
+        assert!(snapshot.contains_key(&root.join("sub/important.log")));
+        for skipped in [
+            ".hidden.md",
+            ".hidden_dir/inner.md",
+            "app.log",
+            "ignored_dir/a.md",
+        ] {
+            assert!(!snapshot.contains_key(&root.join(skipped)), "{skipped}");
+        }
+
+        let now = now_millis();
+        let events = [
+            WatchEvent::modified(root.join("normal.md"), now, Some(5)),
+            WatchEvent::created(root.join(".env"), now, Some(5)),
+            WatchEvent::created(root.join(".hidden_dir/new.md"), now, Some(5)),
+            WatchEvent::modified(root.join("ignored_dir/a.md"), now, Some(5)),
+            WatchEvent::deleted(root.join(".hidden.md"), now),
+        ];
+        let prepared = super::prepare_event_batch(&DiscoveryConfig::default(), &[root], &events);
+        assert_eq!(prepared.skipped, 3, "{:?}", prepared.ops);
+        assert!(matches!(
+            prepared.ops.as_slice(),
+            [WatchIngestOp::Upsert { .. }, WatchIngestOp::Delete { .. }]
+        ));
+    }
+
     #[test]
     fn collect_snapshot_skips_network_root_when_category_is_network() {
         let temp = tempdir().expect("tempdir");
@@ -5399,8 +5725,12 @@ mod tests {
             // would still report live here.
             let lineage_event =
                 WatchEvent::modified(temp.path().join("lib.rs"), now_millis(), Some(128));
-            if let Some(op) = super::event_to_ingest_op(&DiscoveryConfig::default(), &lineage_event)
-            {
+            if let Some(op) = super::event_to_ingest_op(
+                &DiscoveryConfig::default(),
+                &[],
+                &mut super::IgnoreRules::new(),
+                &lineage_event,
+            ) {
                 let _ = pipeline.apply_batch(&cx, std::slice::from_ref(&op)).await;
             }
             assert!(
