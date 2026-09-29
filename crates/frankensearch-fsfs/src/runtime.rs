@@ -2900,6 +2900,17 @@ impl LiveWindowMembership {
         self.lock().0.insert(entry.file_key.clone(), entry);
     }
 
+    fn records(&self, source: &str) -> bool {
+        self.lock().0.contains_key(source)
+    }
+
+    /// Recorded rows describe their sources only while the generation that
+    /// recorded them is complete. A batch that failed or crashed midway
+    /// leaves it incomplete until a replay republishes it.
+    fn is_complete(&self) -> bool {
+        self.lock().1.generation_complete
+    }
+
     fn forget(&self, source: &str) {
         self.lock().0.remove(source);
     }
@@ -3351,6 +3362,22 @@ impl LiveIngestPipeline {
         pipeline.backend_mut().flush(cx).await
     }
 
+    /// Upsert one watched file unless its published row already holds this
+    /// exact document, and report whether it did. Re-upserting identical
+    /// content published a Quill generation per file: the first watch after
+    /// `fsfs index` rewrote the whole keyword index one file at a time.
+    async fn apply_watched_lexical_upsert(
+        &self,
+        cx: &Cx,
+        mutation: LexicalMutation,
+    ) -> SearchResult<bool> {
+        let backend = QuillLexicalBackend::new(&self.lexical_index);
+        let mut pipeline = LexicalPipeline::new(backend);
+        let _stats = pipeline.apply_incremental(std::slice::from_ref(&mutation))?;
+        let resume = pipeline.backend_mut().flush_resumable(cx).await?;
+        Ok(resume.unchanged > 0)
+    }
+
     #[allow(clippy::arc_with_non_send_sync)]
     fn build_storage_batch_context(
         &self,
@@ -3626,6 +3653,7 @@ impl LiveIngestPipeline {
         revision: i64,
         ingestion_class: IngestionClass,
         storage_ctx: Option<&StorageBatchContext>,
+        recorded_windows_current: bool,
     ) -> frankensearch_core::SearchResult<bool> {
         let (abs_path, rel_key) = self.resolve_paths(file_key)?;
 
@@ -3690,16 +3718,14 @@ impl LiveIngestPipeline {
             return Ok(true);
         }
 
-        let file_name = abs_path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or_default()
-            .to_owned();
-        let mut doc =
-            IndexableDocument::new(rel_key.clone(), canonical.clone()).with_title(file_name);
-        if let Some(classification) = classification_metadata.as_ref() {
-            doc = attach_file_classification_metadata(doc, classification);
-        }
+        let doc = watched_document(
+            &abs_path,
+            &rel_key,
+            &canonical,
+            ingestion_class,
+            classification_metadata.as_ref(),
+        )
+        .await;
         let window_text = self.windows.as_ref().map(|_| lexical_text.clone());
         let mut mutation = LexicalMutation::upsert(
             rel_key.clone(),
@@ -3710,11 +3736,16 @@ impl LiveIngestPipeline {
         );
         mutation.title.clone_from(&doc.title);
         mutation.metadata.clone_from(&doc.metadata);
-        self.apply_lexical_mutations(cx, &[mutation]).await?;
+        let lexical_unchanged = self.apply_watched_lexical_upsert(cx, mutation).await?;
         // A windowed generation's fast rows are written inline: the storage
         // queue embeds one whole-file row per document, which the window
         // membership would reject.
         if let (Some(windows), Some(window_text)) = (self.windows.as_ref(), window_text) {
+            // Startup reconciliation replays every observed file. Identical
+            // content whose rows a complete generation recorded needs nothing.
+            if lexical_unchanged && recorded_windows_current && windows.records(&rel_key) {
+                return Ok(false);
+            }
             self.apply_window_upsert(
                 cx,
                 windows,
@@ -3837,16 +3868,14 @@ impl LiveIngestPipeline {
             return Ok(false);
         }
 
-        let file_name = abs_path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or_default()
-            .to_owned();
-        let mut doc =
-            IndexableDocument::new(rel_key.clone(), canonical.clone()).with_title(file_name);
-        if let Some(classification) = classification_metadata.as_ref() {
-            doc = attach_file_classification_metadata(doc, classification);
-        }
+        let doc = watched_document(
+            &abs_path,
+            &rel_key,
+            &canonical,
+            ingestion_class,
+            classification_metadata.as_ref(),
+        )
+        .await;
         let window_text = self.windows.as_ref().map(|_| lexical_text.clone());
         let mut mutation = LexicalMutation::upsert(
             rel_key.clone(),
@@ -3913,6 +3942,7 @@ impl LiveIngestPipeline {
             self.lexical_index.commit(cx).await?;
         }
         let windows = self.windows.as_ref().filter(|_| !batch.is_empty());
+        let recorded_windows_current = windows.is_some_and(LiveWindowMembership::is_complete);
         if let Some(windows) = windows {
             windows.mark_incomplete()?;
         }
@@ -3934,6 +3964,7 @@ impl LiveIngestPipeline {
                             *revision,
                             *ingestion_class,
                             storage_ctx.as_ref(),
+                            recorded_windows_current,
                         )
                         .await?
                     {
@@ -27097,6 +27128,38 @@ fn file_classification_allows_index(decision: &FileClassificationDecision) -> bo
     )
 }
 
+/// The keyword document a watcher writes for one file: the same title and
+/// metadata the one-shot indexer attaches. Quill's resumable flush skips a
+/// file only when this document hashes equal to the published row.
+async fn watched_document(
+    abs_path: &Path,
+    rel_key: &str,
+    canonical: &str,
+    ingestion_class: IngestionClass,
+    classification: Option<&FileClassificationDecision>,
+) -> IndexableDocument {
+    let file_name = abs_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .to_owned();
+    let modified_ms = asupersync::fs::metadata(abs_path)
+        .await
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(system_time_to_ms)
+        .unwrap_or_default();
+    let doc = IndexableDocument::new(rel_key.to_owned(), canonical.to_owned())
+        .with_title(file_name)
+        .with_metadata("source_path", abs_path.display().to_string())
+        .with_metadata("ingestion_class", ingestion_class_label(ingestion_class))
+        .with_metadata("source_modified_ms", modified_ms.to_string());
+    match classification {
+        Some(classification) => attach_file_classification_metadata(doc, classification),
+        None => doc,
+    }
+}
+
 fn attach_file_classification_metadata(
     doc: IndexableDocument,
     decision: &FileClassificationDecision,
@@ -44250,6 +44313,102 @@ mod tests {
                 .expect("delete batch");
             assert_eq!(rows_of("beta.md"), 0);
             assert_searchable(1);
+        });
+    }
+
+    #[test]
+    fn legacy_watch_replay_of_unchanged_files_rewrites_nothing() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            let long = "alpha window text about capybara habitats. ".repeat(400);
+            fs::write(project.join("alpha.md"), &long).expect("write alpha");
+            fs::write(project.join("beta.md"), "short beta note\n").expect("write beta");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            config.indexing.fast_window_max_per_file = 4;
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("windowed index");
+            let index_root = project.join(".frankensearch");
+            let (pipeline, _) = FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Watch,
+                    target_path: Some(project.clone()),
+                    index_dir: Some(index_root.clone()),
+                    watch: true,
+                    ..CliInput::default()
+                })
+                .build_live_ingest_pipeline(&cx)
+                .await
+                .expect("watch a windowed generation");
+            let engine = FsfsRuntime::resolve_lexical_engine(&index_root)
+                .expect("lexical layout")
+                .engine_dir()
+                .expect("Quill engine");
+            let published = || {
+                KeeperSnapshot::open(&engine, DEFAULT_SCHEMA)
+                    .expect("snapshot")
+                    .segment_stats()
+                    .expect("segment stats")
+                    .published_generation
+            };
+            let retired_rows = || {
+                pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .tombstone_count()
+            };
+            let replay = [
+                WatchIngestOp::Upsert {
+                    file_key: project.join("alpha.md").display().to_string(),
+                    revision: 30,
+                    ingestion_class: IngestionClass::FullSemanticLexical,
+                },
+                WatchIngestOp::Upsert {
+                    file_key: project.join("beta.md").display().to_string(),
+                    revision: 30,
+                    ingestion_class: IngestionClass::FullSemanticLexical,
+                },
+            ];
+            let (generation, retired) = (published(), retired_rows());
+
+            // Startup reconciliation replays every file, changed or not.
+            assert_eq!(
+                pipeline.apply_batch(&cx, &replay).await.expect("replay"),
+                0
+            );
+            assert_eq!(published(), generation, "no keyword generation per file");
+            assert_eq!(retired_rows(), retired, "no window row re-embedded");
+            let sentinel = FsfsRuntime::read_index_sentinel(&index_root)
+                .expect("read sentinel")
+                .expect("sentinel");
+            assert!(sentinel.generation_complete);
+
+            // A batch that died midway leaves the generation incomplete; its
+            // replay must re-embed rather than trust the recorded rows.
+            pipeline
+                .windows
+                .as_ref()
+                .expect("windowed pipeline")
+                .mark_incomplete()
+                .expect("simulate an interrupted batch");
+            pipeline.apply_batch(&cx, &replay[..1]).await.expect("repair replay");
+            assert_eq!(retired_rows(), retired + 4, "alpha's four windows replaced");
+            assert!(
+                FsfsRuntime::read_index_sentinel(&index_root)
+                    .expect("read sentinel")
+                    .expect("sentinel")
+                    .generation_complete
+            );
         });
     }
 

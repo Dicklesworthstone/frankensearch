@@ -97,11 +97,15 @@ fn session_id() -> SearchResult<&'static str> {
 fn configuration_digest(runtime: &FsfsRuntime) -> SearchResult<String> {
     // Persist a digest, not the configuration (which can contain private paths
     // or provider settings). A conservative mismatch simply starts cold.
-    let bytes =
-        serde_json::to_vec(runtime.config()).map_err(|source| SearchError::SubsystemError {
-            subsystem: "fsfs.complete_generation.reuse_config",
-            source: Box::new(source),
-        })?;
+    // Whether the command keeps watching afterwards indexes nothing
+    // differently; hashing it made the first `fsfs watch` after `fsfs index`
+    // discard the keyword index and re-embed every file.
+    let mut config = runtime.config().clone();
+    config.indexing.watch_mode = false;
+    let bytes = serde_json::to_vec(&config).map_err(|source| SearchError::SubsystemError {
+        subsystem: "fsfs.complete_generation.reuse_config",
+        source: Box::new(source),
+    })?;
     Ok(content_sha256_hex(&bytes))
 }
 
@@ -2411,6 +2415,14 @@ mod generation_tests {
             receipt.configuration_sha256.push('x');
             assert!(!compatible_receipt(&runtime, &receipt).unwrap());
             receipt.configuration_sha256 = configuration_digest(&runtime).unwrap();
+            // Watching afterwards indexes nothing differently; a setting that
+            // changes what is indexed still refuses the receipt.
+            let mut watching = runtime.clone();
+            watching.config.indexing.watch_mode = !runtime.config.indexing.watch_mode;
+            assert!(compatible_receipt(&watching, &receipt).unwrap());
+            let mut rewindowed = runtime.clone();
+            rewindowed.config.indexing.fast_window_max_per_file += 1;
+            assert!(!compatible_receipt(&rewindowed, &receipt).unwrap());
             receipt.checkpoint.target_root.push('x');
             assert!(!compatible_receipt(&runtime, &receipt).unwrap());
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();

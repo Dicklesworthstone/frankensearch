@@ -243,6 +243,22 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **`fsfs watch` no longer rebuilds an index `fsfs index` just finished.**
+  Two defects made the first watch after an index rewrite everything.
+  Reuse evidence was keyed to the whole configuration, including the
+  `watch_mode` flag that `fsfs watch` sets, so the watch's startup pass
+  discarded the keyword index and re-embedded every file. Then the watcher's
+  startup reconciliation re-upserted every file one at a time, publishing a
+  new keyword generation per file, because its documents lacked the path,
+  class and modification-time fields `fsfs index` writes and so never
+  matched. On a 579-file Rust tree, five one-line edits under `fsfs watch`
+  left 348 keyword segment files and 501 MB; the edits stayed unsearchable
+  for minutes while the rewrite ran, and Ctrl-C was ignored for two minutes.
+  Now the startup pass reuses the index (4 s instead of 24 s), unchanged
+  files are skipped, and the same five edits end at 16 segment files and
+  91 MB, each edit adding one small segment. Watched files keep the same
+  keyword metadata as indexed ones (bd-78o0n).
+
 - **Complete-generation stores no longer make each generation bigger than
   the last.** Every new generation (`FSFS_COMPLETE_GENERATIONS=1`: each
   `fsfs watch` publication, `index`, `append-batch`, `delete` or `compact`)
