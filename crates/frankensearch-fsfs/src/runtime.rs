@@ -16750,15 +16750,20 @@ impl FsfsRuntime {
                 "fsfs detected a legacy lexical engine; rebuilding into a fresh sibling"
             );
         }
-        // One-shot construction uses Quill's routed shard set and suppresses
-        // ordinary tier merges until the final bulk concat. Watch sessions use
-        // the deterministic singleton policy in `build_live_ingest_pipeline`.
+        // One-shot construction suppresses ordinary tier merges until the
+        // final bulk concat. It flushes one embedding batch at a time (64
+        // documents by default), which Quill ingests serially, so extra shards
+        // only rotated the flushes through up to 32 docid leases: the concat
+        // then spans all of them, and DOCLEN/IDMAP store every unused slot
+        // (bd-k07zw). One shard fills one lease. Watch sessions use the
+        // deterministic singleton policy in `build_live_ingest_pipeline`.
         publication_lease.fence("one-shot lexical writer admission")?;
         let lexical_index = QuillIndex::create(
             cx,
             &lexical_path,
             QuillConfig {
                 bulk_load_mode: true,
+                max_ingest_shards: 1,
                 ..QuillConfig::default()
             },
         )
@@ -44799,6 +44804,55 @@ mod tests {
                 FsfsRuntime::gather_lexical_candidates(&cx, lexical, "capybara", 100, None, 100)
                     .expect("lexical candidates");
             assert_eq!(found.len(), 64);
+        });
+    }
+
+    /// Serial bulk flushes rotated through one 65,536-slot docid lease per
+    /// shard, and the final concat stored every unused slot (bd-k07zw).
+    #[test]
+    fn first_index_packs_its_documents_into_one_docid_run() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            for number in 0..64 {
+                fs::write(
+                    project.join(format!("note{number:02}.md")),
+                    format!("capybara habitat note {number} with wetland details\n"),
+                )
+                .expect("write note");
+            }
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            // Eight flushes: one per chunk.
+            config.indexing.embedding_batch_size = 8;
+            FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("first index");
+            let engine = FsfsRuntime::resolve_lexical_engine(&project.join(".frankensearch"))
+                .expect("lexical layout")
+                .engine_dir()
+                .expect("Quill engine");
+            let snapshot = KeeperSnapshot::open(&engine, DEFAULT_SCHEMA).expect("snapshot");
+            let segments = &snapshot.loaded_manifest().manifest.segments;
+            let spans = segments
+                .iter()
+                .map(|segment| (segment.docid_hi - segment.docid_lo, segment.doc_count))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                spans.iter().map(|(_, docs)| u64::from(*docs)).sum::<u64>(),
+                64
+            );
+            assert!(
+                spans.iter().all(|(span, docs)| *span == u64::from(*docs)),
+                "every segment is a hole-free docid run: {spans:?}"
+            );
         });
     }
 

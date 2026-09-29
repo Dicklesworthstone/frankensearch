@@ -273,6 +273,18 @@ qualified; individual results below are narrower than release acceptance.
   6.4 s. A watch that crashes or fails a batch still leaves the next start
   cold (bd-oikhm).
 
+- **A fresh `fsfs index` is a third smaller.** The keyword index reserves
+  document numbers in blocks of 65,536, and its per-document tables store an
+  entry for every number between the first and the last one used. The
+  initial build fed documents one embedding batch at a time into 32 writer
+  shards in rotation, so a small index spanned up to 32 blocks and stored
+  about 36 bytes for every unused number. A 2,017-file Rust tree spanned
+  2,031,651 document numbers. The build now uses one shard, which fills one
+  block: the same tree spans 2,017 numbers, its keyword index shrinks from
+  163 to 89 MB and the whole index from 216 to 143 MB, with the same build
+  time. Each later writer session (`fsfs watch`, `delete`, `append-batch`)
+  still starts a new block (bd-k07zw).
+
 - **`fsfs watch`, `delete` and `append-batch` work on large repositories.**
   They open the keyword index with repair protection, which writes a
   RaptorQ sidecar for every segment. A sidecar encodes a single source block
