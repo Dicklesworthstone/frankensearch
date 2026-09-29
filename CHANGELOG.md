@@ -299,6 +299,14 @@ qualified; individual results below are narrower than release acceptance.
   the watcher's walk reached, most of the first in a hidden Python virtualenv
   (bd-9kgdd).
 
+- **A new file no longer makes `fsfs watch` re-embed its unchanged
+  neighbour.** A new file's keyword row waits for the end of its batch, and
+  while it waited the watcher could not prove the next file unchanged, so it
+  rewrote that file and re-embedded it with both models. When the watch
+  starts after files were added, every new file cost one extra re-embedding.
+  Pending rows are now published before a file whose unchanged state can be
+  proven (bd-r35lc).
+
 - **`fsfs watch`, `delete` and `append-batch` work on large repositories.**
   They open the keyword index with repair protection, which writes a
   RaptorQ sidecar for every segment. A sidecar encodes a single source block

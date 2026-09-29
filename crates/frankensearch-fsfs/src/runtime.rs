@@ -3413,6 +3413,18 @@ impl LiveIngestPipeline {
         cx: &Cx,
         mutation: LexicalMutation,
     ) -> SearchResult<bool> {
+        // A published witness cannot prove anything while rows are staged:
+        // after a new file earlier in the batch (new rows stay staged), the
+        // next unchanged file was rewritten and re-embedded with both models.
+        // Publish the staged rows first when a witness could prove this one.
+        if self.lexical_index.has_uncommitted_changes()
+            && self
+                .lexical_index
+                .document_witness(&mutation.doc_id)?
+                .is_some()
+        {
+            self.lexical_index.commit(cx).await?;
+        }
         let backend = QuillLexicalBackend::new(&self.lexical_index);
         let mut pipeline = LexicalPipeline::new(backend);
         let _stats = pipeline.apply_incremental(std::slice::from_ref(&mutation))?;
@@ -44631,6 +44643,59 @@ mod tests {
                     .expect("sentinel")
                     .generation_complete
             );
+        });
+    }
+
+    /// A new file stages its keyword row, which made the next unchanged file
+    /// in the batch unprovable: it was rewritten and all its windows re-embedded.
+    #[test]
+    fn legacy_watch_new_file_does_not_rewrite_the_next_unchanged_one() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            let long = "alpha window text about capybara habitats. ".repeat(400);
+            fs::write(project.join("alpha.md"), &long).expect("write alpha");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            config.indexing.fast_window_max_per_file = 4;
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("windowed index");
+            let (pipeline, _) = FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Watch,
+                    target_path: Some(project.clone()),
+                    index_dir: Some(project.join(".frankensearch")),
+                    watch: true,
+                    ..CliInput::default()
+                })
+                .build_live_ingest_pipeline(&cx)
+                .await
+                .expect("watch a windowed generation");
+            let retired_rows = || {
+                pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .tombstone_count()
+            };
+            let retired = retired_rows();
+            fs::write(project.join("added.md"), "a note added while unwatched\n")
+                .expect("write added");
+            let batch = ["added.md", "alpha.md"].map(|name| WatchIngestOp::Upsert {
+                file_key: project.join(name).display().to_string(),
+                revision: 30,
+                ingestion_class: IngestionClass::FullSemanticLexical,
+            });
+            assert_eq!(pipeline.apply_batch(&cx, &batch).await.expect("batch"), 1);
+            assert_eq!(retired_rows(), retired, "alpha's windows stay");
         });
     }
 
