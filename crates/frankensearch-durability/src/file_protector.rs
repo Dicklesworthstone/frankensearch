@@ -379,6 +379,16 @@ impl FileProtector {
         self.metrics.snapshot()
     }
 
+    /// Whether a source of `len` bytes fits the single `RaptorQ` source block
+    /// a sidecar encodes. Beyond K'_max symbols of the configured size
+    /// (about 231 MB at the default 4 KiB) protection is impossible, and a
+    /// caller that treats protection as best effort should skip it.
+    #[must_use]
+    pub fn can_protect_len(&self, len: u64) -> bool {
+        let symbol_size = u64::from(self.codec.config().symbol_size.max(1));
+        len.div_ceil(symbol_size) <= u64::from(crate::codec::MAX_SOURCE_SYMBOLS_PER_BLOCK)
+    }
+
     pub fn sidecar_path(path: &Path) -> PathBuf {
         let mut sidecar = path.as_os_str().to_os_string();
         sidecar.push(".fec");
@@ -2101,6 +2111,24 @@ mod tests {
             repair_overhead: 2.0,
             ..DurabilityConfig::default()
         }
+    }
+
+    #[test]
+    fn can_protect_len_stops_at_one_raptorq_source_block() {
+        let protector =
+            FileProtector::new(Arc::new(crate::codec::DefaultSymbolCodec), test_config())
+                .expect("protector");
+        let block = 256 * u64::from(crate::codec::MAX_SOURCE_SYMBOLS_PER_BLOCK);
+        assert!(protector.can_protect_len(0));
+        assert!(protector.can_protect_len(block));
+        assert!(!protector.can_protect_len(block + 1));
+        let default = FileProtector::new(
+            Arc::new(crate::codec::DefaultSymbolCodec),
+            DurabilityConfig::default(),
+        )
+        .expect("default protector");
+        assert!(default.can_protect_len(200 * 1024 * 1024));
+        assert!(!default.can_protect_len(250 * 1024 * 1024));
     }
 
     // --- DurabilityProvider trait tests ---

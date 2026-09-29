@@ -9586,6 +9586,18 @@ fn ensure_matching_durability_sidecar(
                 })?;
         }
     }
+    // A sidecar encodes one RaptorQ source block. A segment past K'_max
+    // symbols cannot be protected; leave it without a sidecar, as a bulk-built
+    // segment already is, instead of refusing every durable writer open of a
+    // large index (fsfs watch, delete and append-batch failed outright).
+    if !protector.can_protect_len(u64::try_from(bytes.len()).unwrap_or(u64::MAX)) {
+        tracing::warn!(
+            path = %source.display(),
+            bytes = bytes.len(),
+            "artifact exceeds one RaptorQ source block; it stays without a repair sidecar"
+        );
+        return Ok(());
+    }
     protector
         .protect_file_with_witness(source, witness)
         .map_err(|source_error| KeeperError::Durability {
@@ -10999,8 +11011,12 @@ fn validate_proposed_manifest_segments(
         #[cfg(not(test))]
         let authenticated_file_witness =
             AuthenticatedFileWitness::mint_after_full_prefix_validation(file_xxh3);
+        // A segment too large for one RaptorQ source block has no sidecar by
+        // design; its bytes were just verified against the MANIFEST witness.
         #[cfg(feature = "durability")]
-        if let WriterProtection::Enabled { protector, .. } = protection {
+        if let WriterProtection::Enabled { protector, .. } = protection
+            && protector.can_protect_len(reader.file_len())
+        {
             let sidecar = FileProtector::sidecar_path(&path);
             let verification = protector.verify_file(&path, &sidecar).map_err(|source| {
                 KeeperError::Durability {
@@ -12620,6 +12636,11 @@ where
         pending,
         |_, published| ensure_durable_segment_sidecar_absent(published),
         |pending, published| {
+            // Past one RaptorQ source block a segment cannot be protected; it
+            // is published without a sidecar, like a bulk-built segment.
+            if !protector.can_protect_len(pending.file_len()) {
+                return Ok(None);
+            }
             let witness = FileSourceWitness::new(pending.file_len(), pending.source_xxh3());
             let result = protector
                 .protect_file_with_witness(published, witness)
@@ -17578,6 +17599,33 @@ mod tests {
             },
         )
         .expect("valid test durability configuration")
+    }
+
+    /// A sidecar encodes one `RaptorQ` source block. Regenerating one for a
+    /// larger segment used to fail the durable writer open (`k_source` exceeds
+    /// the single-block limit), which stopped fsfs watch, delete
+    /// and append-batch on every repository whose keyword segment passed
+    /// ~231 MB. The oversized artifact now stays unprotected.
+    #[cfg(all(feature = "durability", unix))]
+    #[test]
+    fn oversized_artifact_is_left_without_a_sidecar_instead_of_failing() -> TestResult {
+        let directory = tempdir()?;
+        let admission = acquire_writer_admission(directory.path())?;
+        let protector = test_file_protector();
+        let block = 256 * 56_403;
+        let bytes = vec![7_u8; block + 1];
+        assert!(!protector.can_protect_len(u64::try_from(bytes.len())?));
+        let oversized = directory.path().join("seg-00000000000000ff.fslx");
+        std::fs::write(&oversized, &bytes)?;
+        ensure_matching_durability_sidecar(&admission, &protector, &oversized, &bytes)?;
+        assert!(!FileProtector::sidecar_path(&oversized).exists());
+
+        let small_bytes = b"small artifact".to_vec();
+        let small = directory.path().join("seg-00000000000000fe.fslx");
+        std::fs::write(&small, &small_bytes)?;
+        ensure_matching_durability_sidecar(&admission, &protector, &small, &small_bytes)?;
+        assert!(FileProtector::sidecar_path(&small).exists());
+        Ok(())
     }
 
     fn directory_bytes(directory: &Path) -> Result<Vec<(OsString, Vec<u8>)>, io::Error> {

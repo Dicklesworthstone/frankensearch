@@ -45,7 +45,7 @@ pub type RepairCodecConfig = DurabilityConfig;
 pub struct DefaultSymbolCodec;
 
 /// Maximum source symbols per `RaptorQ` source block (K'_max from RFC 6330).
-const MAX_SOURCE_SYMBOLS_PER_BLOCK: u32 = 56403;
+pub(crate) const MAX_SOURCE_SYMBOLS_PER_BLOCK: u32 = 56403;
 
 impl DefaultSymbolCodec {
     fn object_transmission_info(

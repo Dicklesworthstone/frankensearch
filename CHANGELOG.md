@@ -259,6 +259,16 @@ qualified; individual results below are narrower than release acceptance.
   91 MB, each edit adding one small segment. Watched files keep the same
   keyword metadata as indexed ones (bd-78o0n).
 
+- **`fsfs watch`, `delete` and `append-batch` work on large repositories.**
+  They open the keyword index with repair protection, which writes a
+  RaptorQ sidecar for every segment. A sidecar encodes a single source block
+  of at most about 231 MB, so on a repository whose keyword segment was
+  larger (a 9,143-file Rust repository has a 285 MB one) these commands
+  failed immediately with "k_source (exceeds single RaptorQ source block
+  limit)". Such a segment now stays without a sidecar, as a freshly built
+  segment already is; its bytes are still checked against the index's
+  full-file hash (bd-pciv1).
+
 - **Library searches for code identifiers and URLs use the keyword lane.**
   Quill's parser reads `HashMap::new` or `https://example.org` as a
   `field:value` query on an unknown field and drops it, so a
