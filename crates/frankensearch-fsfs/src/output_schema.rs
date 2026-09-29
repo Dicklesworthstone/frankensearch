@@ -948,6 +948,17 @@ pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
              lexical fallback.",
             bounded_public_producer(producer)
         ),
+        // The library wording names `index_documents()` and a data-dir variable
+        // a CLI user never meets; the suggestion carries the `fsfs index` step.
+        SearchError::IndexNotFound { path } => format!("No index found at {}", path.display()),
+        SearchError::IndexCandidatesNotFound { paths } => format!(
+            "No index found at any of: {}",
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         _ => err.to_string(),
     };
 
@@ -2095,6 +2106,27 @@ mod tests {
         assert_eq!(out.code, "invalid_config");
         assert_eq!(out.field.as_deref(), Some("quality_weight"));
         assert_eq!(out.exit_code, 2);
+    }
+
+    #[test]
+    fn missing_index_message_speaks_cli_not_library() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::IndexNotFound {
+            path: PathBuf::from("/srv/idx/vector/index.fsvi"),
+        };
+        let out = output_error_from(&err);
+        assert_eq!(out.message, "No index found at /srv/idx/vector/index.fsvi");
+        assert!(!out.message.contains("index_documents"), "{}", out.message);
+        assert!(
+            out.suggestion
+                .as_deref()
+                .is_some_and(|hint| hint.contains("fsfs index"))
+        );
+        let err = SearchError::IndexCandidatesNotFound {
+            paths: vec![PathBuf::from("/srv/a"), PathBuf::from("/srv/b")],
+        };
+        assert!(!output_error_from(&err).message.contains("index_documents"));
     }
 
     #[test]

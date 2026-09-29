@@ -316,6 +316,13 @@ qualified; individual results below are narrower than release acceptance.
   opens the catalog only then. A session with two edits and one deletion
   went from 11 warning lines to 3 (bd-mjm0g).
 
+- **fsfs accepts `--flag=value`.** `--limit=5`, `--format=json` or
+  `--index-dir=/path` failed with "unknown flag"; they now parse like the
+  spaced form. A missing index also stopped naming a library call: `fsfs
+  flush` and `fsfs compact` said "Run index_documents() first, or check
+  FRANKENSEARCH_DATA_DIR" and now say "No index found at <path>" next to the
+  existing `fsfs index <directory>` hint (bd-z2np8).
+
 - **`fsfs watch` starts 20 times faster.** At startup the watcher re-checks
   every file. Each file waited twice on the async runtime's 25 ms timer
   tick, once to read it and once to stat it, so 2,017 unchanged files took

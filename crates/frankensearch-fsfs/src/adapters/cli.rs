@@ -344,7 +344,7 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    let tokens: Vec<String> = args.into_iter().map(Into::into).collect();
+    let tokens = split_long_flag_values(args.into_iter().map(Into::into).collect());
     let (command, mut idx, command_source) = extract_command(&tokens)?;
     let mut input = CliInput {
         command,
@@ -1069,6 +1069,33 @@ fn is_help_flag(token: &str) -> bool {
 }
 
 #[must_use]
+/// Split `--flag=value` into `--flag value` for known long flags: the GNU
+/// form scripts and agents write, which was rejected as an unknown flag. The
+/// token after a bare `--` stays literal, so a search query may still be the
+/// text --limit=5.
+fn split_long_flag_values(tokens: Vec<String>) -> Vec<String> {
+    let mut split = Vec::with_capacity(tokens.len());
+    let mut literal_next = false;
+    for token in tokens {
+        if std::mem::take(&mut literal_next) {
+            split.push(token);
+            continue;
+        }
+        if token == "--" {
+            literal_next = true;
+        } else if let Some((flag, value)) = token.split_once('=')
+            && flag.starts_with("--")
+            && is_known_cli_flag(flag)
+        {
+            split.push(flag.to_owned());
+            split.push(value.to_owned());
+            continue;
+        }
+        split.push(token);
+    }
+    split
+}
+
 fn is_known_cli_flag(token: &str) -> bool {
     matches!(
         token,
@@ -1163,6 +1190,45 @@ mod tests {
             input.overrides.roots.expect("roots"),
             vec!["/repo".to_string(), "/notes".to_string()]
         );
+    }
+
+    #[test]
+    fn long_flags_accept_an_equals_joined_value() {
+        let joined = parse_cli_args([
+            "search",
+            "theme toggle",
+            "--limit=3",
+            "--format=json",
+            "--index-dir=/idx/a=b",
+            "--filter=lang:rust",
+        ])
+        .expect("equals-joined flags");
+        let spaced = parse_cli_args([
+            "search",
+            "theme toggle",
+            "--limit",
+            "3",
+            "--format",
+            "json",
+            "--index-dir",
+            "/idx/a=b",
+            "--filter",
+            "lang:rust",
+        ])
+        .expect("spaced flags");
+        assert_eq!(joined, spaced);
+        assert_eq!(joined.overrides.limit, Some(3));
+        assert_eq!(joined.index_dir.as_deref(), Some(Path::new("/idx/a=b")));
+
+        // Literal after `--`, and positionals keep their `=`.
+        let literal = parse_cli_args(["search", "--", "--limit=5"]).expect("literal query");
+        assert_eq!(literal.query.as_deref(), Some("--limit=5"));
+        assert_eq!(literal.overrides.limit, None);
+        let positional = parse_cli_args(["search", "a=b"]).expect("positional");
+        assert_eq!(positional.query.as_deref(), Some("a=b"));
+
+        let err = parse_cli_args(["search", "q", "--frob=1"]).expect_err("unknown flag");
+        assert!(err.to_string().contains("unknown flag"), "{err}");
     }
 
     #[test]
