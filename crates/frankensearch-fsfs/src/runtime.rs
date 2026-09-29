@@ -3002,6 +3002,37 @@ struct StorageBatchContext {
     runner: StorageBackedJobRunner,
 }
 
+/// The catalog of one watch batch, opened when an operation first needs it.
+/// A windowed generation writes its vector rows inline and touches the
+/// catalog only to purge a removed file, yet every batch opened it: a SQLite
+/// open, schema check and two WAL-FEC warnings on the terminal per change.
+struct BatchStorage<'a> {
+    pipeline: &'a LiveIngestPipeline,
+    context: std::cell::OnceCell<Option<StorageBatchContext>>,
+}
+
+impl<'a> BatchStorage<'a> {
+    const fn new(pipeline: &'a LiveIngestPipeline) -> Self {
+        Self {
+            pipeline,
+            context: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn get(&self) -> SearchResult<Option<&StorageBatchContext>> {
+        if self.context.get().is_none() {
+            let context = self.pipeline.build_storage_batch_context()?;
+            let _ = self.context.set(context);
+        }
+        Ok(self.opened())
+    }
+
+    /// The catalog if an operation of this batch opened it.
+    fn opened(&self) -> Option<&StorageBatchContext> {
+        self.context.get().and_then(Option::as_ref)
+    }
+}
+
 impl WatchIngestPipeline for LiveIngestPipeline {
     fn apply_batch<'a>(
         &'a self,
@@ -3540,10 +3571,10 @@ impl LiveIngestPipeline {
     }
 
     fn purge_storage_document(
-        storage_ctx: Option<&StorageBatchContext>,
+        storage: &BatchStorage<'_>,
         rel_key: &str,
     ) -> frankensearch_core::SearchResult<()> {
-        let Some(storage_ctx) = storage_ctx else {
+        let Some(storage_ctx) = storage.get()? else {
             return Ok(());
         };
         storage_ctx.storage.delete_document(rel_key).map(|_| ())
@@ -3706,14 +3737,14 @@ impl LiveIngestPipeline {
         file_key: &str,
         revision: i64,
         ingestion_class: IngestionClass,
-        storage_ctx: Option<&StorageBatchContext>,
+        storage: &BatchStorage<'_>,
         recorded_windows_current: bool,
     ) -> frankensearch_core::SearchResult<bool> {
         let (abs_path, rel_key) = self.resolve_paths(file_key)?;
 
         if ingestion_class == IngestionClass::Skip {
             self.prune_indexes(cx, &rel_key).await?;
-            Self::purge_storage_document(storage_ctx, &rel_key)?;
+            Self::purge_storage_document(storage, &rel_key)?;
             return Ok(true);
         }
 
@@ -3721,7 +3752,7 @@ impl LiveIngestPipeline {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 self.prune_indexes(cx, &rel_key).await?;
-                Self::purge_storage_document(storage_ctx, &rel_key)?;
+                Self::purge_storage_document(storage, &rel_key)?;
                 return Ok(true);
             }
             Err(error)
@@ -3746,7 +3777,7 @@ impl LiveIngestPipeline {
                 ),
                 None => {
                     self.prune_indexes(cx, &rel_key).await?;
-                    Self::purge_storage_document(storage_ctx, &rel_key)?;
+                    Self::purge_storage_document(storage, &rel_key)?;
                     return Ok(true);
                 }
             }
@@ -3754,7 +3785,7 @@ impl LiveIngestPipeline {
             let classification = classify_file_for_ingest(&abs_path, &bytes);
             if !file_classification_allows_index(&classification) {
                 self.prune_indexes(cx, &rel_key).await?;
-                Self::purge_storage_document(storage_ctx, &rel_key)?;
+                Self::purge_storage_document(storage, &rel_key)?;
                 return Ok(true);
             }
 
@@ -3768,7 +3799,7 @@ impl LiveIngestPipeline {
 
         if canonical.trim().is_empty() {
             self.prune_indexes(cx, &rel_key).await?;
-            Self::purge_storage_document(storage_ctx, &rel_key)?;
+            Self::purge_storage_document(storage, &rel_key)?;
             return Ok(true);
         }
 
@@ -3820,7 +3851,7 @@ impl LiveIngestPipeline {
         }
 
         if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
-            if let Some(storage_ctx) = storage_ctx {
+            if let Some(storage_ctx) = storage.get()? {
                 Self::enqueue_storage_upsert(storage_ctx, &rel_key, &canonical, &abs_path)?;
                 // Storage pipeline intentionally skips hash-tier queued jobs because hash
                 // vectors are expected to be computed inline. Preserve live watcher behavior by
@@ -3876,7 +3907,7 @@ impl LiveIngestPipeline {
             }
         } else {
             self.soft_delete_vector(&rel_key)?;
-            Self::purge_storage_document(storage_ctx, &rel_key)?;
+            Self::purge_storage_document(storage, &rel_key)?;
         }
 
         Ok(true)
@@ -3981,11 +4012,11 @@ impl LiveIngestPipeline {
         &self,
         cx: &Cx,
         file_key: &str,
-        storage_ctx: Option<&StorageBatchContext>,
+        storage: &BatchStorage<'_>,
     ) -> frankensearch_core::SearchResult<()> {
         let (_abs_path, rel_key) = self.resolve_paths(file_key)?;
         self.prune_indexes(cx, &rel_key).await?;
-        Self::purge_storage_document(storage_ctx, &rel_key)
+        Self::purge_storage_document(storage, &rel_key)
     }
 
     #[allow(clippy::future_not_send)]
@@ -4006,7 +4037,7 @@ impl LiveIngestPipeline {
         if let Some(windows) = windows {
             windows.mark_incomplete()?;
         }
-        let storage_ctx = self.build_storage_batch_context()?;
+        let storage = BatchStorage::new(self);
         let mut count = 0_usize;
 
         for op in batch {
@@ -4023,7 +4054,7 @@ impl LiveIngestPipeline {
                             file_key,
                             *revision,
                             *ingestion_class,
-                            storage_ctx.as_ref(),
+                            &storage,
                             recorded_windows_current,
                         )
                         .await?
@@ -4032,8 +4063,7 @@ impl LiveIngestPipeline {
                     }
                 }
                 WatchIngestOp::Delete { file_key, .. } => {
-                    self.apply_delete_op(cx, file_key, storage_ctx.as_ref())
-                        .await?;
+                    self.apply_delete_op(cx, file_key, &storage).await?;
                     count = count.saturating_add(1);
                 }
             }
@@ -4041,7 +4071,7 @@ impl LiveIngestPipeline {
 
         if count > 0 {
             self.lexical_index.commit(cx).await?;
-            if let Some(storage_ctx) = storage_ctx.as_ref() {
+            if let Some(storage_ctx) = storage.opened() {
                 self.drain_storage_jobs(cx, storage_ctx).await?;
             }
             info!(
@@ -44642,6 +44672,65 @@ mod tests {
                     .expect("read sentinel")
                     .expect("sentinel")
                     .generation_complete
+            );
+        });
+    }
+
+    /// Windowed rows are written inline, so an edit batch has no use for the
+    /// catalog; opening it anyway cost every change a SQLite open and two
+    /// WAL-FEC warnings on the terminal. A removal still purges its row.
+    #[test]
+    fn windowed_watch_edits_leave_the_catalog_closed() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            fs::write(project.join("alpha.md"), "alpha capybara notes\n").expect("write alpha");
+            fs::write(project.join("beta.md"), "beta capybara notes\n").expect("write beta");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            config.indexing.fast_window_max_per_file = 4;
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("windowed index");
+            let (pipeline, _) = FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Watch,
+                    target_path: Some(project.clone()),
+                    index_dir: Some(project.join(".frankensearch")),
+                    watch: true,
+                    ..CliInput::default()
+                })
+                .build_live_ingest_pipeline(&cx)
+                .await
+                .expect("watch a windowed generation");
+            // A catalog path under a regular file cannot be opened.
+            let blocker = temp.path().join("not-a-directory");
+            fs::write(&blocker, "").expect("write blocker");
+            let pipeline = pipeline.with_storage_db_path(blocker.join("catalog.sqlite"));
+
+            fs::write(project.join("alpha.md"), "alpha capybara notes, edited\n")
+                .expect("edit alpha");
+            let edit = [WatchIngestOp::Upsert {
+                file_key: project.join("alpha.md").display().to_string(),
+                revision: 30,
+                ingestion_class: IngestionClass::FullSemanticLexical,
+            }];
+            assert_eq!(pipeline.apply_batch(&cx, &edit).await.expect("edit"), 1);
+
+            let removal = [WatchIngestOp::Delete {
+                file_key: project.join("beta.md").display().to_string(),
+                revision: 31,
+            }];
+            assert!(
+                pipeline.apply_batch(&cx, &removal).await.is_err(),
+                "a removal still purges its catalog row"
             );
         });
     }

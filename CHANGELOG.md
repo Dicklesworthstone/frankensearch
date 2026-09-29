@@ -307,6 +307,13 @@ qualified; individual results below are narrower than release acceptance.
   Pending rows are now published before a file whose unchanged state can be
   proven (bd-r35lc).
 
+- **`fsfs watch` no longer prints two warnings per change.** Every batch
+  opened the metadata catalog, which prints "WAL-FEC requires a caller-owned
+  native runtime" twice. A watched index with fast windows writes its rows
+  directly and needs the catalog only to remove a deleted file, so it now
+  opens the catalog only then. A session with two edits and one deletion
+  went from 11 warning lines to 3 (bd-mjm0g).
+
 - **`fsfs watch`, `delete` and `append-batch` work on large repositories.**
   They open the keyword index with repair protection, which writes a
   RaptorQ sidecar for every segment. A sidecar encodes a single source block
