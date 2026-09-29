@@ -271,7 +271,9 @@ qualified; individual results below are narrower than release acceptance.
   2,019-file Rust tree, the restart after a watch with one edit went from an
   83 s startup pass to 5.5 s, and `fsfs index` afterwards from 68 s to
   6.4 s. A watch that crashes or fails a batch still leaves the next start
-  cold (bd-oikhm).
+  cold (bd-oikhm). `fsfs delete` now keeps the same evidence: on a 338-file
+  tree, the `fsfs index` after deleting one file took 1.9 s instead of
+  11.7 s and re-added only that file (bd-lsuub).
 
 - **A fresh `fsfs index` is a third smaller.** The keyword index reserves
   document numbers in blocks of 65,536, and its per-document tables store an

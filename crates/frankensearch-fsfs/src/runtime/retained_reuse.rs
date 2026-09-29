@@ -398,11 +398,12 @@ fn write_legacy_evidence(
     Ok(())
 }
 
-/// What a windowed watch session keeps so a clean exit leaves warm reuse
-/// evidence. Every committed batch changes the artifacts the completed receipt
-/// digests, so the next `fsfs watch` or `fsfs index` used to re-embed every
-/// file (bd-oikhm).
-pub(super) struct WatchReuseLedger {
+/// What a mutation of a completed legacy root (a watch session, `fsfs
+/// delete`) keeps so that it can leave warm reuse evidence behind. Every
+/// mutation changes the artifacts the completed receipt digests, so the next
+/// `fsfs watch` or `fsfs index` used to re-embed every file (bd-oikhm,
+/// bd-lsuub).
+pub(super) struct ReuseLedger {
     index_root: PathBuf,
     /// The completed checkpoint admitted before the session mutated anything.
     admitted: IndexingCheckpoint,
@@ -413,7 +414,7 @@ pub(super) struct WatchReuseLedger {
     replaced: std::sync::Mutex<BTreeMap<String, Option<String>>>,
 }
 
-impl WatchReuseLedger {
+impl ReuseLedger {
     pub(super) fn index_root(&self) -> &Path {
         &self.index_root
     }
@@ -436,16 +437,16 @@ impl WatchReuseLedger {
     }
 }
 
-/// Admit the completed evidence a windowed watch session starts from. The
-/// startup pass has just written it, so `--full` no longer applies. Hold the
-/// publication lease from this call until the session owns its writers.
-pub(super) fn watch_reuse_ledger(
+/// Admit the completed evidence a mutation starts from. `--full` does not
+/// apply: a watch's startup pass has just written it. Hold the publication
+/// lease from this call until the mutation owns its writers.
+pub(super) fn reuse_ledger(
     cx: &Cx,
     runtime: &FsfsRuntime,
     root: &Path,
-) -> SearchResult<Option<WatchReuseLedger>> {
+) -> SearchResult<Option<ReuseLedger>> {
     Ok(
-        admitted_legacy_checkpoint(cx, runtime, root)?.map(|admitted| WatchReuseLedger {
+        admitted_legacy_checkpoint(cx, runtime, root)?.map(|admitted| ReuseLedger {
             index_root: root.to_path_buf(),
             admitted,
             replaced: std::sync::Mutex::new(BTreeMap::new()),
@@ -453,22 +454,24 @@ pub(super) fn watch_reuse_ledger(
     )
 }
 
-/// Leave completed evidence for the membership a watch session published.
+/// Leave completed evidence for the membership a mutation published.
 /// Sources it never touched keep their admitted entries; replaced ones carry
-/// the hash of the bytes it indexed. Call holding the publication lease, after
-/// every writer of the session has been released.
-pub(super) fn retain_watched_checkpoint(
+/// the hash of the bytes it indexed; removed ones leave. A source whose rows
+/// were only tombstoned keeps its entry, which can no longer be reused because
+/// reuse requires its rows to be live. Call holding the publication lease,
+/// after every writer of the mutation has been released.
+pub(super) fn retain_mutated_checkpoint(
     cx: &Cx,
     runtime: &FsfsRuntime,
-    ledger: &WatchReuseLedger,
+    ledger: &ReuseLedger,
 ) -> SearchResult<()> {
     let root = ledger.index_root();
     retain_or_start_cold(write_legacy_evidence(cx, root, || {
         let manifests = FsfsRuntime::read_matching_manifest_generation(root)?
-            .ok_or_else(|| reuse_error("watched generation has no matching manifests"))?;
+            .ok_or_else(|| reuse_error("mutated generation has no matching manifests"))?;
         let sentinel = FsfsRuntime::read_index_sentinel(root)?
             .filter(|sentinel| sentinel.generation_complete)
-            .ok_or_else(|| reuse_error("watched generation is not complete"))?;
+            .ok_or_else(|| reuse_error("mutated generation is not complete"))?;
         let replaced = ledger.replaced();
         let mut checkpoint = ledger.admitted.clone();
         checkpoint.files = BTreeMap::new();
@@ -487,7 +490,7 @@ pub(super) fn retain_watched_checkpoint(
                 },
                 Some(None) => {
                     return Err(reuse_error(
-                        "a watched source was left between two versions",
+                        "a mutated source was left between two versions",
                     ));
                 }
                 None => ledger
@@ -503,7 +506,7 @@ pub(super) fn retain_watched_checkpoint(
                     })
                     .cloned()
                     .ok_or_else(|| {
-                        reuse_error("watched membership changed outside the session's record")
+                        reuse_error("membership changed outside the mutation's record")
                     })?,
             };
             checkpoint.files.insert(key.clone(), entry);
@@ -515,7 +518,7 @@ pub(super) fn retain_watched_checkpoint(
         checkpoint.updated_at_ms = super::pressure_timestamp_ms();
         if FsfsRuntime::read_checkpoint_manifest_generation(root, &checkpoint)?.is_none() {
             return Err(reuse_error(
-                "watched evidence disagrees with its generation metadata",
+                "mutated evidence disagrees with its generation metadata",
             ));
         }
         Ok(ReuseReceipt {
@@ -2111,6 +2114,29 @@ mod generation_tests {
                     .unwrap();
                 assert_index_calls(&index().await, 1, 1);
                 assert_index_calls(&index().await, 0, 0);
+            });
+        }
+
+        /// A delete keeps the evidence for every other file: the next index
+        /// re-embeds only the removed source, which is still on disk.
+        #[test]
+        fn delete_keeps_warm_evidence_for_the_files_it_did_not_remove() {
+            run_test_with_cx(|cx| async move {
+                for max_windows in [1, 2] {
+                    let parent = tempfile::tempdir().unwrap();
+                    fixture(parent.path(), 3);
+                    let index = || run_counted_legacy_windows(&cx, parent.path(), "index", max_windows);
+                    assert_index_calls(&index().await, 3, 3);
+                    let (mut runtime, _, _) = two_tier_fixture(parent.path(), max_windows);
+                    runtime.cli_input.command = CliCommand::Delete;
+                    // As on the command line: delete names no tree.
+                    runtime.cli_input.target_path = None;
+                    runtime.cli_input.delete_ids = vec!["doc-1.md".to_owned()];
+                    runtime.cli_input.format = crate::OutputFormat::Json;
+                    Box::pin(runtime.run_delete_command(&cx)).await.unwrap();
+                    assert_index_calls(&index().await, 1, 1);
+                    assert_index_calls(&index().await, 0, 0);
+                }
             });
         }
 

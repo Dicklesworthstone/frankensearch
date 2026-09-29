@@ -2880,7 +2880,7 @@ struct LiveIngestPipeline {
     windows: Option<LiveWindowMembership>,
     /// Present when a windowed session started from completed reuse evidence;
     /// records what it changed so a clean exit can leave that evidence warm.
-    reuse: Option<Arc<retained_reuse::WatchReuseLedger>>,
+    reuse: Option<Arc<retained_reuse::ReuseLedger>>,
     /// How long a retired lexical file must age before the post-batch sweep
     /// may unlink it: Quill's reader grace window.
     lexical_garbage_grace: Duration,
@@ -2967,7 +2967,7 @@ struct LiveWatchSession {
     watcher: FsWatcher,
     vector_index: Arc<std::sync::Mutex<VectorIndex>>,
     quality_vector_index: Option<Arc<std::sync::Mutex<VectorIndex>>>,
-    reuse: Option<Arc<retained_reuse::WatchReuseLedger>>,
+    reuse: Option<Arc<retained_reuse::ReuseLedger>>,
 }
 
 #[derive(Debug)]
@@ -3211,12 +3211,12 @@ impl LiveIngestPipeline {
         self
     }
 
-    fn with_reuse_ledger(mut self, ledger: retained_reuse::WatchReuseLedger) -> Self {
+    fn with_reuse_ledger(mut self, ledger: retained_reuse::ReuseLedger) -> Self {
         self.reuse = Some(Arc::new(ledger));
         self
     }
 
-    fn reuse_ledger(&self) -> Option<Arc<retained_reuse::WatchReuseLedger>> {
+    fn reuse_ledger(&self) -> Option<Arc<retained_reuse::ReuseLedger>> {
         self.reuse.clone()
     }
 
@@ -13661,6 +13661,23 @@ impl FsfsRuntime {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        // Removing a source must not cost the next `fsfs index` every other
+        // file: keep the completed evidence this delete starts from (bd-lsuub).
+        // The receipt names the tree it indexed, which `fsfs delete` does not.
+        let indexed = match Self::read_index_sentinel(&index_root)? {
+            Some(sentinel) => {
+                retained_reuse::prepare_legacy_reuse(cx).await?;
+                Some(self.clone().with_cli_input(CliInput {
+                    target_path: Some(PathBuf::from(sentinel.target_root)),
+                    ..self.cli_input.clone()
+                }))
+            }
+            None => None,
+        };
+        let reuse = match indexed.as_ref() {
+            Some(indexed) => retained_reuse::reuse_ledger(cx, indexed, &index_root)?,
+            None => None,
+        };
         {
             let index = VectorIndex::open_read_only(&vector_path)?;
             semantic_windows::load_mapping(&index_root, &index)?;
@@ -13830,6 +13847,15 @@ impl FsfsRuntime {
             }
         }
 
+        drop(index);
+        if let (Some(ledger), Some(indexed)) = (reuse.filter(|_| !targets.is_empty()), &indexed) {
+            match publication_lease.fence("delete reuse evidence") {
+                Ok(()) => retained_reuse::retain_mutated_checkpoint(cx, indexed, &ledger)?,
+                Err(error) => {
+                    warn!(%error, "publication ownership changed; the next index re-embeds cold");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -20454,7 +20480,7 @@ impl FsfsRuntime {
             .as_ref()
             .and_then(|_| crate::lifecycle::PublicationLease::acquire(&index_root).ok());
         let reuse_ledger = if reuse_lease.is_some() {
-            retained_reuse::watch_reuse_ledger(cx, self, &index_root)?
+            retained_reuse::reuse_ledger(cx, self, &index_root)?
         } else {
             None
         };
@@ -20616,7 +20642,7 @@ impl FsfsRuntime {
             warn!(%error, "publication ownership changed; the next start re-indexes cold");
             return Ok(());
         }
-        retained_reuse::retain_watched_checkpoint(cx, self, &reuse)
+        retained_reuse::retain_mutated_checkpoint(cx, self, &reuse)
     }
 
     async fn repair_quarantined_lexical_gap(
