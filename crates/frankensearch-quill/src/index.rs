@@ -79,12 +79,12 @@ use crate::keeper::BenchmarkQuillDirectorySyncState;
 use crate::keeper::UnrepairableSegmentPolicy;
 use crate::keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, CurrentPointer,
-    CurrentPointerError, GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter,
-    LexicalLayout, LiveDocumentFloor, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest,
-    ManifestFieldStats, ManifestSegment, PublicationAuthorityPhase, PublicationAuthorityState,
-    PublicationReadState, PublishIntent, RecoveredSegment, TierMergePolicy, TierPolicyError,
-    TombstoneSet, inspect_lexical_layout, load_manifest_pair, plan_tier_merge,
-    validate_manifest_successor,
+    CurrentPointerError, GarbageCollectionOptions, GarbageCollectionReport, KeeperError,
+    KeeperSnapshot, KeeperWriter, LexicalLayout, LiveDocumentFloor,
+    MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats, ManifestSegment,
+    PublicationAuthorityPhase, PublicationAuthorityState, PublicationReadState, PublishIntent,
+    RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet, inspect_lexical_layout,
+    load_manifest_pair, plan_tier_merge, validate_manifest_successor,
 };
 use crate::query::{
     BooleanClause, BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError,
@@ -8545,7 +8545,8 @@ impl QuillWriterState {
     /// mapped survives the unlink. The same sweep runs once at writer open;
     /// this entry point lets a long-lived or frequently publishing writer
     /// reclaim without reopening, since a merge's folded inputs become
-    /// collectable only after later publications age them out.
+    /// collectable only after later publications age them out. `options` of
+    /// `None` uses the writer's configured grace window.
     ///
     /// # Errors
     ///
@@ -8556,6 +8557,7 @@ impl QuillWriterState {
     pub async fn collect_garbage(
         &mut self,
         cx: &Cx,
+        options: Option<GarbageCollectionOptions>,
     ) -> Result<GarbageCollectionReport, QuillIndexError> {
         check_cancel(cx, "garbage collection")?;
         if self.has_uncommitted_changes() {
@@ -8563,9 +8565,12 @@ impl QuillWriterState {
                 "garbage collection requires a fully committed index",
             ));
         }
-        match &mut self.backend {
-            IndexBackend::Durable(writer) => Ok(writer.collect_garbage(cx).await?),
-            IndexBackend::Memory(_) => Ok(GarbageCollectionReport {
+        match (&mut self.backend, options) {
+            (IndexBackend::Durable(writer), None) => Ok(writer.collect_garbage(cx).await?),
+            (IndexBackend::Durable(writer), Some(options)) => {
+                Ok(writer.collect_garbage_with(cx, options).await?)
+            }
+            (IndexBackend::Memory(_), _) => Ok(GarbageCollectionReport {
                 removed: Vec::new(),
             }),
         }
@@ -12666,7 +12671,31 @@ impl QuillIndex {
         let mut writer = self
             .lock_writer(cx, "garbage collection writer lock")
             .await?;
-        writer.collect_garbage(cx).await
+        writer.collect_garbage(cx, None).await
+    }
+
+    /// Reclaim unreferenced segment files with an explicit grace window.
+    ///
+    /// Identical to [`Self::collect_garbage`] except for the window. Shorten
+    /// it only for a directory no reader can have resolved, such as a private
+    /// build directory that has never been published: the window is what
+    /// protects a reader that read an older `MANIFEST` and has not opened its
+    /// segments yet. Files either `MANIFEST` slot references are kept at any
+    /// window.
+    ///
+    /// # Errors
+    ///
+    /// Rejects writer-lock failure, uncommitted state, cancellation, or the
+    /// Keeper's typed sweep failure.
+    pub async fn collect_garbage_with(
+        &self,
+        cx: &Cx,
+        options: GarbageCollectionOptions,
+    ) -> Result<GarbageCollectionReport, QuillIndexError> {
+        let mut writer = self
+            .lock_writer(cx, "garbage collection writer lock")
+            .await?;
+        writer.collect_garbage(cx, Some(options)).await
     }
 
     /// Delete one live document id and publish the successor snapshot.
@@ -20971,6 +21000,98 @@ mod tests {
                     .await
                     .expect("in-memory sweep")
                     .is_empty()
+            );
+        });
+    }
+
+    /// A never-published build directory may reclaim a merge's folded inputs
+    /// at once. The default window keeps them; a zero window removes exactly
+    /// the inputs and their receipts, never a segment a MANIFEST slot names.
+    #[cfg(unix)]
+    #[test]
+    fn collect_garbage_with_zero_grace_reclaims_what_the_default_window_keeps() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("index directory");
+            let index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create on-disk index");
+            for (document_id, content) in [("one", "alpha"), ("two", "beta")] {
+                LexicalWrite::index_document(
+                    &index,
+                    &cx,
+                    &IndexableDocument::new(document_id, content),
+                )
+                .await
+                .expect("stage document");
+                LexicalWrite::commit(&index, &cx)
+                    .await
+                    .expect("publish one segment per round");
+            }
+            let inputs = committed_segment_ids(&index);
+            let input_files = live_segment_files(&index);
+            let output_segment_id = fresh_merge_segment_id(&index, 0x0453_0003);
+            index
+                .concat_merge(&cx, &inputs, output_segment_id, 1_700_000_000)
+                .await
+                .expect("fold both rounds");
+            LexicalWrite::index_document(&index, &cx, &IndexableDocument::new("three", "gamma"))
+                .await
+                .expect("stage retiring document");
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("retiring publication");
+            let (on_disk, receipts) = segment_files_and_receipts(directory.path());
+            assert_eq!(on_disk.len(), 4, "merged output, third round, two inputs");
+            assert_eq!(receipts.len(), 2);
+
+            assert!(
+                index
+                    .collect_garbage(&cx)
+                    .await
+                    .expect("default-window sweep")
+                    .is_empty(),
+                "freshly retired inputs are inside the default window"
+            );
+            let zero = GarbageCollectionOptions {
+                grace_period: Duration::ZERO,
+            };
+            let report = index
+                .collect_garbage_with(&cx, zero)
+                .await
+                .expect("zero-window sweep");
+            let mut removed = report
+                .removed
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            removed.sort();
+            let mut expected_removed = input_files
+                .iter()
+                .flat_map(|file| [file.clone(), format!("{file}.retired")])
+                .collect::<Vec<_>>();
+            expected_removed.sort();
+            assert_eq!(removed, expected_removed);
+            let (on_disk, receipts) = segment_files_and_receipts(directory.path());
+            assert_eq!(on_disk.len(), 2);
+            assert!(receipts.is_empty());
+            assert!(
+                index
+                    .collect_garbage_with(&cx, zero)
+                    .await
+                    .expect("idempotent zero-window sweep")
+                    .is_empty()
+            );
+            drop(index);
+
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("reader opens the swept directory");
+            assert_eq!(
+                LexicalRead::search(&reader, &cx, "alpha OR beta OR gamma", 10)
+                    .await
+                    .expect("search the swept directory")
+                    .len(),
+                3
             );
         });
     }

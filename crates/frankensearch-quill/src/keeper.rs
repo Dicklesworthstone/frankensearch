@@ -5574,10 +5574,31 @@ impl KeeperWriter {
         &mut self,
         cx: &Cx,
     ) -> Result<GarbageCollectionReport, KeeperError> {
+        let options = self.garbage_options;
+        self.collect_garbage_with(cx, options).await
+    }
+
+    /// Run one garbage sweep with an explicit grace window under the held
+    /// writer admission.
+    ///
+    /// The window protects a reader that resolved an older `MANIFEST` and has
+    /// not opened its segments yet. Shorten it only for a directory no reader
+    /// can have resolved, such as a private build directory that has never
+    /// been published. Files either `MANIFEST` slot references are kept at any
+    /// window.
+    ///
+    /// # Errors
+    ///
+    /// Returns before removal on any recovery, identity, metadata, or path
+    /// validation failure.
+    pub async fn collect_garbage_with(
+        &mut self,
+        cx: &Cx,
+        options: GarbageCollectionOptions,
+    ) -> Result<GarbageCollectionReport, KeeperError> {
         let guard = writer_mutation_guard(cx, &self.admission.directory).await?;
         let admission = Arc::clone(&self.admission);
         let schema = self.snapshot.schema();
-        let options = self.garbage_options;
         spawn_blocking(move || {
             let _guard = guard;
             admission.ensure_directory_identity()?;

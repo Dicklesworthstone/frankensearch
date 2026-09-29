@@ -221,6 +221,38 @@ fn validate_retained_catalog_path(value: &str) -> SearchResult<()> {
     })
 }
 
+/// Unlink Quill segments an unpublished candidate no longer references.
+///
+/// A candidate starts as a byte copy of its predecessor, retired merge inputs
+/// included, and the copy restarts each input's grace window, so every
+/// generation used to inherit all earlier dead segments (bd-2op1d). No reader
+/// can resolve a candidate before its publication, so a zero window is safe
+/// here and nowhere else. Call once every candidate writer has closed, before
+/// resources are admitted and the bundle is sealed.
+async fn reclaim_unpublished_lexical_garbage(cx: &Cx, root: &Path) -> SearchResult<()> {
+    retained_search_checkpoint(cx)?;
+    let layout = FsfsRuntime::resolve_lexical_engine(root)?;
+    let (Some(BlueGreenEngine::Quill), Some(engine)) = (layout.engine(), layout.engine_dir())
+    else {
+        return Ok(());
+    };
+    let index = Box::pin(QuillIndex::open(cx, &engine, QuillConfig::default())).await?;
+    let report = Box::pin(index.collect_garbage_with(
+        cx,
+        frankensearch_quill::GarbageCollectionOptions {
+            grace_period: Duration::ZERO,
+        },
+    ))
+    .await?;
+    drop(index);
+    tracing::debug!(
+        engine = %engine.display(),
+        removed = report.removed.len(),
+        "reclaimed unreferenced lexical files before sealing a candidate"
+    );
+    Ok(())
+}
+
 impl FsfsRuntime {
     /// Open a reusable reader that follows complete-generation publication.
     ///
@@ -373,6 +405,7 @@ impl FsfsRuntime {
         let mut candidate = self.clone().with_cli_input(input);
         candidate.config.indexing.watch_mode = false;
         Box::pin(candidate.run_retained_index_with_reuse(cx, &store, build.path())).await?;
+        reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
 
         // An indexing command can return success with deferred semantic rows.
         // Apply the same full-generation admission used by actual search, then
@@ -712,7 +745,7 @@ impl FsfsRuntime {
         candidate.write_index_sentinel(build.path(), &sentinel)?;
         candidate_lease.fence("complete-generation append candidate complete")?;
         drop(candidate_lease);
-        retained_search_checkpoint(cx)?;
+        reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
@@ -927,7 +960,7 @@ impl FsfsRuntime {
         // Drop clears the lease's owner record. It must precede sealing so no
         // destructor writes through the completed bundle's inventory.
         drop(candidate_lease);
-        retained_search_checkpoint(cx)?;
+        reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
@@ -1014,6 +1047,7 @@ impl FsfsRuntime {
         candidate.write_index_sentinel(build.path(), &sentinel)?;
         candidate_lease.fence("complete-generation compact candidate complete")?;
         drop(candidate_lease);
+        reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
@@ -2569,6 +2603,71 @@ mod retained_search_tests {
                 .expect("rebuild"),
             GenerationPublication::Durable(_)
         ));
+    }
+
+    /// Each successor starts as a copy of its predecessor. Merge inputs that
+    /// a predecessor retired must not ride along into every later generation
+    /// (bd-2op1d: 5 edits grew a 111 MB store to 1.69 GB).
+    #[test]
+    fn successive_rebuilds_do_not_inherit_retired_lexical_segments() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            for round in 0..4 {
+                fs::write(
+                    source.join("alpha.md"),
+                    format!("sharedtoken alpha revision {round}"),
+                )
+                .expect("edit source");
+                fs::write(
+                    source.join(format!("round-{round}.md")),
+                    format!("sharedtoken round {round} document"),
+                )
+                .expect("add source");
+                publish(&runtime, &cx, &root).await;
+            }
+            let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+            let generation = store.active(&cx).expect("active").expect("published");
+            let engine = FsfsRuntime::resolve_lexical_engine(generation.path())
+                .expect("lexical layout")
+                .engine_dir()
+                .expect("Quill engine");
+            let names = fs::read_dir(&engine)
+                .expect("engine directory")
+                .map(|entry| {
+                    entry
+                        .expect("engine entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !names.iter().any(|name| name.ends_with(".retired")),
+                "{names:?}"
+            );
+            let live = KeeperSnapshot::open(&engine, DEFAULT_SCHEMA)
+                .expect("snapshot")
+                .segment_stats()
+                .expect("segment stats")
+                .sealed_segments;
+            let segments = names
+                .iter()
+                .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "fslx"))
+                .count();
+            // MANIFEST.prev may still name one merge's inputs; nothing older.
+            assert!(segments <= live + 2, "{live} live, {names:?}");
+            let mut reader = runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .expect("reader");
+            let phases = reader
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("search");
+            assert_eq!(phases.last().expect("phase").hits.len(), 5);
+        });
     }
 
     #[test]

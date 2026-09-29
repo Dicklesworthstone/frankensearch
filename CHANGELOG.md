@@ -243,6 +243,23 @@ These changes are **not included in the published 0.6.1 crate family**.
 The combined-source quality gate and rebuilt platform artifacts are still being
 qualified; individual results below are narrower than release acceptance.
 
+- **Complete-generation stores no longer make each generation bigger than
+  the last.** Every new generation (`FSFS_COMPLETE_GENERATIONS=1`: each
+  `fsfs watch` publication, `index`, `append-batch`, `delete` or `compact`)
+  began as a copy of the previous one, including keyword-index segments that
+  earlier merges had already retired. The copy restarted their five-minute
+  cleanup window, so they were never deleted. Five one-line edits under
+  `fsfs watch` on a 579-file Rust tree grew the store from 111 MB to 1.69 GB,
+  and the fifth generation held 20 dead segments beside its one live one.
+  Unreferenced keyword segments are now deleted from a new generation before
+  it is sealed; nothing can read a generation before it is published. The
+  same five edits now end at 565 MB, the first build is 76 MB instead of
+  111 MB, and each generation holds only its live segment. Old generations
+  are still never deleted, so the store still grows by one generation per
+  publication, about 80 MB on that tree (bd-2op1d). **Library users:**
+  `QuillIndex::collect_garbage_with` and `KeeperWriter::collect_garbage_with`
+  take an explicit grace window.
+
 - **`pressure.degradation_override` does what its stage promises for
   search.** It was parsed and only logged. Now `force_lexical_only` runs
   every search lexical-only (CLI, `--stream`, `--expand`, the query daemon,
