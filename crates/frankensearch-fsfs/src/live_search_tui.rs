@@ -86,7 +86,11 @@ impl Options {
                 "--index-dir" => root = Some(PathBuf::from(value)),
                 "--config" => config = Some(PathBuf::from(value)),
                 "--query" => {
-                    query = Some(value.into_string().map_err(|_| invalid("query must be UTF-8"))?);
+                    query = Some(
+                        value
+                            .into_string()
+                            .map_err(|_| invalid("query must be UTF-8"))?,
+                    );
                 }
                 "--limit" => {
                     limit = value
@@ -119,6 +123,13 @@ fn invalid(reason: &str) -> SearchError {
         value: String::new(),
         reason: reason.to_owned(),
     }
+}
+
+// A hybrid frame's item is its metadata value. `Some` itself does not fit the
+// higher-ranked `Fn(&T) -> Option<&Value>` bound; a named fn does.
+#[allow(clippy::unnecessary_wraps)]
+fn value_metadata(value: &Value) -> Option<&Value> {
+    Some(value)
 }
 
 fn validate_query(query: &str) -> SearchResult<()> {
@@ -206,14 +217,19 @@ impl View {
     ) -> SearchResult<()> {
         if frame.schema_version != LIVE_SEARCH_SCHEMA_VERSION
             || frame.query != self.query
-            || frame.sequence != self.sequence.checked_add(1)
-                .ok_or_else(|| invalid("sequence exhausted"))?
+            || frame.sequence
+                != self
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("sequence exhausted"))?
             || frame.previous_generation != self.generation
             || frame.generation.is_empty()
             || self.generation.as_deref() == Some(frame.generation.as_str())
             || frame.result_count > self.limit
         {
-            return Err(invalid("live result revision does not extend the visible query"));
+            return Err(invalid(
+                "live result revision does not extend the visible query",
+            ));
         }
         let selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
         let row = |hit: &frankensearch_fsfs::adapters::live_search::RankedLiveSearchHit<T>| -> SearchResult<Row> {
@@ -244,8 +260,12 @@ impl View {
         };
         let mut rows: BTreeMap<String, Row> = match &frame.event {
             LiveSearchEvent::Snapshot { .. } if self.sequence == 0 => BTreeMap::new(),
-            LiveSearchEvent::Delta { .. } if self.sequence != 0 => self.rows
-                .iter().cloned().map(|row| (row.id.clone(), row)).collect(),
+            LiveSearchEvent::Delta { .. } if self.sequence != 0 => self
+                .rows
+                .iter()
+                .cloned()
+                .map(|row| (row.id.clone(), row))
+                .collect(),
             _ => return Err(invalid("expected one initial snapshot followed by deltas")),
         };
         let mut changed = BTreeSet::new();
@@ -281,14 +301,24 @@ impl View {
                                 return Err(invalid("added identity already exists"));
                             }
                         }
-                        LiveSearchChange::Removed { doc_id, previous_rank } => {
-                            if rows.remove(doc_id).is_none_or(|row| row.rank != *previous_rank) {
+                        LiveSearchChange::Removed {
+                            doc_id,
+                            previous_rank,
+                        } => {
+                            if rows
+                                .remove(doc_id)
+                                .is_none_or(|row| row.rank != *previous_rank)
+                            {
                                 return Err(invalid("removal does not match the visible baseline"));
                             }
                         }
-                        LiveSearchChange::Updated { result, previous_rank } => {
+                        LiveSearchChange::Updated {
+                            result,
+                            previous_rank,
+                        } => {
                             let hit = row(result)?;
-                            if rows.insert(hit.id.clone(), hit)
+                            if rows
+                                .insert(hit.id.clone(), hit)
                                 .is_none_or(|old| old.rank != *previous_rank)
                             {
                                 return Err(invalid("update does not match the visible baseline"));
@@ -301,11 +331,15 @@ impl View {
         let mut rows = rows.into_values().collect::<Vec<_>>();
         rows.sort_by_key(|row| row.rank);
         if rows.len() != frame.result_count
-            || rows.iter().enumerate().any(|(offset, row)| row.rank != offset as u64 + 1)
+            || rows
+                .iter()
+                .enumerate()
+                .any(|(offset, row)| row.rank != offset as u64 + 1)
         {
             return Err(invalid("live result ranks or count are inconsistent"));
         }
-        self.selected = selected_id.as_ref()
+        self.selected = selected_id
+            .as_ref()
             .and_then(|id| rows.iter().position(|row| &row.id == id))
             .unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
         self.rows = rows;
@@ -316,43 +350,74 @@ impl View {
 
     fn hybrid(&mut self, frame: &RetainedLiveSearchFrame) -> SearchResult<()> {
         if let Some(update) = &frame.update {
-            self.update(update, Some)?;
+            self.update(update, value_metadata)?;
         }
-        let semantic = frame.annotations.get("semantic_admitted")
-            .and_then(Value::as_bool).unwrap_or(false);
-        let reason = frame.annotations.get("skip_reason").and_then(Value::as_str).unwrap_or("");
+        let semantic = frame
+            .annotations
+            .get("semantic_admitted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let reason = frame
+            .annotations
+            .get("skip_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         self.status = format!(
-            "{} | semantic admitted: {semantic} | {}", frame.phase, literal(reason, 256)
+            "{} | semantic admitted: {semantic} | {}",
+            frame.phase,
+            literal(reason, 256)
         );
         Ok(())
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn event(&mut self, event: Event) -> Action {
         if let Event::Paste(paste) = &event {
             if let Some(draft) = self.draft.as_mut() {
                 for ch in paste.text.chars() {
                     let ch = if ch.is_whitespace() { ' ' } else { ch };
-                    if ch.is_control() { continue; }
-                    if draft.len().saturating_add(ch.len_utf8()) > MAX_QUERY_BYTES { break; }
+                    if ch.is_control() {
+                        continue;
+                    }
+                    if draft.len().saturating_add(ch.len_utf8()) > MAX_QUERY_BYTES {
+                        break;
+                    }
                     draft.push(ch);
                 }
             }
             return Action::Continue;
         }
-        let Event::Key(key) = event else { return Action::Continue };
-        if key.kind == KeyEventKind::Release { return Action::Continue; }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL) { return Action::Cancel; }
+        let Event::Key(key) = event else {
+            return Action::Continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            return Action::Continue;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL) {
+            return Action::Cancel;
+        }
         if let Some(draft) = self.draft.as_mut() {
             match key.code {
                 KeyCode::Escape => self.draft = None,
                 KeyCode::Enter => {
-                    if validate_query(draft).is_ok() { return Action::Query(draft.clone()); }
-                    self.status = "Query must be nonblank and at most 64 KiB".to_owned();
+                    if validate_query(draft).is_ok() {
+                        return Action::Query(draft.clone());
+                    }
+                    "Query must be nonblank and at most 64 KiB".clone_into(&mut self.status);
                 }
-                KeyCode::Backspace => { draft.pop(); }
+                KeyCode::Backspace => {
+                    draft.pop();
+                }
                 KeyCode::Char('u') if key.modifiers.contains(Modifiers::CTRL) => draft.clear(),
-                KeyCode::Char(ch) if !ch.is_control() && !key.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-                    && draft.len().saturating_add(ch.len_utf8()) <= MAX_QUERY_BYTES => { draft.push(ch); }
+                KeyCode::Char(ch)
+                    if !ch.is_control()
+                        && !key
+                            .modifiers
+                            .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+                        && draft.len().saturating_add(ch.len_utf8()) <= MAX_QUERY_BYTES =>
+                {
+                    draft.push(ch);
+                }
                 _ => {}
             }
             return Action::Continue;
@@ -379,7 +444,10 @@ trait Screen: Send {
     fn event(&mut self) -> SearchResult<Option<Event>>;
 }
 
-struct Ui<S> { screen: S, view: View }
+struct Ui<S> {
+    screen: S,
+    view: View,
+}
 
 impl<S: Screen> Ui<S> {
     fn draw(&mut self) -> SearchResult<()> {
@@ -389,10 +457,14 @@ impl<S: Screen> Ui<S> {
     fn input(&mut self) -> SearchResult<Action> {
         // Bound each drain so sustained keyboard input cannot starve search.
         for _ in 0..32 {
-            let Some(event) = self.screen.event().map_err(terminal_error)? else { break };
+            let Some(event) = self.screen.event().map_err(terminal_error)? else {
+                break;
+            };
             let action = self.view.event(event);
             self.draw()?;
-            if action != Action::Continue { return Ok(action); }
+            if action != Action::Continue {
+                return Ok(action);
+            }
         }
         Ok(Action::Continue)
     }
@@ -406,7 +478,8 @@ fn terminal_error(source: SearchError) -> SearchError {
 }
 
 fn lock<S>(ui: &Mutex<Ui<S>>) -> SearchResult<MutexGuard<'_, Ui<S>>> {
-    ui.lock().map_err(|_| invalid("terminal state was poisoned"))
+    ui.lock()
+        .map_err(|_| invalid("terminal state was poisoned"))
 }
 
 enum Session {
@@ -415,16 +488,41 @@ enum Session {
 }
 
 impl Session {
-    fn new(store: CompleteGenerationStore, options: &Options, query: &str, runtime: Option<FsfsRuntime>) -> SearchResult<Self> {
-        let limits = LiveSearchConfig { max_results: options.limit, min_score_delta: 0.0 };
+    fn new(
+        store: CompleteGenerationStore,
+        options: &Options,
+        query: &str,
+        runtime: Option<FsfsRuntime>,
+    ) -> SearchResult<Self> {
+        let limits = LiveSearchConfig {
+            max_results: options.limit,
+            min_score_delta: 0.0,
+        };
         match (options.hybrid, runtime) {
-            (false, None) => Ok(Self::Lexical(Box::new(QuillLiveSearchSession::new(store, query, limits, LiveSearchRefreshConfig::default(), QuillConfig::default())?))),
-            (true, Some(runtime)) => Ok(Self::Hybrid(Box::new(RetainedLiveSearchSession::new(runtime, store, query, limits, LiveSearchRefreshConfig::default())?))),
+            (false, None) => Ok(Self::Lexical(Box::new(QuillLiveSearchSession::new(
+                store,
+                query,
+                limits,
+                LiveSearchRefreshConfig::default(),
+                QuillConfig::default(),
+            )?))),
+            (true, Some(runtime)) => Ok(Self::Hybrid(Box::new(RetainedLiveSearchSession::new(
+                runtime,
+                store,
+                query,
+                limits,
+                LiveSearchRefreshConfig::default(),
+            )?))),
             _ => Err(invalid("query mode and runtime disagree")),
         }
     }
 
-    async fn poll<S: Screen>(&mut self, cx: &Cx, now: Instant, ui: &Mutex<Ui<S>>) -> SearchResult<()> {
+    async fn poll<S: Screen>(
+        &mut self,
+        cx: &Cx,
+        now: Instant,
+        ui: &Mutex<Ui<S>>,
+    ) -> SearchResult<()> {
         match self {
             Self::Lexical(session) => {
                 if let Some(frame) = session.poll(cx, now).await? {
@@ -452,31 +550,49 @@ impl Session {
 // Own and drop the query future BEFORE returning a new-query/quit action.
 // No old sink can run after the caller resets the visible query and subscription.
 async fn responsive<S: Screen, F: std::future::Future<Output = SearchResult<()>> + Send>(
-    cx: &Cx, ui: &Mutex<Ui<S>>, work: F,
+    cx: &Cx,
+    ui: &Mutex<Ui<S>>,
+    work: F,
 ) -> SearchResult<Option<Action>> {
     let mut work = std::pin::pin!(work);
     loop {
         checkpoint(cx)?;
         let action = lock(ui)?.input()?;
-        if action != Action::Continue { return Ok(Some(action)); }
+        if action != Action::Continue {
+            return Ok(Some(action));
+        }
         let mut tick = std::pin::pin!(asupersync::time::sleep(cx.now(), INPUT_TICK));
         let completed = std::future::poll_fn(|task_cx| {
-            if let std::task::Poll::Ready(result) = std::future::Future::poll(work.as_mut(), task_cx) {
+            if let std::task::Poll::Ready(result) =
+                std::future::Future::poll(work.as_mut(), task_cx)
+            {
                 return std::task::Poll::Ready(Some(result));
             }
             if std::future::Future::poll(tick.as_mut(), task_cx).is_ready() {
                 return std::task::Poll::Ready(None);
             }
             std::task::Poll::Pending
-        }).await;
-        if let Some(result) = completed { result?; return Ok(None); }
+        })
+        .await;
+        if let Some(result) = completed {
+            result?;
+            return Ok(None);
+        }
     }
 }
 
-async fn execute<S: Screen>(cx: &Cx, options: &Options, runtime: Option<FsfsRuntime>, screen: S) -> SearchResult<()> {
+async fn execute<S: Screen>(
+    cx: &Cx,
+    options: &Options,
+    runtime: Option<FsfsRuntime>,
+    screen: S,
+) -> SearchResult<()> {
     checkpoint(cx)?;
     let store = CompleteGenerationStore::open(cx, &options.root)?;
-    let ui = Mutex::new(Ui { screen, view: View::new(options.query.clone(), options.limit) });
+    let ui = Mutex::new(Ui {
+        screen,
+        view: View::new(options.query.clone(), options.limit),
+    });
     lock(&ui)?.draw()?;
     let mut session = Session::new(store.clone(), options, &options.query, runtime.clone())?;
     let mut failed = false;
@@ -488,33 +604,47 @@ async fn execute<S: Screen>(cx: &Cx, options: &Options, runtime: Option<FsfsRunt
                 session.poll(cx, Instant::now(), &ui).await?;
                 asupersync::time::sleep(cx.now(), Duration::from_millis(100)).await;
                 Ok(())
-            }).await
+            })
+            .await
         };
         let action = match outcome {
             Ok(action) => action,
             Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-            Err(error @ SearchError::SubsystemError {
-                subsystem: "fsfs.live_search.tui.terminal", ..
-            }) => return Err(error),
+            Err(
+                error @ SearchError::SubsystemError {
+                    subsystem: "fsfs.live_search.tui.terminal",
+                    ..
+                },
+            ) => return Err(error),
             Err(error) => {
                 // No implicit retry or stale-result fallback. The last window
                 // remains explicitly stale; only r or a new query tries again.
                 let mut ui = lock(&ui)?;
-                ui.view.status = format!("STALE / query stopped: {} | r retries", literal(&error.to_string(), 512));
+                ui.view.status = format!(
+                    "STALE / query stopped: {} | r retries",
+                    literal(&error.to_string(), 512)
+                );
                 ui.draw()?;
+                drop(ui);
                 failed = true;
                 continue;
             }
         };
         match action {
             Some(Action::Quit) => return Ok(()),
-            Some(Action::Cancel) => return Err(SearchError::Cancelled { phase: "fsfs.live_search.tui".to_owned(), reason: "Ctrl-C".to_owned() }),
+            Some(Action::Cancel) => {
+                return Err(SearchError::Cancelled {
+                    phase: "fsfs.live_search.tui".to_owned(),
+                    reason: "Ctrl-C".to_owned(),
+                });
+            }
             Some(Action::Query(query)) => {
                 validate_query(&query)?;
                 session = Session::new(store.clone(), options, &query, runtime.clone())?;
                 let mut ui = lock(&ui)?;
                 ui.view = View::new(query, options.limit);
                 ui.draw()?;
+                drop(ui);
                 failed = false;
             }
             _ => {}
@@ -523,15 +653,21 @@ async fn execute<S: Screen>(cx: &Cx, options: &Options, runtime: Option<FsfsRunt
 }
 
 fn configured_runtime(options: &Options) -> SearchResult<Option<FsfsRuntime>> {
-    if !options.hybrid { return Ok(None); }
-    use frankensearch_fsfs::{CliCommand, CliInput, CliOverrides, OutputFormat,
-        current_unicode_environment, default_project_config_file_path, default_user_config_file_path,
-        load_from_layered_sources, load_from_sources};
+    if !options.hybrid {
+        return Ok(None);
+    }
+    use frankensearch_fsfs::{
+        CliCommand, CliInput, CliOverrides, OutputFormat, current_unicode_environment,
+        default_project_config_file_path, default_user_config_file_path, load_from_layered_sources,
+        load_from_sources,
+    };
     let home = frankensearch_core::platform_dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let env = current_unicode_environment();
     let overrides = CliOverrides::default();
     let loaded = if let Some(path) = &options.config {
-        if !std::fs::metadata(path)?.is_file() { return Err(invalid("--config must name a regular file")); }
+        if !std::fs::metadata(path)?.is_file() {
+            return Err(invalid("--config must name a regular file"));
+        }
         load_from_sources(Some(path), &env, &overrides, &home)?
     } else {
         let project = default_project_config_file_path(&std::env::current_dir()?);
@@ -542,77 +678,139 @@ fn configured_runtime(options: &Options) -> SearchResult<Option<FsfsRuntime>> {
     config.indexing.offline = true;
     config.indexing.watch_mode = false;
     Ok(Some(FsfsRuntime::new(config).with_cli_input(CliInput {
-        command: CliCommand::Search, index_dir: Some(options.root.clone()),
-        quiet: true, no_color: true, format: OutputFormat::Jsonl, ..CliInput::default()
+        command: CliCommand::Search,
+        index_dir: Some(options.root.clone()),
+        quiet: true,
+        no_color: true,
+        format: OutputFormat::Jsonl,
+        ..CliInput::default()
     })))
 }
 
 #[cfg(unix)]
 mod terminal {
+    use super::{Duration, Event, Screen, SearchResult, View, literal};
     use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
     use ftui_core::geometry::Rect;
+    use ftui_render::grapheme_pool::GraphemePool;
     use ftui_render::{buffer::Buffer, diff::BufferDiff, frame::Frame};
     use ftui_text::{Line, Text};
     use ftui_tty::{TtyBackend, TtySessionOptions};
     use ftui_widgets::{Widget, paragraph::Paragraph};
-    use super::*;
 
     pub(super) struct Terminal {
         backend: TtyBackend,
+        // ftui-tty 0.7 exposes no presenter pool and presents without one, so
+        // the terminal owns its frames' pool, as the fsfs dashboard does.
+        grapheme_pool: GraphemePool,
         previous: Option<(u16, u16, Buffer)>,
     }
 
     impl Terminal {
         pub(super) fn open() -> SearchResult<Self> {
-            let backend = TtyBackend::open(80, 24, TtySessionOptions {
-                alternate_screen: true, intercept_signals: false,
-                features: BackendFeatures { bracketed_paste: true, ..BackendFeatures::default() },
-            })?;
-            Ok(Self { backend, previous: None })
+            let backend = TtyBackend::open(
+                80,
+                24,
+                TtySessionOptions {
+                    alternate_screen: true,
+                    intercept_signals: false,
+                    features: BackendFeatures {
+                        bracketed_paste: true,
+                        ..BackendFeatures::default()
+                    },
+                },
+            )?;
+            Ok(Self {
+                backend,
+                grapheme_pool: GraphemePool::new(),
+                previous: None,
+            })
         }
     }
 
     impl Screen for Terminal {
         fn event(&mut self) -> SearchResult<Option<Event>> {
-            if !self.backend.poll_event(Duration::ZERO)? { return Ok(None); }
+            if !self.backend.poll_event(Duration::ZERO)? {
+                return Ok(None);
+            }
             Ok(self.backend.read_event()?)
         }
 
         fn draw(&mut self, view: &View) -> SearchResult<()> {
             let (width, height) = self.backend.size()?;
             let (width, height) = (width.min(512), height.min(256));
-            if width == 0 || height == 0 { return Ok(()); }
-            // Grapheme IDs in the buffer must come from the presenter's own
-            // pool; a separate pool corrupts combining and wide Unicode text.
+            if width == 0 || height == 0 {
+                return Ok(());
+            }
             let buffer = {
-            let mut frame = Frame::new(width, height, self.backend.presenter().pool_mut());
-            let query = view.draft.as_deref().unwrap_or(&view.query);
-            let heading = if view.draft.is_some() { "EDIT QUERY (Enter submits, Esc cancels)" } else { "fsfs-live | read-only live search" };
-            let generation = view.generation.as_deref().map_or("none", |value| value);
-            let lines = vec![Line::from(heading), Line::from(literal(query, 512)),
-                Line::from(literal(&view.status, 512)),
-                Line::from(format!("{} results | revision {} | {}", view.rows.len(), view.sequence, literal(generation, 80)))];
-            Paragraph::new(Text::from_lines(lines)).render(Rect::new(0, 0, width, height.min(4)), &mut frame);
-            let body_height = height.saturating_sub(7);
-            let first = view.selected.saturating_sub(usize::from(body_height).saturating_sub(1));
-            let rows = view.rows.iter().enumerate().skip(first).take(usize::from(body_height))
-                .map(|(offset, row)| Line::from(format!("{} {:>4}  {:.5}  {}", if offset == view.selected { ">" } else { " " }, row.rank, row.score, row.path)))
-                .collect::<Vec<_>>();
-            if body_height > 0 {
-                Paragraph::new(Text::from_lines(rows)).render(Rect::new(0, 4, width, body_height), &mut frame);
-            }
-            if height >= 3 {
-                let detail = view.rows.get(view.selected).map_or("", |row| row.detail.as_str());
-                Paragraph::new(Text::from_lines(vec![Line::from(detail),
-                    Line::from("Up/Down j/k select | / query | r retry | q/Esc quit | Ctrl-C cancel")]))
+                let mut frame = Frame::new(width, height, &mut self.grapheme_pool);
+                let query = view.draft.as_deref().unwrap_or(&view.query);
+                let heading = if view.draft.is_some() {
+                    "EDIT QUERY (Enter submits, Esc cancels)"
+                } else {
+                    "fsfs-live | read-only live search"
+                };
+                let generation = view.generation.as_deref().map_or("none", |value| value);
+                let lines = vec![
+                    Line::from(heading),
+                    Line::from(literal(query, 512)),
+                    Line::from(literal(&view.status, 512)),
+                    Line::from(format!(
+                        "{} results | revision {} | {}",
+                        view.rows.len(),
+                        view.sequence,
+                        literal(generation, 80)
+                    )),
+                ];
+                Paragraph::new(Text::from_lines(lines))
+                    .render(Rect::new(0, 0, width, height.min(4)), &mut frame);
+                let body_height = height.saturating_sub(7);
+                let first = view
+                    .selected
+                    .saturating_sub(usize::from(body_height).saturating_sub(1));
+                let rows = view
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(usize::from(body_height))
+                    .map(|(offset, row)| {
+                        Line::from(format!(
+                            "{} {:>4}  {:.5}  {}",
+                            if offset == view.selected { ">" } else { " " },
+                            row.rank,
+                            row.score,
+                            row.path
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                if body_height > 0 {
+                    Paragraph::new(Text::from_lines(rows))
+                        .render(Rect::new(0, 4, width, body_height), &mut frame);
+                }
+                if height >= 3 {
+                    let detail = view
+                        .rows
+                        .get(view.selected)
+                        .map_or("", |row| row.detail.as_str());
+                    Paragraph::new(Text::from_lines(vec![
+                        Line::from(detail),
+                        Line::from(
+                            "Up/Down j/k select | / query | r retry | q/Esc quit | Ctrl-C cancel",
+                        ),
+                    ]))
                     .render(Rect::new(0, height - 3, width, 3), &mut frame);
-            }
-            frame.buffer
+                }
+                frame.buffer
             };
-            let diff = self.previous.as_ref()
+            let diff = self
+                .previous
+                .as_ref()
                 .filter(|(old_width, old_height, _)| *old_width == width && *old_height == height)
                 .map(|(_, _, old)| BufferDiff::compute(old, &buffer));
-            self.backend.presenter().present_ui(&buffer, diff.as_ref(), diff.is_none())?;
+            self.backend
+                .presenter()
+                .present_ui(&buffer, diff.as_ref(), diff.is_none())?;
             self.previous = Some((width, height, buffer));
             Ok(())
         }
@@ -622,7 +820,9 @@ mod terminal {
 #[cfg(unix)]
 fn run(options: Options) -> SearchResult<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Err(invalid("fsfs-live requires terminal stdin and stdout; use fsfs live-search for NDJSON"));
+        return Err(invalid(
+            "fsfs-live requires terminal stdin and stdout; use fsfs live-search for NDJSON",
+        ));
     }
     use asupersync::runtime::RuntimeBuilder;
     use frankensearch_fsfs::{ShutdownCoordinator, runtime::SearchBlockingPool};
@@ -630,7 +830,9 @@ fn run(options: Options) -> SearchResult<()> {
     let runtime = configured_runtime(&options)?;
     #[cfg(feature = "rerank")]
     let runtime = runtime.map(|runtime| runtime.with_native_blocking_pool(pool.handle()));
-    let scheduler = RuntimeBuilder::current_thread().blocking_threads(0, 2).build()
+    let scheduler = RuntimeBuilder::current_thread()
+        .blocking_threads(0, 2)
+        .build()
         .map_err(|error| invalid(&error.to_string()))?;
     let shutdown = Arc::new(ShutdownCoordinator::new());
     shutdown.register_signals()?;
@@ -652,7 +854,7 @@ fn run(options: Options) -> SearchResult<()> {
     result
 }
 
-pub(super) fn entry() {
+pub fn entry() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
         let _ = io::stdout().write_all(HELP.as_bytes());
@@ -661,7 +863,11 @@ pub(super) fn entry() {
     let result = Options::parse(args).and_then(run);
     if let Err(error) = result {
         let code = exit_code_for(&error);
-        let _ = writeln!(io::stderr(), "fsfs-live: {}", literal(&error.to_string(), 2_048));
+        let _ = writeln!(
+            io::stderr(),
+            "fsfs-live: {}",
+            literal(&error.to_string(), 2_048)
+        );
         std::process::exit(code);
     }
 }
@@ -684,18 +890,26 @@ mod tests {
 
     fn options(root: &std::path::Path) -> Options {
         Options {
-            root: root.to_path_buf(), query: "alpha".to_owned(), limit: 20,
-            hybrid: false, config: None,
+            root: root.to_path_buf(),
+            query: "alpha".to_owned(),
+            limit: 20,
+            hybrid: false,
+            config: None,
         }
     }
 
-    fn key(code: KeyCode) -> Event { Event::Key(KeyEvent::new(code)) }
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code))
+    }
 
     fn hits(ids: &[&str]) -> Vec<LiveSearchHit<Value>> {
-        ids.iter().map(|id| LiveSearchHit {
-            doc_id: (*id).to_owned(), score: 1.0,
-            item: json!({"path": format!("/{id}.rs"), "snippet": format!("body of {id}")}),
-        }).collect()
+        ids.iter()
+            .map(|id| LiveSearchHit {
+                doc_id: (*id).to_owned(),
+                score: 1.0,
+                item: json!({"path": format!("/{id}.rs"), "snippet": format!("body of {id}")}),
+            })
+            .collect()
     }
 
     fn tracker() -> LiveSearchTracker<Value> {
@@ -706,11 +920,19 @@ mod tests {
     fn selection_follows_identity_across_reordering_and_metadata_updates() {
         let mut tracker = tracker();
         let mut view = View::new("alpha".to_owned(), 20);
-        view.update(&tracker.apply("a", hits(&["one", "two", "three"])).unwrap().unwrap(), Some).unwrap();
+        view.update(
+            &tracker
+                .apply("a", hits(&["one", "two", "three"]))
+                .unwrap()
+                .unwrap(),
+            value_metadata,
+        )
+        .unwrap();
         view.selected = 1;
         let mut next = hits(&["two", "three", "one"]);
         next[0].item["snippet"] = json!("new indexed body");
-        view.update(&tracker.apply("b", next).unwrap().unwrap(), Some).unwrap();
+        view.update(&tracker.apply("b", next).unwrap().unwrap(), value_metadata)
+            .unwrap();
         assert_eq!(view.selected, 0);
         assert_eq!(view.rows[view.selected].id, "two");
         assert_eq!(view.rows[0].detail, "new indexed body");
@@ -720,12 +942,24 @@ mod tests {
     fn removals_and_empty_successors_clamp_selection_without_stale_hits() {
         let mut tracker = tracker();
         let mut view = View::new("alpha".to_owned(), 20);
-        view.update(&tracker.apply("a", hits(&["one", "two"])).unwrap().unwrap(), Some).unwrap();
+        view.update(
+            &tracker.apply("a", hits(&["one", "two"])).unwrap().unwrap(),
+            value_metadata,
+        )
+        .unwrap();
         view.selected = 1;
-        view.update(&tracker.apply("b", hits(&["one"])).unwrap().unwrap(), Some).unwrap();
+        view.update(
+            &tracker.apply("b", hits(&["one"])).unwrap().unwrap(),
+            value_metadata,
+        )
+        .unwrap();
         assert_eq!(view.selected, 0);
         assert_eq!(view.rows.len(), 1);
-        view.update(&tracker.apply("c", hits(&[])).unwrap().unwrap(), Some).unwrap();
+        view.update(
+            &tracker.apply("c", hits(&[])).unwrap().unwrap(),
+            value_metadata,
+        )
+        .unwrap();
         assert!(view.rows.is_empty());
         assert_eq!(view.selected, 0);
         assert_eq!(view.sequence, 3);
@@ -735,7 +969,11 @@ mod tests {
     fn rejected_revisions_leave_the_entire_window_unchanged() {
         let mut tracker = tracker();
         let mut view = View::new("alpha".to_owned(), 20);
-        view.update(&tracker.apply("a", hits(&["one", "two"])).unwrap().unwrap(), Some).unwrap();
+        view.update(
+            &tracker.apply("a", hits(&["one", "two"])).unwrap().unwrap(),
+            value_metadata,
+        )
+        .unwrap();
         let frame = tracker.apply("b", hits(&["two", "one"])).unwrap().unwrap();
         for case in 0..5 {
             let mut bad = frame.clone();
@@ -747,12 +985,12 @@ mod tests {
                 _ => bad.schema_version = "foreign".to_owned(),
             }
             let before = view.clone();
-            assert!(view.update(&bad, Some).is_err());
+            assert!(view.update(&bad, value_metadata).is_err());
             assert_eq!(view, before);
         }
-        view.update(&frame, Some).unwrap();
+        view.update(&frame, value_metadata).unwrap();
         let before = view.clone();
-        assert!(view.update(&frame, Some).is_err());
+        assert!(view.update(&frame, value_metadata).is_err());
         assert_eq!(view, before);
     }
 
@@ -760,12 +998,21 @@ mod tests {
     fn partial_delta_failure_does_not_apply_its_valid_prefix() {
         let mut tracker = tracker();
         let mut view = View::new("alpha".to_owned(), 20);
-        view.update(&tracker.apply("a", hits(&["one", "two"])).unwrap().unwrap(), Some).unwrap();
+        view.update(
+            &tracker.apply("a", hits(&["one", "two"])).unwrap().unwrap(),
+            value_metadata,
+        )
+        .unwrap();
         let mut frame = tracker.apply("b", hits(&[])).unwrap().unwrap();
-        let LiveSearchEvent::Delta { changes } = &mut frame.event else { panic!("expected delta"); };
-        changes.push(LiveSearchChange::Removed { doc_id: "missing".to_owned(), previous_rank: 3 });
+        let LiveSearchEvent::Delta { changes } = &mut frame.event else {
+            panic!("expected delta");
+        };
+        changes.push(LiveSearchChange::Removed {
+            doc_id: "missing".to_owned(),
+            previous_rank: 3,
+        });
         let before = view.clone();
-        assert!(view.update(&frame, Some).is_err());
+        assert!(view.update(&frame, value_metadata).is_err());
         assert_eq!(view, before);
     }
 
@@ -775,10 +1022,16 @@ mod tests {
         let frame = tracker.apply("a", hits(&["one", "two"])).unwrap().unwrap();
         for bad_score in [false, true] {
             let mut frame = frame.clone();
-            let LiveSearchEvent::Snapshot { results } = &mut frame.event else { panic!("expected snapshot"); };
-            if bad_score { results[0].hit.score = f64::NAN; } else { results[0].rank = 2; }
+            let LiveSearchEvent::Snapshot { results } = &mut frame.event else {
+                panic!("expected snapshot");
+            };
+            if bad_score {
+                results[0].hit.score = f64::NAN;
+            } else {
+                results[0].rank = 2;
+            }
             let mut view = View::new("alpha".to_owned(), 20);
-            assert!(view.update(&frame, Some).is_err());
+            assert!(view.update(&frame, value_metadata).is_err());
             assert_eq!(view.sequence, 0);
             assert!(view.rows.is_empty());
         }
@@ -788,13 +1041,20 @@ mod tests {
     fn failed_refinement_preserves_initial_and_reports_actual_admission() {
         let mut tracker = tracker();
         let mut view = View::new("alpha".to_owned(), 20);
-        view.update(&tracker.apply("g:initial", hits(&["one"])).unwrap().unwrap(), Some).unwrap();
+        view.update(
+            &tracker.apply("g:initial", hits(&["one"])).unwrap().unwrap(),
+            value_metadata,
+        )
+        .unwrap();
         let rows = view.rows.clone();
         view.hybrid(&RetainedLiveSearchFrame {
-            generation_id: "g".to_owned(), manifest_sha256: "a".repeat(64),
+            generation_id: "g".to_owned(),
+            manifest_sha256: "a".repeat(64),
             phase: SearchOutputPhase::RefinementFailed,
-            annotations: json!({"semantic_admitted": false, "skip_reason": "quality_timeout"}), update: None,
-        }).unwrap();
+            annotations: json!({"semantic_admitted": false, "skip_reason": "quality_timeout"}),
+            update: None,
+        })
+        .unwrap();
         assert_eq!(view.rows, rows);
         assert_eq!(view.sequence, 1);
         assert!(view.status.contains("quality_timeout"));
@@ -816,10 +1076,18 @@ mod tests {
     fn query_edits_are_explicit_and_escape_retains_the_current_query() {
         let mut view = View::new("alpha".to_owned(), 20);
         view.event(key(KeyCode::Char('/')));
-        view.event(Event::Key(KeyEvent::new(KeyCode::Char('u')).with_modifiers(Modifiers::CTRL)));
+        view.event(Event::Key(
+            KeyEvent::new(KeyCode::Char('u')).with_modifiers(Modifiers::CTRL),
+        ));
         view.event(key(KeyCode::Char('β')));
-        assert_eq!(view.event(key(KeyCode::Enter)), Action::Query("β".to_owned()));
-        assert_eq!(view.query, "alpha", "the driver owns the actual session switch");
+        assert_eq!(
+            view.event(key(KeyCode::Enter)),
+            Action::Query("β".to_owned())
+        );
+        assert_eq!(
+            view.query, "alpha",
+            "the driver owns the actual session switch"
+        );
         assert_eq!(view.event(key(KeyCode::Escape)), Action::Continue);
         assert!(view.draft.is_none());
         assert_eq!(view.query, "alpha");
@@ -834,7 +1102,9 @@ mod tests {
         view.event(key(KeyCode::Char('/')));
         view.event(Event::Paste(PasteEvent::bracketed("\nβ\x1b")));
         assert_eq!(view.draft.as_deref(), Some("alpha β"));
-        view.event(Event::Key(KeyEvent::new(KeyCode::Backspace).with_kind(KeyEventKind::Release)));
+        view.event(Event::Key(
+            KeyEvent::new(KeyCode::Backspace).with_kind(KeyEventKind::Release),
+        ));
         assert_eq!(view.draft.as_deref(), Some("alpha β"));
         view.draft = Some("x".repeat(MAX_QUERY_BYTES - 1));
         view.event(Event::Paste(PasteEvent::bracketed("🌍")));
@@ -843,11 +1113,22 @@ mod tests {
 
     #[test]
     fn arguments_require_explicit_store_and_do_not_authorize_indexing() {
-        let args = |extra: &[&str]| ["--index-dir", "/store", "--query", "alpha"].into_iter()
-            .chain(extra.iter().copied()).map(OsString::from).collect();
+        let args = |extra: &[&str]| {
+            ["--index-dir", "/store", "--query", "alpha"]
+                .into_iter()
+                .chain(extra.iter().copied())
+                .map(OsString::from)
+                .collect()
+        };
         assert!(Options::parse(args(&[])).is_ok());
-        for extra in [vec!["--limit", "0"], vec!["--limit", "1001"], vec!["--watch-source", "/source"],
-            vec!["--config", "/file"], vec!["--hybrid", "--hybrid"], vec!["--query", "beta"]] {
+        for extra in [
+            vec!["--limit", "0"],
+            vec!["--limit", "1001"],
+            vec!["--watch-source", "/source"],
+            vec!["--config", "/file"],
+            vec!["--hybrid", "--hybrid"],
+            vec!["--query", "beta"],
+        ] {
             assert!(Options::parse(args(&extra)).is_err());
         }
         assert!(Options::parse(Vec::new()).is_err());
@@ -871,9 +1152,14 @@ mod tests {
                     self.switched = true;
                     self.events.extend([
                         key(KeyCode::Char('/')),
-                        Event::Key(KeyEvent::new(KeyCode::Char('u')).with_modifiers(Modifiers::CTRL)),
-                        key(KeyCode::Char('b')), key(KeyCode::Char('e')),
-                        key(KeyCode::Char('t')), key(KeyCode::Char('a')), key(KeyCode::Enter),
+                        Event::Key(
+                            KeyEvent::new(KeyCode::Char('u')).with_modifiers(Modifiers::CTRL),
+                        ),
+                        key(KeyCode::Char('b')),
+                        key(KeyCode::Char('e')),
+                        key(KeyCode::Char('t')),
+                        key(KeyCode::Char('a')),
+                        key(KeyCode::Enter),
                     ]);
                 } else if view.query == "beta" && !self.quit_queued {
                     self.quit_queued = true;
@@ -882,18 +1168,34 @@ mod tests {
             }
             Ok(())
         }
-        fn event(&mut self) -> SearchResult<Option<Event>> { Ok(self.events.pop_front()) }
+        fn event(&mut self) -> SearchResult<Option<Event>> {
+            Ok(self.events.pop_front())
+        }
     }
 
-    async fn publish(cx: &Cx, store: &CompleteGenerationStore, docs: &[IndexableDocument]) -> PublishedGeneration {
+    async fn publish(
+        cx: &Cx,
+        store: &CompleteGenerationStore,
+        docs: &[IndexableDocument],
+    ) -> PublishedGeneration {
         let build = store.begin(cx).unwrap();
-        let index = QuillIndex::create(cx, &build.path().join("lexical"), QuillConfig {
-            deterministic_ingest: true, ..QuillConfig::default()
-        }).await.unwrap();
-        LexicalWrite::index_documents(&index, cx, docs).await.unwrap();
+        let index = QuillIndex::create(
+            cx,
+            &build.path().join("lexical"),
+            QuillConfig {
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        LexicalWrite::index_documents(&index, cx, docs)
+            .await
+            .unwrap();
         LexicalWrite::commit(&index, cx).await.unwrap();
         drop(index);
-        let GenerationPublication::Durable(generation) = build.publish(cx, |_, _| Ok(())).unwrap() else {
+        let GenerationPublication::Durable(generation) = build.publish(cx, |_, _| Ok(())).unwrap()
+        else {
             panic!("fixture did not reach durability");
         };
         generation
@@ -905,18 +1207,36 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
             let first = publish(&cx, &store, &[IndexableDocument::new("old", "alpha first")]).await;
-            let ui = Mutex::new(Ui { screen: Capture::default(), view: View::new("alpha".to_owned(), 20) });
-            let mut session = Session::new(store.clone(), &options(root.path()), "alpha", None).unwrap();
+            let ui = Mutex::new(Ui {
+                screen: Capture::default(),
+                view: View::new("alpha".to_owned(), 20),
+            });
+            let mut session =
+                Session::new(store.clone(), &options(root.path()), "alpha", None).unwrap();
             let now = Instant::now();
             session.poll(&cx, now, &ui).await.unwrap();
             assert_eq!(lock(&ui).unwrap().view.rows[0].id, "old");
-            let successor = publish(&cx, &store, &[IndexableDocument::new("new", "alpha second")]).await;
-            session.poll(&cx, now + Duration::from_millis(1), &ui).await.unwrap();
-            session.poll(&cx, now + Duration::from_millis(101), &ui).await.unwrap();
+            let successor = publish(
+                &cx,
+                &store,
+                &[IndexableDocument::new("new", "alpha second")],
+            )
+            .await;
+            session
+                .poll(&cx, now + Duration::from_millis(1), &ui)
+                .await
+                .unwrap();
+            session
+                .poll(&cx, now + Duration::from_millis(101), &ui)
+                .await
+                .unwrap();
             assert_eq!(lock(&ui).unwrap().view.rows[0].id, "new");
             assert_eq!(lock(&ui).unwrap().view.rows.len(), 1);
             assert_eq!(store.active(&cx).unwrap(), Some(successor));
-            assert!(first.path().exists(), "old pinned generation remains intact");
+            assert!(
+                first.path().exists(),
+                "old pinned generation remains intact"
+            );
             drop(store.begin(&cx).unwrap());
         });
     }
@@ -926,18 +1246,36 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let root = tempfile::tempdir().unwrap();
             let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
-            let generation = publish(&cx, &store, &[
-                IndexableDocument::new("a", "alpha only"), IndexableDocument::new("b", "beta only"),
-            ]).await;
-            let capture = Capture { switch_query: true, ..Capture::default() };
+            let generation = publish(
+                &cx,
+                &store,
+                &[
+                    IndexableDocument::new("a", "alpha only"),
+                    IndexableDocument::new("b", "beta only"),
+                ],
+            )
+            .await;
+            let capture = Capture {
+                switch_query: true,
+                ..Capture::default()
+            };
             let views = Arc::clone(&capture.views);
-            execute(&cx, &options(root.path()), None, capture).await.unwrap();
+            execute(&cx, &options(root.path()), None, capture)
+                .await
+                .unwrap();
             let views = views.lock().unwrap();
-            let alpha = views.iter().find(|view| view.query == "alpha" && view.sequence == 1).unwrap();
+            let alpha = views
+                .iter()
+                .find(|view| view.query == "alpha" && view.sequence == 1)
+                .unwrap();
             assert_eq!(alpha.rows[0].id, "a");
-            let beta = views.iter().find(|view| view.query == "beta" && view.sequence == 1).unwrap();
+            let beta = views
+                .iter()
+                .find(|view| view.query == "beta" && view.sequence == 1)
+                .unwrap();
             assert_eq!(beta.rows[0].id, "b");
             assert_eq!(beta.rows.len(), 1);
+            drop(views);
             assert_eq!(store.active(&cx).unwrap(), Some(generation));
         });
     }
@@ -948,21 +1286,31 @@ mod tests {
     }
     impl std::future::Future for PendingQuery {
         type Output = SearchResult<()>;
-        fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
             self.polled.store(true, Ordering::SeqCst);
             std::task::Poll::Pending
         }
     }
     impl Drop for PendingQuery {
-        fn drop(&mut self) { self.dropped.store(true, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
     }
 
     struct QuitAfterPoll(Arc<AtomicBool>);
 
     impl Screen for QuitAfterPoll {
-        fn draw(&mut self, _view: &View) -> SearchResult<()> { Ok(()) }
+        fn draw(&mut self, _view: &View) -> SearchResult<()> {
+            Ok(())
+        }
         fn event(&mut self) -> SearchResult<Option<Event>> {
-            Ok(self.0.load(Ordering::SeqCst).then(|| key(KeyCode::Char('q'))))
+            Ok(self
+                .0
+                .load(Ordering::SeqCst)
+                .then(|| key(KeyCode::Char('q'))))
         }
     }
 
@@ -972,10 +1320,22 @@ mod tests {
             let dropped = Arc::new(AtomicBool::new(false));
             let polled = Arc::new(AtomicBool::new(false));
             let screen = QuitAfterPoll(Arc::clone(&polled));
-            let ui = Mutex::new(Ui { screen, view: View::new("alpha".to_owned(), 20) });
-            let work = PendingQuery { dropped: Arc::clone(&dropped), polled: Arc::clone(&polled) };
-            assert_eq!(responsive(&cx, &ui, work).await.unwrap(), Some(Action::Quit));
-            assert!(polled.load(Ordering::SeqCst), "quit arrived after the query yielded Pending");
+            let ui = Mutex::new(Ui {
+                screen,
+                view: View::new("alpha".to_owned(), 20),
+            });
+            let work = PendingQuery {
+                dropped: Arc::clone(&dropped),
+                polled: Arc::clone(&polled),
+            };
+            assert_eq!(
+                responsive(&cx, &ui, work).await.unwrap(),
+                Some(Action::Quit)
+            );
+            assert!(
+                polled.load(Ordering::SeqCst),
+                "quit arrived after the query yielded Pending"
+            );
             assert!(dropped.load(Ordering::SeqCst));
         });
     }
@@ -984,12 +1344,19 @@ mod tests {
     fn cancellation_drops_a_pending_query_without_any_frame() {
         run_test_with_cx(|cx| async move {
             let dropped = Arc::new(AtomicBool::new(false));
-            let ui = Mutex::new(Ui { screen: Capture::default(), view: View::new("alpha".to_owned(), 20) });
+            let ui = Mutex::new(Ui {
+                screen: Capture::default(),
+                view: View::new("alpha".to_owned(), 20),
+            });
             cx.set_cancel_requested(true);
             let work = PendingQuery {
-                dropped: Arc::clone(&dropped), polled: Arc::new(AtomicBool::new(false)),
+                dropped: Arc::clone(&dropped),
+                polled: Arc::new(AtomicBool::new(false)),
             };
-            assert!(matches!(responsive(&cx, &ui, work).await, Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                responsive(&cx, &ui, work).await,
+                Err(SearchError::Cancelled { .. })
+            ));
             assert!(dropped.load(Ordering::SeqCst));
             assert_eq!(lock(&ui).unwrap().view.sequence, 0);
         });
@@ -998,7 +1365,9 @@ mod tests {
     struct BrokenInput(Arc<std::sync::atomic::AtomicUsize>);
 
     impl Screen for BrokenInput {
-        fn draw(&mut self, _view: &View) -> SearchResult<()> { Ok(()) }
+        fn draw(&mut self, _view: &View) -> SearchResult<()> {
+            Ok(())
+        }
         fn event(&mut self) -> SearchResult<Option<Event>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err(io::Error::from(io::ErrorKind::BrokenPipe).into())
@@ -1011,10 +1380,20 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let _store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let result = execute(&cx, &options(root.path()), None, BrokenInput(Arc::clone(&calls))).await;
-            assert!(matches!(result, Err(SearchError::SubsystemError {
-                subsystem: "fsfs.live_search.tui.terminal", ..
-            })));
+            let result = execute(
+                &cx,
+                &options(root.path()),
+                None,
+                BrokenInput(Arc::clone(&calls)),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(SearchError::SubsystemError {
+                    subsystem: "fsfs.live_search.tui.terminal",
+                    ..
+                })
+            ));
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         });
     }
