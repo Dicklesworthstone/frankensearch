@@ -314,6 +314,13 @@ qualified; individual results below are narrower than release acceptance.
   opens the catalog only then. A session with two edits and one deletion
   went from 11 warning lines to 3 (bd-mjm0g).
 
+- **`fsfs watch` starts 20 times faster.** At startup the watcher re-checks
+  every file. Each file waited twice on the async runtime's 25 ms timer
+  tick, once to read it and once to stat it, so 2,017 unchanged files took
+  92 s and edits made meanwhile waited for it. A batch now reads and stats
+  its files in one blocking-pool call: the same check takes 4.4 s. The tick
+  itself is an issue in the async runtime (bd-0wxjd).
+
 - **`fsfs watch`, `delete` and `append-batch` work on large repositories.**
   They open the keyword index with repair protection, which writes a
   RaptorQ sidecar for every segment. A sidecar encodes a single source block

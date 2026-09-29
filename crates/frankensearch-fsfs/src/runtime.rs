@@ -3002,6 +3002,17 @@ struct StorageBatchContext {
     runner: StorageBackedJobRunner,
 }
 
+/// Bytes and modification time of one watched source, read ahead of its batch.
+struct PrefetchedSource {
+    bytes: std::io::Result<Vec<u8>>,
+    modified_ms: u64,
+}
+
+/// A larger source is read by its own operation instead of being prefetched.
+const WATCH_PREFETCH_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// Bound on the source bytes one batch holds prefetched at once.
+const WATCH_PREFETCH_MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The catalog of one watch batch, opened when an operation first needs it.
 /// A windowed generation writes its vector rows inline and touches the
 /// catalog only to purge a removed file, yet every batch opened it: a SQLite
@@ -3730,6 +3741,56 @@ impl LiveIngestPipeline {
         Ok(())
     }
 
+    /// Read and stat every upserted source of a batch in one blocking-pool hop.
+    ///
+    /// Every hop from this spawned task waited for the runtime's next timer
+    /// tick, about 25 ms (bd-0wxjd), and each source took two: its read and its
+    /// stat. A watch start replays every file, so reconciling 2,000 unchanged
+    /// files took about a minute. The reads still run on the blocking pool,
+    /// never on the executor. A source over the size caps, or one that cannot
+    /// be stat'd, is left to its own operation.
+    async fn prefetch_sources(&self, batch: &[WatchIngestOp]) -> HashMap<String, PrefetchedSource> {
+        let sources = batch
+            .iter()
+            .filter_map(|op| match op {
+                WatchIngestOp::Upsert {
+                    file_key,
+                    ingestion_class,
+                    ..
+                } if *ingestion_class != IngestionClass::Skip => self
+                    .resolve_paths(file_key)
+                    .ok()
+                    .map(|(abs_path, _)| (file_key.clone(), abs_path)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            return HashMap::new();
+        }
+        spawn_blocking(move || {
+            let mut budget = WATCH_PREFETCH_MAX_BATCH_BYTES;
+            let mut prefetched = HashMap::with_capacity(sources.len());
+            for (file_key, abs_path) in sources {
+                let Ok(len) = fs::metadata(&abs_path).map(|metadata| metadata.len()) else {
+                    continue;
+                };
+                if len > WATCH_PREFETCH_MAX_FILE_BYTES || len > budget {
+                    continue;
+                }
+                budget -= len;
+                let bytes = fs::read(&abs_path);
+                let modified_ms = fs::metadata(&abs_path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .map(system_time_to_ms)
+                    .unwrap_or_default();
+                prefetched.insert(file_key, PrefetchedSource { bytes, modified_ms });
+            }
+            prefetched
+        })
+        .await
+    }
+
     #[allow(clippy::future_not_send)]
     async fn apply_upsert_op(
         &self,
@@ -3739,6 +3800,7 @@ impl LiveIngestPipeline {
         ingestion_class: IngestionClass,
         storage: &BatchStorage<'_>,
         recorded_windows_current: bool,
+        prefetched: Option<PrefetchedSource>,
     ) -> frankensearch_core::SearchResult<bool> {
         let (abs_path, rel_key) = self.resolve_paths(file_key)?;
 
@@ -3748,7 +3810,11 @@ impl LiveIngestPipeline {
             return Ok(true);
         }
 
-        let bytes = match async_file_read(&abs_path).await {
+        let (read, modified_ms) = match prefetched {
+            Some(source) => (source.bytes, Some(source.modified_ms)),
+            None => (async_file_read(&abs_path).await, None),
+        };
+        let bytes = match read {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 self.prune_indexes(cx, &rel_key).await?;
@@ -3809,6 +3875,7 @@ impl LiveIngestPipeline {
             &canonical,
             ingestion_class,
             classification_metadata.as_ref(),
+            modified_ms,
         )
         .await;
         let window_text = self.windows.as_ref().map(|_| lexical_text.clone());
@@ -3965,6 +4032,7 @@ impl LiveIngestPipeline {
             &canonical,
             ingestion_class,
             classification_metadata.as_ref(),
+            None,
         )
         .await;
         let window_text = self.windows.as_ref().map(|_| lexical_text.clone());
@@ -4038,6 +4106,7 @@ impl LiveIngestPipeline {
             windows.mark_incomplete()?;
         }
         let storage = BatchStorage::new(self);
+        let mut prefetched = self.prefetch_sources(batch).await;
         let mut count = 0_usize;
 
         for op in batch {
@@ -4056,6 +4125,7 @@ impl LiveIngestPipeline {
                             *ingestion_class,
                             &storage,
                             recorded_windows_current,
+                            prefetched.remove(file_key),
                         )
                         .await?
                     {
@@ -27353,18 +27423,22 @@ async fn watched_document(
     canonical: &str,
     ingestion_class: IngestionClass,
     classification: Option<&FileClassificationDecision>,
+    modified_ms: Option<u64>,
 ) -> IndexableDocument {
     let file_name = abs_path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default()
         .to_owned();
-    let modified_ms = asupersync::fs::metadata(abs_path)
-        .await
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .map(system_time_to_ms)
-        .unwrap_or_default();
+    let modified_ms = match modified_ms {
+        Some(modified_ms) => modified_ms,
+        None => asupersync::fs::metadata(abs_path)
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(system_time_to_ms)
+            .unwrap_or_default(),
+    };
     let doc = IndexableDocument::new(rel_key.to_owned(), canonical.to_owned())
         .with_title(file_name)
         .with_metadata("source_path", abs_path.display().to_string())
