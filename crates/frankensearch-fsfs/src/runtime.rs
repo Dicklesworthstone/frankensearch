@@ -792,6 +792,19 @@ const fn daemon_spawn_suppressed() -> bool {
     false
 }
 
+/// The query daemon closed or reset the connection, as opposed to a local
+/// transport fault.
+#[cfg(unix)]
+fn daemon_hangup(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardSearchStage {
     Idle,
@@ -7835,6 +7848,17 @@ impl FsfsRuntime {
         }
     }
 
+    /// The daemon closed the connection before sending any frame. Callers
+    /// treat this field like an absent daemon and retrieve in process.
+    #[cfg(unix)]
+    fn search_daemon_hung_up(socket_path: &Path, detail: &str) -> SearchError {
+        SearchError::InvalidConfig {
+            field: "cli.daemon_socket".to_owned(),
+            value: socket_path.display().to_string(),
+            reason: format!("query daemon closed the connection before answering ({detail})"),
+        }
+    }
+
     fn search_daemon_checkpoint(cx: &Cx) -> SearchResult<()> {
         cx.checkpoint().map_err(|error| SearchError::Cancelled {
             phase: "daemon.stream".to_owned(),
@@ -8518,19 +8542,49 @@ impl FsfsRuntime {
                         asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                     }
                     Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) if daemon_hangup(&error) => {
+                        return Err(Self::search_daemon_hung_up(
+                            &socket_path,
+                            &error.to_string(),
+                        ));
+                    }
                     Err(error) => return Err(SearchError::Io(error)),
                 }
             }
-            stream.shutdown(Shutdown::Write).map_err(SearchError::Io)?;
+            match stream.shutdown(Shutdown::Write) {
+                Ok(()) => {}
+                Err(error) if daemon_hangup(&error) || error.kind() == ErrorKind::NotConnected => {
+                    return Err(Self::search_daemon_hung_up(&socket_path, &error.to_string()));
+                }
+                Err(error) => return Err(SearchError::Io(error)),
+            }
             let index_root = self.resolve_status_index_root()?;
             let fingerprint = Self::search_index_fingerprint_at_root(&index_root)?;
             let mut reader = BufReader::new(stream);
             let mut state = SearchServeStreamState::default();
             let mut payloads = Vec::with_capacity(2);
             let mut total_bytes = 0_usize;
-            while let Some(bytes) =
-                Self::read_search_serve_frame(cx, &mut reader, started, budget).await?
-            {
+            let mut frames = 0_usize;
+            loop {
+                let bytes = match Self::read_search_serve_frame(cx, &mut reader, started, budget)
+                    .await
+                {
+                    Ok(Some(bytes)) => bytes,
+                    // A daemon that cannot admit the index exits after binding
+                    // its socket, so the client saw "Connection reset by peer".
+                    // Nothing was delivered yet: report it as unavailable, and
+                    // in-process retrieval names the real cause. A clean close
+                    // stays a protocol failure (missing terminal).
+                    Err(SearchError::Io(error)) if frames == 0 && daemon_hangup(&error) => {
+                        return Err(Self::search_daemon_hung_up(
+                            &socket_path,
+                            &error.to_string(),
+                        ));
+                    }
+                    Ok(None) => break,
+                    Err(error) => return Err(error),
+                };
+                frames = frames.saturating_add(1);
                 total_bytes = total_bytes.saturating_add(bytes.len());
                 if total_bytes > FSFS_DAEMON_STREAM_MAX_BYTES {
                     return Err(Self::search_daemon_error(
@@ -29911,6 +29965,54 @@ mod tests {
         resources.generation_fingerprint =
             FsfsRuntime::search_index_fingerprint_at_root(root).unwrap();
         resources
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_that_hangs_up_before_answering_counts_as_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_dir = short_socket_tempdir();
+        let socket_path = socket_dir.path().join("hangup.sock");
+        drop(published_blend_resources(temp.path()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        // A daemon that could not admit the index exits with the request
+        // unread, which resets the connection. The second one reads it and
+        // sends a frame first, after which a hang-up is a real failure.
+        let server = thread::spawn(move || {
+            for frames in [0_usize, 1] {
+                let (mut stream, _) = listener.accept().unwrap();
+                if frames == 0 {
+                    stream.read_exact(&mut [0_u8; 1]).unwrap();
+                    continue;
+                }
+                let mut request = Vec::new();
+                let _ = stream.read_to_end(&mut request);
+                let _ = stream.write_all(b"{\"not\":\"a frame\"}\n");
+            }
+        });
+        let client = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            index_dir: Some(temp.path().to_path_buf()),
+            daemon: true,
+            daemon_socket: Some(socket_path),
+            format: OutputFormat::Jsonl,
+            ..CliInput::default()
+        });
+        let unavailable = |error: &SearchError| {
+            matches!(error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket")
+        };
+        run_on_runtime_task(move |cx| async move {
+            let silent = client
+                .search_payloads_via_daemon(&cx, "hangup query", 10)
+                .await
+                .unwrap_err();
+            assert!(unavailable(&silent), "{silent:?}");
+            let answered = client
+                .search_payloads_via_daemon(&cx, "hangup query", 10)
+                .await
+                .unwrap_err();
+            assert!(!unavailable(&answered), "{answered:?}");
+        });
+        server.join().unwrap();
     }
 
     #[cfg(unix)]

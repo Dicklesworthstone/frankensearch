@@ -285,6 +285,16 @@ qualified; individual results below are narrower than release acceptance.
   `QuillIndex::collect_garbage_with` and `KeeperWriter::collect_garbage_with`
   take an explicit grace window.
 
+- **`fsfs search` during `fsfs watch` names the real problem.** A running
+  watch holds the index's vector files, so a query daemon started by
+  `fsfs search` could not open the index and exited, and the search failed
+  with "I/O error: Connection reset by peer ... Check file permissions and
+  disk space". Only `--no-daemon` showed the actual message: a running
+  `fsfs watch` holds the files until it exits. A daemon that hangs up before
+  answering now counts as unavailable, so the search reports that message
+  (bd-dtl40). Searching while the default layout is being watched still
+  fails.
+
 - **`fsfs search` works on a complete-generation store with no query
   daemon.** On Unix a plain `fsfs search` uses the daemon transport by
   default. The legacy layout falls back to searching in process when no
