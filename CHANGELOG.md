@@ -259,6 +259,15 @@ qualified; individual results below are narrower than release acceptance.
   91 MB, each edit adding one small segment. Watched files keep the same
   keyword metadata as indexed ones (bd-78o0n).
 
+- **A running `fsfs watch` reclaims retired keyword segments.** The keyword
+  engine deletes segments that merges retired only when a writer opens, and
+  only once they are five minutes old; `fsfs watch` keeps one writer open,
+  so the cold build's retired inputs (about half of a fresh index) and every
+  later merge's inputs stayed on disk until the watch restarted. The watcher
+  now sweeps segments past that window after each committed batch
+  (bd-ipfih). An index that is built once and then only searched still keeps
+  them until the next `fsfs index`.
+
 - **Complete-generation stores no longer make each generation bigger than
   the last.** Every new generation (`FSFS_COMPLETE_GENERATIONS=1`: each
   `fsfs watch` publication, `index`, `append-batch`, `delete` or `compact`)

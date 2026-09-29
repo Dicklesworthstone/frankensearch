@@ -2865,6 +2865,9 @@ struct LiveIngestPipeline {
     storage_db_path: Option<PathBuf>,
     /// Present when the watched generation was built with fast windows.
     windows: Option<LiveWindowMembership>,
+    /// How long a retired lexical file must age before the post-batch sweep
+    /// may unlink it: Quill's reader grace window.
+    lexical_garbage_grace: Duration,
 }
 
 /// The membership a generation built with fast windows must keep exact for
@@ -3131,6 +3134,7 @@ impl LiveIngestPipeline {
             canonicalizer: DefaultCanonicalizer::default(),
             storage_db_path: None,
             windows: None,
+            lexical_garbage_grace: frankensearch_quill::DEFAULT_GARBAGE_GRACE,
         }
     }
 
@@ -3989,6 +3993,23 @@ impl LiveIngestPipeline {
                 reindexed = count,
                 "watcher ingest batch committed"
             );
+            // A long-lived writer sweeps only at open, so merge inputs retired
+            // by the build or earlier batches stayed on disk for the whole
+            // session. Reclaim the aged ones; a failed sweep retries next batch.
+            let options = frankensearch_quill::GarbageCollectionOptions {
+                grace_period: self.lexical_garbage_grace,
+            };
+            match self.lexical_index.collect_garbage_with(cx, options).await {
+                Ok(report) if !report.removed.is_empty() => debug!(
+                    removed = report.removed.len(),
+                    "watcher reclaimed retired lexical files"
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(
+                    error = %error,
+                    "watcher lexical garbage sweep failed; retrying after the next batch"
+                ),
+            }
         }
         // The window rows and the lexical commit agree now; republish the
         // membership that makes the generation complete again.
@@ -44409,6 +44430,96 @@ mod tests {
                     .expect("sentinel")
                     .generation_complete
             );
+        });
+    }
+
+    #[test]
+    fn legacy_watch_batches_reclaim_aged_retired_lexical_files() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).expect("create source root");
+            for name in ["alpha.md", "beta.md", "gamma.md"] {
+                fs::write(project.join(name), format!("{name} capybara notes\n")).expect("write");
+            }
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index");
+            let index_root = project.join(".frankensearch");
+            let (mut pipeline, _) = FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Watch,
+                    target_path: Some(project.clone()),
+                    index_dir: Some(index_root.clone()),
+                    watch: true,
+                    ..CliInput::default()
+                })
+                .build_live_ingest_pipeline(&cx)
+                .await
+                .expect("watch pipeline");
+            let engine = FsfsRuntime::resolve_lexical_engine(&index_root)
+                .expect("lexical layout")
+                .engine_dir()
+                .expect("Quill engine");
+            let retired = || {
+                fs::read_dir(&engine)
+                    .expect("engine directory")
+                    .filter(|entry| {
+                        Path::new(&entry.as_ref().expect("entry").file_name())
+                            .extension()
+                            .is_some_and(|extension| extension == "retired")
+                    })
+                    .count()
+            };
+            let edit = |round: usize| {
+                fs::write(
+                    project.join("alpha.md"),
+                    format!("alpha capybara revision {round}\n"),
+                )
+                .expect("edit alpha");
+                [WatchIngestOp::Upsert {
+                    file_key: project.join("alpha.md").display().to_string(),
+                    revision: i64::try_from(40 + round).expect("revision"),
+                    ingestion_class: IngestionClass::FullSemanticLexical,
+                }]
+            };
+            // Tier merges start after a handful of single-file segments.
+            for round in 0..40 {
+                pipeline.apply_batch(&cx, &edit(round)).await.expect("edit batch");
+                if retired() > 0 {
+                    break;
+                }
+            }
+            // Inside Quill's reader grace window nothing retired is unlinked.
+            assert!(retired() > 0, "the edits must retire merged inputs");
+            pipeline.apply_batch(&cx, &edit(39)).await.expect("edit batch");
+            assert!(retired() > 0, "the default window keeps fresh retirements");
+
+            pipeline.lexical_garbage_grace = Duration::ZERO;
+            pipeline.apply_batch(&cx, &edit(40)).await.expect("edit batch");
+            assert_eq!(retired(), 0, "aged retired files are reclaimed after a batch");
+            drop(pipeline);
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(index_root),
+                ..CliInput::default()
+            });
+            let resources = runtime
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::LexicalOnly)
+                .await
+                .expect("open swept index");
+            let lexical = resources.lexical_index.as_ref().expect("lexical index");
+            let found = FsfsRuntime::gather_lexical_candidates(&cx, lexical, "revision", 10, None, 10)
+                .expect("lexical candidates");
+            assert_eq!(found.len(), 1);
         });
     }
 
