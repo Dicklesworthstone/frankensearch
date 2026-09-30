@@ -1,7 +1,8 @@
 //! Federated search across multiple independent [`TwoTierSearcher`] instances.
 //!
 //! A single query fans out to multiple indices, then gathered results are fused
-//! into one ranked list.
+//! into one ranked list. Fusion accumulates contributions in index-name order,
+//! not response order, so scheduling cannot change scores for the same replies.
 
 use std::future::Future;
 use std::future::poll_fn;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use asupersync::Cx;
 use asupersync::time::timeout;
 use frankensearch_core::{ScoreSource, ScoredResult, SearchError, SearchResult};
@@ -216,6 +217,9 @@ impl FederatedSearcher {
     /// Add an index by name with a fusion weight.
     ///
     /// `weight <= 0.0` effectively disables score contribution from this index.
+    /// Names must be unique among dispatched indices: they identify coverage,
+    /// fusion membership and the primary source. Search rejects duplicates
+    /// before starting any shard work.
     #[must_use]
     pub fn add_index(
         mut self,
@@ -243,6 +247,21 @@ impl FederatedSearcher {
         self.indices.is_empty()
     }
 
+    fn validate_shard_names(&self) -> SearchResult<()> {
+        let mut names = AHashSet::with_capacity(self.indices.len().min(self.config.max_indices));
+        for index in self.indices.iter().take(self.config.max_indices) {
+            if !names.insert(index.name.as_str()) {
+                return Err(SearchError::InvalidConfig {
+                    field: "federated.indices".to_owned(),
+                    value: "duplicate_name".to_owned(),
+                    reason: "dispatched index names must be unique for unambiguous fusion and coverage"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Execute federated search and return globally fused results along with
     /// the per-shard coverage record for this query.
     ///
@@ -250,8 +269,13 @@ impl FederatedSearcher {
     /// `per_index_timeout_ms`) unless `wait_for_indices` requests an early
     /// stop. `min_indices` is a floor validated after the gather.
     ///
+    /// Contributions are accumulated in index-name order, making scores and
+    /// cutoff membership independent of completion order for the same shard
+    /// replies. Explicit early stopping can still change which shards reply.
+    ///
     /// # Errors
     ///
+    /// Returns `SearchError::InvalidConfig` before dispatch for duplicate names.
     /// Returns `SearchError::Cancelled` when cancellation is requested via `cx`.
     /// Returns the first shard error when no shard completes successfully.
     /// Returns `SearchError::FederatedInsufficientResponses` when fewer than
@@ -272,6 +296,7 @@ impl FederatedSearcher {
                 coverage: FederatedCoverage::default(),
             });
         }
+        self.validate_shard_names()?;
 
         let candidate_pool_factor = self.config.candidate_pool_factor.max(1);
         let per_index_limit = limit.saturating_mul(candidate_pool_factor);
@@ -455,6 +480,15 @@ impl FederatedSearcher {
     }
 }
 
+/// Floating-point addition is not associative. Sorting only the final hits
+/// cannot repair a sum that changed with shard completion order, including a
+/// changed top-k boundary. Keep every fusion method on one canonical traversal.
+fn ordered_shards(shards: &[ShardResult]) -> Vec<&ShardResult> {
+    let mut ordered: Vec<_> = shards.iter().collect();
+    ordered.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    ordered
+}
+
 /// Intern the distinct shard names to their **sorted rank**. Returns the sorted
 /// distinct names (indexable by id) and a `name → id` lookup. Because ids are the
 /// sorted-name rank, sorting a doc's `appeared_in` ids ascending reproduces the
@@ -482,7 +516,7 @@ fn fuse_rrf(shards: &[ShardResult], k: f64) -> Vec<FederatedHit> {
     // `doc_id` tiebreak), so map drain order never reaches the result.
     let (names, name_to_id) = intern_shard_names(shards);
     let mut docs: AHashMap<String, AggregateDoc> = AHashMap::new();
-    for shard in shards {
+    for shard in ordered_shards(shards) {
         // NaN.max(0.0) propagates NaN — guard explicitly.
         if !shard.weight.is_finite() || shard.weight <= 0.0 {
             continue;
@@ -515,7 +549,7 @@ fn fuse_weighted(
     let (names, name_to_id) = intern_shard_names(shards);
     let mut docs: AHashMap<String, AggregateDoc> = AHashMap::new();
 
-    for shard in shards {
+    for shard in ordered_shards(shards) {
         // NaN.max(0.0) propagates NaN — guard explicitly.
         if !shard.weight.is_finite() || shard.weight <= 0.0 || shard.hits.is_empty() {
             continue;
@@ -1734,4 +1768,152 @@ mod tests {
     }
 
     // ─── bd-fj0q tests end ───
+
+    fn rounding_sensitive_shards(order: [usize; 3]) -> Vec<super::ShardResult> {
+        let names = ["a-heavy", "b-light", "c-light"];
+        let weights = [1.0, f32::EPSILON / 2.0, f32::EPSILON / 2.0];
+        let hit = |doc_id: &str, name: &str| frankensearch_core::ScoredResult {
+            doc_id: doc_id.into(),
+            score: 1.0,
+            source: frankensearch_core::ScoreSource::SemanticFast,
+            index: Some(0),
+            fast_score: Some(1.0),
+            quality_score: None,
+            lexical_score: None,
+            rerank_score: None,
+            explanation: None,
+            metadata: Some(Arc::new(serde_json::json!({"shard": name}))),
+        };
+        let mut shards: Vec<_> = order
+            .into_iter()
+            .map(|index| super::ShardResult {
+                name: names[index].to_owned(),
+                weight: weights[index],
+                hits: vec![hit("shared", names[index])],
+            })
+            .collect();
+        shards.push(super::ShardResult {
+            name: "z-competitor".to_owned(),
+            weight: 1.0 + f32::EPSILON,
+            hits: vec![hit("competitor", "z-competitor")],
+        });
+        shards
+    }
+
+    fn assert_same_federated_hits(actual: &[super::FederatedHit], expected: &[super::FederatedHit]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.result.score.to_bits(), expected.result.score.to_bits());
+            assert_eq!(
+                serde_json::to_value(&actual.result).unwrap(),
+                serde_json::to_value(&expected.result).unwrap(),
+            );
+            assert_eq!(actual.source_index, expected.source_index);
+            assert_eq!(actual.source_rank, expected.source_rank);
+            assert_eq!(actual.appeared_in, expected.appeared_in);
+        }
+    }
+
+    #[test]
+    fn every_fusion_method_is_bit_identical_across_completion_orders() {
+        let canonical = rounding_sensitive_shards([0, 1, 2]);
+        let expected_rrf = super::fuse_rrf(&canonical, 0.0);
+        assert_eq!(expected_rrf[0].result.doc_id, "competitor");
+        let expected_weighted = super::fuse_weighted(&canonical, NormalizationMethod::None, false);
+        let expected_mnz = super::fuse_weighted(&canonical, NormalizationMethod::None, true);
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let shards = rounding_sensitive_shards(order);
+            assert_same_federated_hits(&super::fuse_rrf(&shards, 0.0), &expected_rrf);
+            assert_same_federated_hits(
+                &super::fuse_weighted(&shards, NormalizationMethod::None, false),
+                &expected_weighted,
+            );
+            assert_same_federated_hits(
+                &super::fuse_weighted(&shards, NormalizationMethod::None, true),
+                &expected_mnz,
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_shard_cannot_change_the_top_one_cutoff() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for delay_heavy in [false, true] {
+                let heavy = if delay_heavy {
+                    build_yielding_searcher(&[("shared", &[1.0, 0.0])])
+                } else {
+                    build_searcher(&[("shared", &[1.0, 0.0])])
+                };
+                let light = build_searcher(&[("shared", &[1.0, 0.0])]);
+                let competitor = build_searcher(&[("competitor", &[1.0, 0.0])]);
+                let federated = FederatedSearcher::new()
+                    .with_config(FederatedConfig {
+                        fusion_method: FederatedFusion::Rrf { k: 0.0 },
+                        min_indices: 4,
+                        ..FederatedConfig::default()
+                    })
+                    .add_index("a-heavy", heavy, 1.0)
+                    .add_index("b-light", Arc::clone(&light), f32::EPSILON / 2.0)
+                    .add_index("c-light", light, f32::EPSILON / 2.0)
+                    .add_index("z-competitor", competitor, 1.0 + f32::EPSILON);
+                let response = federated.search(&cx, "query", 1, |_| None).await.unwrap();
+                assert!(response.coverage.is_complete());
+                assert_eq!(response.coverage.answered.len(), 4);
+                assert_eq!(response.hits.len(), 1);
+                assert_eq!(response.hits[0].result.doc_id, "competitor");
+                assert_eq!(
+                    response.hits[0].result.score.to_bits(),
+                    (1.0 + f32::EPSILON).to_bits(),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn duplicate_dispatched_names_are_rejected_before_gathering() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let pending = build_pending_searcher(&[("doc", &[1.0, 0.0])]);
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    per_index_timeout_ms: 0,
+                    ..FederatedConfig::default()
+                })
+                .add_index("duplicate", Arc::clone(&pending), 1.0)
+                .add_index("duplicate", pending, 1.0);
+            let error = federated
+                .search(&cx, "query", 1, |_| None)
+                .await
+                .expect_err("duplicate names must fail before shard timeouts");
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == "federated.indices" && value == "duplicate_name"
+            ));
+        });
+    }
+
+    #[test]
+    fn undispatched_duplicate_does_not_change_the_selected_fanout() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_searcher(&[("doc", &[1.0, 0.0])]);
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    max_indices: 1,
+                    ..FederatedConfig::default()
+                })
+                .add_index("selected", Arc::clone(&index), 1.0)
+                .add_index("selected", index, 1.0);
+            let response = federated.search(&cx, "query", 1, |_| None).await.unwrap();
+            assert_eq!(response.hits.len(), 1);
+            assert_eq!(response.coverage.queried, vec!["selected".to_owned()]);
+            assert!(response.coverage.is_complete());
+        });
+    }
 }
