@@ -14,7 +14,7 @@ mod kernel;
 pub use kernel::*;
 
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use frankensearch_core::SearchResult;
 
@@ -75,7 +75,21 @@ pub(crate) fn reject_sealed_ancestry(root: &Path) -> SearchResult<()> {
                 }
                 return Ok(());
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // mkdir_all can create `missing` before resolving
+                // `missing/../sealed/child`. Treating that whole suffix as
+                // absent would inspect only the mutable common ancestor and
+                // let native lock initialization write into the sealed child.
+                // Existing parent traversal is still resolved by canonicalize;
+                // only traversal through an unresolved directory is refused.
+                if ancestor.components().next_back() == Some(Component::ParentDir) {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "publication root traverses an unresolved parent directory",
+                    )
+                    .into());
+                }
+            }
             Err(error) => return Err(error.into()),
         }
     }
@@ -206,5 +220,34 @@ mod tests {
             .expect("mutable alias admitted after release")
             .fence("alias publication")
             .expect("alias fence");
+    }
+
+    #[test]
+    fn unresolved_parent_traversal_cannot_create_a_route_into_a_sealed_generation() {
+        let root = tempfile::tempdir().expect("root");
+        let sealed = root.path().join("sealed");
+        let nested = sealed.join("lexical");
+        std::fs::create_dir_all(&nested).expect("nested index");
+        std::fs::write(sealed.join(COMPLETE_GENERATION_MANIFEST), b"sealed")
+            .expect("seal marker");
+        let missing = root.path().join("missing");
+        let indirect = missing.join("../sealed/lexical/new-index");
+
+        PublicationLease::acquire(&indirect).expect_err("unresolved parent traversal");
+        assert!(!missing.exists(), "admission must precede mkdir_all");
+        assert_eq!(std::fs::read_dir(&nested).expect("inventory").count(), 0);
+    }
+
+    #[test]
+    fn resolved_parent_traversal_still_allows_mutable_directory_creation() {
+        let root = tempfile::tempdir().expect("root");
+        let existing = root.path().join("existing");
+        std::fs::create_dir(&existing).expect("existing traversal directory");
+        let indirect = existing.join("../mutable/new-index");
+        let lease = PublicationLease::acquire(&indirect).expect("resolved parent traversal");
+        lease.fence("resolved parent publication").expect("fence");
+        assert!(root.path().join("mutable/new-index").is_dir());
+        PublicationLease::acquire(&root.path().join("mutable/new-index"))
+            .expect_err("resolved alias keeps native exclusion");
     }
 }
