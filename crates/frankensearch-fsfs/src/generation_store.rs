@@ -108,7 +108,8 @@ pub struct GenerationBuild {
 
 impl CompleteGenerationStore {
     /// Create a store beneath an existing parent, or open an existing store,
-    /// without changing its selection.
+    /// without changing its selection. A sealed generation and all of its
+    /// descendants are refused before creating any directory.
     ///
     /// # Errors
     /// Returns cancellation, unsupported-platform, path, or filesystem errors.
@@ -116,6 +117,8 @@ impl CompleteGenerationStore {
         checkpoint(cx)?;
         require_supported_platform()?;
         reject_symlink_if_present(root)?;
+        crate::lifecycle::reject_sealed_ancestry(root)?;
+        checkpoint(cx)?;
         let created = match fs::create_dir(root) {
             Ok(()) => true,
             Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
@@ -134,12 +137,13 @@ impl CompleteGenerationStore {
     /// Open an existing store without creating directories or lock files.
     ///
     /// # Errors
-    /// Returns an error for a missing, non-directory, or symlinked root.
+    /// Returns an error for a missing, non-directory, or symlinked root, or a
+    /// root inside a sealed generation.
     pub fn open(cx: &Cx, root: &Path) -> SearchResult<Self> {
         checkpoint(cx)?;
         require_supported_platform()?;
         require_directory(root)?;
-        reject_published_write(root)?;
+        crate::lifecycle::reject_sealed_ancestry(root)?;
         Ok(Self {
             root: fs::canonicalize(root)?,
         })
@@ -998,6 +1002,126 @@ mod tests {
             assert!(CompleteGenerationStore::open(&cx, generation.path()).is_err());
             assert!(PublicationLease::acquire(generation.path()).is_err());
             assert_eq!(store.active(&cx).unwrap(), Some(generation));
+        });
+    }
+
+    #[test]
+    fn store_creation_refuses_retained_descendants_before_mkdir() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let generation = publish(&store, &cx, "retained");
+            let pointer = fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let before = inventory(&cx, generation.path(), true).unwrap();
+
+            for parent in [
+                generation.path().to_path_buf(),
+                generation.path().join("lexical"),
+            ] {
+                let nested = parent.join("new-store");
+                let error = CompleteGenerationStore::create(&cx, &nested)
+                    .expect_err("retained descendants are immutable");
+                assert!(matches!(error, SearchError::IndexCorrupted { .. }));
+                assert!(!nested.exists(), "refusal must precede directory creation");
+            }
+
+            assert_eq!(inventory(&cx, generation.path(), true).unwrap(), before);
+            assert_eq!(
+                fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(store.active(&cx).unwrap(), Some(generation));
+        });
+    }
+
+    #[test]
+    fn store_open_and_create_refuse_existing_retained_descendants() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let generation = publish(&store, &cx, "retained");
+            let nested = generation.path().join("lexical");
+            let before = inventory(&cx, generation.path(), true).unwrap();
+
+            assert!(CompleteGenerationStore::open(&cx, &nested).is_err());
+            assert!(CompleteGenerationStore::create(&cx, &nested).is_err());
+            assert!(
+                !nested
+                    .join(crate::lifecycle::PUBLICATION_LOCK_FILE_NAME)
+                    .exists()
+            );
+            assert_eq!(inventory(&cx, generation.path(), true).unwrap(), before);
+            assert_eq!(store.active(&cx).unwrap(), Some(generation));
+        });
+    }
+
+    #[test]
+    fn store_parent_alias_cannot_hide_a_retained_ancestor() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let generation = publish(&store, &cx, "retained");
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(generation.path(), &alias).unwrap();
+            let nested = alias.join("lexical");
+            let before = inventory(&cx, generation.path(), true).unwrap();
+
+            assert!(CompleteGenerationStore::open(&cx, &nested).is_err());
+            assert!(CompleteGenerationStore::create(&cx, &nested.join("new-store")).is_err());
+            assert!(!generation.path().join("lexical/new-store").exists());
+            assert_eq!(inventory(&cx, generation.path(), true).unwrap(), before);
+            assert_eq!(store.active(&cx).unwrap(), Some(generation));
+        });
+    }
+
+    #[test]
+    fn store_opened_before_ancestor_sealing_cannot_start_a_writer() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let build = store.begin(&cx).unwrap();
+            write_bundle(build.path(), "retained");
+            let nested = build.path().join("lexical");
+            let opened = CompleteGenerationStore::open(&cx, &nested).unwrap();
+            let publication = build.publish(&cx, |_, _| Ok(())).unwrap();
+            let GenerationPublication::Durable(generation) = publication else {
+                panic!("publication was not durable"); // ubs:ignore — cfg(test) assertion.
+            };
+            let before = inventory(&cx, generation.path(), true).unwrap();
+
+            assert!(opened.begin(&cx).is_err());
+            assert!(
+                !nested
+                    .join(crate::lifecycle::PUBLICATION_LOCK_FILE_NAME)
+                    .exists()
+            );
+            assert!(!nested.join(GENERATIONS).exists());
+            assert_eq!(inventory(&cx, generation.path(), true).unwrap(), before);
+            assert_eq!(store.active(&cx).unwrap(), Some(generation));
+        });
+    }
+
+    #[test]
+    fn store_creation_through_a_mutable_parent_alias_still_publishes() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("mutable");
+            fs::create_dir(&parent).unwrap();
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&parent, &alias).unwrap();
+            let store = CompleteGenerationStore::create(&cx, &alias.join("store")).unwrap();
+            assert_eq!(
+                store.root(),
+                fs::canonicalize(parent.join("store")).unwrap().as_path()
+            );
+
+            let first = publish(&store, &cx, "first");
+            let second = publish(&store, &cx, "second");
+            assert_eq!(store.active(&cx).unwrap(), Some(second));
+            assert_eq!(
+                fs::read_to_string(first.path().join("content.txt")).unwrap(),
+                "first"
+            );
         });
     }
 
