@@ -7,6 +7,8 @@
 
 mod hybrid;
 #[cfg(unix)]
+mod terminal;
+#[cfg(unix)]
 mod watch;
 
 use std::collections::HashSet;
@@ -39,6 +41,7 @@ Run a publisher separately, or explicitly opt into indexing with --watch-source.
   --query TEXT            Nonblank UTF-8 query, at most 64 KiB (required)
   --hybrid                Use the retained progressive hybrid pipeline and local models
   --config FILE           Hybrid configuration/model policy; requires --hybrid
+  --tui                   Live terminal view (Unix, terminal stdin/stdout required)
   --watch-source DIR      Index and watch DIR, publishing successors; requires --hybrid
   --limit N               Result window, 1..=10000 (default 20)
   --poll-ms N             Selection probe interval, 10..=60000 (default 100)
@@ -48,7 +51,7 @@ Run a publisher separately, or explicitly opt into indexing with --watch-source.
   --max-updates N         Exit after N completed generation updates (all phases)
   --once                 Deliver one generation, including refinement, then exit
   --timeout-ms N         Overall cooperative deadline, 1..=86400000
-  --format jsonl         NDJSON is the only supported output format
+  --format jsonl         Explicit machine output (default; incompatible with --tui)
   --help                 Print this help (use alone)
 
 Default stdout contains only fsfs.stream.live_search.v1 frames: an initial snapshot,
@@ -73,6 +76,12 @@ Initial is flushed before refinement. A failed refinement preserves its Initial
 window; it is not a successful Refined update. --once/--max-updates never split
 that phase sequence. Each hybrid record is bounded to 16 MiB before output.
 --filter, --rerank, and --semantic CLI flags are refused rather than ignored.
+
+--tui displays this same subscription in an alternate-screen terminal view.
+Up/Down or j/k select results; PgUp/PgDn move ten rows; Home/End jump; q/Esc quit.
+Selection follows document identity through reranking. Failed refinement retains
+Initial results. The query is fixed for the session; there is no query editor.
+Existing time/update limits still stop the command and restore the terminal.
 
 --watch-source is supported on Unix and requires disjoint source/store trees.
 It builds the initial generation, then streams each durable publication through
@@ -99,6 +108,7 @@ struct Options {
     hybrid: bool,
     config_path: Option<PathBuf>,
     watch_source: Option<PathBuf>,
+    tui: bool,
 }
 
 impl Options {
@@ -115,6 +125,7 @@ impl Options {
         let mut hybrid = false;
         let mut config_path = None;
         let mut watch_source = None;
+        let mut tui = false;
         let mut seen = HashSet::new();
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
@@ -135,6 +146,7 @@ impl Options {
                     | "--hybrid"
                     | "--config"
                     | "--watch-source"
+                    | "--tui"
             ) {
                 return Err(invalid("unknown argument; run fsfs live-search --help"));
             }
@@ -147,6 +159,10 @@ impl Options {
             }
             if flag == "--hybrid" {
                 hybrid = true;
+                continue;
+            }
+            if flag == "--tui" {
+                tui = true;
                 continue;
             }
             let value = args
@@ -207,6 +223,14 @@ impl Options {
                 "--config requires --hybrid; lexical mode never loads configuration",
             ));
         }
+        if tui {
+            if !cfg!(unix) {
+                return Err(invalid("--tui requires the Unix terminal backend"));
+            }
+            if seen.contains("--format") {
+                return Err(invalid("--tui cannot be combined with --format"));
+            }
+        }
         if watch_source.is_some() {
             if !cfg!(unix) {
                 return Err(invalid(
@@ -244,6 +268,7 @@ impl Options {
             hybrid,
             config_path,
             watch_source,
+            tui,
         })
     }
 }
@@ -398,6 +423,14 @@ async fn execute_with_runtime<W: Write + Send>(
 }
 
 fn run(options: Options) -> SearchResult<u64> {
+    // Refuse redirected terminal mode before configuration or a source build
+    // can run. A headless caller continues to use the unchanged NDJSON path.
+    if options.tui {
+        #[cfg(unix)]
+        terminal::preflight()?;
+        #[cfg(not(unix))]
+        return Err(invalid("--tui requires the Unix terminal backend"));
+    }
     // This command owns a dedicated single-request runtime on the calling CLI
     // thread. There are no interactive/request tasks sharing its synchronous
     // filesystem/query/output lane. Quill's async admission uses this same
@@ -422,6 +455,12 @@ fn run(options: Options) -> SearchResult<u64> {
             Cx::current().ok_or_else(|| invalid("runtime did not install a request context"))?;
         let cx = request_pool.context(current);
         let scope = request_shutdown.cancellation_scope(&cx);
+        if options.tui {
+            #[cfg(unix)]
+            return terminal::execute(&scope, &options, app_runtime).await;
+            #[cfg(not(unix))]
+            return Err(invalid("--tui requires the Unix terminal backend"));
+        }
         // Stdout (rather than its non-Send lock guard) lives across admission awaits.
         // Only this task writes stdout, so frames cannot interleave in this process.
         execute_with_runtime(&scope, &options, &mut io::stdout(), app_runtime).await
