@@ -72,6 +72,42 @@ let fused = rrf_fuse(&vector_hits, &lexical_hits, &config);
 // let (results, metrics) = searcher.search_collect(&cx, "query", 10).await?;
 ```
 
+### Federation with separate document stores
+
+`FederatedSearcher::search` accepts a shared `doc_id`-to-text callback. Use
+`search_with_index_text` when each index has its own store or retained text
+snapshot. The callback receives `(index_name, doc_id)` for the originating
+shard, so exclusion clauses and optional reranking use that shard's text.
+The callback can borrow request-scoped stores without cloning the stores or
+requiring a `'static` lifetime.
+
+```rust
+use std::collections::BTreeMap;
+use asupersync::Cx;
+use frankensearch_core::SearchResult;
+use frankensearch_fusion::{FederatedResponse, FederatedSearcher};
+
+async fn search_separate_stores(
+    federation: &FederatedSearcher,
+    cx: &Cx,
+    stores: &BTreeMap<String, BTreeMap<String, String>>,
+) -> SearchResult<FederatedResponse> {
+    federation
+        .search_with_index_text(cx, "ownership -unsafe", 10, |index, doc_id| {
+            stores.get(index).and_then(|store| store.get(doc_id)).cloned()
+        })
+        .await
+}
+```
+
+Index names must be unique within the dispatched fanout. Document IDs remain
+**global fusion identities**: equal IDs from multiple indices combine into one
+hit with `appeared_in` provenance. Namespace unrelated index-local IDs at ingest;
+choosing a text store does not disable deduplication. Check
+`response.coverage.is_complete()` when complete shard coverage is required.
+For the same shard replies, fusion scores do not depend on response order;
+explicit early stopping can still change which shards contribute.
+
 ## Dependency Graph Position
 
 ```

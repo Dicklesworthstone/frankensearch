@@ -262,13 +262,46 @@ impl FederatedSearcher {
         Ok(())
     }
 
-    /// Execute federated search and return globally fused results along with
-    /// the per-shard coverage record for this query.
+    /// Execute federated search using a shared document-text provider.
+    ///
+    /// `text_fn` resolves global document IDs for exclusion filtering and
+    /// reranking. For separate per-index stores, use
+    /// [`Self::search_with_index_text`] to receive the originating index name.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::search_with_index_text`].
+    pub async fn search<F>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        text_fn: F,
+    ) -> SearchResult<FederatedResponse>
+    where
+        F: Fn(&str) -> Option<String> + Send + Sync,
+    {
+        self.search_with_index_text(cx, query, limit, |_index: &str, doc_id: &str| {
+            text_fn(doc_id)
+        })
+        .await
+    }
+
+    /// Execute federated search with text resolved from each originating index.
+    ///
+    /// `text_fn(index_name, doc_id)` receives the exact name registered with
+    /// [`Self::add_index`]. Each shard's exclusion filtering and optional
+    /// reranking use its own bound provider, even when multiple indices return
+    /// the same document ID. The callback may borrow request-scoped stores; it
+    /// need not be `'static`. It is not called for undispatched indices.
+    ///
+    /// Document IDs still denote global fusion identity: equal IDs merge into
+    /// one hit. Applications with unrelated index-local IDs must namespace IDs
+    /// when indexing; selecting a text store does not change deduplication.
     ///
     /// The gather waits for every dispatched shard (each bounded by
     /// `per_index_timeout_ms`) unless `wait_for_indices` requests an early
     /// stop. `min_indices` is a floor validated after the gather.
-    ///
     /// Contributions are accumulated in index-name order, making scores and
     /// cutoff membership independent of completion order for the same shard
     /// replies. Explicit early stopping can still change which shards reply.
@@ -280,7 +313,7 @@ impl FederatedSearcher {
     /// Returns the first shard error when no shard completes successfully.
     /// Returns `SearchError::FederatedInsufficientResponses` when fewer than
     /// `min_indices` shards complete successfully.
-    pub async fn search<F>(
+    pub async fn search_with_index_text<F>(
         &self,
         cx: &Cx,
         query: &str,
@@ -288,7 +321,7 @@ impl FederatedSearcher {
         text_fn: F,
     ) -> SearchResult<FederatedResponse>
     where
-        F: Fn(&str) -> Option<String> + Send + Sync,
+        F: Fn(&str, &str) -> Option<String> + Send + Sync,
     {
         if query.is_empty() || limit == 0 || self.indices.is_empty() {
             return Ok(FederatedResponse {
@@ -336,7 +369,7 @@ impl FederatedSearcher {
         text_fn: &F,
     ) -> SearchResult<(Vec<ShardResult>, FederatedCoverage)>
     where
-        F: Fn(&str) -> Option<String> + Send + Sync,
+        F: Fn(&str, &str) -> Option<String> + Send + Sync,
     {
         let mut coverage = FederatedCoverage {
             queried: self
@@ -357,13 +390,19 @@ impl FederatedSearcher {
                 let searcher = Arc::clone(&index.searcher);
                 Box::pin(async move {
                     let timeout_start = cx.now();
-                    let future = Box::pin(searcher.search_collect_with_text(
-                        cx,
-                        query,
-                        per_index_limit,
-                        text_fn,
-                    ));
-                    match timeout(timeout_start, timeout_budget, future).await {
+                    let response = {
+                        // Bind before the shard starts: exclusion and rerank
+                        // lookups must never hydrate from another index's store.
+                        let shard_text = |doc_id: &str| text_fn(index_name.as_str(), doc_id);
+                        let future = Box::pin(searcher.search_collect_with_text(
+                            cx,
+                            query,
+                            per_index_limit,
+                            shard_text,
+                        ));
+                        timeout(timeout_start, timeout_budget, future).await
+                    };
+                    match response {
                         Ok(Ok((hits, _metrics))) => ShardCompletion::Completed(ShardResult {
                             name: index_name,
                             weight: index_weight,
@@ -1914,6 +1953,118 @@ mod tests {
             assert_eq!(response.hits.len(), 1);
             assert_eq!(response.coverage.queried, vec!["selected".to_owned()]);
             assert!(response.coverage.is_complete());
+        });
+    }
+
+    #[test]
+    fn indexed_text_filters_equal_ids_using_the_originating_store() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let keep = build_searcher(&[("shared", &[1.0, 0.0])]);
+            let drop = build_yielding_searcher(&[("shared", &[1.0, 0.0])]);
+            let stores = std::collections::BTreeMap::from([
+                (
+                    "keep".to_owned(),
+                    std::collections::BTreeMap::from([("shared".to_owned(), "keep".to_owned())]),
+                ),
+                (
+                    "drop".to_owned(),
+                    std::collections::BTreeMap::from([("shared".to_owned(), "dropme".to_owned())]),
+                ),
+            ]);
+            let federated = FederatedSearcher::new()
+                .add_index("keep", keep, 1.0)
+                .add_index("drop", drop, 1.0);
+            let response = federated
+                .search_with_index_text(&cx, "query -dropme", 10, |index, doc_id| {
+                    stores.get(index).and_then(|store| store.get(doc_id)).cloned()
+                })
+                .await
+                .unwrap();
+            assert!(response.coverage.is_complete());
+            assert_eq!(response.coverage.answered.len(), 2);
+            assert_eq!(response.hits.len(), 1);
+            assert_eq!(response.hits[0].result.doc_id, "shared");
+            assert_eq!(response.hits[0].source_index, "keep");
+            assert_eq!(response.hits[0].appeared_in, vec!["keep".to_owned()]);
+        });
+    }
+
+    #[test]
+    fn indexed_text_preserves_shared_provider_results_and_global_fusion() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_searcher(&[
+                ("shared", &[1.0, 0.0]),
+                ("excluded", &[0.5, 0.5]),
+            ]);
+            let texts = std::collections::BTreeMap::from([
+                ("shared".to_owned(), "keep".to_owned()),
+                ("excluded".to_owned(), "dropme".to_owned()),
+            ]);
+            let federated = FederatedSearcher::new()
+                .add_index("a", Arc::clone(&index), 1.0)
+                .add_index("b", index, 2.0);
+            let shared = federated
+                .search(&cx, "query -dropme", 10, |doc_id| texts.get(doc_id).cloned())
+                .await
+                .unwrap();
+            let indexed = federated
+                .search_with_index_text(&cx, "query -dropme", 10, |_index, doc_id| {
+                    texts.get(doc_id).cloned()
+                })
+                .await
+                .unwrap();
+            assert_same_federated_hits(&indexed.hits, &shared.hits);
+            assert_eq!(indexed.hits.len(), 1);
+            assert_eq!(indexed.hits[0].result.doc_id, "shared");
+            assert_eq!(indexed.hits[0].appeared_in, vec!["a", "b"]);
+            assert_eq!(indexed.hits[0].source_index, "b");
+            assert!(indexed.coverage.is_complete());
+        });
+    }
+
+    #[test]
+    fn indexed_text_never_reads_an_undispatched_store() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_searcher(&[("doc", &[1.0, 0.0])]);
+            let calls = AtomicU64::new(0);
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    max_indices: 1,
+                    ..FederatedConfig::default()
+                })
+                .add_index("selected", Arc::clone(&index), 1.0)
+                .add_index("undispatched", index, 1.0);
+            let response = federated
+                .search_with_index_text(&cx, "query -dropme", 10, |name, doc_id| {
+                    assert_eq!(name, "selected");
+                    assert_eq!(doc_id, "doc");
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Some("keep".to_owned())
+                })
+                .await
+                .unwrap();
+            assert!(calls.load(Ordering::Relaxed) > 0);
+            assert_eq!(response.hits.len(), 1);
+            assert_eq!(response.coverage.queried, vec!["selected".to_owned()]);
+            assert!(response.coverage.is_complete());
+        });
+    }
+
+    #[test]
+    fn indexed_text_noop_queries_do_not_access_stores() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_searcher(&[("doc", &[1.0, 0.0])]);
+            let federated = FederatedSearcher::new().add_index("primary", index, 1.0);
+            for (query, limit) in [("", 10), ("query -dropme", 0)] {
+                let response = federated
+                    .search_with_index_text(&cx, query, limit, |_, _| {
+                        panic!("no-op queries must not read document stores")
+                    })
+                    .await
+                    .unwrap();
+                assert!(response.hits.is_empty());
+                assert!(response.coverage.queried.is_empty());
+            }
         });
     }
 }
