@@ -124,8 +124,15 @@ pub struct QuillConfig {
     /// checkpoint, so a resumed ingest re-inserts identities that are already
     /// live and is refused as a duplicate live document id.
     pub max_visibility_lag_ms: u64,
-    /// Permit a durability-enabled writer to quarantine an unrepairable
-    /// segment and publish a degraded successor that omits it.
+    /// Permit an on-disk writer to quarantine an unrepairable segment and
+    /// publish a degraded successor that omits it.
+    ///
+    /// A durable writer (`create_durable`/`open_durable`) quarantines only what
+    /// its repair sidecars cannot restore. A plain writer (`create`/`open`,
+    /// which requires the `durability` feature for this flag) verifies every
+    /// segment when it opens and quarantines any that fail, without reading or
+    /// writing sidecars: the choice for segments that are cheaper to rebuild
+    /// from their sources than to protect.
     ///
     /// This is deliberately off for library embedders. Applications that turn
     /// it on must couple the resulting degraded snapshot to a freshness audit

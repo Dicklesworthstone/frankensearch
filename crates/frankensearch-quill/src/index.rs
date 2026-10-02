@@ -5411,7 +5411,6 @@ impl QuillWriterState {
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
         validate_config(&config)?;
-        validate_non_durable_quarantine(&config)?;
         let open_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::KEEPER_OPEN,
@@ -5425,7 +5424,9 @@ impl QuillWriterState {
         let _open_timer = crate::tracing_conventions::StageTimer::new(&open_span);
         let instrumented = open_span.clone();
         async move {
-            let writer = KeeperWriter::open(cx, directory, DEFAULT_SCHEMA).await?;
+            let writer =
+                open_sidecarless_writer(cx, directory.into(), DEFAULT_SCHEMA, &config, false)
+                    .await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), DEFAULT_SCHEMA, config)?;
             record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
@@ -5452,7 +5453,6 @@ impl QuillWriterState {
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
         validate_config(&config)?;
-        validate_non_durable_quarantine(&config)?;
         let open_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::KEEPER_OPEN,
@@ -5466,7 +5466,8 @@ impl QuillWriterState {
         let _open_timer = crate::tracing_conventions::StageTimer::new(&open_span);
         let instrumented = open_span.clone();
         async move {
-            let writer = KeeperWriter::open(cx, directory, schema).await?;
+            let writer =
+                open_sidecarless_writer(cx, directory.into(), schema, &config, false).await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), schema, config)?;
             record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
@@ -5588,7 +5589,6 @@ impl QuillWriterState {
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
         validate_config(&config)?;
-        validate_non_durable_quarantine(&config)?;
         let open_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::KEEPER_OPEN,
@@ -5602,7 +5602,8 @@ impl QuillWriterState {
         let _open_timer = crate::tracing_conventions::StageTimer::new(&open_span);
         let instrumented = open_span.clone();
         async move {
-            let writer = KeeperWriter::create(cx, directory, schema).await?;
+            let writer =
+                open_sidecarless_writer(cx, directory.into(), schema, &config, true).await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), schema, config)?;
             record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
@@ -13586,10 +13587,43 @@ fn validate_non_durable_quarantine(config: &QuillConfig) -> Result<(), QuillInde
         return Err(QuillIndexError::Config(SearchError::InvalidConfig {
             field: "quarantine_on_unrepairable".to_owned(),
             value: "true".to_owned(),
-            reason: "requires open_durable/create_durable and a FileProtector".to_owned(),
+            reason: "requires an on-disk writer; in-memory and read-only indexes cannot \
+                     quarantine segments"
+                .to_owned(),
         }));
     }
     Ok(())
+}
+
+/// Open (or with `create`, create) the Keeper writer of an index without
+/// repair sidecars. `quarantine_on_unrepairable` selects the writer that
+/// verifies every segment and quarantines an unrepairable one.
+async fn open_sidecarless_writer(
+    cx: &Cx,
+    directory: PathBuf,
+    schema: SchemaDescriptor,
+    config: &QuillConfig,
+    create: bool,
+) -> Result<KeeperWriter, QuillIndexError> {
+    if config.quarantine_on_unrepairable {
+        #[cfg(feature = "durability")]
+        return Ok(if create {
+            KeeperWriter::create_quarantining(cx, directory, schema).await?
+        } else {
+            KeeperWriter::open_quarantining(cx, directory, schema).await?
+        });
+        #[cfg(not(feature = "durability"))]
+        return Err(QuillIndexError::Config(SearchError::InvalidConfig {
+            field: "quarantine_on_unrepairable".to_owned(),
+            value: "true".to_owned(),
+            reason: "segment quarantine requires the durability feature".to_owned(),
+        }));
+    }
+    Ok(if create {
+        KeeperWriter::create(cx, directory, schema).await?
+    } else {
+        KeeperWriter::open(cx, directory, schema).await?
+    })
 }
 
 /// Minimum total sealed live-document count before ranked queries fan

@@ -4421,6 +4421,11 @@ pub enum UnrepairableSegmentPolicy {
 #[derive(Clone)]
 enum WriterProtection {
     Disabled,
+    /// Verify every segment at recovery and quarantine an unrepairable one,
+    /// without reading or writing repair sidecars: for indexes whose segments
+    /// are cheaper to rebuild from their sources than to protect.
+    #[cfg_attr(not(feature = "durability"), allow(dead_code))]
+    VerifyAndQuarantine,
     #[cfg(feature = "durability")]
     Enabled {
         protector: FileProtector,
@@ -4830,6 +4835,60 @@ impl KeeperWriter {
         .await
     }
 
+    /// Open an existing index that verifies every segment at recovery and
+    /// quarantines an unrepairable one, without repair sidecars.
+    ///
+    /// A corrupt segment is retained under a `.quarantine` name and a degraded
+    /// successor MANIFEST omits it, exactly as
+    /// [`UnrepairableSegmentPolicy::Quarantine`] does for a durable writer, but
+    /// no `.fec` sidecar is read, written, or required.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::open`]; quarantine still fails
+    /// closed when the source is not a regular file or no valid successor
+    /// MANIFEST can be published.
+    #[cfg(feature = "durability")]
+    pub async fn open_quarantining(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, KeeperError> {
+        Self::open_inner(
+            cx,
+            directory.into(),
+            schema,
+            false,
+            GarbageCollectionOptions::default(),
+            WriterProtection::VerifyAndQuarantine,
+        )
+        .await
+    }
+
+    /// Create a genesis index or open an existing one that verifies and
+    /// quarantines like [`Self::open_quarantining`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::open_quarantining`] plus directory
+    /// creation or genesis-publication failures.
+    #[cfg(feature = "durability")]
+    pub async fn create_quarantining(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, KeeperError> {
+        Self::open_inner(
+            cx,
+            directory.into(),
+            schema,
+            true,
+            GarbageCollectionOptions::default(),
+            WriterProtection::VerifyAndQuarantine,
+        )
+        .await
+    }
+
     /// Open an existing index and activate writer-only FEC recovery.
     ///
     /// # Errors
@@ -4981,7 +5040,7 @@ impl KeeperWriter {
                 let claim_admission = Arc::clone(&admission);
                 let publisher = ManifestPublisher::new(&directory);
                 match &protection {
-                    WriterProtection::Disabled => {
+                    WriterProtection::Disabled | WriterProtection::VerifyAndQuarantine => {
                         publisher
                             .publish_with_generation_claim(cx, &genesis, move |_, generation| {
                                 GenerationClaimGuard::acquire(claim_admission, generation)
@@ -5143,7 +5202,7 @@ impl KeeperWriter {
             let _guard = guard;
             admission.ensure_directory_identity()?;
             #[cfg(feature = "durability")]
-            if matches!(&protection, WriterProtection::Enabled { .. }) {
+            if !matches!(&protection, WriterProtection::Disabled) {
                 recover_writer_directory(&admission, schema, &protection)?;
                 admission.ensure_directory_identity()?;
             }
@@ -5276,7 +5335,7 @@ impl KeeperWriter {
             proposed_generation: manifest.generation,
         });
         let publish_result = match &self.protection {
-            WriterProtection::Disabled => {
+            WriterProtection::Disabled | WriterProtection::VerifyAndQuarantine => {
                 publisher
                     .publish_with_generation_claim(cx, manifest, move |_, generation| {
                         GenerationClaimGuard::acquire(claim_admission, generation)
@@ -5395,7 +5454,9 @@ impl KeeperWriter {
                 return Ok(published);
             }
             let published = match &protection {
-                WriterProtection::Disabled => publish_pending_segment(pending),
+                WriterProtection::Disabled | WriterProtection::VerifyAndQuarantine => {
+                    publish_pending_segment(pending)
+                }
                 #[cfg(feature = "durability")]
                 WriterProtection::Enabled { protector, .. } => {
                     publish_pending_segment_durable(pending, protector)
@@ -5438,7 +5499,9 @@ impl KeeperWriter {
                 .write_temp_retryable(&admission.directory)
                 .map_err(|source| KeeperError::SegmentInstall { source })?;
             let published = match &protection {
-                WriterProtection::Disabled => publish_pending_segment(pending),
+                WriterProtection::Disabled | WriterProtection::VerifyAndQuarantine => {
+                    publish_pending_segment(pending)
+                }
                 #[cfg(feature = "durability")]
                 WriterProtection::Enabled { protector, .. } => {
                     publish_pending_segment_durable(pending, protector)
@@ -8687,12 +8750,20 @@ fn recover_writer_directory(
     recover_interrupted_generation_claims(admission)?;
     recover_corrupt_primary_slot(admission)?;
     #[cfg(feature = "durability")]
-    if let WriterProtection::Enabled {
-        protector,
-        unrepairable,
-    } = protection
-    {
-        recover_durable_writer_files(admission, schema, protector, *unrepairable)?;
+    match protection {
+        WriterProtection::Disabled => {}
+        WriterProtection::VerifyAndQuarantine => {
+            recover_durable_writer_files(
+                admission,
+                schema,
+                None,
+                UnrepairableSegmentPolicy::Quarantine,
+            )?;
+        }
+        WriterProtection::Enabled {
+            protector,
+            unrepairable,
+        } => recover_durable_writer_files(admission, schema, Some(protector), *unrepairable)?,
     }
     #[cfg(not(feature = "durability"))]
     {
@@ -9126,11 +9197,16 @@ fn recover_manifest_bytes(
     }
 }
 
+/// Verify every manifest segment and repair or quarantine the bad ones.
+///
+/// Without a `protector` no sidecar is read or written: a segment that fails
+/// verification is unrepairable, and the successor MANIFEST is published
+/// without a sidecar of its own.
 #[cfg(feature = "durability")]
 fn recover_durable_writer_files(
     admission: &Arc<WriterAdmissionInner>,
     schema: SchemaDescriptor,
-    protector: &FileProtector,
+    protector: Option<&FileProtector>,
     unrepairable: UnrepairableSegmentPolicy,
 ) -> Result<(), KeeperError> {
     let expected_schema = schema
@@ -9202,13 +9278,23 @@ fn recover_durable_writer_files(
         .to_bytes()
         .map_err(|source| KeeperError::InvalidManifest { source })?;
     let claim_admission = Arc::clone(admission);
-    publish_manifest_durable_choreography(
-        admission.directory.clone(),
-        &bytes,
-        move |_, generation| GenerationClaimGuard::acquire(claim_admission, generation),
-        protector,
-        |_, _| Ok(()),
-    )?;
+    let claim =
+        move |_: &Path, generation| GenerationClaimGuard::acquire(claim_admission, generation);
+    match protector {
+        Some(protector) => publish_manifest_durable_choreography(
+            admission.directory.clone(),
+            &bytes,
+            claim,
+            protector,
+            |_, _| Ok(()),
+        )?,
+        None => publish_manifest_choreography(
+            admission.directory.clone(),
+            &bytes,
+            claim,
+            |_, _| Ok(()),
+        )?,
+    };
 
     for (segment, reason) in quarantined {
         tracing::warn!(
@@ -9235,7 +9321,7 @@ fn recover_durable_manifest_segments(
     unrepairable: UnrepairableSegmentPolicy,
 ) -> Result<(), KeeperError> {
     for manifest_segment in &manifest.segments {
-        match recover_durable_segment(admission, schema, protector, manifest_segment)? {
+        match recover_durable_segment(admission, schema, Some(protector), manifest_segment)? {
             DurableSegmentRecovery::Healthy => {}
             DurableSegmentRecovery::Unrepairable { error } => {
                 if unrepairable == UnrepairableSegmentPolicy::Quarantine
@@ -9260,7 +9346,7 @@ enum DurableSegmentRecovery {
 fn recover_durable_segment(
     admission: &WriterAdmissionInner,
     schema: SchemaDescriptor,
-    protector: &FileProtector,
+    protector: Option<&FileProtector>,
     manifest_segment: &ManifestSegment,
 ) -> Result<DurableSegmentRecovery, KeeperError> {
     let path = admission
@@ -9268,15 +9354,22 @@ fn recover_durable_segment(
         .join(canonical_segment_name(manifest_segment.segment_id));
     let original_error = match open_verified_segment(&path, manifest_segment, schema) {
         Ok(()) => {
-            let bytes = std::fs::read(&path).map_err(|source| KeeperError::Io {
-                operation: "read valid segment for sidecar witness",
-                path: path.clone(),
-                source,
-            })?;
-            ensure_matching_durability_sidecar(admission, protector, &path, &bytes)?;
+            if let Some(protector) = protector {
+                let bytes = std::fs::read(&path).map_err(|source| KeeperError::Io {
+                    operation: "read valid segment for sidecar witness",
+                    path: path.clone(),
+                    source,
+                })?;
+                ensure_matching_durability_sidecar(admission, protector, &path, &bytes)?;
+            }
             return Ok(DurableSegmentRecovery::Healthy);
         }
         Err(error) => error,
+    };
+    let Some(protector) = protector else {
+        return Ok(DurableSegmentRecovery::Unrepairable {
+            error: original_error,
+        });
     };
 
     let sidecar = FileProtector::sidecar_path(&path);
@@ -24799,6 +24892,126 @@ mod tests {
                 || reopened.estimated_missing_docs() != expected_doc_count
             {
                 return Err("read-only reopen silently lost degraded state".to_owned());
+            }
+            Ok(())
+        });
+        outcome.map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    /// bd-2pkpj: a quarantining writer verifies and quarantines like a durable
+    /// one but never reads or writes a repair sidecar.
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn quarantining_writer_retains_a_corrupt_segment_without_any_sidecar() -> TestResult {
+        let index = tempdir()?;
+        let segment_id = 0x51de_ca5e;
+        let encoded = encoded_test_segment(segment_id, 0, 2, 1)?;
+        let expected_doc_count = u64::from(encoded.header().doc_count);
+        let manifest_segment = manifest_segment(&encoded, 1);
+        let directory = index.path().to_path_buf();
+        let sidecars = |directory: &Path| -> Result<Vec<String>, String> {
+            let mut names = Vec::new();
+            for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
+                let name = entry
+                    .map_err(|error| error.to_string())?
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned();
+                let is_sidecar = Path::new(&name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("fec"));
+                if is_sidecar || name.contains(".fec.") {
+                    names.push(name);
+                }
+            }
+            Ok(names)
+        };
+        let outcome: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create_quarantining(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let pending = encoded
+                .write_temp(&directory)
+                .map_err(|error| error.to_string())?;
+            let published = writer
+                .publish_segment(&cx, pending)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut next = writer
+                .retained_snapshot_for_bookkeeping()
+                .next_manifest()
+                .map_err(|error| error.to_string())?;
+            next.docid_high_watermark = manifest_segment.docid_hi;
+            next.segments.push(manifest_segment);
+            writer
+                .publish(&cx, &next)
+                .await
+                .map_err(|error| error.to_string())?;
+            drop(writer);
+
+            // A healthy reopen verifies the segment and protects nothing.
+            let writer = KeeperWriter::open_quarantining(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            if writer.retained_snapshot_for_bookkeeping().is_degraded() {
+                return Err("healthy quarantining open degraded the index".to_owned());
+            }
+            drop(writer);
+            if !sidecars(&directory)?.is_empty() {
+                return Err(format!(
+                    "healthy writer wrote sidecars: {:?}",
+                    sidecars(&directory)?
+                ));
+            }
+
+            let mut corrupt = std::fs::read(&published).map_err(|error| error.to_string())?;
+            let corrupt_offset = corrupt.len() / 2;
+            corrupt[corrupt_offset] ^= 0x80;
+            std::fs::write(&published, &corrupt).map_err(|error| error.to_string())?;
+
+            match KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA).await {
+                Err(KeeperError::SegmentOpen { .. }) => {}
+                Err(error) => return Err(format!("unexpected fail-closed error: {error}")),
+                Ok(_) => return Err("a plain writer opened over a corrupt segment".to_owned()),
+            }
+
+            let writer = KeeperWriter::open_quarantining(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let snapshot = writer.retained_snapshot_for_bookkeeping();
+            if !snapshot.loaded_manifest().manifest.segments.is_empty()
+                || !snapshot.is_degraded()
+                || snapshot.quarantined_segments().len() != 1
+                || snapshot.estimated_missing_docs() != expected_doc_count
+            {
+                return Err(format!(
+                    "unexpected degraded snapshot: segments={} quarantine={} missing={}",
+                    snapshot.loaded_manifest().manifest.segments.len(),
+                    snapshot.quarantined_segments().len(),
+                    snapshot.estimated_missing_docs()
+                ));
+            }
+            if published.exists() {
+                return Err("canonical corrupt segment remained active".to_owned());
+            }
+            let quarantine = &snapshot.quarantined_segments()[0];
+            if quarantine.segment_id != segment_id
+                || std::fs::read(&quarantine.path).map_err(|error| error.to_string())? != corrupt
+            {
+                return Err("quarantine did not retain the corrupt source".to_owned());
+            }
+            drop(writer);
+            if !sidecars(&directory)?.is_empty() {
+                return Err(format!(
+                    "quarantine wrote sidecars: {:?}",
+                    sidecars(&directory)?
+                ));
+            }
+            let reopened = KeeperSnapshot::open(&directory, DEFAULT_SCHEMA)
+                .map_err(|error| error.to_string())?;
+            if !reopened.is_degraded() || reopened.quarantined_segments().len() != 1 {
+                return Err("read-only reopen lost the degraded state".to_owned());
             }
             Ok(())
         });

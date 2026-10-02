@@ -35,7 +35,7 @@ use frankensearch_core::{
     ScoreComponent, SearchError, SearchResult, VectorHit,
 };
 use frankensearch_durability::{
-    DefaultSymbolCodec, DurabilityConfig, FileProtector, FsviProtector, FsviVerifyResult,
+    DefaultSymbolCodec, DurabilityConfig, FsviProtector, FsviVerifyResult,
 };
 #[cfg(feature = "semantic-loaders")]
 use frankensearch_embed::FastEmbedEmbedder;
@@ -2088,10 +2088,6 @@ impl FsfsIndexPayload {
 
 const FSFS_QUILL_ENGINE_DIR: &str = "quill-v1";
 
-fn fsfs_quill_protector() -> SearchResult<FileProtector> {
-    FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
-}
-
 fn fsfs_fsvi_protector() -> SearchResult<FsviProtector> {
     FsviProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
 }
@@ -2104,7 +2100,8 @@ const FSFS_VECTOR_GENERATION_FILES: [(&str, &str); 2] = [
 ];
 
 /// Write (or refresh) the `RaptorQ` `.fec` sidecar for every vector generation
-/// under `index_root`, the same protection Quill segments already get.
+/// under `index_root`. Vectors are expensive to recompute; keyword segments
+/// rebuild from sources and carry no sidecars (bd-2pkpj).
 ///
 /// Called after a full rewrite of the file (one-shot publication, compaction,
 /// vacuum). A protector failure never fails the publication: the generation is
@@ -17891,7 +17888,7 @@ impl FsfsRuntime {
             vector_elapsed_ms.saturating_add(vector_finish_start.elapsed().as_millis());
         // Both generations are final: drop the writer handles (the protector
         // takes the reader side of the map lock) and write their RaptorQ
-        // sidecars under the same lease, like Quill's segments.
+        // sidecars under the same lease.
         let published_vector = PublishedVectorGeneration {
             id: vector_index.embedder_id().to_owned(),
             dimension: vector_index.dimension(),
@@ -19623,7 +19620,10 @@ impl FsfsRuntime {
             );
             return Ok(());
         };
-        let index = QuillIndex::create_durable(
+        // Keyword segments carry no repair sidecars (bd-2pkpj): they rebuild
+        // from sources, so a segment that fails verification is quarantined
+        // and its documents reindexed rather than repaired.
+        let index = QuillIndex::create(
             cx,
             &lexical_path,
             QuillConfig {
@@ -19632,7 +19632,6 @@ impl FsfsRuntime {
                 quarantine_on_unrepairable: true,
                 ..QuillConfig::default()
             },
-            fsfs_quill_protector()?,
         )
         .await?;
         let stats = {
@@ -20505,7 +20504,8 @@ impl FsfsRuntime {
         };
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
-        let lexical_index = QuillIndex::create_durable(
+        // Unprotected but verified, like every other keyword writer (bd-2pkpj).
+        let lexical_index = QuillIndex::create(
             cx,
             &lexical_path,
             QuillConfig {
@@ -20514,7 +20514,6 @@ impl FsfsRuntime {
                 quarantine_on_unrepairable: true,
                 ..QuillConfig::default()
             },
-            fsfs_quill_protector()?,
         )
         .await?;
         // The one-shot pass that precedes watch mode in the same process can
@@ -36740,23 +36739,23 @@ mod tests {
                 watch: true,
                 ..CliInput::default()
             });
-            let (protected, vector_handle) = watch_runtime
+            let (verified, vector_handle) = watch_runtime
                 .build_live_ingest_pipeline(&cx)
                 .await
-                .expect("bootstrap durable watch writer");
-            let lexical_path = protected
+                .expect("bootstrap verified watch writer");
+            let lexical_path = verified
                 .lexical_index
                 .directory()
-                .expect("durable lexical directory")
+                .expect("on-disk lexical directory")
                 .to_path_buf();
             assert!(
-                !protected
+                !verified
                     .lexical_index
                     .segment_stats()
-                    .expect("read protected lexical stats")
+                    .expect("read verified lexical stats")
                     .degraded
             );
-            drop(protected);
+            drop(verified);
             drop(vector_handle);
 
             let segment_path = fs::read_dir(&lexical_path)
@@ -36767,16 +36766,18 @@ mod tests {
                         .is_some_and(|extension| extension == "fslx")
                 })
                 .expect("published FSLX segment");
-            let sidecar = frankensearch_durability::FileProtector::sidecar_path(&segment_path);
-            assert!(
-                sidecar.is_file(),
-                "watch bootstrap must protect the segment"
-            );
+            // Keyword segments are rebuilt from sources, never protected
+            // (bd-2pkpj): the watch bootstrap writes no repair sidecar.
+            let sidecars = fs::read_dir(&lexical_path)
+                .expect("scan lexical directory")
+                .map(|entry| entry.expect("read lexical entry").file_name())
+                .filter(|name| name.to_string_lossy().ends_with(".fec"))
+                .collect::<Vec<_>>();
+            assert!(sidecars.is_empty(), "keyword sidecars written: {sidecars:?}");
             let mut corrupt = fs::read(&segment_path).expect("read segment");
             let corrupt_offset = corrupt.len() / 2;
             corrupt[corrupt_offset] ^= 0x80;
             fs::write(&segment_path, corrupt).expect("corrupt segment");
-            fs::write(&sidecar, b"invalid repair sidecar").expect("corrupt repair sidecar");
 
             let (recovered, _vector_handle) = watch_runtime
                 .build_live_ingest_pipeline(&cx)
